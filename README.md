@@ -13,16 +13,11 @@
 │   ├── summary.html # 3 分钟摘要模板
 │   ├── qa.html      # 常见问答模板
 │   └── img_to_b64.py
-├── hsd/             # HSD：分层概率账本提高草稿接受率
-├── memagent/        # MemAgent：固定长度记忆 + RL
-└── pless/           # p-less Sampling：超参-free 截断采样
+└── <method-name>/   # 每篇论文一个目录
+    ├── index.html   # 主文档
+    ├── summary.html # 3 分钟摘要
+    └── paper.pdf    # 论文原文
 ```
-
-每个论文目录固定三个文件：
-
-- `index.html` — 主文档（问题 / 方法 / 实验 / 总结 / 证据边界声明）
-- `summary.html` — 3 分钟摘要
-- `paper.pdf` — 论文原文
 
 ## 写新笔记
 
