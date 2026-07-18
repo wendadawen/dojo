@@ -47,7 +47,7 @@
 └── paper.pdf        论文原文
 ```
 
-拷贝 `template/` 对应骨架，把 `paper.pdf` 放进去。
+拷贝 `template/` 对应骨架，把 `paper.pdf` 放进去。所有中间产物（插图 `figs/`、`*.b64`、TeX 源码、`pdftotext` 提取文本等）内联/归档完成后删除，最终目录只含上面列出的文件。
 
 ### 5. 写主文档 index.html
 
