@@ -20,7 +20,8 @@ concepts/
 ├── workflow.md
 ├── training-landscape.md
 ├── backward/index.html
-└── dpo/index.html
+├── dpo/index.html
+└── rlhf-rm/index.html
 ```
 
 新增：`concepts/<name>/index.html`
