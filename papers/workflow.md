@@ -1,10 +1,10 @@
 # 论文解读文档写作流程
 
-**产物**：纯 HTML + KaTeX（CDN）+ 图片 base64 内联。单文件可离线打开。
+**产物**：纯 HTML + KaTeX（CDN）+ 图片 base64 内联。每篇论文目录只保留 HTML、可选问答页和 PDF。
 
 **读者画像**：聪明的外行——有技术基础但不懂这个领域。30 秒能抓要点、3 分钟读摘要、10 分钟读全文。
 
-**模板**：`template/` 目录下三套 HTML 骨架（主文档 / 简要总结 / 常见问答），拷贝改。模板已实现本文件描述的默认结构、样式、折叠块、移动端表格滚动——直接改占位符即可，不要从空白 HTML 写起。
+**模板**：`papers/template/` 目录下三套 HTML 骨架（主文档 / 简要总结 / 常见问答），拷贝改。模板已实现本文件描述的默认结构、样式、折叠块、移动端表格滚动——直接改占位符即可，不要从空白 HTML 写起。
 
 **适用范围**：有明确方法 + 实验的论文。纯理论、纯工程、综述类论文不适合本结构，硬套会变形——先判断论文类型再决定是否用这套流程。
 
@@ -40,14 +40,14 @@
 ### 4. 准备目录
 
 ```
-<method-name>/
+papers/<venue>/<method-name>/
 ├── index.html       主文档
 ├── summary.html     3 分钟摘要
 ├── qa.html          常见问答（可选）
 └── paper.pdf        论文原文
 ```
 
-拷贝 `template/` 对应骨架，把 `paper.pdf` 放进去。所有中间产物（插图 `figs/`、`*.b64`、TeX 源码、`pdftotext` 提取文本等）内联/归档完成后删除，最终目录只含上面列出的文件。
+拷贝 `papers/template/` 对应骨架，把 `paper.pdf` 放进去。所有中间产物（插图 `figs/`、`*.b64`、TeX 源码、`pdftotext` 提取文本等）内联/归档完成后删除，最终目录只含上面列出的文件。
 
 ### 5. 写主文档 index.html
 
@@ -64,7 +64,7 @@
 脚本输出 data URI 字符串，粘进 `<img src="...">` 的引号里：
 
 ```bash
-python template/img_to_b64.py figs/arch.png
+python papers/template/img_to_b64.py figs/arch.png
 # 输出：data:image/png;base64,iVBORw0KGgo...
 ```
 
@@ -223,4 +223,4 @@ python template/img_to_b64.py figs/arch.png
 
 ## 模板位置
 
-`template/index.html` · `template/summary.html` · `template/qa.html` · `template/img_to_b64.py`
+`papers/template/index.html` · `papers/template/summary.html` · `papers/template/qa.html` · `papers/template/img_to_b64.py`
