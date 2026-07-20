@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DPO：直接偏好优化</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, "Helvetica Neue", "PingFang SC", sans-serif;
+  background: linear-gradient(135deg, #0a0e1a 0%, #1a1f35 100%);
+  color: #e2e8f0;
+  min-height: 100vh;
+  padding: 16px;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: radial-gradient(circle at 20% 30%, rgba(96, 165, 250, 0.08), transparent 40%),
+              radial-gradient(circle at 80% 70%, rgba(167, 139, 250, 0.08), transparent 40%);
+  pointer-events: none;
+  z-index: -1;
+}
+.container { max-width: 1100px; margin: 0 auto; padding-bottom: 80px; }
+h1 {
+  text-align: center;
+  font-size: 26px;
+  background: linear-gradient(90deg, #60a5fa, #a78bfa, #f472b6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 4px;
+}
+.subtitle { text-align: center; color: #94a3b8; font-size: 13px; margin-bottom: 16px; }
+
+.stage {
+  background: rgba(19, 26, 46, 0.7);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 18px 22px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.stage-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; color: #f1f5f9; }
+.stage-desc { color: #cbd5e1; font-size: 14px; margin-bottom: 10px; }
+.stage-formula {
+  background: rgba(10, 14, 26, 0.6);
+  padding: 12px 16px;
+  border-radius: 6px;
+  border-left: 3px solid #60a5fa;
+  margin: 10px 0;
+  overflow-x: auto;
+}
+
+.matrix-area {
+  background: rgba(13, 20, 36, 0.6);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 24px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.matrix-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.matrix-block { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.matrix-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+.matrix-name { font-size: 15px; font-weight: 700; color: #e2e8f0; margin-bottom: 2px; }
+.matrix {
+  display: grid;
+  gap: 2px;
+  background: rgba(5, 8, 16, 0.6);
+  padding: 4px;
+  border-radius: 4px;
+  border: 1px solid #2d3a5e;
+}
+.cell {
+  padding: 6px 10px;
+  background: rgba(30, 41, 59, 0.6);
+  border-radius: 3px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  text-align: center;
+  min-width: 50px;
+  color: #e2e8f0;
+  transition: all 0.4s ease;
+}
+.cell.chosen { border: 1.5px solid #34d399; background: rgba(52, 211, 153, 0.18); }
+.cell.rejected { border: 1.5px solid #f87171; background: rgba(248, 113, 113, 0.18); }
+.cell.highlight {
+  background: rgba(96, 165, 250, 0.3) !important;
+  box-shadow: 0 0 10px rgba(96, 165, 250, 0.5);
+  transform: scale(1.05);
+}
+.cell.big { font-size: 16px; font-weight: 700; }
+.op { font-size: 18px; color: #64748b; font-weight: 300; }
+
+.derivation {
+  background: rgba(19, 26, 46, 0.7);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 16px 22px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.deriv-title { font-size: 14px; font-weight: 700; color: #fbbf24; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+.deriv-step {
+  margin: 12px 0;
+  padding: 10px 14px;
+  background: rgba(13, 20, 36, 0.6);
+  border-radius: 6px;
+  border-left: 2px solid #fbbf24;
+}
+.deriv-label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+.deriv-note { font-size: 13px; color: #94a3b8; margin-top: 6px; font-style: italic; }
+
+.calc {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  color: #cbd5e1;
+  margin: 4px 0;
+  padding-left: 16px;
+}
+.calc .num { color: #fbbf24; font-weight: 600; }
+.calc .result { color: #34d399; font-weight: 600; }
+.calc .mark { color: #64748b; }
+
+.compare { display: flex; gap: 16px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+.compare-card {
+  background: rgba(13, 20, 36, 0.6);
+  padding: 10px 18px;
+  border-radius: 6px;
+  border: 1px solid #2d3a5e;
+  text-align: center;
+  min-width: 110px;
+}
+.compare-card .label { font-size: 11px; color: #94a3b8; margin-bottom: 2px; }
+.compare-card .value { font-family: "SF Mono", Menlo, monospace; font-size: 20px; font-weight: 700; }
+.compare-card.chosen .value { color: #34d399; }
+.compare-card.rejected .value { color: #f87171; }
+.compare-card.before .value { color: #f87171; }
+.compare-card.after .value { color: #84cc16; }
+
+.tip {
+  background: rgba(96, 165, 250, 0.08);
+  border-left: 3px solid #60a5fa;
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.tip.warning { background: rgba(251, 191, 36, 0.08); border-left-color: #fbbf24; }
+.tip.success { background: rgba(132, 204, 22, 0.08); border-left-color: #84cc16; }
+
+.convention {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.conv-item {
+  background: rgba(13, 20, 36, 0.5);
+  padding: 8px 14px;
+  border-radius: 6px;
+  border-left: 2px solid #60a5fa;
+  font-size: 14px;
+  color: #cbd5e1;
+}
+.conv-item .conv-sym {
+  font-family: "SF Mono", Menlo, monospace;
+  font-weight: 600;
+  color: #60a5fa;
+  margin-right: 8px;
+}
+
+.controls {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: rgba(13, 20, 36, 0.95);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid #2d3a5e;
+  padding: 12px 20px;
+  gap: 16px;
+}
+.btn {
+  background: rgba(96, 165, 250, 0.12);
+  color: #60a5fa;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 110px;
+  transition: all 0.2s;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(96, 165, 250, 0.25);
+  transform: translateY(-1px);
+}
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.indicator { font-size: 14px; color: #94a3b8; min-width: 100px; text-align: center; }
+.indicator .current { color: #60a5fa; font-weight: 700; font-size: 16px; }
+
+@media (max-width: 768px) {
+  .matrix-row { gap: 8px; }
+  .cell { min-width: 40px; padding: 4px 6px; font-size: 11px; }
+  .op { font-size: 14px; }
+  h1 { font-size: 18px; }
+  .convention { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>DPO：直接偏好优化</h1>
+  <p class="subtitle" id="subtitle"></p>
+
+  <div class="stage">
+    <div class="stage-title">数学约定</div>
+    <div class="stage-desc">DPO 用到的记号。</div>
+    <div class="convention" id="conv-grid"></div>
+  </div>
+
+  <div class="stage" id="stageBox">
+    <div class="stage-title" id="sTitle"></div>
+    <div class="stage-desc" id="sDesc"></div>
+    <div class="stage-formula" id="sFormula"></div>
+  </div>
+
+  <div class="matrix-area" id="mArea"></div>
+
+  <div class="derivation" id="derivBox" style="display:none;">
+    <div class="deriv-title" id="dTitle"></div>
+    <div id="dSteps"></div>
+  </div>
+
+  <div class="tip" id="tipBox" style="display:none;"></div>
+</div>
+
+<div class="controls">
+  <button class="btn" id="prevBtn" onclick="change(-1)">◀ 上一页</button>
+  <div class="indicator">第 <span class="current" id="cur">1</span> / <span id="tot">8</span> 页</div>
+  <button class="btn" id="nextBtn" onclick="change(1)">下一页 ▶</button>
+</div>
+
+<script>
+// === 数学渲染辅助（和 backward/index.html 保持一致） ===
+function renderMixed(element, str) {
+  element.innerHTML = '';
+  const parts = str.split(/(\$\$[^$]+\$\$)/g);
+  for (const part of parts) {
+    if (!part) continue;
+    const blockMatch = part.match(/^\$\$([^$]+)\$\$$/);
+    if (blockMatch) {
+      const span = document.createElement('div');
+      try { katex.render(blockMatch[1], span, { displayMode: true, throwOnError: false }); }
+      catch (e) { span.textContent = blockMatch[1]; }
+      element.appendChild(span);
+      continue;
+    }
+    const inlineParts = part.split(/(\$[^$]+\$)/g);
+    for (const ip of inlineParts) {
+      if (!ip) continue;
+      const inlineMatch = ip.match(/^\$([^$]+)\$$/);
+      if (inlineMatch) {
+        const span = document.createElement('span');
+        try { katex.render(inlineMatch[1], span, { displayMode: false, throwOnError: false }); }
+        catch (e) { span.textContent = inlineMatch[1]; }
+        element.appendChild(span);
+      } else {
+        const wrapper = document.createElement('span');
+        wrapper.innerHTML = ip;
+        element.appendChild(wrapper);
+      }
+    }
+  }
+}
+function renderDisplay(element, latex) {
+  try { katex.render(latex, element, { displayMode: true, throwOnError: false }); }
+  catch (e) { element.textContent = latex; }
+}
+function scanAndRender(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const textNodes = [];
+  let node;
+  while (node = walker.nextNode()) textNodes.push(node);
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue;
+    if (!text || !text.includes('$')) continue;
+    const frag = document.createDocumentFragment();
+    const regex = /(\$\$[^$]+\$\$|\$[^$\n]+\$)/g;
+    let lastIdx = 0, match;
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIdx) frag.appendChild(document.createTextNode(text.slice(lastIdx, match.index)));
+      const m = match[0];
+      const span = document.createElement('span');
+      try {
+        if (m.startsWith('$$')) katex.render(m.slice(2, -2), span, { displayMode: true, throwOnError: false });
+        else katex.render(m.slice(1, -1), span, { displayMode: false, throwOnError: false });
+      } catch (e) { span.textContent = m; }
+      frag.appendChild(span);
+      lastIdx = match.index + m.length;
+    }
+    if (lastIdx < text.length) frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+    textNode.parentNode.replaceChild(frag, textNode);
+  }
+}
+
+// === 工具函数 ===
+function f(v, n = 4) { return Number(v).toFixed(n); }
+function vec(v, opts = {}) {
+  const { hl, tgt, chosenIdx, rejectedIdx, cls = [] } = opts;
+  const cells = v.map((val, i) => {
+    let c = 'cell';
+    if (chosenIdx !== undefined && i === chosenIdx) c += ' chosen';
+    if (rejectedIdx !== undefined && i === rejectedIdx) c += ' rejected';
+    if (hl === i) c += ' highlight';
+    if (tgt === i) c += ' target';
+    cls.forEach(k => { if (k(i)) c += ' ' + k; });
+    return '<div class="' + c + '">' + (typeof val === 'number' ? f(val) : val) + '</div>';
+  }).join('');
+  return '<div class="matrix" style="grid-template-columns: 1fr;">' + cells + '</div>';
+}
+function mat(m, opts = {}) {
+  const { hl, cls = [] } = opts;
+  const rows = m.map((row, i) =>
+    row.map((v, j) => {
+      let c = 'cell';
+      if (hl && hl.some(([r, c2]) => r === i && c2 === j)) c += ' highlight';
+      cls.forEach(k => { if (k(i, j)) c += ' ' + k; });
+      return '<div class="' + c + '">' + f(v) + '</div>';
+    }).join('')
+  ).join('');
+  return '<div class="matrix" style="grid-template-columns: repeat(' + m[0].length + ', 1fr);">' + rows + '</div>';
+}
+function blk(label, name, html) {
+  return '<div class="matrix-block">' +
+    (label ? '<div class="matrix-label">' + label + '</div>' : '') +
+    (name ? '<div class="matrix-name">' + name + '</div>' : '') +
+    html +
+  '</div>';
+}
+function op(s) {
+  return '<div class="op">' + s + '</div>';
+}
+function calc(latex, value, mark) {
+  let s = '<div class="calc">' + latex;
+  if (value !== undefined && value !== null) s += ' = <span class="result">' + value + '</span>';
+  if (mark) s += ' <span class="mark">' + mark + '</span>';
+  s += '</div>';
+  return s;
+}
+
+// === 数学约定卡片 ===
+const CONVENTIONS = [
+  { sym: 'x', desc: 'prompt（输入提示）' },
+  { sym: 'y_w', desc: 'chosen（偏好的回答）' },
+  { sym: 'y_l', desc: 'rejected（不偏好的回答）' },
+  { sym: '\\pi_\\theta', desc: '正在训练的模型（参数 $\\theta$ 可更新）' },
+  { sym: '\\pi_{\\text{ref}}', desc: '参考模型（冻住不更新，通常是 SFT 后的模型）' },
+  { sym: '\\pi(y|x)', desc: '模型在 $x$ 下生成 $y$ 的概率' },
+  { sym: '\\beta', desc: '偏离参考模型的惩罚强度（通常 0.1 ~ 0.5）' },
+  { sym: '\\sigma', desc: 'sigmoid 函数 $\\sigma(t) = 1/(1+e^{-t})$，把任意实数压到 $(0,1)$ 区间' },
+  { sym: '\\hat{r}_\\theta', desc: '隐含奖励 $= \\beta \\log \\frac{\\pi_\\theta(y|x)}{\\pi_{\\text{ref}}(y|x)}$，衡量当前模型相对参考模型给 $y$ 的概率变化' },
+  { sym: '\\Delta', desc: 'chosen 与 rejected 的隐含奖励差 $= \\hat{r}_\\theta(y_w) - \\hat{r}_\\theta(y_l)$' },
+  { sym: '\\log', desc: '自然对数（以 $e$ 为底）。$\\log \\frac{a}{b} = \\log a - \\log b$，用于把概率比变成概率差' },
+  { sym: '\\nabla_\\theta', desc: '梯度算子。$\\nabla_\\theta L$ 表示 $L$ 对参数 $\\theta$ 的所有偏导组成的向量，指向 $L$ 上升最快的方向' },
+  { sym: '\\partial', desc: '偏导符号。$\\frac{\\partial L}{\\partial \\theta}$ 读作「$L$ 对 $\\theta$ 的偏导」' },
+  { sym: 'e', desc: '自然对数底 $\\approx 2.718$。sigmoid 里用 $e^{-t}$' },
+  { sym: '\\approx', desc: '约等于' },
+  { sym: '\\to', desc: '趋向 / 映射到。$a \\to b$ 表示 $a$ 变成 $b$' }
+];
+
+function renderConventions() {
+  const grid = document.getElementById('conv-grid');
+  grid.innerHTML = '';
+  CONVENTIONS.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'conv-item';
+    const sym = document.createElement('span');
+    sym.className = 'conv-sym';
+    item.appendChild(sym);
+    const desc = document.createElement('span');
+    desc.className = 'conv-desc';
+    item.appendChild(desc);
+    grid.appendChild(item);
+    renderDisplay(sym, c.sym);
+    renderMixed(desc, c.desc);
+  });
+}
+
+// === 场景：一个最小例子 ===
+// 假设词表 5 个 token，prompt 长度 1，chosen/rejected 各 1 个 token
+// 便于在 HTML 里画出来
+// prompt = [token 0]，chosen = [token 1]，rejected = [token 2]
+// 模型在 prompt 下对下一个 token 的 logits（由 \pi_\theta 给出）
+// 参考模型对下一个 token 的 logits（由 \pi_{\text{ref}} 给出）
+
+// 训练前 \pi_\theta 还没偏向任何回答
+// 训练后 \pi_\theta 应该让 chosen 概率升高，rejected 概率降低
+
+const VOCAB = 5;  // 0..4
+const PROMPT_TOK = 0;
+const CHOSEN_TOK = 1;
+const REJECTED_TOK = 2;
+
+// 参考模型 logits（不更新）
+const refLogits = [-0.5, 0.8, 0.3, 0.1, -0.2];
+// 训练前：当前模型 logits 和参考模型一样
+const thetaLogitsBefore = refLogits.slice();
+// 一步训练后：chosen 上升，rejected 下降
+const thetaLogitsAfter = [-0.6, 1.3, -0.2, 0.15, -0.1];
+
+function softmax(logits) {
+  const expZ = logits.map(v => Math.exp(v));
+  const sum = expZ.reduce((a, b) => a + b, 0);
+  return expZ.map(v => v / sum);
+}
+
+function logProb(logits, tok) {
+  const p = softmax(logits);
+  return Math.log(p[tok]);
+}
+
+const refLogPChosen = logProb(refLogits, CHOSEN_TOK);
+const refLogPRejected = logProb(refLogits, REJECTED_TOK);
+
+const thetaLogPChosenBefore = logProb(thetaLogitsBefore, CHOSEN_TOK);
+const thetaLogPRejectedBefore = logProb(thetaLogitsBefore, REJECTED_TOK);
+
+const thetaLogPChosenAfter = logProb(thetaLogitsAfter, CHOSEN_TOK);
+const thetaLogPRejectedAfter = logProb(thetaLogitsAfter, REJECTED_TOK);
+
+const beta = 0.5;
+
+// 训练前的 ratio 对数
+const logRatioChosenBefore = thetaLogPChosenBefore - refLogPChosen;
+const logRatioRejectedBefore = thetaLogPRejectedBefore - refLogPRejected;
+
+// DPO loss = -log(sigmoid(beta * (logRatioChosen - logRatioRejected)))
+const innerBefore = beta * (logRatioChosenBefore - logRatioRejectedBefore);
+const lossBefore = -Math.log(1 / (1 + Math.exp(-innerBefore)));
+
+// 训练后
+const logRatioChosenAfter = thetaLogPChosenAfter - refLogPChosen;
+const logRatioRejectedAfter = thetaLogPRejectedAfter - refLogPRejected;
+const innerAfter = beta * (logRatioChosenAfter - logRatioRejectedAfter);
+const lossAfter = -Math.log(1 / (1 + Math.exp(-innerAfter)));
+
+// === 页面数据 ===
+const STAGES = [
+  // 1. 起点
+  {
+    title: '起点：从 SFT 模型开始',
+    desc: 'DPO 不从零开始，而是在一个已经 SFT 过的模型上继续。这个起点叫 $\\pi_{\\text{ref}}$（参考模型），训练过程中它永远冻住，不更新参数。',
+    formula: '\\pi_{\\text{ref}} \\leftarrow \\pi_{\\text{SFT}}',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('参考模型', '$\\pi_{\\text{ref}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">冻结</div></div>') +
+        op('训练时只读') +
+        blk('当前模型', '$\\pi_\\theta$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big highlight">更新</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\pi_\\theta$ 一开始 $= \\pi_{\\text{ref}}$（拷贝一份）') +
+        calc('训练目标：调整 $\\pi_\\theta$，让它偏好 chosen，不偏好 rejected') +
+      '</div>',
+    deriv: null,
+    tip: '注意：$\\pi_{\\text{ref}}$ 不是随便选的，它是 DPO 的数学推导需要。下文会看到为什么。'
+  },
+
+  // 2. 数据：偏好对
+  {
+    title: '数据：偏好对 $(x, y_w, y_l)$',
+    desc: 'DPO 的数据和 SFT 完全不同。SFT 是「一个 prompt 配一个标准答案」，DPO 是「一个 prompt 配两个答案，标注哪个更好」。',
+    formula: '\\mathcal{D} = \\{(x^{(i)}, y_w^{(i)}, y_l^{(i)})\\}_{i=1}^N',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('prompt', '$x$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight">token ' + PROMPT_TOK + '</div></div>') +
+        op('+') +
+        blk('偏好回答', '$y_w$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen">token ' + CHOSEN_TOK + '</div></div>') +
+        op('+') +
+        blk('不偏好回答', '$y_l$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected">token ' + REJECTED_TOK + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('SFT 数据：$(x, y)$，模仿 $y$') +
+        calc('DPO 数据：$(x, y_w, y_l)$，让 $y_w$ 比 $y_l$ 更可能') +
+      '</div>',
+    deriv: null,
+    tip: '这就是 DPO 的「偏好」二字含义——不是给标准答案，而是给一对好坏对比。'
+  },
+
+  // 3. 模型在 prompt 下生成各 token 的概率
+  {
+    title: '前向：$\\pi(y|x)$ 的概率',
+    desc: '参考模型对 prompt $x$（token 0）输出一个 logits 向量 $\\mathbf{z}$，softmax 后得到每个 token 的生成概率。这里先把参考模型的概率算出来，作为后面比较的锚点。',
+    formula: '\\pi(y|x) = \\text{softmax}(\\mathbf{z})_y = \\frac{e^{z_y}}{\\sum_j e^{z_j}}',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('输入', '$x$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight">token ' + PROMPT_TOK + '</div></div>') +
+        op('→ $\\pi_{\\text{ref}}$ →') +
+        blk('logits', '$\\mathbf{z}$', vec(refLogits, { chosenIdx: CHOSEN_TOK, rejectedIdx: REJECTED_TOK })) +
+        op('→ softmax →') +
+        blk('概率', '$\\mathbf{p}$', vec(softmax(refLogits), { chosenIdx: CHOSEN_TOK, rejectedIdx: REJECTED_TOK })) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\mathbf{z} = [' + refLogits.map(v => f(v)).join(', ') + ']$（参考模型对 prompt token 0 的输出）') +
+        calc('$e^{z_j}$：$e^{' + refLogits[0] + '}=' + f(Math.exp(refLogits[0])) + '$, $e^{' + refLogits[1] + '}=' + f(Math.exp(refLogits[1])) + '$, $e^{' + refLogits[2] + '}=' + f(Math.exp(refLogits[2])) + '$, $e^{' + refLogits[3] + '}=' + f(Math.exp(refLogits[3])) + '$, $e^{' + refLogits[4] + '}=' + f(Math.exp(refLogits[4])) + '$') +
+        calc('$\\sum_j e^{z_j} = ' + f(refLogits.map(v => Math.exp(v)).reduce((a, b) => a + b, 0)) + '$') +
+        calc('$\\mathbf{p} = [' + softmax(refLogits).map(v => f(v)).join(', ') + ']$') +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('$\\pi_{\\text{ref}}(y_w|x) = p_{' + CHOSEN_TOK + '} = ' + f(softmax(refLogits)[CHOSEN_TOK]) + '$', '', 'chosen') +
+        calc('$\\pi_{\\text{ref}}(y_l|x) = p_{' + REJECTED_TOK + '} = ' + f(softmax(refLogits)[REJECTED_TOK]) + '$', '', 'rejected') +
+      '</div>',
+    deriv: null,
+    tip: '参考模型的概率只是一个「锚点」。DPO 真正关心的是当前模型相对参考模型的变化量。'
+  },
+
+  // 4. 对数概率比
+  {
+    title: '关键量：对数概率比 $\\log \\frac{\\pi_\\theta(y|x)}{\\pi_{\\text{ref}}(y|x)}$',
+    desc: 'DPO 不直接看模型给 chosen 的概率，而是看「当前模型相对参考模型，chosen 概率上升了多少」。这个变化量就是对数概率比。训练前 $\\pi_\\theta = \\pi_{\\text{ref}}$，所以对数比应该是 0——先验证这一点。',
+    formula: '\\hat{r}_\\theta(y|x) = \\beta \\log \\frac{\\pi_\\theta(y|x)}{\\pi_{\\text{ref}}(y|x)}',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('当前模型<br>log p', '$\\log \\pi_\\theta$', vec([thetaLogPChosenBefore, thetaLogPRejectedBefore], { chosenIdx: 0, rejectedIdx: 1 })) +
+        op('−') +
+        blk('参考模型<br>log p', '$\\log \\pi_{\\text{ref}}$', vec([refLogPChosen, refLogPRejected], { chosenIdx: 0, rejectedIdx: 1 })) +
+        op('=') +
+        blk('对数比', '$\\log \\frac{\\pi_\\theta}{\\pi_{\\text{ref}}}$', vec([logRatioChosenBefore, logRatioRejectedBefore], { chosenIdx: 0, rejectedIdx: 1 })) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\log \\pi_{\\text{ref}}(y_w|x) = \\log p_w$，$p_w = ' + f(softmax(refLogits)[CHOSEN_TOK]) + '$，$\\log p_w = ' + f(refLogPChosen) + '$') +
+        calc('$\\log \\pi_{\\text{ref}}(y_l|x) = \\log p_l$，$p_l = ' + f(softmax(refLogits)[REJECTED_TOK]) + '$，$\\log p_l = ' + f(refLogPRejected) + '$') +
+        calc('训练前 $\\pi_\\theta = \\pi_{\\text{ref}}$，所以 $\\log \\pi_\\theta(y_w|x) = ' + f(thetaLogPChosenBefore) + '$') +
+        calc('$\\log \\frac{\\pi_\\theta(y_w|x)}{\\pi_{\\text{ref}}(y_w|x)} = ' + f(thetaLogPChosenBefore) + ' - ' + f(refLogPChosen) + ' = ' + f(logRatioChosenBefore) + '$', f(logRatioChosenBefore), '≈ 0（chosen）') +
+        calc('$\\log \\frac{\\pi_\\theta(y_l|x)}{\\pi_{\\text{ref}}(y_l|x)} = ' + f(thetaLogPRejectedBefore) + ' - ' + f(refLogPRejected) + ' = ' + f(logRatioRejectedBefore) + '$', f(logRatioRejectedBefore), '≈ 0（rejected）') +
+      '</div>',
+    deriv: {
+      title: '为什么取对数比而不是直接看概率？',
+      steps: [
+        { label: '直觉', math: '\\text{绝对概率受 prompt 本身影响很大，不能直接比。}', note: '同一个 token，在不同 prompt 下基础概率差很多。我们要看「相对变化」，而不是「绝对值」。' },
+        { label: '减去参考模型', math: '\\log \\pi_\\theta(y|x) - \\log \\pi_{\\text{ref}}(y|x)', note: '减去参考模型的对数概率，等于只看「当前模型比参考模型进步了多少」。基础概率被消掉。' },
+        { label: '乘 $\\beta$', math: '\\hat{r}_\\theta(y|x) = \\beta \\log \\frac{\\pi_\\theta(y|x)}{\\pi_{\\text{ref}}(y|x)}', note: '$\\beta$ 控制「允许偏离参考模型多远」。$\\beta$ 大 → 偏离越多，$\\beta$ 小 → 偏离越少。' },
+        { label: '论文原话', math: '\\text{「Your Language Model is Secretly a Reward Model」}', note: '这个对数比 $\\hat{r}_\\theta$ 可以理解为模型隐含的「奖励」。下文 DPO loss 就是用这个量算的。' }
+      ]
+    },
+    tip: '$\\hat{r}_\\theta$ 就是「隐含奖励」。DPO 要让 $\\hat{r}_\\theta(y_w) > \\hat{r}_\\theta(y_l)$，即 chosen 的奖励高于 rejected。'
+  },
+
+  // 5. DPO loss
+  {
+    title: 'DPO 损失：偏好比较',
+    desc: '把 chosen 和 rejected 的隐含奖励做差，过一个 sigmoid，取负对数。这就是 DPO 的 loss——形式上就是一个二元分类 loss。',
+    formula: '\\mathcal{L}_{\\text{DPO}} = -\\log \\sigma \\left( \\beta \\log \\frac{\\pi_\\theta(y_w|x)}{\\pi_{\\text{ref}}(y_w|x)} - \\beta \\log \\frac{\\pi_\\theta(y_l|x)}{\\pi_{\\text{ref}}(y_l|x)} \\right)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('chosen 隐含奖励', '$\\hat{r}_\\theta(y_w)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen">' + f(beta * logRatioChosenBefore) + '</div></div>') +
+        op('−') +
+        blk('rejected 隐含奖励', '$\\hat{r}_\\theta(y_l)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected">' + f(beta * logRatioRejectedBefore) + '</div></div>') +
+        op('=') +
+        blk('差值', '$\\Delta$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight">' + f(innerBefore) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\Delta = ' + f(beta * logRatioChosenBefore) + ' - ' + f(beta * logRatioRejectedBefore) + '$', f(innerBefore), 'result') +
+        calc('$\\sigma(\\Delta) = 1 / (1 + e^{-\\Delta})$', f(1 / (1 + Math.exp(-innerBefore)))) +
+        calc('$\\mathcal{L}_{\\text{DPO}} = -\\log \\sigma(\\Delta)$', f(lossBefore), 'result ← 训练前') +
+      '</div>',
+    deriv: {
+      title: '直觉理解',
+      steps: [
+        { label: '差值含义', math: '\\Delta = \\hat{r}_\\theta(y_w) - \\hat{r}_\\theta(y_l)', note: '$\\Delta > 0$：当前模型给 chosen 的奖励高于 rejected（方向对）。$\\Delta < 0$：方向反了。' },
+        { label: 'sigmoid 把差值压到 (0,1)', math: '\\sigma(\\Delta) \\in (0, 1)', note: '$\\sigma(\\Delta) = 1$ 完美偏好 chosen；$\\sigma(\\Delta) = 0$ 完全偏好 rejected（最坏）；$\\sigma(\\Delta) = 0.5$ 没偏好。' },
+        { label: '负对数', math: '\\mathcal{L} = -\\log \\sigma(\\Delta)', note: '$\\sigma$ 越接近 1（偏好正确），$\\mathcal{L}$ 越接近 0。$\\sigma$ 越接近 0（偏好错误），$\\mathcal{L}$ 越大。' },
+        { label: '训练前', math: '\\pi_\\theta = \\pi_{\\text{ref}} \\Rightarrow \\Delta = 0 \\Rightarrow \\mathcal{L} = -\\log 0.5 = 0.693', note: '训练前模型和参考模型一样，对数比都是 0，差值 0，sigmoid(0) = 0.5，loss = 0.693。' }
+      ]
+    },
+    tip: '训练前 loss = 0.693（最中性的状态）。训练的目标是让 loss 下降，也就是让 $\\sigma(\\Delta) \\to 1$，也就是让 chosen 的隐含奖励高于 rejected。'
+  },
+
+  // 6. 反传
+  {
+    title: '反传：让 $\\pi_\\theta$ 偏向 chosen',
+    desc: 'DPO loss 仍然走 backward。梯度会告诉 $\\pi_\\theta$ 的每个参数：往哪个方向调，才能让 $\\hat{r}_\\theta(y_w)$ 升高、$\\hat{r}_\\theta(y_l)$ 降低。',
+    formula: '\\nabla_\\theta \\mathcal{L}_{\\text{DPO}} = -\\beta \\cdot \\sigma(-\\Delta) \\left( \\nabla_\\theta \\log \\pi_\\theta(y_w|x) - \\nabla_\\theta \\log \\pi_\\theta(y_l|x) \\right)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('chosen 梯度', '$\\nabla \\log \\pi_\\theta(y_w)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen">↑</div></div>') +
+        op('−') +
+        blk('rejected 梯度', '$\\nabla \\log \\pi_\\theta(y_l)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected">↓</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\nabla_\\theta \\log \\pi_\\theta(y_w|x)$ → 让 $\\pi_\\theta(y_w)$ 上升') +
+        calc('$\\nabla_\\theta \\log \\pi_\\theta(y_l|x)$ → 让 $\\pi_\\theta(y_l)$ 下降') +
+        calc('$\\sigma(-\\Delta)$ 是「学习权重」：偏好越错，梯度越大；偏好越对，梯度越小') +
+      '</div>',
+    deriv: {
+      title: '梯度推导（简版）',
+      steps: [
+        { label: '设 $u = \\Delta$', math: 'u = \\beta \\log \\frac{\\pi_\\theta(y_w|x)}{\\pi_{\\text{ref}}(y_w|x)} - \\beta \\log \\frac{\\pi_\\theta(y_l|x)}{\\pi_{\\text{ref}}(y_l|x)}', note: '参考模型 $\\pi_{\\text{ref}}$ 冻结，不参与梯度。' },
+        { label: '$\\mathcal{L} = -\\log \\sigma(u)$', math: '\\frac{d\\mathcal{L}}{du} = -\\frac{\\sigma\'(u)}{\\sigma(u)} = -(1 - \\sigma(u)) = \\sigma(-u)', note: 'sigmoid 的导数性质 $\\sigma\'(u) = \\sigma(u)(1 - \\sigma(u))$。' },
+        { label: '链式法则', math: '\\nabla_\\theta \\mathcal{L} = \\sigma(-u) \\cdot \\nabla_\\theta u', note: '$u$ 是 $\\log \\pi_\\theta$ 的线性组合，梯度直接传到模型。' },
+        { label: '展开', math: '\\nabla_\\theta u = \\beta \\left( \\nabla_\\theta \\log \\pi_\\theta(y_w|x) - \\nabla_\\theta \\log \\pi_\\theta(y_l|x) \\right)', note: '看到「升 chosen + 降 rejected」的对称结构。这就是 DPO 的核心直觉。' }
+      ]
+    },
+    tip: '关键直觉：DPO 梯度同时推 chosen 上升和 rejected 下降，这和 SFT 只推正确答案上升不同。'
+  },
+
+  // 7. 一步更新
+  {
+    title: '一步更新：用新参数重算 logits',
+    desc: 'backward 算出梯度后，optimizer.step() 按梯度下降公式更新参数 $\\theta$。更新的对象是 $\\theta$，$\\mathbf{z}$ 是 $\\theta$ 变了之后重新前向算出来的。',
+    formula: '\\theta^{\\text{new}} = \\theta^{\\text{old}} - \\eta \\, \\nabla_\\theta \\mathcal{L}_{\\text{DPO}}',
+    matrix: () =>
+      '<div style="background:rgba(19,26,46,0.7); border:1px solid #2d3a5e; border-radius:10px; padding:16px 22px; margin-bottom:14px; backdrop-filter:blur(10px);">' +
+        '<div style="font-family:\'SF Mono\',Menlo,monospace; font-size:13px; color:#cbd5e1; line-height:1.8;">' +
+          '① $\\theta^{\\text{old}}$ → 前向 → $\\mathbf{z}^{\\text{before}}$ → softmax → $\\mathbf{p}^{\\text{before}}$ → $\\mathcal{L}$<br>' +
+          '② $\\mathcal{L}$ → backward → $\\nabla_\\theta \\mathcal{L}$<br>' +
+          '③ $\\theta^{\\text{new}} = \\theta^{\\text{old}} - \\eta \\, \\nabla_\\theta \\mathcal{L}$<br>' +
+          '④ $\\theta^{\\text{new}}$ → 前向 → $\\mathbf{z}^{\\text{after}}$ → softmax → $\\mathbf{p}^{\\text{after}}$' +
+        '</div>' +
+      '</div>' +
+      '<div class="matrix-row">' +
+        blk('训练前 logits<br>（$\\theta^{\\text{old}}$ 算出）', '$\\mathbf{z}^{\\text{before}}$', vec(thetaLogitsBefore, { chosenIdx: CHOSEN_TOK, rejectedIdx: REJECTED_TOK })) +
+        op('θ 更新后重算') +
+        blk('训练后 logits<br>（$\\theta^{\\text{new}}$ 算出）', '$\\mathbf{z}^{\\text{after}}$', vec(thetaLogitsAfter, { chosenIdx: CHOSEN_TOK, rejectedIdx: REJECTED_TOK })) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('用 $\\theta^{\\text{old}}$ 算：$z_{' + CHOSEN_TOK + '}^{\\text{before}} = ' + f(thetaLogitsBefore[CHOSEN_TOK]) + '$；用 $\\theta^{\\text{new}}$ 重算：$z_{' + CHOSEN_TOK + '}^{\\text{after}} = ' + f(thetaLogitsAfter[CHOSEN_TOK]) + '$', '(chosen 上升 ' + f(thetaLogitsAfter[CHOSEN_TOK] - thetaLogitsBefore[CHOSEN_TOK]) + ')', 'chosen') +
+        calc('用 $\\theta^{\\text{old}}$ 算：$z_{' + REJECTED_TOK + '}^{\\text{before}} = ' + f(thetaLogitsBefore[REJECTED_TOK]) + '$；用 $\\theta^{\\text{new}}$ 重算：$z_{' + REJECTED_TOK + '}^{\\text{after}} = ' + f(thetaLogitsAfter[REJECTED_TOK]) + '$', '(rejected 下降 ' + f(thetaLogitsAfter[REJECTED_TOK] - thetaLogitsBefore[REJECTED_TOK]) + ')', 'rejected') +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('$\\log \\pi_\\theta(y_w|x)$：$p = ' + f(softmax(thetaLogitsBefore)[CHOSEN_TOK]) + '$ → $\\log p = ' + f(thetaLogPChosenBefore) + '$；训练后 $p = ' + f(softmax(thetaLogitsAfter)[CHOSEN_TOK]) + '$ → $\\log p = ' + f(thetaLogPChosenAfter) + '$') +
+        calc('$\\log \\pi_\\theta(y_l|x)$：$p = ' + f(softmax(thetaLogitsBefore)[REJECTED_TOK]) + '$ → $\\log p = ' + f(thetaLogPRejectedBefore) + '$；训练后 $p = ' + f(softmax(thetaLogitsAfter)[REJECTED_TOK]) + '$ → $\\log p = ' + f(thetaLogPRejectedAfter) + '$') +
+      '</div>',
+    deriv: {
+      title: '梯度下降在干什么',
+      steps: [
+        { label: '目标', math: '\\text{让 } \\mathcal{L}_{\\text{DPO}} \\text{ 变小}', note: 'loss 下降 = 模型更偏向 chosen。' },
+        { label: '梯度的含义', math: '\\nabla_\\theta \\mathcal{L} = \\left( \\frac{\\partial \\mathcal{L}}{\\partial \\theta_1}, \\frac{\\partial \\mathcal{L}}{\\partial \\theta_2}, \\ldots \\right)', note: '每个分量是 loss 对那个参数的偏导。' },
+        { label: '走反方向', math: '\\theta^{\\text{new}} = \\theta^{\\text{old}} - \\eta \\, \\nabla_\\theta \\mathcal{L}', note: '负号让 loss 下降。' },
+        { label: '学习率', math: '\\eta = 0.5', note: '控制每步走多远。' },
+        { label: '重算前向', math: '\\mathbf{z}^{\\text{after}} = f(x; \\theta^{\\text{new}})', note: '$\\theta$ 变了，重新前向算出新的 $\\mathbf{z}$。' }
+      ]
+    },
+    tip: '梯度下降更新的是参数 $\\theta$。$\\mathbf{z}$ 是前向算出来的，$\\theta$ 变了重新前向才算出新的 $\\mathbf{z}$。'
+  },
+
+  // 8. 验证：loss 下降
+  {
+    title: '验证：loss 下降',
+    desc: '用更新后的 $\\pi_\\theta$ 重算 DPO loss：算新的 $\\log \\pi_\\theta$，减去不变的 $\\log \\pi_{\\text{ref}}$，得到新的对数比和隐含奖励，再看 $\\Delta$ 和 loss。',
+    formula: '\\mathcal{L}_{\\text{DPO}}^{\\text{after}} = -\\log \\sigma(\\Delta^{\\text{after}})',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('chosen 比对数', '$\\log \\frac{\\pi_\\theta(y_w)}{\\pi_{\\text{ref}}(y_w)}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen">' + f(logRatioChosenAfter) + '</div></div>') +
+        op('−') +
+        blk('rejected 比对数', '$\\log \\frac{\\pi_\\theta(y_l)}{\\pi_{\\text{ref}}(y_l)}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected">' + f(logRatioRejectedAfter) + '</div></div>') +
+        op('=') +
+        blk('新差值', '$\\Delta^{\\text{after}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight">' + f(innerAfter) + '</div></div>') +
+      '</div>' +
+      '<div class="compare">' +
+        '<div class="compare-card before"><div class="label">训练前 loss</div><div class="value">' + f(lossBefore) + '</div></div>' +
+        '<div class="compare-card after"><div class="label">训练后 loss</div><div class="value">' + f(lossAfter) + '</div></div>' +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\log \\pi_\\theta(y_w|x) = \\log p_w$，$p_w = ' + f(softmax(thetaLogitsAfter)[CHOSEN_TOK]) + '$，$\\log p_w = ' + f(thetaLogPChosenAfter) + '$（训练后）') +
+        calc('$\\log \\pi_{\\text{ref}}(y_w|x) = ' + f(refLogPChosen) + '$（参考模型不变）') +
+        calc('$\\log \\frac{\\pi_\\theta(y_w)}{\\pi_{\\text{ref}}(y_w)} = ' + f(thetaLogPChosenAfter) + ' - ' + f(refLogPChosen) + ' = ' + f(logRatioChosenAfter) + '$', '', 'chosen') +
+        calc('$\\log \\frac{\\pi_\\theta(y_l)}{\\pi_{\\text{ref}}(y_l)} = ' + f(thetaLogPRejectedAfter) + ' - ' + f(refLogPRejected) + ' = ' + f(logRatioRejectedAfter) + '$', '', 'rejected') +
+        calc('$\\hat{r}_\\theta(y_w) = \\beta \\cdot ' + f(logRatioChosenAfter) + ' = ' + f(beta * logRatioChosenAfter) + '$') +
+        calc('$\\hat{r}_\\theta(y_l) = \\beta \\cdot ' + f(logRatioRejectedAfter) + ' = ' + f(beta * logRatioRejectedAfter) + '$') +
+        calc('$\\Delta^{\\text{after}} = ' + f(beta * logRatioChosenAfter) + ' - ' + f(beta * logRatioRejectedAfter) + ' = ' + f(innerAfter) + '$') +
+        calc('$\\sigma(\\Delta^{\\text{after}}) = 1/(1+e^{-' + f(innerAfter) + '}) = ' + f(1 / (1 + Math.exp(-innerAfter))) + '$') +
+        calc('$\\mathcal{L}^{\\text{after}} = -\\log \\sigma = ' + f(lossAfter) + '$', f(lossAfter), '← 训练后 loss') +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('对比：$\\Delta^{\\text{before}} = ' + f(innerBefore) + '$, $\\sigma = ' + f(1 / (1 + Math.exp(-innerBefore))) + '$, $\\mathcal{L}^{\\text{before}} = ' + f(lossBefore) + '$') +
+      '</div>',
+    deriv: null,
+    tip: 'loss 下降 = 模型学会在 $x$ 下更偏好 chosen。这就是 DPO 做的事。'
+  }
+];
+
+// === 翻页逻辑 ===
+let current = 0;
+const TOTAL = STAGES.length;
+
+function renderStage(idx) {
+  const s = STAGES[idx];
+  renderMixed(document.getElementById('sTitle'), s.title);
+  renderMixed(document.getElementById('sDesc'), s.desc);
+  renderDisplay(document.getElementById('sFormula'), s.formula);
+
+  const mArea = document.getElementById('mArea');
+  if (s.matrix) {
+    mArea.style.display = '';
+    mArea.innerHTML = s.matrix();
+    scanAndRender(mArea);
+  } else {
+    mArea.style.display = 'none';
+  }
+
+  const derivBox = document.getElementById('derivBox');
+  if (s.deriv) {
+    derivBox.style.display = '';
+    renderMixed(document.getElementById('dTitle'), s.deriv.title);
+    const steps = s.deriv.steps.map(step => {
+      const stepDiv = document.createElement('div');
+      stepDiv.className = 'deriv-step';
+      const labelDiv = document.createElement('div');
+      labelDiv.className = 'deriv-label';
+      renderMixed(labelDiv, step.label);
+      const mathDiv = document.createElement('div');
+      mathDiv.style.margin = '4px 0';
+      renderDisplay(mathDiv, step.math);
+      const noteDiv = document.createElement('div');
+      noteDiv.className = 'deriv-note';
+      renderMixed(noteDiv, step.note);
+      stepDiv.appendChild(labelDiv);
+      stepDiv.appendChild(mathDiv);
+      stepDiv.appendChild(noteDiv);
+      return stepDiv;
+    });
+    const dSteps = document.getElementById('dSteps');
+    dSteps.innerHTML = '';
+    steps.forEach(s => dSteps.appendChild(s));
+  } else {
+    derivBox.style.display = 'none';
+  }
+
+  const tipBox = document.getElementById('tipBox');
+  if (s.tip) {
+    tipBox.style.display = '';
+    renderMixed(tipBox, s.tip);
+  } else {
+    tipBox.style.display = 'none';
+  }
+
+  document.getElementById('cur').textContent = idx + 1;
+  document.getElementById('tot').textContent = TOTAL;
+  document.getElementById('prevBtn').disabled = idx === 0;
+  document.getElementById('nextBtn').disabled = idx === TOTAL - 1;
+}
+
+function change(delta) {
+  const next = current + delta;
+  if (next < 0 || next >= TOTAL) return;
+  current = next;
+  renderStage(current);
+}
+
+// 键盘翻页
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') { change(-1); e.preventDefault(); }
+  if (e.key === 'ArrowRight') { change(1); e.preventDefault(); }
+});
+
+// === 初始化 ===
+renderConventions();
+renderMixed(
+  document.getElementById('subtitle'),
+  'DPO 在 $x$ 下，让 chosen $y_w$ 比 rejected $y_l$ 更可能'
+);
+renderStage(0);
+</script>
+</body>
+</html>
