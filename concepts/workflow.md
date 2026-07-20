@@ -1,82 +1,81 @@
 # 概念教学文档写作规范
 
-写 `concepts/` 下的概念学习材料时使用。目标是：单个概念一个目录，主入口叫 `index.html` 或 `index.md`，方便从首页链接。
+## 目录结构
 
-## 目录约定
+每个概念一个目录，主入口叫 `index.html` 或 `index.md`。
 
 ```text
 concepts/
 ├── workflow.md
 ├── training-landscape.md
-└── backward/
-    └── index.html
+├── backward/index.html
+└── dpo/index.html
 ```
 
-以后新增概念时：
+新增：`concepts/<name>/index.html`
 
-```text
-concepts/<concept-name>/
-└── index.html
-```
+## HTML 依赖
 
-例如：
-
-```text
-concepts/sft/index.html
-concepts/rlhf/index.html
-concepts/attention/index.html
-```
-
-## HTML 依赖原则
-
-1. **默认单 HTML 文件**：CSS / JS 优先写在同一个 HTML 里。
-2. **KaTeX 默认跟 `papers/` 保持一致，用 CDN**：目录更干净，不单独放 `assets`。
-3. **如果 CDN 再次导致公式无法渲染**：再单独讨论是否引入本地 KaTeX，不默认创建 `assets/`。
-4. **不用 auto-render 写复杂教学动画**：优先自己用 `katex.render` 控制渲染，避免局部公式不渲染时难排查。
-
-HTML 头部默认写法：
+- 单 HTML 文件，CSS / JS 内联。
+- KaTeX 用 CDN，和 `papers/` 保持一致，不单独放 `assets/`。
+- 不用 auto-render，自己用 `katex.render` 控制渲染。
 
 ```html
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
 ```
 
-## 数学渲染规则
+## 数学渲染
 
-- 变量和公式都用 LaTeX，不要一半数学符号、一半工程变量名。
-- JS 字符串里的 LaTeX 命令必须写双反斜杠：`\\frac`、`\\partial`。
-- 不用 `\mathbb{1}`，KaTeX 对数字黑板体支持不好；用 `\delta_{ky}` 表示 Kronecker delta。
-- 公式里的箭头用 `\to` 或 `\rightarrow`。
+- 变量和公式用 LaTeX，不要混工程变量名。
+- JS 字符串里 LaTeX 命令写双反斜杠：`\\frac`、`\\partial`。
+- 不用 `\mathbb{1}`，用 `\delta_{ky}`。
+- 箭头用 `\to` 或 `\rightarrow`。
+- 不用 `\log(数字)`，KaTeX 会把括号当函数参数。用 `\log p = 数字`。
+- 含 `$...$` 的字符串不能用 `innerHTML` 塞 DOM，必须走 `renderMixed` 或 `scanAndRender`。
+- 先挂 DOM 再调渲染函数。
+- 数学推导默认零基础：出现的符号（$\nabla$ $\partial$ $\sum$ $\delta_{ky}$ $\sigma$ $e$ $\log$ $\to$ 等）都要在数学约定里解释。
 
-## 交互偏好
+## 内容规范
 
-- 固定底部导航：上一页 / 下一页位置不要随内容变化。
+- 每个阶段：标题、直觉解释、公式、数值例子、提示。
+- 先解释"这一步在干什么"，再给公式。公式不替换成人话，旁边加解释。
+- 数值必须完整链条，每个数字能追溯到前一步。读者能从上一步手算出下一步。
+- 分清参数和中间结果：参数（权重、偏置等）是梯度下降更新的对象；中间结果（logits、概率、loss 等）是前向算出来的，参数变了重新前向才算出新的中间结果。更新公式只作用于参数，中间结果不写"也被更新"。
+- 页面只写内容，不写写作元说明（"本文只讲 X""所有公式用 KaTeX 渲染"）。也不写订正过程（"关键区别""不要画成 X"）。
+
+## 交互
+
+- 固定底部导航，位置不随内容变化。
 - 不要自动播放。
 - 支持键盘 ← / → 翻页。
-- 不要“播放 / 暂停 / 速度”控件。
+- 不要播放/暂停/速度控件。
 
-## 视觉偏好
+## 视觉
 
 - 深色背景：深蓝渐变 + 径向光晕。
 - 标题渐变文字：蓝 → 紫 → 粉。
 - 毛玻璃卡片：`backdrop-filter: blur(10px)`。
-- 矩阵格子可以高亮、发光、轻微缩放。
-- 数学约定用卡片网格，不要堆成一长串公式。
+- 矩阵格子可高亮、发光、轻微缩放。
+- 数学约定用卡片网格，不堆成一长串。
 
-## 写作注意
+## 流程
 
-- 不要批量替换公式和变量，容易引入次生 bug。
-- 改 HTML / Markdown 后立即读回检查，避免代码块或公式被清空。
-- 每个阶段最好包含：标题、直觉解释、公式、数值例子、提示。
-- 教学文档要先解释“这一步在干什么”，再给公式。
+- 不要批量替换公式和变量。
+- 改完 HTML / Markdown 立即读回检查，避免代码块或公式被清空。
+- 改完用 Python 独立复算所有数值，确认链条一致、关键不变式成立。
 
 ## 常见 bug
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
-| `$...$` 原样显示 | KaTeX 没加载 | 先检查 CDN；必要时再考虑本地 KaTeX |
-| `renderMathIn is undefined` | auto-render 没挂到全局 | 不依赖 auto-render，直接用 `katex.render` |
-| `rac{...}` 乱码 | JS 把 `\f` 当 form feed | JS 字符串里写 `\\frac` |
-| `k=y` 或 indicator 显示异常 | `\mathbb{1}` 不适合 | 改成 `\delta_{ky}` |
-| `\neq` 渲染成方块 | 字体没加载完整 | 检查 KaTeX CSS / fonts 是否加载成功 |
-| 公式部分渲染部分不渲染 | 批量替换破坏字符串 | 手动按上下文逐处改 |
+| `$...$` 原样显示 | KaTeX 没加载 | 检查 CDN |
+| 部分字段 `$...$` 不渲染 | 走了 `innerHTML` 没进 `renderMixed` | 用 `renderMixed` 或 `scanAndRender` |
+| `rac{...}` 乱码 | JS 把 `\f` 当 form feed | 写 `\\frac` |
+| `k=y` 显示异常 | `\mathbb{1}` 不支持 | 用 `\delta_{ky}` |
+| `\neq` 渲染成方块 | 字体没加载完整 | 检查 KaTeX CSS/fonts |
+| `\log(0.5)` 渲染异常 | 括号被当函数参数 | 用 `\log p = 数字` |
+| 公式部分渲染部分不渲染 | 批量替换破坏字符串 | 手动逐处改 |
+| 中间结果被画成"也被更新" | 混淆参数和中间结果 | 更新公式只作用于参数，中间结果用"重算"描述 |
+| 数值凭空出现 | 跳步 | 每个数字给来源 |
+| 页面出现订正口吻 | 把纠错过程当教学内容 | 删掉，只讲正确关系 |
