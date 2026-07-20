@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RLHF 奖励模型：Reward Model 训练</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, "Helvetica Neue", "PingFang SC", sans-serif;
+  background: linear-gradient(135deg, #0a0e1a 0%, #1a1f35 100%);
+  color: #e2e8f0;
+  min-height: 100vh;
+  padding: 16px;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: radial-gradient(circle at 20% 30%, rgba(96, 165, 250, 0.08), transparent 40%),
+              radial-gradient(circle at 80% 70%, rgba(167, 139, 250, 0.08), transparent 40%);
+  pointer-events: none;
+  z-index: -1;
+}
+.container { max-width: 1100px; margin: 0 auto; padding-bottom: 80px; }
+h1 {
+  text-align: center;
+  font-size: 26px;
+  background: linear-gradient(90deg, #60a5fa, #a78bfa, #f472b6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 4px;
+}
+.subtitle { text-align: center; color: #94a3b8; font-size: 13px; margin-bottom: 16px; }
+
+.stage {
+  background: rgba(19, 26, 46, 0.7);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 18px 22px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.stage-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; color: #f1f5f9; }
+.stage-desc { color: #cbd5e1; font-size: 14px; margin-bottom: 10px; }
+.stage-formula {
+  background: rgba(10, 14, 26, 0.6);
+  padding: 12px 16px;
+  border-radius: 6px;
+  border-left: 3px solid #60a5fa;
+  margin: 10px 0;
+  overflow-x: auto;
+}
+
+.matrix-area {
+  background: rgba(13, 20, 36, 0.6);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 24px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.matrix-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.matrix-block { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.matrix-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+.matrix-name { font-size: 15px; font-weight: 700; color: #e2e8f0; margin-bottom: 2px; }
+.matrix {
+  display: grid;
+  gap: 2px;
+  background: rgba(5, 8, 16, 0.6);
+  padding: 4px;
+  border-radius: 4px;
+  border: 1px solid #2d3a5e;
+}
+.cell {
+  padding: 6px 10px;
+  background: rgba(30, 41, 59, 0.6);
+  border-radius: 3px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  text-align: center;
+  min-width: 50px;
+  color: #e2e8f0;
+  transition: all 0.4s ease;
+}
+.cell.chosen { border: 1.5px solid #34d399; background: rgba(52, 211, 153, 0.18); }
+.cell.rejected { border: 1.5px solid #f87171; background: rgba(248, 113, 113, 0.18); }
+.cell.highlight {
+  background: rgba(96, 165, 250, 0.3) !important;
+  box-shadow: 0 0 10px rgba(96, 165, 250, 0.5);
+  transform: scale(1.05);
+}
+.cell.big { font-size: 16px; font-weight: 700; }
+.op { font-size: 18px; color: #64748b; font-weight: 300; }
+
+.derivation {
+  background: rgba(19, 26, 46, 0.7);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 16px 22px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.deriv-title { font-size: 14px; font-weight: 700; color: #fbbf24; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+.deriv-step {
+  margin: 12px 0;
+  padding: 10px 14px;
+  background: rgba(13, 20, 36, 0.6);
+  border-radius: 6px;
+  border-left: 2px solid #fbbf24;
+}
+.deriv-label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+.deriv-note { font-size: 13px; color: #94a3b8; margin-top: 6px; font-style: italic; }
+
+.calc {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  color: #cbd5e1;
+  margin: 4px 0;
+  padding-left: 16px;
+}
+.calc .num { color: #fbbf24; font-weight: 600; }
+.calc .result { color: #34d399; font-weight: 600; }
+.calc .mark { color: #64748b; }
+
+.compare { display: flex; gap: 16px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+.compare-card {
+  background: rgba(13, 20, 36, 0.6);
+  padding: 10px 18px;
+  border-radius: 6px;
+  border: 1px solid #2d3a5e;
+  text-align: center;
+  min-width: 110px;
+}
+.compare-card .label { font-size: 11px; color: #94a3b8; margin-bottom: 2px; }
+.compare-card .value { font-family: "SF Mono", Menlo, monospace; font-size: 20px; font-weight: 700; }
+.compare-card.chosen .value { color: #34d399; }
+.compare-card.rejected .value { color: #f87171; }
+.compare-card.before .value { color: #f87171; }
+.compare-card.after .value { color: #84cc16; }
+
+.tip {
+  background: rgba(96, 165, 250, 0.08);
+  border-left: 3px solid #60a5fa;
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.tip.warning { background: rgba(251, 191, 36, 0.08); border-left-color: #fbbf24; }
+.tip.success { background: rgba(132, 204, 22, 0.08); border-left-color: #84cc16; }
+
+.convention {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.conv-item {
+  background: rgba(13, 20, 36, 0.5);
+  padding: 8px 14px;
+  border-radius: 6px;
+  border-left: 2px solid #60a5fa;
+  font-size: 14px;
+  color: #cbd5e1;
+}
+.conv-item .conv-sym {
+  font-family: "SF Mono", Menlo, monospace;
+  font-weight: 600;
+  color: #60a5fa;
+  margin-right: 8px;
+}
+
+.controls {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: rgba(13, 20, 36, 0.95);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid #2d3a5e;
+  padding: 12px 20px;
+  gap: 16px;
+}
+.btn {
+  background: rgba(96, 165, 250, 0.12);
+  color: #60a5fa;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 110px;
+  transition: all 0.2s;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(96, 165, 250, 0.25);
+  transform: translateY(-1px);
+}
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.indicator { font-size: 14px; color: #94a3b8; min-width: 100px; text-align: center; }
+.indicator .current { color: #60a5fa; font-weight: 700; font-size: 16px; }
+
+@media (max-width: 768px) {
+  .matrix-row { gap: 8px; }
+  .cell { min-width: 40px; padding: 4px 6px; font-size: 11px; }
+  .op { font-size: 14px; }
+  h1 { font-size: 18px; }
+  .convention { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>RLHF 奖励模型：Reward Model 训练</h1>
+  <p class="subtitle" id="subtitle"></p>
+
+  <div class="stage">
+    <div class="stage-title">数学约定</div>
+    <div class="stage-desc">RM 训练用到的记号。</div>
+    <div class="convention" id="conv-grid"></div>
+  </div>
+
+  <div class="stage" id="stageBox">
+    <div class="stage-title" id="sTitle"></div>
+    <div class="stage-desc" id="sDesc"></div>
+    <div class="stage-formula" id="sFormula"></div>
+  </div>
+
+  <div class="matrix-area" id="mArea"></div>
+
+  <div class="derivation" id="derivBox" style="display:none;">
+    <div class="deriv-title" id="dTitle"></div>
+    <div id="dSteps"></div>
+  </div>
+
+  <div class="tip" id="tipBox" style="display:none;"></div>
+</div>
+
+<div class="controls">
+  <button class="btn" id="prevBtn" onclick="change(-1)">◀ 上一页</button>
+  <div class="indicator">第 <span class="current" id="cur">1</span> / <span id="tot">8</span> 页</div>
+  <button class="btn" id="nextBtn" onclick="change(1)">下一页 ▶</button>
+</div>
+
+<script>
+// === 数学渲染辅助（和 backward/dpo 保持一致） ===
+function renderMixed(element, str) {
+  element.innerHTML = '';
+  const parts = str.split(/(\$\$[^$]+\$\$)/g);
+  for (const part of parts) {
+    if (!part) continue;
+    const blockMatch = part.match(/^\$\$([^$]+)\$\$$/);
+    if (blockMatch) {
+      const span = document.createElement('div');
+      try { katex.render(blockMatch[1], span, { displayMode: true, throwOnError: false }); }
+      catch (e) { span.textContent = blockMatch[1]; }
+      element.appendChild(span);
+      continue;
+    }
+    const inlineParts = part.split(/(\$[^$]+\$)/g);
+    for (const ip of inlineParts) {
+      if (!ip) continue;
+      const inlineMatch = ip.match(/^\$([^$]+)\$$/);
+      if (inlineMatch) {
+        const span = document.createElement('span');
+        try { katex.render(inlineMatch[1], span, { displayMode: false, throwOnError: false }); }
+        catch (e) { span.textContent = inlineMatch[1]; }
+        element.appendChild(span);
+      } else {
+        const wrapper = document.createElement('span');
+        wrapper.innerHTML = ip;
+        element.appendChild(wrapper);
+      }
+    }
+  }
+}
+function renderDisplay(element, latex) {
+  try { katex.render(latex, element, { displayMode: true, throwOnError: false }); }
+  catch (e) { element.textContent = latex; }
+}
+function scanAndRender(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const textNodes = [];
+  let node;
+  while (node = walker.nextNode()) textNodes.push(node);
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue;
+    if (!text || !text.includes('$')) continue;
+    const frag = document.createDocumentFragment();
+    const regex = /(\$\$[^$]+\$\$|\$[^$\n]+\$)/g;
+    let lastIdx = 0, match;
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIdx) frag.appendChild(document.createTextNode(text.slice(lastIdx, match.index)));
+      const m = match[0];
+      const span = document.createElement('span');
+      try {
+        if (m.startsWith('$$')) katex.render(m.slice(2, -2), span, { displayMode: true, throwOnError: false });
+        else katex.render(m.slice(1, -1), span, { displayMode: false, throwOnError: false });
+      } catch (e) { span.textContent = m; }
+      frag.appendChild(span);
+      lastIdx = match.index + m.length;
+    }
+    if (lastIdx < text.length) frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+    textNode.parentNode.replaceChild(frag, textNode);
+  }
+}
+
+// === 工具函数 ===
+function f(v, n = 4) { return Number(v).toFixed(n); }
+function vec(v, opts = {}) {
+  const { hl, tgt, chosenIdx, rejectedIdx, cls = [] } = opts;
+  const cells = v.map((val, i) => {
+    let c = 'cell';
+    if (chosenIdx !== undefined && i === chosenIdx) c += ' chosen';
+    if (rejectedIdx !== undefined && i === rejectedIdx) c += ' rejected';
+    if (hl === i) c += ' highlight';
+    if (tgt === i) c += ' target';
+    cls.forEach(k => { if (k(i)) c += ' ' + k; });
+    return '<div class="' + c + '">' + (typeof val === 'number' ? f(val) : val) + '</div>';
+  }).join('');
+  return '<div class="matrix" style="grid-template-columns: 1fr;">' + cells + '</div>';
+}
+function blk(label, name, html) {
+  return '<div class="matrix-block">' +
+    (label ? '<div class="matrix-label">' + label + '</div>' : '') +
+    (name ? '<div class="matrix-name">' + name + '</div>' : '') +
+    html +
+  '</div>';
+}
+function op(s) {
+  return '<div class="op">' + s + '</div>';
+}
+function calc(latex, value, mark) {
+  let s = '<div class="calc">' + latex;
+  if (value !== undefined && value !== null) s += ' = <span class="result">' + value + '</span>';
+  if (mark) s += ' <span class="mark">' + mark + '</span>';
+  s += '</div>';
+  return s;
+}
+
+// === 数学约定卡片 ===
+const CONVENTIONS = [
+  { sym: 'x', desc: 'prompt（输入提示）' },
+  { sym: 'y_w', desc: 'chosen（偏好的回答）' },
+  { sym: 'y_l', desc: 'rejected（不偏好的回答）' },
+  { sym: 'r_\\varphi', desc: '奖励模型（参数 $\\varphi$ 可更新），输入 $(x, y)$ 输出标量分数' },
+  { sym: '\\varphi', desc: 'RM 的参数。本例中是每个 token 的 reward 标量' },
+  { sym: 'r_\\varphi(x, y)', desc: 'RM 给 $(x, y)$ 打的标量分数，越大表示越好' },
+  { sym: 'r_w', desc: '$r_\\varphi(x, y_w)$，chosen 的奖励分数' },
+  { sym: 'r_l', desc: '$r_\\varphi(x, y_l)$，rejected 的奖励分数' },
+  { sym: '\\Delta', desc: '奖励差 $= r_w - r_l$。正值表示 chosen 分数更高' },
+  { sym: '\\succ', desc: '偏好关系。$y_w \\succ y_l$ 读作「$y_w$ 比 $y_l$ 更受偏好」' },
+  { sym: 'P(y_w \\succ y_l | x)', desc: '在 $x$ 下，$y_w$ 比 $y_l$ 更受偏好的概率' },
+  { sym: '\\sigma', desc: 'sigmoid 函数 $\\sigma(t) = 1/(1+e^{-t})$，把任意实数压到 $(0,1)$ 区间' },
+  { sym: '\\log', desc: '自然对数（以 $e$ 为底）。$\\log \\frac{a}{b} = \\log a - \\log b$' },
+  { sym: '\\sum', desc: '求和符号。$\\sum_{t \\in y} \\varphi_t$ 表示把 $y$ 中所有 token 的 $\\varphi_t$ 加起来' },
+  { sym: '\\nabla_\\varphi', desc: '梯度算子。$\\nabla_\\varphi L$ 表示 $L$ 对参数 $\\varphi$ 的所有偏导组成的向量' },
+  { sym: '\\partial', desc: '偏导符号。$\\frac{\\partial L}{\\partial \\varphi}$ 读作「$L$ 对 $\\varphi$ 的偏导」' },
+  { sym: 'e', desc: '自然对数底 $\\approx 2.718$。sigmoid 里用 $e^{-t}$' },
+  { sym: '\\eta', desc: '学习率，控制每步梯度下降走多远' },
+  { sym: '\\to', desc: '趋向 / 映射到。$a \\to b$ 表示 $a$ 变成 $b$' }
+];
+
+function renderConventions() {
+  const grid = document.getElementById('conv-grid');
+  grid.innerHTML = '';
+  CONVENTIONS.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'conv-item';
+    const sym = document.createElement('span');
+    sym.className = 'conv-sym';
+    item.appendChild(sym);
+    const desc = document.createElement('span');
+    desc.className = 'conv-desc';
+    item.appendChild(desc);
+    grid.appendChild(item);
+    renderDisplay(sym, c.sym);
+    renderMixed(desc, c.desc);
+  });
+}
+
+// === 场景：一个最小例子 ===
+// 词表 4 个 token
+// prompt = "hello" = [0]
+// chosen = "hi there" = [1, 2]
+// rejected = "bye" = [3]
+// RM 设计：token reward lookup table
+// r_φ(x, y) = sum of φ[t] for t in y（只累加 response token，教学简化）
+
+const VOCAB_NAMES = ['hello', 'hi', 'there', 'bye'];
+const PROMPT_TOK = 0;
+const CHOSEN_TOKS = [1, 2];
+const REJECTED_TOK = 3;
+
+// 初始参数（每个 token 的 reward 都为 0）
+const phiBefore = [0.0, 0.0, 0.0, 0.0];
+// 一步训练后（lr=0.5）
+const phiAfter = [0.0, 0.25, 0.25, -0.25];
+const lr = 0.5;
+
+function sigmoid(z) { return 1.0 / (1.0 + Math.exp(-z)); }
+
+// 训练前
+const r_w_before = phiBefore[1] + phiBefore[2];
+const r_l_before = phiBefore[3];
+const delta_before = r_w_before - r_l_before;
+const p_before = sigmoid(delta_before);
+const loss_before = -Math.log(p_before);
+
+// 反传
+// L = -log σ(Δ), Δ = r_w - r_l
+// dL/dΔ = σ(Δ) - 1
+// dΔ/dr_w = 1, dΔ/dr_l = -1
+// dL/dr_w = σ(Δ) - 1
+// dL/dr_l = 1 - σ(Δ)
+const dL_ddelta = sigmoid(delta_before) - 1;
+const dL_dr_w = dL_ddelta;
+const dL_dr_l = -dL_ddelta;
+// 对每个 token: dL/dφ_t = dL/dr_w * (∂r_w/∂φ_t) + dL/dr_l * (∂r_l/∂φ_t)
+//   - t 在 y_w 里: ∂r_w/∂φ_t = 1
+//   - t 在 y_l 里: ∂r_l/∂φ_t = 1
+//   - 否则: 0
+const grad = [
+  0.0,                  // hello: 不在 y_w 也不在 y_l
+  dL_dr_w * 1,          // hi: 在 y_w
+  dL_dr_w * 1,          // there: 在 y_w
+  dL_dr_l * 1,          // bye: 在 y_l
+];
+
+// 训练后
+const r_w_after = phiAfter[1] + phiAfter[2];
+const r_l_after = phiAfter[3];
+const delta_after = r_w_after - r_l_after;
+const p_after = sigmoid(delta_after);
+const loss_after = -Math.log(p_after);
+
+// === 页面数据 ===
+const STAGES = [
+  // 1. 起点
+  {
+    title: '起点：从偏好数据开始',
+    desc: 'RLHF 第一阶段是训练一个奖励模型 $r_\\varphi$，让它学会给 $(x, y)$ 打分。训练数据和 DPO 同样是偏好对 $(x, y_w, y_l)$：同一个 prompt，标注哪个回答更好。',
+    formula: '\\mathcal{D} = \\{(x^{(i)}, y_w^{(i)}, y_l^{(i)})\\}_{i=1}^N',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('prompt', '$x$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight">' + VOCAB_NAMES[PROMPT_TOK] + '</div></div>') +
+        op('+') +
+        blk('偏好回答', '$y_w$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen">' + VOCAB_NAMES[CHOSEN_TOKS[0]] + ' ' + VOCAB_NAMES[CHOSEN_TOKS[1]] + '</div></div>') +
+        op('+') +
+        blk('不偏好回答', '$y_l$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected">' + VOCAB_NAMES[REJECTED_TOK] + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('SFT 数据：$(x, y)$，模仿 $y$') +
+        calc('RM 数据：$(x, y_w, y_l)$，学「$y_w$ 比 $y_l$ 分高」') +
+      '</div>',
+    deriv: null,
+    tip: 'RM 的任务不是学标准答案，而是学排序：让 chosen 的分数高于 rejected。'
+  },
+
+  // 2. RM 结构
+  {
+    title: 'RM 结构：token reward lookup table',
+    desc: '教学用最简 RM：词表里每个 token 配一个可学习的 reward 标量 $\\varphi_t$，回答 $y$ 的 reward 是 $y$ 中所有 token 的 reward 之和。真实 RM 是预训练模型 + 标量头，但训练 loss 和梯度结构完全一样。',
+    formula: 'r_\\varphi(x, y) = \\sum_{t \\in y} \\varphi_t',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('词表', '$\\text{vocab}$', '<div class="matrix" style="grid-template-columns: 1fr;">' + VOCAB_NAMES.map(n => '<div class="cell">' + n + '</div>').join('') + '</div>') +
+        op('→ 每个 token 配 reward →') +
+        blk('token reward 表<br>（参数 $\\varphi$）', '$\\varphi$', vec(phiBefore)) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('训练前 $\\varphi = [0, 0, 0, 0]$（全 0 初始化）') +
+        calc('token $t$ 的 reward $= \\varphi_t$（可学习）') +
+        calc('回答 $y$ 的 reward $= \\sum_{t \\in y} \\varphi_t$（只累加 response token）') +
+      '</div>',
+    deriv: {
+      title: '关于真实 RM',
+      steps: [
+        { label: '真实架构', math: 'r_\\varphi(x, y) = \\text{ScalarHead}(\\text{Transformer}(x, y))', note: '预训练模型当 backbone，取末尾 token 的隐状态过一个线性层输出标量。' },
+        { label: '本例简化', math: 'r_\\varphi(x, y) = \\sum_{t \\in y} \\varphi_t', note: 'lookup table 让数值手算可执行，但 loss / 梯度结构和真实 RM 完全一致。' },
+        { label: '不变的核心', math: '\\text{RM 输出一个标量，用 BT loss 训练}', note: '无论 backbone 是什么，RM 都是「输入 $(x,y)$ → 标量分数」，用同一个 BT loss。' }
+      ]
+    },
+    tip: '$x$ 不参与 reward 计算（教学简化）。真实 RM 把 $(x, y)$ 一起喂进 transformer。'
+  },
+
+  // 3. 前向：算 r_w, r_l
+  {
+    title: '前向：算 $r_w$ 和 $r_l$',
+    desc: '用初始参数 $\\varphi = [0, 0, 0, 0]$ 算 chosen 和 rejected 的 reward。$y_w$ 含两个 token（hi, there），$y_l$ 含一个 token（bye）。',
+    formula: 'r_w = \\sum_{t \\in y_w} \\varphi_t, \\quad r_l = \\sum_{t \\in y_l} \\varphi_t',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('chosen<br>tokens', '$y_w$', '<div class="matrix" style="grid-template-columns: 1fr;">' +
+          '<div class="cell chosen">' + VOCAB_NAMES[CHOSEN_TOKS[0]] + '</div>' +
+          '<div class="cell chosen">' + VOCAB_NAMES[CHOSEN_TOKS[1]] + '</div>' +
+        '</div>') +
+        op('→ $\\varphi$ 求和 →') +
+        blk('chosen reward', '$r_w$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(r_w_before) + '</div></div>') +
+      '</div>' +
+      '<div class="matrix-row" style="margin-top:12px;">' +
+        blk('rejected<br>tokens', '$y_l$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected">' + VOCAB_NAMES[REJECTED_TOK] + '</div></div>') +
+        op('→ $\\varphi$ 求和 →') +
+        blk('rejected reward', '$r_l$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected big">' + f(r_l_before) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$r_w = \\varphi_{\\text{hi}} + \\varphi_{\\text{there}} = ' + f(phiBefore[1]) + ' + ' + f(phiBefore[2]) + ' = ' + f(r_w_before) + '$', '', 'chosen') +
+        calc('$r_l = \\varphi_{\\text{bye}} = ' + f(phiBefore[3]) + ' = ' + f(r_l_before) + '$', '', 'rejected') +
+      '</div>',
+    deriv: null,
+    tip: '训练前所有 $\\varphi_t = 0$，所以 $r_w = r_l = 0$。RM 还没学到任何偏好。'
+  },
+
+  // 4. 偏好模型 Bradley-Terry
+  {
+    title: '偏好模型：Bradley-Terry',
+    desc: 'Bradley-Terry 模型把「$y_w$ 比 $y_l$ 更受偏好」的概率，写成两个 reward 差的 sigmoid。这是把「打分」变成「偏好概率」的标准做法。',
+    formula: 'P(y_w \\succ y_l | x) = \\sigma(r_w - r_l) = \\sigma(\\Delta)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('chosen reward', '$r_w$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(r_w_before) + '</div></div>') +
+        op('−') +
+        blk('rejected reward', '$r_l$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected big">' + f(r_l_before) + '</div></div>') +
+        op('=') +
+        blk('reward 差', '$\\Delta$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(delta_before) + '</div></div>') +
+        op('→ $\\sigma$ →') +
+        blk('偏好概率', '$P$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(p_before) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\Delta = r_w - r_l = ' + f(r_w_before) + ' - ' + f(r_l_before) + ' = ' + f(delta_before) + '$') +
+        calc('$\\sigma(\\Delta) = 1 / (1 + e^{-\\Delta})$，$p = ' + f(p_before) + '$') +
+      '</div>',
+    deriv: {
+      title: '为什么 BT 等价于 sigmoid 差',
+      steps: [
+        { label: 'BT 原始定义', math: 'P(y_w \\succ y_l) = \\frac{r(y_w)}{r(y_w) + r(y_l)}', note: '直接把 reward 当「强度」，强度大的赢概率大。要求 $r > 0$。' },
+        { label: '换元', math: 'r(y) = e^{s(y)}', note: '用指数函数保证 $r > 0$。$s(y)$ 是任意实数（可以是负的）。' },
+        { label: '代入', math: 'P = \\frac{e^{s(y_w)}}{e^{s(y_w)} + e^{s(y_l)}} = \\frac{1}{1 + e^{s(y_l) - s(y_w)}}', note: '上下同除 $e^{s(y_w)}$。' },
+        { label: 'sigmoid 形式', math: 'P = \\sigma(s(y_w) - s(y_l))', note: '这就是 RM 用的形式：reward 差过 sigmoid = 偏好概率。' }
+      ]
+    },
+    tip: '训练前 $\\Delta = 0$，$\\sigma(0) = 0.5$，表示「RM 认为 $y_w$ 和 $y_l$ 一样好」——最中性的状态。'
+  },
+
+  // 5. RM loss
+  {
+    title: 'RM 损失：负对数似然',
+    desc: '用最大似然：让 RM 给「$y_w \\succ y_l$」这个观测赋高概率。最大化 $\\log P$ 等价于最小化 $-\\log P$。',
+    formula: '\\mathcal{L}_{RM} = -\\log P(y_w \\succ y_l | x) = -\\log \\sigma(\\Delta)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('reward 差', '$\\Delta$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(delta_before) + '</div></div>') +
+        op('→ $\\sigma$ →') +
+        blk('偏好概率', '$P$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(p_before) + '</div></div>') +
+        op('→ $-\\log$ →') +
+        blk('loss', '$\\mathcal{L}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#f87171;">' + f(loss_before) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\Delta = ' + f(delta_before) + '$') +
+        calc('$\\sigma(\\Delta) = ' + f(p_before) + '$') +
+        calc('$\\mathcal{L}_{RM} = -\\log \\sigma(\\Delta)$', f(loss_before), '← 训练前') +
+      '</div>',
+    deriv: {
+      title: '最大似然推导',
+      steps: [
+        { label: '观测', math: 'y_w \\succ y_l', note: '标注者告诉我们 $y_w$ 比 $y_l$ 好。' },
+        { label: '似然', math: 'P(y_w \\succ y_l | x) = \\sigma(\\Delta)', note: 'BT 模型给出这个观测的概率。' },
+        { label: '对数似然', math: '\\log P = \\log \\sigma(\\Delta)', note: '最大化它 = 让 RM 给这个观测高概率。' },
+        { label: '取负', math: '\\mathcal{L} = -\\log \\sigma(\\Delta)', note: '最小化 $\\mathcal{L}$ = 最大化 $\\log P$。这是标准的负对数似然套路。' }
+      ]
+    },
+    tip: '训练前 $\\mathcal{L} = -\\log 0.5 = 0.6931$。训练的目标是让 $\\mathcal{L}$ 下降，也就是让 $\\sigma(\\Delta) \\to 1$。'
+  },
+
+  // 6. 反传
+  {
+    title: '反传：梯度推导',
+    desc: '沿 $\\mathcal{L} \\to \\Delta \\to r_w, r_l \\to \\varphi$ 反向传梯度。链式法则。',
+    formula: '\\frac{\\partial \\mathcal{L}}{\\partial \\varphi_t} = (\\sigma(\\Delta) - 1) \\cdot \\frac{\\partial (r_w - r_l)}{\\partial \\varphi_t}',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('$\\partial \\mathcal{L} / \\partial \\Delta$', '$\\sigma(\\Delta) - 1$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(dL_ddelta) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\frac{\\partial \\mathcal{L}}{\\partial \\Delta} = \\sigma(\\Delta) - 1 = ' + f(p_before) + ' - 1 = ' + f(dL_ddelta) + '$') +
+        calc('$\\frac{\\partial \\Delta}{\\partial r_w} = 1, \\quad \\frac{\\partial \\Delta}{\\partial r_l} = -1$') +
+        calc('$\\frac{\\partial \\mathcal{L}}{\\partial r_w} = ' + f(dL_dr_w) + '$（负 → $r_w$ 要升）', '', 'chosen') +
+        calc('$\\frac{\\partial \\mathcal{L}}{\\partial r_l} = ' + f(dL_dr_l) + '$（正 → $r_l$ 要降）', '', 'rejected') +
+      '</div>' +
+      '<div class="matrix-row" style="margin-top:12px;">' +
+        blk('token reward 梯度', '$\\nabla_\\varphi \\mathcal{L}$', vec(grad, { chosenIdx: 1, rejectedIdx: 3 })) +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('$\\varphi_{\\text{hi}}$：$\\frac{\\partial r_w}{\\partial \\varphi_{\\text{hi}}} = 1$，所以 $\\frac{\\partial \\mathcal{L}}{\\partial \\varphi_{\\text{hi}}} = ' + f(dL_dr_w) + ' \\times 1 = ' + f(grad[1]) + '$', '', 'chosen') +
+        calc('$\\varphi_{\\text{there}}$：同 hi，$= ' + f(grad[2]) + '$', '', 'chosen') +
+        calc('$\\varphi_{\\text{bye}}$：$\\frac{\\partial r_l}{\\partial \\varphi_{\\text{bye}}} = 1$，所以 $\\frac{\\partial \\mathcal{L}}{\\partial \\varphi_{\\text{bye}}} = ' + f(dL_dr_l) + ' \\times 1 = ' + f(grad[3]) + '$', '', 'rejected') +
+        calc('$\\varphi_{\\text{hello}}$：不在 $y_w$ 也不在 $y_l$，梯度 $= 0$') +
+      '</div>',
+    deriv: {
+      title: '链式法则推导',
+      steps: [
+        { label: '设 $u = \\Delta$', math: 'u = r_w - r_l', note: '$\\mathcal{L} = -\\log \\sigma(u)$。' },
+        { label: '对 $u$ 求导', math: '\\frac{d\\mathcal{L}}{du} = -\\frac{\\sigma\'(u)}{\\sigma(u)} = -(1 - \\sigma(u)) = \\sigma(u) - 1', note: 'sigmoid 导数 $\\sigma\'(u) = \\sigma(u)(1 - \\sigma(u))$。' },
+        { label: '$u$ 对 $r_w$ 求导', math: '\\frac{\\partial u}{\\partial r_w} = 1', note: '$u = r_w - r_l$，对 $r_w$ 求导是 1。' },
+        { label: '$u$ 对 $r_l$ 求导', math: '\\frac{\\partial u}{\\partial r_l} = -1', note: '对 $r_l$ 求导是 -1。' },
+        { label: '$r_w$ 对 $\\varphi_t$ 求导', math: '\\frac{\\partial r_w}{\\partial \\varphi_t} = \\begin{cases} 1 & t \\in y_w \\\\ 0 & \\text{否则} \\end{cases}', note: '$r_w$ 是 $y_w$ 中 token reward 之和。' },
+        { label: '链式组合', math: '\\frac{\\partial \\mathcal{L}}{\\partial \\varphi_t} = (\\sigma(u) - 1) \\cdot \\frac{\\partial u}{\\partial r} \\cdot \\frac{\\partial r}{\\partial \\varphi_t}', note: '把三段乘起来。' }
+      ]
+    },
+    tip: '关键规律：$\\partial \\mathcal{L} / \\partial \\Delta = \\sigma(\\Delta) - 1$。训练前 $\\sigma(0) - 1 = -0.5$，所以 chosen 的梯度是负的（要变大），rejected 是正的（要变小）。'
+  },
+
+  // 7. 一步更新
+  {
+    title: '一步更新：$\\varphi^{\\text{new}} = \\varphi^{\\text{old}} - \\eta \\nabla_\\varphi \\mathcal{L}$',
+    desc: '梯度下降更新参数 $\\varphi$（token reward 表）。$r_w$、$r_l$ 是 $\\varphi$ 变了之后重新前向算出来的，不是被公式直接更新。',
+    formula: '\\varphi^{\\text{new}} = \\varphi^{\\text{old}} - \\eta \\, \\nabla_\\varphi \\mathcal{L}',
+    matrix: () =>
+      '<div style="background:rgba(19,26,46,0.7); border:1px solid #2d3a5e; border-radius:10px; padding:16px 22px; margin-bottom:14px; backdrop-filter:blur(10px);">' +
+        '<div style="font-family:\'SF Mono\',Menlo,monospace; font-size:13px; color:#cbd5e1; line-height:1.8;">' +
+          '① $\\varphi^{\\text{old}}$ → 前向 → $r_w, r_l$ → $\\Delta$ → $\\mathcal{L}$<br>' +
+          '② $\\mathcal{L}$ → backward → $\\nabla_\\varphi \\mathcal{L}$<br>' +
+          '③ $\\varphi^{\\text{new}} = \\varphi^{\\text{old}} - \\eta \\, \\nabla_\\varphi \\mathcal{L}$<br>' +
+          '④ $\\varphi^{\\text{new}}$ → 前向 → $r_w^{\\text{after}}, r_l^{\\text{after}}$' +
+        '</div>' +
+      '</div>' +
+      '<div class="matrix-row">' +
+        blk('训练前 $\\varphi$', '$\\varphi^{\\text{old}}$', vec(phiBefore)) +
+        op('− η·∇L') +
+        blk('梯度', '$\\nabla_\\varphi \\mathcal{L}$', vec(grad, { chosenIdx: 1, rejectedIdx: 3 })) +
+        op('=') +
+        blk('训练后 $\\varphi$', '$\\varphi^{\\text{new}}$', vec(phiAfter, { chosenIdx: 1, rejectedIdx: 3 })) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\varphi_{\\text{hello}} = ' + f(phiBefore[0]) + ' - ' + f(lr) + ' \\times ' + f(grad[0]) + ' = ' + f(phiAfter[0]) + '$', '', '不变（未参与）') +
+        calc('$\\varphi_{\\text{hi}} = ' + f(phiBefore[1]) + ' - ' + f(lr) + ' \\times (' + f(grad[1]) + ') = ' + f(phiAfter[1]) + '$', '', 'chosen ↑') +
+        calc('$\\varphi_{\\text{there}} = ' + f(phiBefore[2]) + ' - ' + f(lr) + ' \\times (' + f(grad[2]) + ') = ' + f(phiAfter[2]) + '$', '', 'chosen ↑') +
+        calc('$\\varphi_{\\text{bye}} = ' + f(phiBefore[3]) + ' - ' + f(lr) + ' \\times ' + f(grad[3]) + ' = ' + f(phiAfter[3]) + '$', '', 'rejected ↓') +
+      '</div>',
+    deriv: {
+      title: '梯度下降在干什么',
+      steps: [
+        { label: '目标', math: '\\text{让 } \\mathcal{L}_{RM} \\text{ 变小}', note: 'loss 下降 = RM 学会让 chosen 分数高于 rejected。' },
+        { label: '梯度方向', math: '\\nabla_\\varphi \\mathcal{L} \\text{ 指向 } \\mathcal{L} \\text{ 上升最快方向}', note: '所以走反方向 $-\\nabla$ 让 loss 下降。' },
+        { label: '更新公式', math: '\\varphi^{\\text{new}} = \\varphi^{\\text{old}} - \\eta \\nabla_\\varphi \\mathcal{L}', note: '$\\eta$ 是学习率，控制每步走多远。' },
+        { label: '学习率', math: '\\eta = ' + lr, note: '本例用 0.5。' },
+        { label: '重算前向', math: 'r_w^{\\text{after}}, r_l^{\\text{after}} \\text{ 用 } \\varphi^{\\text{new}} \\text{ 重新算}', note: '$\\varphi$ 变了，reward 也要重算。' }
+      ]
+    },
+    tip: '梯度下降更新的是参数 $\\varphi$（token reward 表）。$r_w, r_l$ 是前向算出来的，$\\varphi$ 变了重新前向才算出新的。'
+  },
+
+  // 8. 验证
+  {
+    title: '验证：loss 下降',
+    desc: '用新参数 $\\varphi^{\\text{new}}$ 重新前向：算 $r_w, r_l, \\Delta, P, \\mathcal{L}$。',
+    formula: '\\mathcal{L}^{\\text{after}} = -\\log \\sigma(\\Delta^{\\text{after}})',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('chosen reward', '$r_w^{\\text{after}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(r_w_after) + '</div></div>') +
+        op('−') +
+        blk('rejected reward', '$r_l^{\\text{after}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell rejected big">' + f(r_l_after) + '</div></div>') +
+        op('=') +
+        blk('新差值', '$\\Delta^{\\text{after}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(delta_after) + '</div></div>') +
+      '</div>' +
+      '<div class="compare">' +
+        '<div class="compare-card before"><div class="label">训练前 loss</div><div class="value">' + f(loss_before) + '</div></div>' +
+        '<div class="compare-card after"><div class="label">训练后 loss</div><div class="value">' + f(loss_after) + '</div></div>' +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$r_w^{\\text{after}} = \\varphi_{\\text{hi}} + \\varphi_{\\text{there}} = ' + f(phiAfter[1]) + ' + ' + f(phiAfter[2]) + ' = ' + f(r_w_after) + '$', '', 'chosen') +
+        calc('$r_l^{\\text{after}} = \\varphi_{\\text{bye}} = ' + f(phiAfter[3]) + '$', '', 'rejected') +
+        calc('$\\Delta^{\\text{after}} = ' + f(r_w_after) + ' - ' + f(r_l_after) + ' = ' + f(delta_after) + '$') +
+        calc('$\\sigma(\\Delta^{\\text{after}})$，$p = ' + f(p_after) + '$') +
+        calc('$\\mathcal{L}^{\\text{after}} = -\\log p = ' + f(loss_after) + '$', f(loss_after), '← 训练后') +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('对比：$\\Delta^{\\text{before}} = ' + f(delta_before) + '$，$\\sigma = ' + f(p_before) + '$，$\\mathcal{L}^{\\text{before}} = ' + f(loss_before) + '$') +
+        calc('$r_w$：' + f(r_w_before) + ' → ' + f(r_w_after) + '（升）') +
+        calc('$r_l$：' + f(r_l_before) + ' → ' + f(r_l_after) + '（降）') +
+      '</div>',
+    deriv: null,
+    tip: 'loss 从 0.6931 降到 0.3869。chosen 的 reward 升高，rejected 的降低，方向对——RM 学会「$y_w$ 比 $y_l$ 好」。'
+  }
+];
+
+// === 翻页逻辑 ===
+let current = 0;
+const TOTAL = STAGES.length;
+
+function renderStage(idx) {
+  const s = STAGES[idx];
+  renderMixed(document.getElementById('sTitle'), s.title);
+  renderMixed(document.getElementById('sDesc'), s.desc);
+  renderDisplay(document.getElementById('sFormula'), s.formula);
+
+  const mArea = document.getElementById('mArea');
+  if (s.matrix) {
+    mArea.style.display = '';
+    mArea.innerHTML = s.matrix();
+    scanAndRender(mArea);
+  } else {
+    mArea.style.display = 'none';
+  }
+
+  const derivBox = document.getElementById('derivBox');
+  if (s.deriv) {
+    derivBox.style.display = '';
+    renderMixed(document.getElementById('dTitle'), s.deriv.title);
+    const steps = s.deriv.steps.map(step => {
+      const stepDiv = document.createElement('div');
+      stepDiv.className = 'deriv-step';
+      const labelDiv = document.createElement('div');
+      labelDiv.className = 'deriv-label';
+      renderMixed(labelDiv, step.label);
+      const mathDiv = document.createElement('div');
+      mathDiv.style.margin = '4px 0';
+      renderDisplay(mathDiv, step.math);
+      const noteDiv = document.createElement('div');
+      noteDiv.className = 'deriv-note';
+      renderMixed(noteDiv, step.note);
+      stepDiv.appendChild(labelDiv);
+      stepDiv.appendChild(mathDiv);
+      stepDiv.appendChild(noteDiv);
+      return stepDiv;
+    });
+    const dSteps = document.getElementById('dSteps');
+    dSteps.innerHTML = '';
+    steps.forEach(s => dSteps.appendChild(s));
+  } else {
+    derivBox.style.display = 'none';
+  }
+
+  const tipBox = document.getElementById('tipBox');
+  if (s.tip) {
+    tipBox.style.display = '';
+    renderMixed(tipBox, s.tip);
+  } else {
+    tipBox.style.display = 'none';
+  }
+
+  document.getElementById('cur').textContent = idx + 1;
+  document.getElementById('tot').textContent = TOTAL;
+  document.getElementById('prevBtn').disabled = idx === 0;
+  document.getElementById('nextBtn').disabled = idx === TOTAL - 1;
+}
+
+function change(delta) {
+  const next = current + delta;
+  if (next < 0 || next >= TOTAL) return;
+  current = next;
+  renderStage(current);
+}
+
+// 键盘翻页
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') { change(-1); e.preventDefault(); }
+  if (e.key === 'ArrowRight') { change(1); e.preventDefault(); }
+});
+
+// === 初始化 ===
+renderConventions();
+renderMixed(
+  document.getElementById('subtitle'),
+  'RM 在 $(x, y_w, y_l)$ 下，学一个标量打分 $r_\\varphi$，让 $r_\\varphi(x, y_w) > r_\\varphi(x, y_l)$'
+);
+renderStage(0);
+</script>
+</body>
+</html>
