@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PPO：近端策略优化</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, "Helvetica Neue", "PingFang SC", sans-serif;
+  background: linear-gradient(135deg, #0a0e1a 0%, #1a1f35 100%);
+  color: #e2e8f0;
+  min-height: 100vh;
+  padding: 16px;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: radial-gradient(circle at 20% 30%, rgba(96, 165, 250, 0.08), transparent 40%),
+              radial-gradient(circle at 80% 70%, rgba(167, 139, 250, 0.08), transparent 40%);
+  pointer-events: none;
+  z-index: -1;
+}
+.container { max-width: 1100px; margin: 0 auto; padding-bottom: 80px; }
+h1 {
+  text-align: center;
+  font-size: 26px;
+  background: linear-gradient(90deg, #60a5fa, #a78bfa, #f472b6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 4px;
+}
+.subtitle { text-align: center; color: #94a3b8; font-size: 13px; margin-bottom: 16px; }
+
+.stage {
+  background: rgba(19, 26, 46, 0.7);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 18px 22px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.stage-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; color: #f1f5f9; }
+.stage-desc { color: #cbd5e1; font-size: 14px; margin-bottom: 10px; }
+.stage-formula {
+  background: rgba(10, 14, 26, 0.6);
+  padding: 12px 16px;
+  border-radius: 6px;
+  border-left: 3px solid #60a5fa;
+  margin: 10px 0;
+  overflow-x: auto;
+}
+
+.matrix-area {
+  background: rgba(13, 20, 36, 0.6);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 24px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.matrix-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.matrix-block { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.matrix-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+.matrix-name { font-size: 15px; font-weight: 700; color: #e2e8f0; margin-bottom: 2px; }
+.matrix {
+  display: grid;
+  gap: 2px;
+  background: rgba(5, 8, 16, 0.6);
+  padding: 4px;
+  border-radius: 4px;
+  border: 1px solid #2d3a5e;
+}
+.cell {
+  padding: 6px 10px;
+  background: rgba(30, 41, 59, 0.6);
+  border-radius: 3px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  text-align: center;
+  min-width: 50px;
+  color: #e2e8f0;
+  transition: all 0.4s ease;
+}
+.cell.chosen { border: 1.5px solid #34d399; background: rgba(52, 211, 153, 0.18); }
+.cell.rejected { border: 1.5px solid #f87171; background: rgba(248, 113, 113, 0.18); }
+.cell.highlight {
+  background: rgba(96, 165, 250, 0.3) !important;
+  box-shadow: 0 0 10px rgba(96, 165, 250, 0.5);
+  transform: scale(1.05);
+}
+.cell.big { font-size: 16px; font-weight: 700; }
+.op { font-size: 18px; color: #64748b; font-weight: 300; }
+
+.derivation {
+  background: rgba(19, 26, 46, 0.7);
+  border: 1px solid #2d3a5e;
+  border-radius: 10px;
+  padding: 16px 22px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(10px);
+}
+.deriv-title { font-size: 14px; font-weight: 700; color: #fbbf24; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+.deriv-step {
+  margin: 12px 0;
+  padding: 10px 14px;
+  background: rgba(13, 20, 36, 0.6);
+  border-radius: 6px;
+  border-left: 2px solid #fbbf24;
+}
+.deriv-label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+.deriv-note { font-size: 13px; color: #94a3b8; margin-top: 6px; font-style: italic; }
+
+.calc {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  color: #cbd5e1;
+  margin: 4px 0;
+  padding-left: 16px;
+}
+.calc .num { color: #fbbf24; font-weight: 600; }
+.calc .result { color: #34d399; font-weight: 600; }
+.calc .mark { color: #64748b; }
+
+.compare { display: flex; gap: 16px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+.compare-card {
+  background: rgba(13, 20, 36, 0.6);
+  padding: 10px 18px;
+  border-radius: 6px;
+  border: 1px solid #2d3a5e;
+  text-align: center;
+  min-width: 110px;
+}
+.compare-card .label { font-size: 11px; color: #94a3b8; margin-bottom: 2px; }
+.compare-card .value { font-family: "SF Mono", Menlo, monospace; font-size: 20px; font-weight: 700; }
+.compare-card.chosen .value { color: #34d399; }
+.compare-card.before .value { color: #f87171; }
+.compare-card.after .value { color: #84cc16; }
+
+.tip {
+  background: rgba(96, 165, 250, 0.08);
+  border-left: 3px solid #60a5fa;
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.tip.warning { background: rgba(251, 191, 36, 0.08); border-left-color: #fbbf24; }
+.tip.success { background: rgba(132, 204, 22, 0.08); border-left-color: #84cc16; }
+
+.convention {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.conv-item {
+  background: rgba(13, 20, 36, 0.5);
+  padding: 8px 14px;
+  border-radius: 6px;
+  border-left: 2px solid #60a5fa;
+  font-size: 14px;
+  color: #cbd5e1;
+}
+.conv-item .conv-sym {
+  font-family: "SF Mono", Menlo, monospace;
+  font-weight: 600;
+  color: #60a5fa;
+  margin-right: 8px;
+}
+
+.controls {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: rgba(13, 20, 36, 0.95);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid #2d3a5e;
+  padding: 12px 20px;
+  gap: 16px;
+}
+.btn {
+  background: rgba(96, 165, 250, 0.12);
+  color: #60a5fa;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 110px;
+  transition: all 0.2s;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(96, 165, 250, 0.25);
+  transform: translateY(-1px);
+}
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.indicator { font-size: 14px; color: #94a3b8; min-width: 100px; text-align: center; }
+.indicator .current { color: #60a5fa; font-weight: 700; font-size: 16px; }
+
+@media (max-width: 768px) {
+  .matrix-row { gap: 8px; }
+  .cell { min-width: 40px; padding: 4px 6px; font-size: 11px; }
+  .op { font-size: 14px; }
+  h1 { font-size: 18px; }
+  .convention { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>PPO：近端策略优化</h1>
+  <p class="subtitle" id="subtitle"></p>
+
+  <div class="stage">
+    <div class="stage-title">数学约定</div>
+    <div class="stage-desc">PPO 用到的记号。</div>
+    <div class="convention" id="conv-grid"></div>
+  </div>
+
+  <div class="stage" id="stageBox">
+    <div class="stage-title" id="sTitle"></div>
+    <div class="stage-desc" id="sDesc"></div>
+    <div class="stage-formula" id="sFormula"></div>
+  </div>
+
+  <div class="matrix-area" id="mArea"></div>
+
+  <div class="derivation" id="derivBox" style="display:none;">
+    <div class="deriv-title" id="dTitle"></div>
+    <div id="dSteps"></div>
+  </div>
+
+  <div class="tip" id="tipBox" style="display:none;"></div>
+</div>
+
+<div class="controls">
+  <button class="btn" id="prevBtn" onclick="change(-1)">◀ 上一页</button>
+  <div class="indicator">第 <span class="current" id="cur">1</span> / <span id="tot">8</span> 页</div>
+  <button class="btn" id="nextBtn" onclick="change(1)">下一页 ▶</button>
+</div>
+
+<script>
+// === 数学渲染辅助（和 backward/dpo/rm/pg 保持一致） ===
+function renderMixed(element, str) {
+  element.innerHTML = '';
+  const parts = str.split(/(\$\$[^$]+\$\$)/g);
+  for (const part of parts) {
+    if (!part) continue;
+    const blockMatch = part.match(/^\$\$([^$]+)\$\$$/);
+    if (blockMatch) {
+      const span = document.createElement('div');
+      try { katex.render(blockMatch[1], span, { displayMode: true, throwOnError: false }); }
+      catch (e) { span.textContent = blockMatch[1]; }
+      element.appendChild(span);
+      continue;
+    }
+    const inlineParts = part.split(/(\$[^$]+\$)/g);
+    for (const ip of inlineParts) {
+      if (!ip) continue;
+      const inlineMatch = ip.match(/^\$([^$]+)\$$/);
+      if (inlineMatch) {
+        const span = document.createElement('span');
+        try { katex.render(inlineMatch[1], span, { displayMode: false, throwOnError: false }); }
+        catch (e) { span.textContent = inlineMatch[1]; }
+        element.appendChild(span);
+      } else {
+        const wrapper = document.createElement('span');
+        wrapper.innerHTML = ip;
+        element.appendChild(wrapper);
+      }
+    }
+  }
+}
+function renderDisplay(element, latex) {
+  try { katex.render(latex, element, { displayMode: true, throwOnError: false }); }
+  catch (e) { element.textContent = latex; }
+}
+function scanAndRender(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const textNodes = [];
+  let node;
+  while (node = walker.nextNode()) textNodes.push(node);
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue;
+    if (!text || !text.includes('$')) continue;
+    const frag = document.createDocumentFragment();
+    const regex = /(\$\$[^$]+\$\$|\$[^$\n]+\$)/g;
+    let lastIdx = 0, match;
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIdx) frag.appendChild(document.createTextNode(text.slice(lastIdx, match.index)));
+      const m = match[0];
+      const span = document.createElement('span');
+      try {
+        if (m.startsWith('$$')) katex.render(m.slice(2, -2), span, { displayMode: true, throwOnError: false });
+        else katex.render(m.slice(1, -1), span, { displayMode: false, throwOnError: false });
+      } catch (e) { span.textContent = m; }
+      frag.appendChild(span);
+      lastIdx = match.index + m.length;
+    }
+    if (lastIdx < text.length) frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+    textNode.parentNode.replaceChild(frag, textNode);
+  }
+}
+
+// === 工具函数 ===
+function f(v, n = 4) { return Number(v).toFixed(n); }
+function vec(v, opts = {}) {
+  const { hl, tgt, chosenIdx, rejectedIdx, cls = [] } = opts;
+  const cells = v.map((val, i) => {
+    let c = 'cell';
+    if (chosenIdx !== undefined && i === chosenIdx) c += ' chosen';
+    if (rejectedIdx !== undefined && i === rejectedIdx) c += ' rejected';
+    if (hl === i) c += ' highlight';
+    if (tgt === i) c += ' target';
+    cls.forEach(k => { if (k(i)) c += ' ' + k; });
+    return '<div class="' + c + '">' + (typeof val === 'number' ? f(val) : val) + '</div>';
+  }).join('');
+  return '<div class="matrix" style="grid-template-columns: 1fr;">' + cells + '</div>';
+}
+function blk(label, name, html) {
+  return '<div class="matrix-block">' +
+    (label ? '<div class="matrix-label">' + label + '</div>' : '') +
+    (name ? '<div class="matrix-name">' + name + '</div>' : '') +
+    html +
+  '</div>';
+}
+function op(s) {
+  return '<div class="op">' + s + '</div>';
+}
+function calc(latex, value, mark) {
+  let s = '<div class="calc">' + latex;
+  if (value !== undefined && value !== null) s += ' = <span class="result">' + value + '</span>';
+  if (mark) s += ' <span class="mark">' + mark + '</span>';
+  s += '</div>';
+  return s;
+}
+
+// === 数学约定卡片 ===
+const CONVENTIONS = [
+  { sym: 's, a, r', desc: 'state（状态）、action（动作）、reward（奖励）。和 PG 一致' },
+  { sym: 'A', desc: 'advantage（优势）。$A = G - V(s)$，衡量 action 相对平均水平的好坏。本例 $A = G$' },
+  { sym: '\\pi_{\\theta_{\\text{old}}}', desc: '旧策略（采样用，固定不更新）。PPO 用它采数据，再优化新策略' },
+  { sym: '\\pi_{\\theta}', desc: '新策略（参数 $\\theta$ 可更新）。一开始 $= \\pi_{\\theta_{\\text{old}}}$' },
+  { sym: '\\theta', desc: '策略参数（logits 向量）' },
+  { sym: 'r_t', desc: 'importance ratio（重要性比率）$= \\pi_\\theta(a_t|s_t) / \\pi_{\\theta_{\\text{old}}}(a_t|s_t)$。新策略相对旧策略这个 action 的概率倍数' },
+  { sym: '\\epsilon', desc: 'clip 范围。通常 0.1~0.3，本例用 0.2' },
+  { sym: 'L^{\\text{CLIP}}', desc: 'PPO 的 clipped objective。最大化它 = 让新策略比旧策略偏好高优势 action，但不能偏太远' },
+  { sym: '\\text{clip}', desc: '$\\text{clip}(x, a, b)$ 把 $x$ 截到 $[a, b]$ 范围内' },
+  { sym: '\\min', desc: '取最小值。PPO 用 $\\min$ 取两个目标的较小者，做悲观估计' },
+  { sym: '\\nabla_\\theta', desc: '梯度算子。$\\nabla_\\theta L$ 指向 $L$ 上升最快的方向' },
+  { sym: '\\partial', desc: '偏导符号。$\\frac{\\partial L}{\\partial \\theta}$ 读作「$L$ 对 $\\theta$ 的偏导」' },
+  { sym: '\\text{one\\_hot}', desc: 'one-hot 向量。第 $a$ 位是 1，其他是 0' },
+  { sym: '\\log', desc: '自然对数' },
+  { sym: '\\mathbb{E}', desc: '期望符号' },
+  { sym: '\\sum', desc: '求和符号' },
+  { sym: 'e', desc: '自然对数底 $\\approx 2.718$' },
+  { sym: '\\eta', desc: '学习率' },
+  { sym: '\\to', desc: '趋向 / 映射到' }
+];
+
+function renderConventions() {
+  const grid = document.getElementById('conv-grid');
+  grid.innerHTML = '';
+  CONVENTIONS.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'conv-item';
+    const sym = document.createElement('span');
+    sym.className = 'conv-sym';
+    item.appendChild(sym);
+    const desc = document.createElement('span');
+    desc.className = 'conv-desc';
+    item.appendChild(desc);
+    grid.appendChild(item);
+    renderDisplay(sym, c.sym);
+    renderMixed(desc, c.desc);
+  });
+}
+
+// === 场景：复用 PG 的设置 + importance ratio + clip ===
+// state s = "hello"，action a = "hi"（采样自 π_old），reward r = 1.0
+// advantage A = G = 1.0（单步简化，baseline = 0）
+// 4 token: hello(0) hi(1) there(2) bye(3)
+
+const VOCAB_NAMES = ['hello', 'hi', 'there', 'bye'];
+const ACTION_TOK = 1;
+const A = 1.0;
+const epsilon = 0.2;
+const lr = 0.5;
+
+// 旧策略（固定）
+const thetaOld = [0.5, 0.8, 0.3, 0.1];
+// 新策略一开始 = 旧策略
+const thetaNewBefore = thetaOld.slice();
+// 一步更新后
+const thetaNewAfter = [0.3698, 1.1242, 0.1934, 0.0127];
+
+// 大偏移情景（演示 clip 截断）
+const thetaFar = [0.3, 1.6, 0.2, 0.1];
+
+function softmax(z) {
+  const e = z.map(v => Math.exp(v));
+  const sum = e.reduce((a, b) => a + b, 0);
+  return e.map(v => v / sum);
+}
+
+function clip(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+const piOld = softmax(thetaOld);
+const piNewBefore = softmax(thetaNewBefore);
+const piNewAfter = softmax(thetaNewAfter);
+const piFar = softmax(thetaFar);
+
+// importance ratio
+const rBefore = piNewBefore[ACTION_TOK] / piOld[ACTION_TOK];
+const rAfter = piNewAfter[ACTION_TOK] / piOld[ACTION_TOK];
+const rFar = piFar[ACTION_TOK] / piOld[ACTION_TOK];
+
+// L^CLIP
+const rClippedBefore = clip(rBefore, 1 - epsilon, 1 + epsilon);
+const rClippedAfter = clip(rAfter, 1 - epsilon, 1 + epsilon);
+const rClippedFar = clip(rFar, 1 - epsilon, 1 + epsilon);
+
+const LBefore = Math.min(rBefore * A, rClippedBefore * A);
+const LAfter = Math.min(rAfter * A, rClippedAfter * A);
+const LFar = Math.min(rFar * A, rClippedFar * A);
+
+// 梯度：当 r 在 clip 范围内时，∂L/∂θ_i = A · r · (one_hot_i - π_new_i)
+const gradL = thetaNewBefore.map((_, i) =>
+  A * rBefore * ((i === ACTION_TOK ? 1.0 : 0.0) - piNewBefore[i])
+);
+
+// === 页面数据 ===
+const STAGES = [
+  // 1. 起点
+  {
+    title: '起点：从 PG 到 PPO',
+    desc: 'PPO 是 PG 的改良版。PG 的问题：每次更新后策略就变了，旧样本不能复用。PPO 引入 importance ratio 和 clip，让旧样本也能用于多次更新。',
+    formula: '\\pi_{\\theta_{\\text{old}}} \\text{ 采样，} \\pi_\\theta \\text{ 更新}',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('旧策略<br>（固定）', '$\\pi_{\\theta_{\\text{old}}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">冻结</div></div>') +
+        op('采样') +
+        blk('数据', '$\\{(s, a, r)\\}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight">样本</div></div>') +
+        op('训练') +
+        blk('新策略', '$\\pi_\\theta$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big highlight">更新</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('PG：采一次用一次就丢') +
+        calc('PPO：用 $\\pi_{\\theta_{\\text{old}}}$ 采的样本，能更新 $\\pi_\\theta$ 多次（复用旧数据）') +
+      '</div>',
+    deriv: {
+      title: '为什么 PPO 要复用旧数据',
+      steps: [
+        { label: 'PG 的痛点', math: '\\text{on-policy：采一次只能更新一次}', note: '每次更新后策略就变了，旧样本失效。样本效率低。' },
+        { label: 'PPO 的思路', math: '\\text{用 importance ratio 修正分布偏移}', note: '$\\pi_\\theta$ 不等于 $\\pi_{\\theta_{\\text{old}}}$ 时，用 $r = \\pi_\\theta / \\pi_{\\theta_{\\text{old}}}$ 修正。' },
+        { label: '但要小心', math: '\\pi_\\theta \\text{ 不能离 } \\pi_{\\theta_{\\text{old}}} \\text{ 太远}', note: '否则估计方差爆炸，训练不稳定。clip 机制限制偏移。' }
+      ]
+    },
+    tip: 'PPO = PG + importance ratio + clip。三个新概念，逐个拆解。'
+  },
+
+  // 2. importance ratio
+  {
+    title: 'importance ratio $r_t$',
+    desc: '新策略 $\\pi_\\theta$ 对 action $a$ 的概率，除以旧策略 $\\pi_{\\theta_{\\text{old}}}$ 对 $a$ 的概率。$r_t = 1$ 表示两个策略一样；$r_t > 1$ 表示新策略更偏好 $a$；$r_t < 1$ 表示更不偏好。',
+    formula: 'r_t = \\frac{\\pi_\\theta(a_t|s_t)}{\\pi_{\\theta_{\\text{old}}}(a_t|s_t)}',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('新策略', '$\\pi_\\theta(a|s)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(piNewBefore[ACTION_TOK]) + '</div></div>') +
+        op('÷') +
+        blk('旧策略', '$\\pi_{\\theta_{\\text{old}}}(a|s)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(piOld[ACTION_TOK]) + '</div></div>') +
+        op('=') +
+        blk('比率', '$r_t$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(rBefore) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\pi_\\theta(a|s) = ' + f(piNewBefore[ACTION_TOK]) + '$（新策略，训练前 $= \\pi_{\\theta_{\\text{old}}}$）') +
+        calc('$\\pi_{\\theta_{\\text{old}}}(a|s) = ' + f(piOld[ACTION_TOK]) + '$（旧策略，固定）') +
+        calc('$r_t = ' + f(piNewBefore[ACTION_TOK]) + ' / ' + f(piOld[ACTION_TOK]) + ' = ' + f(rBefore) + '$', '', '训练前 $r_t = 1$') +
+      '</div>',
+    deriv: {
+      title: 'importance ratio 的概率意义',
+      steps: [
+        { label: '重要性采样', math: '\\mathbb{E}_{x \\sim p}[f(x)] = \\mathbb{E}_{x \\sim q}\\left[\\frac{p(x)}{q(x)} f(x)\\right]', note: '从 $q$ 采样但想算 $p$ 下的期望，乘 $p/q$ 修正。' },
+        { label: '代入 PG', math: '\\nabla_\\theta J = \\mathbb{E}_{a \\sim \\pi_{\\text{old}}}\\left[\\frac{\\pi_\\theta}{\\pi_{\\theta_{\\text{old}}}} G \\nabla_\\theta \\log \\pi_\\theta\\right]', note: '用旧策略采的样本估计新策略的梯度。' },
+        { label: '简化', math: '\\nabla_\\theta \\log \\pi_\\theta = \\nabla_\\theta \\pi_\\theta / \\pi_\\theta', note: '所以 $\\frac{\\pi_\\theta}{\\pi_{\\theta_{\\text{old}}}} \\nabla_\\theta \\log \\pi_\\theta = \\nabla_\\theta \\pi_\\theta / \\pi_{\\theta_{\\text{old}}}$。' },
+        { label: 'PPO 目标', math: '\\mathbb{E}[r_t \\cdot A_t]', note: '把 $r$ 和 $A$ 直接乘起来，作为新策略的优势。' }
+      ]
+    },
+    tip: '$r_t$ 是新策略相对旧策略对 action $a$ 的「偏好倍数」。训练前 $r_t = 1$（两个策略一样）。'
+  },
+
+  // 3. advantage
+  {
+    title: 'advantage $A$：相对好坏',
+    desc: 'advantage 衡量 action $a$ 相对「平均水平」的好坏。$A > 0$：比平均好；$A < 0$：比平均差。本例单步简化 $A = G = r = 1.0$（baseline = 0）。',
+    formula: 'A_t = G_t - V(s_t)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('return', '$G$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#fbbf24;">' + f(A) + '</div></div>') +
+        op('−') +
+        blk('baseline', '$V(s)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">0</div></div>') +
+        op('=') +
+        blk('advantage', '$A$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(A) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$G = r = ' + f(A) + '$（单步）') +
+        calc('$V(s) = 0$（baseline = 0，教学简化）') +
+        calc('$A = ' + f(A) + ' - 0 = ' + f(A) + '$', '', '正 → 这次 action 比平均好') +
+      '</div>',
+    deriv: {
+      title: '为什么需要 advantage',
+      steps: [
+        { label: 'PG 用 $G$', math: '\\nabla_\\theta J = \\mathbb{E}[G \\cdot \\nabla_\\theta \\log \\pi]', note: '直接用 return 作权重。' },
+        { label: '问题', math: '\\text{方差大}', note: '$G$ 的绝对值波动大，梯度方差爆炸。' },
+        { label: '减 baseline', math: 'A = G - V(s)', note: '减去 baseline $V(s)$（状态价值函数，表示「这个状态的预期 return」）。' },
+        { label: '直觉', math: 'A > 0 \\text{ 表示比平均好}', note: '只要相对好坏，不要绝对值。方差小，训练稳。' },
+        { label: '本例简化', math: 'A = G - 0 = G', note: 'baseline = 0，$A = G = r = 1.0$。' }
+      ]
+    },
+    tip: 'advantage 是「相对好坏」。$A > 0$ 的 action 应该概率上升，$A < 0$ 应该下降。'
+  },
+
+  // 4. PPO clipped objective
+  {
+    title: 'PPO 目标 $L^{\\text{CLIP}}$',
+    desc: 'PPO 把 importance ratio 限制在 $[1-\\epsilon, 1+\\epsilon]$ 范围内。目标取 $r_t \\cdot A_t$ 和 $\\text{clip}(r_t) \\cdot A_t$ 的较小者——悲观估计，防止策略偏太远。',
+    formula: 'L^{\\text{CLIP}} = \\min\\left( r_t A_t, \\, \\text{clip}(r_t, 1-\\epsilon, 1+\\epsilon) A_t \\right)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('比率', '$r_t$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(rBefore) + '</div></div>') +
+        op('×') +
+        blk('advantage', '$A$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#fbbf24;">' + f(A) + '</div></div>') +
+        op('=') +
+        blk('未截断', '$r_t A_t$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(rBefore * A) + '</div></div>') +
+      '</div>' +
+      '<div class="matrix-row" style="margin-top:10px;">' +
+        blk('clip 后比率', '$\\text{clip}(r_t)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(rClippedBefore) + '</div></div>') +
+        op('×') +
+        blk('advantage', '$A$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#fbbf24;">' + f(A) + '</div></div>') +
+        op('=') +
+        blk('截断后', '$\\text{clip}(r_t) A$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(rClippedBefore * A) + '</div></div>') +
+      '</div>' +
+      '<div class="matrix-row" style="margin-top:10px;">' +
+        op('L = min(') +
+        blk('$r_t A$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(rBefore * A) + '</div></div>') +
+        op(',') +
+        blk('$\\text{clip}(r_t) A$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">' + f(rClippedBefore * A) + '</div></div>') +
+        op(') = ') +
+        blk('目标', '$L^{\\text{CLIP}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#84cc16;">' + f(LBefore) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$r_t = ' + f(rBefore) + '$（训练前 = 1）') +
+        calc('$\\text{clip}(r_t, ' + f(1 - epsilon) + ', ' + f(1 + epsilon) + ') = ' + f(rClippedBefore) + '$') +
+        calc('$r_t A = ' + f(rBefore * A) + '$') +
+        calc('$\\text{clip}(r_t) A = ' + f(rClippedBefore * A) + '$') +
+        calc('$L^{\\text{CLIP}} = \\min(' + f(rBefore * A) + ', ' + f(rClippedBefore * A) + ') = ' + f(LBefore) + '$', f(LBefore), 'result') +
+      '</div>',
+    deriv: {
+      title: '为什么要 min',
+      steps: [
+        { label: '直觉', math: 'r_t A_t \\text{ 越大越好}', note: '$r_t$ 大（新策略偏好 $a$）且 $A > 0$（$a$ 是好 action），应该鼓励。' },
+        { label: '但 $r_t$ 太大危险', math: '\\pi_\\theta \\text{ 离 } \\pi_{\\theta_{\\text{old}}} \\text{ 太远}', note: 'importance ratio 估计方差爆炸，训练不稳定。' },
+        { label: 'clip 限制', math: '\\text{clip}(r_t, 1-\\epsilon, 1+\\epsilon)', note: '把 $r_t$ 截到 $[1-\\epsilon, 1+\\epsilon]$ 范围。本例 $\\epsilon = 0.2$，范围 $[0.8, 1.2]$。' },
+        { label: '取 min', math: 'L = \\min(r_t A_t, \\text{clip}(r_t) A_t)', note: '悲观估计——拿两个里较小的，防止过激进。' },
+        { label: '$A > 0$ 时', math: 'r_t > 1+\\epsilon \\Rightarrow L = (1+\\epsilon) A', note: '$r_t$ 超出上限时 $L$ 不再增加——梯度消失，停止鼓励。' },
+        { label: '$A < 0$ 时', math: 'r_t < 1-\\epsilon \\Rightarrow L = (1-\\epsilon) A', note: '对称地，$r_t$ 超出下限时 $L$ 不再减小——梯度消失，停止惩罚。' }
+      ]
+    },
+    tip: 'clip 是 PPO 的精髓：允许策略偏离旧策略，但只能偏离 $\\epsilon$ 范围。超出范围梯度消失，防止过激进。'
+  },
+
+  // 5. 训练前 L
+  {
+    title: '训练前 $L$（$r_t = 1$）',
+    desc: '训练前新策略 = 旧策略，所以 $r_t = 1$，在 clip 范围内。$L = 1 \\cdot A = A$。这一步只是验证初始状态。',
+    formula: 'r_t = 1 \\Rightarrow L^{\\text{CLIP}} = A',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('$\\pi_\\theta$', '$=\\pi_{\\theta_{\\text{old}}}$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big">相同</div></div>') +
+        op('→') +
+        blk('$r_t$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(rBefore) + '</div></div>') +
+        op('×') +
+        blk('$A$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#fbbf24;">' + f(A) + '</div></div>') +
+        op('=') +
+        blk('$L$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#84cc16;">' + f(LBefore) + '</div></div>') +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$r_t = ' + f(piNewBefore[ACTION_TOK]) + ' / ' + f(piOld[ACTION_TOK]) + ' = ' + f(rBefore) + '$（训练前两个策略一样）') +
+        calc('$\\text{clip}(1, 0.8, 1.2) = 1$（在范围内）') +
+        calc('$L = \\min(1 \\cdot ' + f(A) + ', 1 \\cdot ' + f(A) + ') = ' + f(LBefore) + '$', '', 'result') +
+      '</div>',
+    deriv: null,
+    tip: '训练前 $r_t = 1$，$L = A = 1.0$。这是 PPO 的起点。'
+  },
+
+  // 6. 梯度推导
+  {
+    title: '梯度：$\\nabla_\\theta L^{\\text{CLIP}}$',
+    desc: '当 $r_t$ 在 clip 范围内时，$\\text{clip}(r_t) = r_t$，$\\min$ 取 $r_t A$。此时 $\\partial L / \\partial \\theta_i = A \\cdot r_t \\cdot (\\text{one\\_hot}_i - \\pi_i)$，和 PG 几乎一样，多了 $r_t$ 和 $A$ 两个权重。',
+    formula: '\\frac{\\partial L}{\\partial \\theta_i} = A \\cdot r_t \\cdot (\\text{one\\_hot}(a)_i - \\pi_\\theta(a|s)_i)',
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('$A$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big" style="color:#fbbf24;">' + f(A) + '</div></div>') +
+        op('×') +
+        blk('$r_t$', '', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell big highlight">' + f(rBefore) + '</div></div>') +
+        op('×') +
+        blk('$\\text{one\\_hot}(a) - \\pi$', '', vec(thetaNewBefore.map((_, i) => (i === ACTION_TOK ? 1.0 : 0.0) - piNewBefore[i]), { chosenIdx: ACTION_TOK })) +
+        op('=') +
+        blk('梯度', '$\\nabla_\\theta L$', vec(gradL, { chosenIdx: ACTION_TOK })) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$A = ' + f(A) + '$, $r_t = ' + f(rBefore) + '$') +
+        calc('$\\text{one\\_hot}(a) - \\pi = [' + thetaNewBefore.map((_, i) => f((i === ACTION_TOK ? 1.0 : 0.0) - piNewBefore[i])).join(', ') + ']$') +
+        calc('$\\nabla_\\theta L = [' + gradL.map(v => f(v)).join(', ') + ']$', '', 'result') +
+      '</div>',
+    deriv: {
+      title: '梯度推导（$r_t$ 在范围内）',
+      steps: [
+        { label: '前提', math: 'r_t \\in [1-\\epsilon, 1+\\epsilon]', note: '$r_t$ 没被 clip 时，$\\text{clip}(r_t) = r_t$，$\\min$ 取 $r_t A$。' },
+        { label: '$r_t$ 展开', math: 'r_t = \\pi_\\theta(a|s) / \\pi_{\\theta_{\\text{old}}}(a|s)', note: '旧策略 $\\pi_{\\theta_{\\text{old}}}$ 固定，不参与梯度。' },
+        { label: '对 $\\theta_i$ 求导', math: '\\frac{\\partial r_t}{\\partial \\theta_i} = \\frac{1}{\\pi_{\\theta_{\\text{old}}}} \\cdot \\frac{\\partial \\pi_\\theta}{\\partial \\theta_i}', note: '分子是新策略，分母是常数。' },
+        { label: 'softmax 梯度', math: '\\frac{\\partial \\pi_\\theta(a)}{\\partial \\theta_i} = \\pi_\\theta(a) \\cdot (\\text{one\\_hot}_i - \\pi_i)', note: '标准 softmax 对 logits 的梯度。' },
+        { label: '代入', math: '\\frac{\\partial L}{\\partial \\theta_i} = A \\cdot \\frac{\\pi_\\theta(a)}{\\pi_{\\theta_{\\text{old}}}(a)} \\cdot (\\text{one\\_hot}_i - \\pi_i)', note: '注意 $\\pi_\\theta(a) / \\pi_{\\theta_{\\text{old}}}(a) = r_t$。' },
+        { label: '化简', math: '\\frac{\\partial L}{\\partial \\theta_i} = A \\cdot r_t \\cdot (\\text{one\\_hot}_i - \\pi_i)', note: '和 PG 相比多了 $A$ 和 $r_t$ 两个权重。' }
+      ]
+    },
+    tip: '和 PG 的 $\\nabla_\\theta J = G \\cdot (\\text{one\\_hot} - \\pi)$ 对比：PPO 多了 $A$（替代 $G$）和 $r_t$（修正旧策略偏移）。'
+  },
+
+  // 7. 一步更新
+  {
+    title: '一步更新：$\\theta^{\\text{new}} = \\theta^{\\text{old}} + \\eta \\nabla_\\theta L$',
+    desc: 'PPO 也是最大化目标 $L^{\\text{CLIP}}$，所以走梯度上升方向（$+$）。',
+    formula: '\\theta^{\\text{new}} = \\theta^{\\text{old}} + \\eta \\, \\nabla_\\theta L^{\\text{CLIP}}',
+    matrix: () =>
+      '<div style="background:rgba(19,26,46,0.7); border:1px solid #2d3a5e; border-radius:10px; padding:16px 22px; margin-bottom:14px; backdrop-filter:blur(10px);">' +
+        '<div style="font-family:\'SF Mono\',Menlo,monospace; font-size:13px; color:#cbd5e1; line-height:1.8;">' +
+          '① $\\pi_{\\theta_{\\text{old}}}$ 采样 $(s, a, r)$，算 $A$<br>' +
+          '② $\\pi_\\theta$ 初始 $= \\pi_{\\theta_{\\text{old}}}$，算 $r_t = 1$<br>' +
+          '③ $L = r_t A$（在 clip 范围内）<br>' +
+          '④ $\\nabla_\\theta L = A \\cdot r_t \\cdot (\\text{one\\_hot} - \\pi)$<br>' +
+          '⑤ $\\theta^{\\text{new}} = \\theta^{\\text{old}} + \\eta \\nabla_\\theta L$' +
+        '</div>' +
+      '</div>' +
+      '<div class="matrix-row">' +
+        blk('训练前 $\\theta$', '$\\theta^{\\text{old}}$', vec(thetaNewBefore)) +
+        op('+ η·∇L') +
+        blk('梯度', '$\\nabla_\\theta L$', vec(gradL, { chosenIdx: ACTION_TOK })) +
+        op('=') +
+        blk('训练后 $\\theta$', '$\\theta^{\\text{new}}$', vec(thetaNewAfter, { chosenIdx: ACTION_TOK })) +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$\\nabla_\\theta L = [' + gradL.map(v => f(v)).join(', ') + ']$') +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('$\\theta_{\\text{hi}} = ' + f(thetaNewBefore[1]) + ' + ' + f(lr) + ' \\times ' + f(gradL[1]) + ' = ' + f(thetaNewAfter[1]) + '$', '', '升 ← 选中') +
+        calc('$\\theta_{\\text{hello}} = ' + f(thetaNewBefore[0]) + ' + ' + f(lr) + ' \\times ' + f(gradL[0]) + ' = ' + f(thetaNewAfter[0]) + '$', '', '降') +
+        calc('$\\theta_{\\text{there}} = ' + f(thetaNewBefore[2]) + ' + ' + f(lr) + ' \\times ' + f(gradL[2]) + ' = ' + f(thetaNewAfter[2]) + '$', '', '降') +
+        calc('$\\theta_{\\text{bye}} = ' + f(thetaNewBefore[3]) + ' + ' + f(lr) + ' \\times ' + f(gradL[3]) + ' = ' + f(thetaNewAfter[3]) + '$', '', '降') +
+      '</div>',
+    deriv: null,
+    tip: '一步更新后 $\\theta$ 朝选中 action 方向移动，和 PG 一样。差别在下一步：PPO 还能复用旧数据，PG 不行。'
+  },
+
+  // 8. 验证 + clip 作用
+  {
+    title: '验证：$L$ 上升 + clip 截断',
+    desc: '用 $\\theta^{\\text{new}}$ 重新算 $r_t$ 和 $L$。这次更新让 $r_t$ 超出了 clip 范围（$r_t = 1.2965 > 1.2$），$L$ 被 clip 截断——这正是 PPO 的保护机制。',
+    formula: 'r_t^{\\text{after}} = ' + f(rAfter) + ' > 1+\\epsilon = ' + f(1 + epsilon),
+    matrix: () =>
+      '<div class="matrix-row">' +
+        blk('新策略', '$\\pi_\\theta(a)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(piNewAfter[ACTION_TOK]) + '</div></div>') +
+        op('÷') +
+        blk('旧策略', '$\\pi_{\\theta_{\\text{old}}}(a)$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell chosen big">' + f(piOld[ACTION_TOK]) + '</div></div>') +
+        op('=') +
+        blk('新比率', '$r_t$', '<div class="matrix" style="grid-template-columns: 1fr;"><div class="cell highlight big">' + f(rAfter) + '</div></div>') +
+      '</div>' +
+      '<div class="compare">' +
+        '<div class="compare-card before"><div class="label">训练前 $L$</div><div class="value">' + f(LBefore) + '</div></div>' +
+        '<div class="compare-card after"><div class="label">训练后 $L$</div><div class="value">' + f(LAfter) + '</div></div>' +
+      '</div>' +
+      '<div style="margin-top:14px;">' +
+        calc('$r_t^{\\text{after}} = ' + f(piNewAfter[ACTION_TOK]) + ' / ' + f(piOld[ACTION_TOK]) + ' = ' + f(rAfter) + '$', '', '出 clip 范围') +
+        calc('$\\text{clip}(r_t, 0.8, 1.2) = ' + f(rClippedAfter) + '$') +
+        calc('$r_t A = ' + f(rAfter * A) + '$') +
+        calc('$\\text{clip}(r_t) A = ' + f(rClippedAfter * A) + '$') +
+        calc('$L^{\\text{after}} = \\min(' + f(rAfter * A) + ', ' + f(rClippedAfter * A) + ') = ' + f(LAfter) + '$', f(LAfter), 'result') +
+      '</div>' +
+      '<div style="margin-top:10px; padding:12px 16px; background:rgba(251,191,36,0.08); border-left:3px solid #fbbf24; border-radius:6px;">' +
+        '<div style="font-size:13px; color:#fbbf24; font-weight:700; margin-bottom:6px;">clip 的保护作用</div>' +
+        '<div style="font-family:\'SF Mono\',Menlo,monospace; font-size:13px; color:#cbd5e1; line-height:1.8;">' +
+          '极端情景：$\\theta = [' + thetaFar.map(v => f(v)).join(', ') + ']$<br>' +
+          '$r_t = ' + f(rFar) + '$（远超 $1+\\epsilon = 1.2$）<br>' +
+          '$L = \\min(' + f(rFar * A) + ', ' + f(rClippedFar * A) + ') = ' + f(LFar) + '$<br>' +
+          '此时 $\\partial L / \\partial \\theta = 0$（梯度消失，停止继续往这个方向走）' +
+        '</div>' +
+      '</div>' +
+      '<div style="margin-top:10px;">' +
+        calc('对比：训练前 $r_t = ' + f(rBefore) + '$，训练后 $r_t = ' + f(rAfter) + '$') +
+        calc('$L = ' + f(LBefore) + ' → ' + f(LAfter) + '$（升 ' + f(LAfter - LBefore) + '）') +
+      '</div>',
+    deriv: {
+      title: 'clip 如何保护训练',
+      steps: [
+        { label: '正常更新', math: 'r_t \\in [1-\\epsilon, 1+\\epsilon]', note: '$r_t$ 在范围内，$L = r_t A$，梯度正常。' },
+        { label: '偏太远', math: 'r_t > 1+\\epsilon', note: '$A > 0$ 时 $L = (1+\\epsilon) A$（被 clip 住），对 $\\theta$ 的梯度 $= 0$。' },
+        { label: '梯度消失', math: '\\nabla_\\theta L = 0', note: '$\\theta$ 不再往这个方向更新——自我保护。' },
+        { label: '本例', math: 'r_t = ' + f(rAfter) + ' > 1.2', note: '这次更新后 $r_t$ 超出了。下次更新如果还想往这方向走，梯度会消失。' }
+      ]
+    },
+    tip: 'clip 让 PPO 训练稳定：策略可以变好，但不能一步跳太远。超出范围梯度消失，相当于自动刹车。'
+  }
+];
+
+// === 翻页逻辑 ===
+let current = 0;
+const TOTAL = STAGES.length;
+
+function renderStage(idx) {
+  const s = STAGES[idx];
+  renderMixed(document.getElementById('sTitle'), s.title);
+  renderMixed(document.getElementById('sDesc'), s.desc);
+  renderDisplay(document.getElementById('sFormula'), s.formula);
+
+  const mArea = document.getElementById('mArea');
+  if (s.matrix) {
+    mArea.style.display = '';
+    mArea.innerHTML = s.matrix();
+    scanAndRender(mArea);
+  } else {
+    mArea.style.display = 'none';
+  }
+
+  const derivBox = document.getElementById('derivBox');
+  if (s.deriv) {
+    derivBox.style.display = '';
+    renderMixed(document.getElementById('dTitle'), s.deriv.title);
+    const steps = s.deriv.steps.map(step => {
+      const stepDiv = document.createElement('div');
+      stepDiv.className = 'deriv-step';
+      const labelDiv = document.createElement('div');
+      labelDiv.className = 'deriv-label';
+      renderMixed(labelDiv, step.label);
+      const mathDiv = document.createElement('div');
+      mathDiv.style.margin = '4px 0';
+      renderDisplay(mathDiv, step.math);
+      const noteDiv = document.createElement('div');
+      noteDiv.className = 'deriv-note';
+      renderMixed(noteDiv, step.note);
+      stepDiv.appendChild(labelDiv);
+      stepDiv.appendChild(mathDiv);
+      stepDiv.appendChild(noteDiv);
+      return stepDiv;
+    });
+    const dSteps = document.getElementById('dSteps');
+    dSteps.innerHTML = '';
+    steps.forEach(s => dSteps.appendChild(s));
+  } else {
+    derivBox.style.display = 'none';
+  }
+
+  const tipBox = document.getElementById('tipBox');
+  if (s.tip) {
+    tipBox.style.display = '';
+    renderMixed(tipBox, s.tip);
+  } else {
+    tipBox.style.display = 'none';
+  }
+
+  document.getElementById('cur').textContent = idx + 1;
+  document.getElementById('tot').textContent = TOTAL;
+  document.getElementById('prevBtn').disabled = idx === 0;
+  document.getElementById('nextBtn').disabled = idx === TOTAL - 1;
+}
+
+function change(delta) {
+  const next = current + delta;
+  if (next < 0 || next >= TOTAL) return;
+  current = next;
+  renderStage(current);
+}
+
+// 键盘翻页
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') { change(-1); e.preventDefault(); }
+  if (e.key === 'ArrowRight') { change(1); e.preventDefault(); }
+});
+
+// === 初始化 ===
+renderConventions();
+renderMixed(
+  document.getElementById('subtitle'),
+  'PPO 在 $\\pi_{\\theta_{\\text{old}}}$ 采的样本上优化 $\\pi_\\theta$，用 clip 限制策略偏移'
+);
+renderStage(0);
+</script>
+</body>
+</html>
