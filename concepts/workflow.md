@@ -21,7 +21,9 @@ concepts/
 ├── training-landscape.md
 ├── backward/index.html
 ├── dpo/index.html
-└── rlhf-rm/index.html
+├── rlhf-rm/index.html
+├── policy-gradient/index.html
+└── ppo/index.html
 ```
 
 新增：`concepts/<name>/index.html`
