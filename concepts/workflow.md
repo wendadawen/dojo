@@ -84,6 +84,7 @@ concepts/
 | ---------------- | ------------------------------- | --------------------------------- |
 | `$...$` 原样显示     | KaTeX 没加载                       | 检查 CDN                            |
 | 部分字段 `$...$` 不渲染 | 走了 `innerHTML` 没进 `renderMixed` | 用 `renderMixed` 或 `scanAndRender` |
+| `<code>$...$</code>` 不渲染 | KaTeX auto-render 不扫描 `<code>` 内部 | 去掉 `<code>`，直接用 `$...$`。变量和公式都不要包在 `<code>` 里 |
 | `rac{...}` 乱码    | JS 把 `\f` 当 form feed           | 写 `\\frac`                        |
 | `k=y` 显示异常       | `\mathbb{1}` 不支持                | 用 `\delta_{ky}`                   |
 | `\neq` 渲染成方块     | 字体没加载完整                         | 检查 KaTeX CSS/fonts                |
