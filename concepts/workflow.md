@@ -182,10 +182,11 @@ blockquote.meta
 
 ## 代码高亮
 
-- 用 highlight.js（本地，存在项目根 `libs/`），不要用 CDN。
-- 代码块写 `<pre><code class="language-python">...</code></pre>`，highlight.js 会自动着色。
-- 暗/亮模式切换时，JS 会自动切换 github / github-dark 主题（`syncHljsTheme` 函数已实现，不要删）。
+- 用 Prism.js（本地，存在项目根 `libs/`），不要用 CDN。
+- 代码块写 `<pre><code class="language-python">...</code></pre>`，Prism 会自动着色——关键字、函数名、方法名、操作符、标点、数字、注释都有不同颜色。
+- 暗/亮模式切换时，JS 会自动切换 prism / prism-tomorrow 主题（`syncCodeTheme` 函数已实现，不要删）。
 - 代码块仍然用 `<details class="code-details">` 折叠（见前文规范）。
+- **不要用 highlight.js**——它对伪代码的识别太保守，只给 Python 关键字上色，函数调用和方法名都没色。Prism 识别更丰富。
 
 ## 常见 bug
 
@@ -202,11 +203,11 @@ blockquote.meta
 | 数值凭空出现 | 跳步 | 每个数字给来源 |
 | 页面出现订正口吻 | 把纠错过程当教学内容 | 删掉，只讲正确关系 |
 | 暗/亮模式切换无效 | CSS `@media` 和 JS `data-theme` 不一致 | 用 `html[data-theme="light/dark"]` 显式定义变量，`@media` 只处理 `html:not([data-theme])` |
-| 代码块无高亮 | 没加 `class="language-python"` 或 highlight.js 没加载 | 检查 `<code class="language-python">` 和 `libs/highlight.min.js` 路径 |
-| 暗色模式下代码高亮主题没切换 | `syncHljsTheme` 函数没调用 | 检查 theme toggle JS 里是否调用了 `syncHljsTheme` |
+| 代码块无高亮或只几个关键字上色 | 用了 highlight.js（识别太保守）或没加 `class="language-python"` | 换 Prism.js；检查 `<code class="language-python">` 和 `libs/prism.min.js` 路径 |
+| 暗色模式下代码高亮主题没切换 | `syncCodeTheme` 函数没调用 | 检查 theme toggle JS 里是否调用了 `syncCodeTheme` |
 
 ## 模板位置
 
 `concepts/template/index.html`
 
-依赖库：项目根 `libs/`（KaTeX + highlight.js + 主题 CSS + 字体，已下载好不要删）
+依赖库：项目根 `libs/`（KaTeX + Prism.js + 主题 CSS + 字体，已下载好不要删）
