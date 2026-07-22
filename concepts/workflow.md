@@ -26,7 +26,7 @@ mkdir -p concepts/<concept-name>
 cp concepts/template/index.html concepts/<concept-name>/index.html
 ```
 
-改占位符：`<title>`、`<h1 class="title">`、nav-brand、blockquote.meta 里的方法来源和前置概念。
+改占位符：`<title>`、`<h1 class="title">`、nav-brand（写具体概念名，如"RLHF"）、blockquote.meta 里的来源和前置。
 
 ### 3. 写内容
 
@@ -49,7 +49,7 @@ cp concepts/template/index.html concepts/<concept-name>/index.html
   问题 → 方案 → 产物，各一句话。不写"效果"（概念教学没有单一实验数据）。
 
 blockquote.meta
-  方法来源（哪篇论文/哪本书）+ 前置概念（学这个前要先懂什么）。
+  来源（哪篇论文/哪本书/哪个领域常识）+ 前置（学这个前要先懂什么）。
 
 "这个概念一句话"段
   一段话展开成 2-3 句。callout 和正文的过渡。
@@ -73,7 +73,7 @@ blockquote.meta
 
 证据边界声明（H1）
   本章你将知道：每个论断的出处。
-  分两段：论文/领域事实 + 解读者推断。
+  分两段：事实/公式出处 + 解读者推断。
 ```
 
 每个 H1（含证据边界声明）下面都要有"本章你将知道"。
@@ -125,7 +125,7 @@ blockquote.meta
 
 - [ ] 每个论断有出处，集中在"证据边界声明"H1 下
 - [ ] 关键假设在主路径 callout 标注，不只藏在折叠块
-- [ ] 证据边界声明区分"论文/领域事实"和"解读者推断"
+- [ ] 证据边界声明区分"事实/公式出处"和"解读者推断"
 
 ### 格式
 
