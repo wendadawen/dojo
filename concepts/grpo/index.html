@@ -466,6 +466,32 @@
       color: var(--green); border-color: var(--green); opacity: 1;
     }
 
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
     /* ============ 章节折叠按钮 ============ */
     h1 .collapse-btn {
       display: inline-block;
@@ -764,6 +790,129 @@
 <p>$$J_{\text{GRPO}}(\theta) = \mathbb{E}_{q, \{o_i\} \sim \pi_{\theta_{\text{old}}}} \left[ \frac{1}{G} \sum_{i=1}^{G} \left( \min\big(\rho_i A_i, \, \text{clip}(\rho_i, 1-\epsilon, 1+\epsilon) A_i\big) - \beta \, D_{KL}\big(\pi_\theta \,\|\, \pi_{\text{ref}}\big) \right) \right]$$</p>
 <p>训练时最大化 $J_{\text{GRPO}}$（等价于最小化 $-J_{\text{GRPO}}$）。每个 batch 跑多个 prompt，每个 prompt 采 $G$ 个回答，组内算 advantage，套 clip + KL，反传更新 $\theta$。</p>
 
+<h2>训练循环伪代码</h2>
+
+<p>上面的数学怎么落地成代码？下面的伪代码参考 <a href="https://github.com/OpenRLHF/OpenRLHF">OpenRLHF</a> 的 GRPO 实现风格，省略工程细节（分布式、混合精度、梯度累积等），只展示核心逻辑。关键是看出 GRPO 和 PPO 的两个区别：<b>组采样 + 无 critic</b>。</p>
+
+<details class="code-details">
+<summary>展开：GRPO 训练循环伪代码（参考 OpenRLHF 风格）</summary>
+<div class="code-block">
+<pre><code class="language-python"># ============ 模型准备 ============
+# actor      = SFT 后的 LLM（待训练，参数 θ）
+# ref_policy = actor 的冻结副本（KL 约束基准，不更新）
+# reward_fn  = 规则验证器（RLVR：答对返回 1，答错返回 0）
+# 注意：没有 critic / value model —— 这是 GRPO 区别于 PPO 的核心
+
+# ============ 超参 ============
+# rollout_batch_size = 一次采样的 prompt 数（如 512）
+# G                  = 每个 prompt 采几个回答（如 8）—— GRPO 的"组大小"
+# num_epochs         = 一批样本训练几个 epoch（如 4）—— 和 PPO 一样复用旧样本
+# mini_batch_size    = 训练时的 mini-batch 大小（如 64）
+# clip_eps           = 0.2, kl_coef = 0.01
+
+# ========================================
+# 外层循环：每个 episode = 一次采样 + 多 epoch 训练
+# ========================================
+for episode in range(num_episodes):
+    prompts = sample_prompts(prompt_dataset, batch_size=rollout_batch_size)
+
+    # ---------- 阶段 1：Rollout（采样 + 组内算 advantage）----------
+    # 对每个 prompt 采 G 个回答，组内归一化算 advantage
+    experiences = []
+    for prompt in prompts:
+        group_responses = []      # 这一组 G 个回答
+        group_old_log_probs = []  # 采样时 actor 的 log prob（每个回答一份）
+        group_ref_log_probs = []  # ref_policy 的 log prob（用于 KL）
+        group_rewards = []        # 每个回答的最终 reward（标量）
+
+        # 1.1 对同一 prompt 采 G 个回答（GRPO 核心：组采样）
+        for i in range(G):
+            response = actor.generate(prompt)
+            # 采样时旧策略的 log prob（训练时不重新采样，固定值）
+            old_log_probs = actor.log_prob(prompt, response).detach()
+            ref_log_probs = ref_policy.log_prob(prompt, response)  # 冻结，无梯度
+            # RLVR：规则验证，1 / 0
+            reward = reward_fn(prompt, response)  # 标量
+
+            group_responses.append(response)
+            group_old_log_probs.append(old_log_probs)
+            group_ref_log_probs.append(ref_log_probs)
+            group_rewards.append(reward)
+
+        # 1.2 组内归一化算 advantage（GRPO 核心：代替 value model 的 baseline）
+        #     A_i = (r_i - mean) / (std + eps)
+        rewards_tensor = stack(group_rewards)         # shape: (G,)
+        mean_r = rewards_tensor.mean()
+        std_r = rewards_tensor.std()
+        advantages = (rewards_tensor - mean_r) / (std_r + 1e-8)  # shape: (G,)
+        # 每个回答的 advantage 是标量，广播到该回答所有 token
+        # （outcome reward 只在最后给出，整条回答共享一个 advantage）
+
+        for i in range(G):
+            experiences.append({
+                'prompt': prompt,
+                'response': group_responses[i],
+                'old_log_probs': group_old_log_probs[i],   # shape: (seq_len,)
+                'ref_log_probs': group_ref_log_probs[i],   # shape: (seq_len,)
+                'advantage': advantages[i],                # 标量，广播到所有 token
+                'reward': group_rewards[i],                # 标量
+            })
+
+    # ---------- 阶段 2：GRPO 训练（一批样本训 num_epochs 轮）----------
+    # 和 PPO 一样：用 old_log_probs 修正分布偏移（off-policy）
+    # 不像 PPO：没有 critic 更新步骤
+    for epoch in range(num_epochs):
+        for batch in split_into_minibatches(experiences, mini_batch_size):
+            # ===== Actor 更新（policy loss）=====
+            # 当前 actor 重新算 log prob（θ 已经变了）
+            new_log_probs = actor.log_prob(batch.prompt, batch.response)
+            # importance ratio = π_new / π_old
+            ratio = exp(new_log_probs - batch.old_log_probs)
+
+            # clipped surrogate loss（和 PPO 完全一样）
+            surr1 = ratio * batch.advantage   # advantage 广播到每个 token
+            surr2 = clamp(ratio, 1-clip_eps, 1+clip_eps) * batch.advantage
+            actor_loss = -mean(min(surr1, surr2))
+
+            # KL 惩罚（每 token 算，防 actor 离 ref_policy 太远）
+            # 用 Schulman k3 估计器：r - log r，其中 r = π_ref / π_new
+            ref_ratio = exp(batch.ref_log_probs - new_log_probs)
+            kl = ref_ratio - log(ref_ratio)
+            actor_loss += kl_coef * mean(kl)
+
+            actor_loss.backward()
+            actor_optimizer.step()
+            actor_optimizer.zero_grad()
+
+            # 注意：没有 critic / value 更新步骤！
+            # PPO 在这里会更新 critic 学 V(s)，GRPO 跳过——这就是省显存的来源
+
+    # 一批样本训完，进入下一个 episode 重新采样
+    # 新 episode 的 old_log_probs 会用新的 actor 重新算</code></pre>
+</div>
+</details>
+
+<div class="callout callout-gray">
+<p><b>伪代码里出现的工程概念速查</b>：</p>
+<ul>
+<li><b><code>.detach()</code></b>：把 tensor 从计算图摘出来，当常数用。<code>old_log_probs</code> 是采样时旧策略算的，训练时要当固定值（不能让它的梯度影响当前 θ），所以 detach。等价写法：<code>with torch.no_grad():</code> 包整个块（ref_policy 用这种，因为它本来就冻结）。</li>
+<li><b><code>stack</code></b>：把一组 tensor 拼成新维度。把 G 个标量 reward 拼成 shape <code>(G,)</code> 的向量，方便向量化的 mean/std 计算。</li>
+<li><b><code>advantage 广播</b></b>：每个回答的 advantage 是一个标量（基于整条回答的最终 reward 算出），但训练时回答有多个 token。把标量 advantage 当作该回答所有 token 的 advantage——outcome reward 场景的标准做法。</li>
+<li><b><code>kl_coef</code></b>：KL 惩罚系数 $\beta$，控制 actor 偏离 ref_policy 的容忍度。通常 0.001~0.01。</li>
+</ul>
+</div>
+
+<div class="callout callout-purple">
+<p><b>关键观察：GRPO 和 PPO 在哪里不同</b>：</p>
+<ul>
+<li><b>组采样</b>：阶段 1 对每个 prompt 采 $G$ 个回答（PPO 只采 1 个）。这 $G$ 个回答的 reward 提供组内 baseline</li>
+<li><b>组内 advantage</b>：用 $A_i = (r_i - \bar{r}) / \text{std}$ 算 advantage（PPO 用 $A = G - V(s)$，需要 critic 估 $V(s)$）</li>
+<li><b>无 critic 更新</b>：阶段 2 只更新 actor，没有 critic loss 步骤——这是 GRPO 区别于 PPO 的核心，也是省一半显存的来源</li>
+<li><b>其他完全一样</b>：importance ratio、clip、num_epochs 样本复用、KL 每 token——这些机制 GRPO 直接继承 PPO</li>
+</ul>
+<p>对比 PPO 伪代码：PPO 在阶段 2 多一步 critic 更新（<code>value_loss.backward(); critic_optimizer.step()</code>），且阶段 1 要算 <code>old_values = critic.value(...)</code> 和 GAE。GRPO 把这些全删了。</p>
+</div>
+
 <h2>数值例子：用 GRPO 训 "1+1="</h2>
 
 <p>prompt $q =$ "1+1="，采 $G = 4$ 个回答（设 policy 是 SFT 后但还没训过加法的模型，答对答错都有）：</p>
@@ -840,11 +989,11 @@
 
 <h2>事实/公式出处（有明确来源）</h2>
 <p>一、问题：PPO 的 advantage $A = G - V(s)$ 需要 value model ← Schulman et al. 2017 (PPO)；"value function needs to be as large as the policy model" ← Shao et al. 2024 (DeepSeekMath) §3 原话；value model 从 SFT 初始化、与 policy 同规模 ← InstructGPT §3.3</p>
-<p>二、方法：组内 advantage $A_i = (r_i - \bar{r}) / \text{std}$ ← Shao et al. 2024 (DeepSeekMath) §3.2 公式 (5)；GRPO 完整目标（含 clip + KL）← 同上 §3.2 公式 (6)；KL 的 k3 估计器 ← Schulman 2016 blog，DeepSeekMath 实现采用；GRPO 应用于 DeepSeek-R1 ← DeepSeek-AI 2025 §2.2</p>
+<p>二、方法：组内 advantage $A_i = (r_i - \bar{r}) / \text{std}$ ← Shao et al. 2024 (DeepSeekMath) §3.2 公式 (5)；GRPO 完整目标（含 clip + KL）← 同上 §3.2 公式 (6)；KL 的 k3 估计器 ← Schulman 2016 blog，DeepSeekMath 实现采用；GRPO 应用于 DeepSeek-R1 ← DeepSeek-AI 2025 §2.2；伪代码风格参考 OpenRLHF 开源实现</p>
 <p>三、总结：PPO vs GRPO 对比表 ← DeepSeekMath §3.2 + §4 实验观察</p>
 
 <h2>解读者推断（不在论文中，需独立验证）</h2>
-<p>"自适应难度"的解释（难题给大 advantage、简单题自动跳过）是 Z-score 归一化的性质推论，论文未明说。"采样开销比 PPO 大 $G$ 倍换显存"的交易分析是本文档构造的工程视角，需读者自行判断。"工业界推理模型主流用 GRPO + RLVR"是 2024-2025 的趋势观察，不是某一篇论文的明确结论。"理论上可以用更小的 value model"是 PPO 框架的一般性质（value model 大小是设计选择），但 DeepSeekMath 论文明确指出"小了估不准"。</p>
+<p>"自适应难度"的解释（难题给大 advantage、简单题自动跳过）是 Z-score 归一化的性质推论，论文未明说。"采样开销比 PPO 大 $G$ 倍换显存"的交易分析是本文档构造的工程视角，需读者自行判断。"工业界推理模型主流用 GRPO + RLVR"是 2024-2025 的趋势观察，不是某一篇论文的明确结论。"理论上可以用更小的 value model"是 PPO 框架的一般性质（value model 大小是设计选择），但 DeepSeekMath 论文明确指出"小了估不准"。伪代码里的具体工程细节（advantage 广播、detach 位置、reward 加在最后一个 token 等）参考 OpenRLHF 实现，DeepSeekMath 论文未明确写出这些实现细节。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
