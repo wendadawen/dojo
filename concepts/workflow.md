@@ -105,6 +105,18 @@ blockquote.meta
 - 不要残留模板占位符（summary.html / paper.pdf 链接等）——概念教学没有这些。
 - 证据出处集中在"证据边界声明"H1 下，不散在正文里。
 
+## 训练伪代码写作要点
+
+伪代码不要凭印象瞎写，要参考权威开源实现（如 OpenRLHF、TRL）。下面是写 PPO/RL 类伪代码时容易踩的坑：
+
+- **采样和训练要分离**：标准 PPO 是"采一批样本 → 训练多个 epoch → 重新采样"两阶段结构。不要写成"每次循环都重新采样"——那是 on-policy 的 PG，不是 PPO。
+- **off-policy 要在代码里体现**：采一批样本后 θ 变了，用 `ratio = exp(new_log_probs - old_log_probs)` 修正——这就是 off-policy 的体现。要明确注释 `old_log_probs` 是采样时的策略算的。
+- **样本复用的关键参数**：`num_epochs`（一批样本训几轮，通常 4）。PG 是 1 轮就丢，PPO 是 4 轮——这是 PPO 相对 PG 的核心改进，要在代码里体现。
+- **4 个模型职责清晰**：actor（待训练）、ref_policy（KL 基准，冻结）、critic（预测 value，待训练）、reward_model（冻结）。不要混淆参数和中间结果。
+- **KL 惩罚粒度**：每个 token 都算 KL，RM reward 只加在最后一个 token。不要把 RM reward 平摊到所有 token。
+- **value loss 也带 clip**：和 policy loss 类似，critic 更新也用 clip 防止更新太激进。
+- **GAE 算 advantage 从后往前递推**：不要只算单步 TD error，LLM 场景通常用 GAE 平衡偏差和方差。
+
 ---
 
 # 三、核查清单
@@ -168,6 +180,13 @@ blockquote.meta
 - 不要把 `$...$` 包在 `<code>` 标签里——KaTeX auto-render 不扫描 `<code>` 内部。
 - 数学推导默认零基础：出现的符号都要在术语速查或公式后解释。
 
+## 代码高亮
+
+- 用 highlight.js（本地，存在 `concepts/template/libs/`），不要用 CDN。
+- 代码块写 `<pre><code class="language-python">...</code></pre>`，highlight.js 会自动着色。
+- 暗/亮模式切换时，JS 会自动切换 github / github-dark 主题（`syncHljsTheme` 函数已实现，不要删）。
+- 代码块仍然用 `<details class="code-details">` 折叠（见前文规范）。
+
 ## 常见 bug
 
 | 现象 | 原因 | 解决 |
@@ -183,7 +202,11 @@ blockquote.meta
 | 数值凭空出现 | 跳步 | 每个数字给来源 |
 | 页面出现订正口吻 | 把纠错过程当教学内容 | 删掉，只讲正确关系 |
 | 暗/亮模式切换无效 | CSS `@media` 和 JS `data-theme` 不一致 | 用 `html[data-theme="light/dark"]` 显式定义变量，`@media` 只处理 `html:not([data-theme])` |
+| 代码块无高亮 | 没加 `class="language-python"` 或 highlight.js 没加载 | 检查 `<code class="language-python">` 和 `libs/highlight.min.js` 路径 |
+| 暗色模式下代码高亮主题没切换 | `syncHljsTheme` 函数没调用 | 检查 theme toggle JS 里是否调用了 `syncHljsTheme` |
 
 ## 模板位置
 
 `concepts/template/index.html`
+
+依赖库：`concepts/template/libs/`（highlight.js + 主题 CSS，已下载好不要删）

@@ -14,6 +14,11 @@
       ],
       throwOnError: false
     });"></script>
+  <!-- highlight.js 代码高亮（本地） -->
+  <link rel="stylesheet" href="../template/libs/github.min.css" id="hljs-light">
+  <link rel="stylesheet" href="../template/libs/github-dark.min.css" id="hljs-dark" disabled>
+  <script defer src="../template/libs/highlight.min.js"
+    onload="document.querySelectorAll('pre code').forEach(b => { try { hljs.highlightElement(b); } catch(e) {} });"></script>
   <style>
     /* ============ 设计令牌 ============ */
     :root {
@@ -918,7 +923,7 @@
 
 <details class="code-details">
 <summary>展开：训 RM 的训练循环伪代码</summary>
-<div class="code-block"><pre><code># 数据：偏好对 (prompt, chosen, rejected)
+<div class="code-block"><pre><code class="language-python"># 数据：偏好对 (prompt, chosen, rejected)
 # RM 是一个 transformer，输入 (prompt, response) 输出标量分数
 
 for prompt, chosen, rejected in preference_dataset:
@@ -944,55 +949,112 @@ for p in RM.parameters():
 
 <h3>第 3 步：用 PPO 训 policy</h3>
 
+<p>下面的伪代码参考 <a href="https://github.com/OpenRLHF/OpenRLHF">OpenRLHF</a> 的实现，省略工程细节（分布式、混合精度、梯度累积等），只展示核心逻辑。关键是看出 PPO 和 PG 的区别：<b>采样和训练分离，一批样本训练多个 epoch</b>——这就是 off-policy 改良的体现。</p>
+
 <details class="code-details">
-<summary>展开：用 PPO 训 policy 的训练循环伪代码</summary>
-<div class="code-block"><pre><code># policy = SFT 后的 LLM（待训练）
-# ref_policy = policy 的冻结副本（KL 约束基准）
-# value_model = 另一个 LLM，预测状态的预期 return（当 baseline）
-# RM = 第 2 步训好的奖励模型（冻结）
+<summary>展开：用 PPO 训 policy 的训练循环伪代码（参考 OpenRLHF）</summary>
+<div class="code-block"><pre><code class="language-python"># ============ 模型准备 ============
+# actor        = SFT 后的 LLM（待训练，参数 θ）
+# ref_policy   = actor 的冻结副本（KL 约束基准，不更新）
+# critic       = 价值模型，预测每个 token 的预期 return（当 baseline）
+# reward_model = 第 2 步训好的 RM（冻结）
 
-for prompt in prompt_dataset:
-    # === 1. 采样：policy 生成回答 ===
-    response = policy.generate(prompt, num_samples=G)
-    # 通常对同一 prompt 采 G 个回答（GRPO 思路，PPO 也可做）
+# ============ 超参 ============
+# rollout_batch_size = 一次采样的 prompt 数（如 512）
+# num_epochs         = 一批样本训练几个 epoch（如 4）—— PPO 能复用旧样本的关键
+# mini_batch_size    = 训练时的 mini-batch 大小（如 64）
+# clip_eps           = 0.2, gamma = 1.0, lambd = 1.0, kl_coef = 0.001
 
-    # === 2. 打分：RM 给每个回答打 reward ===
-    rewards = [RM(prompt, r) for r in response]
+# ========================================
+# 外层循环：每个 episode = 一次采样 + 多 epoch 训练
+# ========================================
+for episode in range(num_episodes):
+    prompts = sample_prompts(prompt_dataset, batch_size=rollout_batch_size)
 
-    # === 3. 算 advantage（减 baseline 降方差）===
-    # value_model 预测"这个 prompt 的预期 return"
-    baseline = value_model(prompt)
-    advantages = [r - baseline for r in rewards]
-    # 归一化（工程实践）
-    advantages = (advantages - mean(advantages)) / std(advantages)
+    # ---------- 阶段 1：Rollout（采样 + 算经验）----------
+    # 用当前 actor 采一批样本。采完这批 θ 就冻结，
+    # 后面多个 epoch 都用这批样本训练——这是 PPO 的核心改良
+    experiences = []
+    for prompt in prompts:
+        # 1.1 当前 actor 生成 response
+        response = actor.generate(prompt)
 
-    # === 4. 算 importance ratio ===
-    # 用旧策略（采样时的 policy）算 log prob
-    log_prob_old = log_prob(prompt, response, policy_old)
-    # 用新策略（当前 policy）算 log prob
-    log_prob_new = log_prob(prompt, response, policy)
-    ratio = exp(log_prob_new - log_prob_old)   # r_t = π_new / π_old
+        # 1.2 算旧策略的 log prob（采样时的 actor，后面训练时不重新采样）
+        old_log_probs = actor.log_prob(prompt, response)
+        # 1.3 ref_policy 的 log prob（用于 KL 约束）
+        ref_log_probs = ref_policy.log_prob(prompt, response)
+        # 1.4 critic 预测每个 token 的 value
+        old_values = critic.value(prompt, response)
+        # 1.5 RM 打分（只在最后一个 token 给 reward）
+        reward = reward_model(prompt, response)
+        # 1.6 KL 惩罚：每个 token 的 reward = -kl_coef * KL + 最后 token 的 RM reward
+        kl = old_log_probs - ref_log_probs
+        token_rewards = -kl_coef * kl
+        token_rewards[-1] += reward
 
-    # === 5. PPO clip loss ===
-    eps = 0.2   # clip 范围
-    surr1 = ratio * advantages
-    surr2 = clip(ratio, 1-eps, 1+eps) * advantages
-    policy_loss = -min(surr1, surr2)    # 负号因为要最大化
+        # 1.7 GAE 算 advantage 和 return（从后往前递推）
+        advantages, returns = compute_gae(old_values, token_rewards, gamma, lambd)
 
-    # KL 惩罚（防止 policy 离 ref 太远）
-    kl = kl_divergence(policy, ref_policy, prompt, response)
-    policy_loss += beta * kl
+        experiences.append({
+            prompt, response, old_log_probs, old_values,
+            advantages, returns
+        })
 
-    # value loss（训 value_model 学会预测 return）
-    value_pred = value_model(prompt)
-    value_loss = mse(value_pred, mean(rewards))
+    # advantage 归一化（工程实践，降方差）
+    advantages = normalize(advantages)
 
-    # === 6. 反传 + 更新 ===
-    total_loss = policy_loss + value_loss_coef * value_loss
-    total_loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()</code></pre></div>
+    # ---------- 阶段 2：PPO 训练（一批样本训 num_epochs 轮）----------
+    # 这里体现 off-policy：用 old_log_probs（采样时的 actor）
+    # 训练时 θ 已经变了，用 importance ratio 修正
+    for epoch in range(num_epochs):
+        for batch in split_into_minibatches(experiences, mini_batch_size):
+            # ===== Actor 更新（policy loss）=====
+            # 当前 actor 重新算 log prob（θ 已经变了）
+            new_log_probs = actor.log_prob(batch.prompt, batch.response)
+            # importance ratio = π_new / π_old
+            ratio = exp(new_log_probs - batch.old_log_probs)
+
+            # clipped surrogate loss（PPO 核心）
+            surr1 = ratio * batch.advantages
+            surr2 = clamp(ratio, 1-clip_eps, 1+clip_eps) * batch.advantages
+            actor_loss = -mean(min(surr1, surr2))
+
+            # KL 惩罚（防止 actor 离 ref_policy 太远）
+            kl = new_log_probs - ref_log_probs
+            actor_loss += kl_coef * mean(kl)
+
+            actor_loss.backward()
+            actor_optimizer.step()
+            actor_optimizer.zero_grad()
+
+            # ===== Critic 更新（value loss）=====
+            # 训 critic 学会预测 return（让 baseline 更准）
+            new_values = critic.value(batch.prompt, batch.response)
+            # clipped value loss（和 policy loss 类似，clip 防止更新太激进）
+            values_clipped = batch.old_values + clamp(
+                new_values - batch.old_values, -clip_eps, clip_eps)
+            value_loss = 0.5 * mean(max(
+                (new_values - batch.returns) ** 2,
+                (values_clipped - batch.returns) ** 2))
+
+            value_loss.backward()
+            critic_optimizer.step()
+            critic_optimizer.zero_grad()
+
+    # 一批样本训完，进入下一个 episode 重新采样
+    # 新 episode 的 old_log_probs 会用新的 actor 重新算</code></pre></div>
 </details>
+
+<div class="callout callout-purple">
+<p><b>关键观察：on-policy → off-policy 在哪里体现</b>：</p>
+<ul>
+<li><b>采样的位置</b>：阶段 1 用<b>当前 actor</b> 采一批 response，算 <code>old_log_probs</code>。这一步是 on-policy 的——采的样本代表当前策略的行为分布</li>
+<li><b>训练的位置</b>：阶段 2 训练时 <code>actor</code> 的 θ 已经变了，但<b>不重新采样</b>。用 <code>ratio = exp(new_log_probs - old_log_probs)</code> 修正分布偏移——这就是 off-policy 的体现</li>
+<li><b>样本复用的关键</b>：一批样本训练 <code>num_epochs</code> 轮（通常 4）。PG 只能训 1 轮就丢，PPO 能训 4 轮——样本效率提升 4 倍</li>
+<li><b>clip 的作用</b>：训练几个 epoch 后 <code>ratio</code> 会偏离 1 越来越远。clip 把它限制在 <code>[1-ε, 1+ε]</code> 范围，超出就停止鼓励——防止 θ 偏离太远导致修正失效</li>
+</ul>
+<p>对比 PG：PG 是 <code>采一批 → 训 1 轮 → 丢掉 → 重新采</code>，每次 θ 变了旧样本就失效。PPO 是 <code>采一批 → 训 4 轮 → 丢掉 → 重新采</code>，4 轮都用 importance ratio 修正，样本利用率高 4 倍。</p>
+</div>
 
 <p>这是 RLHF 训练的核心循环。和 SFT/DPO 相比，工程复杂度高很多——要同时维护 4 个模型在显存里（policy、ref_policy、value_model、RM），还要算 importance ratio 和 clip。这也是为什么 DPO 流行：去掉 ref_policy、value_model、RM，只留 policy 一个模型，循环和 SFT 几乎一样。</p>
 
@@ -1051,16 +1113,26 @@ backToTop.addEventListener('click', () => {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 
-// ============ 暗/亮模式切换（带 localStorage 持久化）============
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
 const themeToggle = document.getElementById('themeToggle');
 const savedTheme = localStorage.getItem('theme') ||
   (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 document.documentElement.setAttribute('data-theme', savedTheme);
+function syncHljsTheme(theme) {
+  const light = document.getElementById('hljs-light');
+  const dark = document.getElementById('hljs-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncHljsTheme(savedTheme);
 themeToggle.addEventListener('click', () => {
   const current = document.documentElement.getAttribute('data-theme');
   const next = current === 'dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
   localStorage.setItem('theme', next);
+  syncHljsTheme(next);
 });
 
 // ============ 自动生成侧边目录 ============
