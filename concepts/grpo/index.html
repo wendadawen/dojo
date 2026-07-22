@@ -689,6 +689,8 @@
 <p>$$A_i = \frac{r_i - \bar{r}}{\text{std}(\{r_1, \ldots, r_G\})}$$</p>
 <p>这样 $A_i$ 的尺度固定（大致在 $[-\sqrt{G}, \sqrt{G}]$ 范围），与 reward 的绝对大小无关。学习率不用跟着 reward 尺度调。</p>
 
+<p><b>关于 std 的分母</b>：数学上写 $\text{std} = \sqrt{\frac{1}{G} \sum (r_j - \bar{r})^2}$（总体标准差，分母 $G$）。但 <b>实现里用无偏估计</b>（分母 $G-1$）—— TRL 的 <code>nanstd</code> 和 OpenRLHF 的 <code>rewards.std(-1)</code> 都是这样。两者只差一个常数因子 $\sqrt{G/(G-1)}$，不影响 advantage 的符号和相对大小，所以对训练效果影响很小。分母还会加个小 $\epsilon$（TRL 用 $10^{-4}$，OpenRLHF 用 $10^{-9}$）防除零。</p>
+
 <p><b>第 4 步：边缘情况——std = 0 怎么办</b></p>
 <p>如果 $G$ 个回答 reward 全一样（全对或全错），$\text{std} = 0$，分母为 0。这时所有 $A_i = 0$，梯度消失，相当于"这一组没学到东西，跳过"。这其实是<b>正确行为</b>：全对说明太简单（无须学），全错说明太难（学不动）。代码实现里分母加个小 $\epsilon$ 防除零。</p>
 
@@ -769,9 +771,11 @@
 
 <p><b>第 3 步：Schulman 的 k3 估计器</b></p>
 <p>John Schulman 提过一个低方差无偏估计器（GRPO 论文用的就是这个）：</p>
-<p>$$D_{KL}\big(\pi_\theta(\cdot|q) \,\|\, \pi_{\text{ref}}(\cdot|q)\big) \approx \frac{\pi_{\text{ref}}(o|q)}{\pi_\theta(o|q)} - \log \frac{\pi_{\text{ref}}(o|q)}{\pi_\theta(o|q)}$$</p>
-<p>令 $r = \pi_{\text{ref}}(o|q) / \pi_\theta(o|q)$，则估计器为 $r - \log r$。这个形式在 $r = 1$（两分布相同）时为 0，且对偏离 1 的两边都给非负的惩罚，方差小。</p>
-<p>实现时按 token 级别算，对一条回答的所有 token 求和/求平均。</p>
+<p>$$D_{KL}\big(\pi_\theta(\cdot|q) \,\|\, \pi_{\text{ref}}(\cdot|q)\big) \approx \frac{\pi_{\text{ref}}(o|q)}{\pi_\theta(o|q)} - \log \frac{\pi_{\text{ref}}(o|q)}{\pi_\theta(o|q)} - 1$$</p>
+<p>令 $r = \pi_{\text{ref}}(o|q) / \pi_\theta(o|q)$，则估计器为 $r - \log r - 1$。这个形式在 $r = 1$（两分布相同）时为 0，且由 AM-GM 不等式 $r - \log r \geq 1$，所以 $r - \log r - 1 \geq 0$——<b>永远非负</b>，方差小。实现时按 token 级别算，对一条回答的所有 token 求和/求平均。</p>
+<p>代码里用 log prob 差直接写更方便（避免除法）：</p>
+<p>$$\text{kl} = \exp(\log \pi_{\text{ref}} - \log \pi_\theta) - (\log \pi_{\text{ref}} - \log \pi_\theta) - 1$$</p>
+<p>这就是 TRL 的 <code>GRPOTrainer._compute_loss</code> 和 OpenRLHF 的 <code>compute_approx_kl(kl_estimator="k3")</code> 用的形式。</p>
 
 <p><b>关键符号解释</b>：</p>
 <ul>
@@ -792,10 +796,10 @@
 
 <h2>训练循环伪代码</h2>
 
-<p>上面的数学怎么落地成代码？下面的伪代码参考 <a href="https://github.com/OpenRLHF/OpenRLHF">OpenRLHF</a> 的 GRPO 实现风格，省略工程细节（分布式、混合精度、梯度累积等），只展示核心逻辑。关键是看出 GRPO 和 PPO 的两个区别：<b>组采样 + 无 critic</b>。</p>
+<p>上面的数学怎么落地成代码？下面的伪代码参考 <a href="https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py">TRL 的 <code>GRPOTrainer</code></a> 和 <a href="https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/loss.py">OpenRLHF 的 <code>PolicyLoss</code></a>，省略工程细节（分布式、混合精度、梯度累积等），只展示核心逻辑。关键是看出 GRPO 和 PPO 的两个区别：<b>组采样 + 无 critic</b>。</p>
 
 <details class="code-details">
-<summary>展开：GRPO 训练循环伪代码（参考 OpenRLHF 风格）</summary>
+<summary>展开：GRPO 训练循环伪代码（参考 TRL / OpenRLHF 实现）</summary>
 <div class="code-block">
 <pre><code class="language-python"># ============ 模型准备 ============
 # actor      = SFT 后的 LLM（待训练，参数 θ）
@@ -803,84 +807,94 @@
 # reward_fn  = 规则验证器（RLVR：答对返回 1，答错返回 0）
 # 注意：没有 critic / value model —— 这是 GRPO 区别于 PPO 的核心
 
-# ============ 超参 ============
-# rollout_batch_size = 一次采样的 prompt 数（如 512）
-# G                  = 每个 prompt 采几个回答（如 8）—— GRPO 的"组大小"
-# num_epochs         = 一批样本训练几个 epoch（如 4）—— 和 PPO 一样复用旧样本
-# mini_batch_size    = 训练时的 mini-batch 大小（如 64）
-# clip_eps           = 0.2, kl_coef = 0.01
+# ============ 超参（对齐 TRL 的 GRPOConfig 命名）============
+# num_generations (G) = 每个 prompt 采几个回答（如 8）—— GRPO 的"组大小"
+# num_iterations (μ)  = 一批样本训几轮（如 1~4）—— 和 PPO 一样复用旧样本
+# epsilon             = 0.2（PPO clip 范围）
+# beta                = 0.01（KL 惩罚系数；为 0 时不加载 ref_policy）
 
 # ========================================
-# 外层循环：每个 episode = 一次采样 + 多 epoch 训练
+# 外层循环：每个 episode = 一次采样 + 多轮训练
 # ========================================
 for episode in range(num_episodes):
     prompts = sample_prompts(prompt_dataset, batch_size=rollout_batch_size)
 
     # ---------- 阶段 1：Rollout（采样 + 组内算 advantage）----------
-    # 对每个 prompt 采 G 个回答，组内归一化算 advantage
     experiences = []
     for prompt in prompts:
-        group_responses = []      # 这一组 G 个回答
-        group_old_log_probs = []  # 采样时 actor 的 log prob（每个回答一份）
-        group_ref_log_probs = []  # ref_policy 的 log prob（用于 KL）
-        group_rewards = []        # 每个回答的最终 reward（标量）
-
         # 1.1 对同一 prompt 采 G 个回答（GRPO 核心：组采样）
+        # 实际实现是 batched generate，这里用循环示意
+        group = []
         for i in range(G):
             response = actor.generate(prompt)
-            # 采样时旧策略的 log prob（训练时不重新采样，固定值）
+            # 采样时旧策略的 per-token log prob（训练时当固定值）
             old_log_probs = actor.log_prob(prompt, response).detach()
-            ref_log_probs = ref_policy.log_prob(prompt, response)  # 冻结，无梯度
-            # RLVR：规则验证，1 / 0
-            reward = reward_fn(prompt, response)  # 标量
-
-            group_responses.append(response)
-            group_old_log_probs.append(old_log_probs)
-            group_ref_log_probs.append(ref_log_probs)
-            group_rewards.append(reward)
+            # ref_policy 的 per-token log prob（冻结，无梯度）
+            ref_log_probs = ref_policy.log_prob(prompt, response)
+            # completion_mask：哪些 token 是回答（非 padding、非 prompt）
+            completion_mask = build_mask(response)
+            # RLVR：规则验证，1 / 0（标量）
+            reward = reward_fn(prompt, response)
+            group.append((response, old_log_probs, ref_log_probs,
+                          completion_mask, reward))
 
         # 1.2 组内归一化算 advantage（GRPO 核心：代替 value model 的 baseline）
-        #     A_i = (r_i - mean) / (std + eps)
-        rewards_tensor = stack(group_rewards)         # shape: (G,)
-        mean_r = rewards_tensor.mean()
-        std_r = rewards_tensor.std()
-        advantages = (rewards_tensor - mean_r) / (std_r + 1e-8)  # shape: (G,)
-        # 每个回答的 advantage 是标量，广播到该回答所有 token
-        # （outcome reward 只在最后给出，整条回答共享一个 advantage）
+        #     对齐 TRL：advantages = (r - mean) / (std + 1e-4)
+        #     std 用无偏估计（N-1，PyTorch 默认）
+        rewards = stack([g[4] for g in group])       # shape: (G,)
+        mean_r = rewards.mean()
+        std_r = rewards.std(unbiased=True)            # 无偏 std（N-1）
+        advantages = (rewards - mean_r) / (std_r + 1e-4)  # shape: (G,)
 
-        for i in range(G):
+        for i, (resp, old_lp, ref_lp, mask, _) in enumerate(group):
             experiences.append({
-                'prompt': prompt,
-                'response': group_responses[i],
-                'old_log_probs': group_old_log_probs[i],   # shape: (seq_len,)
-                'ref_log_probs': group_ref_log_probs[i],   # shape: (seq_len,)
-                'advantage': advantages[i],                # 标量，广播到所有 token
-                'reward': group_rewards[i],                # 标量
+                'response': resp,
+                'old_log_probs': old_lp,    # shape: (seq_len,)
+                'ref_log_probs': ref_lp,    # shape: (seq_len,)
+                'completion_mask': mask,    # shape: (seq_len,) 0/1
+                # advantage 是标量，广播到该回答所有 token
+                'advantage': advantages[i],
             })
 
-    # ---------- 阶段 2：GRPO 训练（一批样本训 num_epochs 轮）----------
+    # ---------- 阶段 2：GRPO 训练（一批样本训 num_iterations 轮）----------
     # 和 PPO 一样：用 old_log_probs 修正分布偏移（off-policy）
     # 不像 PPO：没有 critic 更新步骤
-    for epoch in range(num_epochs):
+    for _ in range(num_iterations):
         for batch in split_into_minibatches(experiences, mini_batch_size):
             # ===== Actor 更新（policy loss）=====
-            # 当前 actor 重新算 log prob（θ 已经变了）
+            # 当前 actor 重新算 per-token log prob（θ 已经变了）
             new_log_probs = actor.log_prob(batch.prompt, batch.response)
+
             # importance ratio = π_new / π_old
-            ratio = exp(new_log_probs - batch.old_log_probs)
+            # 对齐 OpenRLHF：先 clamp log_ratio 到 [-20, 20] 防 exp 溢出
+            log_ratio = (new_log_probs - batch.old_log_probs).clamp(-20, 20)
+            ratio = log_ratio.exp()                       # shape: (B, seq_len)
+
+            # advantage 从 (B,) unsqueeze 到 (B, 1) 广播到所有 token
+            adv = batch.advantage.unsqueeze(1)            # shape: (B, 1)
 
             # clipped surrogate loss（和 PPO 完全一样）
-            surr1 = ratio * batch.advantage   # advantage 广播到每个 token
-            surr2 = clamp(ratio, 1-clip_eps, 1+clip_eps) * batch.advantage
-            actor_loss = -mean(min(surr1, surr2))
+            surr1 = ratio * adv
+            surr2 = clamp(ratio, 1-epsilon, 1+epsilon) * adv
+            per_token_policy_loss = -min(surr1, surr2)   # shape: (B, seq_len)
 
             # KL 惩罚（每 token 算，防 actor 离 ref_policy 太远）
-            # 用 Schulman k3 估计器：r - log r，其中 r = π_ref / π_new
-            ref_ratio = exp(batch.ref_log_probs - new_log_probs)
-            kl = ref_ratio - log(ref_ratio)
-            actor_loss += kl_coef * mean(kl)
+            # 对齐 TRL/OpenRLHF：用 Schulman k3 估计器
+            #   kl = exp(ref - new) - (ref - new) - 1
+            # 等价于 r - log r - 1，其中 r = π_ref / π_new
+            # -1 保证 kl ≥ 0（r - log r ≥ 1，等号在 r=1 即两分布相同时取）
+            log_ref_diff = batch.ref_log_probs - new_log_probs
+            per_token_kl = log_ref_diff.exp() - log_ref_diff - 1  # shape: (B, seq_len)
 
-            actor_loss.backward()
+            # 合并 policy loss + KL（KL 项乘 beta）
+            per_token_loss = per_token_policy_loss + beta * per_token_kl
+
+            # 对齐 TRL 的 loss_type="grpo"：先按 completion_mask 求每条回答的均值，再对 batch 求均值
+            mask = batch.completion_mask                    # shape: (B, seq_len)
+            seq_loss = (per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+            loss = seq_loss.mean()
+
+            loss.backward()
             actor_optimizer.step()
             actor_optimizer.zero_grad()
 
@@ -896,9 +910,11 @@ for episode in range(num_episodes):
 <p><b>伪代码里出现的工程概念速查</b>：</p>
 <ul>
 <li><b><code>.detach()</code></b>：把 tensor 从计算图摘出来，当常数用。<code>old_log_probs</code> 是采样时旧策略算的，训练时要当固定值（不能让它的梯度影响当前 θ），所以 detach。等价写法：<code>with torch.no_grad():</code> 包整个块（ref_policy 用这种，因为它本来就冻结）。</li>
-<li><b><code>stack</code></b>：把一组 tensor 拼成新维度。把 G 个标量 reward 拼成 shape <code>(G,)</code> 的向量，方便向量化的 mean/std 计算。</li>
-<li><b><code>advantage 广播</b></b>：每个回答的 advantage 是一个标量（基于整条回答的最终 reward 算出），但训练时回答有多个 token。把标量 advantage 当作该回答所有 token 的 advantage——outcome reward 场景的标准做法。</li>
-<li><b><code>kl_coef</code></b>：KL 惩罚系数 $\beta$，控制 actor 偏离 ref_policy 的容忍度。通常 0.001~0.01。</li>
+<li><b><code>std(unbiased=True)</code></b>：PyTorch 默认用无偏 std（分母是 $G-1$ 不是 $G$）。TRL 的 <code>nanstd</code> 和 OpenRLHF 的 <code>rewards.std(-1)</code> 都用无偏估计。分母加 <code>1e-4</code>（TRL）或 <code>1e-9</code>（OpenRLHF）防除零。</li>
+<li><b><code>log_ratio.clamp(-20, 20)</code></b>：数值稳定性。如果 <code>new_log_probs</code> 和 <code>old_log_probs</code> 差异大，<code>exp</code> 会溢出成 <code>inf</code>。clamp 到 <code>[-20, 20]</code> 保证 <code>exp</code> 结果在 <code>[e^-20, e^20]</code> 范围内。OpenRLHF 的 <code>PolicyLoss</code> 就是这么做的。</li>
+<li><b><code>advantage.unsqueeze(1)</code></b>：每个回答的 advantage 是一个标量（基于整条回答的最终 reward 算出），但训练时回答有多个 token。把 <code>(B,)</code> 变成 <code>(B, 1)</code>，PyTorch 广播机制自动把它扩展到 <code>(B, seq_len)</code>——outcome reward 场景的标准做法（TRL 的 <code>advantages.unsqueeze(1)</code>）。</li>
+<li><b><code>completion_mask</code></b>：0/1 mask，标记哪些 token 是有效回答（排除 padding 和 prompt token）。算 loss 时只对有效 token 求均值。TRL 用 <code>completion_mask</code>，OpenRLHF 用 <code>action_mask</code>，含义相同。</li>
+<li><b><code>beta</code></b>：KL 惩罚系数。TRL 默认 <code>beta=0.0</code>（不加 KL、不加载 ref_policy，靠 clip 约束就够）；DeepSeek 实现里用 0.01 左右。设为 0 时整个 KL 项和 ref_policy 都可以省掉。</li>
 </ul>
 </div>
 
@@ -908,7 +924,7 @@ for episode in range(num_episodes):
 <li><b>组采样</b>：阶段 1 对每个 prompt 采 $G$ 个回答（PPO 只采 1 个）。这 $G$ 个回答的 reward 提供组内 baseline</li>
 <li><b>组内 advantage</b>：用 $A_i = (r_i - \bar{r}) / \text{std}$ 算 advantage（PPO 用 $A = G - V(s)$，需要 critic 估 $V(s)$）</li>
 <li><b>无 critic 更新</b>：阶段 2 只更新 actor，没有 critic loss 步骤——这是 GRPO 区别于 PPO 的核心，也是省一半显存的来源</li>
-<li><b>其他完全一样</b>：importance ratio、clip、num_epochs 样本复用、KL 每 token——这些机制 GRPO 直接继承 PPO</li>
+<li><b>其他完全一样</b>：importance ratio（带 clamp 防 overflow）、clip、num_iterations 样本复用、KL 每 token——这些机制 GRPO 直接继承 PPO</li>
 </ul>
 <p>对比 PPO 伪代码：PPO 在阶段 2 多一步 critic 更新（<code>value_loss.backward(); critic_optimizer.step()</code>），且阶段 1 要算 <code>old_values = critic.value(...)</code> 和 GAE。GRPO 把这些全删了。</p>
 </div>
@@ -989,11 +1005,11 @@ for episode in range(num_episodes):
 
 <h2>事实/公式出处（有明确来源）</h2>
 <p>一、问题：PPO 的 advantage $A = G - V(s)$ 需要 value model ← Schulman et al. 2017 (PPO)；"value function needs to be as large as the policy model" ← Shao et al. 2024 (DeepSeekMath) §3 原话；value model 从 SFT 初始化、与 policy 同规模 ← InstructGPT §3.3</p>
-<p>二、方法：组内 advantage $A_i = (r_i - \bar{r}) / \text{std}$ ← Shao et al. 2024 (DeepSeekMath) §3.2 公式 (5)；GRPO 完整目标（含 clip + KL）← 同上 §3.2 公式 (6)；KL 的 k3 估计器 ← Schulman 2016 blog，DeepSeekMath 实现采用；GRPO 应用于 DeepSeek-R1 ← DeepSeek-AI 2025 §2.2；伪代码风格参考 OpenRLHF 开源实现</p>
+<p>二、方法：组内 advantage $A_i = (r_i - \bar{r}) / \text{std}$ ← Shao et al. 2024 (DeepSeekMath) §3.2 公式 (5)；GRPO 完整目标（含 clip + KL）← 同上 §3.2 公式 (6)；KL 的 k3 估计器 ← Schulman 2016 blog，DeepSeekMath 实现采用；GRPO 应用于 DeepSeek-R1 ← DeepSeek-AI 2025 §2.2；伪代码经 TRL <code>GRPOTrainer._compute_loss</code>（<code>grpo_trainer.py</code> §2991-3150）和 OpenRLHF <code>PolicyLoss</code>（<code>models/loss.py</code> §121-231）+ <code>compute_approx_kl</code>（<code>models/utils.py</code> §64-95）+ <code>compute_advantages_and_returns</code>（<code>experience_maker.py</code> §269-270）核对：KL 用 k3 带 -1、log_ratio clamp 到 [-20,20]、std 无偏估计 (N-1)、advantage 标量广播到 token、loss 按 completion_mask 求 per-sequence 均值再对 batch 求均值</p>
 <p>三、总结：PPO vs GRPO 对比表 ← DeepSeekMath §3.2 + §4 实验观察</p>
 
 <h2>解读者推断（不在论文中，需独立验证）</h2>
-<p>"自适应难度"的解释（难题给大 advantage、简单题自动跳过）是 Z-score 归一化的性质推论，论文未明说。"采样开销比 PPO 大 $G$ 倍换显存"的交易分析是本文档构造的工程视角，需读者自行判断。"工业界推理模型主流用 GRPO + RLVR"是 2024-2025 的趋势观察，不是某一篇论文的明确结论。"理论上可以用更小的 value model"是 PPO 框架的一般性质（value model 大小是设计选择），但 DeepSeekMath 论文明确指出"小了估不准"。伪代码里的具体工程细节（advantage 广播、detach 位置、reward 加在最后一个 token 等）参考 OpenRLHF 实现，DeepSeekMath 论文未明确写出这些实现细节。</p>
+<p>"自适应难度"的解释（难题给大 advantage、简单题自动跳过）是 Z-score 归一化的性质推论，论文未明说。"采样开销比 PPO 大 $G$ 倍换显存"的交易分析是本文档构造的工程视角，需读者自行判断。"工业界推理模型主流用 GRPO + RLVR"是 2024-2025 的趋势观察，不是某一篇论文的明确结论。"理论上可以用更小的 value model"是 PPO 框架的一般性质（value model 大小是设计选择），但 DeepSeekMath 论文明确指出"小了估不准"。TRL 默认 <code>beta=0.0</code>（不加 KL、不加载 ref_policy）——文档里写 <code>beta=0.01</code> 是对齐 DeepSeek 实现，不是 TRL 默认值。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
