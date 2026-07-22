@@ -1,6 +1,6 @@
 # 概念教学文档写作流程
 
-**产物**：纯 HTML + KaTeX（CDN）。每个概念一个目录，主入口 `index.html`。
+**产物**：纯 HTML + KaTeX（本地库）。每个概念一个目录，主入口 `index.html`。
 
 **读者画像**：零基础入门训练/RL/post-training 的工程师。有技术基础但不懂这个领域。30 秒能抓要点，展开折叠能看到完整公式推导。
 
@@ -182,7 +182,7 @@ blockquote.meta
 
 ## 代码高亮
 
-- 用 highlight.js（本地，存在 `concepts/template/libs/`），不要用 CDN。
+- 用 highlight.js（本地，存在项目根 `libs/`），不要用 CDN。
 - 代码块写 `<pre><code class="language-python">...</code></pre>`，highlight.js 会自动着色。
 - 暗/亮模式切换时，JS 会自动切换 github / github-dark 主题（`syncHljsTheme` 函数已实现，不要删）。
 - 代码块仍然用 `<details class="code-details">` 折叠（见前文规范）。
@@ -191,7 +191,7 @@ blockquote.meta
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
-| `$...$` 原样显示 | KaTeX 没加载 | 检查 CDN |
+| `$...$` 原样显示 | KaTeX 没加载 | 检查 `libs/katex.min.js` 路径 |
 | `<code>$...$</code>` 不渲染 | KaTeX auto-render 不扫描 `<code>` 内部 | 去掉 `<code>`，直接用 `$...$` |
 | `rac{...}` 乱码 | JS 把 `\f` 当 form feed | 写 `\\frac` |
 | `k=y` 显示异常 | `\mathbb{1}` 不支持 | 用 `\delta_{ky}` |
@@ -209,4 +209,4 @@ blockquote.meta
 
 `concepts/template/index.html`
 
-依赖库：`concepts/template/libs/`（highlight.js + 主题 CSS，已下载好不要删）
+依赖库：项目根 `libs/`（KaTeX + highlight.js + 主题 CSS + 字体，已下载好不要删）
