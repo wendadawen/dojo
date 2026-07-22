@@ -579,7 +579,7 @@
 
 <div class="callout callout-blue">
 <p><b>问题</b>：SFT 只能教模型模仿标准答案，但很多问题没有标准答案，只有"谁比谁好"<br>
-<b>方案</b>：用人工标注的偏好对训一个"助教"（RM），再用 RM 当环境做 RL 训 LLM<br>
+<b>方案</b>：用人工标注的偏好对训一个奖励模型（RM），再用 RM 当 reward 信号做 RL 训 LLM<br>
 <b>产物</b>：一个能持续对齐人类偏好的 LLM（ChatGPT 走的就是这条路）</p>
 </div>
 
@@ -598,8 +598,8 @@
 <thead><tr><th>术语</th><th>大白话</th></tr></thead>
 <tbody>
 <tr><td>policy</td><td>你正在训练的那个 LLM 本身。不是模型的某个部分，就是整个模型</td></tr>
-<tr><td>RM</td><td>奖励模型，一个"助教"。输入 (prompt, 回答)，输出一个标量分数</td></tr>
-<tr><td>reward</td><td>RM 给这个回答打的分。分高 = 回答好</td></tr>
+<tr><td>RM</td><td>奖励模型。输入 (prompt, 回答)，输出一个标量分数。分高 = 回答好</td></tr>
+<tr><td>reward</td><td>RM 给这个回答打的分</td></tr>
 <tr><td>偏好数据</td><td>(prompt, 好回答, 差回答) 三元组。人工标的</td></tr>
 <tr><td>PPO</td><td>RLHF 第 3 步用的具体 RL 算法。是 PG（策略梯度）的改良版</td></tr>
 <tr><td>DPO</td><td>RLHF 的简化替代方案，跳过 RM 和 RL，直接在偏好数据上算 loss</td></tr>
@@ -610,14 +610,9 @@
 <h1>一、问题：SFT 教不会模型"谁比谁好"</h1>
 <p class="chapter-summary">本章你将知道：为什么 SFT 不够，需要一种新的训练方式。</p>
 
-<p>假设你在教一个小孩学算术。SFT（监督微调）的方式是：你出题"1+1="，告诉标准答案是"2"，让小孩模仿。</p>
+<p>SFT（监督微调）的方式是：给模型看 (prompt, 标准答案) 对，让它模仿。比如 <code>"1+1=" → "2"</code>。这教得会算术题，但很多问题没有唯一标准答案。</p>
 
-<p>这教得会"1+1=2"，但问题来了：</p>
-
-<ul>
-<li>"怎么学 Python？"这种开放问题，没有唯一标准答案。"看官方文档"和"做项目练手"都不错，你没法说哪个是"标准答案"</li>
-<li>但你能说"看官方文档"比"不知道"好——这是<b>偏好</b>，不是标准答案</li>
-</ul>
+<p>比如"怎么学 Python？"——"看官方文档"和"做项目练手"都不错，没法说哪个是"标准答案"。但你能说"看官方文档"比"不知道"好。这是<b>偏好</b>，不是标准答案。</p>
 
 <p>SFT 只能给标准答案让模型模仿，没法教"在两个都可以的答案里，挑人类更喜欢的那个"。这是 SFT 的根本局限。</p>
 
@@ -630,58 +625,39 @@
 <p>这是 RLHF 区别于 SFT 的本质。SFT 教"该说什么"，RLHF 教"什么更好"。</p>
 </div>
 
-<h1>二、方法：用助教（RM）+ RL 训小孩（policy）</h1>
+<h1>二、方法：训 RM 当 reward 信号，用 RL 训 policy</h1>
 <p class="chapter-summary">本章你将知道：RLHF 的三步流程，以及每步在干什么。</p>
 
-<h2>直觉：教小孩学算术的完整故事</h2>
+<h2>直觉</h2>
 
-<p>RLHF 听着唬人，其实就是<b>教小孩学算术</b>。整个流程每一步都能对应到这个生活场景：</p>
+<p>RLHF 要解决的核心问题是：<b>人工标注太贵，但 RL 需要大量 reward 信号</b>。每次 policy 生成一个回答都要打分，靠人工跟不上。解决方案是训一个 RM 代替人工——用少量人工偏好数据训 RM，之后 RM 能批量给任意 (prompt, 回答) 打分。</p>
 
-<div class="table-scroll">
-<table>
-<thead><tr><th>RLHF</th><th>教小孩学算术</th></tr></thead>
-<tbody>
-<tr><td>policy（你要训的 LLM）</td><td>小孩</td></tr>
-<tr><td>prompt</td><td>你出的题（如"1+1="）</td></tr>
-<tr><td>action</td><td>小孩的回答（如"2"）</td></tr>
-<tr><td>reward</td><td>判分："对/错"</td></tr>
-<tr><td>偏好数据</td><td>你给助教看的几道例题</td></tr>
-<tr><td>RM（奖励模型）</td><td>助教——你太忙，找他帮你判分</td></tr>
-<tr><td>训 RM</td><td>教助教"什么样的答案该给高分"</td></tr>
-<tr><td>用 RL 训 policy</td><td>小孩答题→助教判分→小孩根据分数调整</td></tr>
-<tr><td>PPO</td><td>助教判分别太绝，防止小孩钻空子</td></tr>
-</tbody>
-</table>
-</div>
+<p>整个流程分三步：偏好数据 → 训 RM → 用 RL（PPO 算法）训 policy。下面按顺序讲。</p>
 
-<p>记住这个类比，下面三步按顺序走。</p>
+<h2>第 1 步：偏好数据</h2>
 
-<h2>第 1 步：偏好数据——你给助教看的例题</h2>
-
-<p>你是老师，要教小孩学算术。你太忙，找了个助教帮你判分。但助教一开始不知道"1+1= 的好答案是 2，差答案是 3"，你得先给他看几道例题。</p>
-
-<p>偏好数据就是这个"例题"——每条是一组 (题目, 好答案, 差答案)：</p>
+<p>偏好数据是 RLHF 的燃料。每条数据是一组 (prompt, 好答案, 差答案) 三元组，人工标注"哪个回答更好"：</p>
 
 <div class="callout callout-purple">
 <p><b>数据格式</b>：<code>(x, y_w, y_l)</code></p>
 <ul>
-<li><code>x</code> = 题目（prompt）</li>
-<li><code>y_w</code> = 好答案（chosen，win）</li>
-<li><code>y_l</code> = 差答案（rejected，lose）</li>
+<li><code>x</code> = prompt（题目）</li>
+<li><code>y_w</code> = chosen（好答案，win）</li>
+<li><code>y_l</code> = rejected（差答案，lose）</li>
 </ul>
 </div>
 
-<p>例题不用太多——几万到几十万条就够训一个助教。但每条都要人看，所以很贵。这是整个 RLHF 最耗人工的环节。</p>
+<p>数据量不用太大——几万到几十万条就够训一个 RM。但每条都要人看，所以很贵。这是整个 RLHF 最耗人工的环节。</p>
 
-<h2>第 2 步：训 RM——教助教判分</h2>
+<h2>第 2 步：训 RM</h2>
 
-<p>助教看了几道例题后，要能<b>举一反三</b>——给没见过的 (题目, 答案) 也能打分。这就是训 RM。</p>
+<p>RM 是一个打分模型：输入 (prompt, 回答)，输出一个标量分数。训练目标是让好答案的分高于差答案的分。</p>
 
-<p>训练前助教什么都不知道，给所有答案打 0 分。训练后学会"好答案分高，差答案分低"：</p>
+<p>训练前 RM 什么都不知道，给所有答案打 0 分。训练后学会"好答案分高，差答案分低"：</p>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>题目</th><th>答案</th><th>训练前 RM 分</th><th>训练后 RM 分</th></tr></thead>
+<thead><tr><th>prompt</th><th>回答</th><th>训练前 RM 分</th><th>训练后 RM 分</th></tr></thead>
 <tbody>
 <tr><td>1+1=</td><td>2</td><td>0</td><td><b>+1.0</b></td></tr>
 <tr><td>1+1=</td><td>3</td><td>0</td><td><b>-1.0</b></td></tr>
@@ -710,21 +686,21 @@
 <p>来源：Christiano et al. 2017 + InstructGPT 论文 §3.2。</p>
 </details>
 
-<p>训完 RM，助教上线。后面 policy 每生成一个回答，RM 都能给它打分——这就是 RL 需要的 reward 信号。</p>
+<p>训完 RM，它就能给任意 (prompt, 回答) 打分——这就是 RL 需要的 reward 信号。</p>
 
-<h2>第 3 步：用 RL 训 policy——小孩答题→助教判分→调整</h2>
+<h2>第 3 步：用 RL 训 policy</h2>
 
-<p>助教上线，开始训小孩。流程：</p>
+<p>有了 RM 当 reward 信号，就可以做 RL 训练 policy。流程：</p>
 
 <div class="callout callout-green">
 <p><b>RL 训练循环</b>：</p>
 <ol>
-<li>小孩（policy）看题，生成一个回答</li>
-<li>助教（RM）给这个回答打分（reward）</li>
-<li>小孩根据分数调整——分数高的回答概率变大，分数低的变小</li>
+<li>policy 看 prompt，生成一个回答</li>
+<li>RM 给这个回答打分（reward）</li>
+<li>policy 根据分数调整——分数高的回答概率变大，分数低的变小</li>
 <li>回到第 1 步，继续</li>
 </ol>
-<p>多轮之后，小孩学会生成高分回答。</p>
+<p>多轮之后，policy 学会生成高分回答。</p>
 </div>
 
 <p>这是 RL（强化学习）的核心：<b>没有标准答案，只有 reward 信号</b>。模型通过试错，慢慢学会生成高 reward 的回答。区别于 SFT 的"模仿标准答案"。</p>
@@ -742,13 +718,13 @@
 <p>来源：Williams 1992 (REINFORCE) + Policy Gradient Theorem。</p>
 </details>
 
-<h2>PPO：助教判分别太绝（PG 的改良版）</h2>
+<h2>PPO：PG 的改良版</h2>
 
 <p>PG 有两个问题：</p>
 
 <ol>
-<li><b>太浪费样本</b>：PG 是 on-policy——采一次用一次就丢。每次更新后策略变了，旧样本就失效。小孩答完一次就丢，下次又要重新答</li>
-<li><b>可能被骗</b>：如果某次小孩乱答但助教给高分（reward hacking），小孩会一直乱答。PG 没有保护机制</li>
+<li><b>太浪费样本</b>：PG 是 on-policy——采一次用一次就丢。每次更新后策略变了，旧样本就失效</li>
+<li><b>可能被骗</b>：如果某次 policy 乱答但 RM 给高分（reward hacking），policy 会一直乱答。PG 没有保护机制</li>
 </ol>
 
 <p><b>PPO</b>（Proximal Policy Optimization）是 PG 的改良版，解决这两个问题：</p>
@@ -759,7 +735,7 @@
 <li><b>复用旧样本</b>：用 importance ratio（$r_t = \pi_\text{new} / \pi_\text{old}$）让旧样本也能参与训练。省数据</li>
 <li><b>clip（截断）</b>：限制 $r_t$ 在 $[1-\epsilon, 1+\epsilon]$ 范围（通常 $\epsilon = 0.2$）。超出范围梯度消失——相当于自动刹车，防止 policy 偏太远</li>
 </ul>
-<p>类比：助教判分别太绝。如果发现小孩某次"乱答"也能骗到高分，PPO 说"先别太激进，最多允许偏离 20%"，超出就停止鼓励。</p>
+<p>直觉：允许 policy 往高分方向调整，但不能一步跳太远。如果发现某次"乱答"也能骗到高分，clip 说"先别太激进，最多允许偏离 20%"，超出就停止鼓励。</p>
 </div>
 
 <details>
@@ -810,7 +786,7 @@
 <p>三、总结：DPO vs RLHF 对比 ← Rafailov et al. 2023 (DPO 论文)</p>
 
 <h2>解读者推断（不在论文中，需独立验证）</h2>
-<p>"教小孩学算术"类比、各步骤的命名（"助教""判分别太绝"等）是本文档构造的直觉映射，用于帮助理解，不是论文术语。"DPO 做 base，RLHF 做精细调整"是工业界常见做法的概括，不是某一篇论文的明确结论。</p>
+<p>本文档对直觉的解释（如"自动刹车""防钻空子"等比喻）是辅助理解的映射，不是论文术语。"DPO 做 base，RLHF 做精细调整"是工业界常见做法的概括，不是某一篇论文的明确结论。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
