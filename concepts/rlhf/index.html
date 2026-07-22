@@ -600,6 +600,12 @@
 <tr><td>PPO</td><td>RLHF 第 3 步用的具体 RL 算法。是 PG（策略梯度）的改良版</td></tr>
 <tr><td>on-policy</td><td>采样和更新用同一个 policy。采一次用一次就丢，样本效率低。PG 就是 on-policy</td></tr>
 <tr><td>off-policy</td><td>采样用一个 policy，更新另一个。用 importance ratio 修正，旧样本可复用</td></tr>
+<tr><td>advantage</td><td>$A = G - V(s)$，这次 action 相对平均好不好。正值鼓励，负值惩罚</td></tr>
+<tr><td>value / $V(s)$</td><td>状态 $s$ 的预期 return（平均能拿多少分）。由 critic 模型预测</td></tr>
+<tr><td>critic</td><td>value model，独立预测 $V(s)$ 的模型。和 actor 一起训</td></tr>
+<tr><td>returns</td><td>实际看到的累计 reward。单步 = reward；多步 = 未来 reward 折现和。critic 的训练 target</td></tr>
+<tr><td>GAE</td><td>广义优势估计，多步场景算 advantage 的算法。单步退化成 $A = r - V$</td></tr>
+<tr><td>$\gamma$ / 折扣因子</td><td>未来 reward 的折扣权重（通常 0.99）。越远越不确定越打折扣</td></tr>
 <tr><td>DPO</td><td>RLHF 的简化替代方案，跳过 RM 和 RL，直接在偏好数据上算 loss</td></tr>
 </tbody>
 </table>
@@ -871,6 +877,85 @@
 <p>目标变成：</p>
 <p>$$J(\theta) = \mathbb{E}\left[ r_t(\theta) \cdot A \right]$$</p>
 
+<details>
+<summary>展开：advantage、baseline、critic、value、GAE、returns 都是什么</summary>
+
+<p>伪代码里出现了一堆相关概念：advantage、baseline、critic、value、GAE、returns。它们其实是一条链，下面从头讲清楚。</p>
+
+<p><b>1. baseline 是什么</b></p>
+<p>直接用 reward 当梯度权重有个问题：<b>方差大</b>。假设某个 prompt 平均能拿 100 分，某次 action 拿了 95 分——95 看起来是高分，但实际比平均低，应该惩罚而不是奖励。直接用 reward 分不清这种情况。</p>
+<p>解决方案：减去一个 <b>baseline</b>（平均分）。baseline 是"这个 prompt 平均能拿多少分"。减完后：</p>
+<p>$$A = G - V(s)$$</p>
+<p>这里 $A$ 就是 advantage（优势），$G$ 是 return（这次 action 实际拿的分），$V(s)$ 是 baseline（预期平均分）。</p>
+<ul>
+<li>$A > 0$：这次 action 比平均好 → 鼓励 policy 多做</li>
+<li>$A < 0$：比平均差 → 惩罚，让 policy 少做</li>
+<li>$A = 0$：和平均一样 → 无所谓</li>
+</ul>
+
+<p><b>2. value（$V$）是什么</b></p>
+<p>$V(s)$ 就是"状态 $s$ 的预期 return"——预测"如果用当前 policy，从 $s$ 开始平均能拿多少 reward"。</p>
+<p>问题：怎么知道每个 prompt 的平均分？没法事先知道，要边训边估。于是训一个 <b>value model</b>（也叫 <b>critic</b>）专门预测 $V(s)$——它和 policy（actor）是两个独立的模型，actor 学会生成好回答，critic 学会预测"这个 prompt 平均能拿多少分"。</p>
+
+<p><b>3. critic 怎么训</b></p>
+<p>critic 的目标是学会预测 return。它的训练 target 是<b>实际看到的 return</b>——也就是 returns。</p>
+<p>$$\text{value\_loss} = (V_\phi(s) - \text{returns})^2$$</p>
+<p>critic 的预测值 $V_\phi(s)$ 越接近实际 returns，value_loss 越小。critic 越准，advantage 估计越准，policy 训练越稳。</p>
+
+<p><b>4. returns 是什么</b></p>
+<p>returns 是"实际看到的累计 reward"——critic 要拟合的目标。</p>
+<ul>
+<li><b>单步场景</b>（本例）：returns = reward（只有一个 reward，没有未来）</li>
+<li><b>多步场景</b>：returns = $r_t + \gamma r_{t+1} + \gamma^2 r_{t+2} + \cdots$（未来所有 reward 的折现累计）</li>
+</ul>
+<p>这里 $\gamma \in [0, 1]$ 是折扣因子——未来的 reward 要打折扣，因为越远越不确定。$\gamma = 1$ 表示不折扣（未来和现在一样重要），$\gamma = 0.99$ 是常用值。</p>
+
+<p><b>5. 单步场景下 advantage 和 returns 的关系</b></p>
+<p>单步场景（1 prompt → 1 response → 1 reward）下，没有"未来"，所以：</p>
+<p>$$A = G - V = \text{reward} - V$$</p>
+<p>$$\text{returns} = A + V = \text{reward}$$</p>
+<p>单步下 returns 就是 reward 本身，但保留这个抽象是为了和多步场景统一接口。</p>
+
+<p><b>6. GAE 是什么（多步场景的 advantage 算法）</b></p>
+<p>多步场景下，reward 只在最后给（或分散给一些 token），但每个 token 都"贡献"了结果。哪个 token 该奖哪个该罚？</p>
+<p>GAE（Generalized Advantage Estimation，广义优势估计）解决这个问题。它用 TD error（时序差分）从后往前递推算每个时刻的 advantage：</p>
+<p>$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t) \quad \text{(TD error，实际 - 预期)}$$</p>
+<p>$$A_t^{\text{GAE}} = \delta_t + (\gamma\lambda)\delta_{t+1} + (\gamma\lambda)^2\delta_{t+2} + \cdots$$</p>
+<p>这里 $\lambda \in [0, 1]$ 控制"要看多远的未来"：</p>
+<ul>
+<li>$\lambda = 0$：只看当前一步 TD error，偏差大、方差小</li>
+<li>$\lambda = 1$：用所有未来 reward，偏差小、方差大</li>
+<li>$\lambda = 0.95$（常用）：折中</li>
+</ul>
+<p><b>本代码单步场景下 GAE 退化</b>：只有一步，没有未来，所以 $\delta = \text{reward} - V$，GAE 递推只有一项，advantage = reward - V。代码里的 <code>compute_gae</code> 函数就简化成了 <code>advantages = rewards - values</code>。</p>
+
+<p><b>7. advantage 归一化（工程实践）</b></p>
+<p>训练时通常对 advantage 做标准化：</p>
+<p>$$A \leftarrow \frac{A - \text{mean}(A)}{\text{std}(A) + \epsilon}$$</p>
+<p>把 advantage 缩放到均值 0、方差 1。降方差，让训练更稳。这是工程 trick，不影响数学正确性。</p>
+
+<p><b>8. .detach() 是什么</b></p>
+<p>PyTorch 的概念。算 <code>old_log_probs</code> 时，它依赖当时的 actor 参数 $\theta$，会建立计算图。但训练时 $\theta$ 已经变了，old_log_probs 应该当<b>常数</b>用——不能让它参与梯度反传（否则梯度方向会乱）。</p>
+<p><code>.detach()</code> 把 tensor 从计算图里"摘出来"，断开和 $\theta$ 的连接。这样 backward 时 old_log_probs 当作固定值，不传梯度。</p>
+<p>等价的写法：<code>with torch.no_grad():</code> 包住整个块——从一开始就不建计算图。代码里 ref_policy 和 critic 用 <code>no_grad</code>（本来就冻结），old_log_probs 用 <code>detach</code>（需要它的值参与 loss，但不要梯度）。</p>
+
+<p><b>关键符号解释</b>：</p>
+<ul>
+<li>$V(s)$ / value：状态 $s$ 的预期 return（critic 预测）</li>
+<li>$A$ / advantage：$A = G - V(s)$，这次 action 相对平均好不好</li>
+<li>returns：实际看到的累计 reward，critic 的训练 target</li>
+<li>critic / value model：预测 $V(s)$ 的独立模型，和 actor 一起训</li>
+<li>$\gamma$：折扣因子，未来 reward 的折扣权重</li>
+<li>$\lambda$：GAE 参数，控制看多远的未来</li>
+<li>GAE：多步场景算 advantage 的算法，单步下退化成 $A = r - V$</li>
+<li>value_loss：critic 的 loss，让预测 $V$ 接近实际 returns</li>
+<li>归一化 advantage：工程 trick，降方差</li>
+<li>detach：PyTorch 概念，把 tensor 从计算图断开，当常数用</li>
+</ul>
+
+<p>来源：GAE ← Schulman et al. 2015《High-Dimensional Continuous Control Using Generalized Advantage Estimation》；critic/value 是 RL 领域常识，见 Sutton & Barto 《Reinforcement Learning》。</p>
+</details>
+
 <p><b>第 6 步：clip 限制 $r_t$</b></p>
 <p>PPO 的核心创新：把 $r_t$ 截断到 $[1-\epsilon, 1+\epsilon]$ 范围内（通常 $\epsilon = 0.2$）。超出范围的梯度消失——相当于自动刹车。</p>
 <p>定义 clip 函数：</p>
@@ -1036,6 +1121,18 @@ for episode in range(num_episodes):
     # 新 episode 的 old_log_probs 会用新的 actor 重新算</code></pre></div>
 </details>
 
+<div class="callout callout-gray">
+<p><b>伪代码里出现的 PyTorch / 工程概念速查</b>：</p>
+<ul>
+<li><b><code>.detach()</code></b>：把 tensor 从计算图摘出来，当常数用。<code>old_log_probs</code> 是采样时旧策略算的，训练时要当固定值（不能让它的梯度影响当前 θ），所以 detach。等价写法：<code>with torch.no_grad():</code> 包整个块（ref_policy 和 critic 用这种，因为它们本来就冻结）。</li>
+<li><b><code>torch.cat</code></b>：拼接。把 rollout 时逐条采的 8 条经验拼成一个 batch，方便并行处理。</li>
+<li><b><code>advantage 归一化</code></b>：把 advantage 缩放到均值 0、方差 1（<code>(A - mean) / std</code>）。降方差，让训练更稳。工程 trick，不影响数学正确性。</li>
+<li><b><code>value_loss</code></b>：critic 的 loss，让预测的 $V(s)$ 接近实际 returns。通常用 MSE，PPO 还加 clip 防止 critic 更新太激进。</li>
+<li><b><code>torch.multinomial</code></b>：按概率分布采样。给 <code>[0.1, 0.7, 0.2]</code>，按概率采一个索引（70% 概率采到 1）。训练时用这个采样新回答（带探索）。</li>
+<li><b><code>log_softmax</code> vs <code>softmax</code></b>：采样时用 softmax 得到概率喂给 multinomial；训练时用 log_softmax 直接拿 log 概率（数值更稳，避免 log(0)）。</li>
+</ul>
+</div>
+
 <div class="callout callout-purple">
 <p><b>关键观察：on-policy → off-policy 在哪里体现</b>：</p>
 <ul>
@@ -1082,11 +1179,11 @@ for episode in range(num_episodes):
 
 <h2>事实/公式出处（有明确来源）</h2>
 <p>一、问题：SFT 局限、偏好数据格式 ← InstructGPT 论文 §1-2</p>
-<p>二、方法：RM loss（Bradley-Terry）← Christiano et al. 2017 + InstructGPT §3.2；PG 公式 ← Williams 1992 (REINFORCE)；PPO clip 目标 ← Schulman et al. 2017</p>
+<p>二、方法：RM loss（Bradley-Terry）← Christiano et al. 2017 + InstructGPT §3.2；PG 公式 ← Williams 1992 (REINFORCE)；PPO clip 目标 ← Schulman et al. 2017；GAE ← Schulman et al. 2015《High-Dimensional Continuous Control Using Generalized Advantage Estimation》；critic / value / returns ← RL 领域常识，见 Sutton & Barto《Reinforcement Learning》</p>
 <p>三、总结：DPO vs RLHF 对比 ← Rafailov et al. 2023 (DPO 论文)</p>
 
 <h2>解读者推断（不在论文中，需独立验证）</h2>
-<p>本文档对直觉的解释（如"自动刹车""防钻空子"等比喻）是辅助理解的映射，不是论文术语。"DPO 做 base，RLHF 做精细调整"是工业界常见做法的概括，不是某一篇论文的明确结论。</p>
+<p>本文档对直觉的解释（如"自动刹车""防钻空子"等比喻）是辅助理解的映射，不是论文术语。"DPO 做 base，RLHF 做精细调整"是工业界常见做法的概括，不是某一篇论文的明确结论。伪代码工程细节（detach、归一化、value_loss clip 等）参考 OpenRLHF 实现，是工程实践共识，不是某一篇论文的明确规范。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
