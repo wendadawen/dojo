@@ -879,6 +879,91 @@
 
 <p>PPO 是 RLHF 的事实标准。ChatGPT、Claude、Gemini 这些模型的 RLHF 阶段都用 PPO。</p>
 
+<h2>训练流程（伪代码）</h2>
+
+<p>上面讲了三步流程的数学原理。下面用伪代码展示工业界实际怎么训——RM 训练和 PPO 训练各一个循环。代码省略工程细节（batch、混合精度、分布式等），只展示核心逻辑。</p>
+
+<h3>第 2 步：训 RM</h3>
+
+<div class="code-block"><pre><code># 数据：偏好对 (prompt, chosen, rejected)
+# RM 是一个 transformer，输入 (prompt, response) 输出标量分数
+
+for prompt, chosen, rejected in preference_dataset:
+    # 前向：RM 给两个回答打分
+    r_w = RM(prompt, chosen)       # 好答案的分数
+    r_l = RM(prompt, rejected)     # 差答案的分数
+
+    # RM loss = -log sigmoid(r_w - r_l)（Bradley-Terry）
+    loss = -log_sigmoid(r_w - r_l)
+
+    # 反传 + 更新 RM 参数
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+# 训完的 RM 冻结，后面当 reward 信号用
+RM.eval()
+for p in RM.parameters():
+    p.requires_grad = False</code></pre></div>
+
+<p>这一步和 SFT 训练循环长得几乎一样——只是 loss 从交叉熵换成 BT loss，数据从 (prompt, 标准答案) 换成 (prompt, 好答案, 差答案)。</p>
+
+<h3>第 3 步：用 PPO 训 policy</h3>
+
+<div class="code-block"><pre><code># policy = SFT 后的 LLM（待训练）
+# ref_policy = policy 的冻结副本（KL 约束基准）
+# value_model = 另一个 LLM，预测状态的预期 return（当 baseline）
+# RM = 第 2 步训好的奖励模型（冻结）
+
+for prompt in prompt_dataset:
+    # === 1. 采样：policy 生成回答 ===
+    response = policy.generate(prompt, num_samples=G)
+    # 通常对同一 prompt 采 G 个回答（GRPO 思路，PPO 也可做）
+
+    # === 2. 打分：RM 给每个回答打 reward ===
+    rewards = [RM(prompt, r) for r in response]
+
+    # === 3. 算 advantage（减 baseline 降方差）===
+    # value_model 预测"这个 prompt 的预期 return"
+    baseline = value_model(prompt)
+    advantages = [r - baseline for r in rewards]
+    # 归一化（工程实践）
+    advantages = (advantages - mean(advantages)) / std(advantages)
+
+    # === 4. 算 importance ratio ===
+    # 用旧策略（采样时的 policy）算 log prob
+    log_prob_old = log_prob(prompt, response, policy_old)
+    # 用新策略（当前 policy）算 log prob
+    log_prob_new = log_prob(prompt, response, policy)
+    ratio = exp(log_prob_new - log_prob_old)   # r_t = π_new / π_old
+
+    # === 5. PPO clip loss ===
+    eps = 0.2   # clip 范围
+    surr1 = ratio * advantages
+    surr2 = clip(ratio, 1-eps, 1+eps) * advantages
+    policy_loss = -min(surr1, surr2)    # 负号因为要最大化
+
+    # KL 惩罚（防止 policy 离 ref 太远）
+    kl = kl_divergence(policy, ref_policy, prompt, response)
+    policy_loss += beta * kl
+
+    # value loss（训 value_model 学会预测 return）
+    value_pred = value_model(prompt)
+    value_loss = mse(value_pred, mean(rewards))
+
+    # === 6. 反传 + 更新 ===
+    total_loss = policy_loss + value_loss_coef * value_loss
+    total_loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()</code></pre></div>
+
+<p>这是 RLHF 训练的核心循环。和 SFT/DPO 相比，工程复杂度高很多——要同时维护 4 个模型在显存里（policy、ref_policy、value_model、RM），还要算 importance ratio 和 clip。这也是为什么 DPO 流行：去掉 ref_policy、value_model、RM，只留 policy 一个模型，循环和 SFT 几乎一样。</p>
+
+<div class="callout callout-yellow">
+<p><b>显存瓶颈</b>：4 个 LLM 同时在显存里，参数+梯度+优化器状态，显存需求约是 SFT 的 4 倍。这是 RLHF 工程上的最大挑战，也是为什么开源界更多用 DPO。</p>
+<p><b>GRPO 的改进</b>：去掉 value_model（少一个模型），改用组内 reward 的相对值当 baseline。DeepSeek-R1 用的就是 GRPO。详见 GRPO 概念文档。</p>
+</div>
+
 <h1>三、总结：RLHF 的两条路线</h1>
 <p class="chapter-summary">本章你将知道：RLHF 不是唯一路线，DPO 是简化替代方案。</p>
 
