@@ -5,7 +5,7 @@ GRPO 实际可运行代码（基于 TRL 库）
     pip install trl transformers torch datasets
 
 运行：
-    python concepts/grpo/grpo_example.py
+    python content/concepts/grpo/grpo_example.py
 
 用一个小模型 + 简单数学题演示 GRPO 训练。
 CPU 也能跑（慢），有 GPU 更快。

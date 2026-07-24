@@ -1,12 +1,12 @@
 """
-PPO 最小可运行实现 — 对应 concepts/rlhf/index.html 里的伪代码
+PPO 最小可运行实现 — 对应 content/concepts/rlhf/index.html 里的伪代码
 
 这是一个教学版实现，省略了工程细节（分布式、混合精度、大模型），
 但保留了 PPO 的核心结构：
   1. Rollout（采样 + 算经验）
   2. Train（多 epoch 训练 + importance ratio + clip）
 
-运行：python3 test.py
+运行：python3 content/concepts/rlhf/ppo_example.py
 依赖：torch（已安装）
 
 场景：词表 5 个 token，每个 prompt 是 1 个 token，response 也是 1 个 token。

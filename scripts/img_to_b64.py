@@ -2,7 +2,7 @@
 """把图片转成 base64 data URI 字符串，粘进 HTML 里 <img src="..."> 的引号部分。
 
 用法：
-    python img_to_b64.py <图片路径>
+    python scripts/img_to_b64.py <图片路径>
 
 输出示例：
     data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...
@@ -20,7 +20,7 @@ import sys
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python img_to_b64.py <图片路径>", file=sys.stderr)
+        print("用法: python scripts/img_to_b64.py <图片路径>", file=sys.stderr)
         sys.exit(1)
 
     path = sys.argv[1]
