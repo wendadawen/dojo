@@ -14,8 +14,7 @@
 │   │       ├── hsd/
 │   │       ├── memagent/
 │   │       └── pless/
-│   └── concepts/              # 概念学习页面和学习地图
-│       ├── training-landscape.md
+│   └── concepts/              # 概念学习页面
 │       ├── backward/
 │       ├── dpo/
 │       ├── rlhf/
@@ -51,7 +50,7 @@ python scripts/validate_content.py
 
 ## 写新概念学习材料
 
-1. 读 `workflows/concept.md` 了解概念教学结构、公式、代码和证据规范
+1. 读 `workflows/concept.md`，先确认上下文、旧方案、痛点和概念改变点
 2. 拷贝 `templates/concept/index.html` 到 `content/concepts/<concept-name>/index.html`
 3. 写完按 `workflows/concept.md` 的核查清单逐项检查
 4. 在 `content.json` 增加条目

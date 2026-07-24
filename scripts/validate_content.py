@@ -106,9 +106,20 @@ def validate_index(manifest: dict) -> list[str]:
     return errors
 
 
+def validate_required_files() -> list[str]:
+    required = [
+        "templates/concept/index.html",
+        "templates/paper/index.html",
+        "workflows/concept.md",
+        "workflows/paper.md",
+    ]
+    return [f"missing required file: {path}" for path in required if not (ROOT / path).exists()]
+
+
 def main() -> int:
     manifest = load_manifest()
     errors = []
+    errors.extend(validate_required_files())
     errors.extend(validate_manifest(manifest))
     errors.extend(validate_index(manifest))
 
