@@ -1005,6 +1005,185 @@ for x in prompt_dataset:
 <p>来源：流程结构综合自 Christiano 2017、InstructGPT 2022；伪代码为本文整理。</p>
 </details>
 
+<details class="code-details">
+<summary>展开：基于 TRL 的完整可运行示例（参考 HuggingFace TRL 官方实现）</summary>
+
+<p><b>权威实现</b>：本示例基于 <a href="https://huggingface.co/docs/trl">HuggingFace TRL</a> 库的 <code>PPOTrainer</code> / <code>SFTTrainer</code> / <code>RewardTrainer</code> API。TRL 是 RLHF 领域最主流的开源实现，被大量论文和工业项目复用。</p>
+
+<p><b>版本说明</b>：TRL 的 PPO API 在 v0.12+ 改为 <code>trl.experimental.ppo.PPOTrainer</code>，用 <code>train()</code> 封装整个循环（旧版的 <code>generate()</code> / <code>step()</code> 已废弃）。本示例基于新版 API。</p>
+
+<p><b>运行前提</b>：需要 GPU（至少 16GB 显存跑 1B 模型），安装依赖：</p>
+<div class="code-block">
+<pre><code class="language-bash">pip install trl transformers datasets accelerate torch</code></pre>
+</div>
+
+<div class="code-block">
+<pre><code class="language-python"># RLHF 三步完整可运行示例（基于 TRL 库）
+# 参考：https://huggingface.co/docs/trl
+#
+# 教学用小模型——实际生产用更大的（如 Llama-3-8B）
+
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+)
+from trl import (
+    SFTConfig, SFTTrainer,                              # 第 1 步
+    RewardConfig, RewardTrainer,                        # 第 2 步
+    PPOConfig, PPOTrainer,                              # 第 3 步
+    AutoModelForCausalLMWithValueHead,                  # 带 value head 的 policy
+)
+
+BASE_MODEL = "EleutherAI/pythia-1b-deduped"   # 教学用 1B 参数模型
+
+# ============================================================
+# 第 1 步：SFT——用监督数据训基础模型，得到 π_SFT
+# ============================================================
+# 数据格式：每条是 {"prompt": "...", "completion": "..."}
+sft_dataset = load_dataset(
+    "trl-internal-testing/descriptiveness-sentiment-trl-style",
+    split="descriptiveness",
+)
+
+sft_config = SFTConfig(
+    output_dir="./sft",
+    num_train_epochs=1,
+    per_device_train_batch_size=4,
+    learning_rate=5e-5,        # SFT 学习率（教学用，比 PPO 大）
+    bf16=True,                 # 混合精度训练
+    logging_steps=10,
+)
+
+sft_trainer = SFTTrainer(
+    model=BASE_MODEL,
+    args=sft_config,
+    train_dataset=sft_dataset,
+)
+sft_trainer.train()
+sft_trainer.save_model("./sft")
+# 结果：./sft 就是 π_SFT，后续作为 π_ref 的来源
+
+
+# ============================================================
+# 第 2 步：训 RM——用偏好对训奖励模型，学 r_φ(x, y)
+# ============================================================
+# 数据格式：每条是 {"prompt": "...", "chosen": "...", "rejected": "..."}
+pref_dataset = load_dataset("Anthropic/hh-rlhf", split="train")
+
+# RM 输出标量分数：num_labels=1（对应正文里的 r_φ(x, y)）
+rm_model = AutoModelForSequenceClassification.from_pretrained(
+    BASE_MODEL, num_labels=1,
+)
+rm_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+
+reward_config = RewardConfig(
+    output_dir="./rm",
+    num_train_epochs=1,
+    per_device_train_batch_size=16,
+    learning_rate=5e-6,        # RM 学习率（教学用，比 SFT 小防过拟合）
+    bf16=True,
+    # RewardTrainer 内部自动用 BT 损失：
+    #   L_RM = -log σ(r_φ(x, y_w) - r_φ(x, y_l))
+    # 不需要手写 loss
+)
+
+rm_trainer = RewardTrainer(
+    model=rm_model,
+    args=reward_config,
+    train_dataset=pref_dataset,
+    processing_class=rm_tokenizer,
+)
+rm_trainer.train()
+rm_trainer.save_model("./rm")
+# 结果：./rm 就是训好的 RM，能给任意 (x, y) 打分
+
+
+# ============================================================
+# 第 3 步：PPO——用 RM 当环境，训 policy π_θ
+# ============================================================
+
+# 3a. 加载 SFT 模型作为 policy 起点
+#     AutoModelForCausalLMWithValueHead 在 LM 末尾加一个 value head V(x)
+policy = AutoModelForCausalLMWithValueHead.from_pretrained("./sft")
+ppo_tokenizer = AutoTokenizer.from_pretrained("./sft")
+
+# 3b. 加载训好的 RM
+reward_model = AutoModelForSequenceClassification.from_pretrained("./rm")
+
+# 3c. PPO 配置——每个参数对应正文里的符号
+ppo_config = PPOConfig(
+    output_dir="./ppo",
+    # === 基本训练参数 ===
+    learning_rate=3e-6,              # PPO 学习率（TRL 默认 3e-6，比 SFT 小一个量级）
+    per_device_train_batch_size=16,
+    total_episodes=10000,           # 总共采多少条 prompt
+    num_ppo_epochs=4,               # 每批数据 PPO 更新几轮（TRL 默认 4）
+    num_mini_batches=1,             # 每批切几个 mini-batch（TRL 默认 1）
+    bf16=True,
+    # === PPO 核心超参（对应正文符号）===
+    cliprange=0.2,                  # ε：PPO clip 范围（TRL 默认 0.2）
+    kl_coef=0.05,                   # β：KL 惩罚强度（TRL 默认 0.05）
+    kl_estimator="k1",              # KL 估计器：k1 无偏 / k3 无偏低方差（TRL 默认 k1）
+    vf_coef=0.1,                    # value function loss 权重（TRL 默认 0.1）
+    gamma=1.0,                      # 折扣因子（LLM 任务通常不折扣，TRL 默认 1.0）
+    lam=0.95,                       # GAE λ：优势估计平滑参数（TRL 默认 0.95）
+    # === 生成参数 ===
+    response_length=53,             # 生成回答的最大 token 数（TRL 默认 53）
+    temperature=0.7,                # 采样温度，大于 1 更随机，小于 1 更确定（TRL 默认 0.7）
+    missing_eos_penalty=1.0,        # 没以 EOS 结尾的惩罚（防无限生成骗 reward）
+    # === 监控 ===
+    num_sample_generations=10,      # 训练中打印几条样本生成供人工检查
+)
+
+# 3d. prompt 数据集（只要 prompt，不要答案——PPO 自己生成回答）
+prompt_dataset = load_dataset("trl-lib/tldr", split="train")
+
+# 3e. 构造 PPOTrainer
+#     ref_model=None 时，TRL 自动复制一份 policy 作为参考模型 π_ref（冻结）
+ppo_trainer = PPOTrainer(
+    args=ppo_config,
+    processing_class=ppo_tokenizer,
+    model=policy,                   # 当前训练的 π_θ
+    ref_model=None,                 # 自动创建 π_ref（= SFT 模型冻结，不更新参数）
+    reward_model=reward_model,      # RM（第 2 步训好的）
+    value_model=policy,             # value head V(x)，通常和 policy 共享底层
+    train_dataset=prompt_dataset,
+)
+
+# 3f. 训练——train() 内部循环做的事（对应正文 §六 流程层步骤 3）：
+#   1. policy 在 prompt x 下采回答 y ~ π_θ(·|x)
+#   2. RM 给 y 打分 r_φ(x, y)              → 指标 objective/scores
+#   3. 算 KL 惩罚 β·D_KL[π_θ ‖ π_ref]      → 指标 objective/non_score_reward
+#   4. 算 RLHF reward = score - KL_penalty → 指标 objective/rlhf_reward
+#   5. 用 value head V(x) 算优势 A（GAE 平滑）
+#   6. 算重要性比 r_t = π_θ(y|x) / π_θ_old(y|x)
+#   7. PPO clip 目标 L^CLIP = E[min(r_t·A, clip(r_t, 1-ε, 1+ε)·A)]
+#   8. 总目标 = L^CLIP - vf_coef·L^VF
+#   9. 梯度上升更新 θ
+#  10. 每 num_ppo_epochs 轮后重新采一批（更新 θ_old ← θ）
+ppo_trainer.train()
+
+# 3g. 训练中关注的关键指标（TRL 自动 log）：
+#   objective/scores           — RM 给的平均分（越高说明回答越符合偏好）
+#   objective/non_score_reward — KL 惩罚项（越高说明 policy 离 ref 越远）
+#   objective/rlhf_reward      — score - KL（真正的训练目标）
+#   objective/kl               — 平均 KL 散度（监控是否 reward hacking）
+#   objective/entropy          — policy 熵（太低说明 mode collapse，多样性丢失）
+
+ppo_trainer.save_model("./ppo")
+# 结果：./ppo 就是对齐后的 π_θ，可以部署
+</code></pre>
+</div>
+
+<p><b>超参来源</b>：标注"TRL 默认"的值来自 TRL <code>PPOConfig</code> 默认参数（<a href="https://huggingface.co/docs/trl/main/en/ppo_trainer">TRL PPOTrainer 文档</a>）。SFT/RM 的学习率（5e-5 / 5e-6）是教学用常见值，实际需按任务调。</p>
+
+<p><b>和伪代码的对比</b>：伪代码展示了算法骨架（每步在算什么），本示例展示了工程实现（怎么调用真实库）。差异主要是：①TRL 的 <code>train()</code> 把采样的 10 步循环封装在内部；②value head 和 GAE 是真实 PPO 必备的（伪代码简化掉了）；③KL 估计器（k1/k3）是 TRL 提供的工程优化（影响方差和偏差）。</p>
+
+<p><b>其他权威实现</b>：除 TRL 外，还有 <a href="https://github.com/CarperAI/trlX">CarperAI trlX</a>、微软 <a href="https://github.com/microsoft/DeepSpeedExamples">DeepSpeed-Chat</a>、NVIDIA NeMo-Aligner。API 各异但三步流程一致。</p>
+</details>
+
 <h1>七、边界：什么时候用，什么时候不用</h1>
 <p>RLHF 适合开放性任务——需要符合人类偏好但难以定义标准答案的场景。它<b>不</b>解决一切：</p>
 <ul>
