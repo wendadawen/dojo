@@ -762,6 +762,8 @@
 <p>$$\mathcal{L}_{\text{RM}} = -\log \sigma(r_\phi(x, y_w) - r_\phi(x, y_l))$$</p>
 <p>最小化它就是让 RM 给 chosen 打分高于 rejected。RM 训好后，它能把任意 (prompt, answer) 映射到一个标量分数，分数高低反映人类偏好。</p>
 
+<p><b>RM 的架构</b>：RM 通常是一个 base LM（和 policy 同款底座）末尾接一个<b>标量头</b>——把最后一个 token 的 hidden state（维度 $d$）经过一个 Linear 层映射到 1 维，得到标量分数 $r_\phi(x,y)$。所以 RM 的参数 $\phi$ = base LM 参数 + 标量头参数。打分时把 (prompt, answer) 拼接送进 RM，取末尾 hidden state 过标量头即得分数。这样 RM 复用了 LM 的语言理解能力，不用从头学。BT loss 反传时梯度同时更新 base LM 和标量头。</p>
+
 <p><b>步骤 3：PPO 训 policy</b>。流程是：</p>
 <ol>
 <li>policy $\pi_\theta$ 在 prompt $x$ 下采样回答 $y \sim \pi_\theta(\cdot | x)$（on-policy，用当前 policy 采的数据训当前 policy）。</li>
@@ -872,6 +874,31 @@ $$= V(x) \cdot \nabla_\theta \sum_y \pi_\theta(y|x) = V(x) \cdot \nabla_\theta 1
 <p>$$\nabla_\theta J \approx \mathbb{E}_{y \sim \pi_\theta}\left[ A(x,y) \, \nabla_\theta \log \pi_\theta(y|x) \right] - \beta \, \nabla_\theta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$$</p>
 <p>第二项 $\nabla_\theta D_{\text{KL}}$ 可以直接算（$\pi_{\text{ref}}$ 冻结，KL 散度对 $\theta$ 有解析梯度）。</p>
 
+<p><b>V(x) 怎么实现和训练</b>：$V(x)$ 通常是在 policy 的最后一个 hidden state 上接一个 <b>value head</b>（Linear 层，输出标量），和 policy 共享底层 LM 但有独立参数。value head 怎么训？用<b>实际 return</b> 回归——return 是沿轨迹累加的 reward，$V(x)$ 要去预测它。value loss 是均方误差：</p>
+<p>$$\mathcal{L}_{\text{VF}} = (V(x) - \text{return})^2$$</p>
+<p>PPO 总 loss = $-\mathcal{L}^{\text{CLIP}} + c_v \cdot \mathcal{L}_{\text{VF}}$（$c_v$ 是 value loss 权重，实践共识 0.1 量级）。value head 和 policy 一起更新——这就是为什么 PPO 实现里 policy 模型通常带一个 value head（如 TRL 的 <code>AutoModelForCausalLMWithValueHead</code>）。</p>
+
+<p><b>从单步优势到 GAE</b>：上面的 $A = r - V(x)$ 是<b>单步</b>优势——只看一步 reward 减 baseline。问题是单步 reward 噪声大，方差还是高。能不能把未来多步的 reward 也算进来？这就是 <b>GAE</b>（Generalized Advantage Estimation，广义优势估计）。</p>
+
+<p>在 LLM 里，"状态" $s_t$ = prompt + 已生成的 token 序列，"动作" $a_t$ = 下一个 token。先定义 <b>TD 误差</b>（temporal difference error，时序差分误差）：</p>
+<p>$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$$</p>
+<p>这是"实际看到的 reward + 下一状态估计值 − 当前状态估计值"，衡量 $V$ 在这一步的预测偏差。GAE 把多步 TD 误差按指数衰减加权求和：</p>
+<p>$$A_t^{\text{GAE}(\gamma,\lambda)} = \sum_{k=0}^{\infty} (\gamma \lambda)^k \delta_{t+k}$$</p>
+<p>符号说明：$\gamma$ 是折扣因子（远处的 reward 打折，实践共识 LLM 任务通常取 1.0 不折扣）；$\lambda$ 是 GAE 参数（0 到 1 之间，实践共识 0.9~0.99 量级）；$\delta_t$ 是第 $t$ 步 TD 误差；$s_t$ 是第 $t$ 步状态。</p>
+
+<p><b>λ 的两个极端</b>：</p>
+<ul>
+<li>$\lambda = 0$：$A_t = \delta_t$，单步 TD。偏差大（依赖 $V$ 估得准）、方差小</li>
+<li>$\lambda = 1$：$A_t = \sum_k \gamma^k r_{t+k} - V(s_t)$，完整 return 减 baseline（Monte Carlo）。偏差小（不依赖 $V$）、方差大（整条轨迹噪声都进来）</li>
+<li>$0 < \lambda < 1$：在两者间取平衡</li>
+</ul>
+
+<p><b>RLHF 里的特殊情况</b>：LLM 生成的 reward 通常是 <b>sequence-level</b>（整条回答一个分，不是每个 token 一个分）。两种处理方式：</p>
+<ul>
+<li><b>简化版</b>：把整条回答当单步，$A = r - V(x)$，$V(x)$ 估计 prompt $x$ 下的平均 reward。本页的数值例子用的就是这个</li>
+<li><b>token-level</b>：把 sequence reward 分摊到每个 token（通常只在最后一个 token 给 reward，其余为 0），然后用 GAE 算每个 token 的优势。真实工程实现（如 TRL）常用这种，更细粒度但更复杂</li>
+</ul>
+
 <h3>第 4 步：PPO 的 clip——限制每次更新幅度</h3>
 
 <p><b>朴素策略梯度的问题</b>：第 2、3 步给的梯度无偏，但工程上有问题。你采了一批 $y$（来自当前 $\pi_{\theta_{\text{old}}}$，$\theta_{\text{old}}$ 是采数据时的参数快照），算完梯度更新 $\theta$——如果步子大，新 $\pi_\theta$ 离 $\pi_{\theta_{\text{old}}}$ 太远，这批数据就不再代表新 policy 下的分布了。下次采的 $y$ 可能完全不一样，训练震荡甚至崩。</p>
@@ -946,6 +973,13 @@ $$= V(x) \cdot \nabla_\theta \sum_y \pi_\theta(y|x) = V(x) \cdot \nabla_\theta 1
 <p>KL 约束的作用：$\beta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$ 拉住 policy 不离 $\pi_{\text{ref}}$ 太远。$\pi_{\text{ref}}$ 是 SFT 模型，它的分布是"在训练数据上学到的合理回答分布"——RM 在这个分布附近打分是可信的（因为偏好数据就采自这里）。</p>
 <p>所以 KL 约束的实质是：<b>把 policy 限制在 RM 打分可信的区域内</b>。偏离越远，惩罚越大，policy 就不敢跑到 OOD 去钻空子。</p>
 <p>$\beta$ 越大约束越强——policy 更保守但 reward 上限也低；$\beta$ 越小约束越弱——policy 更激进但更容易 reward hacking。实践共识 $\beta$ 在 0.01~0.1 量级（来源：InstructGPT 等论文实践）。</p>
+
+<p><b>KL 怎么估计</b>：$D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}] = \mathbb{E}_{y \sim \pi_\theta}[\log(\pi_\theta(y|x)/\pi_{\text{ref}}(y|x))]$ 要对所有 $y$ 求期望，不可行。实际用单样本估计（$y$ 从 $\pi_\theta$ 采），有两种常见估计器：</p>
+<ol>
+<li><b>k1 估计器</b>（无偏，高方差）：$\hat{D}_{\text{KL}}^{k1} = \log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}$。<b>问题</b>：单样本估计可能为负（虽然真实 KL 恒非负），方差大</li>
+<li><b>k3 估计器</b>（无偏，低方差，恒非负）：$\hat{D}_{\text{KL}}^{k3} = \frac{\pi_{\text{ref}}(y|x)}{\pi_\theta(y|x)} - \log\frac{\pi_{\text{ref}}(y|x)}{\pi_\theta(y|x)} - 1$。利用 $r - \log r - 1 \geq 0$（$r > 0$，在 $r=1$ 时取 0）保证非负，方差更小</li>
+</ol>
+<p>实践共识用 k3（TRL 提供 k1/k3 可选）。本页数值例子用的简化版相当于 k1。</p>
 </details>
 
 <details>
@@ -1021,18 +1055,18 @@ for x in prompt_dataset:
 </details>
 
 <details class="code-details">
-<summary>展开：RLHF 三步算法实现（纯 PyTorch，手写 PPO 内部）</summary>
+<summary>展开：RLHF 三步完整算法实现（纯 PyTorch，含 value head / GAE / k3 KL / value loss）</summary>
 
-<p><b>本示例展示 RLHF 算法的具体实现</b>——不用任何 RL 库（不调 TRL/PPOTrainer），只用 HuggingFace <code>model.forward()</code> 拿 logits，其余 PPO 数学（log prob、ratio、clip、KL）全部手写 PyTorch tensor 运算。</p>
-
-<p><b>最简版教学约定</b>：单条 prompt 无 batch、优势 A = r − V 用 V=0（不用 GAE）、sequence-level reward（整条回答一个分）、KL 用 k1 估计（log 概率比）。真实工程扩展见下方说明。</p>
+<p><b>本示例展示 RLHF 算法的完整实现</b>——不用任何 RL 库，只用 HuggingFace <code>model.forward()</code> 拿 logits，PPO 的所有核心组件（value head、GAE、k3 KL 估计、value loss、clip）全部手写。代码按层次组织，概念讲解见正文 §六 的对应折叠块。</p>
 
 <div class="code-block">
-<pre><code class="language-python"># RLHF 三步算法实现（纯 PyTorch，手写 PPO 内部）
-# 教学最简版：单条 prompt、无 batch、V=0、不用 GAE
+<pre><code class="language-python"># RLHF 三步完整算法实现（纯 PyTorch）
+# 包含所有真实工程组件：value head / GAE / k3 KL / value loss / clip
 # 只用 HF model.forward() 拿 logits，PPO 数学全手写
+# 概念讲解见正文：value model/GAE 见 PPO 推导折叠块，KL 估计器见 KL 约束折叠块
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
     AutoModelForCausalLM,
@@ -1040,195 +1074,219 @@ from transformers import (
     AutoTokenizer,
 )
 
-BASE_MODEL = "EleutherAI/pythia-1b-deduped"   # 教学用小模型
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+BASE = "EleutherAI/pythia-1b-deduped"   # 教学用小模型
+tokenizer = AutoTokenizer.from_pretrained(BASE)
+
+
+# ============================================================
+# 模型定义
+# ============================================================
+
+class PolicyWithValueHead(nn.Module):
+    """policy（Causal LM）+ value head V(x)。
+    value head 取每个位置 hidden state 过 Linear 输出标量，和 policy 共享底层 LM。
+    架构见正文 PPO 推导折叠块'V(x) 怎么实现和训练'。
+    """
+    def __init__(self, base_model):
+        super().__init__()
+        self.base = base_model
+        self.value_head = nn.Linear(base_model.config.hidden_size, 1)
+
+    def forward(self, input_ids):
+        out = self.base(input_ids=input_ids, output_hidden_states=True)
+        logits = out.logits                              # (1, seq, vocab)
+        values = self.value_head(out.hidden_states[-1])  # (1, seq, 1)
+        return logits, values.squeeze(-1)                # (1, seq, vocab), (1, seq)
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def token_log_probs(logits, x_ids, y_ids):
+    """每个 y token 的 log prob，shape (n_y,)。
+    logits[:, t, :] 预测第 t+1 个 token，所以 shift 一位对齐。
+    """
+    full_ids = torch.cat([x_ids, y_ids], dim=1)
+    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)   # shift 预测
+    labels = full_ids[:, 1:]
+    prompt_len = x_ids.shape[1]
+    y_lp = log_probs[0, prompt_len-1:].gather(
+        1, labels[0, prompt_len-1:].unsqueeze(1)
+    ).squeeze(1)
+    return y_lp   # (n_y,)
+
+
+def token_values(values, x_ids, y_ids):
+    """每个 y token 位置的 V(s_t)，shape (n_y,)。取回答部分的 value。"""
+    prompt_len = x_ids.shape[1]
+    return values[0, prompt_len:]   # (n_y,)
+
+
+def kl_k3(log_pi_theta, log_pi_ref):
+    """k3 KL 估计器，恒非负。见正文 KL 约束折叠块。
+    k3 = exp(log_ratio) - log_ratio - 1，其中 log_ratio = log(π_ref / π_θ)
+    """
+    log_ratio = log_pi_ref - log_pi_theta
+    return (torch.exp(log_ratio) - log_ratio - 1).sum()   # 对 token 求和
+
+
+def compute_gae(rewards, values, gamma, lam):
+    """GAE：A_t = Σ_k (γλ)^k δ_{t+k}，δ_t = r_t + γV_{t+1} - V_t。
+    见正文 PPO 推导折叠块'从单步优势到 GAE'。
+    rewards, values: (n_y,) per-token。返回 (n_y,) advantages。
+    """
+    n = len(rewards)
+    advs = torch.zeros(n)
+    last_gae = 0.0
+    for t in reversed(range(n)):
+        next_v = values[t+1] if t+1 < n else torch.tensor(0.0)
+        delta = rewards[t] + gamma * next_v - values[t]
+        last_gae = delta + gamma * lam * last_gae
+        advs[t] = last_gae
+    return advs
 
 
 # ============================================================
 # 第 1 步：SFT——最大似然监督微调，得到 π_SFT
 # ============================================================
-# 目标：max log π(y|x)，等价于最小化 cross-entropy
+policy = AutoModelForCausalLM.from_pretrained(BASE)
+opt = torch.optim.AdamW(policy.parameters(), lr=5e-5)
 
-policy = AutoModelForCausalLM.from_pretrained(BASE_MODEL)
-optimizer = torch.optim.AdamW(policy.parameters(), lr=5e-5)  # 教学用
-
-# 一条 SFT 数据：(x, y)
 x_ids = tokenizer("Question: 1+1=?", return_tensors="pt").input_ids
 y_ids = tokenizer(" Answer: 2", return_tensors="pt").input_ids
-
-# 拼接 prompt + answer，prompt 部分用 -100 mask 掉（不计入 loss）
 input_ids = torch.cat([x_ids, y_ids], dim=1)
-labels = torch.cat([torch.full_like(x_ids, -100), y_ids], dim=1)
+labels = torch.cat([torch.full_like(x_ids, -100), y_ids], dim=1)  # prompt mask
 
-# HF 的 forward(labels=...) 自动算 cross-entropy = -log π(y|x)
-outputs = policy(input_ids=input_ids, labels=labels)
-loss = outputs.loss
-loss.backward()
-optimizer.step()
-optimizer.zero_grad()
-
-policy.save_pretrained("./sft")   # 得到 π_SFT，后续作为 π_ref
+loss = policy(input_ids=input_ids, labels=labels).loss   # HF 自动算 -log π(y|x)
+loss.backward(); opt.step(); opt.zero_grad()
+policy.save_pretrained("./sft")
 
 
 # ============================================================
 # 第 2 步：训 RM——BT 损失，学 r_φ(x, y)
 # ============================================================
-# 目标：max log σ(r_φ(x, y_w) - r_φ(x, y_l))，等价于最小化 -log σ(r_w - r_l)
-
-rm = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL, num_labels=1)
-rm_optimizer = torch.optim.AdamW(rm.parameters(), lr=5e-6)  # 教学用
+rm = AutoModelForSequenceClassification.from_pretrained(BASE, num_labels=1)
+rm_opt = torch.optim.AdamW(rm.parameters(), lr=5e-6)
 
 def rm_score(x_ids, y_ids):
-    """RM 给 (x, y) 打分，返回标量 r_φ(x, y)"""
     full = torch.cat([x_ids, y_ids], dim=1)
-    return rm(input_ids=full).logits.squeeze(-1)   # (1,)
+    return rm(input_ids=full).logits.squeeze(-1)
 
-# 一条偏好对：(x, y_w, y_l)
 x_ids = tokenizer("Question: 1+1=?", return_tensors="pt").input_ids
-yw_ids = tokenizer(" Answer: 2", return_tensors="pt").input_ids   # chosen
-yl_ids = tokenizer(" Answer: 3", return_tensors="pt").input_ids   # rejected
-
-r_w = rm_score(x_ids, yw_ids)   # chosen 的分数
-r_l = rm_score(x_ids, yl_ids)   # rejected 的分数
-
-# BT loss: -log σ(r_w - r_l)
-loss = -F.logsigmoid(r_w - r_l).mean()
-loss.backward()
-rm_optimizer.step()
-rm_optimizer.zero_grad()
-
-rm.save_pretrained("./rm")   # 得到训好的 RM
+r_w = rm_score(x_ids, tokenizer(" Answer: 2", return_tensors="pt").input_ids)
+r_l = rm_score(x_ids, tokenizer(" Answer: 3", return_tensors="pt").input_ids)
+loss = -F.logsigmoid(r_w - r_l).mean()   # BT loss: -log σ(r_w - r_l)
+loss.backward(); rm_opt.step(); rm_opt.zero_grad()
+rm.save_pretrained("./rm")
 
 
 # ============================================================
-# 第 3 步：PPO——算法实现（重点）
+# 第 3 步：PPO——完整算法
 # ============================================================
-# 目标：max E[min(r_t·A, clip(r_t, 1-ε, 1+ε)·A)]，其中 reward = r_φ - β·KL
 
-# 3a. 加载模型
-policy = AutoModelForCausalLM.from_pretrained("./sft")        # 当前 π_θ（要训练）
-ref_model = AutoModelForCausalLM.from_pretrained("./sft")     # π_ref（冻结）
-ref_model.eval()
-for p in ref_model.parameters():
-    p.requires_grad_(False)
+# 3.0 加载模型
+policy = PolicyWithValueHead(AutoModelForCausalLM.from_pretrained("./sft"))
+ref_model = AutoModelForCausalLM.from_pretrained("./sft"); ref_model.eval()
+for p in ref_model.parameters(): p.requires_grad_(False)
 
-rm = AutoModelForSequenceClassification.from_pretrained("./rm", num_labels=1)
-rm.eval()
-for p in rm.parameters():
-    p.requires_grad_(False)
+rm = AutoModelForSequenceClassification.from_pretrained("./rm", num_labels=1); rm.eval()
+for p in rm.parameters(): p.requires_grad_(False)
 
-ppo_optimizer = torch.optim.AdamW(policy.parameters(), lr=3e-6)  # 教学用
+ppo_opt = torch.optim.AdamW(policy.parameters(), lr=3e-6)
 
-# 关键超参（对应正文符号）
-beta = 0.05       # β：KL 惩罚强度
-epsilon = 0.2     # ε：PPO clip 范围
+# 超参（对应正文符号）
+beta = 0.05       # β: KL 惩罚强度
+epsilon = 0.2     # ε: PPO clip 范围
 K_EPOCHS = 4      # 每批数据 PPO 更新几轮
+gamma = 1.0       # γ: 折扣因子
+lam = 0.95        # λ: GAE 参数
+c_v = 0.1         # value loss 权重
 
-
-def compute_log_prob(model, x_ids, y_ids):
-    """算 log π(y|x) = 回答部分每个 token 的 log prob 之和。
-
-    Causal LM 的 logits[:, t, :] 预测第 t+1 个 token，
-    所以 logits[:, :-1, :] 对应 full_ids[:, 1:] 的预测。
-    只取回答部分（prompt_len-1 之后）的 log prob。
-    """
-    full_ids = torch.cat([x_ids, y_ids], dim=1)
-    logits = model(input_ids=full_ids).logits              # (1, seq_len, vocab)
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)   # shift 预测
-    labels = full_ids[:, 1:]                                # 被预测的 token
-    prompt_len = x_ids.shape[1]
-    # 只取回答部分：从 prompt_len-1 开始（对应第一个 y token 的预测）
-    y_log_probs = log_probs[0, prompt_len-1:].gather(
-        1, labels[0, prompt_len-1:].unsqueeze(1)
-    ).squeeze(1)
-    return y_log_probs.sum()   # log π(y|x)，标量
-
-
-# === PPO 一次完整更新（采一批 + 多轮优化）===
-
-# 一条 prompt
 x_ids = tokenizer("Question: Write a haiku about autumn.", return_tensors="pt").input_ids
 
-# ---- 采数据阶段：用当前 π_θ 当 π_old，记录快照 ----
+# ---- 3.1 Rollout：采数据（全在 no_grad 里，这些是常数）----
 with torch.no_grad():
-    # 1. 采回答 y ~ π_θ(·|x)
-    output = policy.generate(
+    # 采回答 y ~ π_θ(·|x)
+    output = policy.base.generate(
         x_ids, max_new_tokens=20, do_sample=True, temperature=0.7
     )
-    y_ids = output[:, x_ids.shape[1]:]          # 只取回答部分
+    y_ids = output[:, x_ids.shape[1]:]
     full_ids = torch.cat([x_ids, y_ids], dim=1)
+    n_y = y_ids.shape[1]
 
-    # 2. RM 打分 r_φ(x, y)
-    r = rm(input_ids=full_ids).logits.squeeze(-1)   # 标量
+    # RM 打分（sequence-level 标量）
+    r = rm(input_ids=full_ids).logits.squeeze(-1)
 
-    # 3. 算 log π_old(y|x) 和 log π_ref(y|x)（采时的快照，后续固定）
-    log_pi_old = compute_log_prob(policy, x_ids, y_ids)
-    log_pi_ref = compute_log_prob(ref_model, x_ids, y_ids)
+    # 算 log π_old 和 log π_ref（per-token），以及 V(s_t)
+    old_logits, old_values = policy(full_ids)
+    log_pi_old = token_log_probs(old_logits, x_ids, y_ids)     # (n_y,)
+    ref_logits = ref_model(full_ids).logits
+    log_pi_ref = token_log_probs(ref_logits, x_ids, y_ids)     # (n_y,)
+    values_old = token_values(old_values, x_ids, y_ids)        # (n_y,)
 
-    # 4. KL 惩罚（k1 估计：log(π_old / π_ref)，作为 reward 的一部分）
-    kl = log_pi_old - log_pi_ref
+    # KL 惩罚（k3 估计，对 token 求和）
+    kl = kl_k3(log_pi_old, log_pi_ref)
 
-    # 5. 实际 reward = RM 分数 - β·KL
-    effective_reward = r - beta * kl
+    # token-level reward：只在最后一个 token 给 r - β·KL，其余 0
+    token_rewards = torch.zeros(n_y)
+    token_rewards[-1] = r - beta * kl
 
-    # 6. 优势 A = reward - V（最简版 V=0）
-    A = effective_reward    # 标量，后续 PPO 更新中作为常数
+    # GAE 算 per-token 优势
+    advantages = compute_gae(token_rewards, values_old, gamma, lam)
+    # return = advantage + V(s_t)，用于 value loss 回归
+    returns = advantages + values_old
 
-# ---- PPO 多轮更新 ----
+# ---- 3.2 多轮更新（PPO clip + value loss）----
 for epoch in range(K_EPOCHS):
-    # 重新算当前 policy 的 log prob（这个会变，因为 θ 在更新）
-    log_pi_theta = compute_log_prob(policy, x_ids, y_ids)
+    # 前向拿当前 logits 和 value
+    logits, values = policy(full_ids)
+    log_pi_theta = token_log_probs(logits, x_ids, y_ids)   # (n_y,)
+    cur_values = token_values(values, x_ids, y_ids)        # (n_y,)
 
-    # 重要性比 r_t = π_θ(y|x) / π_old(y|x) = exp(log π_θ - log π_old)
-    ratio = torch.exp(log_pi_theta - log_pi_old)
+    # 重要性比（per-token）
+    ratio = torch.exp(log_pi_theta - log_pi_old)           # (n_y,)
 
-    # clipped objective: min(r_t·A, clip(r_t, 1-ε, 1+ε)·A)
+    # PPO clip objective（per-token，对 token 求和）
     ratio_clipped = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-    objective = torch.min(ratio * A, ratio_clipped * A)
+    objective = torch.min(ratio * advantages, ratio_clipped * advantages).sum()
 
-    # loss = -objective（最大化 objective 等价于最小化 -objective）
-    loss = -objective
+    # value loss：回归 return = advantage + V_old
+    value_loss = ((cur_values - returns) ** 2).mean()
+
+    # 总 loss = -objective + c_v · value_loss
+    loss = -objective + c_v * value_loss
 
     loss.backward()
-    ppo_optimizer.step()
-    ppo_optimizer.zero_grad()
+    ppo_opt.step()
+    ppo_opt.zero_grad()
 
-    # 第 0 轮 ratio≈1（θ 还没动），clip 不触发
-    # 后续轮次 ratio 偏离 1，clip 限制更新幅度
-    print(f"epoch {epoch}: ratio={ratio.item():.3f}, objective={objective.item():.3f}")
+    print(f"epoch {epoch}: ratio={ratio.mean().item():.3f}, "
+          f"obj={objective.item():.3f}, v_loss={value_loss.item():.3f}")
 
-policy.save_pretrained("./ppo")   # 得到对齐后的 π_θ
+policy.base.save_pretrained("./ppo")   # 得到对齐后的 π_θ
 </code></pre>
 </div>
 
-<p><b>代码和正文的对应关系</b>：</p>
+<p><b>代码层次</b>：</p>
 <ol>
-<li><b>SFT</b>（第 1 步）：<code>labels</code> 里 prompt 部分填 <code>-100</code> mask 掉，HF 自动算 <code>-log π(y|x)</code>。对应正文 §五 第 1 步公式</li>
-<li><b>训 RM</b>（第 2 步）：<code>F.logsigmoid(r_w - r_l)</code> 就是 BT 损失 <code>log σ(r_w - r_l)</code>，取负就是 <code>L_RM</code>。对应正文 §六 流程层步骤 2</li>
-<li><b>compute_log_prob</b>：把 Causal LM 的 logits 转成 <code>log π(y|x)</code>——这是连接 LM 和 RL 的关键函数。logits shift 一位是因为位置 t 预测位置 t+1</li>
-<li><b>采数据</b>（PPO 前半段）：<code>policy.generate</code> 采回答、<code>rm</code> 打分、记录 <code>log_pi_old</code> 和 <code>log_pi_ref</code> 快照、算 KL 和优势 A。全在 <code>torch.no_grad()</code> 里（这些是常数，不参与梯度）</li>
-<li><b>PPO 多轮更新</b>（PPO 后半段）：每轮重算 <code>log_pi_theta</code>，算 ratio 和 clipped objective，<code>-objective</code> 当 loss 反传。对应正文 §六 PPO clip 推导第 4 步</li>
+<li><b>模型定义</b>：<code>PolicyWithValueHead</code> 把 Causal LM 和 value head 绑在一起，一次前向同时拿 logits（算 log π）和 values（算 V(x)）</li>
+<li><b>工具函数</b>：4 个核心 helper——<code>token_log_probs</code>（logits→log π）、<code>token_values</code>（取回答部分 V）、<code>kl_k3</code>（恒非负 KL 估计）、<code>compute_gae</code>（多步优势）</li>
+<li><b>SFT</b>（第 1 步）：HF <code>labels=</code> 自动算 cross-entropy</li>
+<li><b>训 RM</b>（第 2 步）：<code>F.logsigmoid(r_w - r_l)</code> 即 BT loss</li>
+<li><b>PPO</b>（第 3 步）分两阶段：<b>3.1 Rollout</b>（采回答、RM 打分、记录快照、算 KL 和 GAE 优势）、<b>3.2 多轮更新</b>（重算 log π、ratio、clip、value loss）</li>
 </ol>
 
 <p><b>关键观察</b>：</p>
 <ul>
-<li>第 0 轮 <code>ratio ≈ 1</code>（<code>log_pi_theta</code> 还等于 <code>log_pi_old</code>），clip 不触发，正常更新</li>
-<li>第 1 轮起 <code>θ</code> 已经动了，<code>ratio</code> 偏离 1。如果 <code>ratio</code> 超出 <code>[1-ε, 1+ε]</code>，<code>min</code> 会取 clipped 版本，梯度被冻结——这就是 PPO 限制步长的机制</li>
-<li><code>KL</code> 在采数据时算一次（用 <code>π_old</code> 和 <code>π_ref</code>），作为 reward 的扣减项。不在 PPO 循环里重算——这是最简版的近似</li>
-<li><code>A</code>（优势）在整个 PPO 循环里是常数，不参与梯度——只有 <code>ratio</code> 里的 <code>log_pi_theta</code> 有梯度</li>
+<li><b>value head 和 policy 共享底层</b>：一次前向同时出 logits 和 V(x)，梯度也一起更新——这就是为什么 TRL 有 <code>AutoModelForCausalLMWithValueHead</code> 这个类</li>
+<li><b>reward 只在最后一个 token</b>：RM 给的是 sequence-level 分数，分摊到 token-level 时放在最后一位，前面 token reward=0。GAE 通过 V 把这个延迟 reward 传回前面的 token</li>
+<li><b>returns = advantages + values</b>：value loss 回归的目标不是 reward 本身，而是"优势 + 当前 V 估计"——这是 GAE 框架下的标准做法</li>
+<li><b>k3 保证非负</b>：<code>exp(log_ratio) - log_ratio - 1</code> 利用 <code>x - log x - 1 ≥ 0</code>，不会出现 k1 那种"惩罚变负数"的问题</li>
+<li><b>第 0 轮 ratio≈1</b>，clip 不触发；后续轮次 <code>θ</code> 动了，ratio 偏离 1，clip 限制更新幅度</li>
 </ul>
 
-<p><b>本示例的简化（和真实工程的差距）</b>：</p>
-<ol>
-<li><b>无 batch</b>：真实训练一次处理多条 prompt，需要 padding 和 batch 化的 <code>compute_log_prob</code></li>
-<li><b>V=0</b>：真实 PPO 用一个 value network 学 <code>V(x)</code>，并用 GAE（Generalized Advantage Estimation）做多步优势估计，降低方差</li>
-<li><b>KL 只算一次</b>：真实实现每个 PPO epoch 都重算 KL（因为 <code>π_θ</code> 在动），并且用更稳健的估计器（k3：<code>(π_ref/π_θ) - log(π_ref/π_θ) - 1</code>，恒非负）</li>
-<li><b>sequence-level reward</b>：真实实现常用 token-level reward（把 sequence reward 分摊到每个 token）配合 GAE</li>
-<li><b>无 value loss</b>：真实 PPO 还有一个 value function 的 loss 项 <code>vf_coef · L_VF</code> 来训 value network</li>
-<li><b>无梯度裁剪 / 多卡 / bf16</b>：工程稳定性相关，真实训练必备</li>
-</ol>
-
-<p><b>权威实现参考</b>：想看完整工程实现，参考 <a href="https://huggingface.co/docs/trl">HuggingFace TRL</a> 的 <code>PPOTrainer</code> 源码、<a href="https://github.com/CarperAI/trlX">CarperAI trlX</a>、或 <a href="https://github.com/openai/lm-human-preferences">OpenAI 原始 RLHF 实现</a>（Christiano 2017 那篇的代码）。本示例是这些实现的核心算法骨架的最简版本。</p>
+<p><b>仍简化的部分</b>（和真实工程的差距）：无 batch（真实训练一次处理多条 prompt）、无梯度裁剪、无 bf16/多卡、value head 的初始化和 GAE 的 whitening（归一化优势）省略了。这些是工程稳定性相关，不影响算法理解。完整实现参考 <a href="https://huggingface.co/docs/trl">TRL</a> 的 <code>PPOTrainer</code> 源码或 <a href="https://github.com/openai/lm-human-preferences">OpenAI 原始 RLHF 代码</a>。</p>
 </details>
 
 <h1>七、边界：什么时候用，什么时候不用</h1>
