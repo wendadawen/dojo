@@ -781,20 +781,151 @@
 </details>
 
 <details>
-<summary>展开：PPO 目标怎么变可优化（策略梯度 + 优势函数 + clip）</summary>
-<p>RLHF 第 3 步的目标 $\mathbb{E}_{y \sim \pi_\theta}[r_\phi(x,y)] - \beta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$ 看起来抽象，怎么变成可算梯度的更新？</p>
-<p><b>第 1 步：展开 KL 项</b>。$D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}] = \mathbb{E}_{y \sim \pi_\theta}[\log(\pi_\theta(y|x) / \pi_{\text{ref}}(y|x))]$。代入目标：</p>
-<p>$$\mathbb{E}_{y \sim \pi_\theta}\left[ r_\phi(x,y) - \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)} \right]$$</p>
-<p>这等价于把"偏离参考模型"作为软惩罚加到每条采样上。</p>
-<p><b>第 2 步：用策略梯度</b>。对 $\mathbb{E}_{y \sim \pi_\theta}[f(y)]$ 求 $\theta$ 梯度，标准结果是 $\mathbb{E}_{y \sim \pi_\theta}[f(y) \nabla_\theta \log \pi_\theta(y|x)]$（策略梯度定理，REINFORCE）。</p>
-<p>这里 $f(y) = r_\phi(x,y) - \beta \log(\pi_\theta(y|x) / \pi_{\text{ref}}(y|x))$。但直接用 reward 当 $f$ 方差大，所以减一个 baseline $V(x)$（value function，价值函数，估计 prompt $x$ 下的平均 reward）。</p>
-<p>定义优势函数（advantage function）$A(x,y) = r_\phi(x,y) - V(x)$——某条回答相对平均好多少。梯度变成：</p>
-<p>$$\nabla_\theta J \approx \mathbb{E}_{y \sim \pi_\theta}[A(x,y) \, \nabla_\theta \log \pi_\theta(y|x)] - \beta \nabla_\theta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$$</p>
-<p><b>第 3 步：PPO 的 clip</b>。直接用上面梯度更新，步子大了训练会崩。PPO 用重要性比 $r_t(\theta) = \pi_\theta(y|x) / \pi_{\theta_{\text{old}}}(y|x)$（新 policy 给 $y$ 的概率除以采时 policy 给的概率），clip 到 $[1-\epsilon, 1+\epsilon]$：</p>
-<p>$$\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}[\min(r_t A, \, \text{clip}(r_t, 1-\epsilon, 1+\epsilon) \, A)]$$</p>
-<p>$\epsilon$ 是 clip 范围（实践共识 0.1~0.2 量级）。clip 限制每次更新幅度，避免 policy 一次跳太远破坏训练稳定性。</p>
-<p><b>本节符号说明</b>：$V(x)$ 是 value function（baseline），$\theta_{\text{old}}$ 是采数据时的 policy 参数，$r_t$ 是新旧 policy 概率比，$A$ 是优势函数，$\epsilon$ 是 clip 范围。</p>
-<p>来源：策略梯度定理 ← Williams 1992 (REINFORCE)；PPO ← Schulman et al. 2017。</p>
+<summary>展开：PPO 目标怎么变可优化（策略梯度 + 优势函数 + clip，完整推导）</summary>
+
+<p><b>问题陈述</b>：PPO 第 3 步要最大化的目标是</p>
+<p>$$J(\theta) = \mathbb{E}_{y \sim \pi_\theta}[r_\phi(x,y)] - \beta \, D_{\text{KL}}[\pi_\theta(\cdot|x) \| \pi_{\text{ref}}(\cdot|x)]$$</p>
+<p>符号说明：$J(\theta)$ 是要最大化的目标函数；$\mathbb{E}_{y \sim \pi_\theta}[\cdot]$ 表示"$y$ 从当前 policy $\pi_\theta$ 采样后求平均"；$r_\phi(x,y)$ 是 RM 给的回答 $y$ 的分数；$D_{\text{KL}}$ 是 KL 散度；$\pi_{\text{ref}}$ 是冻结的参考模型；$\beta$ 是 KL 惩罚强度。</p>
+
+<p><b>核心困难</b>：$y$ 是从 $\pi_\theta$ 采样的，下标含 $\theta$。改 $\theta$ 时采样分布本身也变——没法直接对 $\theta$ 求导。监督学习里数据 $(x,y)$ 固定，loss = $\log \pi_\theta(y|x)$ 可以直接 backprop；RL 里数据分布依赖 $\theta$，必须换一种方式求梯度。</p>
+
+<p>下面分 4 步把 $J(\theta)$ 变成"可以用采样估计、可以用梯度上升更新"的形式。</p>
+
+<h3>第 1 步：展开 KL 项，合并成一个期望</h3>
+
+<p>KL 散度的定义（离散情况，对回答空间所有 $y$ 求和）：</p>
+<p>$$D_{\text{KL}}[\pi_\theta(\cdot|x) \| \pi_{\text{ref}}(\cdot|x)] = \sum_y \pi_\theta(y|x) \log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}$$</p>
+<p>这个求和就是期望 $\mathbb{E}_{y \sim \pi_\theta}[\cdot]$ 的定义，所以等价写成：</p>
+<p>$$D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}] = \mathbb{E}_{y \sim \pi_\theta}\left[\log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}\right]$$</p>
+
+<p>代回 $J(\theta)$，两项都是对 $y \sim \pi_\theta$ 求期望，合并：</p>
+<p>$$J(\theta) = \mathbb{E}_{y \sim \pi_\theta}\left[ r_\phi(x,y) - \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)} \right]$$</p>
+
+<p>记方括号里的整体为 $f(y)$（依赖 $\theta$，但记号上简化）：</p>
+<p>$$f(y) = r_\phi(x,y) - \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}$$</p>
+<p>于是 $J(\theta) = \mathbb{E}_{y \sim \pi_\theta}[f(y)]$。这步只是代数变形，"下标含 $\theta$"的问题还在。</p>
+
+<h3>第 2 步：策略梯度定理——把"梯度 of 期望"变成"期望 of 梯度"</h3>
+
+<p>我们要算 $\nabla_\theta J(\theta) = \nabla_\theta \mathbb{E}_{y \sim \pi_\theta}[f(y)]$。$\nabla_\theta$ 表示对 $\theta$ 求梯度（向量导数）。</p>
+
+<p>把期望展开成求和（离散情况）：</p>
+<p>$$\mathbb{E}_{y \sim \pi_\theta}[f(y)] = \sum_y \pi_\theta(y|x) \, f(y)$$</p>
+<p>对 $\theta$ 求导（这里 $f(y)$ 视为给定，先不管 $f$ 本身对 $\theta$ 的依赖——后面会处理）：</p>
+<p>$$\nabla_\theta \sum_y \pi_\theta(y|x) \, f(y) = \sum_y \nabla_\theta \pi_\theta(y|x) \, f(y)$$</p>
+
+<p><b>log-derivative trick</b>（对数导数技巧，整个推导的核心）。对任何正函数 $p(y)$，有恒等式：</p>
+<p>$$\nabla_\theta p(y) = p(y) \cdot \nabla_\theta \log p(y)$$</p>
+<p><b>验证</b>：由链式法则，$\nabla_\theta \log p(y) = \frac{1}{p(y)} \nabla_\theta p(y)$。两边乘 $p(y)$：$p(y) \nabla_\theta \log p(y) = \nabla_\theta p(y)$。✓</p>
+
+<p>代入 $p(y) = \pi_\theta(y|x)$：</p>
+<p>$$\nabla_\theta \pi_\theta(y|x) = \pi_\theta(y|x) \cdot \nabla_\theta \log \pi_\theta(y|x)$$</p>
+
+<p>代回上面的求和：</p>
+<p>$$\sum_y \pi_\theta(y|x) \, f(y) \, \nabla_\theta \log \pi_\theta(y|x)$$</p>
+<p>这个求和就是 $\mathbb{E}_{y \sim \pi_\theta}[\cdot]$ 的定义，所以：</p>
+<p>$$\nabla_\theta \mathbb{E}_{y \sim \pi_\theta}[f(y)] = \mathbb{E}_{y \sim \pi_\theta}\left[ f(y) \, \nabla_\theta \log \pi_\theta(y|x) \right]$$</p>
+
+<p><b>这就是策略梯度定理</b>（policy gradient theorem，REINFORCE）。左边是"期望对 $\theta$ 的梯度"——想要的；右边是"梯度的期望"——可以采样估计的。</p>
+
+<p><b>为什么右边能采样估计</b>：右边的期望还是对 $y \sim \pi_\theta$ 求的。具体操作：</p>
+<ol>
+<li>用当前 $\pi_\theta$ 采一批 $y^{(1)}, y^{(2)}, \ldots, y^{(N)}$</li>
+<li>对每个 $y^{(i)}$ 算 $f(y^{(i)}) \cdot \nabla_\theta \log \pi_\theta(y^{(i)}|x)$</li>
+<li>取平均 $\frac{1}{N} \sum_i f(y^{(i)}) \nabla_\theta \log \pi_\theta(y^{(i)}|x)$</li>
+</ol>
+<p>由大数定律，这个平均是 $\nabla_\theta J(\theta)$ 的无偏估计。拿到梯度就能做梯度上升 $\theta \leftarrow \theta + \eta \nabla_\theta J$（$\eta$ 是学习率）。</p>
+
+<p><b>直觉</b>：$\nabla_\theta \log \pi_\theta(y|x)$ 是"让 $y$ 出现概率上升的方向"（因为 $\log \pi_\theta$ 对 $\theta$ 的梯度指向 $\pi_\theta$ 增大最快的方向）。乘 $f(y)$ 后变成：$y$ 好（$f$ 大）就多往"让 $y$ 出现"的方向推；$y$ 差（$f$ 小或负）就反方向推。所以采到的好回答概率上升，差回答概率下降。</p>
+
+<h3>第 3 步：减 baseline 降低方差</h3>
+
+<p>直接用 $f(y) = r_\phi(x,y)$ 理论上对，但方差太大：不同 prompt $x$ 的平均 reward 差很多（简单问题高分，难题低分），噪声会淹没信号。</p>
+
+<p>解决办法：减一个 <b>baseline</b> $V(x)$。$V(x)$ 是 <b>value function</b>（价值函数），估计 prompt $x$ 下的平均 reward。用 $A(x,y) = r_\phi(x,y) - V(x)$ 代替 $r_\phi(x,y)$。</p>
+
+<p>$A(x,y)$ 叫 <b>优势函数</b>（advantage function）——"这条回答相对这个 prompt 的平均水平好多少"。</p>
+
+<p><b>关键性质：减 baseline 不改变梯度的期望</b>（仍然无偏），只降低方差。证明：</p>
+<p>$$\mathbb{E}_{y \sim \pi_\theta}[V(x) \nabla_\theta \log \pi_\theta(y|x)]$$</p>
+<p>$V(x)$ 不依赖 $y$，提到期望外面：</p>
+<p>$$= V(x) \cdot \mathbb{E}_{y \sim \pi_\theta}[\nabla_\theta \log \pi_\theta(y|x)]$$</p>
+<p>展开成求和：</p>
+<p>$$= V(x) \cdot \sum_y \pi_\theta(y|x) \nabla_\theta \log \pi_\theta(y|x)$$</p>
+<p>用 log-derivative trick 反过来：$\pi_\theta(y|x) \nabla_\theta \log \pi_\theta(y|x) = \nabla_\theta \pi_\theta(y|x)$，所以：</p>
+<p>$$= V(x) \cdot \sum_y \nabla_\theta \pi_\theta(y|x) = V(x) \cdot \nabla_\theta \sum_y \pi_\theta(y|x) = V(x) \cdot \nabla_\theta 1 = 0$$</p>
+<p>（概率分布求和恒为 1，对 $\theta$ 求梯度得 0。）所以减 $V(x)$ 不改变梯度的期望，只降低方差。✓</p>
+
+<p>RLHF 里通常把 KL 惩罚单独算（不放进 $f$），用 $A(x,y) = r_\phi(x,y) - V(x)$ 作为策略梯度里的项。完整梯度：</p>
+<p>$$\nabla_\theta J \approx \mathbb{E}_{y \sim \pi_\theta}\left[ A(x,y) \, \nabla_\theta \log \pi_\theta(y|x) \right] - \beta \, \nabla_\theta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$$</p>
+<p>第二项 $\nabla_\theta D_{\text{KL}}$ 可以直接算（$\pi_{\text{ref}}$ 冻结，KL 散度对 $\theta$ 有解析梯度）。</p>
+
+<h3>第 4 步：PPO 的 clip——限制每次更新幅度</h3>
+
+<p><b>朴素策略梯度的问题</b>：第 2、3 步给的梯度无偏，但工程上有问题。你采了一批 $y$（来自当前 $\pi_{\theta_{\text{old}}}$，$\theta_{\text{old}}$ 是采数据时的参数快照），算完梯度更新 $\theta$——如果步子大，新 $\pi_\theta$ 离 $\pi_{\theta_{\text{old}}}$ 太远，这批数据就不再代表新 policy 下的分布了。下次采的 $y$ 可能完全不一样，训练震荡甚至崩。</p>
+
+<p><b>重要性采样</b>（importance sampling）：想估 $\mathbb{E}_{y \sim \pi_\theta}[g(y)]$，但只有 $\pi_{\theta_{\text{old}}}$ 采的样本。用恒等式：</p>
+<p>$$\mathbb{E}_{y \sim \pi_\theta}[g(y)] = \mathbb{E}_{y \sim \pi_{\theta_{\text{old}}}}\left[\frac{\pi_\theta(y|x)}{\pi_{\theta_{\text{old}}}(y|x)} \, g(y)\right]$$</p>
+<p>证明：$\mathbb{E}_{y \sim \pi_\theta}[g(y)] = \sum_y \pi_\theta(y|x) g(y) = \sum_y \pi_{\theta_{\text{old}}}(y|x) \cdot \frac{\pi_\theta(y|x)}{\pi_{\theta_{\text{old}}}(y|x)} g(y) = \mathbb{E}_{y \sim \pi_{\theta_{\text{old}}}}[\frac{\pi_\theta}{\pi_{\theta_{\text{old}}}} g]$。✓</p>
+
+<p>定义 <b>重要性比</b>（importance ratio）：</p>
+<p>$$r_t(\theta) = \frac{\pi_\theta(y|x)}{\pi_{\theta_{\text{old}}}(y|x)}$$</p>
+<p>$r_t$ 衡量"新 policy 给 $y$ 的概率 ÷ 采时 policy 给 $y$ 的概率"。$r_t = 1$ 表示 $\theta$ 没动；$r_t$ 远离 1 表示 $\theta$ 离 $\theta_{\text{old}}$ 跑远了。下标 $t$ 表示第 $t$ 次采样。</p>
+
+<p>用旧样本估策略梯度，理论上可以。但 $r_t$ 太大或太小时，这个估计方差爆炸。PPO 的核心创新：<b>clip 限制 $r_t$ 的范围</b>，避免方差爆炸。</p>
+
+<p><b>PPO clip 目标</b>（最大化它）：</p>
+<p>$$\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}_{y \sim \pi_{\theta_{\text{old}}}}\left[ \min\left( r_t(\theta) \, A, \, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \, A \right) \right]$$</p>
+<p>符号说明：$r_t$ 是重要性比；$A$ 是优势函数（第 3 步定义的）；$\epsilon$ 是 clip 范围（实践共识 0.1~0.2 量级）；$\text{clip}(r, a, b)$ 表示把 $r$ 限制在 $[a, b]$（小于 $a$ 取 $a$，大于 $b$ 取 $b$）；$\min$ 取两者较小值（悲观取值）。</p>
+
+<p><b>clip 在干什么——分两种情况看</b>：</p>
+
+<p><b>情况 1：$A > 0$（好回答，要鼓励）</b>。我们想让 $\pi_\theta(y|x)$ 上升，即 $r_t > 1$。最大化目标下，更大的 $r_t$ 让 $r_t A$ 更大（目标更大）——policy 有动力抬 $r_t$。</p>
+<ul>
+<li>当 $r_t \le 1+\epsilon$：clip 不生效，$\text{clip}(r_t, \ldots) = r_t$，$\min(r_t A, r_t A) = r_t A$，正常更新</li>
+<li>当 $r_t > 1+\epsilon$：clip 把 $r_t$ 砍成 $1+\epsilon$。因为 $A > 0$，$(1+\epsilon) A < r_t A$（砍后更小）。$\min$ 取 $(1+\epsilon) A$——目标被冻结在 $(1+\epsilon) A$，再抬 $r_t$ 也不会让目标更大（梯度为 0），policy 没动力继续抬</li>
+</ul>
+<p>意思：好回答的概率可以涨，但涨到 $r_t = 1+\epsilon$（即 $\pi_\theta(y|x)$ 是采时的 $1+\epsilon$ 倍）就封顶。</p>
+
+<p><b>情况 2：$A < 0$（差回答，要压制）</b>。我们想让 $\pi_\theta(y|x)$ 下降，即 $r_t < 1$。最大化目标下，更小的 $r_t$ 让 $r_t A$ 更接近 0（更不负，目标更大）——policy 有动力压低 $r_t$。</p>
+<ul>
+<li>当 $r_t \ge 1-\epsilon$：clip 不生效，$\min(r_t A, r_t A) = r_t A$，正常更新</li>
+<li>当 $r_t < 1-\epsilon$：clip 把 $r_t$ 抬到 $1-\epsilon$。因为 $A < 0$，$(1-\epsilon) A$ 比 $r_t A$ 更负（更小）。$\min$ 取 $(1-\epsilon) A$——目标被冻结在 $(1-\epsilon) A$，再压低 $r_t$ 也不会让目标更大（梯度为 0），policy 没动力继续压</li>
+</ul>
+<p>意思：差回答的概率可以降，但降到 $r_t = 1-\epsilon$ 就封顶。</p>
+
+<p><b>两种情况合起来</b>：clip 在 $r_t$ 离 1 太远时把梯度效应冻结，让 policy 没动力继续往那个方向跑。每次更新被限制在"$\pi_{\theta_{\text{old}}}$ 附近一个小邻域内"（由 $\epsilon$ 控制），保证采的样本在新 policy 下还有代表性。</p>
+
+<p><b>$\min$ 的作用</b>：取较小值是<b>悲观</b>取值——对 policy 不利的方向更谨慎。如果反过来取 $\max$，policy 会鼓励 $r_t$ 极端化（往两端跑），训练必崩。</p>
+
+<h3>串起来：RLHF 的 PPO 完整流程</h3>
+
+<p>4 步合起来，RLHF 第 3 步的一次更新是：</p>
+<ol>
+<li>用当前 policy $\pi_{\theta_{\text{old}}}$ 采一批 $y$</li>
+<li>RM 给每个 $y$ 打分 $r_\phi(x,y)$</li>
+<li>用 value function $V(x)$ 算优势 $A = r_\phi(x,y) - V(x)$</li>
+<li>算重要性比 $r_t = \pi_\theta(y|x) / \pi_{\theta_{\text{old}}}(y|x)$（$\theta_{\text{old}}$ 是采时参数，$\theta$ 是正在更新的参数）</li>
+<li>算 PPO clip 目标 $\mathcal{L}^{\text{CLIP}} = \mathbb{E}[\min(r_t A, \, \text{clip}(r_t, 1-\epsilon, 1+\epsilon) A)]$</li>
+<li>减 KL 惩罚 $\beta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$</li>
+<li>对 $(\mathcal{L}^{\text{CLIP}} - \beta D_{\text{KL}})$ 做梯度上升更新 $\theta$</li>
+<li>重复——更新几步后 $\theta$ 离 $\theta_{\text{old}}$ 太远，重新采一批（设 $\theta_{\text{old}} \leftarrow \theta$）</li>
+</ol>
+
+<p><b>一句话总结</b>：目标函数里 $y$ 从 $\pi_\theta$ 采，没法直接求导 → 策略梯度定理把"梯度 of 期望"变成"期望 of 梯度"（可采样估） → 减 baseline 降方差 → 单步更新太大会破坏采样代表性，PPO 用 clip 比值限制步长。</p>
+
+<p><b>本节符号总览</b>：</p>
+<ul>
+<li>$\theta_{\text{old}}$：采数据时的 policy 参数（最近一次采样的快照）</li>
+<li>$V(x)$：value function，估计 prompt $x$ 下的平均 reward（baseline）</li>
+<li>$A(x,y) = r_\phi(x,y) - V(x)$：优势函数，这条回答相对平均好多少</li>
+<li>$r_t(\theta)$：重要性比，新 policy 给 $y$ 的概率 ÷ 采时 policy 给的概率</li>
+<li>$\epsilon$：clip 范围（实践共识 0.1~0.2 量级）</li>
+<li>$\nabla_\theta$：对 $\theta$ 求梯度</li>
+<li>$\eta$：学习率</li>
+</ul>
+
+<p>来源：策略梯度定理 + log-derivative trick ← Williams 1992 (REINFORCE)；PPO clip ← Schulman et al. 2017；重要性采样 ← 统计学基础。</p>
 </details>
 
 <details>
