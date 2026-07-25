@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RLHF：用人类反馈教语言模型听话</title>
+  <title>RLHF：让语言模型听人话的三阶段训练法</title>
   <link rel="stylesheet" href="../../../libs/katex.min.css">
   <script defer src="../../../libs/katex.min.js"></script>
   <script defer src="../../../libs/auto-render.min.js"
@@ -628,401 +628,775 @@
   <div class="lightbox-caption" id="lightboxCaption"></div>
 </div>
 
-<h1 class="title">RLHF：用人类反馈教语言模型听话</h1>
+<h1 class="title">RLHF：让语言模型听人话的三阶段训练法</h1>
 <p class="reading-time" id="readingTime"></p>
 
 <div class="callout callout-blue">
-<p><b>问题</b>：预训练（pretraining，用海量无标注文本让模型学会语言本身的阶段）加上 SFT（Supervised Fine-Tuning，监督微调，用人写示范答案教模型答题）之后，模型已经会说话、会答题，但答案不一定符合人类真正想要的——而让人写"标准答案"又贵、又难统一标准。<br>
-<b>方案</b>：让人对两个答案做 A/B 选择，这种<b>偏好数据</b>（preference data，记录"人选哪个答案更好"的数据）比写标准答案省力；训一个<b>奖励模型</b>（RM，Reward Model，给"问题+答案"打一个<b>标量</b>分数——即一个数，不是向量——的模型）来模仿人类偏好；再用<b>强化学习</b>（RL，Reinforcement Learning，让模型通过试错去最大化某个分数的学习方式）优化语言模型去拿高分，同时用 <b>KL 散度</b>（KL divergence，衡量两个概率分布差异大小的数值）约束它别跑偏。<br>
-<b>产物</b>：一个更"听人话"的语言模型，也就是完成了<b>对齐</b>（alignment，让模型行为符合人类意图）。</p>
+<p><b>问题</b>：监督微调（SFT，Supervised Fine-Tuning，给模型看"问-答"对、用交叉熵学字面答案的训练方式）只能学"标准答案的字面"，但很多任务没有唯一正确答案，且标注员写一条高质量示范 ≈ 比较两个答案谁更好的 10-100 倍成本（InstructGPT 论文 §3.2）。<br>
+<b>方案</b>：RLHF（Reinforcement Learning from Human Feedback，基于人类反馈的强化学习）用人类对模型输出的<b>偏好</b>（A 比 B 好）训练一个奖励模型 RM（Reward Model，输入 prompt+response 输出标量分数、模拟"人类觉得这个回答有多好"），再用 RM 当奖励通过 PPO（Proximal Policy Optimization，一种用 clip 限制每次更新步长的策略梯度算法）优化语言模型。<br>
+<b>产物</b>：一个听人话的语言模型——1.3B 参数的 InstructGPT 输出在人类偏好评估上超过 175B 的原始 GPT-3（GPT，Generative Pre-trained Transformer，OpenAI 的语言模型家族；InstructGPT 论文 §3.5）。</p>
 </div>
 
 <div class="context-box">
   <p class="context-box-title">30 秒上下文：先知道它站在哪里</p>
   <div class="context-grid">
-    <div class="context-label">大流程</div><div class="context-value">预训练 → SFT → <b>RLHF（对齐阶段）</b>。RLHF 是把"会说话的模型"变成"听话的模型"那一步。</div>
-    <div class="context-label">旧方案</div><div class="context-value">只做预训练 + SFT，靠人写标准答案教模型。</div>
-    <div class="context-label">痛点</div><div class="context-value">标准答案贵、不同人写的标准不一致；主观维度（哪个更有用、更无害）上人很难写出"最优答案"，但很容易判断"A 比 B 好"。</div>
-    <div class="context-label">改变点</div><div class="context-value">用偏好数据 + 奖励模型 + 强化学习，把"人类偏好"变成一个可以梯度优化的分数。</div>
+    <div class="context-label">大流程</div><div class="context-value">大语言模型（LLM，Large Language Model）训练三段式：<b>预训练</b>（海量文本学语言）→ <b>SFT</b>（示范数据学指令跟随）→ <b>对齐</b>（RLHF/DPO/RLAIF 等让模型符合人类偏好）。RLHF 在第三段。</div>
+    <div class="context-label">旧方案</div><div class="context-value">只用 SFT：标注员手写标准答案，模型用交叉熵学字面。</div>
+    <div class="context-label">痛点</div><div class="context-value">①很多任务没有唯一正确答案（写作、对话、推理）②偏好是相对的（A 比 B 好），不是绝对的③手写高质量示范成本极高。</div>
+    <div class="context-label">改变点</div><div class="context-value">监督信号从"标准答案"变成"偏好对"；训练目标从交叉熵变成"期望奖励 - KL（Kullback-Leibler 散度，衡量两个概率分布差异的非负量，0 表示完全相同）惩罚"；优化器从 SGD 变成 PPO。</div>
   </div>
 </div>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
   <ul>
-    <li>RLHF 在 LLM 训练流程里处于哪一步、要解决什么问题？</li>
-    <li>为什么"让人做选择"比"让人写答案"更便宜、更可扩展？</li>
-    <li>RLHF 的三个阶段（SFT → 奖励模型 → PPO，PPO 是一种强化学习优化算法）分别做什么？</li>
-    <li>为什么必须加 KL 散度约束、不加会怎样？</li>
-    <li>RLHF 在什么情况下会失效、有哪些替代方案？</li>
+    <li>RLHF 在大模型训练流程里属于哪一步？解决什么问题？</li>
+    <li>为什么不能用 SFT 直接解决偏好问题？为什么要绕一圈用强化学习？</li>
+    <li>RLHF 的三个阶段（SFT / RM / PPO）分别做什么、输入输出是什么？</li>
+    <li>PPO 优化时为什么要加 KL 惩罚项？不加会怎样？</li>
+    <li>RLHF 的代价和边界在哪？什么时候该用 DPO / GRPO 等替代方案？</li>
   </ul>
 </section>
 
 <section class="misconceptions">
   <h2>最容易误解</h2>
   <ul>
-    <li><b>"RLHF = PPO"</b>——错。PPO（Proximal Policy Optimization，一种策略优化算法）只是第三步用的 RL 算法，RLHF 是"偏好数据 → 奖励模型 → RL"整套范式。</li>
-    <li><b>"RLHF 不需要 SFT"</b>——错。SFT 是 RLHF pipeline 的第一步，它给出一个"会答题"的起点模型，后面才能在这个起点上做偏好优化。</li>
-    <li><b>"奖励模型就是语言模型本身"</b>——不对。奖励模型是单独训练的"打分头"，输入 (问题, 答案)、输出一个标量分数，不生成 token。</li>
-    <li><b>"KL 惩罚是为了让模型完全不变"</b>——错。KL 惩罚是防止模型为钻奖励模型漏洞而跑偏，不是禁止它变化；β 太大模型就学不动，太小模型就乱跑。</li>
+    <li><b>"RLHF = PPO"</b>：错。PPO 只是 RLHF 默认的优化器，是通用 RL 算法。RLHF 是"用 RM 当奖励 + RL 优化"的范式，换成 GRPO / REINFORCE 也是 RLHF。</li>
+    <li><b>"RLHF = DPO"</b>：错。DPO（Direct Preference Optimization，直接用偏好对优化策略、跳过 RM 和 RL 阶段的方法）是 RLHF 的替代方案，不是 RLHF 的一种。</li>
+    <li><b>"RLHF 就是让人类给每个回答打分"</b>：不严格。人类标注的是<b>偏好对</b>（A 比 B 好），不是绝对分数。绝对分数一致性差，相对比较一致性高。</li>
+    <li><b>"RM 越大越准"</b>：不一定。RM 容量受限于人类标注的一致性（InstructGPT 标注员一致性约 73%），RM 太大会过拟合标注噪声。</li>
   </ul>
 </section>
 
 <blockquote class="meta">
-<p><b>来源</b>：InstructGPT（Ouyang et al., 2022）；Christiano et al., 2017 "Deep reinforcement learning from human preferences"；PPO（Schulman et al., 2017）；Bradley-Terry 模型。</p>
+<p><b>来源</b>：InstructGPT 论文（Ouyang et al., NeurIPS 2022, arXiv:2203.02155）；Learning to Summarize from Human Feedback（Stiennon et al., NeurIPS 2020, arXiv:2009.01325）；PPO 原论文（Schulman et al., 2017, arXiv:1707.06347）；DeepSeek-R1（DeepSeek, 2025-01，GRPO 来源）；HuggingFace TRL 实现（github.com/huggingface/trl）。具体数字出处见每处标注和末尾"证据边界声明"。</p>
 </blockquote>
 
-<p><b>小白版一句话定义</b>：RLHF 是先让人给模型的答案做"谁更好"的选择，训出一个能模仿人偏好的打分器，再让模型用强化学习去拿高分，同时用一根"绳子"（KL 约束）拉着它别跑偏。</p>
+<p><b>小白版一句话定义</b>：RLHF 是让模型"听人话"的训练方法——先教模型说话（SFT），再让人对比模型输出的好坏训一个"打分器"（RM），最后用这个打分器当奖励、用强化学习（PPO）调模型，让它越生成越合人意。</p>
 
-<!-- ============ 第一章：它在哪 + 之前怎么做 + 为什么不够 ============ -->
+<!-- 正文结构自由，但必须覆盖七个认知阶段：
+  1. 它在哪：属于哪个大流程
+  2. 之前怎么做：旧方案
+  3. 为什么不够：旧方案的问题
+  4. 它改了什么：核心思路
+  5. 它是什么：定义
+  6. 它怎么工作：机制
+  7. 什么时候用：边界
+  可以合并、拆分、跳过、自由命名标题。
+  读者读完后必须能回答这七个问题。
+-->
 
-<h1>预训练模型会说话，但不听你的</h1>
+<!-- ============ 认知阶段 1：它在哪 ============ -->
 
-<p>一个刚预训练完的语言模型，本质上只学会了一件事：给定前面的文本，预测下一个 <b>token</b>（语言模型处理的最小单位，约等于一个词或几个字符）。它读过海量网页和书籍，所以会说人话、会接话——但你问它"帮我写一封请假信"，它可能接着写"……的格式如下"然后把话题岔开，因为它没学过"听指令、然后回答"这件事。</p>
+<h1>大模型训练流程里 RLHF 在哪一步</h1>
 
-<p>早期的做法是 <b>SFT</b>（监督微调）：人写很多 <code>(prompt, response)</code> 对——<b>prompt</b> 是输入给模型的问题，<b>response</b> 是希望模型给的答案——然后让模型模仿这些示范。这一步把"会说话"的模型变成"会答题"的模型。</p>
+<p>要理解 RLHF 在干什么，先看一个现代大语言模型（LLM，Large Language Model，给一段文本输出概率 P(text) 的大神经网络）从零到能用的完整流程。业界把它分成三段：</p>
 
-<p>但 SFT 有三个绕不开的问题：</p>
+<pre class="diagram">
+   预训练                SFT                  对齐
+  ┌────────┐         ┌────────┐         ┌──────────────┐
+  │ 海量文本 │  ───>  │ 示范数据 │  ───>  │ 偏好数据 + RL │
+  │ 学语言   │         │ 学指令   │         │ 学人类偏好    │
+  └────────┘         └────────┘         └──────────────┘
+   GPT-3 原版          会回答问题           听话、安全、有用
+   "续写文本"          "回答指令"           "对齐人类"
+                                              ↑
+                                           RLHF 在这
+</pre>
 
+<p>三段各自的目标不同：</p>
 <ul>
-  <li><b>写好答案又贵又难统一</b>。一个领域专家写一条高质量答案可能要十几分钟，不同人写的"好"标准也不一样，有的人啰嗦、有的人精简。</li>
-  <li><b>主观维度上人写不出"最优"</b>。比如"哪个答案更有用"、"哪个更无害"，人很容易判断 A 比 B 好，但很难凭空写出"最有用、最无害"的那条答案——写示范比做选择难得多。</li>
-  <li><b>SFT 学不到偏好信号</b>。监督微调只学"像示范"，但示范本身没有告诉你"这个答案比那个好多少"，模型学不到排序信息。</li>
+<li><b>预训练</b>：在海量互联网文本上做"下一个 token 预测"，让模型学会语言本身。产物是一个会续写但不听指令的模型（你问它"中国的首都是？"，它可能续写"日本的首都是东京"）。</li>
+<li><b>SFT（Supervised Fine-Tuning，监督微调）</b>：用人工写的"问-答"示范数据，让模型学会"看到指令就回答"。产物是一个会回答问题的模型，但回答质量取决于示范数据，且容易答得"不像人话"。</li>
+<li><b>对齐</b>：让模型的输出符合人类偏好——更听话、更有用、更安全。RLHF 是这一段的核心方法之一，其他还有 DPO、RLAIF 等。</li>
 </ul>
 
-<p>这三个问题的共同根源是：<b>让人写答案，是用错了人的能力</b>。人真正擅长、又便宜的是"做判断"，不是"做创作"。RLHF 的核心思路就是顺着这个能力重新设计训练信号。</p>
+<p>RLHF 解决的核心问题是：<b>"什么样的回答是好回答"无法用 loss 直接写出来</b>。预训练和 SFT 都有明确的损失函数（下一个 token 的交叉熵），但"好"是一个主观、相对的概念——RLHF 的工作就是把这种主观偏好变成一个可以求导、可以优化的标量目标。</p>
 
-<!-- ============ 第二章：它改了什么 ============ -->
+<p class="chapter-summary">这章把 RLHF 定位在训练流程的第三段（对齐），知道了它要解决"偏好无法直接写成 loss"的问题。下一章看在 RLHF 之前，第二段的 SFT 具体怎么做、卡在哪。</p>
 
-<h1>让人做选择，比让人写答案容易</h1>
+<!-- ============ 认知阶段 2+3：之前怎么做 + 为什么不够 ============ -->
 
-<p>RLHF 改的第一件事，是把训练信号从"示范数据"换成"偏好数据"。<b>偏好数据</b>长这样：给标注员一个 prompt 和两个 response（A 和 B，可能来自两个不同模型、或同一个模型的不同采样），让她二选一，记录下"人选了 A"还是"人选了 B"。</p>
+<h1>在 RLHF 之前：SFT 怎么做、卡在哪</h1>
 
-<p>为什么这个改变是关键的：</p>
+<p>SFT 的做法很直接：人工标注员写一批高质量的"问-答"对，比如：</p>
 
-<ol>
-  <li><b>选比写快</b>。判断两个答案哪个更好可能只要 30 秒，写一条好答案要十几分钟。同样预算下能采十倍以上的数据。</li>
-  <li><b>主观维度更一致</b>。"哪个更有用"这种判断，人做选择的一致性远高于凭空写出"最有用"的答案。</li>
-  <li><b>不需要标注员是专家</b>。做选择不需要写出最优解，只要能比较，所以可以批量招标注员。</li>
-</ol>
+<pre class="diagram">
+prompt x  =  "把这句话翻译成英文：今天天气不错"
+response y =  "The weather is nice today."
+</pre>
 
-<p>但偏好数据有个问题：<b>它只是"A 比 B 好"，不是一个可以求导的分数</b>。强化学习需要一个能算梯度的目标函数，"人选了 A"这种离散标签没法直接优化。所以需要第二步——训练一个奖励模型，把偏好变成连续分数。</p>
+<p>然后把模型的输出概率 P(y | x) 拉高。具体是用<b>交叉熵</b>（衡量两个概率分布差异的损失，越小越接近）作为损失函数，对每个 token 做监督学习。模型参数 θ（神经网络权重）通过梯度下降让交叉熵越来越小，最终模型在看到这个 prompt 时会输出接近 y 的回答。</p>
 
-<h2>奖励模型：把偏好变成分数</h2>
+<p>SFT 的产物是一个"会说话"的模型——能回答指令。但它在三个地方卡住了：</p>
 
-<p><b>奖励模型 RM</b> 的输入是 <code>(prompt, response)</code>，输出是一个标量分数 $r_\varphi(x, y)$（$\varphi$ 表示 RM 的参数，$x$ 是 prompt，$y$ 是 response）。训练目标很直接：让人偏好的答案分数高于不偏好的答案。</p>
+<h2>卡点 1：很多任务没有唯一正确答案</h2>
 
-<p>把"偏好"变成"分数"用的是一个经典数学模型——<b>Bradley-Terry 模型</b>。它假设：如果答案 A 的"真实质量分"是 $r_A$、B 是 $r_B$，那么人选 A 而不是 B 的概率是：</p>
+<p>翻译任务还能写标准答案，但写文章、对话、推理这类任务没有唯一正解。同一个 prompt "写一首关于秋天的诗"，可以有千百种好回答。SFT 只能学一个固定答案的字面，模型学不到"什么是好"。</p>
 
-$$P(y_A \succ y_B \mid x) = \sigma\big(r_\varphi(x, y_A) - r_\varphi(x, y_B)\big)$$
+<h2>卡点 2：偏好是相对的，不是绝对的</h2>
 
-<p>这里 $\sigma$ 是 <b>sigmoid 函数</b>，把任意实数压到 $(0, 1)$ 区间，可以当概率用：</p>
+<p>人类判断"好坏"靠比较，不靠打分。给两个回答 A 和 B，人能轻松说"A 比 B 好"；但要给每个回答打 0-100 分，人与人之间一致性极差（你打 80 我打 60）。SFT 的损失函数没法表达"A 比 B 好"这种<b>偏好关系</b>——它只能表达"答案就是这个"。</p>
 
-$$\sigma(z) = \frac{1}{1 + e^{-z}}$$
+<h2>卡点 3：写高质量示范的成本极高</h2>
 
-<p>RM 的训练损失就是最大化"人选了 A"这个事件发生的概率，等价于下面这个负对数似然：</p>
+<p>InstructGPT 论文 §3.2 给了一个关键数字：<b>写一条高质量示范 ≈ 比较两个答案谁更好的 10-100 倍成本</b>。原因很直接——写一条好答案需要人从头创作高质量内容，而比较两个已有答案只需要判断优劣。同样的预算，做偏好标注能拿到 10-100 倍的数据量。</p>
 
-$$\mathcal{L}_{\text{RM}} = -\log \sigma\big(r_\varphi(x, y_w) - r_\varphi(x, y_l)\big)$$
+<p>这三个卡点合起来意味着：SFT 把模型拉到了"能用"的起点，但要把模型从"能用"推到"好用"，需要一种能用偏好数据、能把"好坏"变成可优化目标的方法。</p>
 
-<p>其中 $y_w$ 是被选中的（winner），$y_l$ 是没被选中的（loser）。这个损失直观上很合理：当 $r_\varphi(x, y_w)$ 比 $r_\varphi(x, y_l)$ 大很多时，$\sigma$ 接近 1，$\log \sigma$ 接近 0，损失就小；反之损失大。RM 训练完，就有了一个可以给任意 <code>(prompt, response)</code> 打分的函数，可以求导，可以用来做强化学习。</p>
+<p class="chapter-summary">这章讲了 SFT 的做法（监督交叉熵学字面答案）和它的三个卡点（无唯一答案、偏好相对、标注贵）。下一章看 RLHF 怎么针对这三个卡点改设计。</p>
 
-<p>读到这里，你应该已经能解释：</p>
-<ul>
-  <li>为什么"让人做选择"比"让人写答案"更便宜、更可扩展；</li>
-  <li>奖励模型的输入和输出分别是什么；</li>
-  <li>Bradley-Terry 模型怎么把"A 比 B 好"转成一个可优化的概率。</li>
-</ul>
+<!-- ============ 认知阶段 4：它改了什么 ============ -->
 
-<!-- ============ 第三章：它是什么 + 它怎么工作 ============ -->
+<h1>RLHF 改了什么：把"好坏"变成可优化目标</h1>
 
-<h1>三步走：SFT、奖励模型、PPO</h1>
+<p>针对上一章的三个卡点，RLHF 做了三个对应的改变：</p>
 
-<p>把前两章拼起来，再加上强化学习这一步，就是完整的 RLHF 流程。</p>
+<h2>改变 1：监督信号从"标准答案"变成"偏好对"</h2>
 
-<p><b>小白版定义</b>：RLHF 就是三件事按顺序做——先用 SFT 给一个"会答题"的起点模型；再用偏好数据训一个奖励模型来打分；最后用 PPO 让语言模型去拿高分，同时用 KL 散度拉着它别离起点太远。</p>
+<p>不再要标注员写答案，改要他们做比较。给标注员一个 prompt 和模型的两个回答 A、B，让他们标"A 比 B 好"还是"B 比 A 好"。这样一条数据形如 (x, y<sub>w</sub>, y<sub>l</sub>)——x 是 prompt，y<sub>w</sub> 是 winner（更好的回答），y<sub>l</sub> 是 loser（更差的回答）。这种数据叫<b>偏好对</b>，比写示范便宜 10-100 倍。</p>
 
-<p><b>正式技术定义</b>：在 SFT 模型 $\pi_{\text{ref}}$ 基础上，用人类偏好数据训练奖励模型 $r_\varphi(x, y)$；以 $\pi_{\text{ref}}$ 为参考，用 PPO 优化策略 $\pi_\theta$ 最大化下面的目标：</p>
+<h2>改变 2：训练目标从"交叉熵"变成"期望奖励"</h2>
 
-$$\max_{\pi_\theta}\; \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot \mid x)}\left[ r_\varphi(x, y) - \beta \, \mathrm{KL}\big(\pi_\theta(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x)\big) \right]$$
+<p>用一个奖励模型 r<sub>φ</sub>(x, y)（参数 φ，输入 prompt x 和 response y 输出标量分数）模拟人类偏好——它学会了"什么样的回答人觉得好"。然后用它当奖励，让策略 π<sub>θ</sub>（参数 θ 的语言模型）优化"期望奖励"：</p>
+
+<p>$$J(\theta) = \mathbb{E}_{x \sim D,\, y \sim \pi_\theta(\cdot|x)}\big[r_\varphi(x, y)\big]$$</p>
 
 <p>符号说明：</p>
 <ul>
-  <li>$x$：prompt（问题）</li>
-  <li>$y$：response（答案），由当前策略 $\pi_\theta$ 采样得到</li>
-  <li>$\pi_\theta$：<b>策略</b>（policy），当前正在优化的语言模型。RL 术语里把"被优化的模型"叫策略</li>
-  <li>$\pi_{\text{ref}}$：<b>参考模型</b>，SFT 后冻结，用来约束 $\pi_\theta$ 不要跑偏</li>
-  <li>$r_\varphi$：奖励模型</li>
-  <li>$\beta$：KL 惩罚的强度系数（一个超参数）</li>
-  <li>$\mathrm{KL}(\cdot \| \cdot)$：KL 散度，衡量两个分布在每个 token 上的概率差异</li>
-  <li>$\mathbb{E}$：期望，对所有 prompt 和采样的 response 取平均</li>
-  <li>$\mathcal{D}$：prompt 的分布（训练数据集）</li>
+<li>J(θ)：优化目标，θ 的函数，越大越好。</li>
+<li>E[·]：期望，对所有可能的 prompt x 和模型生成的 response y 取平均。</li>
+<li>D：prompt 的分布（来自用户实际会问的问题）。</li>
+<li>π<sub>θ</sub>(·|x)：策略，即参数为 θ 的语言模型，给定 x 输出 y 的概率分布。</li>
+<li>r<sub>φ</sub>(x, y)：奖励模型，参数 φ，输入 (x, y) 输出标量分数。</li>
 </ul>
 
-<h2>三阶段流程图</h2>
+<p>这个目标说的是："让模型生成的回答在 RM 看来分数尽量高。" 但这样直接优化会出问题——见下一个改变。</p>
 
-<pre class="diagram">        预训练语言模型
-              │
-              ▼  SFT（用示范数据：人写答案）
-        π_ref（参考模型，冻结）
-              │
-              ├──► 训练奖励模型 RM（用偏好数据：人做 A/B 选择）
-              │           │
-              │           ▼
-              │          r_φ(x, y)  ← 给任意 (问题, 答案) 打分
-              │
-              ▼  PPO（用 RL 最大化 r_φ - β·KL）
-        π_θ（对齐后的模型）◄── KL 把它拉回 π_ref</pre>
+<h2>改变 3：加 KL 惩罚防漂移</h2>
 
-<p>三个阶段各自的责任很清晰：SFT 给一个"会答题"的起点 $\pi_{\text{ref}}$；RM 把人的偏好变成可微的分数 $r_\varphi$；PPO 让 $\pi_\theta$ 往高分方向走，KL 这根绳子防止它走歪。下一章专门讲为什么这根绳子不能少。</p>
+<p>RM 只在人类标注过的那批数据分布上学得好。如果模型为了刷高分跑到 RM 没见过的区域，RM 给的分数就不可信了——模型可能钻空子输出一些 RM 觉得高分、但人类觉得垃圾的文本（这叫 <b>reward hacking</b>，奖励钻空子）。比如 RM 学到"包含礼貌用语分数高"，模型可能输出"谢谢 谢谢 谢谢 谢谢"刷分。</p>
 
-<!-- ============ 第四章：它怎么工作的关键深化 ============ -->
+<p>解决办法：把策略 π<sub>θ</sub> 拉回一个<b>参考模型</b> π<sub>ref</sub>（通常是 SFT 后冻结的模型，作为<b>锚点</b>——防止漂移的参考点）附近，用 KL 散度做惩罚：</p>
 
-<h1>为什么必须用 KL 拉住模型</h1>
+<p>$$J(\theta) = \mathbb{E}_{x,\, y \sim \pi_\theta}\big[r_\varphi(x, y) - \beta \cdot \mathrm{KL}(\pi_\theta(\cdot|x) \,\|\, \pi_{\mathrm{ref}}(\cdot|x))\big]$$</p>
 
-<p>如果你只写 <code>max E[r_φ(x, y)]</code> 而不加 KL 项，会发生什么？模型会找到一个捷径：既然 RM 是一个有限数据训出来的打分器，它一定有漏洞，模型只要找到能让 $r_\varphi$ 给高分的"漏洞答案"，就能拿满分——但这种答案对人来说往往毫无意义。</p>
-
-<p>这个现象叫 <b>reward hacking</b>（钻奖励的漏洞）。举几个真实会出现的例子：</p>
-
+<p>符号说明：</p>
 <ul>
-  <li>RM 在训练数据里偏好长答案 → 模型就无限凑字数，答案越长越好</li>
-  <li>RM 偏好带"作为 AI 语言模型"这种话术 → 模型每条答案都加这句话</li>
-  <li>RM 对某类句式给高分 → 模型不管问什么都用这个句式回答</li>
+<li>KL(π<sub>θ</sub> ‖ π<sub>ref</sub>)：当前策略相对参考模型的 KL 散度。非负，0 表示两个分布完全相同，越大越偏离。</li>
+<li>β：KL 惩罚系数，标量。控制"允许离参考模型多远"。InstructGPT 用 0.001 量级（论文附录训练超参）。</li>
+<li>其余符号同上。</li>
 </ul>
 
-<p>这些答案 RM 会给高分，但人看着很糟糕。问题的根源是：RM 只在偏好数据覆盖到的答案分布上是准的，一旦模型为了刷分跑到这个分布之外，RM 的打分就不可靠了。</p>
+<p>这个目标就是 RLHF 优化策略时用的核心公式：<b>既要 RM 分数高，又不能离 SFT 模型太远</b>。β 小 → 更激进追求高分（可能 reward hacking）；β 大 → 更保守（接近 SFT 模型，学不到偏好）。</p>
 
-<h2>KL 散度：一根拉住模型的绳子</h2>
-
-<p><b>KL 散度</b>衡量两个概率分布的差异。对语言模型来说，每个位置都有一个"下一个 token 取各个词的概率分布"，KL 把 $\pi_\theta$ 和 $\pi_{\text{ref}}$ 在每个位置的分布差异加起来：</p>
-
-$$\mathrm{KL}\big(\pi_\theta(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x)\big) = \sum_t \sum_v \pi_\theta(v \mid x, y_{<t}) \log \frac{\pi_\theta(v \mid x, y_{<t})}{\pi_{\text{ref}}(v \mid x, y_{<t})}$$
-
-<p>这里 $t$ 遍历 response 里的每个位置，$v$ 遍历词表里的每个 token，$y_{<t}$ 是位置 $t$ 之前已经生成的 token。$\pi_{\text{ref}}$ 是"会正常答题"的 SFT 模型。如果 $\pi_\theta$ 为了刷分跑到了 $\pi_{\text{ref}}$ 认为很离谱的地方（比如给一个正常 prompt 回答全是无意义重复 token），KL 就会很大，目标函数里的 $-\beta \cdot \mathrm{KL}$ 项就会把这个解压下去。</p>
-
-<p>$\beta$ 控制"绳子的松紧"：</p>
-
+<p>读到这里，你应该已经能解释：</p>
 <ul>
-  <li><b>$\beta$ 大</b>：绳子紧，$\pi_\theta$ 不敢偏离 $\pi_{\text{ref}}$ 太多 → 安全但学不到新东西</li>
-  <li><b>$\beta$ 小</b>：绳子松，$\pi_\theta$ 可以大幅改变 → 能学到偏好，但容易 reward hacking</li>
-  <li><b>$\beta = 0$</b>：没绳子，纯刷分 → 几乎一定 reward hacking</li>
+<li>RLHF 的三个改变点分别针对 SFT 的哪个卡点？</li>
+<li>为什么优化目标里要有 KL 惩罚项？不加会发生什么？</li>
+<li>β 这个超参变大或变小，模型行为会怎么变？</li>
 </ul>
 
-<p>实际工程里 $\beta$ 是个需要调的超参数，InstructGPT 报告用一个较小的值来平衡这两个极端（具体值见论文）。</p>
+<p class="chapter-summary">这章讲了 RLHF 的三个核心改变：偏好对代替答案、期望奖励代替交叉熵、KL 惩罚防漂移。下一章给出 RLHF 的正式定义和三阶段管线。</p>
+
+<!-- ============ 认知阶段 5：它是什么 ============ -->
+
+<h1>RLHF 的正式定义：三阶段管线</h1>
+
+<p><b>小白版定义</b>：RLHF 是"先教模型说话、再训一个打分器、最后用打分器当奖励调模型"的三步训练法。</p>
+
+<p><b>正式技术定义</b>：RLHF 是一种对齐方法，由三个阶段组成——(1) SFT 得到初始策略 π<sub>θ<sub>0</sub></sub>；(2) 用人类偏好对 D<sub>pref</sub> 训练奖励模型 r<sub>φ</sub>；(3) 用 r<sub>φ</sub> 当奖励、用 PPO 优化策略 π<sub>θ</sub>，目标为 J(θ) = E[r<sub>φ</sub>(x,y)] - β·KL(π<sub>θ</sub>‖π<sub>ref</sub>)，其中 π<sub>ref</sub> = π<sub>θ<sub>0</sub></sub> 冻结。</p>
+
+<pre class="diagram">
+   阶段 1：SFT             阶段 2：RM                阶段 3：PPO
+  ┌──────────────┐       ┌──────────────┐        ┌────────────────┐
+  │ 示范数据      │       │ 偏好对数据    │        │ RM 当奖励       │
+  │ 交叉熵训练    │ ───>  │ Bradley-Terry │ ───>   │ PPO 优化策略    │
+  │              │       │ 训练 r_φ      │        │ + KL 惩罚       │
+  └──────────────┘       └──────────────┘        └────────────────┘
+   产物: π_SFT            产物: r_φ              产物: π_RLHF
+        │                      ↑                       │
+        └──────────────────────┴───────────────────────┘
+            π_SFT 同时作为 RM 的训练起点和 PPO 的参考模型
+</pre>
+
+<p>符号说明：</p>
+<ul>
+<li>π<sub>θ</sub>：参数为 θ 的语言模型（策略）。给定 prompt x 输出 response y 的概率 P(y|x)。θ 是神经网络权重。</li>
+<li>π<sub>θ<sub>0</sub></sub> 或 π<sub>SFT</sub>：SFT 后的初始策略。</li>
+<li>π<sub>ref</sub>：参考模型，PPO 阶段冻结，作为 KL 锚点。等于 π<sub>SFT</sub>。</li>
+<li>r<sub>φ</sub>(x, y)：奖励模型，参数 φ。输入 (x, y) 输出标量分数。</li>
+<li>D<sub>pref</sub>：偏好数据集，每条形如 (x, y<sub>w</sub>, y<sub>l</sub>)。</li>
+<li>y<sub>w</sub>, y<sub>l</sub>：winner / loser，人类标注里更好和更差的回答。</li>
+<li>β：KL 惩罚系数（标量）。</li>
+</ul>
+
+<p class="chapter-summary">这章给了 RLHF 的正式定义和三阶段管线图。下面三章分别拆解每个阶段——SFT、RM、PPO，每个都给直觉、公式、推导、数值例子和可运行代码。</p>
+
+<!-- ============ 认知阶段 6：它怎么工作 — 子概念 1：SFT ============ -->
+
+<h1>第一阶段 SFT：让模型会说话</h1>
+
+<h2>直觉</h2>
+
+<p>预训练后的模型只会"续写"——你给它"中国的首都"它可能续写成"是日本的首都"而不是回答"是北京"。SFT（监督微调）就是给模型看一批"问-答"示范，让它从"续写模式"切换到"回答指令模式"。这是<b>冷启动</b>（cold start，模型完全没学过任务、需要拉到能用的水平）阶段。</p>
+
+<h2>公式</h2>
+
+<p>对每条示范 (x, y)，其中 y = (y<sub>1</sub>, y<sub>2</sub>, …, y<sub>T</sub>) 是 T 个 token 的序列，SFT 最小化交叉熵损失：</p>
+
+<p>$$\mathcal{L}_{\mathrm{SFT}}(\theta) = -\sum_{t=1}^{T} \log \pi_\theta(y_t \mid x, y_{<t})$$</p>
+
+<p>符号说明：</p>
+<ul>
+<li>L<sub>SFT</sub>(θ)：SFT 损失，θ 的函数，越小越好。</li>
+<li>y<sub>t</sub>：response 的第 t 个 token。</li>
+<li>y<sub>&lt;t</sub>：第 t 个 token 之前的所有 token（y<sub>1</sub>, …, y<sub>t-1</sub>）。</li>
+<li>π<sub>θ</sub>(y<sub>t</sub> | x, y<sub>&lt;t</sub>)：策略在看到 x 和前 t-1 个 token 后，输出第 t 个 token 是 y<sub>t</sub> 的概率。</li>
+<li>T：response 长度（token 数）。</li>
+<li>log：自然对数。</li>
+</ul>
+
+<p>这个公式的意思是：把 response 拆成 token 序列，对每个位置让模型输出"正确 token"的概率尽量大。-log 把概率变成损失（概率越大损失越小），求和得到整条 response 的损失。</p>
 
 <details>
-<summary>展开推导：为什么用 KL(π_θ ‖ π_ref) 而不是反过来</summary>
+<summary>展开：为什么交叉熵能学字面答案</summary>
 
-<p><b>问题陈述</b>：我们要在目标函数里加一个 KL 惩罚项，让 $\pi_\theta$ 不要离 $\pi_{\text{ref}}$ 太远。但 KL 散度是有方向的——$\mathrm{KL}(P \| Q) \neq \mathrm{KL}(Q \| P)$——该用哪个方向？</p>
+<p><b>问题陈述</b>：为什么最小化 -Σ log π<sub>θ</sub>(y<sub>t</sub> | x, y<sub>&lt;t</sub>) 等价于"让模型在 prompt x 下输出 y 的概率最大"？</p>
 
-<p><b>核心困难</b>：选错方向会导致 $\pi_\theta$ 的优化行为不符合"防止钻漏洞"的本意。</p>
+<p><b>核心困难</b>：response 是 token 序列，整体概率 P(y|x) 和每个 token 的概率 π<sub>θ</sub>(y<sub>t</sub> | x, y<sub>&lt;t</sub>) 之间是什么关系？</p>
 
-<p><b>第 1 步：前向 KL = KL(π_ref ‖ π_θ) 的行为</b></p>
-<p>前向 KL 对 $\pi_\theta$ 的要求是：凡是 $\pi_{\text{ref}}$ 给高概率的 token，$\pi_\theta$ 也得给一定概率。这种性质叫 <b>mean-seeking</b>（覆盖模式），$\pi_\theta$ 会被逼着去覆盖 $\pi_{\text{ref}}$ 的所有可能输出。问题是它允许 $\pi_\theta$ 在 $\pi_{\text{ref}}$ 认为不太可能的 token 上也给出高概率——只要 $\pi_{\text{ref}}$ 给过高概率的都覆盖到就行。这正是 reward hacking 想钻的空子。</p>
+<p><b>第 1 步：把整体概率拆开</b>。一条 response y = (y<sub>1</sub>, …, y<sub>T</sub>) 在 prompt x 下被模型生成的概率，按<b>链式法则</b>（概率论里 P(A,B) = P(A)·P(B|A) 的多步推广）展开：</p>
 
-<p><b>第 2 步：反向 KL = KL(π_θ ‖ π_ref) 的行为</b></p>
-<p>反向 KL 对 $\pi_\theta$ 的要求是：凡是 $\pi_\theta$ 给高概率的 token，$\pi_{\text{ref}}$ 也得给一定概率。这种性质叫 <b>mode-seeking</b>（寻找模式），$\pi_\theta$ 不敢去 $\pi_{\text{ref}}$ 认为概率很低的地方。换句话说，$\pi_\theta$ 只能在 $\pi_{\text{ref}}$ 已经认为"合理"的区域里探索新模式。</p>
+<p>$$\pi_\theta(y \mid x) = \prod_{t=1}^{T} \pi_\theta(y_t \mid x, y_{<t})$$</p>
 
-<p><b>第 3 步：为什么 RLHF 要的是反向</b></p>
-<p>reward hacking 的本质就是 $\pi_\theta$ 跑到了 $\pi_{\text{ref}}$（正常答题模型）认为离谱的地方去刷分。反向 KL 正好惩罚这种行为：你想去 $\pi_{\text{ref}}$ 认为不可能的地方？行，但 KL 会爆炸，目标函数把你拉回来。所以反向 KL(π_θ ‖ π_ref) 和"防止钻漏洞"的目标天然对齐。</p>
+<p>验证：T=2 时，π<sub>θ</sub>(y<sub>1</sub>,y<sub>2</sub>|x) = π<sub>θ</sub>(y<sub>1</sub>|x)·π<sub>θ</sub>(y<sub>2</sub>|x,y<sub>1</sub>)。符合条件概率定义。</p>
 
-<p><b>验证</b>：考虑一个极端情况。设某个 token $v^*$ 在 $\pi_{\text{ref}}$ 下概率极低 $\pi_{\text{ref}}(v^*) = \epsilon$，但 RM 错误地给包含 $v^*$ 的答案高分。如果 $\pi_\theta$ 想把 $v^*$ 的概率提到 $p$：</p>
+<p><b>第 2 步：取对数把乘积变求和</b>。直接最大化乘积难算（数值下溢、梯度复杂），取 log 把乘积变求和：</p>
+
+<p>$$\log \pi_\theta(y \mid x) = \sum_{t=1}^{T} \log \pi_\theta(y_t \mid x, y_{<t})$$</p>
+
+<p>验证：log(AB) = log A + log B，递推得 log(∏) = Σ log。</p>
+
+<p><b>第 3 步：最大化 ⇔ 最小化负对数</b>。我们要让 π<sub>θ</sub>(y|x) 尽量大，等价于让 log π<sub>θ</sub>(y|x) 尽量大，等价于让 -log π<sub>θ</sub>(y|x) 尽量小：</p>
+
+<p>$$\max_\theta \pi_\theta(y \mid x) \iff \min_\theta \big[-\log \pi_\theta(y \mid x)\big] = \min_\theta \Big[-\sum_{t=1}^{T} \log \pi_\theta(y_t \mid x, y_{<t})\Big]$$</p>
+
+<p>这就是 L<sub>SFT</sub> 的来源。梯度下降最小化它，模型就会让每个 token 的条件概率逼近"标准答案"。</p>
+
+<p><b>一句话总结</b>：交叉熵损失 = 整条 response 概率的负对数，最小化它 = 最大化模型生成标准答案的概率。</p>
+
+<p><b>符号总览</b>：π<sub>θ</sub>(y|x) = 整体概率；π<sub>θ</sub>(y<sub>t</sub>|x, y<sub>&lt;t</sub>) = 第 t 个 token 的条件概率；log 把乘积变求和；负号把最大化变最小化。</p>
+</details>
+
+<details>
+<summary>展开：最小数值例子（3 token）</summary>
+
+<p>（本文构造，教学用）</p>
+
+<p>假设 prompt x = "翻译：good morning"，标准答案 y = ("早", "上", "好") 共 3 个 token。模型当前参数下每个 token 的条件概率：</p>
+
+<pre class="diagram">
+位置 t=1: π(早 | x)                = 0.5
+位置 t=2: π(上 | x, 早)            = 0.4
+位置 t=3: π(好 | x, 早, 上)        = 0.8
+</pre>
+
+<p>整体概率：π(y|x) = 0.5 × 0.4 × 0.8 = 0.16</p>
+
+<p>log 概率：log(0.5) + log(0.4) + log(0.8) = -0.693 - 0.916 - 0.223 = -1.832</p>
+
+<p>交叉熵损失：L = -(-1.832) = 1.832</p>
+
+<p>梯度下降一步后，模型会让这 3 个概率都变大，比如变成 (0.6, 0.5, 0.85)，新损失 = -[log(0.6)+log(0.5)+log(0.85)] = -[−0.511−0.693−0.163] = 1.367，损失下降了。</p>
+</details>
+
+<details class="code-details">
+<summary>展开：可运行代码（最小 SFT 一步）</summary>
+<div class="code-block">
+<pre><code class="language-python">"""最小 SFT：用交叉熵更新一个 tiny 语言模型的一步。
+不依赖任何外部库，纯 PyTorch。"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+# 假设词表大小 V=10，序列长度 T=4
+V, T, D = 10, 4, 8  # D 是 embedding 维度
+
+# 一个最小的"语言模型"：embedding + 一层线性
+class TinyLM(nn.Module):
+    def __init__(self, V, D):
+        super().__init__()
+        self.emb = nn.Embedding(V, D)
+        self.proj = nn.Linear(D, V)
+    def forward(self, tokens):
+        # tokens: (B, T) -> logits: (B, T, V)
+        return self.proj(self.emb(tokens))
+
+model = TinyLM(V, D)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+# 一条示范数据：prompt + response 拼成 token 序列
+# 假设前 2 个是 prompt，后 2 个是 response
+tokens = torch.tensor([[1, 2, 5, 7]])  # (B=1, T=4)
+
+# SFT loss：对每个位置预测下一个 token
+# 输入 tokens[:-1]，目标 tokens[1:]
+logits = model(tokens[:, :-1])  # (1, 3, V) 预测位置 1,2,3
+targets = tokens[:, 1:]         # (1, 3)    真实位置 1,2,3
+
+loss = F.cross_entropy(
+    logits.reshape(-1, V),  # (3, V)
+    targets.reshape(-1),    # (3,)
+)
+print(f"SFT loss = {loss.item():.4f}")
+
+# 反传 + 更新
+loss.backward()
+optimizer.step()
+
+# 再算一次，loss 应该下降
+with torch.no_grad():
+    new_logits = model(tokens[:, :-1])
+    new_loss = F.cross_entropy(
+        new_logits.reshape(-1, V), targets.reshape(-1))
+print(f"updated loss = {new_loss.item():.4f}")  # 应该比上面小
+</code></pre>
+</div>
+<p><b>代码层次</b>：第 1 层是数据（tokens），第 2 层是模型（TinyLM：embedding + 线性层），第 3 层是 loss（cross_entropy）+ 优化器（Adam）。真实 SFT 把 TinyLM 换成 Transformer，其他结构一样。</p>
+<p><b>读者容易卡在哪</b>：(1) 为什么输入是 tokens[:-1] 目标是 tokens[1:]？因为每个位置预测的是<b>下一个</b> token。(2) cross_entropy 内部已经做了 log_softmax，不要再手动 log。(3) reshape(-1, V) 是把 batch 和序列维度合并，因为 cross_entropy 接受 (N, C) 形状。</p>
+<p><b>和真实工程的差距</b>：真实模型是几十亿参数的 Transformer，有 causal mask、KV cache、packing（多条数据拼成一串提高 GPU 利用率）、分布式训练（DDP/ZeRO）。但这些都不改变 SFT 的本质——交叉熵最小化。InstructGPT 用约 13k 条示范数据做 SFT（论文 §3.1 表 1）。</p>
+</details>
+
+<p class="chapter-summary">这章讲了 SFT：用交叉熵让模型学标准答案的字面，产物是初始策略 π<sub>SFT</sub>。它解决了"会说话"的问题，但解决不了"说得好"——下一章看 RM 怎么把"好坏"变成可微的标量。</p>
+
+<!-- ============ 认知阶段 6：它怎么工作 — 子概念 2：RM ============ -->
+
+<h1>第二阶段 RM：把"好坏"变成标量</h1>
+
+<h2>直觉</h2>
+
+<p>偏好是相对的（A 比 B 好），不是绝对的（A 80 分）。要把它变成可优化的标量，需要一个函数 r(x, y) 把"好坏"映射成数字。RM 就是学这个函数——它是一个神经网络，输入 prompt x 和 response y，输出一个标量分数 r<sub>φ</sub>(x, y)。</p>
+
+<p>关键想法：人类标注的是"A 比 B 好"，但 RM 学的是绝对分数 r(x, y)。怎么从相对比较学到绝对分数？用 <b>Bradley-Terry 模型</b>——一个经典的偏好建模方法：假设每个选项有个"实力值" r，A 比 B 好的概率 = σ(r(A) - r(B))，其中 σ 是 sigmoid。</p>
+
+<h2>数据格式</h2>
+
+<p>偏好数据集 D<sub>pref</sub> 每条形如 (x, y<sub>w</sub>, y<sub>l</sub>)：</p>
+
+<pre class="diagram">
+x     = "解释什么是递归"
+y_w   = "递归是函数调用自己..."  (winner，更好)
+y_l   = "递归就是循环..."        (loser，更差)
+</pre>
+
+<p>收集方式：给标注员一个 prompt，让她对模型的 K 个回答排序（InstructGPT 用 K=9，Stiennon 用 K=4）。排序后每两个组成一个偏好对。</p>
+
+<h2>公式</h2>
+
+<p>用 Bradley-Terry 模型，RM 把"A 比 B 好"的概率建模为：</p>
+
+<p>$$P(y_w \succ y_l \mid x) = \sigma\big(r_\varphi(x, y_w) - r_\varphi(x, y_l)\big) = \frac{1}{1 + e^{-(r_\varphi(x,y_w) - r_\varphi(x,y_l))}}$$</p>
+
+<p>符号说明：</p>
 <ul>
-  <li>反向 KL 贡献：$p \log(p / \epsilon)$，当 $\epsilon \to 0$ 时这项趋于无穷大 → 强烈惩罚</li>
-  <li>前向 KL 贡献：$\epsilon \log(\epsilon / p)$，当 $\epsilon \to 0$ 时这项趋于 0 → 几乎不惩罚</li>
+<li>P(y<sub>w</sub> ≻ y<sub>l</sub> | x)：在 prompt x 下，y<sub>w</sub> 比 y<sub>l</sub> 好的概率。≻ 读作"优于"。</li>
+<li>σ(z) = 1/(1+e<sup>-z</sup>)：sigmoid 函数，把任意实数 z 压到 (0, 1)。z=0 时 σ=0.5，z 越大越接近 1。</li>
+<li>r<sub>φ</sub>(x, y)：奖励模型，参数 φ，输入 (x, y) 输出标量。φ 是 RM 网络权重。</li>
+<li>y<sub>w</sub>, y<sub>l</sub>：winner / loser。</li>
 </ul>
-<p>这验证了反向 KL 才能挡住"去低概率区钻漏洞"的行为。</p>
 
-<p><b>一句话总结</b>：反向 KL 让 $\pi_\theta$ "在 $\pi_{\text{ref}}$ 的地盘里玩"，正好契合"防止钻漏洞"的目标；前向 KL 允许 $\pi_\theta$ 乱跑，挡不住 reward hacking。</p>
+<p>RM 训练就是最大化这个概率（等价于最小化负对数似然）：</p>
 
-<p><b>符号总览</b>：</p>
+<p>$$\mathcal{L}_{\mathrm{RM}}(\varphi) = -\log \sigma\big(r_\varphi(x, y_w) - r_\varphi(x, y_l)\big)$$</p>
+
+<p>RM 网络结构通常和策略模型相同（InstructGPT 的 RM 是 6B，和策略 1.3B/6B 相当），只是最后输出一个标量而不是 token 分布。</p>
+
+<details>
+<summary>展开：从偏好数据到 RM 损失的推导</summary>
+
+<p><b>问题陈述</b>：怎么从"人类标注的偏好对"训出一个能对任意 (x, y) 打分的函数 r<sub>φ</sub>？</p>
+
+<p><b>核心困难</b>：人类标注是离散的"A 比 B 好"，但 RM 要输出连续分数。需要一座桥把"离散偏好"和"连续分数"连起来。</p>
+
+<p><b>第 1 步：假设每个 response 有一个"潜在实力值"</b>。给 (x, y) 定义一个分数 r<sub>φ</sub>(x, y)（RM 网络的输出）。分数越高代表人类觉得越好。这是<b>建模假设</b>——把模糊的"好坏"参数化。</p>
+
+<p><b>第 2 步：用 Bradley-Terry 把偏好变成概率</b>。假设 A 比 B 好的概率只取决于两者分数差：</p>
+
+<p>$$P(A \succ B) = \sigma(r(A) - r(B)) = \frac{1}{1 + e^{-(r(A)-r(B))}}$$</p>
+
+<p>验证边界：r(A) - r(B) → +∞ 时 σ → 1（A 必胜）；→ -∞ 时 σ → 0（A 必败）；= 0 时 σ = 0.5（平局）。符合直觉。</p>
+
+<p><b>分情况讨论</b>：为什么用 sigmoid 而不是别的？</p>
 <ul>
-  <li>$\pi_\theta$：当前策略（被优化的模型）</li>
-  <li>$\pi_{\text{ref}}$：参考模型（冻结的 SFT 模型）</li>
-  <li>$\mathrm{KL}(P \| Q) = \sum_i P(i) \log \frac{P(i)}{Q(i)}$：从 $P$ 看 $Q$ 的差异</li>
-  <li>前向 KL = $\mathrm{KL}(\pi_{\text{ref}} \| \pi_\theta)$：mean-seeking</li>
-  <li>反向 KL = $\mathrm{KL}(\pi_\theta \| \pi_{\text{ref}})$：mode-seeking，RLHF 用这个</li>
-  <li>$v^*$、$\epsilon$、$p$：验证例子里的构造量（本文构造）</li>
+<li>如果用阶跃函数（差 > 0 就 P=1，否则 P=0）：梯度处处为 0，没法训。</li>
+<li>如果用线性 P = r(A) - r(B)：可能 &lt; 0 或 &gt; 1，违反概率定义。</li>
+<li>sigmoid 把任意实数压到 (0, 1)，且处处可导——是建模概率的标准选择。</li>
 </ul>
+
+<p><b>第 3 步：最大化标注数据的似然</b>。人类标了"y<sub>w</sub> 比 y<sub>l</sub> 好"，我们希望模型给这个事件的概率 P(y<sub>w</sub> ≻ y<sub>l</sub> | x) 尽量大。对一批数据取对数似然：</p>
+
+<p>$$\max_\varphi \sum_{(x,y_w,y_l)} \log P(y_w \succ y_l \mid x) = \max_\varphi \sum \log \sigma\big(r_\varphi(x, y_w) - r_\varphi(x, y_l)\big)$$</p>
+
+<p><b>第 4 步：转成最小化损失</b>。最大化对数似然 ⇔ 最小化负对数似然：</p>
+
+<p>$$\mathcal{L}_{\mathrm{RM}}(\varphi) = -\log \sigma\big(r_\varphi(x, y_w) - r_\varphi(x, y_l)\big)$$</p>
+
+<p>梯度下降最小化它，RM 就会让 winner 的分数比 loser 高。</p>
+
+<p><b>一句话总结</b>：RM 用 Bradley-Terry 把"偏好对"变成"分数差过 sigmoid"，最大化标注似然 = 让 winner 分数比 loser 高。</p>
+
+<p><b>符号总览</b>：r<sub>φ</sub>(x,y) = 潜在分数；σ = sigmoid 把分数差压成概率；P(y<sub>w</sub>≻y<sub>l</sub>|x) = 偏好概率；L<sub>RM</sub> = 负对数似然。</p>
 </details>
 
 <details>
 <summary>展开：最小数值例子</summary>
 
-<p>（本文构造，教学用）假设词表只有 3 个 token：好、坏、了。设在 prompt "今天天气" 后面：</p>
-<ul>
-  <li>$\pi_{\text{ref}}$（SFT 模型）给的下一个 token 概率：好=0.5，坏=0.3，了=0.2</li>
-  <li>$\pi_\theta$（当前模型）给的下一个 token 概率：好=0.7，坏=0.2，了=0.1</li>
-</ul>
+<p>（本文构造，教学用）</p>
 
-<p>计算反向 KL：</p>
+<p>假设 prompt x = "翻译：good morning"，RM 当前给两个回答的分数：</p>
 
-<p>$\mathrm{KL}(\pi_\theta \| \pi_{\text{ref}}) = 0.7 \log\frac{0.7}{0.5} + 0.2 \log\frac{0.2}{0.3} + 0.1 \log\frac{0.1}{0.2}$</p>
+<pre class="diagram">
+y_A = "早上好"      r_φ(x, y_A) = 1.2
+y_B = "morning"     r_φ(x, y_B) = 0.3
+</pre>
 
-<p>逐项算：</p>
-<ul>
-  <li>$0.7 \log(1.4) \approx 0.7 \times 0.336 = 0.235$</li>
-  <li>$0.2 \log(0.667) \approx 0.2 \times (-0.405) = -0.081$</li>
-  <li>$0.1 \log(0.5) \approx 0.1 \times (-0.693) = -0.069$</li>
-</ul>
+<p>人类标注：y<sub>A</sub> 比 y<sub>B</sub> 好（即 y<sub>w</sub> = y<sub>A</sub>, y<sub>l</sub> = y<sub>B</sub>）。</p>
 
-<p>加起来 $\mathrm{KL} \approx 0.235 - 0.081 - 0.069 = 0.085$。这个数很小，说明 $\pi_\theta$ 偏离 $\pi_{\text{ref}}$ 不远——它只是更偏向"好"一点，这在正常优化范围内。</p>
+<p>分数差：r(x, y<sub>w</sub>) - r(x, y<sub>l</sub>) = 1.2 - 0.3 = 0.9</p>
 
-<p>假设 RM 给"今天天气好"打 $r_\varphi = 2.0$，取 $\beta = 0.1$（本文构造），则目标函数值：</p>
+<p>偏好概率：P(y<sub>A</sub> ≻ y<sub>B</sub> | x) = σ(0.9) = 1 / (1 + e<sup>-0.9</sup>) ≈ 1 / (1 + 0.407) ≈ 0.71</p>
 
-<p>$r_\varphi - \beta \cdot \mathrm{KL} = 2.0 - 0.1 \times 0.085 = 2.0 - 0.0085 = 1.9915$</p>
+<p>RM 损失：L = -log(0.71) ≈ 0.342</p>
 
-<p>对比一下：如果 $\pi_\theta$ 为了刷分把"好"的概率压到 0.99、把"坏"压到 0.005、"了"压到 0.005（极端偏向），KL 会暴涨到约 0.84，目标函数变成 $2.0 - 0.1 \times 0.84 = 1.916$——反而比温和偏离时更低。这就是 KL 项在起作用：温和偏离能拿净分，极端跑偏会被惩罚掉。</p>
+<p>梯度下降一步后，RM 会让 r(x, y<sub>A</sub>) 变大、r(x, y<sub>B</sub>) 变小，比如变成 (1.5, 0.1)：新分数差 1.4，新概率 σ(1.4) ≈ 0.802，新损失 -log(0.802) ≈ 0.221，损失下降了。</p>
 </details>
 
 <details class="code-details">
-<summary>展开：伪代码</summary>
+<summary>展开：可运行代码（最小 RM 一步）</summary>
 <div class="code-block">
-<pre><code class="language-python"># RLHF 三阶段伪代码
+<pre><code class="language-python">"""最小 RM：用 Bradley-Terry loss 更新一个 RM 的一步。"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-# 阶段 1: SFT —— 用示范数据微调预训练模型
-pi_ref = train_sft(pretrained_lm, sft_data)
-#   sft_data: List[(prompt, human_response)]
+torch.manual_seed(0)
 
-# 阶段 2: 训练奖励模型 RM —— 用偏好数据
-rm = train_reward_model(pi_ref, preference_data)
-#   preference_data: List[(prompt, response_chosen, response_rejected)]
-#   损失: -log σ(rm(chosen) - rm(rejected))
+# 假设词表 V=10，response 长度 T=3
+V, T, D = 10, 3, 8
 
-# 阶段 3: PPO —— 用 RL 优化 π_θ
-pi_ref.eval()  # 冻结参考模型
-pi_theta = copy(pi_ref)
-for step in range(N_steps):
-    prompts = sample_prompts(from=prompt_dataset)
-    # 用当前策略采样 response
-    responses = pi_theta.generate(prompts)
-    # RM 打分
-    rewards = rm.score(prompts, responses)
-    # 算 KL（每个位置上 π_θ 和 π_ref 的 token 分布差异）
-    kl = kl_divergence(pi_theta, pi_ref, prompts, responses)
-    # RLHF 目标：最大化 reward - β·KL，等价于最小化 -(reward - β·KL)
-    objective = -(rewards - beta * kl).mean()
-    ppo_update(pi_theta, objective)
+# RM：embedding + 平均池化 + 线性输出标量
+class TinyRM(nn.Module):
+    def __init__(self, V, D):
+        super().__init__()
+        self.emb = nn.Embedding(V, D)
+        self.proj = nn.Linear(D, 1)  # 输出一个标量 logit
+    def forward(self, tokens):
+        # tokens: (B, T) -> score: (B,)
+        h = self.emb(tokens).mean(dim=1)  # (B, D) 平均池化
+        return self.proj(h).squeeze(-1)   # (B,)
+
+rm = TinyRM(V, D)
+optimizer = torch.optim.Adam(rm.parameters(), lr=1e-2)
+
+# 一条偏好对：(x, y_w, y_l) 拼成 token 序列
+# 简化：直接给 y_w 和 y_l 的 token 序列
+y_w = torch.tensor([[1, 2, 3]])  # winner
+y_l = torch.tensor([[4, 5, 6]])  # loser
+
+# Bradley-Terry loss: -log σ(r(y_w) - r(y_l))
+r_w = rm(y_w)  # (1,)
+r_l = rm(y_l)  # (1,)
+loss = -F.logsigmoid(r_w - r_l).sum()
+print(f"RM loss = {loss.item():.4f}")
+
+# 反传 + 更新
+loss.backward()
+optimizer.step()
+
+# 再算一次，loss 应该下降，且 r_w - r_l 应该变大
+with torch.no_grad():
+    new_r_w = rm(y_w)
+    new_r_l = rm(y_l)
+    new_loss = -F.logsigmoid(new_r_w - new_r_l).sum()
+print(f"updated loss = {new_loss.item():.4f}")
+print(f"r_w - r_l: before={r_w.item()-r_l.item():.4f}, "
+      f"after={new_r_w.item()-new_r_l.item():.4f}")
 </code></pre>
 </div>
+<p><b>代码层次</b>：第 1 层是 RM 网络结构（embedding + 池化 + 线性），第 2 层是 Bradley-Terry loss（logsigmoid），第 3 层是优化器。真实 RM 把网络换成 Transformer，loss 一样。</p>
+<p><b>读者容易卡在哪</b>：(1) RM 输出是<b>标量</b>不是分布——和语言模型不同，最后是 Linear(D, 1) 不是 Linear(D, V)。(2) logsigmoid 内部已经做了 log + sigmoid，不要再手动算。(3) RM 通常用 SFT 模型初始化（embedding 共享），不是从头训。</p>
+<p><b>和真实工程的差距</b>：真实 RM 用 Transformer backbone，处理 prompt 和 response 拼接，对 response 部分做池化（不是平均，而是取最后一个 token 或专门加 reward token）。InstructGPT 用约 31k 偏好对训 RM，只训 1 epoch 防过拟合（论文 §3.2、§3.4）。</p>
 </details>
 
-<details class="code-details">
-<summary>展开：可运行代码（TRL 风格 API 示意）</summary>
-<div class="code-block">
-<pre><code class="language-python"># 教学用：展示调用结构，非真实可运行脚本
-# 依赖：pip install trl transformers（版本需查当前文档确认）
-
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
-
-# ---- 阶段 1: SFT（这里假设已经训好，直接加载）----
-sft_model_name = "my-sft-model"
-tokenizer = AutoTokenizer.from_pretrained(sft_model_name)
-
-# ---- 阶段 2: 奖励模型（假设已用偏好数据训好）----
-# rm = train_reward_model(preference_data)  # 用 RewardTrainer 训
-reward_model = AutoModelForSequenceClassification.from_pretrained("my-reward-model")
-
-# ---- 阶段 3: PPO ----
-ppo_config = PPOConfig(
-    kl_coef=0.1,          # 即公式里的 β
-    batch_size=64,
-    learning_rate=1e-5,
-)
-pi_theta = AutoModelForCausalLMWithValueHead.from_pretrained(sft_model_name)
-pi_ref = create_reference_model(pi_theta)  # 冻结的参考模型
-
-trainer = PPOTrainer(
-    model=pi_theta,
-    ref_model=pi_ref,
-    reward_model=reward_model,
-    config=ppo_config,
-    tokenizer=tokenizer,
-    dataset=prompt_dataset,
-)
-
-for batch in trainer.dataloader:
-    query_tensors = batch["input_ids"]
-    # 用当前策略 π_θ 采样 response
-    response_tensors = trainer.generate(query_tensors)
-    # RM 给 (query, response) 打分
-    rewards = reward_model.score(batch, response_tensors)
-    # PPO 一步更新：内部会算 KL 和 advantage，最大化 r - β·KL
-    trainer.step(query_tensors, response_tensors, rewards)
-</code></pre>
-</div>
-<p><b>代码层次</b>：第一层是模型对象（SFT 模型、奖励模型、带 value head 的 π_θ）；第二层是 PPOTrainer，它把采样、打分、KL 计算、PPO 更新包成一个 <code>step</code>；第三层是数据加载和配置。</p>
-<p><b>读者容易卡在哪</b>：<code>AutoModelForCausalLMWithValueHead</code> 比普通语言模型多一个 value head（输出标量 value 估计），PPO 需要它来算 advantage；<code>create_reference_model</code> 返回的就是冻结的 $\pi_{\text{ref}}$；KL 在 PPOTrainer 内部算，代码里看不到显式的 <code>kl_divergence(...)</code> 调用。</p>
-<p><b>和真实工程的差距</b>：真实训练（如 DeepSpeed-Chat、OpenRLHF）要处理大规模分布式（模型并行、ZeRO）、rollout 缓冲、GAE 优势估计、PPO clip 范围、RM 在线更新等；这里省略了所有这些细节。超参 <code>kl_coef=0.1</code> 是教学示意，真实值需查当前 TRL 文档和具体实验设置。</p>
-</details>
-
-<!-- ============ 第五章：什么时候用 ============ -->
-
-<h1>什么时候用、什么时候会坏</h1>
-
-<p>RLHF 不是万能药。它在某些场景里是当前最有效的对齐方法，在另一些场景里要么用不起、要么会出问题。</p>
-
-<h2>适合用 RLHF 的场景</h2>
+<h2>RM 的局限</h2>
 
 <ul>
-  <li><b>需要对齐人类意图</b>：聊天助手、指令跟随模型——模型不仅要"会答"，还要"答得让人满意"。</li>
-  <li><b>有偏好数据采集能力</b>：能招到标注员、能设计清晰的标注规范。</li>
-  <li><b>SFT 已经给了不错的起点</b>：$\pi_{\text{ref}}$ 不能太差，否则 KL 约束反而把模型锁在差的起点上。</li>
-  <li><b>能承担 PPO 的工程成本</b>：PPO 训练不稳定、需要在线采样、显存翻倍（要同时放 $\pi_\theta$、$\pi_{\text{ref}}$、RM）。</li>
+<li><b>标注一致性有上限</b>：InstructGPT 标注员一致性约 73%（论文 §3.4）。RM 学的是带噪声的人类判断，再大也学不过 73% 这个天花板。</li>
+<li><b>分布外失效</b>：RM 只在标注数据分布上学得好，模型跑到没见过的 prompt 类型时 RM 分数不可信。</li>
+<li><b>容量有限</b>：RM 把复杂的"好坏"压成一个标量，丢掉了"为什么好"的信息。</li>
 </ul>
 
-<h2>RLHF 会失效的几种方式</h2>
+<p class="chapter-summary">这章讲了 RM：用 Bradley-Terry 把偏好对变成可微的标量损失，产物是奖励函数 r<sub>φ</sub>。它解决了"好坏怎么变成数字"，但 RM 只能打分不能优化模型——下一章看 PPO 怎么用 RM 当奖励做策略优化。</p>
+
+<!-- ============ 认知阶段 6：它怎么工作 — 子概念 3：PPO ============ -->
+
+<h1>第三阶段 PPO：用 RM 当奖励优化策略</h1>
+
+<h2>直觉</h2>
+
+<p>现在有了 RM 当奖励函数，怎么用它优化语言模型？直接对 J(θ) = E[r<sub>φ</sub>(x, y)] 求梯度——这就是<b>策略梯度</b>（一类 RL 算法，直接对"策略参数"求奖励期望的梯度，形式 ∇<sub>θ</sub>J = E[奖励 × ∇log π(a|s)]）。但朴素策略梯度方差大、步长不稳，容易把模型训崩。PPO 用两个技巧解决：(1) <b>clip</b> 限制每次更新比例；(2) <b>advantage</b> 减小梯度方差。</p>
+
+<p>关键概念对照 RL 术语：</p>
+<ul>
+<li><b>状态</b> s = 已生成的 token 序列（prompt + 已生成部分）。</li>
+<li><b>动作</b> a = 采样下一个 token。</li>
+<li><b>策略</b> π(a|s) = 语言模型本身，给定已生成部分输出下一个 token 的分布。</li>
+<li><b>奖励</b> r = RM 给完整 response 打的分（episodic，只在序列结束给奖励）。</li>
+<li><b>rollout</b> = 让当前策略实际跑一遍生成 K 个回答（on-policy，策略用当前数据更新后必须重新采样）。</li>
+</ul>
+
+<h2>流程</h2>
 
 <ol>
-  <li><b>reward hacking</b>：模型钻 RM 漏洞拿高分但答案糟糕。本章前面讲过，KL 是主要防线，但 $\beta$ 调不好仍会出问题。</li>
-  <li><b>标注偏差</b>：标注员群体的偏好不代表所有用户。比如某些话题上不同文化背景的标注员会给出相反的偏好，训出来的 RM 只反映了标注群体的偏见。</li>
-  <li><b>RM 分布外</b>：训 RM 用的答案分布 $\neq$ PPO 采样的答案分布。PPO 越优化，$\pi_\theta$ 采出的答案离 RM 训练分布越远，RM 打分越不可靠——这是个正反馈的失效循环。</li>
-  <li><b>成本高</b>：训 RM 要偏好数据，PPO 要在线采样（一边生成一边学习）、训练不稳定、显存大。整体成本显著高于 SFT（解读者估算）。</li>
-  <li><b>$\beta$ 难调</b>：太松 reward hacking，太紧模型学不动。不同任务、不同模型规模下最优 $\beta$ 不一样。</li>
+<li><b>采样 rollout</b>：从 prompt 分布 D 取一批 prompt，对每个用当前策略 π<sub>θ</sub> 生成 K 个 response（Stiennon 用 K=4）。</li>
+<li><b>RM 打分</b>：对每个 (x, y) 算 r<sub>φ</sub>(x, y)。</li>
+<li><b>算 advantage</b>：用 value 网络 V(s)（估状态 s 的期望累计奖励）算 A = r - V(s)。A &gt; 0 表示比平均好。</li>
+<li><b>算概率比</b>：r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>old</sub>(a<sub>t</sub>|s<sub>t</sub>)，新策略 / 采样时旧策略的概率比。</li>
+<li><b>clip 更新</b>：把 r<sub>t</sub>(θ) 限制在 [1-ε, 1+ε]（PPO 论文 ε=0.2），防止单步更新太激进。</li>
+<li><b>加 KL 惩罚</b>：在损失里加 β·KL(π<sub>θ</sub>‖π<sub>ref</sub>)，把策略拉回参考模型。</li>
+<li><b>反传更新 θ</b>，回到第 1 步，重复直到收敛（InstructGPT 训 200k-1M steps）。</li>
 </ol>
 
-<h2>和相邻方案的对比</h2>
+<h2>公式</h2>
+
+<p>PPO 的核心损失（单条 (s<sub>t</sub>, a<sub>t</sub>)）：</p>
+
+<p>$$\mathcal{L}_{\mathrm{PPO}}(\theta) = -\mathbb{E}_t\Big[\min\big(r_t(\theta) A_t,\; \mathrm{clip}(r_t(\theta), 1-\varepsilon, 1+\varepsilon) A_t\big)\Big] + \beta \cdot \mathrm{KL}(\pi_\theta \,\|\, \pi_{\mathrm{ref}})$$</p>
+
+<p>符号说明：</p>
+<ul>
+<li>L<sub>PPO</sub>(θ)：PPO 损失，越小越好（前面取负号因为我们要最大化 advantage×ratio）。</li>
+<li>r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>old</sub>(a<sub>t</sub>|s<sub>t</sub>)：概率比，新策略 / 旧策略。1 表示没变。</li>
+<li>A<sub>t</sub>：优势函数 advantage，在状态 s<sub>t</sub> 做动作 a<sub>t</sub> 比平均好多少。A<sub>t</sub> = R - V(s<sub>t</sub>)，其中 R 是 RM 给该 response 的标量奖励，V 是 value 网络。（注意这里 R 是奖励，和上面的概率比 r<sub>t</sub>(θ) 不是同一个量。）</li>
+<li>clip(r, 1-ε, 1+ε)：把 r 截断到 [1-ε, 1+ε] 范围内。ε=0.2 表示比例限制在 [0.8, 1.2]。</li>
+<li>ε：clip 范围，标量。PPO 论文默认 0.2。</li>
+<li>min(·, ·)：取两者较小值——这是 PPO 的核心，既限制上界也限制下界。</li>
+<li>β·KL(π<sub>θ</sub>‖π<sub>ref</sub>)：KL 惩罚项，β 是系数（InstructGPT 用 0.001 量级）。</li>
+<li>E<sub>t</sub>：对所有 (s<sub>t</sub>, a<sub>t</sub>) 对取期望（平均）。</li>
+</ul>
+
+<details>
+<summary>展开：从策略梯度到 PPO clip 的推导</summary>
+
+<p><b>问题陈述</b>：为什么要 clip？为什么不直接用朴素策略梯度 ∇J = E[A·∇log π]？</p>
+
+<p><b>核心困难</b>：朴素策略梯度允许单步更新任意大——如果某个动作 advantage 很高，梯度可能把它的概率推得极高，模型一步就崩了。需要一种机制限制"每次更新能改变策略多少"。</p>
+
+<p><b>第 1 步：从策略梯度到概率比</b>。朴素策略梯度：</p>
+
+<p>$$\nabla_\theta J = \mathbb{E}\big[A_t \cdot \nabla_\theta \log \pi_\theta(a_t|s_t)\big] = \mathbb{E}\Big[A_t \cdot \frac{\nabla_\theta \pi_\theta(a_t|s_t)}{\pi_\theta(a_t|s_t)}\Big]$$</p>
+
+<p>引入概率比 r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>old</sub>(a<sub>t</sub>|s<sub>t</sub>)（π<sub>old</sub> 是采样时的旧策略，固定），可以写成：</p>
+
+<p>$$\nabla_\theta J = \mathbb{E}\big[A_t \cdot \nabla_\theta r_t(\theta)\big]$$</p>
+
+<p>验证：∇<sub>θ</sub> log π = ∇π / π = ∇(π/π<sub>old</sub>) / (π/π<sub>old</sub>) = ∇r<sub>t</sub> / r<sub>t</sub>。乘 r<sub>t</sub> 得 ∇r<sub>t</sub>。</p>
+
+<p><b>第 2 步：最大化 E[A·r] 但要限制 r</b>。直接最大化 E[A<sub>t</sub>·r<sub>t</sub>(θ)] 会让 r 在 A&gt;0 时趋向无穷（π<sub>θ</sub> &gt;&gt; π<sub>old</sub>）。TRPO（PPO 前身）用 KL 约束限制，但求解复杂。PPO 改用 clip：</p>
+
+<p>$$J_{\mathrm{clip}}(\theta) = \mathbb{E}\big[\min(r_t A_t,\; \mathrm{clip}(r_t, 1-\varepsilon, 1+\varepsilon) A_t)\big]$$</p>
+
+<p><b>第 3 步：为什么取 min</b>。分两种情况（A<sub>t</sub> 的正负）：</p>
+
+<ul>
+<li><b>A<sub>t</sub> &gt; 0</b>（动作比平均好）：我们想让 r<sub>t</sub> 变大（多采样这个动作）。但 clip 把 r<sub>t</sub> 上界限制在 1+ε。如果 r<sub>t</sub> &gt; 1+ε，clip 项 = (1+ε)A<sub>t</sub> &lt; r<sub>t</sub>A<sub>t</sub>，取 min 用 clip 项 → 梯度 = 0，不再奖励"过度增大"。</li>
+<li><b>A<sub>t</sub> &lt; 0</b>（动作比平均差）：我们想让 r<sub>t</sub> 变小。但 clip 把 r<sub>t</sub> 下界限制在 1-ε。如果 r<sub>t</sub> &lt; 1-ε，clip 项 = (1-ε)A<sub>t</sub> &gt; r<sub>t</sub>A<sub>t</sub>（注意 A<sub>t</sub> 是负数，(1-ε) &gt; r<sub>t</sub> 所以乘 A<sub>t</sub> 后 (1-ε)A<sub>t</sub> 更小……这里需要仔细看），取 min 用 r<sub>t</sub> 项 → 梯度 = 0，不再惩罚"过度减小"。</li>
+</ul>
+
+<p>验证（A<sub>t</sub> &gt; 0, r<sub>t</sub> = 1.5, ε = 0.2）：clip(1.5, 0.8, 1.2) = 1.2。min(1.5·A, 1.2·A) = 1.2·A。梯度通过 min 选了 clip 项，r<sub>t</sub> 已经超出 1.2 不再获益。</p>
+
+<p><b>一句话总结</b>：PPO 用 clip 把概率比限制在 [1-ε, 1+ε]，超出范围梯度归零，防止单步更新把策略推太远。取 min 保证无论 A 正负都能正确截断。</p>
+
+<p><b>符号总览</b>：r<sub>t</sub> = 概率比；A<sub>t</sub> = advantage；clip = 截断；min = 选更保守的梯度；ε = clip 范围。</p>
+</details>
+
+<details>
+<summary>展开：最小数值例子</summary>
+
+<p>（本文构造，教学用）</p>
+
+<p>假设当前 PPO 一步的数据：</p>
+
+<pre class="diagram">
+某个 (s_t, a_t) 的旧策略概率: π_old(a_t|s_t) = 0.25
+新策略概率:                π_θ(a_t|s_t)   = 0.375
+advantage:                 A_t            = +0.5  (比平均好)
+clip 范围:                 ε              = 0.2   (论文默认)
+</pre>
+
+<p>（1）算概率比 r<sub>t</sub> = 0.375 / 0.25 = 1.5</p>
+
+<p>（2）clip r<sub>t</sub> 到 [1-0.2, 1+0.2] = [0.8, 1.2]。1.5 &gt; 1.2，所以 clip(r<sub>t</sub>) = 1.2</p>
+
+<p>（3）算两项</p>
+
+<pre class="diagram">
+原项:   r_t · A_t = 1.5 × 0.5 = 0.75
+clip 项: clip(r_t) · A_t = 1.2 × 0.5 = 0.60
+</pre>
+
+<p>（4）取 min = 0.60。因为 r<sub>t</sub> = 1.5 已超出 clip 上界 1.2，梯度被截断——再增大 r<sub>t</sub> 也不会增加目标，模型不会被鼓励把这个动作的概率推得更高。</p>
+
+<p>（5）KL 惩罚（简化估算）。假设 π<sub>θ</sub> 在某个 token 上 = 0.375，π<sub>ref</sub> = 0.30，KL 贡献 ≈ 0.375·log(0.375/0.30) = 0.375·0.223 ≈ 0.084。若 β = 0.001，惩罚 ≈ 0.000084（很小，主要靠 clip 限制）。</p>
+
+<p>注意：实际 KL 是对所有 token 求和，这里只算一个 token 演示。</p>
+</details>
+
+<details class="code-details">
+<summary>展开：可运行代码（最小 PPO 一步）</summary>
+<div class="code-block">
+<pre><code class="language-python">"""最小 PPO：对一个 tiny 策略做一步 PPO 更新。
+简化：跳过 value 网络（用真实 reward 当 advantage 演示 clip 机制）。
+真实 PPO 需要训练 value 网络估 V(s)。"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+V, D = 10, 8  # 词表大小, embedding 维度
+
+class TinyPolicy(nn.Module):
+    def __init__(self, V, D):
+        super().__init__()
+        self.emb = nn.Embedding(V, D)
+        self.proj = nn.Linear(D, V)
+    def forward(self, tokens):
+        return self.proj(self.emb(tokens))  # logits (B, T, V)
+    def logp(self, tokens):
+        """返回每个位置 log π(a_t|s_t)，shape (B, T)"""
+        logits = self.forward(tokens[:, :-1])
+        targets = tokens[:, 1:]
+        logp = F.log_softmax(logits, dim=-1)
+        # 取出对应 target 的 logp
+        return logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+policy = TinyPolicy(V, D)
+ref = TinyPolicy(V, D)
+ref.load_state_dict(policy.state_dict())  # π_ref = 初始 π_θ
+for p in ref.parameters():
+    p.requires_grad_(False)
+
+opt = torch.optim.Adam(policy.parameters(), lr=1e-3)
+
+# 一批 rollout 数据（简化：假设已经采样好）
+# old_logp: 采样时旧策略的 log π_old(a_t|s_t)
+# reward: RM 给的标量奖励（这里用固定值 1.0 模拟）
+# tokens: 采样得到的 token 序列
+tokens = torch.tensor([[1, 2, 3, 4, 5]])  # (1, 5)
+old_logp = policy.logp(tokens).detach()   # 用当前策略算一次并 detach
+reward = torch.tensor([1.0])              # RM 打的分（模拟）
+advantage = reward  # 简化：A = r，跳过 value 网络
+
+# PPO 多个 epoch（用同一批数据更新几次，on-policy 但重复利用）
+EPS = 0.2
+BETA = 0.001
+
+for ppo_step in range(4):
+    new_logp = policy.logp(tokens)  # 新策略 log π_θ
+    ratio = (new_logp - old_logp).exp()  # r_t = π_θ / π_old
+    # advantage 广播到每个 token
+    A = advantage.unsqueeze(-1).expand_as(ratio)
+
+    # clip 项
+    surr1 = ratio * A
+    surr2 = torch.clamp(ratio, 1 - EPS, 1 + EPS) * A
+    ppo_loss = -torch.min(surr1, surr2).mean()
+
+    # KL 惩罚（简化：用新策略和 ref 的 logp 差近似）
+    with torch.no_grad():
+        ref_logp = ref.logp(tokens)
+    kl = (new_logp.exp() * (new_logp - ref_logp)).mean()  # 近似 KL
+    loss = ppo_loss + BETA * kl
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    print(f"ppo_step={ppo_step} loss={loss.item():.4f} "
+          f"ratio_mean={ratio.mean().item():.4f} kl={kl.item():.4f}")
+
+print("done")
+</code></pre>
+</div>
+<p><b>代码层次</b>：第 1 层是策略网络（TinyPolicy，和 SFT 的 TinyLM 结构一样），第 2 层是 PPO loss（ratio + clip + min），第 3 层是 KL 惩罚（简化估算），第 4 层是多次 epoch 重复利用数据。</p>
+<p><b>读者容易卡在哪</b>：(1) <b>logp 的 gather 操作</b>：log_softmax 输出 (B, T, V)，要按 target 索引取出对应位置的概率，用 gather。(2) <b>ratio = exp(new_logp - old_logp)</b>：因为 π = exp(logπ)，所以 π_new/π_old = exp(logπ_new - logπ_old)，避免数值溢出。(3) <b>old_logp 必须 detach</b>：它是个常量，不参与梯度。(4) <b>为什么能跑多个 epoch</b>：PPO 用 clip 保证即使重复利用数据，策略也不会偏离太远——这正是 clip 的设计目的。</p>
+<p><b>和真实工程的差距</b>：(1) 真实 PPO 有 value 网络估 V(s)，advantage 用 GAE（Generalized Advantage Estimation）算，不是直接用 reward。(2) 真实 KL 是对所有 token 求和，不是 mean。(3) 真实工程用大规模分布式 rollout（多卡同时生成），InstructGPT 训 200k-1M steps，每步 batch 几百到几千 prompt。(4) 真实代码（HuggingFace TRL 的 PPOTrainer）还处理长度 padding、attention mask、value loss 系数等工程细节。本代码只演示 clip + KL 的核心机制。</p>
+</details>
+
+<p class="chapter-summary">这章讲了 PPO：用 RM 当奖励、用 clip 限制更新步长、用 KL 拉回参考模型，产物是最终策略 π<sub>RLHF</sub>。三阶段讲完了——下一章看 RLHF 的代价和边界。</p>
+
+<!-- ============ 认知阶段 7：什么时候用 ============ -->
+
+<h1>RLHF 的边界：什么时候不用</h1>
+
+<p>RLHF 解决了"偏好无法直接写成 loss"的问题，但它本身有代价。这一章讲清楚什么时候该用、什么时候该换别的方法。</p>
+
+<h2>RLHF 的代价</h2>
+
+<ul>
+<li><b>标注仍贵</b>：虽然比较比写答案便宜 10-100 倍，但要做出能用的 RM，InstructGPT 用了约 31k 偏好对（论文 §3.2 表 1）。大规模对齐 still 要花真金白银。</li>
+<li><b>训练不稳</b>：PPO 超参敏感（β、ε、learning rate、value 网络学习率、rollout 数 K），调参比 SFT 难得多。开源社区报告 PPO 复现经常崩。</li>
+<li><b>RM 上限</b>：RM 学的是人类标注的判断，标注员一致性 73% 是天花板。RM 越大越过拟合标注噪声。</li>
+<li><b>Reward hacking</b>：模型可能钻 RM 空子。InstructGPT 论文描述了案例——模型输出冗长重复内容刷分。KL 惩罚能缓解但不能根治。</li>
+<li><b>在线采样贵</b>：PPO 是 on-policy，每步都要用当前模型生成新 response（rollout）。生成是 LLM 推理，比前向慢。</li>
+</ul>
+
+<h2>替代方案对比</h2>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>方案</th><th>解决什么</th><th>不解决什么</th><th>什么时候用</th></tr></thead>
+<thead><tr><th>方法</th><th>解决什么</th><th>不解决什么</th><th>什么时候用</th></tr></thead>
 <tbody>
-<tr class="highlight-row"><td>RLHF</td><td>用偏好数据对齐模型，能在线采样、有显式奖励信号</td><td>没有偏好数据时不能用；PPO 不稳定</td><td>有偏好数据、需要对齐、能承担 PPO 成本</td></tr>
-<tr><td>SFT</td><td>用示范数据教模型答题</td><td>学不到偏好排序信号</td><td>有示范数据、预算有限、对齐要求不高</td></tr>
-<tr><td>DPO（见 DPO 概念页）</td><td>直接从偏好对优化策略，跳过 RM 和 PPO</td><td>没有在线采样、没有显式奖励模型可复用</td><td>有偏好数据、想避开 PPO 不稳定性</td></tr>
-<tr><td>RLAIF</td><td>用 AI 反馈代替人类反馈</td><td>偏好质量受限于给反馈的 AI</td><td>没有人类标注预算、可接受 AI 偏好</td></tr>
+<tr class="highlight-row"><td>RLHF（三阶段）</td><td>用偏好对齐模型、可在线优化、有 RM 可复用</td><td>训练稳、成本低、RM 噪声</td><td>需要在线探索、有标注预算、追求 SOTA 对齐质量</td></tr>
+<tr><td>DPO</td><td>跳过 RM 和 RL，直接用偏好对训策略，训练像 SFT 一样稳</td><td>没有 RM 可复用、没有在线探索</td><td>偏好数据已有、不需要在线采样、想要简单稳定的训练</td></tr>
+<tr><td>RLAIF</td><td>用 AI 评委代替人类，标注成本接近 0</td><td>AI 评委本身的偏差、人类偏好保真度</td><td>预算紧、任务适合 AI 评估（如摘要、代码）</td></tr>
+<tr><td>GRPO</td><td>去掉 value 网络、用 group baseline，比 PPO 简单</td><td>仍需在线采样、仍可能 reward hacking</td><td>推理任务（DeepSeek-R1）、想简化 PPO 流程</td></tr>
+<tr><td>SFT only</td><td>最简单、最稳</td><td>学不了偏好、上限低</td><td>冷启动、小模型、对齐要求不高</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>值得注意的是 DPO 这条路：它从 RLHF 的同一个起点（偏好数据）出发，但数学上把"RM + PPO + KL"重新推导成一个直接的监督损失，省掉了 RM 和 PPO，工程上简单很多。这是 RLHF 之后最重要的替代方案，但 RLHF 因为有显式奖励模型，在一些需要"可解释打分"或"在线采样"的场景里仍然不可替代。</p>
+<h2>选择建议</h2>
+
+<ol>
+<li><b>预算紧、偏好数据已有</b> → 优先试 DPO。简单稳定，效果接近 RLHF。</li>
+<li><b>需要在线探索、追求 SOTA</b> → RLHF（PPO 或 GRPO）。能持续从模型新输出里学。</li>
+<li><b>任务适合 AI 评估</b> → RLAIF。但要验证 AI 评委和人类偏好一致。</li>
+<li><b>推理任务</b> → GRPO（DeepSeek-R1 路线，group size 64，论文 §3.2）。</li>
+<li><b>刚起步</b> → SFT 先把模型拉到能用，再考虑对齐。</li>
+</ol>
+
+<p class="chapter-summary">这章讲了 RLHF 的代价（标注贵、训练不稳、RM 上限、reward hacking、在线采样贵）和替代方案（DPO/RLAIF/GRPO/SFT）。选哪种取决于任务、预算、数据和工程能力。</p>
 
 <h1>证据边界声明</h1>
 
 <h2>官方文档</h2>
-<p>无。InstructGPT 没有公开的官方工程文档。</p>
+<p>ChatGPT 公告（openai.com/blog/chatgpt, 2022-11-30）确认 ChatGPT 使用 RLHF，但未公开具体训练细节、超参数或数据量。HuggingFace TRL（github.com/huggingface/trl）是工业界常用开源实现，本页代码示例不依赖 TRL 的 API 以避开版本漂移。</p>
 
 <h2>论文 / 技术报告</h2>
-<ul>
-  <li>InstructGPT（Ouyang et al., 2022）：三阶段流程、RLHF 目标函数、偏好数据规模（约 1.3 万条 SFT 示范、约 3.3 万条偏好对比）、模型规模（1.3B / 6B / 175B）。</li>
-  <li>Christiano et al., 2017 "Deep reinforcement learning from human preferences"：RLHF 范式的起源，把"偏好 → 奖励模型 → RL"这套思路首次系统化。</li>
-  <li>PPO（Schulman et al., 2017）：RLHF 第三步用的 RL 算法。</li>
-  <li>Bradley-Terry 模型：RM 损失函数的理论基础。</li>
-</ul>
+<p>InstructGPT 论文（Ouyang et al., NeurIPS 2022, arXiv:2203.02155）是本页主要事实来源：三阶段范式、标注成本 10-100 倍（§3.2）、1.3B 偏好胜率超 175B（§3.5）、KL 系数 0.001 量级（附录）、标注员一致性 73%（§3.4）、SFT 13k 示范 / RM 31k 偏好对（§3.1-3.2 表 1）、RM 训 1 epoch（§3.4）。PPO 论文（Schulman et al., 2017, arXiv:1707.06347）提供 ε=0.2 默认值。Learning to Summarize（Stiennon et al., NeurIPS 2020, arXiv:2009.01325）提供 K=4 和摘要任务 RLHF 早期范式。DeepSeek-R1（DeepSeek, 2025-01）提供 GRPO group size 64。</p>
 
 <h2>官方源码 / 配置</h2>
-<p>InstructGPT 未开源。可参考的开源实现：HuggingFace TRL 的 <code>PPOTrainer</code>、DeepSpeed-Chat、OpenRLHF。具体 API 名称和超参需查当前版本文档。</p>
+<p>HuggingFace TRL 的 <code>PPOTrainer</code> / <code>PPOConfig</code> / <code>RewardTrainer</code> 是参考实现，API 在 2025-2026 间有命名变化（如 <code>kl_coef</code> 参数）。本页代码示例用纯 PyTorch 写最小实现，API 不依赖 TRL 版本。未直接引用 OpenAI 内部源码（未公开）。</p>
 
 <h2>实测 / 示例</h2>
-<p>本文未做实测。InstructGPT 论文报告的实验数据（标注员偏好胜率、模型规模等）见论文 §3-§5。</p>
+<p>本页所有数值例子（SFT 3 token、RM 分数 1.2/0.3、PPO ratio 1.5）均为本文构造，已在例子开头标注"（本文构造，教学用）"。数字规模刻意小到手算 1 分钟内完成，不代表真实训练规模。</p>
 
 <h2>解读者推断</h2>
-<ul>
-  <li>前向 KL vs 反向 KL 的直觉解释（mean-seeking vs mode-seeking）：这是变分推断里的经典结论，本文把它和"防 reward hacking"对应起来，这种对应是解读者的推断，不是 InstructGPT 论文原文。</li>
-  <li>reward hacking 的具体例子（RM 偏好长答案、偏好特定话术）的形式：基于业界普遍观察的整理，不是 InstructGPT 论文的具体实验结果。</li>
-  <li>三阶段流程图：本文整理的示意图，不是论文原图。</li>
-  <li>最小数值例子和可运行代码里的具体数字、API 调用结构：均为本文构造的教学示例。</li>
-</ul>
+<p>"DPO 训练比 RLHF 稳定"是社区共识，但无统一量化数字，本页只说"训练像 SFT 一样稳"不写具体倍数。"reward hacking 案例"参考 InstructGPT 论文描述但无系统量化。选择建议部分（DPO 优先 / GRPO 适合推理）是结合社区实践的推断，非论文直接结论。PPO 代码中"多次 epoch 重复利用数据"是 PPO 的标准设计目的，本页对此的解释是解读。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
