@@ -110,7 +110,7 @@ cp templates/concept/index.html content/concepts/<name>/index.html
 - 输入版本：scope.md / evidence.md / outline.md 的 commit 或工作树哈希
 - 大纲落实：章节、核心问题、基础知识、贯穿例子、误解和边界、过渡均已落实（逐项一行）
 - 代码运行：每个代码块一行——运行命令、退出码、实际输出与页面描述一致
-- 机械检查：python3 scripts/concept/validate.py <页面路径> 的命令和结果
+- 机械检查：python3 scripts/validate.py <页面路径> 的命令和结果
 - 公式渲染与交互：浏览器打开后的实际检查结果
 - 写作偏差：无 / 偏差内容及处理方式（返回阶段 1 / 返回阶段 2 / 局部修正）
 ```
@@ -125,6 +125,6 @@ cp templates/concept/index.html content/concepts/<name>/index.html
 - 教学构造和教学解释均已标记；C/F/N 引用与 `evidence.md` 一致
 - 所有声称可运行的代码已实际执行，输出与页面说明一致
 - 占位符、组件标记和写作注释已清除
-- `scripts/concept/validate.py` 通过；公式渲染和页面交互已在浏览器中实际检查
+- `scripts/validate.py` 通过；公式渲染和页面交互已在浏览器中实际检查
 - 折叠块全部收起时正文仍能回答全部核心问题
 - `draft-check.md` 已填写
