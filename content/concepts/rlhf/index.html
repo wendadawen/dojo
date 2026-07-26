@@ -1,0 +1,1334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RLHF：用人类偏好训练语言模型</title>
+  <link rel="stylesheet" href="../../../libs/katex.min.css">
+  <script defer src="../../../libs/katex.min.js"></script>
+  <script defer src="../../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../../libs/prism.min.js"></script>
+  <script defer src="../../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    h1 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h1 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h1 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h1.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">RLHF：用人类偏好训练语言模型</span>
+    <div class="nav-links">
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">RLHF：用人类偏好训练语言模型</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>RLHF（Reinforcement Learning from Human Feedback，基于人类反馈的强化学习）是一种让语言模型按"人类更喜欢哪个回答"来学习的技术：先让人比较模型给出的几个回答，用这些比较训练一个会打分的奖励模型，再用强化学习让模型学会拿高分。</p>
+</div>
+
+<p>同样大小的模型，为什么经过 RLHF 的助手更"听话"、回答更有帮助？这套技术内部由哪几个部件组成，每个部件又解决什么困难？本页从零开始，把这套机制逐层拆开。</p>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>为什么只让模型模仿标准答案不够，还需要 RLHF？</li>
+    <li>"这个回答比那个好"的判断，怎样变成一个会自动打分的模型？</li>
+    <li>用强化学习刷高奖励分时，靠什么防止模型学坏？</li>
+    <li>RLHF 的完整流水线分哪几步，每步喂什么数据、产出什么？</li>
+    <li>RLHF 能保证什么、不能保证什么？</li>
+  </ul>
+</section>
+
+<p>先看一个具体场景。给语言模型这样一个提示：</p>
+
+<div class="callout callout-gray">
+<p>提示 x："用一两句话向小学生解释：为什么天空是蓝色的？"</p>
+</div>
+
+<p>模型可能给出两个回答：</p>
+<ul>
+  <li><b>回答 A</b>："阳光穿过空气时，蓝光比红光更容易被空气分子散射，所以天空看起来是蓝的。"</li>
+  <li><b>回答 B</b>："因为天空反射了大海的颜色，所以看起来是蓝的。"</li>
+</ul>
+
+<p>几乎每个人都能立刻判断 A 更好——B 的说法是错的。这个"哪个更好"的判断对人来说毫不费力，但麻烦在于：它没法写成一个可计算的规则。我们无法逐条定义"什么叫解释得好"，也就没法把它直接变成训练模型的损失函数（训练时用来衡量"差多少"、要把它最小化的函数）。这里先解释两个之后要用的术语：<b>语言模型</b>是给定上文、逐小块文字预测下一小块是什么的概率模型；<b>微调</b>是在已经训练好的模型上用新数据继续训练。</p>
+
+<p>人能轻松判断好坏，机器却写不出目标——这就是 RLHF 要解开的矛盾。第一章先看，为什么"多给标准答案让模型模仿"解决不了这个矛盾。</p>
+
+<h1 id="why-not-sft">有些"好"没法写成公式——为什么监督微调不够</h1>
+
+<p>本章只回答一个问题：想让模型"有帮助"，为什么只靠模仿标准答案做不到？要回答它，先得知道语言模型是怎样生成回答的。</p>
+
+<h2 id="lm-generation">语言模型怎样生成回答</h2>
+
+<p>语言模型做的事情只有一件：给定前面的文字，预测下一小块文字是什么、各自的概率有多大。这一小块文字称为 <b>token</b>（可以是字、词或标点片段）。生成回答时，模型先根据提示采样出第一个 token，再把已生成的内容接在后面采样下一个，如此反复，直到产生结束标记。因此，一个完整回答 $y$ 在提示 $x$ 下的概率，是它每个 token 概率的连乘；取对数后变成求和：</p>
+
+<p>$$\log \pi(y \mid x) = \text{回答中各 token 的对数概率之和}$$</p>
+
+<p>其中 $\pi$ 表示模型这个"概率分配器"，$\pi(y \mid x)$ 是它给整个回答 $y$ 的概率，第三章会用到这个记号。这里只需记住一件事：因为每个 token 都按概率<b>采样</b>，同一个提示可以生成许多互不相同的回答——这是后面"让人比较多个回答"的前提。</p>
+
+<h2 id="sft-limits">监督微调：模仿能做到什么、做不到什么</h2>
+
+<p>要让预训练模型学会"好好回答"，最直接的办法是<b>监督微调</b>（Supervised Fine-Tuning，SFT）：请标注者为一批提示写出示范回答，让模型在示范上做最大似然训练——把示范回答出现的概率调高。请注意：这个目标里只有"照抄示范"，没有任何"哪个回答更好"的排序信息。</p>
+
+<p>模仿路线有两个绕不开的局限：</p>
+<ul>
+<li><b>上限就是示范本身</b>。模仿最多做到和示范一样好，无法超过写示范的人；示范没覆盖的情形，模型只能碰运气。</li>
+<li><b>有些"好"写不成规则</b>。训练需要一个能算出来的目标，但很多期望行为无法逐条定义：</li>
+</ul>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>目标类型</th><th>例子</th><th>能否写成可计算的规则</th></tr></thead>
+<tbody>
+<tr><td>能写成规则的"好"</td><td>拼写正确；回答不超过 100 字</td><td>能：逐条自动检查即可</td></tr>
+<tr><td>只能判断的"好"</td><td>解释得体、确实有帮助、语气不冒犯</td><td>难：无法逐条定义，但人很容易比较两个候选哪个更好</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>页面开头的例子正是如此：判断 A 比 B 好毫不费力，写出"什么是好解释"的规则却办不到。</p>
+
+<pre class="diagram">            提示 x（同一个）
+           ┌─────┴─────┐
+           ▼           ▼
+        回答 A       回答 B
+      （正确简洁）  （事实错误）
+           └─────┬─────┘
+                 ▼
+         标注者判断：A 更好
+   （判断容易做，规则却写不出来）</pre>
+
+<p>于是思路自然转向：既然人擅长做"哪个更好"的比较判断，能不能把这种判断变成机器可以优化的数字信号？已有研究给出了肯定答案——Stiennon 等人在 Reddit 帖文摘要任务上发现：先按人类偏好训练一个打分模型，再让模型去优化这个分数，按人类评估，效果优于模仿人类参考摘要，也优于优化 ROUGE（一种按字面重合度给摘要自动打分的指标）（Stiennon et al.,《Learning to summarize from human feedback》, NeurIPS 2020）。</p>
+
+<p>本章结论：模仿解决不了"写不成规则的好"，但人的比较判断可以变成数字信号。问题是，数字具体从哪来？下一章看两两比较怎样训练出一个会打分的模型。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+<li>能解释：为什么同一个提示能从模型得到多个不同的回答？</li>
+<li>能判断："SFT 的训练目标里包含标注者对回答好坏的排序"——对不对？</li>
+<li>能再举出一个无法写成损失函数、但人容易判断好坏的期望行为。</li>
+</ul>
+
+<h1 id="reward-model">把"哪个更好"变成分数——偏好数据与奖励模型</h1>
+
+<p>本章回答：成对的"这个比那个好"的比较标签，怎样训练出一个能给任意回答打分数的模型？这个模型叫<b>奖励模型</b>（Reward Model，RM），它是 RLHF 连接"人类判断"与"机器优化"的桥梁。</p>
+
+<h2 id="preference-data">偏好数据：不是打分，而是比较</h2>
+
+<p>RLHF 用的数据长这样：对同一个提示，从模型采样 $K$ 个不同回答（第一章说过，采样天然会产生不同回答），请标注者把它们从好到差排序。一组 $K$ 个回答的排序可以拆成 $\binom{K}{2}$ 个"两两对"——例如 4 个回答排出名次，就得到 $\binom{4}{2}=6$ 对"A 比 B 好"式的记录。以 InstructGPT 为例，标注者每次对 $K=4$ 到 $9$ 个回答排序（Ouyang et al., 2022, §3.5）。</p>
+
+<div class="callout callout-yellow">
+<p><b>容易误解</b>：以为 RLHF 是"人守在训练过程中实时给模型反馈"。实际上人只做一件事——离线地比较回答对；之后的所有训练（奖励模型训练、强化学习）都不再有人参与。</p>
+</div>
+
+<p>为什么是"比较"而不是直接让标注者打分？（教学解释：这是理解数据设计的动机说明，不是某篇论文的原句。）绝对分数的尺度很难校准：同一个"7 分"，在不同标注者、不同提示下含义都不一样；而"这两个里哪个好"是相对稳定得多的判断。从 Christiano 等人 2017 年的工作起，这类方法就采用非专业标注者也能可靠完成的成对比较（Christiano et al., NeurIPS 2017）。</p>
+
+<h2 id="sigmoid">预备：用 sigmoid 把"分差"变成"概率"</h2>
+
+<p>训练公式里会出现一个函数，先认识它。sigmoid 函数 $\sigma(z)=\dfrac{1}{1+e^{-z}}$ 把任意实数 $z$ 压到 $(0,1)$ 区间，并且单调递增：输入越大，输出越接近 1；$\sigma(0)=0.5$。稍后用它回答："赢家分数比输家高 $z$ 分时，赢家被偏好的概率是多少"。先算一个马上用到的值：$\sigma(3)\approx 0.953$。</p>
+
+<h2 id="rm-loss">奖励模型的训练公式</h2>
+
+<p>奖励模型是一个打分器：输入（提示，回答），输出一个标量分数，记作 $r_\theta(x, y)$，其中 $\theta$ 是模型内部的可调参数。我们希望：在一条比较数据里，赢家 $y_w$ 的分数应当高于输家 $y_l$。Bradley-Terry 模型把这个希望写成概率假设——赢家被偏好的概率完全由分差决定：</p>
+
+<p>$$P(y_w \succ y_l \mid x) = \sigma\bigl(r_\theta(x, y_w) - r_\theta(x, y_l)\bigr)$$</p>
+
+<p>其中 $P(y_w \succ y_l \mid x)$ 表示"在提示 $x$ 下，$y_w$ 被偏好于 $y_l$"的概率，$\succ$ 读作"胜过"。分差为 0 时概率为 0.5（势均力敌），分差越大概率越接近 1。训练奖励模型，就是调整 $\theta$，让真实的比较数据在这个假设下出现的概率尽量大；等价地，最小化下面的损失（Ouyang et al., 2022, §3.5 公式 (1)）：</p>
+
+<p>$$\operatorname{loss}(\theta) = -\frac{1}{\binom{K}{2}}\, \mathbb{E}_{(x,\, y_w,\, y_l) \sim D}\Bigl[\log \sigma\bigl(r_\theta(x, y_w) - r_\theta(x, y_l)\bigr)\Bigr]$$</p>
+
+<p>逐项看各部分职责：</p>
+<ul>
+<li>$D$ 是人类比较数据集；$\mathbb{E}$ 表示对数据求平均；$\frac{1}{\binom{K}{2}}$ 把每个提示产生的两两对数量约掉，使不同提示的损失可以比较。</li>
+<li>$\sigma(\cdot)$ 把赢家与输家的分差变成偏好概率。</li>
+<li>$\log \sigma(\cdot)$ 中，偏好概率越接近 1，$\log$ 越接近 0；加上前面的负号后，"概率接近 1"对应"损失接近 0"。所以训练的效果就是<b>拉开赢家与输家的分差</b>。</li>
+</ul>
+
+<h2 id="rm-handcalc">手算一遍：分差如何变成损失</h2>
+
+<p><b>教学示例</b>（数字为手算而构造）：设奖励模型给页面开头两个回答的分数为 $r(x,A)=2.0$、$r(x,B)=-1.0$。分差为 $2.0-(-1.0)=3.0$，A 被偏好的概率为 $\sigma(3.0)\approx 0.953$，这条比较的损失为 $-\ln 0.953 \approx 0.049$（$\ln$ 是自然对数）。多试几组分差做对照：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>分差 $r_w - r_l$</th><th>偏好概率 $\sigma(\cdot)$</th><th>损失 $-\ln \sigma(\cdot)$</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>3.0</td><td>0.953</td><td>0.049</td><td>赢家明显更强，损失很小</td></tr>
+<tr><td>1.0</td><td>0.731</td><td>0.313</td><td>优势一般，损失中等</td></tr>
+<tr><td>0.1</td><td>0.525</td><td>0.644</td><td>几乎分不出高下，损失接近最大的 $-\ln 0.5 \approx 0.693$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>这组对照说明损失的脾气：分差越大损失越小，但收益递减——从 0.1 提到 1.0 能减掉约 0.33 的损失，从 1.0 提到 3.0 只再减约 0.26。</p>
+
+<p>再做第二个检查：把两个分数同时加 5，变成 $7.0$ 和 $4.0$，分差仍是 3.0，概率和损失分毫不变。这不是巧合——损失里出现的永远是<b>两个分数的差</b>，给全部分数加任何常数都不改变任何结果。InstructGPT 论文也明确写到这一点：RM 损失对奖励平移不变（Ouyang et al., 2022, §3.5）。由此得到一个必须记住的结论：</p>
+
+<div class="callout callout-red">
+<p><b>奖励模型的分数不是绝对质量分</b>。一方面，平移不变性说明分数的绝对数值本身没有意义；另一方面，训练数据只包含同一提示内的两两比较，所以<b>分差</b>也只在同一提示的候选间有意义——"甲得 10 分、乙得 8 分"，如果它们回答的是不同提示，这个比较没有依据。</p>
+</div>
+
+<details>
+<summary>补充：σ 数值表与三组完整手算</summary>
+<p>$\sigma(z)=1/(1+e^{-z})$ 的常用取值：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>$z$</th><th>−3</th><th>−2</th><th>−1</th><th>−0.5</th><th>0</th><th>0.5</th><th>1</th><th>2</th><th>3</th></tr></thead>
+<tbody>
+<tr><td>$\sigma(z)$</td><td>0.0474</td><td>0.1192</td><td>0.2689</td><td>0.3775</td><td>0.5000</td><td>0.6225</td><td>0.7311</td><td>0.8808</td><td>0.9526</td></tr>
+</tbody>
+</table>
+</div>
+<p>三组手算（$e^{-3}\approx 0.0498$，$e^{-1}\approx 0.3679$，$e^{-0.1}\approx 0.9048$）：</p>
+<ul>
+<li>分差 3.0：$\sigma(3.0)=\frac{1}{1+0.0498}\approx 0.9526$；损失 $-\ln(0.9526)\approx 0.0486$。</li>
+<li>分差 1.0：$\sigma(1.0)=\frac{1}{1+0.3679}\approx 0.7311$；损失 $-\ln(0.7311)\approx 0.3133$。</li>
+<li>分差 0.1：$\sigma(0.1)=\frac{1}{1+0.9048}\approx 0.5250$；损失 $-\ln(0.5250)\approx 0.6444$。</li>
+</ul>
+</details>
+
+<details>
+<summary>补充推导：Bradley-Terry 与 softmax 的恒等关系</summary>
+<p>Christiano et al. (2017, §2.2.3 公式 (1)) 把同一假设写成 softmax 形式：$\hat P[\sigma^1 \succ \sigma^2] = \dfrac{\exp \sum_t \hat r(o^1_t,a^1_t)}{\exp \sum_t \hat r(o^1_t,a^1_t) + \exp \sum_t \hat r(o^2_t,a^2_t)}$，即对轨迹片段上各步的预测奖励求和后再指数化。它与正文的 sigmoid 形式是同一个式子：令 $a=\sum_t \hat r(o^1_t,a^1_t)$、$b=\sum_t \hat r(o^2_t,a^2_t)$，则</p>
+<p>$$\frac{e^a}{e^a+e^b} = \frac{e^a / e^a}{(e^a+e^b)/e^a} = \frac{1}{1+e^{\,b-a}} = \frac{1}{1+e^{-(a-b)}} = \sigma(a-b)$$</p>
+<p>两种写法等价：语言模型场景习惯用 sigmoid 分差形式，轨迹场景习惯用 softmax 求和形式。</p>
+</details>
+
+<h2 id="rm-code">用代码看训练过程</h2>
+
+<p>下面的纯 Python 代码把本章机制完整跑一遍：4 个回答、4 条两两比较（4 个回答共有 $\binom{4}{2}=6$ 对，演示只取其中 4 条，并未取全），奖励模型被简化成"每个回答直接对应一个可学习分数"，用梯度下降（把参数朝让损失变小的方向反复小调的通用方法）最小化本章的损失公式。输入是比较排序，输出是训练过程中各回答分数的变化（代码与输入均为教学构造）。</p>
+
+<p>实际运行结果：总损失从 2.4623 单调降到 0.0467；四个回答的分数从全 0 分化为 A=+3.49、D=+1.12、B=−0.34、C=−4.27。注意 D 排到了 B 前面——两者各赢一场，但 B 输给过 A，D 没有输过，分数忠实地反映了完整的胜负记录。训练后 $P(A \succ B)=\sigma(3.83)=0.9787$，与"排序中 A 明显高于 B"一致。</p>
+
+<details class="code-details">
+<summary>可运行代码：在 4 条两两比较上训练一个玩具奖励模型</summary>
+<div class="code-block">
+<pre><code class="language-python">import math
+
+# 教学示例：一个提示下的 4 个回答与 4 条两两比较
+# 4 个回答共有 C(4,2)=6 对，演示只取其中 4 条，并非取全
+# 人为设定的排序：A 胜过 B、C；B 胜过 C；D 胜过 C
+comparisons = [("A", "B"), ("A", "C"), ("B", "C"), ("D", "C")]
+
+# 教学简化的奖励模型：每个回答直接对应一个可学习分数，初始全为 0
+scores = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+learning_rate = 0.5
+
+def pair_loss_and_grads(winner, loser):
+    diff = scores[winner] - scores[loser]
+    prob = 1.0 / (1.0 + math.exp(-diff))      # σ(r_w − r_l)：赢家被偏好的概率
+    loss = -math.log(prob)                    # 一条比较的损失
+    grad_winner = prob - 1.0                  # loss 对 r_winner 的导数
+    grad_loser = 1.0 - prob                   # loss 对 r_loser 的导数
+    return loss, grad_winner, grad_loser
+
+for epoch in range(80):
+    total_loss = 0.0
+    for winner, loser in comparisons:
+        loss, g_w, g_l = pair_loss_and_grads(winner, loser)
+        total_loss += loss
+        scores[winner] -= learning_rate * g_w
+        scores[loser] -= learning_rate * g_l
+    if epoch % 20 == 0 or epoch == 79:
+        report = " ".join(f"{name}={value:+.2f}" for name, value in scores.items())
+        print(f"epoch={epoch:>2} total_loss={total_loss:.4f} {report}")
+
+diff = scores["A"] - scores["B"]
+prob = 1.0 / (1.0 + math.exp(-diff))
+print(f"P(A 胜过 B) = σ({diff:.2f}) = {prob:.4f}")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">epoch= 0 total_loss=2.4623 A=+0.47 B=+0.00 C=-0.66 D=+0.19
+epoch=20 total_loss=0.1682 A=+2.36 B=-0.22 C=-2.99 D=+0.85
+epoch=40 total_loss=0.0890 A=+2.91 B=-0.28 C=-3.62 D=+0.99
+epoch=60 total_loss=0.0607 A=+3.25 B=-0.32 C=-4.00 D=+1.07
+epoch=79 total_loss=0.0467 A=+3.49 B=-0.34 C=-4.27 D=+1.12
+P(A 胜过 B) = σ(3.83) = 0.9787</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>prob</code> 对应正文公式的 $\sigma(r_w - r_l)$，<code>loss</code> 对应 $-\log\sigma(\cdot)$；梯度 $p-1$（赢家）与 $1-p$（输家）由损失对分差求导得到：令 $z=r_w-r_l$，有 $\frac{d(-\ln\sigma(z))}{dz}=\sigma(z)-1$（求导属微积分预备知识，此处直接给出结论），再分别对 $r_w$、$r_l$ 求导即得两式；更新方向永远是赢家加分、输家减分——即"拉开分差"。</p>
+<p><b>观察重点</b>：总损失单调下降；分数从全 0 逐渐分化出与排序一致的次序；分差越大，$\sigma$ 越接近 1，每一步的修正量 $1-p$ 越小，分数增长自然放缓。</p>
+<p><b>教学简化</b>：真实奖励模型是神经网络，输入（提示，回答）全文、输出一个标量，通过反向传播调整内部参数；这里把"每个回答一个分数"直接当作可学习参数，省去了网络结构与反向传播，只为暴露损失与分差的关系。真实工程中还需分批训练、校验集、数值稳定处理等，均不属于本段验证的机制。</p>
+</details>
+
+<p>本章结论：两两比较先变成"分差 → 概率"的假设，再变成可梯度下降的损失，训练的效果是拉开赢家与输家的分差。会打分的模型有了，下一章的问题变成：直接让模型去刷这个分数，行不行？</p>
+
+<p>完成本章后，检查自己：</p>
+<ul>
+<li>能计算：$r(x,A)=1.0$、$r(x,B)=0.0$ 时，A 被偏好的概率（$\sigma(1)\approx 0.731$）和这条比较的损失（$\approx 0.313$）各是多少。</li>
+<li>能判断："奖励模型给甲打 10 分、给乙打 8 分，所以甲在任何语境下都更好"——对不对？为什么？</li>
+</ul>
+
+<h1 id="rl-with-kl">刷高奖励但不越界——KL 约束下的强化学习</h1>
+
+<p>本章回答：用强化学习让模型去刷奖励模型的高分时，靠什么防止它学坏？</p>
+
+<h2 id="lm-as-policy">把语言模型看成强化学习策略</h2>
+
+<p>强化学习（Reinforcement Learning，RL）研究"边做边学"：一个策略采取行动、拿到奖励，然后调整自己，让以后的奖励更大。把这套框架套到语言模型上，对应关系是：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>强化学习里的概念</th><th>在 RLHF 中对应什么</th></tr></thead>
+<tbody>
+<tr><td>策略（policy）</td><td>语言模型本身：给定提示，决定每个 token 的生成概率</td></tr>
+<tr><td>动作（action）</td><td>生成下一个 token</td></tr>
+<tr><td>一条轨迹（trajectory）</td><td>一个完整回答 $y$</td></tr>
+<tr><td>奖励（reward）</td><td>奖励模型给的分数 $r_\theta(x,y)$</td></tr>
+<tr><td>目标</td><td>调整策略，让生成回答的期望奖励变大</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>本章只需要"调整策略使期望奖励变大"这一层理解；值函数、优势估计等属于 PPO 算法内部机制，本页不展开。</p>
+
+<h2 id="reward-hacking">为什么不能闷头刷分：奖励作弊与过优化</h2>
+
+<p>奖励模型不是人类裁判本身，它只是从有限比较数据里学出的<b>代理</b>。这带来两个隐患：</p>
+<ul>
+<li><b>它只在训练数据分布附近可靠</b>。它见过的都是"正常回答"；一旦策略为了高分生成稀奇古怪的输出，它的打分相当于瞎猜。</li>
+<li><b>它有漏洞</b>。任何代理都有系统性偏差，策略优化得越狠，越容易找到"分数高但其实不好"的输出——这叫<b>奖励作弊</b>（reward hacking）。</li>
+</ul>
+
+<p><b>教学示例</b>（场景为说明机制而构造）：回到天空的例子。假设标注数据里"礼貌、详细"的回答普遍得分偏高，奖励模型可能学到"长而客气 ≈ 好"。这时策略可能生成回答 C——"这是个特别好的问题！让我认真、详细地为你解答：天空是蓝色的，这是一个非常有趣的现象，有很多值得探讨的地方……"——空洞但讨好，反而拿到比 A 更高的分。这个场景是构造的，但它对应一个被定量研究过的现象：Gao、Schulman 和 Hilton 用一个"金标准"奖励模型充当裁判发现，对着代理奖励模型优化得越多，金标准分数先升<b>后降</b>——代理分数与真实质量脱钩，这就是<b>过优化</b>（Gao et al.,《Scaling Laws for Reward Model Overoptimization》, ICML 2023）。</p>
+
+<pre class="diagram">分数
+ ▲
+ │  奖励模型分数（代理）：随优化持续上升
+ │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ↗
+ │
+ │  真实人类偏好：先升后降
+ │  ────╱‾‾‾╲────
+ │
+ └─────────────────────────► 优化强度（策略离初始模型越远）
+
+（示意图：趋势依据 Gao et al. 的实验结论，曲线形状非实验数据）</pre>
+
+<div class="callout callout-red">
+<p><b>容易误解</b>："训练时奖励模型分数一直涨，说明模型一直在变好"。错——涨的只是代理分数；越过某个点之后，真实人类偏好在下降。</p>
+</div>
+
+<h2 id="kl-penalty">KL 惩罚：给策略拴一根橡皮筋</h2>
+
+<p>既然问题出在"跑太远"，解法就是给策略拴一个锚：限制它偏离最初的监督微调模型。偏离程度这样衡量——对每个 token，计算 $\log \dfrac{\pi_{RL}}{\pi_{SFT}}$（两个模型给同一 token 的概率之比取对数），在整个回答上累加；这个累加量的期望就是 KL 散度（Kullback–Leibler divergence）。$\pi_{RL}$ 是正在训练的策略，$\pi_{SFT}$ 是作为锚的监督微调模型。策略越敢改（$\pi_{RL}$ 比 $\pi_{SFT}$ 大得越多），这个量就越大。把它作为代价从奖励里减掉，就得到 RLHF 的优化目标（Ouyang et al., 2022, §3.5 公式 (2)）：</p>
+
+<p>$$\operatorname{objective}(\phi) = \mathbb{E}_{(x,y)\sim \pi^{RL}_\phi}\Bigl[\, r_\theta(x,y) \;-\; \beta \log \frac{\pi^{RL}_\phi(y \mid x)}{\pi^{SFT}(y \mid x)} \,\Bigr] \;+\; \gamma\, \mathbb{E}_{x \sim D_{pretrain}}\bigl[\log \pi^{RL}_\phi(x)\bigr]$$</p>
+
+<p>逐项看：</p>
+<ul>
+<li>$\phi$ 是正在训练的策略参数；$\mathbb{E}_{(x,y)\sim\pi^{RL}_\phi}$ 表示"用当前策略自己生成回答来评估"。</li>
+<li>$r_\theta(x,y)$ 是奖励模型分数，是要刷高的部分。</li>
+<li>$\beta \log \dfrac{\pi^{RL}_\phi(y \mid x)}{\pi^{SFT}(y \mid x)}$ 是 KL 惩罚项：$\beta$ 是系数，控制拴得多紧；对数比逐 token 计算再累加。原文写明它的目的是"缓解对奖励模型的过优化"（to mitigate over-optimization of the reward model）。</li>
+<li>最后一项以 $\gamma$ 加权，把预训练文本的似然混进来，减少模型在公开基准上的退化；纯 PPO 设置中 $\gamma=0$。注意区分职责：防"忘本"主要靠它，KL 项的职责是防"跑野"。</li>
+</ul>
+
+<div class="callout callout-yellow">
+<p><b>容易误解</b>："KL 惩罚是为了防止模型忘掉预训练知识"。原文给 KL 项指定的职责是把策略约束在奖励模型的可靠范围内（防过优化）；防基准退化另有 $\gamma$ 项负责。</p>
+</div>
+
+<p><b>教学示例</b>（句级简化：实际按逐 token 计算并累加，这里把一个回答当作一个整体，只为手算方便）：同样把某回答的概率提到 $\pi_{RL}=0.90$，起点不同，代价完全不同：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>起点 $\pi_{SFT}$</th><th>$\log(\pi_{RL}/\pi_{SFT})$</th><th>$\beta=0.1$ 时的代价</th><th>划算的条件</th></tr></thead>
+<tbody>
+<tr><td>0.50（初始模型本来就常这么说）</td><td>$\log 1.8 \approx 0.588$</td><td>$\approx 0.059$</td><td>RM 分多拿 0.06 就值</td></tr>
+<tr><td>0.001（初始模型几乎不会这么说，比如钻空子式输出）</td><td>$\log 900 \approx 6.802$</td><td>$\approx 0.680$</td><td>RM 分必须多拿 0.68 才抵得上</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>可以把 $\beta$ 理解成"汇率"：它决定策略为偏离初始模型付多少"学费"。于是最优策略落在中间地带——再往前一步，RM 收益已经抵不上 KL 代价。（教学解释：汇率类比只服务"代价随偏离放大"这一局部关系；KL 项的正式定义就是上面的对数比期望，类比不替代定义。）</p>
+
+<details>
+<summary>补充计算：逐 token 的 KL 惩罚怎么累加</summary>
+<p><b>教学示例</b>：设一个回答只有 3 个 token，两个模型在各位置的概率与对数比如下：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>token 位置</th><th>$\pi_{RL}$</th><th>$\pi_{SFT}$</th><th>$\log(\pi_{RL}/\pi_{SFT})$</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>0.9</td><td>0.5</td><td>$\log 1.8 \approx 0.588$</td></tr>
+<tr><td>2</td><td>0.8</td><td>0.4</td><td>$\log 2.0 \approx 0.693$</td></tr>
+<tr><td>3</td><td>0.5</td><td>0.25</td><td>$\log 2.0 \approx 0.693$</td></tr>
+</tbody>
+</table>
+</div>
+<p>累加得 $0.588+0.693+0.693=1.974$，$\beta=0.1$ 时代价 $\approx 0.197$。逐 token 累加意味着：真正"外星"的输出会在每个 token 上反复付费，代价比句级近似显示的更狠。</p>
+</details>
+
+<h2 id="ppo-role">PPO 在这里干什么</h2>
+
+<p>目标有了，还需要一个算法去实际执行"用当前策略生成回答、评估目标、小步更新参数"这个循环。InstructGPT 用的是 PPO（Proximal Policy Optimization，Schulman et al., 2017），它的特点是每次只在小范围内更新，避免一步把策略改崩。</p>
+
+<div class="callout callout-yellow">
+<p><b>容易误解</b>："RLHF 就是 PPO"。RLHF 的必要结构是"偏好数据 → 奖励模型 → 带 KL 约束的强化学习"；PPO 只是历史上默认的执行算法，完全可以换成其他强化学习算法。</p>
+</div>
+
+<p>本章结论：RL 阶段的目标 = RM 分数 − β × 偏离代价；KL 项把策略拴在奖励模型可靠的范围内，PPO 负责小步执行。三个部件——SFT 给起点、RM 给分数、带约束的 RL 给更新方式——已经齐了。下一章看它们如何按顺序组装成完整流水线，并对照 InstructGPT 的真实数字。</p>
+
+<p>完成本章后，检查自己：</p>
+<ul>
+<li>能计算：$\pi_{SFT}=0.25$、$\pi_{RL}=0.75$、$\beta=0.1$ 时这一步的 KL 代价（$\log 3 \approx 1.099$，代价 $\approx 0.110$）。</li>
+<li>能解释：训练中奖励模型分数持续上升，为什么反而可能是警报？</li>
+<li>能判断："把 $\beta$ 调得非常大，模型会更敢于探索新回答"——对不对？</li>
+</ul>
+
+<h1 id="pipeline">三个部件的组装——InstructGPT 流水线</h1>
+
+<p>本章回答：SFT、奖励模型、PPO 如何衔接成一条完整流水线？以 InstructGPT（Ouyang et al., NeurIPS 2022）为实例，核对每个阶段的真实数字。</p>
+
+<pre class="diagram">阶段 1：SFT
+  数据：约 13k 个提示 + 标注者写的示范回答
+  做法：监督微调 GPT-3
+  产物：初始策略 π_SFT ───────────────┐
+                                      │（既用来采样，也当 KL 的锚）
+阶段 2：奖励模型                       ▼
+  数据：约 33k 个提示；每个提示采样 K=4~9 个回答（大部分采自 π_SFT，部分采自 PPO 策略），标注者排序
+  做法：成对比较训练（第二章的损失公式）
+  产物：奖励模型 r_θ ─────────────────┐
+                                      ▼
+阶段 3：PPO
+  数据：约 31k 个提示（只用提示，不再需要人工标注）
+  做法：策略从 π_SFT 出发，最大化「r_θ 分数 − β × 逐 token KL」
+  产物：对齐后的最终模型 InstructGPT</pre>
+
+<p>图中 GPT-3 是 OpenAI 的预训练语言模型，InstructGPT 在它之上完成这套流水线；"B" 是参数规模单位，1B 为十亿（$10^9$）个参数。读这张图的要点是"产物接力"：SFT 的产物既是 RM 阶段的采样器，又是 PPO 阶段的起点和锚；RM 的产物是 PPO 阶段的奖励来源。三个阶段的数据来源见下表（Ouyang et al., 2022, §3.2、§3.5）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>阶段</th><th>数据</th><th>规模</th><th>做法</th><th>产物</th></tr></thead>
+<tbody>
+<tr><td>1：SFT</td><td>提示 + 标注者示范回答</td><td>约 13k 个提示</td><td>监督微调</td><td>初始策略 $\pi_{SFT}$</td></tr>
+<tr><td>2：奖励模型</td><td>提示 + 每提示 $K=4\sim9$ 个回答的排序</td><td>约 33k 个提示</td><td>成对比较训练</td><td>奖励模型 $r_\theta$（6B）</td></tr>
+<tr><td>3：PPO</td><td>仅提示（无新人工标注）</td><td>约 31k 个提示</td><td>最大化 RM 分 − $\beta$·KL</td><td>对齐模型 $\pi_{RL}$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>把页面开头的例子放回流水线走一遍：提示 x 在 SFT 阶段对应一条标注者写的示范回答；在 RM 阶段对应一组"A 胜过 B"式的排序；在 PPO 阶段，它只是一条训练提示——模型自己生成回答、奖励模型打分、按第三章的目标更新。注意 PPO 阶段不再需要人写新标注：人的偏好已经"存"进了奖励模型。</p>
+
+<p>两个值得记住的工程事实：其一，InstructGPT 的奖励模型只有 6B，比策略小得多——论文说明这是因为 175B 的奖励模型训练不稳定，而且小奖励模型省算力（Ouyang et al., 2022, §3.5），所以"奖励模型必须和策略一样大"并不成立。其二，最终效果：在该论文提示分布的人工评估中，1.3B 参数的 InstructGPT 输出优于 175B 的 GPT-3——参数差 100 倍，对齐的收益盖过了堆参数（同文摘要）。</p>
+
+<p>这条流水线不是一天建成的：Christiano 等人 2017 年在 Atari 游戏和机器人任务上首创"比较 → 奖励模型 → 强化学习"的范式，人类反馈只覆盖不足 1% 的智能体交互（Christiano et al., NeurIPS 2017）；Ziegler 等人 2019 年首次把它用于语言任务，风格续写只用了 5,000 条比较、摘要用了 60,000 条（Ziegler et al., 2019）。</p>
+
+<p>本章结论：SFT 给起点、RM 给分数、PPO 在 KL 约束下优化，三者按产物接力组装。流水线能工作，但它的保证以什么为限？最后一章盘点。</p>
+
+<p>完成本章后，检查自己：</p>
+<ul>
+<li>能画出三阶段图，并说出每个阶段的输入数据类型与产物。</li>
+<li>能复述：1.3B 对 175B 的评估结论是什么，它说明"对齐"和"堆参数"是什么关系？</li>
+<li>能判断："PPO 阶段还需要标注者继续写示范回答"——对不对？</li>
+</ul>
+
+<h1 id="boundaries">RLHF 能承诺什么、不能承诺什么</h1>
+
+<p>最后一章盘点边界：这套流水线的结论在什么条件下成立？越过边界会怎样？</p>
+
+<h2 id="align-to-whom">对齐的是"标注者的偏好"，不是客观正确</h2>
+
+<p>奖励模型学到的是"标注者在什么情况下选哪个回答"，而不是"什么是真的"。回看页面开头的例子：如果标注者群体普遍相信 B 的说法（天空反射大海的颜色），那么排序数据里 B 会赢，奖励模型会奖励 B，最终模型会学说 B——流水线忠实地执行了，错的是数据。由此推论三件 RLHF 不保证的事：<b>不保证事实正确</b>（它编码标注者的信念，而非客观真相）、<b>不保证对抗鲁棒性</b>、<b>不代表所有人</b>（结论只代表参与标注的人群及其标注指南）。</p>
+
+<h2 id="conditions">三个成立条件与越界后果</h2>
+
+<p>RLHF 机制成立依赖三个条件：</p>
+<ol>
+<li><b>奖励模型的外推可靠</b>：它能给策略新产生的输出打出可信的分；</li>
+<li><b>偏好数据一致且覆盖目标行为</b>：标注标准统一，且覆盖模型实际会遇到的情形；</li>
+<li><b>KL 系数 $\beta$ 适当</b>：把策略拴在奖励模型可靠的范围内。</li>
+</ol>
+
+<p>条件被破坏时的表现，前面都已见过：优化过度 → 代理分升、真实质量降（第三章示意图）；奖励模型有漏洞 → 奖励作弊（回答 C 那种空洞讨好的输出）；数据偏差 → 模型学会错误内容（本节"标注者信 B"的例子）。</p>
+
+<h2 id="misconceptions-recap">常见误解集中回顾</h2>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>误解</th><th>纠正</th><th>处理章节</th></tr></thead>
+<tbody>
+<tr><td>RLHF 是人在训练中实时给模型反馈</td><td>人只离线提供比较标签；梯度信号全部来自奖励模型</td><td>第二章</td></tr>
+<tr><td>奖励模型分数是绝对质量分</td><td>只有同一提示内的分差有意义；分数可任意平移</td><td>第二章</td></tr>
+<tr><td>RLHF 必须等于 PPO</td><td>必要结构是 RM ＋ KL 约束的 RL；PPO 可替换</td><td>第三章</td></tr>
+<tr><td>RM 分数越高模型越好</td><td>代理分持续上升可能正是过优化的警报</td><td>第三章</td></tr>
+<tr><td>KL 惩罚是为了防遗忘</td><td>KL 项防过优化；防退化另有 $\gamma$ 项</td><td>第三章</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="adjacent">两个相邻概念</h2>
+
+<ul>
+<li><b>DPO</b>（Direct Preference Optimization，直接偏好优化）：同样使用偏好比较数据，但跳过显式奖励模型和强化学习，直接用一个闭式目标调整策略。本站另有独立概念页介绍。</li>
+<li><b>RLAIF</b>（基于 AI 反馈的强化学习）：把人类标注者换成 AI 模型来产生偏好反馈，机制骨架与 RLHF 同构。</li>
+</ul>
+
+<p>完成本章后，检查自己：</p>
+<ul>
+<li>能逐条判断并给出理由："RLHF 让模型更真实""RLHF 让模型一定更安全""RM 分更高的模型一定更好"。</li>
+<li>能不看书说出 RLHF 成立的三个条件。</li>
+</ul>
+
+<h1 id="sources-and-teaching-notes">来源与教学说明</h1>
+
+<h2 id="src-claims">核心论断与来源</h2>
+<ul>
+<li>RLHF 的三过程结构（策略用 RL 最大化预测奖励、人比较输出对、奖励估计用监督学习拟合比较）：Christiano et al.,《Deep reinforcement learning from human preferences》, NeurIPS 2017, §2.2, arXiv:1706.03741。</li>
+<li>语言模型的 SFT → RM → PPO 三阶段流水线：Ouyang et al.,《Training language models to follow instructions with human feedback》, NeurIPS 2022, §3.1、§3.5, arXiv:2203.02155。</li>
+<li>优化人类偏好训练的奖励模型优于模仿人类参考摘要、优于优化 ROUGE（按人类判断）：Stiennon et al.,《Learning to summarize from human feedback》, NeurIPS 2020, arXiv:2009.01325。</li>
+<li>对代理奖励模型过优化会降低真实（金标准）表现：Gao, Schulman, Hilton,《Scaling Laws for Reward Model Overoptimization》, ICML 2023, arXiv:2210.10760。</li>
+<li>奖励学习首次用于语言任务（情感与描述性续写、摘要）：Ziegler et al.,《Fine-Tuning Language Models from Human Preferences》, 2019, arXiv:1909.08593。</li>
+<li>PPO 算法：Schulman et al.,《Proximal Policy Optimization Algorithms》, 2017, arXiv:1707.06347。</li>
+</ul>
+
+<h2 id="src-formulas">核心公式与来源</h2>
+<ul>
+<li>偏好概率（Bradley-Terry / softmax 形式）：Christiano et al. 2017, §2.2.3 公式 (1)。</li>
+<li>奖励模型损失 $\operatorname{loss}(\theta) = -\frac{1}{\binom{K}{2}}\mathbb{E}[\log\sigma(r_\theta(x,y_w)-r_\theta(x,y_l))]$：Ouyang et al. 2022, §3.5 公式 (1)。与 softmax 形式的等价推导见第二章折叠块（由两式直接推出）。</li>
+<li>RL 目标 $\mathbb{E}[r_\theta(x,y)-\beta\log(\pi_{RL}/\pi_{SFT})]+\gamma\,\mathbb{E}[\log\pi_{RL}(x)]$：Ouyang et al. 2022, §3.5 公式 (2）；"KL 项用于缓解对奖励模型的过优化"为该节原文。</li>
+<li>"分数可任意平移、绝对数值无意义"：由上述两公式的代数恒等式直接推出（$\sigma((a+c)-(b+c))=\sigma(a-b)$）；Ouyang et al. 2022, §3.5 亦明确"RM 损失对奖励平移不变"（"since the RM loss is invariant to shifts in reward"）。"分差只在同一提示内有意义"的依据是训练数据只含同一提示内的两两比较（同文 §3.5）。</li>
+</ul>
+
+<h2 id="src-numbers">外部数字与实验条件</h2>
+<ul>
+<li>约 13k（SFT）/ 33k（RM）/ 31k（PPO）个提示：Ouyang et al. 2022, §3.2。</li>
+<li>RM 训练每提示排序 $K=4\sim9$ 个回答：同文 §3.5。</li>
+<li>1.3B InstructGPT 输出优于 175B GPT-3：同文摘要；条件为该论文提示分布上的人工评估。</li>
+<li>奖励模型用 6B（175B RM 训练不稳定）：同文 §3.5。</li>
+<li>人类反馈覆盖不足 1% 的智能体交互：Christiano et al. 2017 摘要（Atari 与机器人语境）。</li>
+<li>风格续写 5,000 条、摘要 60,000 条比较：Ziegler et al. 2019 摘要。</li>
+</ul>
+
+<h2 id="src-examples">教学示例</h2>
+<ul>
+<li>贯穿例子（"为什么天空是蓝色的"与回答 A/B/C）：内容为说明机制而构造；回答 C 用于演示奖励作弊；均非真实模型输出。</li>
+<li>第二章手算（$r(x,A)=2.0$、$r(x,B)=-1.0$ 等）与第三章句级 KL 计算（$\pi_{SFT}$、$\pi_{RL}$、$\beta=0.1$ 的取值）：为手算方便构造，不代表真实模型的分数或工程推荐值。</li>
+<li>玩具奖励模型代码：4 个回答、4 条比较、初始分数全 0、学习率 0.5 均为人为设定，用于观察损失与分差的关系。</li>
+</ul>
+
+<h2 id="src-explanations">教学解释与类比边界</h2>
+<ul>
+<li>"比较比打分更容易校准"：解释数据设计动机的教学解释，非某篇论文原句；边界是——在评分量表经过严格校准的领域，直接打分同样可行。</li>
+<li>"$\beta$ 是汇率 / 橡皮筋"：只解释"代价随偏离放大、$\beta$ 控制松紧"这一局部关系；KL 项的正式定义是正文的对数比期望，类比不替代定义。</li>
+<li>第三章过优化示意图：趋势依据 Gao et al. 的实验结论，曲线形状为示意，非实验数据。</li>
+</ul>
+
+<h2 id="src-simplifications">教学简化及其限制</h2>
+<ul>
+<li>第三章的句级 KL 计算把回答当作整体；实际按逐 token 对数比累加（见该章折叠块），逐 token 累加会放大极端输出的代价。</li>
+<li>玩具奖励模型把"每个回答一个可学习分数"当作可训练参数；真实奖励模型是神经网络，输入（提示，回答）全文，通过反向传播调整内部参数。</li>
+<li>本页只使用"调整策略使期望奖励变大"层面的强化学习；PPO 的裁剪目标、优势估计与训练细节属于 PPO 概念本身，本页未展开。</li>
+<li>$\gamma$ 预训练混合项只用一句话说明其作用，相关消融实验未展开。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('h1:not(.title), h2');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H2') {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      if (currentH1Li) currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('h1:not(.title), h2'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+document.getElementById('readingTime').textContent = `约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('h1:not(.title)').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H1') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('h1:not(.title)'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      // 留出顶部导航的空间
+      setTimeout(() => {
+        window.scrollBy(0, -80);
+      }, 50);
+    }
+  });
+});
+</script>
+
+</body>
+</html>
