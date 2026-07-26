@@ -21,8 +21,9 @@
 │   └── concept/               # concept 各阶段规则（step-1~5）与写法示例库
 ├── scripts/                   # 生产工具
 │   ├── generate_index.py
-│   ├── validate_content.py
-│   └── img_to_b64.py
+│   ├── img_to_b64.py
+│   └── concept/
+│       └── validate.py        # 单个概念页的机械检查
 └── libs/                      # 前端本地依赖：KaTeX、Prism、字体
 ```
 
@@ -37,7 +38,6 @@
 
 ```bash
 python scripts/generate_index.py
-python scripts/validate_content.py
 ```
 
 ## 写新概念学习材料

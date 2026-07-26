@@ -102,7 +102,6 @@ python scripts/img_to_b64.py figs/arch.png
 
 ```bash
 python scripts/generate_index.py
-python scripts/validate_content.py
 ```
 
 ---
@@ -183,7 +182,6 @@ python scripts/validate_content.py
 - [ ] 宽表用 `.table-scroll`
 - [ ] 关键数字加粗
 - [ ] 本地资源路径指向 `../../../../libs/`
-- [ ] `python scripts/validate_content.py` 通过
 
 ---
 
