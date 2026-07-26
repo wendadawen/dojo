@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Validate a single concept page (index.html).
+"""Validate a single concept or paper page (index.html).
 
 Deterministic checks only: shell integrity, template leftovers, duplicate
 ids, same-page anchors and broken local references. Semantic quality is out
 of scope (handled by the independent review).
 
 Usage:
-    python3 scripts/concept/validate.py content/concepts/<name>/index.html
-    python3 scripts/concept/validate.py content/concepts/<name>/
+    python3 scripts/validate.py content/concepts/<name>/index.html
+    python3 scripts/validate.py content/papers/<venue>/<name>/index.html
 """
 
 from __future__ import annotations

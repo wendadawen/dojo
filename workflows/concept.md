@@ -79,7 +79,7 @@ content/concepts/<name>/index.html
 
 作者根据已确认的研究范围、教学大纲、外壳 `templates/concept/index.html` 和组件库 `templates/concept/components.html` 写作，不参考 `content/concepts/` 下已有页面的写作风格，不自行补充未经确认的核心内容。
 
-本阶段必须完成：所有声称可运行的代码实际执行并核对输出；运行 `python3 scripts/concept/validate.py <页面路径>` 通过；填写一页 `research/draft-check.md`。
+本阶段必须完成：所有声称可运行的代码实际执行并核对输出；运行 `python3 scripts/validate.py <页面路径>` 通过；填写一页 `research/draft-check.md`。
 
 产物：`content/concepts/<name>/index.html` 和 `research/draft-check.md`。
 
@@ -140,4 +140,4 @@ AI 可以根据用户的对话回复代写记录，但必须注明"确认方式�
 - 阶段产物必须满足下一阶段规定的输入要求。
 - 研究范围或教学大纲在确认后发生变化时，原确认失效，需重新提交对应门槛确认。
 - 作者可以承担修复工作；阶段 4 审查者必须是未参与初稿生成的全新上下文。
-- `scripts/concept/validate.py` 只做机械检查，通过它不替代独立审查和人工确认。
+- `scripts/validate.py` 只做机械检查，通过它不替代独立审查和人工确认。
