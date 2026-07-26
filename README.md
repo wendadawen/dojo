@@ -8,21 +8,17 @@
 .
 ├── index.html                 # 首页，由 scripts/generate_index.py 从 content.json 生成
 ├── content.json               # 最小内容 manifest：控制首页条目、顺序和描述
+├── AGENTS.md / CLAUDE.md / CODEBUDDY.md   # AI CLI 发现入口，指向 workflows/concept.md
 ├── content/                   # 最终可阅读内容
-│   ├── papers/                # 论文解读页面
-│   │   └── iclr2026/
-│   │       ├── hsd/
-│   │       ├── memagent/
-│   │       └── pless/
-│   └── concepts/              # 概念学习页面
-│       ├── backward/
-│       └── dpo/
+│   ├── papers/                # 论文解读页面（content/papers/<venue>/<name>/）
+│   └── concepts/              # 概念学习页面（content/concepts/<name>/）
 ├── templates/                 # HTML 骨架模板，不是发布内容
 │   ├── paper/
-│   └── concept/
+│   └── concept/               # index.html 外壳 + components.html 组件库
 ├── workflows/                 # 写作流程和质量标准
 │   ├── paper.md
-│   └── concept.md
+│   ├── concept.md             # concept 工作流编排入口
+│   └── concept/               # concept 各阶段规则（step-1~5）与写法示例库
 ├── scripts/                   # 生产工具
 │   ├── generate_index.py
 │   ├── validate_content.py
@@ -46,16 +42,14 @@ python scripts/validate_content.py
 
 ## 写新概念学习材料
 
-1. 读 `workflows/concept.md`，先确认上下文、旧方案、痛点和概念改变点
-2. 拷贝 `templates/concept/index.html` 到 `content/concepts/<concept-name>/index.html`
-3. 写完按 `workflows/concept.md` 的核查清单逐项检查
-4. 在 `content.json` 增加条目
-5. 运行：
+concept 工作流按五阶段进行：研究范围 → 教学大纲 → 生成初稿 → 独立审查 → 修复与发布。研究范围、教学大纲和最终发布各设一个人工确认门槛，未确认不得进入后续阶段。
 
-```bash
-python scripts/generate_index.py
-python scripts/validate_content.py
-```
+1. 用一句话启动，例如："执行 concept 工作流，概念是 PPO"
+2. AI 依次阅读 `workflows/concept.md`（编排入口）和 `workflows/concept/` 下的阶段文件执行
+3. 在三个确认点审阅确认材料，明确回复通过或退回意见
+4. 最终确认通过后，AI 更新 `content.json`，并运行 `python3 scripts/generate_index.py` 生成首页
+
+产物：`content/concepts/<name>/index.html`；研究材料、确认记录和审查报告等过程证据保存在 `content/concepts/<name>/research/`。
 
 ## 内容边界
 
