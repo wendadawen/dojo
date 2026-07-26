@@ -29,7 +29,8 @@
 ```text
 content/concepts/<name>/research/
 ├── scope.md
-└── evidence.md
+├── evidence.md
+└── confirmations.md   # 确认门槛形成后创建
 ```
 
 ### 2.1 `scope.md`
@@ -499,19 +500,21 @@ content/concepts/<name>/research/
 - 概念歧义及处理状态
 - 证据冲突和证据不足摘要
 
-确认结果记录为：
+确认按 `workflows/concept.md` 第 7 节“人工确认的操作形式”执行，结果追加到 `research/confirmations.md`：
 
 ```markdown
 ## 研究范围确认
 
 - 结果：通过 / 退回
+- 确认方式：对话确认
+- 用户原话：<确认或退回的原话或摘要>
 - 确认人：<人工确认者>
 - 确认时间：<日期和时间>
-- scope.md 版本：<文件哈希或 commit>
-- evidence.md 版本：<文件哈希或 commit>
+- scope.md 版本：<commit 短哈希或工作树哈希>
+- evidence.md 版本：<commit 短哈希或工作树哈希>
 - 确认意见：<通过理由或退回修改项>
 ```
 
-确认记录必须由人工形成，自动执行者不得代填“通过”。确认结果为“通过”后方可进入阶段 2。确认意见要求调整范围时，应同步更新 `scope.md` 和受影响的 `evidence.md`，再重新确认。
+确认结果为“通过”后方可进入阶段 2。确认意见要求调整范围时，应同步更新 `scope.md` 和受影响的 `evidence.md`，再重新确认。
 
 确认覆盖的任一文件发生内容变化后，原确认失效；仅修正空白、排版或不改变语义的格式变化时，可保留原确认，但必须记录变更内容。

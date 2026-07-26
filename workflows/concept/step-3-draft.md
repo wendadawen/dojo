@@ -38,8 +38,8 @@ workflows/concept/content-examples.md
 
 开始写作前必须确认：
 
-- `scope.md` 和 `evidence.md` 的研究范围确认结果为“通过”
-- `outline.md` 的教学大纲确认结果为“通过”
+- `scope.md` 和 `evidence.md` 的研究范围确认结果为“通过”（确认记录位于 `research/confirmations.md`）
+- `outline.md` 的教学大纲确认结果为“通过”（同上）
 - 三份文件的当前版本与确认记录一致
 - `outline.md` 中所有将进入正式讲解的 C/F/N 引用均存在，并满足以下一种状态：处于“已确认”；或处于“存在冲突”，但 `scope.md` 已确认处理方式且 `outline.md` 已确认具体呈现方式。处于“证据不足”的项不得进入页面
 - 不存在需要返回阶段 1 的范围或证据缺口

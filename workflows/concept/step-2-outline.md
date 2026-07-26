@@ -41,7 +41,7 @@ content/concepts/<name>/research/
 
 进入本阶段前必须满足：
 
-- `scope.md` 和 `evidence.md` 已通过阶段 1 的人工确认
+- `scope.md` 和 `evidence.md` 已通过阶段 1 的人工确认，确认记录位于 `research/confirmations.md`
 - 确认记录包含确认人、确认时间和两份文件的版本
 - 两份文件的当前内容与确认版本一致
 - 不存在影响核心定义、核心问题、主要机制、核心公式或主要结论的阻断项
@@ -488,8 +488,6 @@ content/concepts/<name>/research/outline.md
 ### 7.3 C/F/N 证据引用
 
 ## 8. 范围一致性检查
-
-## 9. 教学大纲确认
 ```
 
 章节大纲是教学设计的主记录。核心问题覆盖表、教学依赖表和跨章节索引只记录编号、章节位置和检查状态，不复制 `scope.md` 的完成答案、`evidence.md` 的来源详情或章节中的完整讲解方案。
@@ -563,21 +561,23 @@ content/concepts/<name>/research/outline.md
 - 不展开内容和范围一致性检查结果
 - 证据缺口检查结果
 
-确认结果记录在 `outline.md`：
+确认按 `workflows/concept.md` 第 7 节“人工确认的操作形式”执行，结果追加到 `research/confirmations.md`：
 
 ```markdown
 ## 教学大纲确认
 
 - 结果：通过 / 退回
+- 确认方式：对话确认
+- 用户原话：<确认或退回的原话或摘要>
 - 确认人：<人工确认者>
 - 确认时间：<日期和时间>
-- outline.md 版本：<文件哈希或 commit>
-- scope.md 版本：<文件哈希或 commit>
-- evidence.md 版本：<文件哈希或 commit>
+- outline.md 版本：<commit 短哈希或工作树哈希>
+- scope.md 版本：<commit 短哈希或工作树哈希>
+- evidence.md 版本：<commit 短哈希或工作树哈希>
 - 确认意见：<通过理由或退回修改项>
 ```
 
-确认记录必须由人工形成，自动执行者不得代填“通过”。确认结果为“通过”后方可进入阶段 3。
+确认结果为“通过”后方可进入阶段 3。
 
 `outline.md` 发生任何语义变化后，原教学大纲确认失效。包括但不限于：页面开头、章节目标或顺序、完成检查、章节过渡、贯穿内容、基础知识安排、讲解材料及深度、教学简化、正文与折叠块分工、核心问题覆盖关系、误解与边界处理位置、证据引用。
 
