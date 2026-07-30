@@ -12,18 +12,16 @@
 - “一步一步带我读懂这个 PR：<链接>”
 - “把我们刚才学清楚的内容整理成笔记”
 
-AI 会从 `AGENTS.md` / `CLAUDE.md` / `CODEBUDDY.md` 识别场景，并加载 `prompts/` 下对应的独立提示词。
+AI 会从 `AGENTS.md` / `CLAUDE.md` / `CODEBUDDY.md` 识别场景，并加载 `guides/` 下对应的场景指南。
 
 ## 目录
 
 ```text
-prompts/           五种学习场景的提示词
-workflows/         论文与概念页面的现有生产流程
-content/papers/    论文解读页面
-content/concepts/  概念学习页面
-content/notes/     对话后按需生成的结构化笔记
-templates/         三类 HTML 页面模板
-content.json       首页内容清单
+guides/       每个学习场景一份指南（paper/concept 含五阶段流程，explain/pr/note 为占位）
+wiki/         学过的内容生成的可浏览页面（wiki/<name>/index.html）
+.dojo/        构建素材与脚本（HTML 模板、首页生成器、校验器）
+content.json  首页数据清单
+index.html    首页，双击即可离线浏览
 ```
 
 ## 在线访问
