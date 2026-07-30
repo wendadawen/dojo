@@ -1,22 +1,35 @@
 # Dojo
 
-这是一个通用 AI 学习仓库。不同任务差异很大，因此没有统一总工作流；先识别用户意图，再只读取对应的场景提示词。
+一个工具无关的 AI 学习仓库：读论文、学概念、问问题、读 PR，并在需要时把学清楚的内容留成可浏览页面。不同任务差异很大，因此没有统一总工作流——先识别用户意图，再只读取对应的场景指南。
+
+## 目录结构
+
+```text
+guides/       每个学习场景一份指南（AI 的操作入口）
+wiki/         学过的内容生成的可浏览页面（wiki/<name>/index.html）
+.dojo/        构建素材与脚本（模板、首页生成器、校验器），平时不用改
+content.json  首页数据清单
+index.html    首页（双击即可离线浏览）
+```
 
 ## 场景路由
 
-| 用户意图 | 读取并执行 |
-|---|---|
-| 读论文、精读论文、把论文生成 HTML | `prompts/paper.md` |
-| 系统学习概念并生成 HTML | `prompts/concept.md` |
-| 提一个问题、希望通过对话弄懂 | `prompts/explain.md` |
-| 带我读懂一个 PR / diff | `prompts/pr.md` |
-| 把已经学清楚的内容整理留档 | `prompts/note.md` |
+| 用户意图 | 读取并执行 | 成熟度 |
+|---|---|---|
+| 读论文、精读论文、把论文生成 HTML | `guides/paper.md` | 成熟（含 `guides/paper/` 五阶段流程） |
+| 系统学习概念并生成 HTML | `guides/concept.md` | 成熟（含 `guides/concept/` 五阶段流程） |
+| 提一个问题、希望通过对话弄懂 | `guides/explain.md` | 占位·待完善 |
+| 带我读懂一个 PR / diff | `guides/pr.md` | 占位·待完善 |
+| 把已经学清楚的内容整理留档 | `guides/note.md` | 占位·待完善 |
 
-如果意图不明确，只问一个足以判断场景的问题，不要一次发问卷。场景进行中以用户最新要求为准；用户从“解释”切到“留档”时，再加载 `prompts/note.md`。
+标注「占位·待完善」的指南目前只有一份入口说明，尚未接入调研过的成熟方案，后续会逐个补全。执行时以指南现有内容为准，不要臆造流程。
+
+如果意图不明确，只问一个足以判断场景的问题，不要一次发问卷。场景进行中以用户最新要求为准；用户从「解释」切到「留档」时，再加载 `guides/note.md`。
 
 ## 项目约束
 
-- 可浏览内容统一生成 HTML，并登记到 `content.json`，再运行 `scripts/generate_index.py` 更新首页。
-- 论文、概念、笔记分别进入 `content/papers/`、`content/concepts/`、`content/notes/`。
-- 生成页面后运行 `scripts/validate.py <页面路径>`。
+- 可浏览内容统一生成 HTML，放入 `wiki/<name>/`，登记到 `content.json`，再运行 `.dojo/scripts/generate_index.py` 更新首页。
+- 页面用相对路径引用 `libs/`（`wiki/<name>/` 深两层，即 `../../libs/...`）。
+- 生成页面后运行 `.dojo/scripts/validate.py <页面路径>`。
+- 全站纯静态、可离线双击浏览；不引入需要联网或构建服务的依赖。
 - 不自动 commit、push、重命名 GitHub 仓库或部署，除非用户明确要求。
