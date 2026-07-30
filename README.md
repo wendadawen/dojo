@@ -28,8 +28,6 @@ content.json       首页内容清单
 
 ## 在线访问
 
-当前 GitHub Pages 地址仍沿用原仓库名：
-
 https://wendadawen.github.io/dojo/
 
 GitHub 仓库、本地项目目录与站点品牌均使用 `dojo`。
