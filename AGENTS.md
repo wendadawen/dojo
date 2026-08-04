@@ -1,7 +1,5 @@
 # Dojo
 
-> 唯一规则文件，兼容各 AI 工具（Claude Code / Codex / CodeBuddy / WorkBuddy 等均支持读取 AGENTS.md）。
-
 一个工具无关的 AI 学习仓库：读论文、学概念、问问题、读 PR，并在需要时把学清楚的内容留成可浏览页面。不同任务差异很大，因此没有统一总工作流——先识别用户意图，再只读取对应的场景指南。
 
 ## 目录结构
@@ -16,15 +14,13 @@ index.html    首页（双击即可离线浏览）
 
 ## 场景路由
 
-| 用户意图 | 读取并执行 | 成熟度 |
-|---|---|---|
-| 读论文、精读论文、把论文生成 HTML | `guides/paper.md` | 成熟（含 `guides/paper/` 五阶段流程） |
-| 系统学习概念并生成 HTML | `guides/concept.md` | 成熟（含 `guides/concept/` 五阶段流程） |
-| 提一个问题、希望通过对话弄懂 | `guides/explain.md` | 成熟（Socratic 教学法增强） |
-| 带我读懂一个 PR / diff | `guides/pr.md` | 占位·待完善 |
-| 把已经学清楚的内容整理留档 | `guides/note.md` | 占位·待完善 |
-
-标注「占位·待完善」的指南目前只有一份入口说明，尚未接入调研过的成熟方案，后续会逐个补全。执行时以指南现有内容为准，不要臆造流程。
+| 用户意图 | 读取并执行 |
+|---|---|
+| 读论文、精读论文、把论文生成 HTML | `guides/paper.md` |
+| 系统学习概念并生成 HTML | `guides/concept.md` |
+| 提一个问题、希望通过对话弄懂 | `guides/explain.md` |
+| 带我读懂一个 PR / diff | `guides/pr.md` |
+| 把已经学清楚的内容整理留档 | `guides/note.md` |
 
 如果意图不明确，只问一个足以判断场景的问题，不要一次发问卷。场景进行中以用户最新要求为准；用户从「解释」切到「留档」时，再加载 `guides/note.md`。
 
