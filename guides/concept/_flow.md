@@ -12,8 +12,6 @@ wiki/<name>/index.html
 
 工作流由五个阶段组成。概念定义、边界或核心问题发生变化时返回阶段 1；章节目标、讲解顺序或教学方式发生变化时返回阶段 2；不改变范围和大纲的内容问题在阶段 4 和阶段 5 之间循环处理。
 
----
-
 ## 1. 总流程
 
 ```text
@@ -33,8 +31,6 @@ wiki/<name>/index.html
 
 各阶段达到完成条件后连续自动执行，无需人工确认。审查要求改变研究范围时自动返回阶段 1，要求改变教学大纲时自动返回阶段 2；达到重试上限或硬性完成条件无法满足时，流程失败且不发布。
 
----
-
 ## 2. 阶段 1：研究范围——决定讲什么
 
 详细规则见 `guides/concept/step-1-research.md`。
@@ -50,8 +46,6 @@ wiki/<name>/index.html
 
 产物：`research/scope.md` 和 `research/evidence.md`。
 
----
-
 ## 3. 阶段 2：教学大纲——决定怎么讲
 
 详细规则见 `guides/concept/step-2-outline.md`。
@@ -66,8 +60,6 @@ wiki/<name>/index.html
 
 产物：`research/outline.md`。
 
----
-
 ## 4. 阶段 3：生成初稿——按阶段产物写 HTML
 
 详细规则见 `guides/concept/step-3-draft.md`。局部写法参考 `guides/concept/content-examples.md`。
@@ -77,8 +69,6 @@ wiki/<name>/index.html
 本阶段必须完成：所有声称可运行的代码实际执行并核对输出；运行 `python3 .dojo/scripts/validate.py <页面路径>` 通过；填写一页 `research/draft-check.md`。
 
 产物：`wiki/<name>/index.html` 和 `research/draft-check.md`。
-
----
 
 ## 5. 阶段 4：独立审查——判断是否正确、是否看得懂
 
@@ -91,8 +81,6 @@ wiki/<name>/index.html
 
 产物：`research/review.md`，每个问题一行，含级别、位置、问题、修法；修复和复验结果就地回填。阻断和重要问题必须修复并复验通过；轻微问题逐条跟踪，可以修复或标记遗留。
 
----
-
 ## 6. 阶段 5：修复、复验与发布
 
 详细规则见 `guides/concept/step-5-fix.md`。
@@ -102,8 +90,6 @@ wiki/<name>/index.html
 审查发现需要改变研究范围时自动返回阶段 1，需要改变教学大纲时自动返回阶段 2，并重新执行后续阶段。
 
 阻断和重要问题全部关闭、轻微遗留均有接受理由、`validate.py` 通过且代码重跑一致后，自动更新 `content.json`，运行 `python3 .dojo/scripts/generate_index.py`，检查首页条目和链接。
-
----
 
 ## 7. 跨阶段约束
 
