@@ -19,5 +19,3 @@
 - `wiki/<name>/index.html`
 - 更新后的 `content.json` 和 `index.html`
 - 对用户只说明：生成位置、核心覆盖内容、验证结果、仍有的边界。
-
-不要自动 commit、push 或部署。
