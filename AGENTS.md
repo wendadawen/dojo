@@ -1,6 +1,6 @@
 # Dojo
 
-> 唯一正文源。`CLAUDE.md` 与 `CODEBUDDY.md` 为壳文件，均指向本文件。
+> 唯一规则文件，兼容各 AI 工具（Claude Code / Codex / CodeBuddy / WorkBuddy 等均支持读取 AGENTS.md）。
 
 一个工具无关的 AI 学习仓库：读论文、学概念、问问题、读 PR，并在需要时把学清楚的内容留成可浏览页面。不同任务差异很大，因此没有统一总工作流——先识别用户意图，再只读取对应的场景指南。
 
