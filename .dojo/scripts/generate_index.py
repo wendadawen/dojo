@@ -27,19 +27,6 @@ def card(item: dict, tag_class: str) -> str:
           </a>"""
 
 
-def render_modes(modes: list[dict], repo_url: str) -> str:
-    cards = []
-    for mode in modes:
-        prompt_url = f"{repo_url}/blob/main/{mode['prompt']}"
-        cards.append(f"""        <a class="mode" href="{escape(prompt_url)}">
-          <span class="mode-kicker">{escape(mode['id'])}</span>
-          <h3>{escape(mode['title'])}</h3>
-          <p>{escape(mode['desc'])}</p>
-          <span class="mode-link">查看提示词 →</span>
-        </a>""")
-    return "\n".join(cards)
-
-
 def render_papers(items: list[dict]) -> str:
     groups: dict[str, list[dict]] = defaultdict(list)
     for item in items:
@@ -90,7 +77,6 @@ def render(manifest: dict) -> str:
     for item in manifest["items"]:
         items_by_section[item["section"]].append(item)
 
-    modes = render_modes(manifest["modes"], site["repo_url"])
     sections = "\n\n".join(
         render_section(section, items_by_section[section["id"]])
         for section in manifest["sections"]
@@ -125,15 +111,6 @@ def render(manifest: dict) -> str:
     h1 {{ font-family: var(--font-body); font-size: 44px; font-weight: 600; margin: 0 0 0.5rem; letter-spacing: -0.02em; }}
     .subtitle {{ max-width: 680px; color: var(--text-light); font-size: 17px; margin: 0; }}
     .meta {{ color: var(--text-muted); font-size: 13px; margin-top: 1rem; font-family: var(--font-mono); }}
-    .modes-title {{ font-family: var(--font-body); font-size: 24px; margin: 0 0 .25rem; }}
-    .modes-desc {{ color: var(--text-light); font-size: 14px; margin: 0 0 1rem; }}
-    .modes {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; }}
-    .mode {{ display: block; padding: 1.15rem 1.25rem; background: var(--bg-soft); border: 1px solid var(--border-light); border-radius: 8px; color: inherit; text-decoration: none; }}
-    .mode:hover {{ border-color: var(--border); }}
-    .mode-kicker {{ color: var(--purple); font: 11px/1.4 var(--font-mono); }}
-    .mode h3 {{ margin: .25rem 0; font: 600 18px/1.4 var(--font-body); }}
-    .mode p {{ margin: 0; color: var(--text-light); font-size: 13px; }}
-    .mode-link {{ display: inline-block; margin-top: .65rem; color: var(--blue); font-size: 12px; }}
     .section {{ margin-top: 3.25rem; }}
     .section-title {{ font-family: var(--font-body); font-size: 24px; font-weight: 600; margin: 0 0 0.25rem; }}
     .section-desc {{ color: var(--text-light); font-size: 14px; margin: 0 0 1rem; }}
@@ -156,7 +133,7 @@ def render(manifest: dict) -> str:
     .empty {{ margin: 0; padding: 1.2rem 1.3rem; color: var(--text-muted); background: var(--bg-soft); border: 1px dashed var(--border); border-radius: 8px; font-size: 13px; }}
     footer {{ margin-top: 4rem; padding-top: 2rem; border-top: 1px solid var(--border-light); color: var(--text-muted); font-size: 13px; }}
     footer a {{ color: var(--blue); text-decoration: none; }} footer a:hover {{ text-decoration: underline; }}
-    @media (max-width: 680px) {{ .container {{ padding-top: 2.5rem; }} h1 {{ font-size: 38px; }} .modes {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 680px) {{ .container {{ padding-top: 2.5rem; }} h1 {{ font-size: 38px; }} }}
   </style>
 </head>
 <body>
@@ -166,14 +143,6 @@ def render(manifest: dict) -> str:
       <p class="subtitle">{escape(site['subtitle'])}</p>
       <p class="meta">{escape(site['repo'])}</p>
     </header>
-
-    <section>
-      <h2 class="modes-title">五种学习动作</h2>
-      <p class="modes-desc">没有统一大工作流。不同任务加载各自独立的提示词。</p>
-      <div class="modes">
-{modes}
-      </div>
-    </section>
 
 {sections}
 
