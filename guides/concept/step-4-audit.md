@@ -24,9 +24,9 @@
 2. 待审概念目录名（替换任务包中的 `<name>`）
 3. 一句话指令："阅读任务包并严格执行，只读取任务包允许的输入文件"
 
-- **CodeBuddy**：使用 Agent 工具派生子代理（`subagent_type=general-purpose`）
-- **Claude Code**：使用 Task 工具派生子代理
-- **其他 CLI**：必须使用能够自动创建独立上下文的等效机制；无法创建时流程失败且不发布
+- CodeBuddy：使用 Agent 工具派生子代理（`subagent_type=general-purpose`）
+- Claude Code：使用 Task 工具派生子代理
+- 其他 CLI：必须使用能够自动创建独立上下文的等效机制；无法创建时流程失败且不发布
 
 编排者不得向审查上下文转发作者推理记录、修复意图或研究产物。审查期间编排者不改动 `index.html`。
 
