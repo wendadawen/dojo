@@ -20,7 +20,7 @@ index.html    首页（双击即可离线浏览）
 |---|---|---|
 | 读论文、精读论文、把论文生成 HTML | `guides/paper.md` | 成熟（含 `guides/paper/` 五阶段流程） |
 | 系统学习概念并生成 HTML | `guides/concept.md` | 成熟（含 `guides/concept/` 五阶段流程） |
-| 提一个问题、希望通过对话弄懂 | `guides/explain.md` | 占位·待完善 |
+| 提一个问题、希望通过对话弄懂 | `guides/explain.md` | 成熟（Socratic 教学法增强） |
 | 带我读懂一个 PR / diff | `guides/pr.md` | 占位·待完善 |
 | 把已经学清楚的内容整理留档 | `guides/note.md` | 占位·待完善 |
 
