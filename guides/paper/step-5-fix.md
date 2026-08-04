@@ -64,4 +64,4 @@ wiki/<name>/
 - 时间：<日期和时间>
 ```
 
-任一发布条件不满足时不得更新 `content.json` 或首页。自动化范围不包含 commit、push 或部署。
+任一发布条件不满足时不得更新 `content.json` 或首页。
