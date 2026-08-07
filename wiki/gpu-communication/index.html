@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPU 通信：原语、算法与传输路径 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.75 var(--body); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 3rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1, h2, h3 { font-family: var(--body); line-height: 1.3; }
+    h1 { margin: .5rem 0 1rem; font-size: 2.35rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.6rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.08rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    p { margin: 1.15rem 0; }
+    a { color: var(--accent); }
+    code { font: .84em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--soft); border: 1px solid var(--border); border-radius: 8px; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin: 1.5rem 0; padding: .2rem 1.25rem; border-left: 3px solid var(--border); color: var(--muted); }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .45rem 0; }
+    table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--ui); }
+    th, td { padding: .7rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    svg { display: block; margin: 1.6rem auto; }
+    footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { body { font-size: 17px; } .wrap { padding-top: 2rem; } h1 { font-size: 2rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav><a href="../../index.html">← 返回 Dojo</a></nav>
+    <header>
+      <span class="eyebrow">学习笔记 · GPU 通信</span>
+      <h1>GPU 通信：原语、算法与传输路径</h1>
+      <p class="lead">通信原语只有搬、算、换三类动作；跨机传输快慢的分界在于 CPU 是否参与搬运——socket/TCP 路径 CPU 全程参与，RDMA 路径绕过 CPU，GPUDirect 连主机内存都跳过。</p>
+      <p class="meta">更新于 2026-08-07 · 类型：学习笔记</p>
+    </header>
+
+    <h2>分层与主线：谁调度、谁搬运</h2>
+    <p>GPU 之间传数据，从发出请求到数据落位，经过三个层次，各司其职：</p>
+    <ul>
+      <li><strong>应用层</strong>：框架发起通信请求（"我要 all-reduce"）。应用不关心通信细节，只描述意图。</li>
+      <li><strong>通信库</strong>：枢纽。探测硬件拓扑（哪些卡之间有 NVLink、跨机走哪条网络）、选择算法（环形、树形）、管理通信组、决定数据走哪条物理通道。</li>
+      <li><strong>硬件层</strong>：物理通道执行搬运——机内的 PCIe/NVLink、跨机的网卡与网络。</li>
+    </ul>
+    <svg viewBox="0 0 680 240" width="100%" role="img" aria-label="通信三层与加速主线示意">
+      <title>通信三层与加速主线</title>
+      <rect x="180" y="30" width="320" height="48" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+      <text x="340" y="54" text-anchor="middle" font-size="13" font-weight="500" fill="#0C447C" dominant-baseline="central">应用层：发起通信请求</text>
+      <line x1="340" y1="78" x2="340" y2="98" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ga)"/>
+      <rect x="180" y="98" width="320" height="48" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+      <text x="340" y="122" text-anchor="middle" font-size="13" font-weight="500" fill="#085041" dominant-baseline="central">通信库：选算法、选路径</text>
+      <line x1="340" y1="146" x2="340" y2="166" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ga)"/>
+      <rect x="180" y="166" width="320" height="48" rx="10" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+      <text x="340" y="190" text-anchor="middle" font-size="13" font-weight="500" fill="#633806" dominant-baseline="central">硬件层：物理通道执行搬运</text>
+      <text x="565" y="122" text-anchor="middle" font-size="12" fill="#A32D2D">主线：CPU 是否参与搬运</text>
+      <defs>
+        <marker id="ga" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+    </svg>
+    <p>贯穿全部层次的加速主线只有一条：<strong>CPU 是否参与数据搬运</strong>。CPU 参与每一次拷贝与协议处理，传输就慢；网卡等硬件直接搬运、CPU 只下指令，传输就快。后文所有术语都围绕这条主线展开。</p>
+
+    <h2>通信原语：搬、算、换三类动作</h2>
+    <p>集合通信原语是通信库提供的最小操作，全部可归为三类动作，前缀 <code>all</code> 统一表示「结果人人有份」：</p>
+    <ul>
+      <li><strong>搬</strong>：数据移位，值不变。broadcast、scatter、gather、all-gather。</li>
+      <li><strong>算</strong>：数据归约，值改变。reduce、all-reduce、reduce_scatter。</li>
+      <li><strong>换</strong>：数据交换主人。all-to-all。</li>
+    </ul>
+    <h3>八个原语的完整定义</h3>
+    <p>描述每个原语只需回答两个问题：操作前每张卡各持有什么，操作后每张卡各持有什么。以 2 张卡 A、B 为例：</p>
+    <table>
+      <tr><th>原语</th><th>操作前</th><th>操作后</th><th>典型用途</th></tr>
+      <tr><td>broadcast 广播</td><td>只有 A 有完整数据 [1,2,3]</td><td>A、B 都有同一份 [1,2,3]</td><td>分发公共参数、配置</td></tr>
+      <tr><td>scatter 散播</td><td>只有 A 有 [1,2,3,4]</td><td>A 拿 [1,2]，B 拿 [3,4]（每人不同份）</td><td>把任务/数据切分下发</td></tr>
+      <tr><td>gather 收集</td><td>A 有 [1,2]，B 有 [3,4]</td><td>拼到 A：A 有 [1,2,3,4]，B 无结果</td><td>汇集到主卡</td></tr>
+      <tr><td>all-gather 全收集</td><td>A 有 [1,2]，B 有 [3,4]</td><td>每张卡都有拼接结果 [1,2,3,4]</td><td>张量并行输出拼列</td></tr>
+      <tr><td>reduce 归约</td><td>A 有 [1,2]，B 有 [3,4]</td><td>归约（求和）到 A：A 有 [4,6]</td><td>梯度汇总到根卡</td></tr>
+      <tr><td>all-reduce 全归约</td><td>A 有 [1,2]，B 有 [3,4]</td><td>每张卡都有 [4,6]（1+3，2+4）</td><td>梯度同步、张量并行求和</td></tr>
+      <tr><td>reduce_scatter 归约散播</td><td>A 有 [1,2]，B 有 [3,4]</td><td>先求和得 [4,6] 再切开：A 拿 [4]，B 拿 [6]</td><td>序列并行中的归约切分</td></tr>
+      <tr><td>all-to-all 全交换</td><td>A 有 [a1,a2]，B 有 [b1,b2]</td><td>A 拿 [a1,b1]，B 拿 [a2,b2]（数据换主人）</td><td>MoE 专家路由、维度互换</td></tr>
+    </table>
+    <p>三类动作的边界：<strong>搬</strong>只改变数据的位置与排列，元素值全部保留；<strong>算</strong>把多张卡的数合并成新值（求和、求最大等归约操作）；<strong>换</strong>让每张卡收到其他卡各自给它的一份，是唯一能实现「维度互换」的原语。</p>
+    <p>两个容易混淆的对比：broadcast 与 scatter 都是「一个源发给大家」，区别是发同一份（broadcast）还是切开每人一份（scatter）；gather 与 all-gather 都是「把分片拼起来」，区别是拼到一张卡（gather）还是每张卡（all-gather）。reduce_scatter 是归约与切分的组合，先算后切——它的两个阶段分别对应 all-reduce 的前半段。</p>
+    <p>原语在张量并行中的对应：列切法（权重沿输出维切）每卡算出不同输出列，输出端需要 all-gather 拼列；行切法（权重沿输入维切）每卡算出部分和，输出端需要 all-reduce 求和。</p>
+
+    <h2>环形 all-reduce：带宽最优的两阶段算法</h2>
+    <p>all-reduce（求全局和）是训练与推理中最频繁的通信，最常见的实现是环形算法（ring all-reduce），由通信库在内部执行。以 4 张卡、每卡数据切成 4 块为例，分两个阶段：</p>
+    <h3>阶段一：reduce-scatter（边传边加）</h3>
+    <p>每张卡把自己的数据切成 N 块（N=卡数）。沿环传 N-1 步：每步把一块传给下一卡，收到后与自己同位置的块相加。3 步后，每张卡各持有「某一块」的全局和（卡 0 持有 A 块的和、卡 1 持有 B 块的和……）。</p>
+    <h3>阶段二：all-gather（边传边存）</h3>
+    <p>把已算好的块沿环再传 N-1 步，收到直接存储、不再相加。3 步后，每张卡都持有 A+B+C+D 的完整全局和。</p>
+    <svg viewBox="0 0 680 250" width="100%" role="img" aria-label="环形 all-reduce 两阶段示意">
+      <title>环形 all-reduce 两阶段</title>
+      <text x="340" y="26" text-anchor="middle" font-size="13" font-weight="500" fill="#854F0B">阶段 1：reduce-scatter，N-1 步，边传边加</text>
+      <rect x="70" y="40" width="90" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+      <text x="115" y="60" text-anchor="middle" font-size="12" fill="#444441" dominant-baseline="central">卡0 持ABCD</text>
+      <rect x="220" y="40" width="90" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+      <text x="265" y="60" text-anchor="middle" font-size="12" fill="#444441" dominant-baseline="central">卡1 持ABCD</text>
+      <rect x="370" y="40" width="90" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+      <text x="415" y="60" text-anchor="middle" font-size="12" fill="#444441" dominant-baseline="central">卡2 持ABCD</text>
+      <rect x="520" y="40" width="90" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+      <text x="565" y="60" text-anchor="middle" font-size="12" fill="#444441" dominant-baseline="central">卡3 持ABCD</text>
+      <line x1="160" y1="60" x2="218" y2="60" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#gb)"/>
+      <line x1="310" y1="60" x2="368" y2="60" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#gb)"/>
+      <line x1="460" y1="60" x2="518" y2="60" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#gb)"/>
+      <path d="M 565 80 Q 340 100 115 80" fill="none" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#gb)"/>
+      <text x="340" y="112" text-anchor="middle" font-size="11" fill="#5F5E5A">每步把一块传给下一卡并同位置相加 → 3 步后每卡持一块的全局和</text>
+      <text x="340" y="142" text-anchor="middle" font-size="13" font-weight="500" fill="#0F6E56">阶段 2：all-gather，N-1 步，边传边存</text>
+      <rect x="70" y="156" width="90" height="40" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+      <text x="115" y="176" text-anchor="middle" font-size="11" fill="#085041" dominant-baseline="central">卡0 持A之和</text>
+      <rect x="220" y="156" width="90" height="40" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+      <text x="265" y="176" text-anchor="middle" font-size="11" fill="#085041" dominant-baseline="central">卡1 持B之和</text>
+      <rect x="370" y="156" width="90" height="40" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+      <text x="415" y="176" text-anchor="middle" font-size="11" fill="#085041" dominant-baseline="central">卡2 持C之和</text>
+      <rect x="520" y="156" width="90" height="40" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+      <text x="565" y="176" text-anchor="middle" font-size="11" fill="#085041" dominant-baseline="central">卡3 持D之和</text>
+      <line x1="160" y1="176" x2="218" y2="176" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#gb)"/>
+      <line x1="310" y1="176" x2="368" y2="176" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#gb)"/>
+      <line x1="460" y1="176" x2="518" y2="176" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#gb)"/>
+      <path d="M 565 196 Q 340 216 115 196" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#gb)"/>
+      <text x="340" y="232" text-anchor="middle" font-size="11" fill="#0F6E56">每步把已算好的块传给下一卡并直接存储 → 3 步后每卡持完整全局和</text>
+      <defs>
+        <marker id="gb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+    </svg>
+    <h3>通信量：为什么环形算法带宽最优</h3>
+    <p>通信量按「每张卡发送的数据总量」计算。以每卡初始 1MB 数据为例：</p>
+    <table>
+      <tr><th>卡数 N</th><th>环形算法（每卡发送）</th><th>朴素方案（每卡发送）</th></tr>
+      <tr><td>4 卡</td><td>两个阶段各 3 步、每步传 1/4，共 1.5MB = 1.5 倍</td><td>把自己的 1MB 复制给其余 3 卡 = 3MB = 3 倍</td></tr>
+      <tr><td>8 卡</td><td>约 1.75 倍</td><td>7 倍</td></tr>
+      <tr><td>128 卡</td><td>约 1.98 倍</td><td>127 倍</td></tr>
+    </table>
+    <p>环形算法的总通信量为 $\frac{2(N-1)}{N}$ × 数据量，卡数增大时趋近 2 倍、<strong>不超过 2 倍</strong>；朴素方案（每卡把自己的完整数据复制给其余所有卡）通信量为 N-1 倍，卡数越多越昂贵。这就是「带宽最优」的含义：任意卡数下通信量最多翻一倍。代价是延迟随卡数线性增长（步数 N-1），因此小消息场景环形算法表现一般。</p>
+    <h3>其他算法与选择</h3>
+    <p>树形算法（tree）在卡数多的集群中延迟更低（步数约 $2\log_2 N$，聚合 + 广播各 log 步），适合小消息与大集群；NVLS 利用 NVLink 硬件多播加速；PAT 等混合算法用于特定规模。通信库默认自动选择，也可通过环境变量指定算法与协议。</p>
+
+    <h2>机内互联：总线、直连与中心交换</h2>
+    <p>单台机器内的 GPU 之间有三条通道，速度与专用程度递增：</p>
+    <table>
+      <tr><th>通道</th><th>定位</th><th>连接范围</th><th>特性</th></tr>
+      <tr><td>PCIe</td><td>公共总线</td><td>CPU 与所有外设（GPU、网卡、硬盘）</td><td>共享带宽；数据出网必经此路（网卡插在 PCIe 总线上，NVLink 不连网卡）</td></tr>
+      <tr><td>NVLink</td><td>GPU 专用直连</td><td>GPU 与 GPU（或 GPU 与 NVSwitch）</td><td>点对点、不经 CPU，带宽数倍于 PCIe；不连网卡、不连硬盘</td></tr>
+      <tr><td>NVSwitch</td><td>中心交换芯片</td><td>多张 GPU 汇聚到它，任意两卡互通</td><td>8 卡两两直连需 28 条线，中心交换用 8 条线实现全互联</td></tr>
+    </table>
+    <p>三条通道各自存在的理由：<strong>PCIe</strong> 是外设与 CPU 之间的通用数据通路，任何外设都要靠它接入机器；<strong>NVLink</strong> 针对 GPU 间通信极其频繁的场景（张量并行每步都要通信），公共总线会成为瓶颈，需要专用快道；<strong>NVSwitch</strong> 解决全互联的物理难题——两两直连的线缆数量按组合数增长（8 卡需要 28 条），中心交换用少量线缆换回任意两卡互通。</p>
+    <p>由此推出数据路径的约束：GPU 与 GPU 之间优先走 NVLink；数据要出机器（到网卡）则必经 PCIe——因为网卡挂在 PCIe 总线上，NVLink 不连接网卡。这也是「出网必经 PCIe」的由来。</p>
+
+    <h2>跨机传输：CPU 参与与绕过 CPU 两条路径</h2>
+    <h3>路径一：socket / TCP / IP / 以太网，CPU 全程参与</h3>
+    <p>这一路径由四层协作，数据发出时从上往下逐层打包，接收时反向逐层拆包：</p>
+    <ul>
+      <li><strong>socket</strong>：编程接口（API），程序打开它建立连接点、收发数据。不是协议，是「开口」。</li>
+      <li><strong>TCP</strong>（Transmission Control Protocol）：传输控制协议，保证数据可靠有序到达——丢包重传、乱序排好。</li>
+      <li><strong>IP</strong>（Internet Protocol）：互联网协议，给每台机器分配门牌号（如 192.168.x.x），数据包靠它跨网络找到目标。</li>
+      <li><strong>以太网</strong>（IEEE 802.3）：物理层与链路层的统一标准，规定帧格式、速率等级，用 MAC 地址在交换机覆盖的网段内寻址。名字借自 19 世纪假想的传光介质「以太（Ether）」，寓意无处不在的传输媒介。</li>
+    </ul>
+    <p><strong>MAC 与 IP 的分工</strong>：MAC 地址是网卡出厂固化的 48 位编号（如 08:00:27:b9:88:74），是以太网层「这一跳」的本地地址，交换机靠它把帧转给正确端口（交换机内部维护 MAC↔端口表）；IP 是网络层「全程」的全局地址。数据先靠 IP 知道要去哪台机器，到达所在网段后再靠 MAC 找到具体端口。</p>
+    <p><strong>为什么慢</strong>：数据每过一层，CPU 都要参与处理（封包、校验、拷贝），加上用户态与内核态之间、内核与网卡之间的多次拷贝，延迟高且占 CPU。作为代价，这一路径通用——任何机器、任何网络都能用，不需要专门硬件。</p>
+    <h3>路径二：RDMA 家族，绕过 CPU</h3>
+    <p>RDMA（Remote Direct Memory Access，远程直接内存访问）让网卡直接读写远端内存：应用先向网卡注册内存区域，网卡用 DMA 从源内存读出、经网络直达目标内存写入，绕过 CPU 与操作系统协议栈，零拷贝。三个关键词：<strong>远程</strong>（跨机器）、<strong>直接</strong>（不经 CPU）、<strong>内存访问</strong>（直接读写内存）。</p>
+    <p>RDMA 是技术思想，需要硬件支持，有两条落地路线：</p>
+    <table>
+      <tr><th></th><th>IB（InfiniBand）</th><th>RoCE（RDMA over Converged Ethernet）</th></tr>
+      <tr><td>本质</td><td>专为 RDMA 设计的独立网络（Infini 无限 + Band 带宽）</td><td>把 RDMA 封装进以太网帧，跑在现成以太网上</td></tr>
+      <tr><td>硬件</td><td>自有交换机、网卡（HCA）、线缆，需单独布线</td><td>复用现有以太网交换机与线缆</td></tr>
+      <tr><td>无损保障</td><td>链路层内置信用流控，天生无损</td><td>需在交换机配置 PFC/ECN 制造「无损」，配置复杂且易错</td></tr>
+      <tr><td>取舍</td><td>性能最好、延迟最低，但设备昂贵</td><td>成本低、融入以太网生态，但性能依赖配置</td></tr>
+    </table>
+    <p>配套术语：<strong>HCA</strong>（Host Channel Adapter）是 IB 网络里对网卡（NIC）的称呼——同一个硬件角色在不同网络世界的名字，HCA 里的 Adapter 指「转接两种规格」：主机内部总线与 IB 网络；<strong>GID</strong>（Global Identifier）是 IB/RoCE 网络的全局寻址，相当于 IB 世界的 IP（IB 独立设计，没有 IP 体系）；<strong>mlx5</strong> 是 Mellanox（已被 NVIDIA 收购）网卡在 Linux 里的设备名（如 mlx5_0），通信库找 RDMA 设备时找的就是它。</p>
+    <p><strong>GPUDirect</strong> 更进一步：普通 RDMA 网卡读写的是主机内存，数据路径是「GPU 显存 → 主机内存 → 网卡」，主机内存仍当中转；GPUDirect 让网卡直接读写 GPU 显存，连主机内存都跳过（NVIDIA 官方表述：CPU 与主机内存完全不在数据路径上）。对数据常驻显存的 AI 场景，这一跳的节省直接进入通信时间。</p>
+    <p><strong>两条路径并存的原因</strong>：TCP 路径通用、任何环境可用；RDMA 需要支持 RDMA 的网卡（如 Mellanox ConnectX 系列）与匹配的网络，只有高性能集群才配置。通信库会探测可用硬件，优先 RDMA，退化到 TCP。</p>
+
+    <h2>网卡：一个角色，多个名字与用法</h2>
+    <p>网卡是「机器出网的门」这个硬件角色，围绕它有一组容易混淆的术语，分属三个层面：</p>
+    <ul>
+      <li><strong>称呼层</strong>：NIC（Network Interface Card，网络接口卡）是它在以太网世界的叫法；HCA（Host Channel Adapter）是它在 IB 世界的叫法。同一个角色，两个艺名，不是两种硬件。</li>
+      <li><strong>系统层</strong>：网卡装进 Linux 系统后不止一个名字，同一块物理网卡有两个身份——网络接口名 <code>eth0</code>（Ethernet 0，以太网接口 0 号，传统按发现顺序编号；现代系统也有按硬件位置编码的可预测命名，如板载网卡 eno1、PCIe 槽位网卡 ens1f0）走 IP/TCP 慢路径；RDMA 设备名 <code>mlx5_0</code>（Mellanox 第 5 代驱动）走 RDMA 快路径。通信库找快路径设备时找的是 mlx5_0 而不是 eth0。</li>
+      <li><strong>用法层</strong>：bond（绑定）不是新网卡，而是「把多块物理网卡绑成一块逻辑网卡 bond0」的使用方式，动机有两个——带宽叠加（链路聚合，如两块 25G 绑成 50G，需交换机配合 LACP）与故障冗余（主备模式，一块坏了另一块秒切）。</li>
+    </ul>
+    <p>为什么需要网卡这个设备而不是让 CPU 直接处理网络：一是信号转换，机器内部是 PCIe 总线信号（短距离、并行），外部是线缆信号（长距离、串行、带协议），两套规格需要硬件转接；二是协议处理卸载，封帧、寻址、校验是高频固定活，用专门硬件做比 CPU 软件做快得多、不占 CPU。</p>
+
+    <h2>通信库：集合通信库与传输库的分工</h2>
+    <p>通信库分两类，职责不同：集合通信库实现原语与算法、管理通信组；传输库封装底层传输通道、提供统一接口。</p>
+    <table>
+      <tr><th>库</th><th>类别</th><th>定位</th><th>关键特征</th></tr>
+      <tr><td>NCCL</td><td>集合通信库</td><td>NVIDIA 的标准 GPU 通信库</td><td>GPU 通信事实标准，探测拓扑、选算法、管理通信组</td></tr>
+      <tr><td>TCCL</td><td>集合通信库</td><td>腾讯针对自研高性能网络定制的版本</td><td>接口与 NCCL 完全一致、替换即用，懂自研网络的拓扑与路由（官方披露常用通信模式性能提升约 40%）</td></tr>
+      <tr><td>gloo</td><td>集合通信库</td><td>PyTorch 自带</td><td>支持 CPU 张量与跨平台（macOS/Windows），定位 CPU 训练或作为后备</td></tr>
+      <tr><td>UCX</td><td>传输库</td><td>开源统一通信框架</td><td>把 RDMA、TCP 等封装成统一 API，自动探测可用传输并选最优路径</td></tr>
+      <tr><td>NIXL</td><td>传输库</td><td>NVIDIA 面向推理的传输库（Xfer = Transfer）</td><td>插件化支持 UCX、GDS 等后端；面向 KV 缓存跨节点传输、内存注册、异步零拷贝等推理场景</td></tr>
+    </table>
+    <p>两组容易混淆的对比：<strong>NCCL 与 gloo</strong> 都是集合通信库，一个 GPU 专用（CUDA），一个覆盖 CPU 与跨平台——官方选择规则是 GPU 训练用 NCCL、CPU 训练用 gloo；<strong>UCX 与 NIXL</strong> 都是传输库，UCX 面向通用高性能计算（HPC），NIXL 面向 AI 推理场景，UCX 只是 NIXL 的可选后端之一。TCCL 存在的理由是 NCCL 为通用硬件优化、不认识自研网络的特殊拓扑与协议，定制版按相同接口重写后无需改应用代码。</p>
+
+    <h2>来源</h2>
+    <ul>
+      <li>NCCL 官方文档与 NVIDIA 博客《Fast Multi-GPU collectives with NCCL》：环形 all-reduce 两阶段、通信量公式、Copy/Reduce 内核原语、算法与协议选择</li>
+      <li>PyTorch 官方文档 torch.distributed：gloo 定位（CPU 训练）、NCCL 与 gloo 后端选择规则</li>
+      <li>NVIDIA 官方 GPUDirect 文档：GPUDirect RDMA 直接读写 GPU 显存、CPU 与主机内存不在数据路径上</li>
+      <li>NVIDIA Dynamo 文档：NIXL（NVIDIA Inference Xfer Library）与 UCX 后端</li>
+      <li>腾讯云星脉网络官方披露：TCCL 定位、接口兼容、通信性能提升数据</li>
+      <li>OpenStack 网络文档与 IEEE 802.3：以太网定义、MAC 地址、交换机转发</li>
+      <li>PCIe 与 NVLink 带宽量级：NVIDIA 公开硬件规格（数量级对比，具体数值随代际变化）</li>
+    </ul>
+
+    <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
+  </main>
+</body>
+</html>
