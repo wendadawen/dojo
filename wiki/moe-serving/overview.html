@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoE 大模型推理与服务基础 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 大模型服务</span>
+      <h1>MoE 大模型推理与服务基础</h1>
+      <p class="lead">MoE 大模型（如 DeepSeek-V3）怎么做到"存 6710 亿参数、每个字只算 5.5%"，以及这样的模型如何摊到几百张 GPU 上成为在线服务——从模型结构到部署的最小概念链。</p>
+      <p class="meta">更新于 2026-08-07</p>
+    </header>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><strong>容量与成本的矛盾</strong>：模型参数越多能装的知识越多，但稠密模型参数翻倍、每个 token 的计算量也翻倍，服务成本同步翻倍。MoE 把"存多少"和"算多少"解开。</li>
+      <li><strong>权重放不进一张卡</strong>：稀疏激活只省计算不省存储，全部权重必须驻留显存，于是专家要切到多张 GPU 上（专家并行），引入 token 在网络上的来回搬运。</li>
+      <li><strong>生成是逐字的</strong>：模型每步只产出一个 token 且要看全部前缀，不缓存中间结果就会海量重算——这决定了服务天然分两个阶段、各有脾气。</li>
+      <li><strong>"快"不是一个数</strong>：等服务首字和等后续出字是两回事，需要分开度量、分别承诺，才有"服务得好不好"的可比标准。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>MoE = 一排专家 + 一个路由器</strong>：把 Transformer 层里的 FFN（每层的参数大户，约占 2/3）换成 N 个小 FFN（专家），router 给每个 token 打分、只选 top-k 个专家计算并加权求和。DeepSeek-V3 每层 256 个路由专家选 8 个、外加 1 个所有 token 都经过的共享专家，所以总参数 671B 而每 token 只激活约 37B（≈5.5%）。</li>
+      <li><strong>专家并行把 token 搬来搬去</strong>：专家分片到多卡后，token 的激活要被送到选中专家所在的卡（dispatch）、算完送回（combine），通常用 all-to-all 通信实现。token 的偏好会变成 GPU 间的忙闲不均。</li>
+      <li><strong>通信可以"藏"在计算下面</strong>：TBO 用一个微批的计算盖住另一个微批的通信，SBO 在同一批内用共享专家的计算盖住路由专家的通信。是藏不是消——通信仍占带宽。</li>
+      <li><strong>prefill 建缓存、decode 读缓存</strong>：prefill 一次性并行处理全部输入、建立 KV cache（各层 key/value 张量）、产出首字；decode 每步只算 1 个新 token、复用缓存。前者重吞吐，后者重延迟。</li>
+      <li><strong>服务指标四人组</strong>：TTFT 量首字延迟（看 prefill），TPOT 量出字速度（看 decode），SLO 是对两者的承诺，goodput 是"满足承诺前提下每秒最多接多少请求"——不是裸吞吐。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>稀疏激活省算力不省显存</strong>："每 token 只用 5.5% 参数"不意味着只需 5.5% 的显存；全部权重都要驻留，这是专家并行存在的原因。</li>
+      <li><strong>部署的两条路线各有代价</strong>：PD 合设（一份权重、无 KV 传输，但长短步互相干扰）与 PD 分离（无干扰、各自定制，但每实例一份完整副本、要传 KV cache、按部署单元成组扩缩——DeepSeek-V3 报告单元为 32 prefill GPU + 320 decode GPU）。</li>
+      <li><strong>数字以 DeepSeek-V3 系为准</strong>：671B/37B、256 选 8、61 层中前 3 层稠密等数字来自 DeepSeek-V3 技术报告与其推理系统概览；其他 MoE 模型配置不同，但机制相通。</li>
+      <li><strong>本页边界</strong>：不展开 GPU 内部执行模型（由概念页《GPU 执行模型》负责）、MoE 训练、推理引擎实现；PDD/合设的深层局限与 ExpertPlex 的混合架构见该论文解析页。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

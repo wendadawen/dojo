@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPU 执行模型与 kernel 调度 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 系统 / GPU</span>
+      <h1>GPU 执行模型与 kernel 调度</h1>
+      <p class="lead">GPU 把一段并行计算（kernel）组织成「线程 → warp → CTA → cluster」的层级，分发到上百个计算单元（SM）上执行；这套模型决定了计算任务如何被启动、切分、共享与切换。</p>
+      <p class="meta">更新于 2026-08-07 · 约 5 分钟</p>
+    </header>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li>GPU 不是「一个大核心」，而是上百块 SM 并行工作；不懂执行层级，就无法判断一个计算会多快、会挡别人多久。</li>
+      <li>大模型推理服务里，毫秒级的大计算（prefill）和微秒级的小计算（decode）会抢同一张卡；「小计算要等多久」的答案完全由执行模型决定（prefill/decode 等服务层概念由姊妹概念页负责，页面生成中）。</li>
+      <li>它是 ExpertPlex（arXiv:2607.18002）论文解析页的前置知识：「在 tile 边界调度」「常驻 kernel」「SM 分区」这些词的全部含义都在本页。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>数据必须搬进 SM 才能算。</strong>H100 有 132 块 SM，每块只有 228KB 高速存储，而主存 HBM 有 80GB。搬数据比算数据贵，所以一切优化围绕「搬一次、用多次」。</li>
+      <li><strong>kernel 启动 = CTA 排队上 SM，上了一个就跑到底。</strong>一个 CTA（线程块）被放到 SM 上后运行到完成才释放；没有用户可控的中途打断，stream 优先级只是调度提示。</li>
+      <li><strong>矩阵乘切成 tile 是因为高速存储装不下。</strong>tile 尺寸由 SM 的 228KB 容量决定，与输入规模无关；输入变长只是 tile 变多，单个 tile 的时间不变——所以 tile 边界是与输入长度无关的天然调度刻度。</li>
+      <li><strong>Hopper 的三件协作工具：</strong>TMA 让搬运不占计算线程；warp specialization 让搬运 warp 和计算 warp 组成流水线；CTA cluster + DSMEM 让相邻 SM 直接互访高速存储（可移植上限 8 个 CTA）。</li>
+      <li><strong>persistent kernel 与 CUDA Graph 都在消除启动开销：</strong>前者一次启动、循环领任务；后者把一串 kernel 录制成图整体重放。共同约束是偏好形状固定的负载。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>共享一张 GPU 的四种官方机制各有不能：stream 优先级不抢占已运行的 kernel；MPS 不预留资源（不同进程的 kernel 可落同一 SM）；MIG 只有固定档位（H100 六档）且改配置要停负载；Green Context 创建后固定（Hopper 上 8 的倍数、最小 8 个 SM）且无并发前进保证。</li>
+      <li>合起来的结论（本文为归纳，各分句有官方来源）：没有任何一种机制能在 kernel 运行期间以微秒级粒度重分 SM——这就是「要么切死、要么等」的根源，也是 tile 级调度要补的空位。</li>
+      <li>边界：页面数字以 H100（Hopper）+ CUDA 12.x 为准，跨代际会变；本页只讲执行模型，不讲 CUDA 编程、不讲 MoE 服务层。</li>
+    </ul>
+
+    <p>想复算 tile 的手算例子、看四种共享机制的完整对照表与官方原文，进入 <a href="index.html">深度教学</a>。</p>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>
