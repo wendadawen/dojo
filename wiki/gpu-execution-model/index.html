@@ -1,0 +1,1178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPU 执行模型与 kernel 调度：一段计算如何铺满一百多个计算单元</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">GPU 执行模型与 kernel 调度</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">GPU 执行模型与 kernel 调度</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<p>一块 GPU 上同时来了两件事情。一件是「大活」：一个大矩阵乘，要跑大约 2 毫秒；一件是「小活」：一个小矩阵乘，只要大约 30 微秒。大活正在跑，小活已经就绪。<strong>小活要等多久？</strong></p>
+
+<p>这不是假想题。在大模型推理服务里，长输入的预填充（prefill）会产生毫秒级的大计算，而已开始请求的逐字解码（decode）会产生几十微秒的小计算，两者撞在同一张卡上是日常。ExpertPlex（arXiv:2607.18002）这篇系统论文的全部设计，就建立在「小活到底要等多久、能不能只等一个极小的刻度」这个问题上。本页是它的前置知识页：不讲论文本身，只讲看懂它所需的 GPU 执行模型。上面的 2 毫秒与 30 微秒是<strong>教学构造的整数量级</strong>，用来制造反差，不代表任何测量值；prefill、decode、MoE 这些服务层概念本身由姊妹概念页《<a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>》负责，本页只在需要动机时点名。</p>
+
+<p>本页约定：<em>kernel</em> 指「在 GPU 上由大量线程并行执行的一段函数」，这是 CUDA 的用法，和操作系统内核（OS kernel）只是同名，没有任何关系。</p>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>一个 kernel 从启动到跑完经过哪些层级？为什么说正在运行的 kernel 不会被打断？</li>
+    <li>为什么矩阵乘（GEMM）要切成 tile 来算？为什么输入变长只是 tile 变多、单个 tile 不会变大？</li>
+    <li>启动一个 kernel 有哪些开销？persistent kernel 和 CUDA Graph 各消除哪一部分？</li>
+    <li>CTA cluster、DSMEM、TMA、warp specialization 各自解决了什么瓶颈？</li>
+    <li>两个任务共享一张 GPU 时，stream 优先级、MPS、MIG、Green Context 各自能做什么、不能做什么？</li>
+  </ul>
+</section>
+
+<section class="misconceptions">
+  <h2>最容易误解</h2>
+  <ul>
+    <li>「GPU 线程和 CPU 线程一样，随时会被系统切换」——GPU 的线程块（CTA）一旦被放到计算单元上，就<strong>运行到完成才释放</strong>，没有用户可控的中途打断（第 2、6 章）。</li>
+    <li>「输入越长，每个 tile 就越大」——tile 的尺寸由硬件容量决定，与输入规模无关；输入变长只是 tile 的<strong>数量</strong>变多（第 3 章）。</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：NVIDIA 官方文档与白皮书——CUDA C++ Programming Guide、Hopper Tuning Guide、H100 架构白皮书、CUDA Driver API（stream 优先级 / Green Context）、MPS 与 MIG 官方文档。正文中的 [C1]–[C16]、[N1]–[N8] 编号在文末「来源与教学说明」逐条对应。</p>
+</blockquote>
+
+<h2 id="hardware">先认识硬件：一块 GPU 里有什么</h2>
+
+<p>要知道「小活要等多久」，先得知道大活跑在什么东西上面。一块 GPU 拆开看，真正需要记住的只有两类部件：<strong>计算单元</strong>和<strong>内存</strong>。</p>
+
+<p>计算单元叫 <strong>SM</strong>（Streaming Multiprocessor，流式多处理器）。可以把一块 SM 理解成一个小而完整的计算车间：它能独立执行指令、有自己的工人（通用计算单元）和一台专门机器（<strong>Tensor Core</strong>，一次完成一小块矩阵的乘加）。一块 H100 SXM5 上有 <strong>132 块 SM</strong>，每块 SM 有 4 个第四代 Tensor Core [C5][N1]。这就是 GPU「 massively parallel 」的全部含义：不是一个巨大的计算核心，而是一百多个独立车间同时开工。</p>
+
+<p>内存按离车间的远近分成几层，越近越快、越小：</p>
+
+<ul>
+  <li><strong>寄存器</strong>：SM 内部、线程私有的存储，最快也最小。</li>
+  <li><strong>shared memory</strong>：SM 内部、同车间线程共享的可编程存储。H100 每块 SM 有 228KB，一个线程块最多能用 227KB [C6][N2]。</li>
+  <li><strong>L2 缓存</strong>：全卡 132 块 SM 共享，H100 为 50MB [C5]。</li>
+  <li><strong>HBM 全局内存</strong>：GPU 板载主存（H100 用的是 HBM3，第三代高带宽显存），H100 为 80GB，带宽 3.35 TB/s [C5][N1]。所有输入数据一开始都躺在这里。</li>
+</ul>
+
+<pre class="diagram">数据住在哪里、离计算多远（H100，数字为官方规格 [N1][N2]）：
+
+  HBM3 全局内存   80 GB · 3.35 TB/s —— 输入数据的家
+       │（经 L2 中转）
+  L2 缓存         50 MB —— 全卡 132 块 SM 共享
+       │
+  SM 0 · SM 1 · …… · SM 131 —— 每块 SM 内部：
+     228 KB shared memory + 寄存器 + 4 个 Tensor Core + 通用计算单元
+
+  规则：数据必须搬进 SM 内部（shared memory / 寄存器）才能参与计算</pre>
+
+<p>为什么分层？因为「搬数据」比「算数据」贵。HBM 有 80GB 但隔着整个芯片；shared memory 就在车间里，却只有 228KB。一个计算想跑快，就要尽量少从远处搬东西、搬来一次用多次。<strong>这条规则会在第 3 章直接决定 tile 的尺寸</strong>。</p>
+
+<p>回到贯穿例子：大活和小活的输入矩阵，此刻都躺在 80GB 的 HBM 里。它们要变成结果，都得先被搬到某块 SM 的 228KB 小柜子里。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>不看正文，说出 SM、Tensor Core、shared memory、L2、HBM 各是什么、谁共享谁独占。</li>
+  <li>为什么 80GB 的输入不能「全搬上来慢慢算」？用 228KB 与 80GB 两个数字说明。</li>
+</ul>
+
+<h2 id="launch">kernel 是怎么跑起来的：线程、warp、CTA 与 stream</h2>
+
+<p>上一章是静态的硬件。这一章回答动态的问题：CPU 上一句「启动」，怎么变成 132 块 SM 上的千军万马？</p>
+
+<p>程序员写一个 <strong>kernel</strong>——一段函数。和普通函数不同的是，它不是被调用一次，而是被<strong>成千上万个线程同时执行</strong>，每个线程处理数据的一小块。这些线程按两级组织起来：</p>
+
+<ul>
+  <li><strong>CTA</strong>（Cooperative Thread Array，也叫 thread block，线程块）：一组最多 1024 个线程 [C1]。关键性质：一个 CTA 整体驻留在<strong>同一块 SM</strong> 上执行，独占这块 SM 上分给它的那份 shared memory，CTA 内线程可以高效协作。</li>
+  <li><strong>grid</strong>：一次启动的全部 CTA。一个 grid 可以有成百上千个 CTA。</li>
+</ul>
+
+<p>CTA 内部，SM 不是逐个线程调度，而是每 <strong>32 个线程组成一个 warp</strong>，以 warp 为单位发射指令 [C2][N3]——同一 warp 的 32 个线程齐步走，执行同一条指令、处理各自的数据。一块 SM 上可以同时常驻最多 64 个 warp [C2]，它们轮流占用计算单元：一个 warp 在等数据时，另一个 warp 立即补上。这就是 GPU 隐藏搬运延迟的基本手段，叫「用并行换等待」。</p>
+
+<pre class="diagram">一次 kernel 启动的旅程：
+
+  CPU                                    GPU
+  程序调用 kernel
+     │  ① 提交到一个 stream（命令队列，同一队列内严格按提交顺序执行 [C4]）
+     ▼
+  stream ─────────────►  ② 硬件分发器把 grid 拆成一个个 CTA，
+                            哪块 SM 有空位就放哪块
+                            ┌──────┬──────┬──────────┐
+                            │ SM 0 │ SM 1 │ …… SM 131│
+                            └──────┴──────┴──────────┘
+                            ③ 每块 SM 内，warp 调度器每周期
+                               挑选一个就绪的 warp 发射指令
+  ④ grid 里所有 CTA 全部跑完，kernel 结束，SM 空出</pre>
+
+<p>现在说出本章最重要的事实：<strong>一个 CTA 被放到 SM 上之后，会运行到完成才释放这块 SM；CUDA 不提供任何让用户打断运行中 kernel 的接口</strong> [C3]。官方文档在讲 stream 优先级时把这一点写得很直白：优先级只是「尽量先调度高优先级工作」的提示，「不会抢占已经在运行的工作，也不对执行顺序提供任何功能性保证」（CUDA Driver API，cuStreamCreateWithPriority，原文引用见第 6 章）[C11]。</p>
+
+<p>另一个需要记住的语义：同一个 stream 里的操作严格按提交顺序执行；不同 stream 之间没有顺序保证，资源允许时可以并发 [C4]。</p>
+
+<p>贯穿例子推进：大活的 grid 有几百个 CTA，一波波铺满了 132 块 SM；小活的 CTA 此刻提交到另一个 stream，只能排队等空位。<strong>小活要等多久，取决于大活的 CTA 什么时候跑完</strong>——这就是开头问题的第一层答案，也是「队头阻塞」（head-of-line blocking，即队列前面的长任务挡住后面的短任务，使短任务即使已就绪也无法开始）的来源。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>按顺序说出一个 kernel 从 CPU 提交到执行完成经过的四个环节。</li>
+  <li>判断并解释：把小活的 stream 优先级调到最高，能不能打断正在运行的大活？</li>
+  <li>warp 和 CTA 的区别是什么？谁是 SM 内调度指令的单位，谁是驻留 SM 的单位？</li>
+</ul>
+
+<h2 id="tile">为什么矩阵乘要切成 tile：一次能搬多少数据说了算</h2>
+
+<p>上一章说计算被切成 CTA。但一个 CTA 负责的那块矩阵乘，内部还要再切一层，切成 <strong>tile</strong>。为什么？这一章用一个可以手算的例子给出答案，并得出全页最关键的结构性结论：<strong>tile 的尺寸由硬件容量决定，输入变长只是 tile 变多</strong>。</p>
+
+<p>先复习矩阵乘的形式。$C = A \times B$，其中 $A$ 是 $M \times K$、$B$ 是 $K \times N$、$C$ 是 $M \times N$，每个输出元素是 $C[i][j] = \sum_{k=1}^{K} A[i][k] \cdot B[k][j]$——$A$ 的第 $i$ 行与 $B$ 的第 $j$ 列逐元素相乘再求和，共 $K$ 次乘加。</p>
+
+<h3 id="tile-why">不切 tile 的代价：手算一遍</h3>
+
+<p>教学示例。取最小的可算规模：$M = N = K = 4$，两个 $4 \times 4$ 矩阵相乘。数一数「从内存读数据」的次数（这是第 1 章说的贵操作）。</p>
+
+<p>不切 tile 的算法：算每个 $C[i][j]$ 时，读 $A$ 的第 $i$ 行（4 个数）和 $B$ 的第 $j$ 列（4 个数）。于是 $A$ 的每个元素被它所在行的 4 个输出各读一次，共被读 $4$ 次；$A$ 有 16 个元素，总读取 $16 \times 4 = 64$ 次。$B$ 同理也是 64 次。合计 <strong>128 次读取</strong>。</p>
+
+<p>切 tile 的算法：把三个矩阵都切成 $2 \times 2$ 的小块（tile）。算输出 tile $C_{11}$（左上角的 $2\times2$）时，先把 $A_{11}$、$B_{11}$ 两小块搬进 SM 内的高速存储，算出部分和；再搬 $A_{12}$、$B_{21}$，累加进去。关键是：<strong>搬进车间的数据会被反复使用</strong>——$A_{11}$ 的 4 个元素服务了 4 次乘加，而不是读一次用一次。数下来，$A$ 的每个小块被 $N/2 = 2$ 个输出 tile 使用，即 $A$ 的每个元素只从内存读 $2$ 次，总读取 $16 \times 2 = 32$ 次；$B$ 同理 32 次。合计 <strong>64 次读取</strong>。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>算法（$4\times4$ 矩阵，教学示例）</th><th>每个 $A$ 元素被读次数</th><th>$A$ 总读取</th><th>$B$ 总读取</th><th>合计读取</th></tr></thead>
+<tbody>
+<tr><td>不切 tile</td><td>$N = 4$</td><td>$16 \times 4 = 64$</td><td>64</td><td>128</td></tr>
+<tr class="highlight-row"><td>切 $2\times2$ tile</td><td>$N / T = 4 / 2 = 2$</td><td>$16 \times 2 = 32$</td><td>32</td><td>64</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>读取次数从 128 降到 64，省了一半。一般规律是：tile 边长为 $T$ 时，每个 $A$ 元素被读 $N/T$ 次——<strong>tile 越大，搬运越省</strong> [F1]。</p>
+
+<details>
+<summary>补充：4×4 例子逐 tile 的读取清单</summary>
+<p>切 $2\times2$ tile 后，$C$ 有 4 个输出 tile：$C_{11}, C_{12}, C_{21}, C_{22}$。每个输出 tile 沿 $K$ 方向要 2 步：$C_{11}$ 用 $(A_{11},B_{11})$ 再 $(A_{12},B_{21})$；$C_{12}$ 用 $(A_{11},B_{12})$ 再 $(A_{12},B_{22})$；$C_{21}$、$C_{22}$ 类似。$A_{11}$ 出现在 $C_{11}$ 和 $C_{12}$ 的计算中，共 2 次，且每次是整块搬入后块内 4 个元素都被复用——所以每个元素的「从内存读取」只有 2 次，而不是 4 次或 8 次。四个 $A$ 小块各被读 2 次，每次 4 个元素：$4 \times 2 \times 4 = 32$ 次，与正文一致。</p>
+</details>
+
+<h3 id="tile-size">tile 能做多大：228KB 说了算</h3>
+
+<p>既然 tile 越大越省，为什么不把 tile 做成 1000×1000？因为复用的前提是 tile 能整个搬进 SM 内的高速存储，而它的容量是硬件固定的。教学示例：用 fp16（每个数 2 字节）算，一个 $128 \times 128$ 的 $A$ tile 占 $128 \times 128 \times 2 = 32768$ 字节 $= 32$KB；$B$ tile 同样 32KB；为了不等待，通常要双缓冲（搬下一块的同时算这一块），搬运缓冲翻倍约 128KB；再加输出累加等开销，总量在百 KB 量级——已经逼近单 CTA 227KB 的上限 [C6][N2]。tile 再大就放不进车间了。</p>
+
+<p>所以 tile 的尺寸（实际高性能 GEMM 常用 $128 \times 128$ 这类档位）是<strong>由 shared memory 容量、数据类型和缓冲策略共同决定的固定值</strong>，跟你要算的矩阵总共有多大毫无关系。</p>
+
+<h3 id="tile-more">输入变长时，什么变、什么不变</h3>
+
+<p>把例子的 $M$ 从 8192 加倍到 16384（教学构造数字），tile 边长仍是 128。行方向的 tile 数从 $8192 / 128 = 64$ 变成 $16384 / 128 = 128$——<strong>tile 数量翻倍，每个 tile 的搬运量和计算量完全不变</strong>。整活的耗时近似翻倍，但那是「同样的活干了两遍」，不是「每个活变大了」。</p>
+
+<p>把这一点翻译成调度语言（<strong>本文归纳</strong>）：tile 是 GEMM kernel 内部最小可独立完成的计算单位；单个 tile 的耗时由 tile 尺寸决定，与输入总长度无关。因此「一个 tile 执行完的那个瞬间」构成了一串与输入长度无关的天然调度刻度——一个跑 2 毫秒的 kernel 内部，其实每过一小段固定的时间就经过一个 tile 边界。记住这个结论，第 6 章末尾和 ExpertPlex 论文页都会用到它。</p>
+
+<p>贯穿例子推进：大活不是一个「2 毫秒的实心疙瘩」，而是几千个 tile 排成的长队；小活只有几个 tile。两者共用同一种刻度。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>复算：$4 \times 4$ 矩阵乘，切 $2 \times 2$ tile 后 $A$ 的总读取次数为什么是 32 而不是 64？</li>
+  <li>为什么 tile 不能做到 $512 \times 512$？用 shared memory 容量回答。</li>
+  <li>输入长度变成 4 倍，tile 数量怎么变？单个 tile 的时间怎么变？</li>
+</ul>
+
+<h2 id="hopper-tools">Hopper 的协作工具箱：TMA、warp 分工与 CTA cluster</h2>
+
+<p>第 3 章留下一个工程问题：一个 tile 的生命周期是「搬进车间 → 算 → 搬下一块」。如果搬的时候算闲着、算的时候搬闲着，一半时间就浪费了。要让搬和算重叠起来，还需要三件工具。这一章讲的都是 Hopper 架构（H100 这一代）引入的机制 [C7][C8][C9]。</p>
+
+<h3 id="tma">TMA：把搬运从计算线程手里解放出来</h3>
+
+<p>在更早的 GPU 上，搬一个 tile 要靠计算线程自己一条一条指令地搬，搬运期间这些线程干不了别的。<strong>TMA</strong>（Tensor Memory Accelerator）是一个专门的异步拷贝引擎：只需要<strong>一个线程</strong>向它发出一条「把这整块张量从全局内存搬到 shared memory」的指令，引擎就在后台完成全部搬运，其他线程继续做计算，等数据到了再取 [C7]。它支持 1 到 5 维的张量块，也能在相邻 SM 的 shared memory 之间直接传输。</p>
+
+<h3 id="warp-spec">warp specialization：搬运工与计算工的分工流水线</h3>
+
+<p>有了异步搬运，就可以让一个 CTA 内的 warp 分工种：少数 warp 专职当 <strong>producer</strong>（发起 TMA 搬运、等数据到、通知大家），其余 warp 专职当 <strong>consumer</strong>（只负责算）。这就是 <strong>warp specialization</strong> [C9]。它的效果是一条流水线：</p>
+
+<pre class="diagram">tile 流水线（教学示意，时间向右）：
+
+  producer warp：  搬 tile 1 ─┬─ 搬 tile 2 ─┬─ 搬 tile 3 ─┬─ 搬 tile 4
+  consumer warp：             └─ 算 tile 1 ─┴─ 算 tile 2 ─┴─ 算 tile 3
+                              ▲
+                  算 tile t 的同时，tile t+1 已经在路上</pre>
+
+<p>教学解释。这条流水线只说明「搬与算在时间上重叠」这一层关系。真实的实现还要处理同步（谁通知谁数据到了）、多级缓冲等细节，本页省略；正式机制以官方文档的 TMA 与 pipeline 章节为准 [C7]。</p>
+
+<h3 id="cluster">CTA cluster 与 DSMEM：相邻车间直接递东西</h3>
+
+<p>第 2 章说过，CTA 是协作的天花板：不同 CTA 在编程模型里互相看不见对方的车间内部。Hopper 打破了这堵墙——可以把最多 8 个 CTA 声明为一个 <strong>CTA cluster</strong>（H100 上通过显式 opt-in 可以到 16 个，但这是不可移植的特例）[C8][N4]。cluster 内的 CTA 被硬件<strong>共同调度</strong>到同一组相邻的 SM（同一个 GPC——Graphics Processing Cluster，图形处理集群，是 GPU 硬件层级中一组物理相邻的 SM，H100 有 8 个 GPC）上 [C15]，并且可以直接读写彼此 SM 里的 shared memory——这个机制叫 <strong>DSMEM</strong>（Distributed Shared Memory，分布式共享内存）[C8]。</p>
+
+<p>它解决的瓶颈是：当一块矩阵太大、一个 CTA 的车间放不下、必须几个 CTA 分摊时，没有 cluster 就只能绕远路——写回全局内存再让别人读；有了 cluster，相邻车间直接递。配合 TMA 的组播能力，同一份数据可以一次发给 cluster 内多个 CTA [C7]。</p>
+
+<p>代价同样由官方给出：cluster 越大，GPU 上能同时活跃的独立 block 数可能越少 [C8]——共同调度要求一组相邻 SM 同时有空位，比找单个空位更苛刻。</p>
+
+<p>本章的机制描述是概念级简化：省略了 TMA descriptor 的构造、mbarrier 同步原语等实现细节；这些不影响「搬运不占计算线程」「cluster 内直接互访」两个核心结论。</p>
+
+<p>贯穿例子推进：大活内部，tile 一个接一个在流水线上走；小活的 tile 太少（只有几个），流水线刚预热就结束了——小 kernel 天然吃不满硬件，这是它「单位效率低」的另一层原因。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>分别用一句话说出 TMA、warp specialization、DSMEM 各自解决什么瓶颈。</li>
+  <li>cluster 内两个 CTA 交换数据，需要经过 HBM 全局内存吗？</li>
+  <li>cluster 的上限是多少？把上限设大有什么代价？</li>
+</ul>
+
+<h2 id="persistent">反复启动太贵：persistent kernel 与 CUDA Graph</h2>
+
+<p>前几章都在讲一个 kernel 内部怎么跑。这一章换一个角度：如果一个 kernel 本身很小、一天要跑成千上万次，那么「启动」这个动作本身就值得审视。</p>
+
+<p>启动一次 kernel 有两部分开销。CPU 侧：每次启动都要走一遍「准备参数、提交到 stream」的流程，量级是微秒级（<strong>量级说明</strong>：官方文档没有给出单一数字，CUDA Graphs 章节定性指出「当 kernel 又多又小时，逐次启动的开销占比会变得显著」[C10][N8]）。GPU 侧：grid 的 CTA 要被逐波分发到 SM、跑完要收尾。大活跑 2 毫秒，这点开销无所谓；小活本身只要 30 微秒，逐次启动的占比就刺眼了。有两种主流手段把它压掉。</p>
+
+<h3 id="persistent-kernel">persistent kernel：不退出，循环领活</h3>
+
+<p><strong>persistent kernel</strong>（常驻内核）不是一种 CUDA API，而是一种<strong>编程模式</strong>（这一点常被误解）：kernel 只启动一次，启动后不退出，在 kernel 内部写一个循环，不断从全局内存的任务队列里领取下一个任务、执行、再领，直到收到退出信号。启动开销从「每任务一次」摊成「全程一次」。</p>
+
+<details class="code-details">
+<summary>伪代码：persistent kernel 的主循环（不是 Python，不可运行）</summary>
+<div class="code-block">
+<pre><code class="language-text">输入：全局内存中的任务队列 Q（每个任务描述一组 tile 的输入位置与输出位置）
+状态：本 CTA 长期驻留 SM，不退出
+循环：
+    从 Q 领取下一个任务（队列为空时按实现等待或检查退出标志）
+    按任务描述搬入数据 → 计算 → 写回结果
+    标记该任务完成
+直到：收到全局退出信号
+输出：全部任务的结果</code></pre>
+</div>
+<p>说明：这是机制示意，省略了多 CTA 抢任务的原子操作、队列溢出处理等真实工程内容。</p>
+</details>
+
+<p>代价同样直接，而且是第 2 章事实的推论：<strong>常驻期间，它的 CTA 一直占着 SM，别的 kernel 用不了这些 SM</strong>。常驻 kernel 省下了启动，却把「什么时候让出资源」这个问题从硬件手里拿回到了软件自己手里——这正是它既强大又危险的原因。</p>
+
+<h3 id="cuda-graph">CUDA Graph：录制一次，整体重放</h3>
+
+<p>另一种手段解决的是 CPU 侧。深度学习的一步推理往往是几十上百个小 kernel 的固定序列。CUDA Graph 允许把这串操作<strong>录制（capture）</strong>成一张图，之后每次执行只需把整张图<strong>重放（replay）</strong>一次提交，消除了逐个 kernel 的 CPU 提交开销 [C10]。</p>
+
+<p>约束来自「录制」二字：图内 kernel 的数量、形状、内存地址在捕获时就固定了。输入长度变了、形状变了，就得换一张图或重新捕获。所以 CUDA Graph 天然适合形状固定的循环体（比如固定 batch 的逐字解码），不适合每步形状都变的工作负载。</p>
+
+<p>两种手段是正交的，可以叠加：一个常驻 kernel 内部，也可以把它周期性执行的那串小 kernel 录成图来重放。共同点是都偏好「形状固定」的负载。vLLM 推理引擎中 CUDA Graph 的工程细节（捕获哪些尺寸、捕获失败会怎样）属于另一个故事，见 <a href="../vllm-cudagraph/index.html">torch.compile 与 CUDA Graph 笔记</a>。</p>
+
+<p>贯穿例子推进：小活每 30 微秒来一次。若每次单独启动，开销占比高；若把它录进 CUDA Graph 或交给常驻 kernel 执行，启动开销被压掉——但前提是大活愿意让出 SM。绕了一圈，问题又回到了资源分配。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>persistent kernel 和 CUDA Graph 各消除哪一部分启动开销？各付什么代价？</li>
+  <li>判断：一个「每一步输入长度都不同」的循环，能不能整体录进一张 CUDA Graph？为什么？</li>
+  <li>为什么说 persistent kernel 把资源让出的责任从硬件拿回了软件？</li>
+</ul>
+
+<h2 id="sharing">分一张卡的四种机制：能力边界对照</h2>
+
+<p>最后一章回答开头问题的完整版：大活小活要共享一张 GPU，系统层面到底有哪些分法？NVIDIA 官方提供四种机制，力度各不相同。逐个看它们<strong>能做什么、不能做什么</strong>——「不能」比「能」更重要。</p>
+
+<h3 id="sharing-stream">stream 优先级：只是提示，不是抢占</h3>
+
+<p>给不同 stream 设不同优先级（如小活高优先级、大活低优先级）。官方文档的原文语义是：优先级「提供一个提示，让高优先级的工作在可能时被优先调度，但<strong>不会抢占已经在运行的工作，也不对执行顺序提供任何功能性保证</strong>」（CUDA Driver API，cuStreamCreateWithPriority）[C11]。翻译过来：它能决定「下一个空位给谁」，不能决定「现在让谁停下」。大活的 CTA 已经铺在 SM 上，小活优先级再高也得等空位。</p>
+
+<h3 id="sharing-mps">MPS：多进程真并发，但不预留资源</h3>
+
+<p><strong>MPS</strong>（Multi-Process Service）让多个操作系统进程（各自独立的程序）的 kernel 在同一张卡上真正并发执行 [C12]。它可以给每个客户端设资源限额，但官方文档明确：限额「<strong>不为任何客户端预留专用资源</strong>，只是限制它最多能用多少」，而且「不同客户端的 kernel 可能执行在同一块 SM 上，取决于负载均衡」[C12]。所以 MPS 提供的是「可以挤在一起」，不是「各自圈地」；干扰（缓存竞争、SM 争抢）依旧存在。</p>
+
+<h3 id="sharing-mig">MIG：硬件级隔离，但档位固定、改配置要停负载</h3>
+
+<p><strong>MIG</strong>（Multi-Instance GPU）是最硬的分法：把 GPU 在硬件层切成互相隔离的实例，各自独占 SM、显存和缓存切片。隔离最强，代价是<strong>只有固定档位</strong>。H100 有 7 个可用的 GPU 计算切片（对应 7 个 GPC，另留 1 个 GPC 给管理用）；profile 名称里的数字 <code>g</code> 表示该实例占用的计算切片数，数字后的 GB 表示它独占的显存量，7 个切片用满即整卡 [C13][N5]。H100（80GB）的全部 profile 如下：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>MIG profile</th><th>显存</th><th>每卡最多实例数</th></tr></thead>
+<tbody>
+<tr><td>1g.10gb</td><td>10 GB</td><td>7</td></tr>
+<tr><td>1g.20gb</td><td>20 GB</td><td>4</td></tr>
+<tr><td>2g.20gb</td><td>20 GB</td><td>3</td></tr>
+<tr><td>3g.40gb</td><td>40 GB</td><td>2</td></tr>
+<tr><td>4g.40gb</td><td>40 GB</td><td>1</td></tr>
+<tr><td>7g.80gb（整卡）</td><td>80 GB</td><td>1</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两个任务分一张卡，只能从这张表里挑组合（例如 3g + 4g 正好用满）。负载比例变化时想改配置，需要 GPU 上没有运行中的负载才能重配——它没有时间复用，也没有运行中调整 [C13]。</p>
+
+<h3 id="sharing-green">Green Context：进程内按 SM 圈地，但创建后固定</h3>
+
+<p><strong>Green Context</strong>（CUDA 12.4 引入）在同一个进程内把 SM 集合切成空间分区：往某个 Green Context 的 stream 提交的 kernel，只会落在该分区的 SM 上 [C14]。它比 MIG 细：不需要切显存，粒度是 SM 个数——但 Hopper 上分区必须是 <strong>8 的倍数、最少 8 个 SM</strong> [C14][N6]。两条边界由 API 设计决定：其一，SM 分区在创建 Green Context 时通过 split API 指定，Green Context API 不提供运行期重分区接口，要改变分区需销毁并重建 Green Context，所以运行中的 kernel 期间不能重新划分；其二，「即使两个 Green Context 的 SM 分区互不相交，也<strong>不保证</strong>两者的 kernel 会并发执行或有前进保证」（CUDA Driver API，Green Contexts 章节）[C14]。</p>
+
+<h3 id="sharing-table">对照与归纳</h3>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>机制</th><th>切分对象</th><th>粒度</th><th>运行期可否改变</th><th>关键短板</th></tr></thead>
+<tbody>
+<tr><td>stream 优先级 [C11]</td><td>什么都不切，只是调度提示</td><td>单个 kernel 的先后</td><td>随时</td><td>不抢占已运行的 kernel，不保证顺序</td></tr>
+<tr><td>MPS [C12]</td><td>多进程并发执行</td><td>进程级；限额是上限</td><td>限额可调整</td><td>不预留资源，kernel 可落同一 SM</td></tr>
+<tr><td>MIG [C13]</td><td>硬件级实例（SM+显存+缓存）</td><td>固定六档</td><td>改配置需停负载</td><td>档位粗，无时间复用</td></tr>
+<tr><td>Green Context [C14]</td><td>进程内 SM 空间分区</td><td>8 的倍数、最小 8 SM</td><td>创建后固定</td><td>kernel 期间不可重配置，无并发/前进保证</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>把四行合起来，得到一个<strong>本文归纳</strong>（各分句均有官方来源，合取为推断）[C16]：四种机制中没有任何一种能在一个 kernel 运行期间，以微秒级粒度重新分配 SM。优先级不抢占；MPS 不预留；MIG 和 Green Context 都是空间切分、改起来要停负载或重建上下文。于是共享一张卡只剩两个极端：要么切死（空间固定分区，闲时浪费），要么等（长 kernel 挡短 kernel，队头阻塞）。</p>
+
+<p>这个空位正是「tile 级调度」要补的：如果 kernel 自身被设计成能在 tile 边界让出 SM（第 3 章的刻度），调度粒度就从「整个 kernel」细化到「一个 tile」——ExpertPlex 的 APK 走的就是这条路，具体机制在论文解析页展开，本页的任务到此为止。</p>
+
+<p>本章数字以 H100（Hopper）与 CUDA 12.x 文档为准；跨代际数字（SM 数、分区粒度、MIG 档位）会变，但「无运行期细粒度重分配」这一结构性结论在现有代际上均成立。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>不看对照表，复述四种机制各自「不能做什么」。</li>
+  <li>给定需求「小活必须在 50 微秒内拿到 SM」，判断四种机制谁能给出这个保证，并说明理由。</li>
+  <li>为什么 MIG 的 3g + 4g 组合能「用满整卡」却仍可能浪费？（提示：负载比例随时间变化。）</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>[C1] CUDA C++ Programming Guide，Programming Model / Thread Hierarchy（CTA ≤1024 线程、CTA 驻留单 SM）。 [C2] 同指南 Hardware Multithreading / SIMT（warp=32）；Hopper 每 SM 最多 64 warp 见 Hopper Tuning Guide §4.1.1 Occupancy。 [C3] 编程模型语义（CTA 运行至完成）；用户不可抢占由 [C11] 官方语义反推。 [C4] CUDA C++ Programming Guide，Asynchronous Concurrent Execution / Streams。 [C5] NVIDIA H100 Tensor Core GPU Architecture White Paper 及 NVIDIA Hopper Architecture In-Depth（developer.nvidia.com）：132 SM、每 SM 4 个第四代 Tensor Core、50MB L2、80GB HBM3 @ 3.35 TB/s。 [C6][C7][C8][C9] NVIDIA Hopper Tuning Guide §4.1.1–§4.1.3（228KB/227KB shared memory；TMA 异步拷贝与组播；cluster 上限 8、H100 opt-in 16、占用率代价；warp specialization）。 [C10] CUDA C++ Programming Guide，CUDA Graphs。 [C11] CUDA Driver API，cuStreamCreateWithPriority 描述原文。 [C12] NVIDIA MPS 官方文档，Execution Resource Provisioning（「不预留专用资源」「不同客户端 kernel 可落同一 SM」）。 [C13] NVIDIA MIG User Guide 及 NVIDIA vGPU 参考文档 H100 SXM5 表（六档 profile 与实例数；改配置需 GPU 空闲）。 [C14] CUDA Driver API，§Green Contexts（CUDA 12.4+；CC 9.0+ 最小 8、8 的倍数；不保证并发与前进；创建时固定）。 [C15] H100 白皮书（8 GPC 结构）+ Programming Guide（cluster 共同调度）。 [C16] 本文归纳：由 [C11][C12][C13][C14] 合取，正文已标注为推断。</p>
+
+<h3>核心公式与来源</h3>
+<p>[F1] tile 化 GEMM 的读取计数（每元素被读 $N/T$ 次）：标准教材推导（如 Kirk &amp; Hwu《Programming Massively Parallel Processors》tiled GEMM 章的同款推导）；本页按教学推导处理，$4\times4$ 例子在正文与折叠块中可完整复算。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>[N1][N2][N3][N4][N5][N6] 与 [C5][C6][C2][C8][C13][C14] 同源，均为 H100 SXM5 / Hopper / CUDA 12.x 条件下的规格数字，跨代际会变。 [N8]「kernel 启动 CPU 侧开销为微秒量级」为工程经验的量级说明，无单一官方数字，页面未给精确值。</p>
+
+<h3>教学示例</h3>
+<p>开头的「大活约 2 毫秒 / 小活约 30 微秒」为教学构造的整数量级，与 ExpertPlex §4.1 的场景同构但不引用其测量值。$4\times4$ 矩阵乘、$M$ 从 8192 到 16384、fp16 下 $128\times128$ tile 的容量估算，均为便于手算的教学构造，不代表推荐工程参数。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>「车间」类比只帮助理解 SM 独享 shared memory、数据须搬入才能算这一局部关系；它无法表达 warp 级指令调度、缓存一致性等细节，正式判断以编程模型文档为准。「流水线」示意只说明搬算重叠，不含同步原语细节。</p>
+
+<h3>教学简化及其限制</h3>
+<p>本页省略：硬件 CTA 分发器（GigaThread engine）的内部算法（官方未公开，不影响「CTA 跑完才释放」的结论）；TMA descriptor 与 mbarrier 同步细节；cache 命中、带宽竞争与功耗对时间的影响；驱动级时间片（compute preemption，粒度粗且不可编程控制）。这些省略不改变「tile 尺寸由容量决定」「kernel 运行期无用户可控抢占」「四种共享机制无运行期细粒度重分配」三个核心结论；但本页给出的时间量级（tile 时间近似恒定等）是结构性的，不构成任何具体 kernel 的性能预测。</p>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

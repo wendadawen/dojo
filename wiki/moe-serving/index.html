@@ -1,0 +1,1246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoE 大模型推理与服务基础：从"存得多、算得少"到在线服务</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">MoE 大模型推理与服务基础</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">MoE 大模型推理与服务基础：从"存得多、算得少"到在线服务</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<p>DeepSeek-V3 有 6710 亿（671B）个参数，但它回答你问题时，每生成一个字只动用其中约 370 亿（37B）——大约 5.5%（数字来源：DeepSeek-V3 技术报告摘要，见文末 N1）。它是怎么做到"存得多、算得少"的？而这 5.5% 的计算，又如何摊到几百张 GPU 上，变成你能对话的在线服务？这一页把这条链完整讲一遍。</p>
+
+<p>一句话说清本页内容：MoE（Mixture-of-Experts，专家混合）大模型从模型结构到在线服务的最小概念链——为什么把 Transformer 层里的一个模块换成"一排只被选中几个的专家"、专家怎么摆到多张 GPU 上、一次请求经过哪两个阶段、服务好坏怎么量、两个阶段放一起还是分开。</p>
+
+<div class="context-box">
+  <p class="context-box-title">开始之前</p>
+  <div class="context-grid">
+    <div class="context-label">本页位置</div><div class="context-value">论文《ExpertPlex》（MoE 大模型服务系统，arXiv:2607.18002）解析页的前置概念页，解析页将从本页的概念出发</div>
+    <div class="context-label">读者设定</div><div class="context-value">完全零背景：不需要任何 GPU、分布式或服务系统经验，需要的少量基础在第 1 章就地补齐</div>
+    <div class="context-label">不讲什么</div><div class="context-value">GPU 内部如何执行计算（由概念页《<a href="../gpu-execution-model/index.html">GPU 执行模型</a>》负责）；MoE 如何训练；具体推理引擎实现</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>为什么把 Transformer 层的 FFN 换成 MoE，能让模型存下多得多的参数而每个 token 的计算量几乎不涨？</li>
+    <li>MoE 模型的专家为什么要切到多张 GPU 上，all-to-all 的 dispatch/combine 在搬运什么，TBO/SBO 怎样掩盖这部分通信开销？</li>
+    <li>一次对话请求在 prefill 和 decode 两个阶段分别做什么，KV cache 消除了哪部分重复计算？</li>
+    <li>TTFT、TPOT、SLO、goodput 各自衡量什么，为什么"服务快"要拆成两个指标？</li>
+    <li>PD 合设与 PD 分离各自的动机和基本代价是什么？</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：DeepSeek-V3 Technical Report（arXiv:2412.19437）、DistServe（OSDI 2024，arXiv:2401.09670）、ExpertPlex 背景章（arXiv:2607.18002 v2 §2）、Shazeer et al. 2017（arXiv:1701.06538）；逐条定位见文末"来源与教学说明"。</p>
+</blockquote>
+
+<h2 id="s1-transformer-layer">一个字是怎么蹦出来的：token、参数与 Transformer 层</h2>
+
+<p>模型不直接读文字。你输入的一句话会先被切成若干小块，每块叫一个 <strong>token</strong>（大致是一个字或一个词片段）。模型看到和生成的，都是一串 token。</p>
+
+<p>一个大模型本质上是一大批存好的数字，叫<strong>参数</strong>（也叫权重）。一次"计算"就是让输入逐层流过模型、与这些数字做大量乘加，最后产出一个新 token——这一趟叫一次<strong>前向计算</strong>。聊天时模型不是一次说完整句话，而是一个 token 一个 token 往外蹦：每次前向计算只产出一个新 token，把它接在末尾再算下一个。这叫<strong>自回归生成</strong>，第 5 章会展开它带来的后果。</p>
+
+<p>大模型由几十层相同结构的 <strong>Transformer 层</strong>堆叠而成。每一层里有两个模块（论断 C1）：</p>
+
+<ul>
+  <li><strong>attention（注意力）</strong>：让 token 之间交换信息。"它"指代谁、哪个词修饰哪个词，靠这一步把前面 token 的信息汇过来。</li>
+  <li><strong>FFN（前馈网络）</strong>：对每个 token 独立做同一套变换的小计算器，token 之间在这一步互不打交道。它由两个矩阵（两张"把向量变成另一个向量的权重表"）构成。</li>
+</ul>
+
+<pre class="diagram">一个 token 穿过一层 Transformer：
+
+token 向量 ──► attention（token 之间交换信息）──► FFN（每个 token 独立变换）──► 送往下一层
+                  参数 ≈ 4d²                        参数 ≈ 8d²（约为前者的 2 倍）</pre>
+
+<p>这两个模块谁存的参数多？在 Transformer 原始论文（Vaswani 等，2017）的标准配置里，隐层宽度 $d=512$，FFN 中间层宽度 $d_{ff}=2048$。可以手算（忽略偏置和归一化参数）：</p>
+
+<ul>
+  <li>attention 有 4 个投影矩阵，每个 $d\times d$，合计 $4d^2 = 4\times 512^2 = 1{,}048{,}576 \approx 105$ 万个参数；</li>
+  <li>FFN 的两个矩阵分别是 $d\times d_{ff}$ 和 $d_{ff}\times d$，合计 $2\times 512\times 2048 = 8d^2 = 2{,}097{,}152 \approx 210$ 万个参数。</li>
+</ul>
+
+<p>FFN 约占两者之和的 2/3（数字 N7）。也就是说，每一层里存"知识"的大头是 FFN。这个比例是下一章的出发点：想把模型"撑大"，首先动的是 FFN。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出一个 token 经过一层 Transformer 时，attention 和 FFN 各做什么。</li>
+  <li>复算 $d=512$、$d_{ff}=2048$ 时两个模块的参数量，并说明 FFN 占比。</li>
+</ul>
+
+<p>既然 FFN 是参数大户，"让模型更大"在工程上就是"让 FFN 更大"。下一章的问题是：怎样让 FFN 部分存下几十倍的参数，却不让每个 token 的计算量跟着爆炸？</p>
+
+<h2 id="s2-moe-topk">把一个 FFN 换成一排专家：MoE 与 top-k 稀疏激活</h2>
+
+<p>直觉上，模型存的参数越多，能记住和表达的东西越多。但稠密（dense）模型里参数翻倍意味着每个 token 的计算量也翻倍——每一层的每个模块对每个 token 都要算一遍。计算量直接就是服务成本：参数翻倍，每个回答都贵一倍。有没有办法让"存得多"和"算得少"分开？</p>
+
+<p>MoE 的做法是：把每层那个 FFN 复制成一排 $N$ 个小 FFN，每个叫一个<strong>专家</strong>（expert）；再加一个很小的打分器叫 <strong>router</strong>（路由器）。每个 token 到来时，router 给所有专家打分，只让得分最高的 $k$ 个（<strong>top-k</strong>）专家真正计算这个 token，其余专家这一轮完全不碰它。选中的专家各自给出输出，最后按 router 给的权重加权求和：</p>
+
+<p>$$y(x)=\sum_{i\in S_k(x)} g_i(x)\cdot E_i(x)$$</p>
+
+<ul>
+  <li>$x$：该 token 的输入向量；</li>
+  <li>$E_i(x)$：第 $i$ 个专家（一个小 FFN）对 $x$ 的输出；</li>
+  <li>$S_k(x)$：router 为 $x$ 选中的 $k$ 个专家；</li>
+  <li>$g_i(x)$：选中专家的门控权重，由打分归一化而来；</li>
+  <li>$y(x)$：这一层对该 token 的最终输出。</li>
+</ul>
+
+<p>用一个边界检查这个公式：如果 $k=N$（全部选中）且权重相同，MoE 就退化成"所有专家都算一遍"，稀疏省算力的意义消失。所以 $k$ 必须远小于 $N$——下面会看到 DeepSeek-V3 是 256 选 8。</p>
+
+<p><strong>教学示例。</strong> 构造 8 个 routed expert（按路由激活的专家）、top-2 的情形。某个 token 的 router 打分如下（打分为便于手算构造的数字）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>专家编号</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th></tr></thead>
+<tbody>
+<tr><td>router 打分</td><td>0.1</td><td>0.3</td><td>0.05</td><td><strong>0.9</strong></td><td>0.2</td><td>0.4</td><td>0.1</td><td><strong>0.6</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>得分最高的两个是专家 3（0.9）和专家 7（0.6）。把选中专家的得分归一化为权重：$g_3 = 0.9/1.5 = 0.6$，$g_7 = 0.6/1.5 = 0.4$，于是这一层的输出是 $y = 0.6\,E_3(x) + 0.4\,E_7(x)$。其余 6 个专家对这个 token 完全不计算。（教学简化：归一化细节因实现而异——DeepSeek-V3 用 sigmoid 亲和度打分再加偏置选 top-8，见其技术报告 §2.1.2；但"只算选中的 $k$ 个、输出加权求和"这一结构是共同的。）</p>
+
+<p>除 routed expert 外，还有一类 <strong>shared expert</strong>（共享专家）：所有 token 都经过它，与按路由激活的专家并存，承载每个 token 都需要的通用变换（论断 C4）。</p>
+
+<p>现在把开头那个数字落实。DeepSeek-V3 的每个 MoE 层含 1 个 shared expert 与 256 个 routed expert，每个 token 激活其中 8 个（top-8，数字 N2）；全部 61 层中，前 3 层保留稠密 FFN，其余 58 层是 MoE 层（N3）；模型总参数 671B，每个 token 只激活约 37B（N1）。手算验证：$37 \div 671 \approx 0.055$，即每个 token 只动用约 5.5% 的参数。这就是"存 671B、每 token 只算 37B"同时成立的原因：<strong>稀疏激活把总参数量和每 token 计算量解耦了</strong>（论断 C3）。</p>
+
+<div class="callout callout-red">
+<p><b>最容易误解：</b>MoE 不是"几个独立模型在投票"。专家是同一个网络内部的一排小 FFN，与 router 一起联合训练、作为一个模型统一部署——没有任何一个专家能单独回答问题。</p>
+</div>
+
+<p>还有一个隐患先记下来：router 可能总偏爱少数几个专家，被选中的累垮、没被选中的白训。训练时要靠额外的均衡机制（辅助损失或偏置调整）拉住，这属于训练侧问题，本页不展开；但请记住"负载可能不均"，下一章它会在服务侧以另一种形式出现。</p>
+
+<details>
+<summary>补充：稀疏 MoE 的历史脉络（top-k 的 k 没有标准答案）</summary>
+<p>稀疏激活的专家混合层由 Shazeer 等人 2017 年提出（带噪声的 top-k 门控，最多 1370 亿参数）；GShard（2020）把它搬进 Transformer 并用 top-2；Switch Transformer（2021）简化为 top-1；DeepSeek-V3（2024）用细粒度专家加 top-8。k 取多少、专家分多细，至今没有统一答案，是各模型自己的权衡。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话解释"为什么 DeepSeek-V3 总参数 671B，但每个 token 只算约 37B"。</li>
+  <li>给定 8 个专家的打分表，复算 top-2 的选择与归一化权重。</li>
+  <li>说明 shared expert 与 routed expert 的区别。</li>
+</ul>
+
+<p>本章解决了"算得少"。但注意一个容易滑过去的点：稀疏激活省的是<strong>计算</strong>，不是存储。那 671B 权重，一个数字都不能少地待在某个地方。下一章的问题是：一张 GPU 放不下时怎么办？</p>
+
+<h2 id="s3-ep-alltoall">权重放不下了：专家并行与 all-to-all 搬运</h2>
+
+<div class="callout callout-red">
+<p><b>最容易误解：</b>"每个 token 只激活 5.5% 的参数，所以模型只需要 37B 对应的显存。"错。稀疏激活省的是每 token 的计算量；全部 671B 权重都必须驻留——因为任何一个 token 都可能选中任何一个专家，哪个都不能缺。</p>
+</div>
+
+<p>先补一个事实：GPU 是擅长并行做矩阵乘法的芯片，它的高速存储（<strong>显存</strong>）容量有限（单卡几十到上百 GB 量级），权重必须放进显存才能算。671B 参数远超单卡容量，必须把模型摊开。（GPU 内部如何执行计算由概念页《<a href="../gpu-execution-model/index.html">GPU 执行模型</a>》负责；本页只需要"显存有限"这一个事实。）</p>
+
+<p>MoE 有一种天然的切法：按专家切。把 256 个专家分片到多张 GPU，每张卡只存其中几个——这叫<strong>专家并行</strong>（EP，expert parallelism，论断 C6）。顺带区分两个容易混淆的切法（本页不展开）：把整模型复制多份分摊请求叫数据并行（DP），把每个矩阵切开来算叫张量并行（TP）。</p>
+
+<p>切完之后问题来了：路由是按 token 决定的，而每张卡只持有部分专家。于是每个 token 的中间结果（<strong>激活</strong>，即它流过这一层时的向量）必须被送到选中专家所在的卡上——这一步叫 <strong>dispatch</strong>；专家算完，结果要送回来加权求和——这一步叫 <strong>combine</strong>。由于每张卡上的 token 都可能要去任何一张卡，dispatch 和 combine 通常用 <strong>all-to-all</strong> 通信实现：每张卡都同时与所有其他卡交换数据（论断 C7）。DeepSeek 为此开源了专门的通信库 DeepEP。</p>
+
+<pre class="diagram">一层 MoE 在 2 张卡上的数据流（EP=2，8 个专家每卡 4 个）：
+
+  卡0 上的 token ──┐                         ┌── 卡0：专家 0,1,2,3 ──┐
+  卡1 上的 token ──┴─► router 打分、选 top-k ─►│                        │─► 各卡专家并行计算
+                        （每 token 决定去     └── 卡1：专家 4,5,6,7 ──┘
+                         哪 k 个专家）                    ▲
+                              │                           │
+                              └── dispatch（all-to-all：把激活送到选中专家所在的卡）
+                                  combine（all-to-all：把专家输出送回原卡，加权求和）──► 下一层</pre>
+
+<p><strong>教学示例。</strong> 把上一章那 8 个 routed expert 放到 2 张卡上：卡 0 存专家 0–3，卡 1 存专家 4–7。4 个 token 的 top-2 路由结果如下（构造数字）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>token</th><th>选中的专家</th><th>dispatch 到卡 0 的对数</th><th>dispatch 到卡 1 的对数</th></tr></thead>
+<tbody>
+<tr><td>t1</td><td>1, 2</td><td>2</td><td>0</td></tr>
+<tr><td>t2</td><td>2, 5</td><td>1</td><td>1</td></tr>
+<tr><td>t3</td><td>1, 3</td><td>2</td><td>0</td></tr>
+<tr><td>t4</td><td>0, 6</td><td>1</td><td>1</td></tr>
+<tr class="highlight-row"><td>合计</td><td>—</td><td>6</td><td>2</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>每个"token–专家"对就是一次搬运：卡 0 收到 6 对，卡 1 只收到 2 对；combine 再按原路把同样数量的结果送回。现在看负载：如果每对的计算时间相近，卡 0 这一步要干的活约为卡 1 的 3 倍，而整层要等所有卡都算完才能继续——卡 1 的算力在空转。上一章"路由偏好导致负载不均"的隐患，在服务侧就长成这个样子：token 的偏好直接变成 GPU 之间的忙闲不均（论断 C5）。真实系统会复制热门专家、定期调整摆放来缓解（DeepSeek 的部署就是这么做的），细节超出本页范围。</p>
+
+<p>真实规模感受一下：DeepSeek 的在线推理系统里，prefill 的一个部署单元是 4 节点 32 张 GPU（EP32，每卡放 9 个路由专家加 1 个共享专家），decode 的一个部署单元是 18 节点 144 张 GPU（EP144，每卡只放 2 个路由专家加 1 个共享专家）（数字 N4）。256 个专家摊到上百张卡上，每张卡只剩个位数。</p>
+
+<details class="code-details">
+<summary>可运行代码：模拟 top-2 路由下的 dispatch 计数，验证上面的表格</summary>
+<div class="code-block">
+<pre><code class="language-python">import random
+
+# 教学示例：8 个路由专家、每 token 选 top-2，专家分片到 2 张卡
+NUM_EXPERTS = 8
+TOP_K = 2
+NUM_GPUS = 2  # 卡 0 放专家 0-3，卡 1 放专家 4-7
+
+def gpu_of(expert):
+    return expert // (NUM_EXPERTS // NUM_GPUS)
+
+# 正文教学示例的固定路由表：4 个 token 各自选中的 2 个专家
+routes = [
+    ("t1", [1, 2]),
+    ("t2", [2, 5]),
+    ("t3", [1, 3]),
+    ("t4", [0, 6]),
+]
+
+counts = [0] * NUM_GPUS
+for token, experts in routes:
+    for e in experts:
+        g = gpu_of(e)
+        counts[g] += 1
+        print(f"{token} -> 专家{e}（卡{g}）：dispatch 1 个 token-expert 对")
+print(f"dispatch 计数：卡0={counts[0]} 对，卡1={counts[1]} 对")
+print(f"combine 把同样数量的结果送回：卡0={counts[0]} 对，卡1={counts[1]} 对")
+
+# 扩展：路由均匀随机时，1000 个 token 的负载是否仍可能倾斜
+random.seed(0)
+counts = [0] * NUM_GPUS
+for _ in range(1000):
+    for e in random.sample(range(NUM_EXPERTS), TOP_K):
+        counts[gpu_of(e)] += 1
+print(f"均匀随机路由 1000 token：卡0={counts[0]} 对，卡1={counts[1]} 对（期望各 1000）")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">t1 -> 专家1（卡0）：dispatch 1 个 token-expert 对
+t1 -> 专家2（卡0）：dispatch 1 个 token-expert 对
+t2 -> 专家2（卡0）：dispatch 1 个 token-expert 对
+t2 -> 专家5（卡1）：dispatch 1 个 token-expert 对
+t3 -> 专家1（卡0）：dispatch 1 个 token-expert 对
+t3 -> 专家3（卡0）：dispatch 1 个 token-expert 对
+t4 -> 专家0（卡0）：dispatch 1 个 token-expert 对
+t4 -> 专家6（卡1）：dispatch 1 个 token-expert 对
+dispatch 计数：卡0=6 对，卡1=2 对
+combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
+均匀随机路由 1000 token：卡0=1003 对，卡1=997 对（期望各 1000）</code></pre>
+</div>
+<p><b>验证的机制</b>：代码中 <code>routes</code> 就是正文的 top-2 路由表，<code>gpu_of</code> 对应"专家分片到卡"的 EP 摆放，<code>counts</code> 逐对累计 dispatch 搬运量，与正文表格的合计行一致。</p>
+<p><b>观察重点</b>：固定路由表下卡 0 收到 6 对、卡 1 只有 2 对——负载不均来自 token 的选择偏好；而均匀随机路由 1000 个 token 时两卡几乎持平（1003 对 997），说明倾斜不是 EP 的必然，而是路由分布的结果。</p>
+<p><b>教学简化</b>：代码只做计数，不含真实的网络传输与专家计算；真实系统中 dispatch/combine 由 DeepEP 这类通信库在多卡间完成，combine 还要按门控权重加权求和。本例 8 专家、2 卡是缩小版，DeepSeek-V3 是 256 专家、上百张卡。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出 dispatch 和 combine 各搬什么、沿什么方向搬。</li>
+  <li>复算上表卡 0 与卡 1 的计数，并解释"卡 1 空转"的原因。</li>
+  <li>解释为什么"每 token 只激活 8/256 个专家"并不能让模型少占显存。</li>
+</ul>
+
+<p>dispatch 和 combine 是真实的网络传输，要花时间。通信在路上时，GPU 在干什么？什么也不干——除非刻意安排。下一章的问题是：怎样把这段通信时间"藏起来"？</p>
+
+<h2 id="s4-tbo-sbo">通信不能干等：TBO 与 SBO 的重叠</h2>
+
+<p>把一层 MoE 的各步骤按时间排开，最朴素的执行是串行的：</p>
+
+<pre class="diagram">串行执行（一层 MoE）：
+
+[attention 等计算] ──► [dispatch] ──► [专家计算] ──► [combine] ──► 下一层
+                       └───────── 通信期间算力闲置（气泡）─────────┘</pre>
+
+<p>通信期间 GPU 的算力在空转，这段空白叫<strong>气泡</strong>。all-to-all 的规模越大（卡越多、token 越多），气泡越长。两种通行的"藏"法（论断 C8）：</p>
+
+<p><strong>TBO（two-batch overlap，双批次重叠）</strong>：把一个大批拆成两个<strong>微批</strong>（microbatch），交替执行——微批 A 做 dispatch/combine 通信时，微批 B 在计算；轮到 B 通信时 A 在计算。一个微批的通信被另一个微批的计算盖住。DeepSeek 在线系统在 prefill 阶段用的正是这种"双批次重叠"（数字 N4 的同一份部署说明）。</p>
+
+<p><strong>SBO（single-batch overlap，单批次重叠）</strong>：在同一微批内部找可并行的工作。shared expert 的计算不依赖路由结果，不需要等 dispatch——让它与 routed expert 的 dispatch/combine 同时进行，同一批之内把通信盖住。</p>
+
+<pre class="diagram">TBO：微批 A 的通信与微批 B 的计算重叠
+微批A  [计算A] [──通信A──] [专家A] [计算A′]
+微批B         [计算B     ] [──通信B──] [专家B] ...
+                ▲ B 的计算盖住了 A 的通信
+
+SBO：同一微批内，共享专家计算与路由专家通信重叠
+同一批 [计算] [dispatch/combine（路由专家）] [路由专家计算] [合并]
+              [shared 专家计算（同时进行）]      ▲ 共享专家计算盖住了同批通信</pre>
+
+<div class="callout callout-yellow">
+<p><b>注意边界：</b>重叠是"藏"不是"消"。通信本身仍占用带宽与硬件资源；能否藏住取决于有没有足够的可并行计算——批太小、或 shared expert 的计算太短，气泡还是会露出来。TBO/SBO 也没有消除 all-to-all，只是让它与计算同时进行。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定串行时间线，指出 TBO 和 SBO 分别能盖住哪一段通信。</li>
+  <li>说出"重叠不能消除通信开销"的两个理由。</li>
+</ul>
+
+<p>模型会算了、权重铺开了、通信也藏住了。现在换到用户视角：你发出一句话到一个字一个字收到回答，中间到底发生了什么？</p>
+
+<h2 id="s5-prefill-decode-kvcache">一次请求的两个阶段：prefill、decode 与 KV cache</h2>
+
+<p>第 1 章说过，模型逐 token 生成。现在把它展开成一个循环：第 1 步，把你输入的全部 token 过一遍模型，产出第 1 个新 token；第 2 步，把"你的输入 + 刚生成的 token"再过一遍，产出第 2 个……直到模型说"完了"。每一步都要看到全部前缀。</p>
+
+<p>这里藏着一处巨大的浪费。attention 让每个 token 从前面所有 token 汇信息，为此每个 token 在各层都要算出两个向量：key 和 value（可以粗糙地理解为这个 token 的"检索标签"和"信息内容"）。如果每生成一步都把全部前缀重新过一遍模型，前面那些 token 的 key/value 就被一遍遍重算——而它们的内容一模一样，因为前缀从来没变过。</p>
+
+<p>解法直白：把每层算过的 key/value 张量存下来，这就是 <strong>KV cache</strong>。下一步只需为那 1 个新 token 算 key/value，再拼到 cache 后面（论断 C10）。</p>
+
+<p><strong>教学示例。</strong> 你的输入是 4 个 token，模型再生成 3 个。只数 key/value 投影这一项的计算次数（教学简化：忽略 attention 打分与其余计算）：</p>
+
+<ul>
+  <li>不存 cache：第 1 步要为 4 个前缀 token 算 key/value；第 2 步前缀变成 5 个，重算 5 个；第 3 步重算 6 个。合计 $4+5+6=15$ 个 token 次。</li>
+  <li>存 cache：第一步算 4 个并入库；之后每步只算新 token 的 1 个。合计 $4+1+1+1=7$ 个 token 次。</li>
+</ul>
+
+<p>对话越长，差距越大——KV cache 把"每步重算全部前缀"变成"每步只算一个"。</p>
+
+<p>由此，一次请求自然分成两个阶段（论断 C9）：</p>
+
+<ul>
+  <li><strong>prefill（预填充）</strong>：一次性并行处理全部输入 token，建好 KV cache，产出第一个新 token。一次算很多 token，计算密集，追求<strong>吞吐</strong>。</li>
+  <li><strong>decode（解码）</strong>：之后每步只处理 1 个新 token，大量时间花在读 KV cache 上。每一步都很短，但每一步的长短直接决定你看到的"出字速度"，对<strong>延迟</strong>敏感。</li>
+</ul>
+
+<pre class="diagram">prefill：输入 [你][好][今][天] 一次性并行处理
+           ──► 各层 key/value 写入 KV cache ──► 产出首 token「吃」
+
+decode： 第1步：读 cache + 新 token「吃」──► 算 1 个 key/value 追加进 cache ──► 产出「饭」
+          第2步：读 cache + 新 token「饭」──► 算 1 个 key/value 追加进 cache ──► 产出「了」
+          ……每步只算 1 个新 token 的 key/value，前缀全靠读 cache</pre>
+
+<details>
+<summary>补充：KV cache 本身会占掉大量显存</summary>
+<p>KV cache 随对话长度增长，长对话、多并发下它本身就是显存大户，怎么存放、换入换出、跨请求复用是推理引擎的核心难题之一（例如 vLLM 的 PagedAttention）。这属于引擎实现层，本页不展开。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>复算 4 token 输入 + 生成 3 个 token 时，有无 KV cache 的 key/value 计算次数。</li>
+  <li>说出 prefill 和 decode 各自对 KV cache 是"写"还是"读"，以及为什么 prefill 重吞吐、decode 重延迟。</li>
+</ul>
+
+<p>两个阶段脾气完全不同：一个一次算一大片，一个一次算一丁点但要算很多步。那么"这个服务快不快"该怎么量？一个数字够吗？</p>
+
+<h2 id="s6-metrics">服务好不好怎么量：TTFT、TPOT、SLO 与 goodput</h2>
+
+<p>上一章的两个阶段各贡献一段等待，于是 LLM 服务的延迟天然拆成两个指标（论断 C11，来自 DistServe 论文）：</p>
+
+<ul>
+  <li><strong>TTFT</strong>（time to first token，首 token 延迟）：从发出请求到看到第一个字，约等于 prefill 阶段的时长（教学补充：线上服务里还包含排队等待）。</li>
+  <li><strong>TPOT</strong>（time per output token）：除首 token 外，平均每个输出 token 的生成时间，反映 decode 阶段的速度。</li>
+</ul>
+
+<p>总延迟 = TTFT + TPOT × decode 阶段生成的 token 数（即不含首 token）。为什么要拆成两个？因为不同应用对两者的要求完全不同（论断 C12）：实时聊天重 TTFT——没人愿意对着转圈等半分钟，而 TPOT 只要快过人的阅读速度（约 250 词/分钟）就够用；批量生成长文档则相反——首 token 等 1 秒还是 2 秒无所谓，TPOT 决定整篇要等多久。</p>
+
+<p><strong>教学示例。</strong> 某请求 prefill 花了 0.3 s，之后生成 5 个 token，每步 0.05 s（构造数字）。那么 TTFT = 0.3 s；TPOT = $(0.05\times 5)/5 = 0.05$ s；总延迟 = $0.3 + 5\times 0.05 = 0.55$ s。</p>
+
+<p>服务方对这两个指标分别承诺上限，并要求一定比例的请求达标——这叫 <strong>SLO</strong>（服务级别目标），达标请求占比的下限叫<strong>达成率</strong>（比如 90% 的请求满足 TTFT 与 TPOT 上限）。</p>
+
+<p>最后是衡量系统容量的主指标：<strong>goodput</strong>（有效吞吐）= 在满足 SLO 达成率的前提下，系统每秒最多能承接多少请求（论断 C12）。注意它不是"尽量快"：请求越挤，排队越久，超 SLO 的请求越多。goodput 问的是"在不让达成率破防的前提下，还能再加多少请求"。<strong>教学示例。</strong> 若实测 4 req/s 时 95% 的请求达标、8 req/s 时只剩 80% 达标（构造数字），那么 goodput 落在 4 与 8 之间，需要找到仍满足 90% 达成率的最大速率。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>指标</th><th>量的是什么</th><th>由哪个阶段主导</th><th>常见误区</th></tr></thead>
+<tbody>
+<tr><td>TTFT</td><td>首 token 延迟</td><td>prefill</td><td>把它当成全部延迟，忽略后续生成</td></tr>
+<tr><td>TPOT</td><td>平均每输出 token 时间</td><td>decode</td><td>用"总延迟/总 token 数"混算，掩盖首 token</td></tr>
+<tr><td>goodput</td><td>满足 SLO 达成率的最大请求率</td><td>两阶段共同</td><td>与裸吞吐混淆——不顾延迟达标的每秒请求数再高也不算 goodput</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>这组指标不是纸面定义，它直接驱动系统设计：以 goodput 为目标、把 prefill 和 decode 分开部署的 DistServe 系统，能比当时最优系统多服务最多 7.4 倍请求，或把 SLO 收紧 12.6 倍（>90% 请求达标，数字 N6）。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定 prefill 0.5 s、生成 4 个 token 各 0.1 s 的时间线，算出 TTFT、TPOT 与总延迟。</li>
+  <li>用一句话说清 goodput 与裸吞吐量的区别。</li>
+  <li>解释为什么实时聊天应用更在意 TTFT 而不是 TPOT。</li>
+</ul>
+
+<p>两个指标由两个脾气不同的阶段贡献：TTFT 看 prefill，TPOT 看 decode。部署时，把这两个阶段放在同一批 GPU 上，还是分开？</p>
+
+<h2 id="s7-pdd-colocation">放一起还是分开：PD 合设与 PD 分离</h2>
+
+<p>两条主流路线（论断 C13、C14）：</p>
+
+<p><strong>PD 合设（colocation）</strong>：prefill 和 decode 跑在同一批 GPU、同一份模型权重上。好处是省显存、prefill 建好的 KV cache 就地可用。代价是<strong>互相干扰</strong>：一个 prefill 步往往比一个 decode 步长得多，排在一起时 decode 步被拖慢、TPOT 变差；decode 步挤进来也抬高 TTFT。两个阶段抢同一份资源，调度上偏向哪边都伤另一边。</p>
+
+<p><strong>PD 分离（PDD，prefill-decode disaggregation）</strong>：prefill 和 decode 各自用一组 GPU 实例。干扰消失，两个阶段可以按各自目标独立配置资源与并行方式（prefill 求吞吐、decode 求延迟）。代价有三：第一，每个实例都要存一份完整模型副本——对 MoE 模型，权重的大头是专家，副本很贵；第二，prefill 产出的 KV cache 要跨实例传给 decode；第三，两阶段的容量要按配比成组供给，最小供给单位是一整个"部署单元"——DeepSeek-V3 技术报告的一个配比单元是 32 张 prefill GPU 加 320 张 decode GPU（数字 N5）。不是对半分：配比由两阶段负载的不对称决定。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>对比项</th><th>PD 合设（colocation）</th><th>PD 分离（PDD）</th></tr></thead>
+<tbody>
+<tr><td>模型权重份数</td><td>一份</td><td>每个实例一份完整副本</td></tr>
+<tr><td>跨阶段干扰</td><td>有：长 prefill 步拖慢 decode，反之亦然</td><td>无：物理隔离</td></tr>
+<tr><td>KV cache 传输</td><td>不需要</td><td>prefill → decode 跨实例传输</td></tr>
+<tr><td>资源配置</td><td>两阶段共享，无法各自定制</td><td>各自定制，但按部署单元（如 32P+320D）成组扩缩</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两条路线各自的深层局限——分离的副本太贵、部署单元太粗，合设的干扰难消、GPU 内部切分太死——以及一种更细的混合架构，正是论文 ExpertPlex 要解决的问题；其解析页将从本页的概念出发，本页到此为止。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出 PDD 用哪三样代价换来了"无干扰"和"各自定制"。</li>
+  <li>解释为什么 PDD 的 P:D 配比不是 1:1，并举出 DeepSeek-V3 的部署单元数字。</li>
+  <li>说明合设省下的两样东西是什么。</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>C1（Transformer 层 = attention + FFN；attention 跨 token、FFN 逐 token）：Vaswani et al., Attention Is All You Need, NeurIPS 2017, arXiv:1706.03762 §3.1；ExpertPlex arXiv:2607.18002 v2 §2.1。C2（FFN 参数 8d² 约为 attention 4d² 的 2 倍）：由 Vaswani 2017 §3.1 与 Table 1 配置（d=512，d_ff=2048）直接推导。C3（稀疏激活解耦容量与计算）：Shazeer et al., ICLR 2017, arXiv:1701.06538 摘要与 §2；ExpertPlex §2.1。C4（router + routed/shared expert、top-k 加权和）：Shazeer 2017 §2；DeepSeek-V3 Technical Report arXiv:2412.19437 §2.1.2 Eq.(14)–(16)；ExpertPlex §2.1。C5（负载不均及其训练/服务两侧表现）：Shazeer 2017 §2 及附录；DeepSeek-V3 §2.1.2（auxiliary-loss-free 偏置调整）；ExpertPlex §2.5。C6（EP 动机）：ExpertPlex §2.3。C7（dispatch/combine 与 all-to-all）：ExpertPlex §2.3；GShard arXiv:2006.16668 §3；通信库 github.com/deepseek-ai/DeepEP。C8（TBO/SBO 定义）：ExpertPlex §2.3 与延迟模型段；DeepSeek 官方《DeepSeek-V3/R1 推理系统概览》（2025-03-01，知乎/github.com/deepseek-ai）"双批次重叠"段。C9（prefill/decode 定义与导向）：DistServe, OSDI 2024, arXiv:2401.09670 §2.1；ExpertPlex §2.1。C10（KV cache 复用）：ExpertPlex §2.1。C11（TTFT/TPOT 定义与总延迟公式）：DistServe §1 及脚注 1。C12（SLO/goodput 定义、250 词/分钟例）：DistServe §1，§2.1 重申 goodput。C13（PDD 收益与代价）：DistServe §1/§2.1；Splitwise, ISCA 2024, arXiv:2311.18677；ExpertPlex §2.4。C14（colocation 定义与干扰）：DistServe §2.1；ExpertPlex §2.5。</p>
+
+<h3>核心公式与来源</h3>
+<p>F1（MoE 层输出 y = Σ g_i·E_i，top-k 稀疏）：Shazeer 2017 §2（y = Σ G(x)_i E_i(x)，G 为稀疏门控）；DeepSeek-V3 §2.1.2 Eq.(14)–(16)（sigmoid 亲和度 + 偏置选 top-k）。页面中"把选中专家得分归一化为权重"的写法为教学简化，不绑定具体归一化实现。FFN/attention 参数计数（4d² 与 8d²）：由 Vaswani 2017 Table 1 配置直接推导，忽略偏置与 LayerNorm。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>N1：DeepSeek-V3 总参数 671B、每 token 激活 37B——DeepSeek-V3 Technical Report 摘要。N2：每 MoE 层 1 shared + 256 routed、top-8——同报告 §2.1.2；在线系统概览"每层仅激活 256 个专家中的 8 个"。N3：61 层、前 3 层稠密——同报告 §2.1.2（"except for the first three layers"）与官方模型配置（num_hidden_layers=61，first_k_dense_replace=3）。N4：在线推理部署（prefill 4 节点 32 GPU / EP32、每卡 9 路由 + 1 共享；decode 18 节点 144 GPU / EP144、每卡 2 路由 + 1 共享；prefill 双批次重叠）——《DeepSeek-V3/R1 推理系统概览》2025-03-01。N5：技术报告版部署单元（prefill 4 节点 32 GPU / EP32；decode 40 节点 320 GPU / EP320）——DeepSeek-V3 Technical Report 部署章节；ExpertPlex §2.4 转述为"32 prefill and 320 decode GPUs"。N6：DistServe 最多 7.4× 请求 / 12.6× 更紧 SLO（>90% 达标）——DistServe 摘要。N7：4d²≈105 万、8d²≈210 万——由 Vaswani 2017 配置计算。</p>
+
+<h3>教学示例</h3>
+<p>E1（第 2 章）：8 专家 top-2 打分表为构造数字，展示选择与归一化。E2（第 3 章）：4 token 的 top-2 路由表为构造数字，展示 dispatch 计数与负载倾斜；配套可运行代码已实际执行，输出与页面一致。E3（第 5 章）：4+3 token 的 key/value 计数，只数 K/V 投影一项。E4（第 6 章）：0.3 s + 5×0.05 s 时间线与 4/8 req/s 达成率为构造数字，展示指标计算与 goodput 含义。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>"FFN 是存知识的大头"仅以参数占比（2/3）为依据，不断言知识具体存在哪里。key/value 的"检索标签/信息内容"表述只解释为什么它们可以被缓存复用，不解释 attention 内部机制（超出本页范围）。"气泡"指通信期间算力闲置，不特指流水线并行中的 pipeline bubble。</p>
+
+<h3>教学简化及其限制</h3>
+<p>（1）attention 内部 Q/K/V 打分、多头结构未展开，只保留"跨 token 汇信息、产出 key/value"这一功能描述；KV cache 的 E3 只数 K/V 投影计算，实际朴素重算的浪费还包括 attention 打分与全部层计算，因此 15 对 7 是浪费的下界而非全部。（2）router 归一化写法（选中专家得分归一化）是多种实现之一；DeepSeek-V3 用 sigmoid + 偏置，Switch 用 softmax top-1，结构共性是"只算选中的 k 个、加权和输出"。（3）TBO/SBO 时间线为示意图，不反映真实 kernel 调度（由《<a href="../gpu-execution-model/index.html">GPU 执行模型</a>》概念页负责）。（4）本页所有数字以 DeepSeek-V3 系模型为准；其他 MoE 模型（如 Mixtral 8 专家 top-2）层数、专家数、k 值不同，机制描述仍成立。（5）GPU/显存只用"并行矩阵运算芯片、显存有限"的最小表述，SM、kernel、CUDA Graph 等执行细节不在本页范围。</p>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>
