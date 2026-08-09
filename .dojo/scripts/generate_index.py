@@ -27,14 +27,15 @@ def card(item: dict, tag_class: str) -> str:
           </a>"""
 
 
-def render_papers(items: list[dict]) -> str:
+def render_groups(items: list[dict], section_id: str) -> str:
     groups: dict[str, list[dict]] = defaultdict(list)
     for item in items:
         groups[item.get("group", "未分组")].append(item)
 
+    tag_class = section_id.rstrip("s")
     parts = []
     for group, group_items in groups.items():
-        cards = "\n".join(card(item, "paper") for item in group_items)
+        cards = "\n".join(card(item, tag_class) for item in group_items)
         parts.append(f"""      <details class="group">
         <summary class="group-summary">
           <div class="left">
@@ -50,20 +51,11 @@ def render_papers(items: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def render_cards(items: list[dict], section_id: str) -> str:
-    if not items:
-        return "      <p class=\"empty\">还没有内容。完成一次学习后再决定是否留档。</p>"
-    cards = "\n".join(card(item, section_id.rstrip("s")) for item in items)
-    return f"""      <div class="group-body flat">
-{cards}
-      </div>"""
-
-
 def render_section(section: dict, items: list[dict]) -> str:
-    if section["id"] == "papers" and items:
-        body = render_papers(items)
+    if not items:
+        body = '      <p class="empty">还没有内容。完成一次学习后再决定是否留档。</p>'
     else:
-        body = render_cards(items, section["id"])
+        body = render_groups(items, section["id"])
     return f"""    <section class="section">
       <h2 class="section-title">{escape(section['title'])}</h2>
       <p class="section-desc">{escape(section['description'])}</p>
