@@ -1,0 +1,21 @@
+# MoE 大模型推理与服务基础 初稿检查
+
+- 输入版本：scope.md / evidence.md / outline.md / glossary.md 均为本轮规划定稿（2026-08-07），规划完成条件已逐项核对
+- 大纲落实：
+  - 章节：S1–S7 + 来源与教学说明共 8 个 h2，标题与顺序与 outline.md 一致
+  - 学习目标：Q1→S2、Q2→S3+S4、Q3→S5、Q4→S6、Q5→S7，与 outline 映射一致
+  - 前置知识：token/参数/前向计算内联于 S1；GPU/显存最小表述 + 《GPU 执行模型》占位提示（规划中，无链接）于 S3
+  - 贯穿例子：DeepSeek-V3 数字锚点贯穿 S2/S3/S4/S7；E1（S2）→E2（S3，复用 8 专家 top-2 设定）→E3（S5）→E4（S6）
+  - 误解：5 条全部落入章节（S2 专家≠独立模型、S3 显存误解 callout、S4 重叠≠消除 callout、S6 goodput≠吞吐对照表、S7 配比≠对半分）
+  - 过渡：S1→S2→S3→S4→S5→S6→S7 每章末有逻辑缺口式过渡句
+- 学习目标闭环：
+  - Q1：S2 完整回答（动机、F1、E1 手算、N1–N3、37/671≈5.5% 手算、shared/routed）
+  - Q2：S3（EP 动机、dispatch/combine/all-to-all、E2 计数、负载不均）+ S4（TBO/SBO、时间线、边界）完整回答
+  - Q3：S5 完整回答（自回归循环、K/V 重算浪费、E3 手算 15 vs 7、两阶段定义）
+  - Q4：S6 完整回答（TTFT/TPOT 定义、拆分理由、E4 手算 0.55 s、SLO/达成率/goodput、对照表）
+  - Q5：S7 完整回答（两条路线动机与代价、N5 部署单元、对照表）
+  - 折叠块全部收起时正文仍回答全部目标（折叠块仅含历史脉络、KV cache 显存补充、可运行代码）
+- 代码运行：`python3 /tmp/moe-serving/dispatch_sim.py` 退出码 0，实际输出与页面"预期输出"逐行一致（卡0=6/卡1=2；随机 1003/997）
+- 机械检查：`python3 .dojo/scripts/validate.py wiki/moe-serving/index.html` → validation ok；`... overview.html` → validation ok（修复 title 占位符后）
+- 公式渲染与交互：用本地 libs/katex.min.js 在 Node 中对全部 2 个 display 与 29 个 inline 公式 renderToString 全部成功（fail=0）；逐行检查 $ 分隔符配对无奇数行；页面含 8 h2 / 3 details / 5 表 / 5 图，目录与折叠按钮依赖的扁平结构满足（h2 均为 body 直接子级）
+- 写作偏差：无
