@@ -658,7 +658,7 @@
   <h2>读完你能回答</h2>
   <ul>
     <li>MLA 用低秩联合压缩如何减少 KV cache，同时保留全局 token-to-token 注意力？</li>
-    <li>为什么 MLA 要把 RoPE 解耦，不能直接对压缩潜向量应用 RoPE？</li>
+    <li>为什么 MLA 要把 RoPE（旋转位置编码，见 S3）解耦，不能直接对压缩潜向量应用 RoPE？</li>
     <li>MLA 的 KV cache 每 token 占多少元素，相比 MHA / GQA / MQA 减少多少？</li>
     <li>推理时如何通过"矩阵吸收"避免显式重建 K 和 V？</li>
     <li>K3 在 DeepSeek-V2 MLA 上做的两处改动——NoPE 与 input-dependent full-rank output gate——各自解决什么问题？</li>
@@ -675,7 +675,7 @@
     <div class="context-label">每头维度 $d_h$</div><div class="context-value">4</div>
     <div class="context-label">头数 $n_h$</div><div class="context-value">2</div>
     <div class="context-label">KV 压缩维度 $d_c$</div><div class="context-value">3</div>
-    <div class="context-label">解耦 RoPE 维度 $d_h^R$</div><div class="context-value">2</div>
+    <div class="context-label">解耦 RoPE 维度 $d_h^R$（RoPE 在 S3 讲解，此处先列维度）</div><div class="context-value">2</div>
     <div class="context-label">层数 $l$</div><div class="context-value">1（先看单层）</div>
     <div class="context-label">输入 $\mathbf{h}_t$</div><div class="context-value">$(1, 0, 1, 0)$</div>
   </div>
@@ -829,7 +829,7 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <p>$$\mathbf{o}_{t,i} = \sum_{j=1}^{t} \mathrm{Softmax}_j\!\left(\frac{\mathbf{q}_{t,i}^\top \mathbf{k}_{j,i}}{\sqrt{d_h + d_h^R}}\right) \mathbf{v}_{j,i}^C.$$</p>
 
-<p>content 部分 $\mathbf{k}_t^C = W^{UK} \mathbf{c}_t^{KV}$ 不施加 RoPE，仍可被吸进 $W^Q$；RoPE 部分 $\mathbf{k}_t^R$ 不能吸收，必须单独缓存。因此 MLA 的 KV cache 从 S1 的 $d_c$ 变成 $d_c + d_h^R$<sup>[C1]</sup>。</p>
+<p>content 部分 $\mathbf{k}_t^C = W^{UK} \mathbf{c}_t^{KV}$ 不施加 RoPE，仍可被吸进 $W^Q$；RoPE 部分 $\mathbf{k}_t^R$ 不能吸收。$\mathbf{k}_t^R$ 由 $\mathbf{h}_t$ 直接投影（论文 Eq.(15) $W^{KR}\mathbf{h}_t$，不经 $\mathbf{c}_t^{KV}$），推理时不再保留 $\mathbf{h}_t$，故 $\mathbf{k}_t^R$ 须事先算好单独缓存。因此 MLA 的 KV cache 从 S1 的 $d_c$ 变成 $d_c + d_h^R$<sup>[C1]</sup>。</p>
 
 <p>用贯穿例子手算解耦。沿用 S2 的单头视角，取 $\mathbf{q}_{t,i}^R = (1, 0) \in \mathbb{R}^2$、$\mathbf{k}_t^R = (0, 1) \in \mathbb{R}^2$（这里略去 RoPE 旋转本身，用固定值表示"已经被 RoPE 旋转过的结果"），content 部分沿用 S1、S2 的单头 content query $\mathbf{q}_{t,i}^C = (1, 1, 0, 0)$、$\mathbf{k}_{t,i}^C = (1, 0, 1, 0)$。拼接后：</p>
 
@@ -928,14 +928,14 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <h3 id="k3-output-gate">改动二：input-dependent full-rank output gate</h3>
 
-<p>K3 给 MLA 末加了一道 channel-wise 乘性 gate<sup>[F6]</sup>：</p>
+<p>K3 给 MLA 末加了一道 channel-wise 乘性 gate<sup>[F6]</sup>（下面公式中的 $\mathbf{x}_t$ 即前文输入 $\mathbf{h}_t$——K3 报告记为 $\mathbf{x}_t$，本文 S5 沿用报告符号以与引文一致）：</p>
 
 <p>$$\mathbf{y}_t = W^O \left[ \mathrm{Sigmoid}(W^g \mathbf{x}_t) \odot \tilde{\mathbf{o}}_t \right].$$</p>
 
 <p>其中：</p>
 <ul>
   <li>$\tilde{\mathbf{o}}_t$ 是未 gate 的 MLA 输出（即 S1 公式里 $W^O$ 输入端的拼接向量 $[\mathbf{o}_{t,1}; \ldots; \mathbf{o}_{t,n_h}]$，$W^O$ 之前；区别于 $W^O$ 之后的 $\mathbf{u}_t$，仅强调"ungated"）。</li>
-  <li>$W^g \in \mathbb{R}^{d \times d}$ 是 gate 的投影矩阵，<b>满秩</b>（K3 §2.1.2 末段："full rank, matching the new parameterization used by KDA"）。</li>
+  <li>$W^g \in \mathbb{R}^{d \times d}$ 是 gate 的投影矩阵，<b>满秩</b>（K3 §2.1.1："full rank, matching the new parameterization used by KDA"）。</li>
   <li>$\mathrm{Sigmoid}(W^g \mathbf{x}_t) \in (0,1)^d$ 是逐通道的门信号，对 $\tilde{\mathbf{o}}_t$ 做通道级缩放。</li>
   <li>$\odot$ 是逐元素乘（Hadamard 积）。</li>
   <li>对应 <code>config.json</code> 中 <code>mla_use_output_gate: true</code>。</li>
@@ -953,11 +953,11 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <p>$$\mathrm{Sigmoid}(\mathbf{x}_t) \odot \tilde{\mathbf{o}}_t \approx (0.7311 \cdot 1, 0.5000 \cdot 2, 0.2689 \cdot 3, 0.5000 \cdot 4) = (0.7311, 1.0000, 0.8067, 2.0000).$$</p>
 
-<p>gate 在通道 0 放大（gate $> 0.5$，原值 1 → 0.73，相对其他通道被强调），通道 2 抑制（gate $< 0.5$，原值 3 → 0.81，相对被削弱）。这是 K3 §2.1.2 末段"each token to modulate the channels read from global attention"的字面含义。</p>
+<p>gate 在通道 0 相对强调（gate $> 0.5$，原值 1 → 0.73，Sigmoid 对所有通道都是绝对缩小，但此通道缩小最少，相对被强调），通道 2 抑制（gate $< 0.5$，原值 3 → 0.81，相对被削弱）。这是 K3 §2.1.2 末段"each token to modulate the channels read from global attention"的字面含义。</p>
 
 <details>
 <summary>补充：为什么 $W^g$ 满秩重要</summary>
-<p>若 $W^g$ 不满秩（比如秩 $r < d$），则 $W^g \mathbf{x}_t$ 只能取 $\mathbb{R}^r$ 子空间中的值，$\mathrm{Sigmoid}(W^g \mathbf{x}_t)$ 在剩余 $d - r$ 个通道上恒为常数 $\mathrm{Sigmoid}(0) = 0.5$，这些通道的 gate 退化成固定值 0.5，无法根据输入调制。$W^g$ 满秩保证每个通道都能根据输入独立变化。K3 §2.1.2 末段说这个 full-rank 参数化与 KDA 的 output gate 一致，是 K3 相对 Kimi Linear 的一个改动。</p>
+<p>若 $W^g$ 不满秩（比如秩 $r < d$），则 $W^g \mathbf{x}_t$ 只能取 $\mathbb{R}^r$ 子空间中的值，$\mathrm{Sigmoid}(W^g \mathbf{x}_t)$ 在剩余 $d - r$ 个通道上恒为常数 $\mathrm{Sigmoid}(0) = 0.5$，这些通道的 gate 退化成固定值 0.5，无法根据输入调制。$W^g$ 满秩保证每个通道都能根据输入独立变化。K3 §2.1.1 Full-rank gate 段说 K3 把 KDA 的 output gate 从 Kimi Linear 用的低秩参数化改为 input-dependent full-rank projection，MLA 的 output gate 沿用同一参数化。</p>
 </details>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
