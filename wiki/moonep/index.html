@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoonEP 完美均衡专家并行：让每个 EP rank 恰好收到 S×K token</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">MoonEP 完美均衡专家并行</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">MoonEP 完美均衡专家并行：让每个 EP rank 恰好收到 S×K token</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>MoE 训练里，每个 EP rank 收到多少 token 完全由 router 决定，而 router 偏好随每个 micro-batch、每一层都在变。结果有的 rank 收到 10 倍于其他 rank 的 token，有的几乎空转；通信 buffer 的形状每次都不一样，每层都得让 CPU 跟 GPU 同步一次才能确定本层到底算多少。MoonEP 解决的就是这件事——让每个 rank 每层都恰好收到 $S\times K$ 个 token，把"动态形状"彻底改成"静态形状"。</p>
+</div>
+
+<p>MoonEP 是 Moonshot AI 在 K3 训练系统里提出的 MoE 训练专家并行方案：在保留 DeepEP 等传统 EP 总体计算流的前提下，通过在线规划和迁移"冗余专家"让每个 EP rank 恰好收到 $S\times K$ 个 token，从而把负载、通信 buffer 形状和每层计算形状都变成静态已知（论断 C2）。本文依据 K3 技术报告 §5.2.1 与 §E 附录，不引用未公开的源码。</p>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>传统 EP 在 MoE 训练中为什么让 rank 间负载不均衡？MoonEP 用什么核心思路让每 rank 恰好收到 $S\times K$ 个 token？</li>
+    <li>"冗余专家"是什么？为什么预留 $E/R$ 个槽位足以保证可行解存在，这个界为什么"基本紧"？</li>
+    <li>完美均衡怎样让通信 buffer 从 $S\times K\times R$ 降到 $S\times K$、消除每层 host 同步？forward/backward 怎样在线规划与归还冗余专家？</li>
+    <li>MoonEP 解决什么、不解决什么？与 ECHO、UltraEP、DeepEP 的关键区别是什么？</li>
+  </ul>
+</section>
+
+<div class="context-box">
+  <p class="context-box-title">前置知识</p>
+  <div class="context-grid">
+    <div class="context-label">MoE 与 EP</div><div class="context-value">router、top-k、shared/routed expert、token-expert pair 与专家并行（EP）的 all-to-all dispatch/combine 数据流，见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a></div>
+    <div class="context-label">GPU 同步</div><div class="context-value">host-device 同步动机与 kernel launch 形状确定，见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型与 kernel 调度</a></div>
+    <div class="context-label">本文语境</div><div class="context-value">$S$ = 每 rank 本地序列长度；$K$ = 每 token 选的专家数；$E$ = 专家总数；$R$ = EP size（EP rank 数）。只讲训练场景。</div>
+  </div>
+</div>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Kimi K3 Technical Report §5.2.1（Perfectly Balanced Expert-Parallel MoE Training）与 §E（MoonEP General Upper Bound Proof）。MoonEP 开源仓库 <a href="https://github.com/MoonshotAI/MoonEP">github.com/MoonshotAI/MoonEP</a>；本页不引用其源码。</p>
+</blockquote>
+
+<p>下面先用一个最小例子把"不均衡"具体化。教学示例。 设 $E=4$ 个专家、$R=2$ 个 EP rank、每 rank 本地 $S=4$ 个 token、每 token 选 $K=1$ 个专家。每 rank 持有 $E/R=2$ 个本地专家：rank 0 持专家 $\{0,1\}$，rank 1 持专家 $\{2,3\}$。每 rank 发出 $S\times K=4$ 个 token-expert pair，全网络总 pair 数 $S\times K\times R=8$。完美均衡时每 rank 收到 $S\times K=4$ 个 pair。</p>
+
+<h2 id="s1-imbalance-and-idea">传统 EP 为什么让 rank 间负载不均衡？MoonEP 的核心思路是什么？</h2>
+
+<p>先回顾 EP 的基础数据流（详细见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>的 EP 章节）：每个 token 选 $K$ 个专家，专家被均匀分片到 $R$ 个 rank 上、每个 rank 持有 $E/R$ 个本地专家。一个 token 想算某个专家，就得把它的激活送到那个专家所在的 rank（home rank）上算，算完再送回原 rank。一次 forward 由两段 all-to-all 组成：dispatch 把 token-expert pair 送到 home rank，combine 把专家输出送回原 rank。</p>
+
+<p>关键问题在于：每 rank 收到多少 pair 完全取决于"我持有的 $E/R$ 个专家被全网 token 选了多少次"。这个数由 router 的偏好决定，而 router 偏好随每个 micro-batch、每一层都在变。报告原文（论断 C1）给出两个直接后果：<strong>计算不均衡降低训练吞吐</strong>，<strong>routed-expert 激活形状动态变化导致显存碎片</strong>。</p>
+
+<p>用贯穿例子把不均衡具体化。教学示例。 设 router 输出极端不均衡——8 个 token 的选择全部落到专家 0（在 rank 0 上）。那么 rank 0 收到全部 8 个 pair（过载 2 倍），rank 1 收到 0 个（完全空转）。总量守恒（公式 F4）仍成立：$8+0=8=S\times K\times R$，但每 rank 收到的数远偏离平衡值 $S\times K=4$。</p>
+
+<pre class="diagram">传统 EP dispatch（router 极端偏好专家 0 时）
+
+rank 0 持专家 {0,1}    rank 1 持专家 {2,3}
+   8 个 pair ──dispatch──►  [rank 0: 收 8 个 pair]   过载 2×
+                           [rank 1: 收 0 个 pair]  完全空转
+
+  每 rank 平衡值 = S×K = 4；实际 {8, 0} → 不均衡
+  每层 token 数变化 → 每层都要 host-device 同步拿形状</pre>
+
+<p>MoonEP 的核心新对象是<strong>冗余专家</strong>：把某个 home rank 上的专家<strong>临时复制</strong>到另一个 rank 上，让那个 rank 在本地处理原本要发出去的 token。这不是常驻副本——forward 阶段从当前 micro-batch、当前层 router 输出在线规划需要哪些冗余专家并预取，backward 阶段把冗余专家的梯度暂存到本地 reduce buffer、计算完成后再归约回 home rank。整个流程保留了 DeepEP 等传统方案的总体计算流，只是在 dispatch 之前多了一步在线规划（论断 C2）。</p>
+
+<p>有了冗余专家，MoonEP 把目标定为<strong>完美均衡</strong>：每 rank 恰好收到 $S\times K$ 个 token（论断 C3）。总量守恒保证这总是可能——$R$ 个 rank 各收 $S\times K$，总和 $S\times K\times R$ 恰好等于全网发出的 pair 总数。回到上面的例子：rank 0 过载 8 个、rank 1 空转 0 个，要把 rank 0 上的 4 个 pair 迁到 rank 1 上算。这 4 个 pair 都想算专家 0，所以 rank 1 需要专家 0 的一个副本——这就是一个冗余专家。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>传统 EP（如 DeepEP）</th><th>MoonEP 完美均衡</th></tr></thead>
+<tbody>
+<tr><td>每 rank 收到 token 数</td><td>由 router 偏好决定，随层和 micro-batch 变化</td><td>恒等于 $S\times K$</td></tr>
+<tr><td>计算形状</td><td>每层动态变化</td><td>所有层静态已知</td></tr>
+<tr><td>是否引入新对象</td><td>否</td><td>冗余专家（forward 预取、backward 归还）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>本章回答了 Q1：传统 EP 不均衡的根源是 router 偏好动态、rank 收到 pair 数完全被动；MoonEP 引入冗余专家作为负载载体，把过载 rank 的 token 迁到空转 rank 上本地计算，从而让每 rank 恰好收到 $S\times K$。但这里马上出现下一个问题：要迁多少个冗余专家才够？</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说明传统 EP 下某 rank 收到多少 pair 由什么决定。</li>
+  <li>说明"冗余专家"是什么、它为什么能消除不均衡，并指出它是常驻还是临时副本。</li>
+  <li>在 $E=4,R=2,S=4,K=1$ 的例子里，rank 0 收到 8、rank 1 收到 0 时，总量与每 rank 平衡值 $S\times K=4$ 之间是什么关系？</li>
+</ul>
+
+<h2 id="s2-bound-and-tightness">冗余专家要多少个才够？$E/R$ 上界与"基本紧"</h2>
+
+<p>现在把"要多少冗余专家"形式化。给定一个 router 输出 $I$，规划 $P$ 决定哪些专家被复制到哪些 rank。记 $m_r(P)$ 为规划 $P$ 下 rank $r$ 上的冗余专家数。MoonEP 的规划目标是</p>
+
+$$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
+
+<p>这是个 min-max 目标——最小化"任意 rank 上冗余数的最大值"。注意它不要求每 rank 冗余数相等，只要求最坏那个 rank 别太离谱。这个目标的选择直接对应工程预留：每 rank 预留 $M(I)$ 个冗余槽位即可保证该 router 输出下有可行规划。</p>
+
+<p>报告 §E 证明了两个定理。第一个是一般上界（论断 F2）：</p>
+
+<p><strong>Theorem 1</strong>：对任意 router 输出 $I$，$M(I)\le E/R$。</p>
+
+<p>证明的核心是一条关键引理：<strong>存在一种规划 $P^*$，使每 rank 的远端 token 全部来自同一个 home rank</strong>。构造过程是迭代的填充：初始每 rank 只有本地 token，按是否达到 $S\times K$ 分为 underloaded 和 overloaded；每次取一个 underloaded rank 和一个 overloaded rank，把 overloaded rank 上的 token 迁过来填满 underloaded rank 到 $S\times K$；overloaded rank 可能仍过载、可能恰好平衡、可能变 underloaded，放回对应集合。重复直到全部平衡。</p>
+
+<p>这个填充过程有两个关键性质。第一，每次 fill 让一个 underloaded rank 达到 $S\times K$ 且此后不再变化，所以至多 $R-1$ 次 fill 就终止。第二，每个 rank 至多被 fill 一次，所以它的远端 token 全部来自同一个 home rank。既然远端 token 同源 rank $s$，而这些 token 想算的都是 rank $s$ 上的本地专家，而 rank $s$ 至多有 $E/R$ 个本地专家（专家均匀分片），所以 rank $r$ 上的冗余专家数 $m_r(P^*)\le E/R$。这就推出 $M(I)\le E/R$。</p>
+
+<p>工程含义：每 rank 预留 $E/R$ 个冗余槽位就保证<strong>总有可行规划</strong>，训练不会因为"找不到满足条件的规划"而中断。</p>
+
+<details>
+<summary>补充：Theorem 1 构造性证明的完整复述与终止性论证</summary>
+<p>报告 §E 原文（约 2947–2962 行）的完整论证：</p>
+<p>目标：证明对任意 router 输出 $I$，$M(I)\le E/R$。</p>
+<p>关键引理：存在规划 $P^*$ 使每 EP rank 收到恰好 $S\times K$ 个 token，且每 rank 的远端 token 全来自同一个 EP rank。</p>
+<p>构造：初始每 rank 只有本地 token，按是否达到 $S\times K$ 分为 underloaded / overloaded 两集合。重复以下操作：取一个 underloaded rank $u$ 和一个 overloaded rank $o$；把 $o$ 上的 token 迁到 $u$ 直到 $u$ 达到 $S\times K$；$o$ 可能仍过载、可能恰好平衡、可能变 underloaded，放回对应集合；$u$ 已平衡，移出 underloaded 集合。</p>
+<p>终止性：每次 fill 让一个 underloaded rank 达到 $S\times K$ 且此后不再变化（后续 fill 只往其他 underloaded rank 迁 token，不会动已平衡的 rank），所以至多 $R-1$ 次 fill 后所有 rank 平衡，过程终止。</p>
+<p>同源性：每个 rank 至多被 fill 一次（一旦平衡就移出 underloaded 集合，不会再被选为填充目标），所以它的远端 token 全部来自同一个 home rank。引理证毕。</p>
+<p>推出上界：rank $r$ 的远端 token 全来自 rank $s$，这些 token 想算的都是 rank $s$ 上的本地专家；rank $s$ 至多 $E/R$ 个本地专家（专家均匀分片），所以 $m_r(P^*)\le E/R$。故 $M(I)=\min_P\max_r m_r(P)\le\max_r m_r(P^*)\le E/R$。即公式 (28)。</p>
+</details>
+
+<p>第二个定理给出界的<strong>基本紧性</strong>（论断 F3）：</p>
+
+<p><strong>Theorem 2</strong>：存在 router 输出 $I^*$ 使 $M(I^*)=\lceil E(R-1)/R^2\rceil\approx E/R$（大 $R$）。</p>
+
+<p>最坏构造：让 rank 0 上的 $E/R$ 个专家收到 0 个 token，其余 $R-1$ 个 rank 上的 $E(R-1)/R$ 个专家均分全部 $S\times K\times R$ 个 pair。每个被使用的专家收到 $SKR^2/(E(R-1))$ 个 pair。rank 0 必须从远端收 $S\times K$ 个 pair，这些 pair 至少涉及 $\lceil S K / (S K R^2/(E(R-1)))\rceil=\lceil E(R-1)/R^2\rceil$ 个不同专家，所以 rank 0 至少需要这么多冗余专家。反向用填充过程构造规划可以把每 rank 冗余数控制在这个值，故等号成立。</p>
+
+<p>大 $R$ 时 $\lceil E(R-1)/R^2\rceil\approx E/R$，所以<strong>不可能有显著小于 $E/R$ 的通用上界</strong>——这就是"基本紧"。MoonEP 预留 $E/R$ 槽位不是工程经验值，而是有证明的最优预留。</p>
+
+<details>
+<summary>数字例子：在 $E=4,R=2$ 的贯穿例子里手算 $E/R$ 与最坏构造</summary>
+<p>教学示例。 沿用 $E=4, R=2, S=4, K=1$，rank 0 持专家 $\{0,1\}$，rank 1 持专家 $\{2,3\}$。$E/R=4/2=2$，所以每 rank 预留 2 个冗余槽位即保证可行。</p>
+<p><strong>情形 A（一般不均衡，用界但不达上界）</strong>：8 个 pair 全部落到专家 0（在 rank 0 上）。rank 0 过载（收到 8）、rank 1 空转（收到 0）。填充：把 4 个 pair 从 rank 0 迁到 rank 1。这 4 个 pair 都想算专家 0，所以 rank 1 需要专家 0 的副本——1 个冗余专家。验证 $1\le E/R=2$，未达上界。</p>
+<p><strong>情形 B（最坏构造，界达到）</strong>：rank 0 上的专家 $\{0,1\}$ 收到 0 个 pair，rank 1 上的专家 $\{2,3\}$ 均分全部 8 个 pair（每个专家收 4 个）。rank 0 必须从远端收 $S\times K=4$ 个 pair。最优规划让 rank 0 取同一专家的全部 4 个 pair（如全取专家 2），只需 1 个冗余专家。验证 $M(I^*)=1=\lceil E(R-1)/R^2\rceil=\lceil 4\times 1/4\rceil=1&lt;E/R=2$。此例展示小 $R$ 下 $\lceil E(R-1)/R^2\rceil$ 严格小于 $E/R$，$E/R$ 仅大 $R$ 渐近紧。</p>
+</details>
+
+<p>本章回答了 Q2：$E/R$ 上界来自构造性证明的关键引理（远端 token 同源 → home rank 至多 $E/R$ 本地专家 → 冗余数 $\le E/R$）；基本紧来自最坏构造（rank 0 空载、其余均分）使冗余数达到 $\lceil E(R-1)/R^2\rceil\approx E/R$。预留 $E/R$ 槽位即保证总有可行解，且不可能显著更小。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说明 $M(I)=\min_P\max_r\{m_r(P)\}$ 中 min 和 max 各自的含义，以及为什么这是 min-max 而不是求平均。</li>
+  <li>说明"远端 token 同源"为什么推出 $m_r(P^*)\le E/R$，关键用了"home rank 上至多 $E/R$ 个本地专家"这一事实。</li>
+  <li>说明 Theorem 2 最坏构造里 rank 0 为什么必须收 $\lceil E(R-1)/R^2\rceil$ 个不同专家，以及大 $R$ 下为什么近似 $E/R$。</li>
+  <li>说明"基本紧"对工程预留槽位意味着什么——能不能预留显著少于 $E/R$？</li>
+</ul>
+
+<h2 id="s3-buffer-sync-flow">完美均衡怎样让 buffer 降到 $S\times K$、消除 host 同步？forward/backward 怎样跑？</h2>
+
+<p>有了 $E/R$ 上界保证可行解，接下来看完美均衡带来的三个工程收益怎样落地，以及 MoonEP 的 forward/backward 与传统 EP 有什么不同。</p>
+
+<h3 id="s3-1-buffer">通信 buffer 从 $S\times K\times R$ 降到 $S\times K$</h3>
+
+<p>传统 EP（如 DeepEP）在最坏不均衡下要支持 zero-copy 数据路径，需要 $S\times K\times R$ 的通信 buffer（论断 C7）——因为任何一个 rank 都可能收到接近全网总量的 pair，buffer 必须按最坏情况预留。注意这里的 $S\times K\times R$ 是<strong>最坏不均衡</strong>下的预留，不是 DeepEP 的常态开销；非最坏情况下 DeepEP 可以用更小 buffer。</p>
+
+<p>MoonEP 因为保证每 rank 恰好收到 $S\times K$ 个 pair，buffer 形状恒定为 $S\times K$，与 router 输出无关。$R$ 倍的节省在最坏情况下是直接的显存收益。</p>
+
+<h3 id="s3-2-sync">静态形状消除每层 host 同步</h3>
+
+<p>传统 EP 实现里，per-expert token 数随 step 和层变化，host 必须在<strong>每一层</strong>与 device 同步一次拿到真实计算形状，才能 launch 该层的 expert 计算 kernel（论断 C8）。这个同步点会 stall 流水线、放大 host-side kernel-launch overhead。</p>
+
+<p>MoonEP 让每 rank 每层都收 $S\times K$，所有层的计算形状<strong>静态已知</strong>——这意味着形状在 launch 前就确定，不需要 host 在每层等 device 报数。报告原文（论断 C8）说这"消除每层 MoE host 同步、缓解 host-side kernel-launch overhead"。</p>
+
+<h3 id="s3-3-forward">forward：planning kernel + 零拷贝 dispatch</h3>
+
+<p>MoonEP 的 forward 在传统 dispatch 之前多一步在线规划（论断 C4、C6）：</p>
+
+<ol>
+  <li><strong>planning kernel</strong>：从当前 micro-batch、当前层的 router 输出，在线计算哪些专家要复制到哪些 rank 上。报告明确说每步求精确最优代价过高（"prohibitively expensive"），所以 GPU planning kernel 只求近最优——开销可忽略、且总尊重 $E/R$ 上界。离线用 ILP 求代表性 case 的精确解作为 GPU kernel 的参考。</li>
+  <li><strong>预取冗余专家</strong>：把要用的冗余专家权重拉到本地，在 routed-expert 计算之前完成。</li>
+  <li><strong>fused permute/unpermute dispatch</strong>：planning kernel 已经预计算了每个 token 的目的地，所以 token 直接被发到远端 rank 上<strong>expert-grouped 位置</strong>（同一专家的所有 token 连续存放，便于后续 GEMM），并直接返回通信 buffer 的 view 给计算 kernel，<strong>免中间拷贝</strong>（论断 C6）。</li>
+</ol>
+
+<h3 id="s3-4-backward">backward：梯度暂存 + reduce 回 home rank</h3>
+
+<p>backward 阶段冗余专家也要算梯度，但这些梯度属于 home rank 而非本地。MoonEP 的处理（论断 C5）：</p>
+
+<ol>
+  <li><strong>暂存本地 reduce buffer</strong>：冗余专家的梯度先写到本地一个 reduce buffer，不直接写回原梯度 buffer。</li>
+  <li><strong>reduce 回 home rank</strong>：该 rank 上所有冗余专家计算完成后，把暂存的梯度归约回它们各自 home rank 的梯度 buffer。这里的 "reduce" 与 all-reduce 同语义（跨 rank 归约），但只针对冗余专家的梯度，不是全量梯度。</li>
+</ol>
+
+<p>这个流程保证冗余专家只是<strong>临时副本</strong>：forward 预取、用完即弃；backward 算完梯度归还原 rank。下一层、下一个 micro-batch 会重新规划。</p>
+
+<pre class="diagram">MoonEP forward 与 backward 数据流（vs 传统 EP 多了 planning 与 reduce-back）
+
+[forward]
+  router 输出 ──► planning kernel（在线规划冗余专家，近最优、尊重 E/R）
+              │
+              ├─► 预取冗余专家权重到本地
+              │
+              └─► fused permute：token 直接发到远端 expert-grouped 位置
+                                 返回 buffer view，免中间拷贝
+                                 每个收到 S×K 个 pair（完美均衡）
+
+[backward]
+  冗余专家梯度 ──► 本地 reduce buffer（暂存，不直接写回）
+                │
+                └─► 计算完成后 reduce 回 home rank 的梯度 buffer
+                    （只针对冗余专家梯度，不是全量 all-reduce）</pre>
+
+<details class="code-details">
+<summary>伪代码：MoonEP forward 的 planning + dispatch（不是 Python）</summary>
+<div class="code-block">
+<pre><code class="language-text">输入：
+  router 输出 I（当前 micro-batch、当前层的 top-k 选择）
+  每个专家的 home rank 表 home[e] ∈ {0,…,R-1}
+  每 rank 本地 token 数 S、每 token 选 K 个专家、专家总数 E、EP size R
+  每 rank 预留的冗余槽位 E/R
+状态：
+  本地 token 池 local_tokens（每 rank S 个）
+  通信 buffer recv_buf[S×K]（固定大小，形状静态）
+  冗余专家权重缓存 redund_w[E/R]（最多 E/R 个槽位）
+核心步骤：
+  # 1. planning：在线决定哪些专家要复制到哪些 rank
+  plan = planning_kernel(I, home, S, K, E, R)   # 近最优，m_r ≤ E/R
+  
+  # 2. 预取冗余专家权重
+  for (expert e, target_rank r) in plan.redundant_copies:
+      redund_w[r].pull(home[e], e)   # 从 home rank 拉专家 e 的权重
+  
+  # 3. fused permute dispatch：每 token 直接发到远端 expert-grouped 位置
+  for token t in local_tokens:
+      for expert e in t.selected_experts:
+          dest_rank = plan.destination(t, e)   # 已预计算
+          # token 直接写到 dest_rank 的 recv_buf 中 expert-grouped 位置
+          # 不经过中间 buffer
+  # 返回 recv_buf 的 view 给本地计算 kernel
+  return recv_buf.view()
+输出：
+  recv_buf：每 rank 恰好收到 S×K 个 pair，按 expert 分组连续存放
+  plan：供 backward 阶段 reduce-back 使用</code></pre>
+</div>
+<p>伪代码只展示 planning、预取、dispatch 三个核心步骤；combine、router 训练、辅助损失等通用 MoE 步骤不在本伪代码里。实际 GPU planning kernel 的具体算法报告未公开，只声明近最优、开销可忽略、总尊重 $E/R$。</p>
+</details>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>传统 EP（如 DeepEP）</th><th>MoonEP</th></tr></thead>
+<tbody>
+<tr><td>最坏通信 buffer</td><td>$S\times K\times R$</td><td>固定 $S\times K$</td></tr>
+<tr><td>计算形状</td><td>每层动态</td><td>所有层静态</td></tr>
+<tr><td>每层 host-device 同步</td><td>需要</td><td>不需要</td></tr>
+<tr><td>forward 多出的步骤</td><td>—</td><td>planning kernel + 预取冗余专家</td></tr>
+<tr><td>backward 多出的步骤</td><td>—</td><td>暂存本地 reduce buffer + reduce 回 home rank</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>本章回答了 Q3：完美均衡让 buffer 从 $S\times K\times R$ 降到 $S\times K$（因每 rank 恒收 $S\times K$）、让形状静态化消除每层 host 同步（因形状 launch 前就已知）；forward 在 dispatch 前加 planning + 预取，并用 fused permute 把 token 直接发到 expert-grouped 位置免中间拷贝；backward 把冗余专家梯度暂存本地 reduce buffer 再 reduce 回 home rank，使冗余专家成为临时副本。本章讲了三个工程收益，但 MoonEP 的边界在哪里？</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说明 DeepEP 在最坏不均衡下 buffer 为什么是 $S\times K\times R$，MoonEP 为什么只需 $S\times K$——并指出"$S\times K\times R$"是<strong>最坏</strong>情况限定，不是 DeepEP 的常态开销。</li>
+  <li>说明传统 EP 为什么每层需要 host-device 同步，MoonEP 为什么不需要。</li>
+  <li>按顺序列出 MoonEP forward 的三个关键步骤（planning、预取、fused permute dispatch）。</li>
+  <li>按顺序列出 MoonEP backward 的两个关键步骤（暂存本地 reduce buffer、reduce 回 home rank），并说明为什么这让冗余专家成为临时副本。</li>
+</ul>
+
+<h2 id="s4-boundary-and-comparison">MoonEP 解决什么、不解决什么？与 ECHO、UltraEP、DeepEP 的区别</h2>
+
+<h3 id="s4-1-solves">MoonEP 解决的三个问题</h3>
+
+<p>前三章已得结论，这里汇总：MoonEP 解决<strong>训练时 EP 的 rank 间负载不均衡</strong>（S1）、<strong>通信 buffer 形状动态</strong>（S3）、<strong>每层 host 同步开销</strong>（S3）。三个问题都源自同一个根因——router 偏好动态导致每 rank 收到 token 数动态——所以同一个机制（完美均衡）一次性解决。</p>
+
+<h3 id="s4-2-not-solves">MoonEP 不解决的三个问题</h3>
+
+<p>报告 §5.2.1 最后一段（论断 C9）明确指出：即使 rank 间总量完美均衡，<strong>每 rank 内部 per-expert token 数仍可能偏斜</strong>，固定顺序、workload-oblivious 的调度会让这种偏斜变成跨 SM 的 makespan 不均。这是 MoonEP 不解决的问题，由独立的 <strong>Expert-GEMM workload-aware scheduler</strong> 处理：launch 前根据当前 token 分布调参、launch 后固定；系数通过离线 autotuning 标定（具体算法报告未公开，本页不展开）。同时，<strong>shared expert 的 GEMM 分到独立 stream</strong> 与其他 kernel 重叠。</p>
+
+<p>另外两个 MoonEP 不解决的问题：<strong>router 本身的训练</strong>——router 是否均衡训练由辅助损失负责，MoonEP 只在 router 输出给定后做规划，不修改 router（这是常见误解，见下方边界）；<strong>内存碎片</strong>——由 §5.2.2 memory-efficient training 独立处理（如 unified activation manager、memory-efficient MoE），与完美均衡无关。</p>
+
+<h3 id="s4-3-vs-echo-ultra">与 ECHO、UltraEP 的区别</h3>
+
+<p>报告 §5.2.1（论断 C10）明确对比：ECHO 和 UltraEP <strong>预设冗余专家数或施加 per-rank token cap</strong>，训练在找不到满足 cap 的可行规划时会<strong>被迫中断</strong>，且 cap 本身需要手动调参、仍留残余不均衡。MoonEP 用 $E/R$ 这个<strong>有证明的、基本紧的上界</strong>预留槽位，保证总有可行解、不需手动调参。这是 MoonEP 区别于 ECHO/UltraEP 的核心：把"经验值"换成"有证明的界"。</p>
+
+<h3 id="s4-4-vs-deepep">与 DeepEP 的区别</h3>
+
+<p>MoonEP <strong>保留 DeepEP 的总体计算流</strong>（论断 C2），只是在其上增加了在线规划与冗余专家迁移。所以 MoonEP 不是 DeepEP 的替代，而是 DeepEP 之上的一层扩展：DeepEP 提供 dispatch/combine 的基础数据路径，MoonEP 决定哪些 token 走冗余专家这条路。最坏 buffer 从 $S\times K\times R$ 降到 $S\times K$ 是这一扩展带来的直接收益。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>方案</th><th>是否有界保证</th><th>是否需手动调 cap</th><th>最坏通信 buffer</th><th>训练是否会因无解中断</th></tr></thead>
+<tbody>
+<tr><td>MoonEP</td><td>是，$E/R$（Theorem 1）</td><td>否</td><td>$S\times K$</td><td>不会</td></tr>
+<tr><td>DeepEP</td><td>否（传统方案）</td><td>—</td><td>$S\times K\times R$（最坏）</td><td>不会（但不保证均衡）</td></tr>
+<tr><td>ECHO</td><td>否，预设冗余数</td><td>是</td><td>—</td><td>会（无解时）</td></tr>
+<tr><td>UltraEP</td><td>否，施加 token cap</td><td>是</td><td>—</td><td>会（无解时）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>本章回答了 Q4：MoonEP 解决负载、buffer、host 同步三个问题；不解决 per-expert 偏斜（由 Expert-GEMM scheduler 处理）、router 训练（由辅助损失负责）、内存碎片（由 §5.2.2 处理）；与 ECHO/UltraEP 区别在"有界保证"对"预设 cap"，与 DeepEP 关系是"保留计算流 + 增加规划"。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>列出 MoonEP 解决的三个问题与不解决的三个问题，并说明每个"不解决"由谁处理。</li>
+  <li>说明 ECHO/UltraEP 为什么训练可能中断，MoonEP 为什么不会——关键差异是"经验值"还是"有证明的界"。</li>
+  <li>说明 MoonEP 与 DeepEP 的关系：是替代还是扩展？最坏 buffer 从多少降到多少？</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>C1–C10 全部来自 Kimi K3 Technical Report §5.2.1（约 1305–1354 行）与 §E（约 2941–3022 行），文件位置 <code>/tmp/kimi-k3-research/k3-report.txt</code>。具体定位：</p>
+<ul>
+  <li>C1（传统 EP 不均衡 + 内存碎片）：§5.2.1 开头，报告 1305–1308 行。</li>
+  <li>C2（MoonEP 用动态冗余专家 + forward/backward 总述）：报告 1308–1313 行。</li>
+  <li>C3（每 rank 收 $S\times K$）：报告 1315–1317 行。</li>
+  <li>C4（online planning + ILP + GPU kernel 近最优）：报告 1325–1327 行。</li>
+  <li>C5（backward 暂存 + reduce 回 home rank）：报告 1312–1313 行。</li>
+  <li>C6（fused permute/unpermute + buffer view 免拷贝）：报告 1329–1332 行。</li>
+  <li>C7（DeepEP 最坏 $S\times K\times R$ vs MoonEP $S\times K$）：报告 1332–1334 行，明确 "Under worst-case imbalance" 限定。</li>
+  <li>C8（静态形状消除每层 host 同步）：报告 1336–1346 行。</li>
+  <li>C9（per-expert 偏斜 + Expert-GEMM scheduler + shared expert 独立 stream）：报告 1348–1354 行。</li>
+  <li>C10（ECHO/UltraEP 预设 cap 可能中断）：报告 1320–1323 行。</li>
+</ul>
+
+<h3>核心公式与来源</h3>
+<ul>
+  <li>F1（$M(I)=\min_P\max_r\{m_r(P)\}$）：§E 开头，报告 2942–2943 行。</li>
+  <li>F2（Theorem 1，$M(I)\le E/R$）：§E Theorem 1，报告 2947–2962 行。关键引理"远端 token 同源"由构造性填充过程证明。</li>
+  <li>F3（Theorem 2，$M(I^*)=\lceil E(R-1)/R^2\rceil\approx E/R$）：§E Theorem 2，报告 3005–3022 行。最坏构造：rank 0 空载、其余 $R-1$ rank 均分。</li>
+  <li>F4（总量守恒 $R\times S\times K=S\times K\times R$）：由 C3 与 token-expert pair 总量守恒直接推出，无独立报告来源。</li>
+</ul>
+
+<h3>教学示例</h3>
+<p>$E=4, R=2, S=4, K=1$ 的贯穿例子及其两种 router 输出（情形 A 一般不均衡、情形 B 最坏构造）是<strong>教学构造</strong>，目的在于让 $E/R$ 上界、最坏构造、forward/backward 流程在 $\le 4$ 的数字上可手算复算。<strong>不来自 K3 报告</strong>，不代表真实训练配置。报告未公开 K3 训练 2.8T MoE 的具体 $E, R, K, S$ 取值。</p>
+
+<h3>教学解释与类比边界</h3>
+<ul>
+  <li>"冗余专家 = 临时副本"：用于强调 forward 预取、backward 归还的特性。失效边界：若 router 极端偏好长期不变，冗余专家可能在多个 micro-batch 间复用副本，但 MoonEP 仍按每 micro-batch、每层重新规划，不假设长期复用。</li>
+  <li>"reduce-back 与 all-reduce 同语义但只针对冗余专家梯度"：用于帮助理解 reduce-back 的归约语义。失效边界：reduce-back 不是全量梯度 all-reduce，只涉及当前层、当前 micro-batch 用到的冗余专家梯度。</li>
+</ul>
+
+<h3>教学简化及其限制</h3>
+<ul>
+  <li>伪代码省略了 combine、router 训练、辅助损失、optimizer step 等通用 MoE 步骤，只展示 planning、预取、dispatch 三个 MoonEP 特有步骤。真实工程还包括 stream 调度、内存池管理等。简化不改变 MoonEP 机制的关键构成（planning、冗余专家、零拷贝 dispatch、reduce-back）。</li>
+  <li>Theorem 1 构造性证明的复述省略了原证明中"overloaded rank 在 fill 后可能仍过载、可能恰好平衡、可能变 underloaded"的状态转移细节对算法复杂度的分析，只保留终止性与同源性两个关键性质。完整证明见补充折叠块与报告 §E。</li>
+  <li>Theorem 2 最坏构造的下界公式 $\lceil E(R-1)/R^2\rceil$ 在小 $R$ 下严格小于 $E/R$，界仅大 $R$ 渐近紧；数字例子折叠块手算验证 $E=4,R=2$ 时 $M(I^*)=1&lt;E/R=2$。</li>
+  <li>DeepEP 的 $S\times K\times R$ 是<strong>最坏不均衡</strong>下的 buffer 预留，不是 DeepEP 常态开销；本页在正文与表格中均标明这一限定。</li>
+</ul>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

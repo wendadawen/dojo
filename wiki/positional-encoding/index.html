@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>位置编码基础：给不含位置信息的注意力补充位置信号的四类方案</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">位置编码基础</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">位置编码基础：给不含位置信息的注意力补充位置信号的四类方案</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>把"我打你"和"你打我"这两句话喂给一个完全没有位置编码的 Transformer——模型能分清谁打谁吗？答案是：不能。两句话的 token 完全相同，只是顺序不同；而自注意力只看内容匹配、不看顺序，交换 token 顺序后每个位置的输出值不变。要让模型分清"谁在前谁在后"，必须把位置信息注入进去。<strong>位置编码</strong>就是干这件事的一类方法：给本身不含位置感知的自注意力补充位置信号。</p>
+</div>
+
+<div class="context-box">
+  <p class="context-box-title">本页定位</p>
+  <div class="context-grid">
+    <div class="context-label">概念</div><div class="context-value">位置编码——给排列等变的自注意力注入位置信号的一类方法</div>
+    <div class="context-label">解决什么</div><div class="context-value">自注意力对输入行重排不变，模型无法区分 token 顺序；位置编码通过加位置向量、加分数偏置或乘位置旋转把位置信号注入</div>
+    <div class="context-label">四类方案</div><div class="context-value">绝对正弦（Vaswani 2017）、可学习绝对、相对偏置（T5）、旋转（RoPE）；另有 NoPE（不施加）</div>
+    <div class="context-label">主要依据</div><div class="context-value">Vaswani et al. 2017 §3.5；Raffel et al. 2019 §3.2；RoPE/NoPE 见独立概念页</div>
+    <div class="context-label">适用场景</div><div class="context-value">所有 Transformer 架构的位置信号注入设计</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>为什么 Transformer 需要位置编码？注意力本身的什么性质导致位置信息缺失？</li>
+    <li>写出绝对正弦位置编码公式，解释每个符号，并手算 d=4、pos=1、2 的 PE 向量；说明为什么用不同频率的 sin/cos。</li>
+    <li>可学习绝对位置编码与正弦位置编码的区别与权衡是什么？</li>
+    <li>相对位置编码（T5 bias）的机制是什么，与绝对位置编码的本质区别是什么？</li>
+    <li>用一张表对比四类方案与 NoPE 的核心权衡，并说明 K3 为什么选 NoPE。</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §3.5 位置编码（Eq.(3)(4) 正弦公式、Table 3 row (e) learned 对比）；Raffel et al. 2019, "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", JMLR, §3.2 相对位置偏置。RoPE 与 NoPE 的完整机制分别见已有概念页。</p>
+</blockquote>
+
+<p>本文依赖几个已有概念页，正文只引用结论不内联展开：<strong>自注意力</strong>的完整机制见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>，排列等变性的形式化讨论见 <a href="../../wiki/nope/index.html">NoPE</a>。<strong>RoPE</strong>（旋转位置编码）与 <strong>NoPE</strong>（无位置编码）各有独立概念页，本页只在对比章节引用。<strong>Kimi K3</strong> 的 MLA 与 NoPE 选择见 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a>，MLA 的矩阵吸收见 <a href="../../wiki/mla/index.html">MLA</a>。</p>
+
+<p>先看一个贯穿全文的问题：用一个 $d_{model}=4$ 的最小正弦位置编码，pos=1 和 pos=2 的位置向量长什么样？这个问题会在第二章手算回答，并在第三章以后作为对比基准。</p>
+
+<h2 id="why-positional-encoding">为什么 Transformer 需要位置编码——注意力的排列等变性</h2>
+
+<p>标准自注意力做的事情是"用 query 和 key 做匹配，按匹配程度对 value 加权求和"（见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>）。它只关心两个 token 的内容像不像，不关心它们各自在第几位。这引出一个问题：如果模型不知道 token 的位置，它还能区分"我打你"和"你打我"吗？</p>
+
+<p>要回答它，先看注意力本身的一个性质。如果注意力是双向的（每个位置都能看到所有位置）并且不给任何位置信息，那么交换输入顺序后，每个位置仍然看到同样的一组 token、按同样的内容匹配得到同样的权重——只是输出跟着挪了位置，而每个位置上的输出值不变。这种现象叫<strong>排列等变</strong>（permutation-equivariant）：模型对"谁先谁后"没有真正的区分能力。排列等变的更完整讨论见 <a href="../../wiki/nope/index.html">NoPE</a> 页面，本文只用这个结论。</p>
+
+<p>正因如此，"我打你"和"你打我"在无位置信息时不可区分：两个句子的 token 集合相同，注意力只按内容匹配，交换顺序后每个位置看到的内容集合不变，输出值也不变。但两句话意思完全相反——位置信息对语义至关重要。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>架构</th><th>位置感知来源</th><th>是否需要外接位置信号</th></tr></thead>
+<tbody>
+<tr><td>RNN</td><td>按时间步逐步处理，隐状态天然带顺序</td><td>不需要</td></tr>
+<tr><td>CNN（kernel $k$）</td><td>卷积核的局部窗口隐含相对位置</td><td>部分需要（远距离仍需补充）</td></tr>
+<tr><td>自注意力</td><td>无——所有位置同时交互，对行重排不变</td><td>需要</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>RNN 靠"逐步处理"天然带顺序，CNN 靠"局部窗口"隐含相对位置，自注意力把所有位置同时拉到一起、丢掉了顺序——所以它是唯一必须外接位置信号的。这个"外接位置信号"就是<strong>位置编码</strong>（Positional Encoding）：给本身不含位置信息的注意力补充位置信号的一类方法。</p>
+
+<p>位置编码不是单一方法，而是一类方法。按"位置信号加在哪里、怎么加"可以分成四类：加在输入嵌入上的绝对位置编码（正弦或可学习）、加在注意力分数上的相对位置编码、乘在 query/key 上的旋转位置编码（RoPE），以及完全不施加的 NoPE。下面四章依次讲清前三类的机制与权衡，最后一章总收束对比并解释 NoPE 的选择。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说出注意力为什么不含位置信息（排列等变——交换顺序后每个位置输出值不变）。</li>
+  <li>RNN、CNN、自注意力三者哪个需要外接位置信号？为什么？</li>
+  <li>"我打你"和"你打我"在无位置信息时为什么不可区分？</li>
+</ul>
+
+<p>知道了"为什么需要"，下一章看 Vaswani 2017 给出的第一种注入方式——绝对正弦位置编码。</p>
+
+<h2 id="sinusoidal-pe">绝对正弦位置编码——Vaswani 2017 的 sin/cos 公式与手算</h2>
+
+<p>位置编码最直接的做法是：给每个位置 $pos$ 生成一个与位置绑定的向量 $PE_{pos}$，加到那个位置的 token 嵌入上。注入方式是</p>
+
+<p>$$x'_{pos} = x_{pos} + PE_{pos},\qquad\text{F2, Vaswani 2017 §3.5}$$</p>
+
+<p>其中 $x_{pos}$ 是位置 $pos$ 的 token 嵌入，$PE_{pos}$ 是位置 $pos$ 的位置向量，两者都是 $d_{model}$ 维。位置信息通过相加注入到嵌入里，之后被 $W^Q$、$W^K$、$W^V$ 投影到注意力使用的子空间。</p>
+
+<p>Vaswani et al. 2017 给出的位置向量生成公式是</p>
+
+<p>$$PE_{(pos,2i)}=\sin\!\left(\frac{pos}{10000^{2i/d_{model}}}\right),\qquad PE_{(pos,2i+1)}=\cos\!\left(\frac{pos}{10000^{2i/d_{model}}}\right).\qquad\text{F1, Vaswani 2017 §3.5 Eq.(3)(4)}$$</p>
+
+<p>逐个符号解释：</p>
+<ul>
+  <li>$pos$：token 在序列中的位置索引，取 $0, 1, 2, \ldots$。</li>
+  <li>$i$：维度对索引，取 $0, 1, \ldots, d_{model}/2-1$。第 $i$ 对覆盖维度 $2i$（用 sin）与 $2i+1$（用 cos），两个维度共用同一个频率。</li>
+  <li>$d_{model}$：token 嵌入维度，也是位置向量维度；Vaswani 2017 base 模型为 512。</li>
+  <li>$10000$：base 常数，控制频率几何递减的速率；论文取 10000。</li>
+  <li>偶数维用 sin、奇数维用 cos；同一对 $(2i, 2i+1)$ 共用频率 $\omega_i = 1/10000^{2i/d_{model}}$。</li>
+</ul>
+
+<p>关键在于频率 $\omega_i$ 随 $i$ 几何递减。把第 $i$ 对的角频率记为 $\omega_i = 1/10000^{2i/d_{model}}$，则 $i$ 每加 1，$\omega_i$ 乘上 $10000^{-2/d_{model}}$。这意味着不同维度对编码不同尺度的位置信息：</p>
+<ul>
+  <li>$i$ 小（如 $i=0$）：$\omega_i$ 大（$\omega_0 = 1$），波长 $\lambda_i = 2\pi/\omega_i = 2\pi$（约 6 个位置转一圈），sin/cos 随 $pos$ 变化快，编码<strong>局部/精细</strong>位置。</li>
+  <li>$i$ 大（如 $i=d_{model}/2-1$，$d_{model}=512$ 时 $i=255$）：$\omega_i$ 小（$\omega_{255} = 1/10000$），波长 $10000\cdot 2\pi$（约 62832 个位置转一圈），sin/cos 几乎不变，编码<strong>全局/粗略</strong>位置。</li>
+</ul>
+
+<p>波长从 $2\pi$ 到 $10000\cdot 2\pi$ 跨越四个数量级——同一个位置向量同时编码了从"邻近 6 个位置就转完一圈"到"6 万个位置才转完一圈"的多尺度位置信息。这让模型能同时处理短程和长程的位置关系。</p>
+
+<div class="callout callout-purple">
+<p><strong>教学解释</strong>。 可以把多频率 sin/cos 暂时理解成一个"连续版二进制计数器"：二进制里最低位每步翻转（高频）、最高位很少翻转（低频），组合起来唯一标识每个整数；正弦位置编码里 $i$ 小的维度振荡快（像低位）、$i$ 大的维度振荡慢（像高位），组合起来给每个位置一个唯一的"指纹"。这个类比只帮助理解"为什么多频率能唯一编码位置"。它失效的边界：二进制各位是离散 0/1 跳变，sin/cos 是连续平滑函数；二进制位数固定，这里维度对数由 $d_{model}$ 决定且波长连续分布；二进制有唯一性证明，sin/cos 的唯一性依赖频率不可约。正式判断仍以 F1 公式为准。</p>
+</div>
+
+<p>下面用教学示例把公式落到可复算程度。</p>
+
+<div class="callout callout-yellow">
+<p><strong>教学示例</strong>。 取 $d_{model}=4$（让计算可手算；真实模型 $d_{model}=512$）。由 $\omega_i = 1/10000^{2i/4}$：</p>
+<p>$$\omega_0 = 1/10000^{0} = 1,\qquad \omega_1 = 1/10000^{2/4} = 1/10000^{0.5} = 1/100.$$</p>
+<p>所以维度 0,1 用频率 $\omega_0=1$（$pos$ 直接作自变量），维度 2,3 用频率 $\omega_1=0.01$（$pos/100$ 作自变量）。数字为便于手算构造，不代表真实模型配置。</p>
+</div>
+
+<p>代入 F1 计算 $pos=0,1,2,3$ 的 PE 向量：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>$pos$</th><th>dim 0: $\sin(pos\cdot\omega_0)$</th><th>dim 1: $\cos(pos\cdot\omega_0)$</th><th>dim 2: $\sin(pos\cdot\omega_1)$</th><th>dim 3: $\cos(pos\cdot\omega_1)$</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>$\sin 0 = 0$</td><td>$\cos 0 = 1$</td><td>$\sin 0 = 0$</td><td>$\cos 0 = 1$</td></tr>
+<tr><td>1</td><td>$\sin 1 \approx 0.8415$</td><td>$\cos 1 \approx 0.5403$</td><td>$\sin 0.01 \approx 0.0100$</td><td>$\cos 0.01 \approx 1.0000$</td></tr>
+<tr><td>2</td><td>$\sin 2 \approx 0.9093$</td><td>$\cos 2 \approx -0.4161$</td><td>$\sin 0.02 \approx 0.0200$</td><td>$\cos 0.02 \approx 0.9998$</td></tr>
+<tr><td>3</td><td>$\sin 3 \approx 0.1411$</td><td>$\cos 3 \approx -0.9900$</td><td>$\sin 0.03 \approx 0.0300$</td><td>$\cos 0.03 \approx 0.9996$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>看两个尺度怎么同时工作。维度 0,1（高频 $\omega_0=1$）：$pos$ 从 0 到 3，sin 值 $0 \to 0.8415 \to 0.9093 \to 0.1411$，cos 值 $1 \to 0.5403 \to -0.4161 \to -0.9900$——几乎转完一圈，变化剧烈。维度 2,3（低频 $\omega_1=0.01$）：sin 值 $0 \to 0.0100 \to 0.0200 \to 0.0300$，cos 值 $1 \to 1.0000 \to 0.9998 \to 0.9996$——几乎不动。高频维区分邻近位置（$pos=1$ 和 $pos=2$ 的 dim 0 差 0.07、dim 1 差 0.96），低频维区分远距离位置（$pos=1$ 和 $pos=100$ 的 dim 2 才差约 1）。这就是多尺度同时编码的最小例证。</p>
+
+<details>
+<summary>d=4 手算例子的完整逐步代入</summary>
+<p>已知 $d_{model}=4$、base $=10000$、$\omega_0=1$、$\omega_1=0.01$。</p>
+<p><strong>$pos=1$</strong>：</p>
+<p>$$PE_{(1,0)}=\sin(1/10000^{0})=\sin(1)\approx 0.8415,$$</p>
+<p>$$PE_{(1,1)}=\cos(1/10000^{0})=\cos(1)\approx 0.5403,$$</p>
+<p>$$PE_{(1,2)}=\sin(1/10000^{2/4})=\sin(1/100)=\sin(0.01)\approx 0.0100,$$</p>
+<p>$$PE_{(1,3)}=\cos(1/10000^{2/4})=\cos(0.01)\approx 0.99995\approx 1.0000.$$</p>
+<p>所以 $PE_1 \approx (0.8415,\ 0.5403,\ 0.0100,\ 1.0000)$。</p>
+<p><strong>$pos=2$</strong>：</p>
+<p>$$PE_{(2,0)}=\sin(2)\approx 0.9093,\quad PE_{(2,1)}=\cos(2)\approx -0.4161,$$</p>
+<p>$$PE_{(2,2)}=\sin(0.02)\approx 0.0200,\quad PE_{(2,3)}=\cos(0.02)\approx 0.9998.$$</p>
+<p>所以 $PE_2 \approx (0.9093,\ -0.4161,\ 0.0200,\ 0.9998)$。</p>
+<p><strong>验证多尺度</strong>：dim 0 从 $pos=1$ 到 $pos=2$ 变化 $0.9093-0.8415=0.0678$（小），dim 1 变化 $-0.4161-0.5403=-0.9564$（大）——高频维在 1 步内就剧烈变化；dim 2 变化 $0.0200-0.0100=0.0100$（极小），dim 3 变化 $0.9998-1.0000=-0.0002$（几乎无）——低频维在 1 步内几乎不动。若 $pos$ 从 1 跳到 100，dim 2 才会从 $\sin(0.01)\approx 0.01$ 变到 $\sin(1)\approx 0.84$——低频维需要长距离才显出区分力。</p>
+</details>
+
+<p>正弦位置编码还有一个性质，是后续旋转位置编码的思想伏笔。Vaswani 2017 §3.5 指出：对任意固定偏移 $k$，$PE_{pos+k}$ 可以表示为 $PE_{pos}$ 的线性函数。具体地，对同一频率对（维度 $2i$、$2i+1$，角频率 $\omega_i$）：</p>
+
+<p>$$PE_{(pos+k,\,2i)}=PE_{(pos,2i)}\cos(k\omega_i)+PE_{(pos,2i+1)}\sin(k\omega_i),\qquad\text{F3}$$</p>
+<p>$$PE_{(pos+k,\,2i+1)}=PE_{(pos,2i+1)}\cos(k\omega_i)-PE_{(pos,2i)}\sin(k\omega_i).$$</p>
+
+<p>这个变换是一个旋转（角度 $k\omega_i$）。它的意义是：虽然位置向量与绝对位置 $pos$ 绑定，但"位置 $pos+k$ 的向量"可以由"位置 $pos$ 的向量"经一个固定旋转得到——这意味着模型有可能从绝对编码中线性读出相对位置 $k$。这正是 Vaswani 选择 sin/cos 而非任意函数的理由（"we hypothesized it would allow the model to easily learn to attend by relative positions"）。</p>
+
+<details>
+<summary>F3 线性性质的和角公式推导</summary>
+<p>目标：证明 $PE_{(pos+k,2i)} = PE_{(pos,2i)}\cos(k\omega_i) + PE_{(pos,2i+1)}\sin(k\omega_i)$。</p>
+<p>由 F1，$PE_{(pos,2i)}=\sin(pos\cdot\omega_i)$、$PE_{(pos,2i+1)}=\cos(pos\cdot\omega_i)$、$PE_{(pos+k,2i)}=\sin((pos+k)\cdot\omega_i)$。</p>
+<p>用正弦和角公式 $\sin(a+b)=\sin a\cos b + \cos a\sin b$，令 $a=pos\cdot\omega_i$、$b=k\omega_i$：</p>
+<p>$$\sin((pos+k)\omega_i)=\sin(pos\cdot\omega_i)\cos(k\omega_i)+\cos(pos\cdot\omega_i)\sin(k\omega_i)=PE_{(pos,2i)}\cos(k\omega_i)+PE_{(pos,2i+1)}\sin(k\omega_i).$$</p>
+<p>同理用余弦和角公式 $\cos(a+b)=\cos a\cos b - \sin a\sin b$：</p>
+<p>$$\cos((pos+k)\omega_i)=\cos(pos\cdot\omega_i)\cos(k\omega_i)-\sin(pos\cdot\omega_i)\sin(k\omega_i)=PE_{(pos,2i+1)}\cos(k\omega_i)-PE_{(pos,2i)}\sin(k\omega_i).$$</p>
+<p>用 d=4 手算例子验证：从 $pos=1$ 到 $pos=2$，$k=1$、$\omega_0=1$。$PE_{(2,0)}=\sin 2\approx 0.9093$；按 F3：$PE_{(1,0)}\cos 1 + PE_{(1,1)}\sin 1 = \sin 1\cos 1 + \cos 1\sin 1 = 2\sin 1\cos 1 = \sin 2 \approx 0.9093$。一致。</p>
+<p>注意：这个"旋转"性质只在一对维度内成立，且 $k$ 是固定偏移。它说明相对位置可由线性变换读出，但正弦方案本身仍是绝对位置编码（向量与 $pos$ 绑定、加在嵌入上）——不等于"相对位置编码"。</p>
+</details>
+
+<div class="callout callout-red">
+<p><strong>常见误解</strong>：把正弦位置编码叫做"相对位置编码"。这是错的。正弦方案是<strong>绝对</strong>位置编码——位置向量与绝对位置 $pos$ 绑定、加在输入嵌入上。它具有"PE(pos+k) 是 PE(pos) 的线性函数"这一性质，使模型<strong>有可能</strong>学到相对位置，但这不改变它属于绝对方案的事实。真正的相对位置编码加在注意力分数上、与相对距离绑定，下一章会讲。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 F1 公式并解释 $pos$、$i$、$d_{model}$、$10000$ 每个符号。</li>
+  <li>手算 $d_{model}=4$、$pos=1$ 的 PE 向量（应为 $\approx (0.8415, 0.5403, 0.0100, 1.0000)$）。</li>
+  <li>$i$ 小 vs $i$ 大的维度对哪个编码局部位置、哪个编码全局位置？为什么？</li>
+  <li>F3 线性性质说明什么？它为什么是 RoPE 的思想伏笔？</li>
+</ul>
+
+<p>正弦方案用固定公式生成位置向量。如果把固定公式换成可学习参数会怎样？下一章看可学习绝对方案。</p>
+
+<h2 id="learned-pe">可学习绝对位置编码——把固定向量换成可学习参数</h2>
+
+<p>正弦方案的频率与公式都是人工设定的。一个自然的改进是：让模型自己学每个位置该用什么向量。这就是<strong>可学习绝对位置编码</strong>：用一个 $L\times d_{model}$ 的可学习参数表 $PE$ 代替固定 sin/cos，$L$ 是预设的最大序列长度，每个位置一个可学习向量。</p>
+
+<p>$$PE \in \mathbb{R}^{L\times d_{model}}\ \text{（可学习）},\qquad x'_m = x_m + PE_m.\qquad\text{F5}$$</p>
+
+<p>注入方式不变——仍是加到 token 嵌入上（F2）。唯一区别是 $PE$ 从"按公式算"变成"从参数表查"。位置 $m$ 超出 $L$ 时没有对应参数，模型无法处理。</p>
+
+<p>Vaswani et al. 2017 在 §3.5 报告了对两者的对比（引用 Gehring et al. 2017 的可学习方案 [9]）：</p>
+
+<details>
+<summary>Vaswani 2017 Table 3 row (e) 的完整对比数字</summary>
+<p>论文 §3.5 原文："We also experimented with using learned positional embeddings [9] and found that the two versions produced nearly identical results (see Table 3 row (e))."</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>配置</th><th>EN-DE BLEU（base）</th></tr></thead>
+<tbody>
+<tr><td>sinusoidal（正弦，论文最终采用）</td><td>27.3</td></tr>
+<tr><td>learned（可学习，实验对比项）</td><td>26.74</td></tr>
+</tbody>
+</table>
+</div>
+<p>两者差距小于 1 BLEU，论文描述为"nearly identical"。正弦略优，但论文最终选正弦的理由不是性能，而是"sinusoidal 可能允许外推到训练时未见过的更长序列"（may allow the model to extrapolate to sequence lengths longer than the ones encountered during training）。Table 3 row (e) 仅对 base 模型做了 learned 消融；big 模型（Table 2 最终结果 BLEU 28.4）只用正弦，未做 learned 对比。可学习只是实验项。</p>
+</details>
+
+<p>核心权衡在<strong>外推能力</strong>与<strong>参数量</strong>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>正弦（sinusoidal）</th><th>可学习（learned）</th></tr></thead>
+<tbody>
+<tr><td>位置向量来源</td><td>按 F1 公式计算（固定）</td><td>从 $L\times d_{model}$ 参数表查</td></tr>
+<tr><td>可学习参数量</td><td>0</td><td>$L\cdot d_{model}$（如 $L=512, d=512$ 时约 26 万）</td></tr>
+<tr><td>训练长度内表现</td><td>与可学习相近（Table 3 row (e)）</td><td>与正弦相近</td></tr>
+<tr><td>长度外推</td><td>公式对任意 $pos$ 成立，理论可外推（经验上也退化）</td><td>超出 $L$ 即无参数，外推失败</td></tr>
+<tr><td>采用情况</td><td>Vaswani 2017 base/big</td><td>BERT、GPT-2</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout callout-red">
+<p><strong>常见误解</strong>："Vaswani 2017 的 big 模型用了可学习位置编码。"这是错的。base 和 big 模型都用正弦位置编码；可学习只是 Table 3 row (e) 的实验对比项，论文报告两者"nearly identical"并最终选正弦。BERT、GPT-2 后来采用可学习，是因为在训练长度内表现相近且实现简单，不是因为 Vaswani 证明了可学习更好。</p>
+</div>
+
+<p>可学习方案换来了"数据驱动"（模型能学到任务特定的位置模式），但失去了外推能力（超出 $L$ 即失败），并增加 $L\cdot d_{model}$ 参数。这是绝对位置编码（无论正弦还是可学习）的共同局限：它们都加在输入嵌入上、编码"第几位"，而语言理解往往更依赖"相差几位"。下一章看相对位置编码如何换一个作用点。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出可学习方案的参数表形式 F5，说明 $L$ 的含义。</li>
+  <li>Vaswani 2017 报告 learned 与 sinusoidal 的关系是什么？（相近，正弦略优，base/big 都用正弦）</li>
+  <li>可学习方案为什么外推失败？正弦方案外推是否就一定好？</li>
+</ul>
+
+<p>绝对方案（正弦与可学习）都加在输入嵌入上、编码"第几位"。但语言理解常更依赖"相差几位"——下一章看相对方案。</p>
+
+<h2 id="relative-pe">相对位置编码——T5 的 bias 机制与"加在分数上"的本质区别</h2>
+
+<p>绝对位置编码给每个位置一个独立向量，编码的是"这是第几位"。但语言学里更重要的是相对距离：理解"The cat sat on the mat"中"sat"与"cat"的关系，需要知道"cat 在 sat 前面 1 位"（主谓关系），而不是"cat 是第 2 位、sat 是第 3 位"。<strong>相对位置编码</strong>直接编码"两个位置相差几位"。</p>
+
+<p>T5（Raffel et al. 2019）采用的相对方案不在输入嵌入上加位置向量，而是在注意力分数 softmax 之前加一个与 query-key 相对距离 $i-j$ 绑定的标量偏置：</p>
+
+<p>$$\text{score}(i,j)=q_i\cdot k_j + b_{\text{bucket}(i-j)}.\qquad\text{F4, Raffel 2019 §3.2}$$</p>
+
+<p>其中 $q_i$ 是位置 $i$ 的 query、$k_j$ 是位置 $j$ 的 key、$b_{\text{bucket}(i-j)}$ 是与相对距离 $i-j$ 绑定的可学习标量。逐项说明 T5 的具体机制：</p>
+<ul>
+  <li><strong>分桶（bucketing）</strong>：相对距离 $i-j$ 是整数（从 $-(L-1)$ 到 $L-1$），直接每个距离一个参数会有 $2L-1$ 个。T5 用一个分桶函数把连续距离映射到有限个桶（约 32 个桶），桶内共享参数——邻近距离用细桶（每距离一桶）、远距离用粗桶（多距离合一桶），总共约 32 个可学习标量。</li>
+  <li><strong>每头独立、各层共享</strong>：每个注意力头有自己的一套 bias（共约 $32 \times h$ 个标量，$h$ 是头数），但同一套 bias 在所有注意力层之间共享——位置偏置学一次、各层复用。</li>
+  <li><strong>外推处理</strong>：对超出训练时见过的最大距离的相对距离，T5 把它 clamp（截断）到最大桶，复用最大桶的 bias。</li>
+</ul>
+
+<pre class="diagram">绝对位置编码（正弦/可学习）：位置信号加在输入嵌入上
+  x_m ──► +PE_m ──► W^Q ──► q_m ┐
+  x_n ──► +PE_n ──► W^K ──► k_n ┼──► q_m · k_n ──► softmax ──► 加权 V
+  x_n ──► +PE_n ──► W^V ──► v_n ┘   （位置只通过嵌入进入一次，之后被投影扭曲）
+
+相对位置编码（T5 bias）：位置信号加在注意力分数上
+  x_m ──► W^Q ──► q_m ┐
+  x_n ──► W^K ──► k_n ┼──► q_m · k_n + b_{bucket(m-n)} ──► softmax ──► 加权 V
+  x_n ──► W^V ──► v_n ┘   （位置在每个注意力层、每个头都直接进入分数）</pre>
+
+<p>本质区别在两点：</p>
+<ul>
+  <li><strong>编码对象不同</strong>：绝对方案编码"第几位"（向量与绝对位置 $pos$ 绑定）；相对方案编码"相差几位"（偏置与相对距离 $i-j$ 绑定）。</li>
+  <li><strong>作用点不同</strong>：绝对方案加在输入嵌入上，位置信号只在第一层之前进入一次，之后被 $W^Q$、$W^K$、$W^V$ 投影扭曲；相对方案加在注意力分数上，每个注意力层、每个头都直接把位置信号注入分数——模型对位置更敏感。</li>
+</ul>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>绝对方案（正弦/可学习）</th><th>相对方案（T5 bias）</th></tr></thead>
+<tbody>
+<tr><td>编码对象</td><td>绝对位置 pos</td><td>相对距离 i−j</td></tr>
+<tr><td>作用点</td><td>输入嵌入（第一层之前）</td><td>注意力分数（softmax 之前，每层每头）</td></tr>
+<tr><td>可学习参数量</td><td>0（正弦）或 $L\cdot d$（可学习）</td><td>约 $32 \times h$（桶数×头数，各层共享）</td></tr>
+<tr><td>长度外推</td><td>正弦理论可外推、可学习失败</td><td>clamp 到最大桶，可一定程度外推</td></tr>
+<tr><td>与 FlashAttention 兼容</td><td>兼容（位置在嵌入上，不干扰分数计算）</td><td>不兼容（需物化 $n\times n$ 偏置矩阵，Flash 的分块 IO 优化失效）</td></tr>
+</tbody>
+</table>
+</div>
+
+<details>
+<summary>补充：T5 分桶函数的方向性说明（不展开完整公式）</summary>
+<p>T5 的分桶不是对称的：它对"query 在前、key 在后"（$i-j>0$）和"query 在后、key 在前"（$i-j<0$）用不同的桶。原因是语言中"看前面"和"看后面"的依赖模式不同（自回归解码时 query 只能看前面的 key）。分桶函数把 $[-(L-1), L-1]$ 范围的相对距离映射到约 32 个桶，邻近距离（如 $|i-j|\le 8$）每距离一桶、远距离按对数合并。完整分桶公式见 T5 源码 <code>_relative_position_bucket</code>，本页不展开。</p>
+<p>ALiBi（Press et al. 2021）是另一种相对方案：不用分桶，而是给每个头一个与距离成正比的线性负偏置 $b_h \cdot (i-j)$（$b_h$ 是该头的固定斜率，不学习）。它让远距离 token 的注意力分数单调下降，外推性好。本页不展开 ALiBi 的机制。</p>
+</details>
+
+<p>相对方案换来了"直接编码相对距离"和"每层每头注入位置"，但也带来代价：与 FlashAttention 不兼容（需物化 $n\times n$ 偏置矩阵），限制了高效推理。这正是后来 RoPE 被广泛采用的原因之一——RoPE 用乘旋转实现相对效果，但不需要物化偏置矩阵（详见 <a href="../../wiki/rope/index.html">RoPE</a>）。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出 T5 bias 加在哪里（注意力分数 softmax 之前）、与相对距离怎么绑定（分桶后每桶一个标量）。</li>
+  <li>说出绝对方案与相对方案的两个本质区别（编码对象：第几位 vs 相差几位；作用点：嵌入 vs 分数）。</li>
+  <li>T5 bias 为什么与 FlashAttention 不兼容？（需物化 $n\times n$ 偏置矩阵）</li>
+</ul>
+
+<p>四类方案（绝对正弦、可学习绝对、相对 bias、RoPE）各自的机制已清楚。最后一章把它们放一张表对比，并看 K3 为什么选 NoPE。</p>
+
+<h2 id="comparison-and-nope">四类方案对比与 NoPE 选择——为什么 K3 选 NoPE</h2>
+
+<p>把四类方案与 NoPE 放一张表，从四个维度对比核心权衡：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>方案</th><th>位置信号加在哪里</th><th>可学习参数</th><th>长度外推</th><th>与推理优化兼容性</th></tr></thead>
+<tbody>
+<tr><td>绝对正弦</td><td>输入嵌入（加）</td><td>无</td><td>理论可外推，经验也退化</td><td>兼容</td></tr>
+<tr><td>可学习绝对</td><td>输入嵌入（加）</td><td>$L\times d_{model}$</td><td>超出 $L$ 即失败</td><td>兼容</td></tr>
+<tr><td>相对 bias（T5）</td><td>注意力分数（加）</td><td>桶数×头数（各层共享）</td><td>clamp 到最大桶，有限外推</td><td>与 FlashAttention 不兼容（需物化 $n\times n$）</td></tr>
+<tr><td>RoPE</td><td>Q/K（乘旋转）</td><td>无</td><td>需 YaRN/PI 扩展</td><td>与 MLA 矩阵吸收冲突</td></tr>
+<tr><td>NoPE</td><td>什么都不做</td><td>无</td><td>decoder-only 直接外推</td><td>兼容（依赖因果掩码）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>前三类都在主动"加"位置信息，区别是加在哪里、怎么加。RoPE 换成"乘"——按绝对位置 $m$ 旋转 query 和 key，使内积只依赖相对位置 $m-n$，叫"绝对构造、相对效果"（详见 <a href="../../wiki/rope/index.html">RoPE</a>）。NoPE 那一行的"什么都不做"是另一条路径：不施加任何显式位置编码，依赖 decoder-only 的因果掩码隐式提供位置信息（详见 <a href="../../wiki/nope/index.html">NoPE</a>）。</p>
+
+<div class="callout callout-red">
+<p><strong>常见误解</strong>："NoPE 完全没有位置信息。"这是错的。NoPE 不施加<strong>显式</strong>位置编码，但 decoder-only 的因果掩码让每个位置只能看到它之前的 token——这种"可见位置集合随当前位置变化"的不对称性隐式提供了位置信号。NoPE 不适用于双向编码器（那里每个位置看到同样的 token 集合，真没有位置信息）。详见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
+</div>
+
+<h3 id="k3-nope-choice">K3 为什么选 NoPE</h3>
+
+<p>Kimi K3 的 Gated MLA 层在结构上保留了 RoPE 接口（拆出 rot 分量），但配置中 <code>mla_use_nope=true</code>，所有 MLA 层不施加位置编码。这个选择有两个原因：</p>
+
+<p>第一，RoPE 与 MLA 的矩阵吸收冲突。MLA 通过压缩潜向量减少 KV cache，其推理优化依赖"矩阵吸收"——把投影矩阵 $W^{UK}$ 从 key 侧搬到 query 侧避免显式重建 K（详见 <a href="../../wiki/mla/index.html">MLA</a>）。但矩阵吸收要求 $W^{UK}$ 与位置无关；若对压缩潜变量施加 RoPE，旋转矩阵介于 query 和 $W^{UK}$ 之间且每个 token 不同，无法合并成固定矩阵——位置敏感的旋转破坏了矩阵吸收的前提。</p>
+
+<p>第二，K3 的位置信息由 KDA（递归注意力变体）隐式提供。K3 用 KDA 的递归门控与衰减机制承载时序信息，MLA 不需要额外的位置编码。这意味着扩展上下文长度时无需修改位置编码参数（如 RoPE rescaling 或 YaRN），模型直接外推到 1M token（详见 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a> §2.1.2、§3.4）。</p>
+
+<p>这是 NoPE 路线相对 RoPE 的一个实际优势：当架构需要与推理优化（如矩阵吸收）兼容、且位置信息有其他来源时，不施加位置编码反而更简单、外推更直接。K3 的选择不是"位置编码不重要"，而是"位置信息由别的机制提供，MLA 不需要显式位置编码"。</p>
+
+<p>选择位置方案的判断框架：看模型架构（decoder-only 适用 NoPE/RoPE；双向编码器需显式位置信号）、推理优化约束（FlashAttention 与相对 bias 不兼容；MLA 矩阵吸收与 RoPE 冲突）、外推需求（NoPE 直接外推；RoPE 需扩展；可学习无法外推）。没有银弹，只有权衡。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一张表对比四类方案与 NoPE 在"加在哪里、是否有参数、长度外推、与推理优化兼容性"四维上的差异。</li>
+  <li>RoPE 为什么叫"绝对构造、相对效果"？NoPE 的位置信息从哪来？</li>
+  <li>K3 的 MLA 层为什么选 NoPE？（RoPE 与矩阵吸收冲突；位置信息由 KDA 提供）</li>
+  <li>举一个 RoPE 不适用的场景（如 MLA 压缩潜变量），一个 NoPE 不适用的场景（如双向编码器）。</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p><strong>C1（自注意力排列等变、不含位置信息）</strong>：Vaswani et al. 2017, arXiv:1706.03762, §3.5 第 1 段；排列等变论证见已有页面 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a> §复杂度与边界。</p>
+<p><strong>C2（绝对正弦位置编码公式）</strong>：Vaswani et al. 2017, §3.5, Eq.(3) 与 Eq.(4)。</p>
+<p><strong>C3（多频率多尺度）</strong>：Vaswani et al. 2017, §3.5 第 3 段（波长从 $2\pi$ 到 $10000\cdot 2\pi$）。</p>
+<p><strong>C4（正弦 PE 线性性质）</strong>：Vaswani et al. 2017, §3.5 第 4 段（"PE_{pos+k} can be represented as a linear function of PE_{pos}"）。</p>
+<p><strong>C5（base/big 都用正弦；可学习是实验项）</strong>：Vaswani et al. 2017, §3.5 第 5 段与 Table 3 row (e)；经 The Annotated Transformer (nlp.seas.harvard.edu) 核实；引用 [9] = Gehring et al. 2017, arXiv:1705.03122。</p>
+<p><strong>C6（可学习外推失败）</strong>：Vaswani 2017 §3.5；iclr-blogposts 2025 综述印证；BERT (Devlin et al. 2018)、GPT-2 (Radford et al. 2019) 采用可学习。</p>
+<p><strong>C7（T5 相对 bias 机制）</strong>：Raffel et al. 2019, "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", JMLR Vol 21, §3.2；T5 源码 <code>_relative_position_bucket</code>。</p>
+<p><strong>C8（绝对 vs 相对本质区别）</strong>：Vaswani 2017 §3.5（绝对作用点）；Raffel 2019 §3.2（相对作用点）；iclr-blogposts 2025 综述明确区分。</p>
+<p><strong>C9（RoPE 绝对构造相对效果；NoPE 依赖因果掩码）</strong>：Su et al. 2021, arXiv:2104.09864 §3.1；已有页面 <a href="../../wiki/rope/index.html">RoPE</a>、<a href="../../wiki/nope/index.html">NoPE</a>。</p>
+<p><strong>C10（K3 MLA 选 NoPE）</strong>：已有页面 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a> §2.1.2、§3.4；<a href="../../wiki/mla/index.html">MLA</a> §3；<a href="../../wiki/nope/index.html">NoPE</a>。</p>
+
+<h3>核心公式与来源</h3>
+<p><strong>F1（正弦 PE 公式）</strong>：Vaswani et al. 2017, §3.5, Eq.(3) 与 Eq.(4)。</p>
+<p><strong>F2（注入方式 $x'=x+PE$）</strong>：Vaswani et al. 2017, §3.5（"we add the positional encodings to the input embeddings"）。</p>
+<p><strong>F3（线性性质）</strong>：Vaswani et al. 2017, §3.5 第 4 段陈述形式；由 sin/cos 和角公式直接推出。</p>
+<p><strong>F4（T5 bias 加在分数）</strong>：Raffel et al. 2019, §3.2。</p>
+<p><strong>F5（可学习参数表）</strong>：Vaswani 2017 §3.5 引用 [9] Gehring et al. 2017。</p>
+
+<h3>外部数字与实验条件</h3>
+<p><strong>N1（Table 3 row (e) BLEU 对比）</strong>：Vaswani et al. 2017 Table 3 row (e)；learned base 26.74，sinusoidal base 27.3（Table 3 row (e) 仅对 base 做了 learned 消融；big 28.4 出自 Table 2 最终结果，big 未做 learned 消融）；经 The Annotated Transformer 核实。</p>
+<p><strong>N2（波长范围）</strong>：Vaswani et al. 2017 §3.5 第 3 段；$i=0$ 波长 $2\pi$，$i=d_{model}/2-1$（$d_{model}=512$ 时 $i=255$）波长 $10000\cdot 2\pi$。</p>
+<p><strong>N3（$d_{model}=512$）</strong>：Vaswani et al. 2017 §3.2.2 / Table 3 base 模型。</p>
+
+<h3>教学示例</h3>
+<p><strong>d=4 正弦 PE 手算</strong>：$d_{model}=4$、base $=10000$，计算 $pos=0,1,2,3$ 的 PE 向量。构造目的：用最小手算例子展示多频率在同一位置的不同变化速率（高频维 dim 0,1 振荡快、低频维 dim 2,3 几乎不动）。数字便于手算，不代表真实模型配置（真实 $d_{model}=512$）。</p>
+<p><strong>"我打你"vs"你打我"钩子</strong>：教学构造，说明排列等变带来的语义丢失——相同 token 不同顺序在无位置信息时不可区分。</p>
+<p><strong>"The cat sat on the mat"相对距离</strong>：教学构造，说明语言学中相对距离比绝对位置更重要。</p>
+
+<h3>教学解释与类比边界</h3>
+<p><strong>二进制计数器类比</strong>：服务"多频率为何能唯一编码位置"这一局部关系——$i$ 小的维度振荡快像二进制低位、$i$ 大的维度振荡慢像高位、组合起来给每个位置唯一指纹。<strong>失效边界</strong>：（1）二进制各位是离散 0/1 跳变，sin/cos 是连续平滑函数；（2）二进制位数固定，这里维度对数由 $d_{model}$ 决定且波长连续分布；（3）二进制有严格唯一性证明，sin/cos 的唯一性依赖频率不可约，非完全等价。正式判断仍以 F1 公式为准。</p>
+
+<h3>教学简化及其限制</h3>
+<p><strong>简化 1：用 $d_{model}=4$ 手算</strong>。真实模型 $d_{model}=512$，有 256 个频率对，不可手算。简化目的：便于复算验证多频率机制；不可推出"真实模型也只用 2 个频率对"。</p>
+<p><strong>简化 2：T5 分桶只说方向不展开完整公式</strong>。完整分桶函数（约 32 桶、对数合并、方向不对称）见 T5 源码，本页只讲"分桶让参数量与桶数而非序列长度成正比"。简化目的：讲清机制；不可推出"本页已给出分桶函数的完整定义"。</p>
+<p><strong>简化 3：ALiBi 只列方向</strong>。ALiBi 的线性负偏置机制属相邻概念，本页只在折叠块一句话提及，不展开斜率设计与外推性质。</p>
+<p><strong>简化 4：RoPE 与 NoPE 只引用不展开</strong>。两者已有独立概念页，本页只在对比表与 K3 章节引用结论。简化目的：避免重复；不可推出"本页已完整论证 RoPE 的旋转矩阵推导或 NoPE 的位置信息来源"。</p>
+<p><strong>简化 5：K3 MLA 部分引用已有页面</strong>。MLA 矩阵吸收与 RoPE 解耦的完整论证在 <a href="../../wiki/mla/index.html">MLA</a> §3，本文只摘要引用。简化目的：避免重复推导；不可推出"本文已完整论证矩阵吸收"。
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

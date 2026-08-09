@@ -1,0 +1,1392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gated DeltaNet：把 Delta 规则的精准覆写与标量衰减门统一</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Gated DeltaNet</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Gated DeltaNet：把 Delta 规则的精准覆写与标量衰减门统一</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>当一个语言模型在阅读一段长文档时，前面写了一段与当前问题无关的背景——模型需要"忘掉整段"重新聚焦。DeltaNet 的 delta 规则能精准覆写单个 key，但要逐 key 串行擦除整段过时记忆；Mamba2 的标量衰减门能一步衰减整张状态，但无差别衰减所有 key-value 关联。能不能两者都要——既精准覆写单点、又快速遗忘全局？Gated DeltaNet 的回答是：把两个机制塞进同一个递归公式。</p>
+</div>
+
+<div class="context-box">
+  <p class="context-box-title">本文所处的位置</p>
+  <div class="context-grid">
+    <div class="context-label">概念</div><div class="context-value">Gated DeltaNet（门控 DeltaNet）；论文标题 "Gated Delta Networks"，缩写 GDN</div>
+    <div class="context-label">所属家族</div><div class="context-value">线性注意力 / 线性 RNN / 状态空间模型</div>
+    <div class="context-label">前置概念</div><div class="context-value"><a href="../delta-rule/index.html">Delta 规则与 DeltaNet</a>（精准覆写机制）；<a href="../linear-attention/index.html">线性注意力</a>（固定大小递归状态）</div>
+    <div class="context-label">来源</div><div class="context-value">Yang, Kautz & Hatamizadeh. "Gated Delta Networks: Improving Mamba2 with Delta Rule." ICLR 2025（arXiv:2412.06464）</div>
+    <div class="context-label">现实应用</div><div class="context-value">Qwen3-Next 等用 Gated DeltaNet 作线性层；Kimi K3 的 <a href="../kda/index.html">KDA</a> 基于 Gated DeltaNet 但把 α_t 改为 channel-wise + lower-bounded decay</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>DeltaNet 的 delta 规则在"快速遗忘整段记忆"上有什么缺陷？Gated DeltaNet 为什么要加 α_t？</li>
+    <li>给定 $S_{t-1}$、$k_t$、$v_t$、$\alpha_t$、$\beta_t$，用 Gated DeltaNet 公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 手算一步更新，并说明 α_t、β_t 的职责分工。</li>
+    <li>Gated DeltaNet 在 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 两种极端下分别退化为哪个模型？为什么？</li>
+    <li>Gated DeltaNet 的并行训练算法解决什么问题？为什么不能直接串行递归？</li>
+    <li>Gated DeltaNet 与 KDA 在 α_t 的设计上有什么关键区别？</li>
+  </ul>
+</section>
+
+<section class="misconceptions">
+  <h2>最容易误解</h2>
+  <ul>
+    <li>"Gated DeltaNet 的 α_t 和 KDA 的 α_t 是同一个东西"——Gated DeltaNet 的 α_t 是标量（每步一个衰减率作用于整张 S），KDA 的 α_t 是 channel-wise 向量（每 key 通道独立）且有 lower-bounded decay。</li>
+    <li>"α_t 和 β_t 都是遗忘门，职责重叠"——α_t 控全局衰减（整张 S 按比例缩小），β_t 控单点覆写强度（当前 k_t 方向新旧值混合比例），职责不重叠。</li>
+    <li>"Gated DeltaNet 只是 DeltaNet 加了个 α_t 系数，没本质区别"——α_t 使 Gated DeltaNet 能一步衰减整段记忆（上下文切换），DeltaNet 要逐 key 擦除；S-NIAH-2 数字针检索上 Gated DeltaNet 显著优于 DeltaNet。</li>
+    <li>"α_t 是固定常数衰减率"——α_t 是数据相关的（α_t = σ(W_α x_t)），模型根据当前输入决定本步衰减多少，这是它相对早期 data-independent decay（如 RetNet 的固定 γ）的区别。</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Yang, Kautz & Hatamizadeh. "Gated Delta Networks: Improving Mamba2 with Delta Rule." ICLR 2025（arXiv:2412.06464）§3.1 Eq.8 给出 gated delta rule 公式；§3.2 给出 chunkwise 并行算法；§4 给出实验。DeltaNet 与 delta 规则的前置讲解见 <a href="../delta-rule/index.html">Delta 规则与 DeltaNet</a>。</p>
+</blockquote>
+
+<h2 id="why-gate-and-delta">DeltaNet 与 Mamba2 各自缺什么——gating 与 delta 规则的互补性</h2>
+
+<p>Gated DeltaNet 不是凭空设计的，它来自一个观察：DeltaNet 与 Mamba2 各自解决线性注意力"记不清"问题的一半，但都不完整。要理解 Gated DeltaNet，先看这两个"半成品"各缺什么。</p>
+
+<p>DeltaNet 的 delta 规则把线性注意力的纯加性累加替换为"先擦除后写入"：</p>
+
+$$S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top\qquad\text{（DeltaNet，F4）}$$
+
+<p>它的核心机制是<strong>方向擦除</strong>——矩阵 $I - \beta_t k_t k_t^\top$ 只擦除当前 $k_t$ 一个方向的旧值，保留与 $k_t$ 正交的其他方向。这让 DeltaNet 能精准覆写单个 key-value 关联（比如"把 key=k_2 对应的 value 从 v_old 改成 v_new"）。但精准也意味着局限：如果要清空整段过时记忆（比如模型从一段背景介绍切换到新话题），需要逐个 key 串行擦除，无法一步完成。Yang 2025 ICLR §2.3 原文说 DeltaNet "lacks the ability to rapidly clear outdated information, particularly during context switches"<sup>[C1]</sup>。delta 规则与 DeltaNet 的完整讲解见 <a href="../delta-rule/index.html">Delta 规则与 DeltaNet</a>。</p>
+
+<p>Mamba2 走另一条路——用标量衰减门 α_t 全局衰减整张状态：</p>
+
+$$S_t = \alpha_t S_{t-1} + v_t k_t^\top\qquad\text{（Mamba2，F3）}$$
+
+<p>α_t 是一个标量，整张 $S_{t-1}$ 被乘以同一个 α_t。当 α_t 接近 0 时，一步就能清空整段记忆（"上下文切换"）。但 Mamba2 的衰减是<strong>无差别的</strong>——所有 key-value 关联按同一比例缩小，不区分哪个 key 更重要。Yang 2025 ICLR §2.2 原文说 "this approach does not account for the varying importance of different key-value associations"<sup>[C2]</sup>。Mamba2 无独立概念页，本页只引用此公式作对比，不展开状态空间模型理论。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>模型</th><th>递归更新规则</th><th>擦除机制</th><th>写入机制</th><th>缺什么</th></tr></thead>
+<tbody>
+<tr><td>DeltaNet<sup>[F4]</sup></td><td>$S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$</td><td>方向擦除（只擦 $k_t$ 方向）</td><td>新旧值凸插值</td><td>无法快速清空整段</td></tr>
+<tr><td>Mamba2<sup>[F3]</sup></td><td>$S_t = \alpha_t S_{t-1} + v_t k_t^\top$</td><td>标量全局衰减（整张 S）</td><td>加性累加</td><td>无法选择性擦除单点</td></tr>
+<tr class="highlight-row"><td>Gated DeltaNet<sup>[F1]</sup></td><td>$S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$</td><td>标量衰减 + 方向擦除（双重）</td><td>新旧值凸插值</td><td>—（两者的统一）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两者<strong>互补</strong>：gating（α_t）擅长快速遗忘全局，delta 规则（$I - \beta_t k_t k_t^\top$）擅长精准覆写单点。Yang 2025 ICLR §1 原文 "we observe that these mechanisms are complementary—gating enables rapid memory erasure while the delta rule facilitates targeted updates"<sup>[C7]</sup>。Gated DeltaNet 的工作就是把两者塞进同一个递归公式。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说明 DeltaNet 为什么不能快速清空整段记忆（提示：方向擦除 vs 全局）。</li>
+  <li>用一句话说明 Mamba2 为什么不能选择性擦除单点（提示：α_t 是标量还是向量）。</li>
+  <li>说明 "gating 与 delta 规则互补" 指的是哪两种能力互补。</li>
+</ul>
+
+<p>两种机制各管一摊已经清楚了。下一章给出把它们结合的公式。</p>
+
+<h2 id="gated-deltanet-formula">Gated DeltaNet 的公式与符号</h2>
+
+<p>Gated DeltaNet 的递归更新公式（Yang 2025 ICLR §3.1 Eq.8<sup>[C3]</sup>）：</p>
+
+$$\boxed{\,S_t = S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) + \beta_t v_t k_t^\top\,}\qquad\text{（Gated DeltaNet，F1）}$$
+
+<p>公式出现前先说清它解决的问题：上一章看到 DeltaNet 缺全局遗忘、Mamba2 缺方向擦除。Gated DeltaNet 把 Mamba2 的标量 α_t 嵌进 DeltaNet 的 $I - \beta_t k_t k_t^\top$ 擦除项前面，得到 $\alpha_t(I - \beta_t k_t k_t^\top)$——先衰减整张状态、再做 delta 擦写。</p>
+
+<p>每个符号：</p>
+
+<ul>
+  <li>$S_t \in \mathbb{R}^{d_v \times d_k}$：第 $t$ 步的<strong>矩阵状态</strong>（记忆矩阵）。行数 $d_v$ 对应 value 维度，列数 $d_k$ 对应 key 维度。本页默认 $d_v = d_k = d$。</li>
+  <li>$S_{t-1}$：上一步的状态，公式右侧第一个因子。</li>
+  <li>$I \in \mathbb{R}^{d_k \times d_k}$：单位矩阵，与 $k_t$ 同维。</li>
+  <li>$k_t \in \mathbb{R}^{d_k}$：第 $t$ 步的 key 向量，由输入 $x_t$ 经投影 $k_t = W_K x_t$ 得到。</li>
+  <li>$v_t \in \mathbb{R}^{d_v}$：第 $t$ 步的 value 向量，由 $v_t = W_V x_t$ 得到。</li>
+  <li>$q_t \in \mathbb{R}^{d_k}$：第 $t$ 步的 query 向量，由 $q_t = W_Q x_t$ 得到；输出 $o_t = S_t q_t$。</li>
+  <li>$\alpha_t = \sigma(W_\alpha x_t) \in (0, 1)$：<strong>数据相关标量衰减门</strong>，由 sigmoid 输出。α_t 控制整张 $S_{t-1}$ 的全局衰减——模型根据当前输入 $x_t$ 决定本步衰减多少<sup>[C4]</sup>。</li>
+  <li>$\beta_t = \sigma(W_\beta x_t) \in (0, 1)$：<strong>数据相关标量写入强度</strong>，由 sigmoid 输出。β_t 控制当前 $k_t$ 方向新旧值的混合比例。</li>
+  <li>$\sigma(z) = 1/(1 + e^{-z})$：sigmoid 函数。</li>
+  <li>$W_Q, W_K, W_V, W_\alpha, W_\beta$：可学习参数。</li>
+</ul>
+
+<p>形状检查（验证维度自洽）：$k_t k_t^\top$ 是 $(d_k, 1) \times (1, d_k) = (d_k, d_k)$；$I - \beta_t k_t k_t^\top$ 是 $(d_k, d_k)$；$\alpha_t$ 是标量，$\alpha_t(I - \beta_t k_t k_t^\top)$ 仍是 $(d_k, d_k)$；$S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top))$ 是 $(d_v, d_k) \cdot (d_k, d_k) = (d_v, d_k)$；$\beta_t v_t k_t^\top$ 是标量 $\times (d_v, 1) \times (1, d_k) = (d_v, d_k)$；两项相加形状一致，结果 $(d_v, d_k)$。检查通过。</p>
+
+<h3 id="alpha-beta-roles">α_t 与 β_t 的职责分工</h3>
+
+<p>α_t 与 β_t <strong>不是同一个东西</strong>，职责不重叠<sup>[C4]</sup>：</p>
+
+<ul>
+  <li><strong>α_t 控全局衰减</strong>：$\alpha_t$ 是标量，作用于整张 $S_{t-1}$。无论 $S_{t-1}$ 里存了多少 key-value 关联，全部按 α_t 比例缩小。α_t → 0 时一步清空整段记忆（上下文切换），α_t → 1 时几乎不衰减。</li>
+  <li><strong>β_t 控单点覆写</strong>：$\beta_t$ 只影响当前 $k_t$ 一个方向。$I - \beta_t k_t k_t^\top$ 只擦 $k_t$ 方向的旧值，$\beta_t v_t k_t^\top$ 写入新值。β_t → 1 时完全覆写 $k_t$ 方向，β_t → 0 时几乎不擦不写。这与 DeltaNet 的 β_t 完全一致（见 <a href="../delta-rule/index.html">Delta 规则</a>第 2 章）。</li>
+</ul>
+
+<p>论文 §3.1 原文："the data-dependent gating term $\alpha_t \in (0,1)$ controls state decay"；§1 原文："gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
+
+<h3 id="decay-then-rewrite">"先衰减后擦写"的等价解读</h3>
+
+<p>Gated DeltaNet 公式的乘法顺序 $\alpha_t(I - \beta_t k_t k_t^\top)$ 有明确的语义。因为 $\alpha_t$ 是标量，它可以与矩阵交换：</p>
+
+$$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}(I - \beta_t k_t k_t^\top).$$
+
+<p>所以 Gated DeltaNet 的一步更新可以读作<strong>"先衰减、再擦写"</strong><sup>[C5]</sup>：</p>
+
+<ol>
+  <li><strong>衰减</strong>：$\alpha_t \cdot S_{t-1}$——整张状态乘 α_t，所有 key-value 关联按比例缩小。</li>
+  <li><strong>擦除</strong>：$(\alpha_t S_{t-1})(I - \beta_t k_t k_t^\top)$——在已衰减的状态上，擦除 $k_t$ 方向的旧值。</li>
+  <li><strong>写入</strong>：$+ \beta_t v_t k_t^\top$——写入新值。</li>
+</ol>
+
+<pre class="diagram">Gated DeltaNet 一步更新的三步语义（α_t 标量可交换）：
+
+  S_{t-1} ──[① 衰减]──► α_t · S_{t-1} ──[② 擦除 k_t 方向]──►
+                             (整张按 α_t 缩小)        (I - β_t k_t k_t^T)
+                                                          │
+                                                          ▼
+                                          ──[③ 写入]──► S_t
+                                              + β_t v_t k_t^T
+
+  DeltaNet 只有 ②③（无 ① 全局衰减）
+  Mamba2 只有 ① + 加性写入（无 ② 方向擦除）
+</pre>
+
+<p><strong>前提条件</strong>：α_t 是标量（可与矩阵交换）。若 α_t 是 channel-wise 向量（如 KDA 的情形），则不能这样交换——这是 Gated DeltaNet 与 KDA 的关键区别，第 5 章详述。</p>
+
+<p>两个快速边界检查。第一，若 $\alpha_t = 1$，则 $S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$——退化为 DeltaNet（无全局衰减）。第二，若 $\beta_t = 0$，则 $S_t = S_{t-1}(\alpha_t \cdot I) + 0 = \alpha_t S_{t-1}$——退化为 Mamba2 在 $v_t = 0$ 时的特殊情形（只衰减不写入）。退化关系第 4 章详细讨论。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说明 α_t 与 β_t 的职责差异（全局 vs 单点），并指出论文原文怎么描述这个分工。</li>
+  <li>用代数规则说明为什么 $\alpha_t(I - \beta_t k_t k_t^\top)$ 可以读作"先衰减后擦写"，以及这个等价需要什么前提。</li>
+  <li>$\alpha_t = 1$ 与 $\beta_t = 0$ 时 Gated DeltaNet 分别退化为哪种更新？</li>
+</ul>
+
+<p>公式有了，下一章手算验证。</p>
+
+<h2 id="hand-compute">手算 Gated DeltaNet 一步更新</h2>
+
+<p>教学示例。 取 $d = 2$ 维，3 步序列。前两步在两个正交方向各写一个关联，第 3 步覆写 $k_1$ 方向并加 $\alpha < 1$ 全局衰减——这样能同时看到 α_t 衰减非 $k_t$ 方向、β_t 覆写 $k_t$ 方向。key 已归一化（$\|k_1\| = \|k_2\| = 1$）。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>步 $t$</th><th>$k_t$</th><th>$v_t$</th><th>$\alpha_t$</th><th>$\beta_t$</th><th>意图</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>$(1, 0)^\top$</td><td>$(1, 0)^\top$</td><td>$1$</td><td>$1$</td><td>在 $k_1$ 方向写 $v_1$</td></tr>
+<tr><td>2</td><td>$(0, 1)^\top$</td><td>$(0, 1)^\top$</td><td>$1$</td><td>$1$</td><td>在正交方向 $k_2$ 写 $v_2$</td></tr>
+<tr><td>3</td><td>$(1, 0)^\top = k_1$</td><td>$(0, 1)^\top$</td><td>$0.5$</td><td>$1$</td><td>覆写 $k_1$ 方向（β=1），同时全局衰减（α=0.5）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>第 1 步：$S_0 = 0$，$k_1 = (1, 0)^\top$，$v_1 = (1, 0)^\top$，$\alpha_1 = 1$，$\beta_1 = 1$。</p>
+
+<p>$$k_1 k_1^\top = \begin{pmatrix}1 \\ 0\end{pmatrix}\begin{pmatrix}1 & 0\end{pmatrix} = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix},\qquad I - \beta_1 k_1 k_1^\top = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix}.$$</p>
+
+<p>$\alpha_1(I - \beta_1 k_1 k_1^\top) = 1 \cdot \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix}$。$S_0$ 乘它为 0；$\beta_1 v_1 k_1^\top = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}$。所以：</p>
+
+<p>$$S_1 = 0 + \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}.$$</p>
+
+<p>第 2 步：$k_2 = (0, 1)^\top$（与 $k_1$ 正交），$v_2 = (0, 1)^\top$，$\alpha_2 = 1$，$\beta_2 = 1$。</p>
+
+<p>$$I - \beta_2 k_2 k_2^\top = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix},\qquad S_1 \cdot \alpha_2(I - \beta_2 k_2 k_2^\top) = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}\begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}.$$</p>
+
+<p>$\beta_2 v_2 k_2^\top = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix}$。所以：</p>
+
+<p>$$S_2 = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} + \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}.$$</p>
+
+<p>注意 $S_2$ 在两个正交方向各存了一个关联——查询 $k_1$ 返回 $v_1 = (1, 0)^\top$，查询 $k_2$ 返回 $v_2 = (0, 1)^\top$。这一步与 DeltaNet 完全一致（因为 $\alpha_2 = 1$）。</p>
+
+<p>第 3 步（关键步）：$k_3 = (1, 0)^\top = k_1$，$v_3 = (0, 1)^\top$，$\alpha_3 = 0.5$，$\beta_3 = 1$。这一步同时做两件事——用 β=1 覆写 $k_1$ 方向（delta 规则），用 α=0.5 衰减整张 $S_2$（全局门）。</p>
+
+<p>$$I - \beta_3 k_3 k_3^\top = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix},\qquad \alpha_3(I - \beta_3 k_3 k_3^\top) = 0.5 \cdot \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix}.$$</p>
+
+<p>$$S_2 \cdot \alpha_3(I - \beta_3 k_3 k_3^\top) = \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}\begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix}.$$</p>
+
+<p>$\beta_3 v_3 k_3^\top = \begin{pmatrix}0 \\ 1\end{pmatrix}\begin{pmatrix}1 & 0\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix}$。合起来：</p>
+
+<p>$$S_3 = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix} + \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}.$$</p>
+
+<h3 id="compare-three-models">三模型在同一序列上的结果对比</h3>
+
+<p>现在把 Gated DeltaNet 与 DeltaNet（$\alpha = 1$）、Mamba2（$\beta = 0$，只衰减不写入）在第 3 步的结果并排对比：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>模型</th><th>第 3 步公式</th><th>$S_3$</th><th>$S_3 k_3$（查 $k_1$ 方向）</th><th>$S_3 k_2$（查 $k_2$ 方向）</th></tr></thead>
+<tbody>
+<tr><td>DeltaNet<sup>[F4]</sup></td><td>$S_2(I - k_3 k_3^\top) + v_3 k_3^\top$</td><td>$\begin{pmatrix}0 & 0 \\ 1 & 1\end{pmatrix}$</td><td>$(0, 1)^\top = v_3$</td><td>$(0, 1)^\top = v_2$（未衰减）</td></tr>
+<tr class="highlight-row"><td>Gated DeltaNet<sup>[F1]</sup></td><td>$S_2(0.5(I - k_3 k_3^\top)) + v_3 k_3^\top$</td><td>$\begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}$</td><td>$(0, 1)^\top = v_3$</td><td>$(0, 0.5)^\top$（衰减到一半）</td></tr>
+<tr><td>Mamba2<sup>[F3]</sup></td><td>$0.5 \cdot S_2$（$\beta = 0$，无写入）</td><td>$\begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}$</td><td>$(0.5, 0)^\top$（衰减，未覆写）</td><td>$(0, 0.5)^\top$（衰减）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>三个关键观察：</p>
+
+<ul>
+  <li><strong>Gated DeltaNet 与 DeltaNet 查 $k_3$ 都返回 $v_3$</strong>：因为 $\beta_3 = 1$ 完全覆写了 $k_3$ 方向，α_t 的衰减不影响"刚写入的新值"（$\beta_t v_t k_t^\top$ 这一项不被 α_t 衰减）。这是 delta 规则精准覆写的体现。</li>
+  <li><strong>Gated DeltaNet 查 $k_2$ 返回 $(0, 0.5)^\top$ 而 DeltaNet 返回 $(0, 1)^\top$</strong>：$k_2$ 方向与 $k_3$ 正交，delta 规则不擦它，但 α_t = 0.5 把它衰减了一半。这正是 α_t 的作用——衰减非 $k_t$ 方向的旧关联。</li>
+  <li><strong>Mamba2 查 $k_3$ 返回 $(0.5, 0)^\top \neq v_3$</strong>：Mamba2 没有 delta 规则，无法覆写 $k_3$ 方向，只能把旧的 $v_1 = (1, 0)^\top$ 衰减到 $(0.5, 0)^\top$。这是 Mamba2 缺方向擦除的体现。</li>
+</ul>
+
+<p>这个例子把"Gated DeltaNet = DeltaNet 的精准覆写 + Mamba2 的全局衰减"具体化了：$k_3$ 方向被精准覆写（像 DeltaNet），$k_2$ 方向被全局衰减（像 Mamba2），两者在同一步里各司其职。</p>
+
+<details>
+<summary>完整逐步代入：Gated DeltaNet 第 3 步的"先衰减后擦写"解读</summary>
+<p>用 C5 的等价形式 $S_3 = \alpha_3 \cdot S_2(I - \beta_3 k_3 k_3^\top) + \beta_3 v_3 k_3^\top$ 分三步验证：</p>
+<p><strong>① 衰减</strong>：$\alpha_3 \cdot S_2 = 0.5 \cdot \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}$。整张 $S_2$ 被乘 0.5。</p>
+<p><strong>② 擦除</strong>：$(\alpha_3 S_2)(I - \beta_3 k_3 k_3^\top) = \begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}\begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix}$。擦掉 $k_3$ 方向（第一列），保留 $k_2$ 方向（衰减后的 0.5）。</p>
+<p><strong>③ 写入</strong>：$+ \beta_3 v_3 k_3^\top = \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix}$。写入新值 $v_3$ 到 $k_3$ 方向。</p>
+<p>合起来 $S_3 = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix} + \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}$，与紧凑公式一致。这一步展示"先衰减后擦写"的语义：α_t 先把整张状态缩小，delta 规则再在缩小的状态上擦写 $k_3$ 方向。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定 $S_{t-1} = \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}$、$k_t = (0, 1)^\top$、$v_t = (1, 0)^\top$、$\alpha_t = 0.5$、$\beta_t = 1$，手算 $S_t$，并说明查询 $k_t$ 与查询 $(1, 0)^\top$ 各返回什么。</li>
+  <li>说明为什么 Gated DeltaNet 查 $k_3$ 返回 $v_3$ 而 Mamba2 查 $k_3$ 不返回 $v_3$（提示：delta 规则的覆写 vs 加性累加）。</li>
+  <li>说明为什么 Gated DeltaNet 查 $k_2$ 返回衰减后的 $(0, 0.5)^\top$ 而 DeltaNet 查 $k_2$ 返回未衰减的 $(0, 1)^\top$（提示：α_t 作用于哪些方向）。</li>
+</ul>
+
+<p>手算验证了公式与 α_t、β_t 的协同。下一章看退化关系与并行训练算法。</p>
+
+<h2 id="degradation-and-parallel">退化关系与并行训练算法</h2>
+
+<h3 id="degradation">Gated DeltaNet 的退化</h3>
+
+<p>把 $\alpha_t$ 和 $\beta_t$ 推到极端，看 Gated DeltaNet 分别退化为哪个模型<sup>[F2]</sup>。这是验证理解的最简方式。</p>
+
+<ul>
+  <li><strong>$\alpha_t \to 1$</strong>：$S_t = S_{t-1}(1 \cdot (I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$——退化为 <strong>DeltaNet</strong>（无全局衰减，只有方向擦写）。</li>
+  <li><strong>$\beta_t \to 0$</strong>：$S_t = S_{t-1}(\alpha_t \cdot I) + 0 = \alpha_t S_{t-1}$——退化为 <strong>Mamba2 在 $v_t = 0$ 时的特殊情形</strong>（只衰减不写入）。注意完整 Mamba2 还有 $+ v_t k_t^\top$ 写入项，Gated DeltaNet 在 $\beta_t = 0$ 时连 delta 写入也关闭了。</li>
+  <li><strong>$\alpha_t \to 0$</strong>：$S_t = S_{t-1}(0) + \beta_t v_t k_t^\top = \beta_t v_t k_t^\top$——清空所有历史，只保留当前步的写入。这是"上下文切换"的极端：一步忘掉全部过去。</li>
+</ul>
+
+<p>退化关系揭示 Gated DeltaNet 是 DeltaNet 与 Mamba2 的<strong>统一</strong>：DeltaNet 是 $\alpha_t = 1$ 的特例，Mamba2（无写入时）是 $\beta_t = 0$ 的特例，Gated DeltaNet 把两者统一进一个公式。</p>
+
+<h3 id="parallel-training">并行训练算法——为什么不能直接串行递归</h3>
+
+<p>Gated DeltaNet 的递归形式 $S_t$ 依赖 $S_{t-1}$，训练时要算整段序列的 $S_1, S_2, \ldots, S_L$，串行计算 $L$ 步无法利用 GPU 的并行能力。这在长序列上不可接受。</p>
+
+<p>Yang 2025 ICLR §3.2 给出 <strong>chunkwise 并行算法</strong><sup>[C6]</sup>，思路是把序列切成大小为 $C$ 的 chunk（$C$ 通常取 64，且为 16 的倍数以用 Tensor Core）：</p>
+
+<ul>
+  <li><strong>chunk 内</strong>：用扩展的 WY 表示（Bischof & Van Loan 1985）把递归展开为矩阵乘法，可并行计算。</li>
+  <li><strong>chunk 间</strong>：递归传递 chunk 末尾的状态 $S_{[t]}$ 作为下一个 chunk 的初始状态。</li>
+  <li><strong>门控兼容性</strong>：α_t 只做逐元素乘法（标量乘矩阵），不破坏矩阵乘法结构，因此整个 chunkwise 形式仍兼容 Tensor Core GPU 优化。</li>
+</ul>
+
+<p>论文 §3.2 原文："the gating term only performs element-wise multiplication and does not affect the matrix multiplication structure, thus compatible with tensor core GPU optimization"。</p>
+
+<details>
+<summary>补充：WY 表示与 chunkwise 形式的作用（不展开推导）</summary>
+<p>WY 表示（Bischof & Van Loan 1985）把 Householder 矩阵乘积 $\prod_i (I - \beta_i k_i k_i^\top)$ 写成紧凑形式 $I - \sum_i w_i k_i^\top$，使 chunk 内的累积擦除可表示为一次矩阵乘法。Yang 2025 ICLR §3.2 Eq.9-10 把 WY 表示扩展以纳入 α_t 衰减项，得到 $\mathbf{P}_{[t]}^r = \gamma_{[t]}^r(I - \sum_i w_i k_i^\top)$，其中 $\gamma_{[t]}^j = \prod_i \alpha_i$ 是局部累积衰减。这让 chunk 内计算全部归约为矩阵乘法，可用 Tensor Core 加速。本页不展开 UT 变换、前向替换等数值线性代数细节——它们属于独立的数值线性代数概念，Yang 2025 ICLR §3.2 与 DeltaNet 论文 §3（见 <a href="../delta-rule/index.html">Delta 规则</a>）已有完整论证。</p>
+</details>
+
+<p>这个算法解决的核心问题是：让 Gated DeltaNet 在保持递归形式（推理时固定大小状态）的同时，训练时能像注意力一样并行计算。没有它，Gated DeltaNet 只能在短序列上用，无法扩展到 100B tokens 训练。</p>
+
+<details class="code-details">
+<summary>代码：实现 Gated DeltaNet 递归并与 DeltaNet、Mamba2 对比</summary>
+<div class="code-block">
+<pre><code class="language-python">import numpy as np
+
+# 教学示例：d=2 维，3 步序列，对比 Gated DeltaNet、DeltaNet、Mamba2
+# 第 1-2 步在两个正交方向各写一个关联，第 3 步覆写 k_1 方向并加 alpha<1 全局衰减
+
+d = 2
+S0 = np.zeros((d, d))
+I_mat = np.eye(d)
+
+# 两个正交 key：k_1=(1,0), k_2=(0,1)
+k1 = np.array([1.0, 0.0])
+v1 = np.array([1.0, 0.0])
+k2 = np.array([0.0, 1.0])
+v2 = np.array([0.0, 1.0])
+# 第 3 步用 k_3=k_1 覆写，新值 v_3=(0,1)
+k3 = np.array([1.0, 0.0])
+v3 = np.array([0.0, 1.0])
+
+beta1, beta2, beta3 = 1.0, 1.0, 1.0
+alpha3 = 0.5  # 第 3 步的全局衰减门
+
+# === DeltaNet：alpha=1，纯 delta rule ===
+def delta_step(S_prev, k, v, beta):
+    kkT = np.outer(k, k)
+    return S_prev @ (I_mat - beta * kkT) + beta * np.outer(v, k)
+
+S_del = S0.copy()
+S_del = delta_step(S_del, k1, v1, beta1)
+S_del = delta_step(S_del, k2, v2, beta2)
+S_del = delta_step(S_del, k3, v3, beta3)
+print("DeltaNet S_3 =")
+print(S_del)
+print("  S_3 @ k_3 =", S_del @ k3, "(k_1 direction: rewritten to v_3)")
+print("  S_3 @ k_2 =", S_del @ k2, "(k_2 direction: untouched by delta rule)")
+print()
+
+# === Gated DeltaNet：第 3 步 alpha=0.5, beta=1 ===
+def gated_delta_step(S_prev, k, v, alpha, beta):
+    kkT = np.outer(k, k)
+    return S_prev @ (alpha * (I_mat - beta * kkT)) + beta * np.outer(v, k)
+
+S_gdn = S0.copy()
+S_gdn = gated_delta_step(S_gdn, k1, v1, alpha=1.0, beta=beta1)
+S_gdn = gated_delta_step(S_gdn, k2, v2, alpha=1.0, beta=beta2)
+S_gdn = gated_delta_step(S_gdn, k3, v3, alpha=alpha3, beta=beta3)
+print("Gated DeltaNet S_3 (alpha_3=0.5, beta_3=1) =")
+print(S_gdn)
+print("  S_3 @ k_3 =", S_gdn @ k3, "(k_1 direction: rewritten to v_3 by delta rule)")
+print("  S_3 @ k_2 =", S_gdn @ k2, "(k_2 direction: decayed to 0.5 by alpha gate)")
+print()
+
+# === Mamba2：第 3 步 alpha=0.5，无 delta 写入（beta=0 对照）===
+def mamba2_step(S_prev, k, v, alpha):
+    return alpha * S_prev + np.outer(v, k)
+
+S_mamba = S0.copy()
+S_mamba = mamba2_step(S_mamba, k1, v1, alpha=1.0)
+S_mamba = mamba2_step(S_mamba, k2, v2, alpha=1.0)
+S_mamba = alpha3 * S_mamba  # 第 3 步只衰减不写入（模拟 beta=0）
+print("Mamba2 S_3 (alpha_3=0.5, no write) =")
+print(S_mamba)
+print("  S_3 @ k_3 =", S_mamba @ k3, "(k_1 direction: decayed, NOT rewritten)")
+print("  S_3 @ k_2 =", S_mamba @ k2, "(k_2 direction: decayed)")
+print()
+
+# === 退化验证：alpha=1 时 Gated DeltaNet == DeltaNet ===
+S_gdn_a1 = S0.copy()
+for k, v, a, b in [(k1, v1, 1.0, beta1), (k2, v2, 1.0, beta2), (k3, v3, 1.0, beta3)]:
+    S_gdn_a1 = gated_delta_step(S_gdn_a1, k, v, a, b)
+print("Degradation alpha=1: Gated DeltaNet == DeltaNet:", np.allclose(S_gdn_a1, S_del))
+
+# === 退化验证：beta=0 时 Gated DeltaNet == alpha * S_{t-1} ===
+S_gdn_b0 = S0.copy()
+S_gdn_b0 = gated_delta_step(S_gdn_b0, k1, v1, 1.0, beta1)
+S_gdn_b0 = gated_delta_step(S_gdn_b0, k2, v2, 1.0, beta2)
+S_prev = S_gdn_b0.copy()
+S_gdn_b0 = gated_delta_step(S_gdn_b0, k3, v3, alpha3, 0.0)  # beta=0
+print("Degradation beta=0: Gated DeltaNet == alpha * S_2:", np.allclose(S_gdn_b0, alpha3 * S_prev))
+</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">DeltaNet S_3 =
+[[0. 0.]
+ [1. 1.]]
+  S_3 @ k_3 = [0. 1.] (k_1 direction: rewritten to v_3)
+  S_3 @ k_2 = [0. 1.] (k_2 direction: untouched by delta rule)
+
+Gated DeltaNet S_3 (alpha_3=0.5, beta_3=1) =
+[[0.  0. ]
+ [1.  0.5]]
+  S_3 @ k_3 = [0. 1.] (k_1 direction: rewritten to v_3 by delta rule)
+  S_3 @ k_2 = [0.  0.5] (k_2 direction: decayed to 0.5 by alpha gate)
+
+Mamba2 S_3 (alpha_3=0.5, no write) =
+[[0.5 0. ]
+ [0.  0.5]]
+  S_3 @ k_3 = [0.5 0.] (k_1 direction: decayed, NOT rewritten)
+  S_3 @ k_2 = [0. 0.5] (k_2 direction: decayed)
+
+Degradation alpha=1: Gated DeltaNet == DeltaNet: True
+Degradation beta=0: Gated DeltaNet == alpha * S_2: True
+</code></pre>
+</div>
+<p><b>验证的机制</b>：代码实现 F1（Gated DeltaNet 紧凑公式）、F4（DeltaNet）、F3（Mamba2），逐行对应正文 §2 公式与 §3 手算。第 3 步 $\alpha_3 = 0.5, \beta_3 = 1$：Gated DeltaNet 查 $k_3$ 返回 $v_3$（delta 规则覆写），查 $k_2$ 返回 $(0, 0.5)^\top$（α 门衰减非 $k_t$ 方向）；DeltaNet 查 $k_2$ 返回 $(0, 1)^\top$（无衰减）；Mamba2 查 $k_3$ 返回 $(0.5, 0)^\top$（无覆写）。退化验证确认 $\alpha=1$ 时 Gated DeltaNet == DeltaNet，$\beta=0$ 时 == $\alpha \cdot S_{t-1}$。</p>
+<p><b>观察重点</b>：Gated DeltaNet 的 $S_3$ 第二行第二列是 0.5（$k_2$ 方向被 α 衰减），而 DeltaNet 是 1（未衰减）；Gated DeltaNet 的 $S_3$ 第二行第一列是 1（$k_3$ 方向被 β 覆写为新值 $v_3$），而 Mamba2 是 0（无写入）。这正是"先衰减后擦写"的数值体现。</p>
+<p><b>教学简化</b>：教学实现使用 numpy 标量循环逐手算 step；真实工程用 Triton chunkwise kernel（Yang 2025 ICLR §3.2）批量并行计算，chunk size 通常为 64，且融合 L2 归一化与 kernel。本代码不实现 batch、不处理多头、不归一化 key、不实现 chunkwise 并行。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说明 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 时 Gated DeltaNet 各退化为哪个模型，并从公式代入说明。</li>
+  <li>用一句话说明为什么 Gated DeltaNet 训练时不能直接串行递归。</li>
+  <li>说明 chunkwise 算法的两个层次（chunk 内并行、chunk 间递归）各做什么，以及 α_t 为什么不破坏 Tensor Core 兼容性。</li>
+</ul>
+
+<p>机制讲完了。下一章看 Gated DeltaNet 与 KDA 的关系，以及实验效果。</p>
+
+<h2 id="kda-and-experiments">与 KDA 的关系及实验效果</h2>
+
+<h3 id="gated-deltanet-vs-kda">Gated DeltaNet 与 KDA 的 α_t 区别</h3>
+
+<p>Gated DeltaNet 是 Kimi K3 的 <a href="../kda/index.html">KDA（Kimi Delta Attention）</a> 的直接前身。KDA 基于 Gated DeltaNet 但做了三项改动<sup>[C8]</sup>，其中最关键的是 α_t 的设计：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>设计项</th><th>Gated DeltaNet</th><th>KDA</th></tr></thead>
+<tbody>
+<tr><td>α_t 形状</td><td>标量（每步一个衰减率作用于整张 S）</td><td>channel-wise 向量（每 key 通道一个独立衰减率）</td></tr>
+<tr><td>decay 参数化</td><td>sigmoid（α_t ∈ (0,1)，无下界约束）</td><td>scaled sigmoid（$g \in (g_{\min}, 0)$，lower-bounded）</td></tr>
+<tr><td>output gate</td><td>（论文未特别强调 full-rank）</td><td>full-rank output gate</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>α_t 标量 vs channel-wise 的区别影响什么</strong>：Gated DeltaNet 的 α_t 是标量，整张 $S_{t-1}$ 按同一速率衰减——所有 key-value 关联同比例缩小，无法按通道差异化遗忘。KDA 的 α_t 是向量 $\alpha_t \in (0,1)^{d_k}$，每个 key 通道一个独立衰减率——$S_{t-1}$ 的不同行可以按不同速率衰减，模型能按通道差异化遗忘。这是 KDA 相对 Gated DeltaNet 的表达力提升。</p>
+
+<p><strong>lower-bounded decay 的动机</strong>：Gated DeltaNet 的 α_t = σ(W_α x_t) ∈ (0,1) 可任意接近 0，累积衰减倒数可能溢出 BF16。KDA 把 decay 参数化改为 scaled sigmoid（限定 $g \in (g_{\min}, 0)$，K3 取 $g_{\min} = -5$），让 α_t 有下界 $e^{-5} \approx 0.0067$，使 chunkwise 形式的对角 tile 也能用 Tensor Core。这是工程稳定性改动，不影响递归形式本身。详见 <a href="../kda/index.html">KDA</a> 第 2-3 章。</p>
+
+<p><strong>公式差异</strong>：Gated DeltaNet 是 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$（α_t 标量可交换）；KDA 是 $S_t = (I - \beta_t k_t k_t^\top)\mathrm{Diag}(\alpha_t) S_{t-1} + \beta_t k_t v_t^\top$（α_t 向量不能与 $I - \beta_t k_t k_t^\top$ 交换，乘法顺序由 $\mathrm{Diag}(\alpha_t)$ 在左侧决定）。两者形式同源但 α_t 形状与参数化不同。</p>
+
+<h3 id="experiments">实验效果：Gated DeltaNet 在哪些任务上占优</h3>
+
+<p>Yang 2025 ICLR §4 在 1.3B 参数 / 100B tokens（FineWeb-Edu）设置下对比 Gated DeltaNet、DeltaNet、Mamba2、Transformer++<sup>[N1]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>模型</th><th>Wiki PPL↓</th><th>LMB PPL↓</th><th>常识推理 7 项平均↑</th></tr></thead>
+<tbody>
+<tr><td>Transformer++</td><td>18.53</td><td>18.32</td><td>52.25</td></tr>
+<tr><td>Mamba2</td><td>16.56</td><td>12.56</td><td>54.89</td></tr>
+<tr><td>DeltaNet</td><td>17.71</td><td>16.88</td><td>52.14</td></tr>
+<tr class="highlight-row"><td>Gated DeltaNet</td><td>16.42</td><td>12.17</td><td>55.32</td></tr>
+<tr><td>Gated DeltaNet-H1（+SWA）</td><td>16.07</td><td>12.12</td><td>56.40</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Gated DeltaNet 在 PPL 与常识推理上均优于 DeltaNet 与 Mamba2<sup>[N1, N3]</sup>。混合架构 Gated DeltaNet-H1（加滑动窗口注意力）进一步提升。这验证了"gating + delta 规则互补"的设计假设——两者结合确实比单独用任何一个都好。</p>
+
+<p>检索任务上差异更显著。S-NIAH-2（number-in-haystack 数字针单针检索）4K 长度<sup>[N2]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>模型</th><th>S-NIAH-2 4K↑</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>DeltaNet</td><td>18.6</td><td>数字针检索上显著退化</td></tr>
+<tr><td>Mamba2</td><td>56.2</td><td>—</td></tr>
+<tr class="highlight-row"><td>Gated DeltaNet</td><td>92.2</td><td>α_t 全局衰减让模型能"忘掉旧话题聚焦新问题"</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>DeltaNet 在简单 S-NIAH-1 上接近完美，但在干扰更强的 S-NIAH-2/3（number/uuid 针，非真实文本）上性能显著下降——这正对应 §1 说的"DeltaNet 缺乏快速清空整段记忆"。Gated DeltaNet 的 α_t 让模型能在上下文切换时快速衰减过时段落，检索能力大幅提升<sup>[N2]</sup>。这是 Gated DeltaNet 相对 DeltaNet 的核心实证收益。</p>
+
+<h3 id="real-world-apps">现实应用</h3>
+
+<p>Gated DeltaNet 已被多个实际模型采用：</p>
+
+<ul>
+  <li><strong>Qwen3-Next</strong> 等混合架构用 Gated DeltaNet 作线性层（多数层 GDN + 少数层全注意力），用极小的全注意力预算补回精确检索能力。</li>
+  <li><strong>Kimi K3</strong> 的 <a href="../kda/index.html">KDA</a> 基于 Gated DeltaNet，把 α_t 改为 channel-wise + lower-bounded decay 以适配 BF16 训练。K3 的 93 层 backbone 中 69 层用 KDA。</li>
+  <li>论文还探索了<strong>混合架构</strong> Gated DeltaNet-H1（GDN + 滑动窗口注意力 SWA）与 Gated DeltaNet-H2（GDN + Mamba2 + SWA），在长程状态建模与局部精细对齐之间折中。本页不展开混合架构设计。</li>
+</ul>
+
+<p>开源实现在 NVlabs/GatedDeltaNet 与 flash-linear-attention 库（Triton kernel）。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说明 Gated DeltaNet 与 KDA 在 α_t 形状上的区别，以及这个区别影响什么（提示：标量 vs channel-wise）。</li>
+  <li>说明 KDA 为什么要把 decay 参数化改为 lower-bounded scaled sigmoid（提示：BF16 数值稳定性）。</li>
+  <li>用 S-NIAH-2 的数字说明 Gated DeltaNet 相对 DeltaNet 的核心收益在哪类任务上。</li>
+</ul>
+
+<p>五问已答完：DeltaNet 缺全局遗忘、Mamba2 缺方向擦除，Gated DeltaNet 把两者统一（Q1，§1）；公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 中 α_t 控全局衰减、β_t 控单点覆写，"先衰减后擦写"（Q2，§2-3）；$\alpha_t \to 1$ 退化为 DeltaNet、$\beta_t \to 0$ 退化为 Mamba2 特殊情形，chunkwise 算法让训练可并行（Q3-4，§4）；KDA 把 α_t 改 channel-wise + lower-bounded decay（Q5，§5）。这正是 K3 中 KDA 选择 Gated DeltaNet 作基础、再工程化改造的前提。</p>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+
+<p><b>C1（DeltaNet 缺乏全局遗忘）</b>：Yang, Kautz & Hatamizadeh. "Gated Delta Networks: Improving Mamba2 with Delta Rule." ICLR 2025, arXiv:2412.06464 §2.3 与 §1。§2.3 原文 "it lacks the ability to rapidly clear outdated information, particularly during context switches"。</p>
+
+<p><b>C2（Mamba2 标量衰减门机制）</b>：Yang 2025 ICLR arXiv:2412.06464 §2.2。原文 "Mamba2 decays all key-value associations uniformly by a dynamic ratio α_t" 与 "this approach does not account for the varying importance of different key-value associations"。</p>
+
+<p><b>C3（Gated DeltaNet 公式）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1 Eq.8。原文公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$。</p>
+
+<p><b>C4（α_t 与 β_t 职责分工）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1。原文 "the data-dependent gating term α_t ∈ (0,1) controls state decay" 与 §1 "gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
+
+<p><b>C5（"先衰减后擦写"等价解读）</b>：由 C3 公式结合矩阵乘法结合律与标量交换律直接得到：$S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) = \alpha_t \cdot S_{t-1}(I - \beta_t k_t k_t^\top)$（α_t 标量可交换）。适用条件：α_t 是标量。</p>
+
+<p><b>C6（chunkwise 并行算法）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.2 Eq.9-12。原文 "the gating term only performs element-wise multiplication and does not affect the matrix multiplication structure, thus compatible with tensor core GPU optimization"。WY 表示引自 Bischof & Van Loan 1985（论文引用 [Bischof & Loan, 1985]）。</p>
+
+<p><b>C7（与 Mamba2、DeltaNet 互补）</b>：Yang 2025 ICLR arXiv:2412.06464 §1 与 §3.1。§1 原文 "we observe that these mechanisms are complementary—gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
+
+<p><b>C8（与 KDA 的 α_t 区别）</b>：Kimi K3 Technical Report §2.1.1 Eq.1、Eq.5（KDA 公式与 scaled sigmoid）；Gated DeltaNet 公式见 C3。KDA 完整讲解见 <a href="../kda/index.html">wiki/kda/</a>。</p>
+
+<h3>核心公式与来源</h3>
+
+<p><b>F1（Gated DeltaNet 递归公式）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1 Eq.8。</p>
+
+<p><b>F2（Gated DeltaNet 退化）</b>：由 F1 直接代入。Mamba2 公式见 F3；DeltaNet 公式见 F4。</p>
+
+<p><b>F3（Mamba2 递归公式）</b>：Yang 2025 ICLR arXiv:2412.06464 §2.2，$S_t = \alpha_t S_{t-1} + v_t k_t^\top$。</p>
+
+<p><b>F4（DeltaNet 递归公式）</b>：Yang, Wang, Zhang, Shen & Kim. "Parallelizing Linear Transformers with the Delta Rule over Sequence Length." NeurIPS 2024, arXiv:2406.06484 §2.2；<a href="../delta-rule/index.html">wiki/delta-rule/</a>。</p>
+
+<h3>外部数字与实验条件</h3>
+
+<p><b>N1</b>：Yang 2025 ICLR arXiv:2412.06464 §4 Table 2。1.3B 参数 / 100B tokens / FineWeb-Edu 数据集。Gated DeltaNet Wiki PPL = 16.42, LMB PPL = 12.17；Mamba2 = 16.56 / 12.56；DeltaNet = 17.71 / 16.88；Transformer++ = 18.53 / 18.32；Gated DeltaNet-H1 = 16.07 / 12.12；Gated DeltaNet-H2 = 15.91 / 12.55。不外推到其他规模或数据。</p>
+
+<p><b>N2</b>：Yang 2025 ICLR arXiv:2412.06464 §4 Table 3（S-NIAH 检索基准）。S-NIAH-2 4K：DeltaNet = 18.6，Mamba2 = 56.2，Gated DeltaNet = 92.2。S-NIAH-3 4K：DeltaNet = 22.4，Mamba2 = 4.6，Gated DeltaNet = 27.6。</p>
+
+<p><b>N3</b>：Yang 2025 ICLR arXiv:2412.06464 §4 Table 2。1.3B 模型常识推理 7 项平均（PIQA、HellaSwag、WinoGrande、ARC-e、ARC-c、SIQA、BoolQ）：Gated DeltaNet = 55.32，Mamba2 = 54.89，DeltaNet = 52.14，Transformer++ = 52.25，Gated DeltaNet-H1 = 56.40，H2 = 56.18。</p>
+
+<h3>教学示例</h3>
+
+<p>本页构造了一组教学数字，均非真实模型数据：</p>
+
+<ul>
+  <li><b>第 3 章主例子</b>：$d = 2$ 维、$L = 3$ 步、key 归一化（$k_1 = (1,0)^\top, k_2 = (0,1)^\top$ 正交，$k_3 = k_1$）。$v_1 = (1,0)^\top, v_2 = (0,1)^\top, v_3 = (0,1)^\top$；$\beta_1 = \beta_2 = \beta_3 = 1$；$\alpha_1 = \alpha_2 = 1$，$\alpha_3 = 0.5$。构造目的：第 1-2 步在两个正交方向各写一个关联，第 3 步覆写 $k_1$ 方向（β=1）同时全局衰减（α=0.5），让 α_t 衰减非 $k_t$ 方向（$k_2$）的效果可见。沿用 <a href="../delta-rule/index.html">Delta 规则</a>概念页的 key/value 设定，便于读者复用已有手算经验。</li>
+  <li><b>对照设定</b>：DeltaNet 取 $\alpha = 1$（无衰减），Mamba2 取 $\beta = 0$（无写入，只衰减）。两者均非完整模型在真实序列上的行为，只为对照 Gated DeltaNet 的 α_t 与 β_t 各自贡献。</li>
+</ul>
+
+<h3>教学解释与类比边界</h3>
+
+<p><b>"先衰减后擦写"类比</b>：把 $\alpha_t(I - \beta_t k_t k_t^\top)$ 解释为"先衰减整张、再擦写 $k_t$ 方向"是教学解释，服务于理解 C5 的等价关系。失效边界：(1) 仅当 α_t 是标量时可交换；KDA 的 channel-wise α_t 不能这样交换；(2) "先衰减"指 α_t 作用于 $S_{t-1}$，不包括 $\beta_t v_t k_t^\top$ 写入项（写入项不被 α_t 衰减）；(3) "擦写"仍受 $\beta_t$ 控制，$\beta_t < 1$ 时是部分擦除。正式判断以 F1 公式为准。</p>
+
+<p><b>"Gated DeltaNet = DeltaNet + Mamba2"类比</b>：把 Gated DeltaNet 说成"DeltaNet 与 Mamba2 的统一"是教学解释，服务于理解退化关系 F2。失效边界：(1) Gated DeltaNet 不是两个模型的简单拼接，而是把 α_t 嵌进 delta 规则的擦除项前；(2) $\beta_t \to 0$ 退化为 Mamba2 在 $v_t = 0$ 的特殊情形，完整 Mamba2 还有 $+ v_t k_t^\top$ 写入项；(3) Gated DeltaNet 的训练算法与 Mamba2/DeltaNet 都不同（扩展 WY 表示）。</p>
+
+<h3>教学简化及其限制</h3>
+
+<ul>
+  <li><b>$d_v = d_k = 2$ 极小维度</b>：为便于手算选 $d = 2$。真实模型 $d$ 通常为 64 或 128。$d$ 越大可容纳的正交 key 越多，但 $\alpha_t$ 仍作用于整张 $S$。本页结论不依赖具体 $d$ 值。</li>
+  <li><b>α_t 取 0.5 便于手算</b>：真实 Gated DeltaNet 的 α_t = σ(W_α x_t) 由模型学习，取值连续。本页取 0.5 只为手算方便，不代表真实模型取值。</li>
+  <li><b>未展开 WY 表示与 chunkwise 算法推导</b>：Yang 2025 ICLR §3.2 用扩展 WY 表示把递归改写为 chunkwise 并行形式。本页只提及存在与作用，不展开 UT 变换、前向替换、$\mathbf{A}_{[t]}^W$/$\mathbf{A}_{[t]}^U$ 等数值线性代数细节。原因：属于独立数值线性代数概念，不影响 Gated DeltaNet 概念理解。</li>
+  <li><b>未展开多头实现</b>：真实 Gated DeltaNet 是多头模型，每个 head 维护独立的 $S$。本页只讲单头递归，多头属于工程。</li>
+  <li><b>代码使用 numpy 标量循环</b>：教学代码逐 step 循环；真实工程用 Triton chunkwise kernel 批量并行。教学代码只验证公式正确性，不验证训练效率。</li>
+  <li><b>未展开混合架构 H1/H2</b>：论文 §3.3 探索 Gated DeltaNet + SWA（H1）与 GDN + Mamba2 + SWA（H2）。本页一句话提及存在与组成，不展开设计。</li>
+  <li><b>未展开在线学习视角</b>：论文 §3.1 Table 1 给出 gated delta rule 对应的带自适应权重衰减的在线学习目标函数。本页只提及存在，不展开推导。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

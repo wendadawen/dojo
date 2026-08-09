@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LatentMoE · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · MoE 架构</span>
+      <h1>LatentMoE（隐空间 MoE）</h1>
+      <p class="lead">把路由专家的输入输出从模型全宽压到更窄的隐空间再计算，使扩大专家池时路由通信与专家权重流量不再随路由倍数线性增长。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>这个概念是什么</h2>
+    <p>LatentMoE 是一种 <a href="../moe-serving/index.html">MoE（专家混合）</a>架构。普通 MoE 里每个被选中的路由专家都直接接收完整的 $d$ 维 token、在 $d$ 维空间里做 FFN 变换。LatentMoE 在路由分支两端各加一次共享线性投影——下投影 $W_\downarrow$ 把 token 从 $d$ 压到更窄的隐空间 $\ell$（$\ell < d$），路由专家在 $\ell$ 维空间内计算，上投影 $W_\uparrow$ 把结果投回 $d$。共享专家与 router 仍在全宽 $d$ 工作，不进隐空间。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><b>路由通信随 $d$ 线性增长</b>：分布式部署里，每个"token–专家"对都要 dispatch 一个 $d$ 维向量到专家所在的卡、combine 一个 $d$ 维向量回来。扩大 top-$k$ 时，这部分 all-to-all 通信量 $\propto k \cdot d$，常常先于 FLOPs 到瓶颈。</li>
+      <li><b>专家权重读取随 $d$ 线性增长</b>：每个被选中的专家要从显存读一份 $d$ 维的 FFN 权重才能算。低延迟场景下这部分读取常常是延迟大头。</li>
+      <li><b>想扩大专家池但不让开销爆炸</b>：扩大 $N$ 与 $k$ 能提升专家专门化潜力，但路由部分开销会跟着涨。LatentMoE 让路由部分的开销随更小的 $\ell$ 走，而非随 $d$ 走。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><b>只压路由分支，不压共享与 router</b>：共享专家承载通用变换、router 做门控决策，都不是瓶颈，留在全宽 $d$；只有路由 payload 与路由专家计算进入隐空间 $\ell$。</li>
+      <li><b>压缩比 $d/\ell$ 是路由部分的缩小比例</b>：dispatch 通信量与路由专家权重大小都大致按 $d/\ell$ 缩小。Nemotron-3 用 4x，K3 用 2x。</li>
+      <li><b>省下的预算 reinvest 到更多专家与更高 top-$k$</b>：把 $N$ 与 $k$ 按同一因子 $\alpha = d/\ell$ 放大，组合数 $\binom{N}{k}$ 显著增长，服务成本基本不变。这是 LatentMoE 区别于"单纯压缩"的关键。</li>
+      <li><b>压缩时保持非线性容量不变，reinvestment 时提升</b>：压缩 $d\to\ell$ 时保持 $k$ 与中间维度不变（$U_\text{eff}$ 不变）；reinvestment 放大 $k$ 时中间维度不缩小，$U_\text{eff}$ 随之提升——这是 reinvestment 提升准确率的机制之一。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><b>压缩比不等于整体加速比</b>：只压缩了路由部分，down/up-projection 本身有计算成本（K2-1T 规模投影约 +9%）。"4x 压缩"不意味着整个 MoE 层快 4 倍。</li>
+      <li><b>压缩有下限</b>：存在任务相关的"特征秩"下限，$\ell$ 压到低于此下限会损害质量。NVIDIA 16B 消融显示压缩比到 4 时质量仍可保持。</li>
+      <li><b>只压缩不 reinvestment 会掉点</b>：reinvestment 是维持质量的必要条件，不是可选项。</li>
+      <li><b>与 Stable LatentMoE 的关系</b>：K3 的 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> = LatentMoE 主结构 + 三件稳定化（Normalized LatentMoE 在 $W_\uparrow$ 前加 RMSNorm、SiTU-GLU 有界激活、Quantile Balancing 负载均衡），用于 $N=896, k=16$ 的极端稀疏与 2.8T 规模。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入<a href="index.html">深度教学</a></footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Per-Head Muon · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 优化器 / 大模型训练</span>
+      <h1>Per-Head Muon</h1>
+      <p class="lead">Muon 优化器在注意力 Q/K/V 投影层上的改进：把动量矩阵沿头维度切分，每个头块单独做 Newton-Schulz 正交化，避免大尺度头压低小尺度头的更新幅度。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>是什么</h2>
+    <p>Per-Head Muon 是 Muon 优化器在多头注意力 Q/K/V 投影层上的一个改进。原版 Muon（<a href="../muon-optimizer/index.html">完整讲解待生成</a>）对整个投影矩阵做 Newton-Schulz 正交化——把矩阵的奇异值都拉平为 1，让更新在各方向均衡。Per-Head Muon 不改变正交化算法本身，只改变它作用的对象：把动量矩阵沿头维度切成 $H$ 个头块，每个头块单独正交化。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li>全矩阵正交化把所有头当作一个耦合块：奇异向量混合了所有头的贡献，大尺度头主导方向。</li>
+      <li>小尺度头"未充分正交化"：它在正交化结果里对应的行块没有获得单位幅度，更新被大尺度头压低。</li>
+      <li>多头各自学不同内容、尺度本就不同，整块正交化让小尺度头一直被压着，学习动力学不均衡。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li>Muon 的正交化等于"把矩阵各奇异方向的作用强度都拉成 1"，这是它让更新均衡的方式。</li>
+      <li>全矩阵正交化只保证整块矩阵的奇异值拉平，不保证每个头的行块都被拉平——大尺度头定调、小尺度头行块幅度远小于 1。</li>
+      <li>按头正交化把"拉平"的作用域从整块缩小到每个头：每个头各自获得单位幅度的更新，各头更新幅度趋于一致。</li>
+      <li>每头块是更小的矩阵，Newton-Schulz 的 Gram 矩阵也更小，开销略降。</li>
+      <li>分布式实现里，NS 需要完整矩阵但参数被分片了；K3 用 P2P 通信让每个 rank 只取回自己负责的参数分片，替代全参数 all-gather。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><b>只适用于有头维度的矩阵参数</b>（注意力 Q/K/V 投影）；FFN 等无头维度的矩阵仍用原版 Muon。它不是新优化器，是 Muon 的一个局部改动。</li>
+      <li><b>均衡的是更新幅度，不是方向</b>：被压低的是小尺度头更新块的范数，各头原始的方向信息仍由各自动量决定。</li>
+      <li><b>NS 算法本身没变</b>，变的只是作用对象（整矩阵 → 每头块）；系数、步数、归一化都与原版 Muon 一致。</li>
+      <li><b>实践结论是定性的</b>：K3 报告称带来更均衡的学习动力学、提升大尺度训练稳定性、略降开销，但未给 per-head 单独贡献的消融数字。不应推广为"任何规模都更稳更省"。</li>
+      <li><b>P2P 不是消除通信</b>：仍需取回参数分片，只是用定点取回替代集体 all-gather，降低而非消除通信。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节与手算例子进入<a href="index.html">深度教学</a></footer>
+  </main>
+</body>
+</html>

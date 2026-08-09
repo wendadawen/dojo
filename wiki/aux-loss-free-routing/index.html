@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>辅助损失无关路由：用 bias 调选谁、不调用多少</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">辅助损失无关路由</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">辅助损失无关路由：用 bias 调选谁、不调用多少</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>MoE 训练里路由器看到 4 个专家、每次让 token 自己选 top-2。训几万步后发现专家 0 被选中 90% 的次数、专家 3 一次都没被选中——它根本没在训。传统做法是给损失函数加一个"鼓励均衡"的项，但项的权重 $\alpha$ 是个玄学：太大压住专家特化、损害主任务；太小压不住坍塌。DeepSeek 团队 2024 年 8 月在 arXiv:2408.15664 上提了个绕开损失函数的方案：给每个专家加一个 bias，加到路由分数上只参与"选谁"，不进入"权重多少"，再用"过载就减、欠载就增"的固定小步规则在每步训练后更新 bias。这就是辅助损失无关路由（Auxiliary-Loss-Free Routing）。</p>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>MoE 训练为什么需要负载均衡？传统辅助损失方案为什么有缺陷？</li>
+    <li>bias 在前向传播里做什么、不做什么？为什么它不会引入"干扰梯度"？</li>
+    <li>bias 在训练时怎么被更新？为什么用 sign 而不是用误差幅度？</li>
+    <li>给定 4 专家 top-2 的打分与初始 bias，能否手算一轮路由、统计负载、更新 bias、再跑一轮路由？</li>
+    <li>DeepSeek-V3 中本方法的实际配置是什么？它解决什么、不解决什么？</li>
+  </ul>
+</section>
+
+<section class="misconceptions">
+  <h2>最容易误解</h2>
+  <ul>
+    <li>"bias 是模型参数，被反向传播更新" —— bias 不是模型参数，不进计算图，每步训练后由规则式 sign 更新，更新依据是上一批的负载统计。</li>
+    <li>"bias 加到分数上，所以 mixture weight 也含 bias" —— bias 只决定是否进 top-k；进入后门控值取原始分数，归一化分母也不含 bias。</li>
+    <li>"有了 aux-loss-free 就能单步完美均衡" —— sign 走固定小步，需要训练步数积累；某步负载不均是正常的。</li>
+    <li>"aux-loss-free 同时解决序列内均衡" —— 它只看批级负载；序列内均衡由 DeepSeek-V3 另加的 sequence-wise balance loss 处理。</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts（Wang et al., 2024, arXiv:2408.15664）；DeepSeek-V3 Technical Report（arXiv:2412.19437 §2.2, Eq.16-19）。本页所用 $\gamma$ 取值与调度、$\alpha$ 取值、专家数与 top-k 均来自这两份原文。</p>
+</blockquote>
+
+<h2 id="s1-why-balance">S1：MoE 训练为什么会"负载坍塌"，辅助损失方案又卡在哪</h2>
+
+<p>先回顾一下 MoE 是什么、为什么训练时会出问题。MoE（Mixture-of-Experts，专家混合）把 Transformer 层里那个 FFN 换成一排 $N_r$ 个小 FFN（叫 <strong>routed expert</strong>），再加一个很小的打分器 <strong>router</strong>。每个 token 到来时，router 给所有专家打分，只让得分最高的 $K_r$ 个（<strong>top-k</strong>）真正计算这个 token。详细机制见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。</p>
+
+<p>路由器在训练初始时权重是随机的，但只要某几个专家在早期被多选了几次，它们就得到更多梯度、特化得更快，下一轮更容易被选——这是一个正反馈。论文里把这个失效模式叫 <strong>路由坍塌（routing collapse）</strong>：少数专家包揽绝大多数 token，其余专家一次都不被选中、梯度为零、根本训不动（论断 C1，arXiv:2408.15664 §1，引用 Shazeer et al. 2017）。在专家并行训练里它还会引发另一个症状：把专家分片到多张 GPU 后，热专家所在那张卡成了瓶颈，其余卡空转，吞吐下降。</p>
+
+<p>传统做法是给损失函数加一个"鼓励均衡"的辅助项，最经典的形式（Switch Transformer / GShard 一族）写作</p>
+
+$$L_{bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,$$
+
+<p>其中 $f_i$ 是专家 $i$ 被选中的频率，$P_i$ 是 router 给它的平均分数，$\alpha$ 是平衡系数。当负载完全均衡时该损失取最小值。问题是 $\alpha$ 难调（论断 C2）：</p>
+
+<ul>
+  <li>$\alpha$ 过大：辅助损失的梯度混进主任务梯度，扭曲专家特化，损害主任务性能。这种"混进来的梯度"被原文称作 <strong>干扰梯度（interference gradients）</strong>。</li>
+  <li>$\alpha$ 过小：压不住坍塌，负载依然不均。</li>
+</ul>
+
+<p>原始论文 Table 2 的实验对照：在 1B / 3B 模型上，辅助损失方案（baseline $\alpha=0.001$）的验证集 perplexity 与 MaxVio（最大负载偏差）均劣于本方法。也就是说"加损失项调梯度"这条路本身就有代价。</p>
+
+<p>能不能不写损失项，又把均衡做出来？这就是 aux-loss-free 要回答的问题。下一章看它的回答：把均衡从"损失目标里"挪到"路由选择上"。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说明为什么"加 bias 调选择"比"加损失项调梯度"更不容易损害主任务。</li>
+  <li>辅助损失方案的 $\alpha$ 太大、太小分别会发生什么？</li>
+</ul>
+
+<h2 id="s2-bias-in-forward">S2：bias 加在路由分数上——只管选谁，不管用多少</h2>
+
+<p>先列出本页要用的符号。令 $u_t$ 是 token $t$ 的输入向量，$e_i$ 是 router 权重的第 $i$ 行（也叫专家 $i$ 的中心向量），$\sigma$ 是 sigmoid 函数 $\sigma(x)=1/(1+e^{-x})$。DeepSeek-V3 把 router 的打分定义为</p>
+
+$$s_{i,t}=\sigma(u_t^\top e_i).\qquad\text{(F1)}$$
+
+<p>$s_{i,t}\in(0,1)$ 是 token $t$ 对专家 $i$ 的<strong>路由分数</strong>。给每个专家再加一个数 $b_i$ 叫 <strong>bias</strong>，初始 $b_i=0$。bias 加到分数上一起做 top-k 选择：</p>
+
+$$g'_{i,t}=\begin{cases}s_{i,t}, & s_{i,t}+b_i\in\mathrm{Topk}(\{s_{j,t}+b_j\mid 1\leq j\leq N_r\},K_r)\\[4pt] 0, & \text{otherwise.}\end{cases}\qquad\text{(F2)}$$
+
+<p>然后对被选中的 $K_r$ 个专家做归一化，得到最终 <strong>门控权重</strong>：</p>
+
+$$g_{i,t}=\frac{g'_{i,t}}{\sum_{j=1}^{N_r}g'_{j,t}}.\qquad\text{(F3)}$$
+
+<p>这里有两件事必须看清楚（论断 C3）：</p>
+
+<ol>
+  <li><strong>选择依据是 $s_{i,t}+b_i$</strong>：bias 影响哪个专家进 top-k。</li>
+  <li><strong>门控权重取原始 $s_{i,t}$</strong>：被选中后 $g'_{i,t}=s_{i,t}$，<em>不含 bias</em>；归一化分母 $\sum_j g'_{j,t}$ 也只对被选中的 $K_r$ 个原始分数求和，<em>不含 bias</em>。</li>
+</ol>
+
+<p>最后这层 MoE 的输出（沿用 DeepSeekMoE 基本结构，DeepSeek-V3 报告 Eq.14）写作</p>
+
+$$h_t'=u_t+\sum_{i=1}^{N_s}\mathrm{FFN}_i^{(s)}(u_t)+\sum_{i=1}^{N_r}g_{i,t}\,\mathrm{FFN}_i^{(r)}(u_t),\qquad\text{(F5)}$$
+
+<p>其中 $\mathrm{FFN}_i^{(s)}$ 是 $N_s$ 个 <strong>shared expert</strong>（所有 token 都激活），$\mathrm{FFN}_i^{(r)}$ 是 $N_r$ 个 routed expert（只激活 $K_r$ 个，按 $g_{i,t}$ 加权）。shared expert 的角色见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。</p>
+
+<p>用两个边界检查验证 bias 的角色。</p>
+
+<p><strong>第一，所有 bias 同时加常数 $c$。</strong> 此时 $s_{i,t}+b_i+c=(s_{i,t}+b_i)+c$，所有分数同时平移，相对排序不变，top-k 选择不变。也就是说 <em>bias 只有相对差异起作用，整体平移没有效果</em>。</p>
+
+<p><strong>第二，bias 不进 mixture weight。</strong> $g'_{i,t}=s_{i,t}$ 不含 $b_i$；分母 $\sum_j g'_{j,t}$ 也不含 $b$。所以无论 bias 怎么调，被选中专家之间的相对权重完全由原始分数 $s$ 决定。bias 改变"选谁"，不改变"被选中后给多少权重"。</p>
+
+<p>因为 bias 不进 $g_{i,t}$，反向传播算 $\partial L/\partial s_{i,t}$ 时不会经过 $b$；$b$ 也不在模型参数列表里。这就是"loss-free"的来源——<strong>没有辅助损失项，也没有混进主梯度的额外梯度</strong>（论断 C3）。</p>
+
+<p>但 bias 自己怎么变？下一章看 DeepSeek-V3 的规则式更新。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定 $s_{i,t}+b_i$ 进入了 top-k，被选中后的 $g'_{i,t}$ 取什么值？为什么不含 bias？</li>
+  <li>所有 bias 同时加 0.5，top-k 选择会变吗？归一化权重 $g_{i,t}$ 会变吗？</li>
+  <li>用一句话说明为什么 bias 不会产生"干扰梯度"。</li>
+</ul>
+
+<h2 id="s3-bias-update">S3：bias 的固定步长 sign 更新——规则式，不进梯度</h2>
+
+<p>bias 不是模型参数，所以不用梯度更新。它的更新规则由原始论文 Algorithm 1 给出，DeepSeek-V3 上线版本同样采用。</p>
+
+<p>每一步训练结束后，统计本步每个专家收到的 token 数，记为 <strong>负载</strong> $c_i$。再算所有专家的平均负载</p>
+
+$$\bar c_i=\frac{1}{N_r}\sum_{j=1}^{N_r}c_j.$$
+
+<p>偏差定义为 $e_i=\bar c_i-c_i$：</p>
+
+<ul>
+  <li>$e_i>0$ 表示专家 $i$ 收到的 token <em>少于平均</em>，处于<strong>欠载</strong>。</li>
+  <li>$e_i<0$ 表示专家 $i$ 收到的 token <em>多于平均</em>，处于<strong>过载</strong>。</li>
+  <li>$e_i=0$ 表示恰好平均。</li>
+</ul>
+
+<p>更新规则写作</p>
+
+$$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i),\qquad\text{(F4)}$$
+
+<p>其中 $\mathrm{sign}(x)=+1$ 若 $x>0$，$-1$ 若 $x<0$，$0$ 若 $x=0$；$\gamma$ 是固定步长超参（原始论文记为 $u$，DeepSeek-V3 报告统一记为 $\gamma$，叫 <strong>bias update speed</strong>）。也就是说：</p>
+
+<ul>
+  <li>欠载（$e_i>0$）→ $b_i$ 增大 $\gamma$ → 下一轮 $s_{i,t}+b_i$ 更容易进 top-k → 该专家下一轮更可能被选中。</li>
+  <li>过载（$e_i<0$）→ $b_i$ 减小 $\gamma$ → 下一轮 $s_{i,t}+b_i$ 更难进 top-k → 该专家下一轮更可能被冷落。</li>
+  <li>恰好平均 → $b_i$ 不变。</li>
+</ul>
+
+<p>这里要强调三件事。</p>
+
+<p><strong>第一，这是规则式更新，不进反向传播。</strong> bias 不在计算图里，$\partial L/\partial b_i$ 不存在。每步训练的反向传播结束后，单独按 F4 用上一批的负载统计调一次 bias。论文里特别强调：用历史 batch 的负载更新，避免用到当前序列的 future token 信息（<em>因果约束</em>，arXiv:2408.15664 §3.2）。</p>
+
+<p><strong>第二，为什么用 sign 而不是用误差幅度 $e_i$？</strong> 原始论文实验了两种变体：sign 版本 $b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(e_i)$ 和连续幅度版本 $b_i\leftarrow b_i+\gamma\cdot e_i$。Table 3 报告两者 perplexity 几乎相同（9.50 vs 9.51），MaxVio 也接近（0.044 vs 0.036）。作者最终采用更简单的 sign 版本。sign 的好处是<strong>每步走固定小步</strong>，单步稳定，不会因一个 batch 偏差大就猛跳；代价是<strong>丢失幅度信息</strong>——差 1 个 token 和差 50 个 token 走的步长完全一样（论断 C5）。</p>
+
+<details>
+<summary>补充：原始论文的变体实验对照（Table 3）</summary>
+<p>arXiv:2408.15664 Table 3 在 1B 模型上对照加法 sign 与加法幅度两种 bias 设计（幅度版本再扫描三个 $\gamma$）：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>bias 更新规则</th><th>$\gamma$（论文记 $u$）</th><th>验证 PPL ↓</th><th>MaxVio_global ↓</th></tr></thead>
+<tbody>
+<tr><td>加法 + sign（采用）</td><td>0.001</td><td>9.50</td><td>0.044</td></tr>
+<tr><td>加法 + 幅度</td><td>0.01</td><td>9.53</td><td>0.028</td></tr>
+<tr><td>加法 + 幅度</td><td>0.001</td><td>9.51</td><td>0.036</td></tr>
+<tr><td>加法 + 幅度</td><td>0.0001</td><td>9.51</td><td>0.040</td></tr>
+</tbody>
+</table>
+</div>
+<p>幅度版本在 MaxVio 上略优（最低 0.028），但 PPL 不优于 sign 版本（最差 9.53、最佳 9.51 与 sign 持平）。作者认为幅度版本需要再调一个 $\gamma$、收益不明显，故采用更简单的 sign。乘法 bias 变体在 Table 4 单独讨论，性能略差，本表不展开。</p>
+</details>
+
+<p><strong>第三，初始化 $b_i=0$，靠训练逐步逼近均衡。</strong> 由于每步只走 $\gamma$，本方法不保证单步完美均衡——它只是在训练过程中把负载逐步往均衡方向推。这是它的边界，下一章 S5 会展开。</p>
+
+<details>
+<summary>伪代码：每步训练结束后的 bias 更新</summary>
+<details class="code-details">
+<summary>Algorithm 1：bias 更新（伪代码，不是 Python）</summary>
+<div class="code-block">
+<pre><code class="language-text">输入：
+  N_r 个专家的当前 bias b[1..N_r]
+  本步训练刚结束，记录了每个专家被选中的 token 数 c[1..N_r]
+  固定步长超参 gamma
+
+状态：
+  b  # 长度为 N_r 的 bias 向量，初始为 0
+
+核心步骤：
+  算平均负载 c_bar ← (1/N_r) * Σ_j c[j]
+  对每个专家 i ∈ {1, ..., N_r}：
+    算偏差 e_i ← c_bar - c[i]
+    算方向 step ← sign(e_i)        # +1, -1 或 0
+    更新 bias b[i] ← b[i] + gamma * step
+
+输出：更新后的 b，用于下一步训练的前向路由选择
+</code></pre>
+</div>
+<p>注意 sign 与 $\bar c_i-c_i$ 的对应：欠载时 $e_i>0$ → step=+1 → bias 增大；过载时 $e_i<0$ → step=-1 → bias 减小。这一步在反向传播之外发生。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 F4；说明欠载时 bias 朝哪个方向变、过载时朝哪个方向变。</li>
+  <li>sign 版本和连续幅度版本各有什么优劣？原始论文最终采用哪个？</li>
+  <li>bias 的更新依据是当前序列还是历史 batch 的负载？为什么？</li>
+</ul>
+
+<h2 id="s4-hand-example">S4：手算一个 4 专家 top-2 的训练步</h2>
+
+<p>把 S2 与 S3 串起来，端到端跑一遍。教学示例。 设 $N_r=4$ 个专家、$K_r=2$、初始 $b=(0,0,0,0)$、$\gamma=0.001$。一个 batch 含 4 个 token，router 给它们的原始分数如下（数字为便于手算构造，不代表真实模型）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>token \ expert</th><th>$E_0$</th><th>$E_1$</th><th>$E_2$</th><th>$E_3$</th></tr></thead>
+<tbody>
+<tr><td>$t_1$</td><td>0.30</td><td>0.10</td><td>0.05</td><td>0.60</td></tr>
+<tr><td>$t_2$</td><td>0.40</td><td>0.20</td><td>0.10</td><td>0.50</td></tr>
+<tr><td>$t_3$</td><td>0.35</td><td>0.15</td><td>0.20</td><td>0.55</td></tr>
+<tr><td>$t_4$</td><td>0.25</td><td>0.30</td><td>0.10</td><td>0.45</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>第 1 步：首轮路由（bias 全为 0）。</strong> 因为 $b=0$，$s_{i,t}+b_i=s_{i,t}$，选每个 token 分数最高的两个：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>token</th><th>分数排序（高→低）</th><th>选中（top-2）</th></tr></thead>
+<tbody>
+<tr><td>$t_1$</td><td>0.60 ($E_3$) &gt; 0.30 ($E_0$) &gt; 0.10 ($E_1$) &gt; 0.05 ($E_2$)</td><td>$E_3, E_0$</td></tr>
+<tr><td>$t_2$</td><td>0.50 ($E_3$) &gt; 0.40 ($E_0$) &gt; 0.20 ($E_1$) &gt; 0.10 ($E_2$)</td><td>$E_3, E_0$</td></tr>
+<tr><td>$t_3$</td><td>0.55 ($E_3$) &gt; 0.35 ($E_0$) &gt; 0.20 ($E_2$) &gt; 0.15 ($E_1$)</td><td>$E_3, E_0$</td></tr>
+<tr><td>$t_4$</td><td>0.45 ($E_3$) &gt; 0.30 ($E_1$) &gt; 0.25 ($E_0$) &gt; 0.10 ($E_2$)</td><td>$E_3, E_1$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>统计负载：$c_0=3$（$t_1,t_2,t_3$ 选了 $E_0$）、$c_1=1$（只有 $t_4$）、$c_2=0$（一个都没选）、$c_3=4$（每个 token 都选）。平均负载 $\bar c_i=(3+1+0+4)/4=2$。偏差 $e_i=\bar c_i-c_i$：$E_0$ 是 $2-3=-1$（过载），$E_1$ 是 $2-1=+1$（欠载），$E_2$ 是 $2-0=+2$（更欠载），$E_3$ 是 $2-4=-2$（更过载）。</p>
+
+<details>
+<summary>完整手算：从负载统计到 bias 更新</summary>
+<p>对每个专家套 F4：$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(e_i)$，$\gamma=0.001$：</p>
+<ul>
+  <li>$E_0$：$e_0=-1$ → $\mathrm{sign}=-1$ → $b_0\leftarrow 0+0.001\times(-1)=-0.001$。</li>
+  <li>$E_1$：$e_1=+1$ → $\mathrm{sign}=+1$ → $b_1\leftarrow 0+0.001\times(+1)=+0.001$。</li>
+  <li>$E_2$：$e_2=+2$ → $\mathrm{sign}=+1$ → $b_2\leftarrow 0+0.001\times(+1)=+0.001$。</li>
+  <li>$E_3$：$e_3=-2$ → $\mathrm{sign}=-1$ → $b_3\leftarrow 0+0.001\times(-1)=-0.001$。</li>
+</ul>
+<p>注意 $E_2$ 与 $E_1$ 偏差相差 1 倍（$+2$ vs $+1$），但走到的步长相同——这是 sign 丢失幅度的直接体现。</p>
+</details>
+
+<p><strong>第 2 步：用新 bias 再跑一轮路由。</strong> 假设 batch 不变（教学示例，真实训练是下一个 batch），新 bias $b=(-0.001, +0.001, +0.001, -0.001)$。把 $s_{i,t}+b_i$ 列出来：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>token \ expert</th><th>$E_0$ ($b=-0.001$)</th><th>$E_1$ ($b=+0.001$)</th><th>$E_2$ ($b=+0.001$)</th><th>$E_3$ ($b=-0.001$)</th></tr></thead>
+<tbody>
+<tr><td>$t_1$</td><td>0.299</td><td>0.101</td><td>0.051</td><td>0.599</td></tr>
+<tr><td>$t_2$</td><td>0.399</td><td>0.201</td><td>0.101</td><td>0.499</td></tr>
+<tr><td>$t_3$</td><td>0.349</td><td>0.151</td><td>0.201</td><td>0.549</td></tr>
+<tr><td>$t_4$</td><td>0.249</td><td>0.301</td><td>0.101</td><td>0.449</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>对 $t_1,t_2,t_3$，加 bias 后的排序与首轮完全相同（$E_3$ 与 $E_0$ 仍居前二，差 $0.001$ 没改变次序），仍选 $\{E_3,E_0\}$。对 $t_4$，原排序 $E_3(0.45) > E_1(0.30) > E_0(0.25) > E_2(0.10)$；加 bias 后 $E_3(0.449) > E_1(0.301) > E_0(0.249) > E_2(0.101)$，top-2 仍是 $\{E_3,E_1\}$，不变。</p>
+
+<p><strong>这个例子说明一个关键事实：单步 bias 调整 $\gamma=0.001$ 的影响非常小</strong>。在我们的教学数字里，这一步根本没改变选择。要看到选择真的被改写，需要数十甚至数百步累积。这正是 S5 要讲的边界：sign 是慢速调度，靠训练步数积累生效。但即便单步没变，bias 已经在朝正确方向走：过载的 $E_0,E_3$ bias 在减小，欠载的 $E_1,E_2$ bias 在增大，若干步后冷门专家会被拉回。</p>
+
+<details>
+<summary>教学示例：把 gamma 调大到 0.05，看一步能否改写选择</summary>
+<p>保留上面同一 batch，但把 $\gamma$ 设为 $0.05$（仅为教学展示，远大于真实值）。更新后 $b=(-0.05, +0.05, +0.05, -0.05)$，加 bias 后的分数：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>token \ expert</th><th>$E_0$</th><th>$E_1$</th><th>$E_2$</th><th>$E_3$</th></tr></thead>
+<tbody>
+<tr><td>$t_1$</td><td>0.25</td><td>0.15</td><td>0.10</td><td>0.55</td></tr>
+<tr><td>$t_2$</td><td>0.35</td><td>0.25</td><td>0.15</td><td>0.45</td></tr>
+<tr><td>$t_3$</td><td>0.30</td><td>0.20</td><td>0.25</td><td>0.50</td></tr>
+<tr><td>$t_4$</td><td>0.20</td><td>0.35</td><td>0.15</td><td>0.40</td></tr>
+</tbody>
+</table>
+</div>
+<p>逐个 token 检查 top-2：$t_1$ 仍是 $\{E_3(0.55), E_0(0.25)\}$；$t_2$ 仍是 $\{E_3(0.45), E_0(0.35)\}$；$t_3$ 仍是 $\{E_3(0.50), E_0(0.30)\}$；$t_4$ 仍是 $\{E_3(0.40), E_1(0.35)\}$。<strong>即便 $\gamma$ 调到 0.05，在这个例子中也没改变任何 token 的 top-2</strong>——这进一步说明：要改写路由需要 bias 累积到能跨越分数间距的程度，而分数间距通常远大于 $\gamma$。这正是 sign 调度"慢但稳"的特征。</p>
+<p>教学简化：这个对照只为展示 sign 的步长特性，真实训练不会把 $\gamma$ 调到 0.05；那样会震荡。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定 4 个 token 的打分和初始 $b=0$，写出首轮每个 token 的 top-2 选择。</li>
+  <li>统计 $c_i$、$\bar c_i$、$e_i$，按 F4 写出每个专家的新 bias。</li>
+  <li>$\gamma=0.001$ 时为什么一轮 bias 更新不一定改变第二轮选择？这反映了 sign 调度的什么特征？</li>
+</ul>
+
+<h2 id="s5-deepseek-v3-config">S5：DeepSeek-V3 中的配置、调度与边界</h2>
+
+<p>把概念落回真实工程。DeepSeek-V3 技术报告（arXiv:2412.19437）配置如下（数字 N1-N3）：</p>
+
+<div class="context-box">
+  <p class="context-box-title">DeepSeek-V3 上线配置</p>
+  <div class="context-grid">
+    <div class="context-label">规模</div><div class="context-value">671B 总参数 / 37B 每 token 激活；每 MoE 层 256 routed expert + 1 shared expert；top-8；61 层中前 3 层稠密、其余 58 层为 MoE</div>
+    <div class="context-label">$\gamma$ 调度</div><div class="context-value">前 14.3T token 用 $\gamma=0.001$；最后 500B token 设 $\gamma=0$（冻结 bias）；总训练 14.8T token</div>
+    <div class="context-label">互补损失</div><div class="context-value">$\alpha=0.0001$ 的 sequence-wise balance loss（处理序列内均衡）</div>
+    <div class="context-label">推理</div><div class="context-value">bias 不再单独存储，已被吸收进 router 权重 $e_i$；前向按 $s_{i,t}=\sigma(u_t^\top e_i)$ 路由，无需显式加 $b_i$</div>
+  </div>
+</div>
+
+<p>关于 $\gamma$ 调度（论断 C5、数字 N2）：训练前 14.3T token 用 $\gamma=0.001$ 让 bias 在大量数据上逐步逼近均衡；最后 500B token 把 $\gamma$ 设为 0 冻结 bias。这一调度反映一个事实——<strong>训练后期路由已基本稳定，继续更新 bias 反而会干扰最后收敛</strong>。$\gamma=0.001$ 这个值在原始 1B / 3B 实验上就被选为最佳（arXiv:2408.15664 §4.1），V3 直接继承。</p>
+
+<p>关于互补损失（论断 C6、数字 N3、公式 F6）：aux-loss-free 只看批级 $c_i$，但可能出现"一个序列内每个 token 都激活同一组专家"——批级负载看起来均衡，但序列维度并不均衡。DeepSeek-V3 另加一个 sequence-wise balance loss</p>
+
+$$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T\mathbb{1}(s_{i,t}\in\mathrm{Topk}),\quad P_i=\frac{1}{T}\sum_{t=1}^T s'_{i,t},\qquad\text{(F6)}$$
+
+<p>其中 $T$ 是序列长度，$f_i$ 是序列内专家 $i$ 被选中的频率，$P_i$ 是序列内平均归一化分数，$s'_{i,t}=\frac{s_{i,t}}{\sum_j s_{j,t}}$ 为归一化路由分数（$\sum_j$ 对该序列内全部 routed 专家求和）。$\alpha=0.0001$ 是个小权重——它不是 aux-loss-free 的替代，而是它的补充：aux-loss-free 解决批级，sequence-wise 解决序列内。<strong>本页不展开 F6 的推导</strong>，只点明它解决什么。</p>
+
+<p>本方法的边界：</p>
+
+<ul>
+  <li><strong>只解决批级负载均衡</strong>。序列内均衡由 sequence-wise loss 处理；二者各管一摊。</li>
+  <li><strong>不保证单步完美均衡</strong>。sign 走固定小步 $\gamma=0.001$，需要训练步数积累才能逼近均衡。S4 的手算例子已经显示单步 bias 调整通常不足以改变选择。</li>
+  <li><strong>推理时 bias 不再单独存储，已被吸收进 router 权重 $e_i$</strong>。本方法是训练阶段的均衡机制，推理阶段前向按 $s_{i,t}=\sigma(u_t^\top e_i)$ 路由，无需显式加 $b_i$（DeepSeek-V3 报告 §2.2 明确说明）。</li>
+  <li><strong>专家数极多时 sign 收敛过慢</strong>。K3 把 routed expert 池扩大到 896 后，sign 丢失幅度信息的缺陷被放大：差 1 个 token 和差 100 个 token 走相同步长，部分专家长期训练不足。K3 用 <strong>Quantile Balancing</strong> 替代 sign——它从一次前向的路由分数分位数直接算出下一个 bias，仍属 aux-loss-free 家族（不引入损失项），只换 bias 的更新规则。详见 <a href="../quantile-balancing/index.html">Quantile Balancing</a>。</li>
+</ul>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说明为什么最后 500B token 要把 $\gamma$ 设为 0。</li>
+  <li>aux-loss-free 与 sequence-wise loss 各解决什么？为什么需要二者互补？</li>
+  <li>K3 为什么要把 sign 换成 Quantile Balancing？sign 在 896 专家时失效的具体原因是什么？</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>- C1（路由坍塌）：arXiv:2408.15664 §1，引用 Shazeer et al. 2017（Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer）。<br>
+- C2（辅助损失方案两难）：arXiv:2408.15664 §1、Table 2（baseline $\alpha=0.001$ 的对照）。<br>
+- C3（bias 只做选择不进权重）：DeepSeek-V3 报告 Eq.16；arXiv:2408.15664 §3.1 Eq.1-2。<br>
+- C4（sign 规则式更新）：arXiv:2408.15664 Algorithm 1、§3.2；DeepSeek-V3 报告 §2.2 文字描述。<br>
+- C5（sign 与变体对比、采用 sign 的理由）：arXiv:2408.15664 Table 3。<br>
+- C6（互补 sequence-wise loss）：DeepSeek-V3 报告 Eq.17-19、§2.2 文字描述。</p>
+
+<h3>核心公式与来源</h3>
+<p>- F1（$s_{i,t}=\sigma(u_t^\top e_i)$）：DeepSeek-V3 报告 Eq.16。原始论文记为 $s_{i,t}=G(u_t^\top e_i)$，$G$ 为非线性门控；DeepSeek-V3 上线版本用 sigmoid。<br>
+- F2（$g'_{i,t}$ 选择规则）：DeepSeek-V3 报告 Eq.16；原始论文 Eq.1-2。<br>
+- F3（$g_{i,t}$ 归一化）：DeepSeek-V3 报告 §2.1 Eq.15（DeepSeekMoE 基本结构）。<br>
+- F4（$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i)$）：原始论文 Algorithm 1 与 §3.2；DeepSeek-V3 报告 §2.2 文字描述（"decrease by γ if overloaded, increase by γ if underloaded"）。本文统一用 $c_i$、$\bar c_i$、$\gamma$ 与原始论文符号一致；DeepSeek-V3 报告里把负载写为 $\mathrm{Load}_i$。<br>
+- F5（$h_t'$ MoE 层输出）：DeepSeek-V3 报告 Eq.14（DeepSeekMoE 基本结构）。<br>
+- F6（$L_{Bal}$）：DeepSeek-V3 报告 Eq.17-19。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>- N1（DeepSeek-V3 规模）：671B 总参数 / 37B 每 token 激活；256 routed expert + 1 shared；top-8；58 MoE 层。DeepSeek-V3 报告摘要与 §2.1；与 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a> 一致。<br>
+- N2（$\gamma$ 调度）：$\gamma=0.001$ 用于前 14.3T token，$\gamma=0$ 用于最后 500B token；总训练 14.8T token。DeepSeek-V3 报告 §2.2。<br>
+- N3（$\alpha=0.0001$）：DeepSeek-V3 报告 §2.2。<br>
+- N4（原始论文实验配置）：1B 与 3B 模型；100B / 200B token 训练；$u=0.001$ 为最佳。arXiv:2408.15664 §4.1、Table 2。<br>
+- N5（变体对照）：sign 版 PPL 9.50 / MaxVio 0.044；连续幅度版 PPL 9.51 / MaxVio 0.036。arXiv:2408.15664 Table 3。</p>
+
+<h3>教学示例</h3>
+<p>- S4 的 4 专家 top-2、4 token batch、$\gamma=0.001$ 的打分表与逐步手算：人为构造数字，目的是让读者能手算验证 F2/F3/F4。打分值与真实模型无关。<br>
+- S4 折叠块中 $\gamma=0.05$ 的对照：仅为展示 sign 的步长特性，真实训练不会取该值。<br>
+- S3 折叠块伪代码：原始论文 Algorithm 1 的简化形式，省略 batch 内 token 维度的循环细节。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>教学解释。 可以把 bias 想成"配额调节阀"：冷门专家的阀往上拧一点、热门专家的阀往下拧一点，每步只拧固定一圈。这个类比只帮助理解"固定步长 + 方向调节"。它不覆盖：bias 不进 mixture weight 的细节（见 F2-F3）；sign 丢失幅度信息的缺陷（见 C5）；推理阶段 bias 冻结（见 S5）。正式判断仍以 F2-F4 为准。</p>
+
+<h3>教学简化及其限制</h3>
+<p>- 把专家数设为 4、top-k 设为 2、batch 设为 4 token，是为了让手算可行。真实 DeepSeek-V3 是 256 选 8，batch 含数千 token。简化不改变机制结论，只省略规模。<br>
+- F6 只点出公式不展开推导：aux-loss-free 与 sequence-wise loss 是互补但独立的两件事，本页不展开后者。<br>
+- S3 折叠块的变体实验对照只列 Table 3 关键数据，省略其他实验设置；不影响 C5 的结论。<br>
+- S5 中 K3 的 Quantile Balancing 只引用对比，完整推导见 <a href="../quantile-balancing/index.html">Quantile Balancing</a>。</p>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

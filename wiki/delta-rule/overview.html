@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Delta 规则与 DeltaNet · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 线性注意力 / 线性 RNN</span>
+      <h1>Delta 规则与 DeltaNet</h1>
+      <p class="lead">一种递归记忆更新规则——向矩阵状态写入新 key-value 关联前，先沿当前 key 方向擦除旧值，再做加权写入。DeltaNet 是把线性注意力的纯加性累加替换为 delta 规则的模型。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>是什么</h2>
+    <p>Delta 规则的公式是 $S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$。线性注意力的递归 $S_t = S_{t-1} + v_t k_t^\top$ 是纯加法（不擦任何东西），DeltaNet 把它换成"先擦后写"。$\beta_t \in (0,1)$ 是写入强度，由 sigmoid 输出，控制新值覆盖旧值的程度。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li>线性注意力把所有历史压成一个固定大小矩阵 $S$，省显存但会"记不清"。</li>
+      <li>$d$ 维空间最多容纳 $d$ 个正交 key；当序列长度 $L > d$ 时，不同 key 之间不正交，查询时相互干扰（retrieval error）。</li>
+      <li>纯加性累加不擦除任何东西，旧 key-value 关联堆叠在 $S$ 里，碰撞不可避免。</li>
+      <li>经典 Transformer 用 KV cache 解决碰撞（显存随长度线性增长），DeltaNet 走另一条路——在固定大小状态里用 delta 规则管理容量。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><b>先擦后写</b>：写入新值前先用 $I - \beta k k^\top$ 把 $k$ 方向的旧分量擦掉，再加新值 $\beta v k^\top$。擦与写的强度都由 $\beta_t$ 控制。</li>
+      <li><b>等价改写</b>：$S_t = S_{t-1} - v_t^{\text{old}} k_t^\top + v_t^{\text{new}} k_t^\top$，其中 $v_t^{\text{old}} = S_{t-1} k_t$（旧值）、$v_t^{\text{new}} = \beta_t v_t + (1-\beta_t) v_t^{\text{old}}$（新旧插值）。看清楚"擦的是什么"。</li>
+      <li><b>方向擦除</b>：当 $\|k\| = 1, \beta = 1$ 时 $I - k k^\top$ 是沿 $k$ 方向的正交投影——只擦 $k$ 方向，保留与之正交的 $d-1$ 维子空间。</li>
+      <li><b>边界</b>：$\beta_t = 0$ 时记忆不变；$\beta_t = 1$ 且 $\|k\| = 1$ 时完全覆盖；中间值是新旧值凸插值。</li>
+      <li><b>命名溯源</b>：形式上类比 Widrow-Hoff 1960 经典 delta rule（"误差 × 学习率 × 输入"），但作用对象不同——经典 delta rule 改训练参数，DeltaNet delta rule 改前向记忆状态。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><b>占优场景</b>：DeltaNet 在 in-context recall、selective copy、noisy recall 等需要精确覆写 key-value 关联的任务上接近满分（Yang 2024 NeurIPS §4.1）。</li>
+      <li><b>不占优场景</b>：在 memorize 类任务上反而弱于 Mamba（52.8 vs. 89.5）——Mamba 的标量衰减更擅长"渐进式记住全部历史"。</li>
+      <li><b>相邻概念</b>：Mamba2 用 $\alpha_t S_{t-1} + v_t k_t^\top$ 做标量全局衰减；Gated DeltaNet 把 $\alpha_t$ 嵌进 delta 规则前面得到 $\alpha_t(I - \beta k k^\top)$，同时具备方向擦除与全局衰减。$\alpha_t \to 1$ 时退化为 DeltaNet，$\alpha_t \to 0$ 时清空全部记忆。</li>
+      <li><b>常见误解</b>：$I - \beta k k^\top$ 仅在 $\beta = 1$ 且 $\|k\| = 1$ 时是正交投影，其他情况是秩-1 扰动；delta 规则"擦"的是单个 key 方向，不是整个矩阵。</li>
+      <li><b>本页未展开</b>：WY 表示与 chunkwise 并行训练算法（属数值线性代数与工程）、Triton kernel 实现、Kimi K3 KDA 架构（独立概念）。完整推导与手算见 <a href="index.html">深度教学</a>。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

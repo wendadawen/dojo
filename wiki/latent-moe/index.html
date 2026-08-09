@@ -1,0 +1,1237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LatentMoE：把路由专家放进紧凑隐空间，扩大专家池不让通信与显存带宽线性增长</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">LatentMoE 隐空间 MoE</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">LatentMoE：把路由专家放进紧凑隐空间，扩大专家池不让通信与显存带宽线性增长</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<p>一个 MoE 层有 256 个路由专家、每 token 激活 8 个，想扩到 896 个专家、每 token 激活 16 个——直觉上"专家多了、每个 token 走的路径多了"应该更好。但在分布式部署里，每多一个被选中的专家，就要把整个 $d$ 维向量送过去、把 $d$ 维变换后的向量取回来，还要从显存读一份 $d$ 维的专家权重。扩大路由倍数时，这部分通信与显存带宽随路由倍数线性增长，常常比 FLOPs 本身更先到瓶颈。LatentMoE 用两次投影把路由专家放进更窄的隐空间，让这部分开销不再随全宽 $d$ 走。</p>
+
+<p>一句话说清本页内容：LatentMoE 是一种 MoE 架构，把路由专家的输入输出从模型全宽 $d$ 投影到更窄的隐空间 $\ell$（$\ell < d$）再计算，使扩大专家池时路由通信与专家权重流量不再随路由倍数线性增长。它要解决的是标准 MoE 在分布式部署下"路由部分开销随 $d$ 线性增长"的瓶颈，并把节省的预算重新投入到更多专家与更高 top-k。</p>
+
+<div class="context-box">
+  <p class="context-box-title">开始之前</p>
+  <div class="context-grid">
+    <div class="context-label">本页位置</div><div class="context-value">讲清 LatentMoE 这一通用架构概念（以 NVIDIA 论文 arXiv:2601.18089 为主源）；K3 的 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 是它的稳定化变体，由独立概念页负责</div>
+    <div class="context-label">读者设定</div><div class="context-value">已了解 top-K MoE 的基本概念（router、top-k、加权和）与 shared+routed 专家组织；若没有，先读<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 2、3 章与<a href="../deepseek-moe/index.html">《DeepSeekMoE》</a></div>
+    <div class="context-label">不讲什么</div><div class="context-value">Stable LatentMoE 的三件稳定化（RMSNorm 位置、SiTU-GLU、Quantile Balancing）——见<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>；路由打分细节；MoE 服务部署的工程细节</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>标准 MoE 在扩大专家池时，为什么路由通信与专家权重流量会随路由倍数线性增长？LatentMoE 用什么结构变化缓解？</li>
+    <li>LatentMoE 层的共享分支与路由分支各自走什么宽度、经过哪些投影？写出完整层公式。</li>
+    <li>LatentMoE 把路由宽度从 $d$ 压到 $\ell$ 后，节省的开销以什么比例缩小？这笔节省通常被 reinvest 到哪里？</li>
+    <li>LatentMoE 的压缩比 $d/\ell$ 能不能无限放大？受什么约束？</li>
+    <li>LatentMoE 与 Stable LatentMoE 是什么关系？</li>
+  </ul>
+</section>
+
+<div class="callout callout-blue">
+<p><b>最容易误解：</b>LatentMoE 不是把整个模型压窄——只压窄路由分支；共享专家与 router 仍在全宽 $d$ 工作。压缩比 $d/\ell = 4$ 也不意味着整个 MoE 层快 4 倍——只压缩了路由部分的通信与权重流量，down/up-projection 本身还有计算成本。</p>
+</div>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Elango et al., 2026, "LatentMoE: Toward Optimal Accuracy per FLOP and Parameter in Mixture of Experts", arXiv:2601.18089（NVIDIA，引用为 [L]）；Kimi K3 技术报告 §2.3（引用为 [K3]）；逐条定位见文末"来源与教学说明"。</p>
+</blockquote>
+
+<h2 id="s1-standard-moe-cost">扩大专家池的代价：标准 MoE 的全宽路由开销</h2>
+
+<p>先回顾标准 MoE 层的结构（完整机制见<a href="../moe-serving/index.html">前置概念页</a>第 2 章）。一层里有 $N$ 个路由专家（每个是一个小 FFN），每来一个 token，router 给所有专家打分，只让得分最高的 $k$ 个（top-$k$）专家真正计算，最后按门控权重 $g_i$ 加权求和：</p>
+
+<p>$$y(x)=\sum_{i\in S_k(x)} g_i(x)\cdot E_i(x)$$</p>
+
+<p>这里 $x \in \mathbb{R}^d$ 是 token 的输入向量，$d$ 是模型隐层宽度；$E_i(x)$ 是第 $i$ 个路由专家对 $x$ 的输出，仍是 $d$ 维；$S_k(x)$ 是 router 为 $x$ 选中的 $k$ 个专家下标集合；$g_i(x)$ 是门控权重。关键事实是：<strong>每个被选中的路由专家都接收完整的 $d$ 维 token、输出 $d$ 维，专家 FFN 的权重矩阵也在 $d$ 维空间</strong>（论断 C2）。</p>
+
+<p>在分布式部署里（专家并行 EP，把专家分片到多张 GPU，见<a href="../moe-serving/index.html">前置页</a>第 3 章），这一点会变成真实的开销。每个"token–专家"对都要 dispatch 一个 $d$ 维向量到选中专家所在的卡、combine 一个 $d$ 维向量回来，这一步通常用 all-to-all 通信实现。同时每个被选中的专家要从 GPU 高速显存（HBM）读一份 $d$ 维的 FFN 权重才能算——在低延迟场景下，这部分读取常常是延迟大头（论断 C2、设计原则 1、2）。</p>
+
+<p><strong>教学示例。</strong> 取 $d=4096$。若每 token 激活 $k=8$ 个路由专家，那么每 token 的路由 dispatch 量是 $k \times d = 8 \times 4096 = 32768$ 个数；扩到 $k=16$ 时翻倍到 $65536$ 个数。每个被选中的专家还要从 HBM 读一份 $d$ 维权重的 FFN，这部分流量也随 $k$ 线性增长。扩大路由倍数（$N$ 与 $k$ 同时放大）时，dispatch 通信量 $\propto k \cdot d$、专家权重读取量 $\propto k \cdot d$——FLOPs 也涨，但通信与带宽常常先到瓶颈。</p>
+
+<p>这就是 LatentMoE 要解决的问题：<strong>路由部分的开销随 $d$ 走，而 $d$ 是模型全宽，通常很大</strong>。想扩大专家池提升准确率，但不想让这部分开销跟着爆炸。那能不能让路由专家不在 $d$ 维工作，而在更窄的空间里工作？</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出标准 MoE 中每个被选中的路由专家接收什么维度的输入、输出什么维度。</li>
+  <li>用 $d=4096$、$k=8$ 复算每 token 的路由 dispatch 量，并说明扩到 $k=16$ 时增长多少。</li>
+  <li>说明为什么"扩大专家池"在分布式部署下会让通信与显存带宽先到瓶颈，而不是 FLOPs。</li>
+</ul>
+
+<h2 id="s2-latent-moe-layer">LatentMoE 的层结构：共享分支全宽、路由分支隐空间</h2>
+
+<p>LatentMoE 沿用 DeepSeekMoE 提出的"共享专家 + 路由专家"组织（见<a href="../deepseek-moe/index.html">DeepSeekMoE 概念页</a>）：共享专家对所有 token 恒激活、承载通用变换；路由专家参与 top-$k$ 选择、承载差异化变换。在此之上，LatentMoE 做了一个关键改造——<strong>把路由分支的两端各加一次共享线性投影，让路由专家在一个比 $d$ 更窄的隐空间 $\ell$ 里工作</strong>（论断 C1）。</p>
+
+<p>具体做法分三步。第一，下投影 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 把 token 从模型全宽 $d$ 压到隐空间 $\ell$：</p>
+
+<p>$$z = W_\downarrow x, \qquad z \in \mathbb{R}^\ell, \quad \ell < d.$$</p>
+
+<p>第二，router 仍从全宽 $x \in \mathbb{R}^d$ 计算门控决策（论断 C7），选出的 top-$k$ 个路由专家在隐空间 $\mathbb{R}^\ell$ 内对 $z$ 做变换 $E_i^{\text{routed}}: \mathbb{R}^\ell \to \mathbb{R}^\ell$，输出仍是 $\ell$ 维；这些 $\ell$ 维输出按门控权重加权聚合得到 $u \in \mathbb{R}^\ell$。第三，上投影 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 把 $u$ 投回全宽 $d$。共享专家则不走隐空间——直接吃 $x \in \mathbb{R}^d$、输出 $\mathbb{R}^d$。</p>
+
+<p>把两支合起来，LatentMoE 层的完整公式为（公式 F2）：</p>
+
+<p>$$u = \sum_{i \in T_k(x)} p_i \cdot E_i^{\text{routed}}(W_\downarrow x), \qquad y = \sum_{j=1}^{N_s} E_j^{\text{shared}}(x) + W_\uparrow u$$</p>
+
+<p>每个符号的含义：</p>
+<ul>
+  <li>$x \in \mathbb{R}^d$：层输入，$d$ 是模型隐层宽度。</li>
+  <li>$W_\downarrow \in \mathbb{R}^{\ell \times d}$：下投影，把 $x$ 压到隐空间 $\mathbb{R}^\ell$。</li>
+  <li>$E_i^{\text{routed}}: \mathbb{R}^\ell \to \mathbb{R}^\ell$：第 $i$ 个路由专家，输入输出都在隐空间。</li>
+  <li>$T_k(x)$：对 $x$ 选中的 top-$k$ 路由专家下标集合（与上一章的 $S_k(x)$ 含义相同，此处改用 $T_k$ 以与 K3 报告 Eq. 11 一致）。</li>
+  <li>$p_i$：路由权重，由 router 在 $d$ 维空间给出，对 $T_k(x)$ 内的 $i$ 非零（与上一章的 $g_i$ 含义相同，此处改用 $p_i$ 以与 K3 一致）。</li>
+  <li>$u \in \mathbb{R}^\ell$：路由专家的加权聚合。</li>
+  <li>$W_\uparrow \in \mathbb{R}^{d \times \ell}$：上投影，把 $u$ 投回 $\mathbb{R}^d$。</li>
+  <li>$E_j^{\text{shared}}: \mathbb{R}^d \to \mathbb{R}^d$：第 $j$ 个共享专家，输入输出都在全宽 $d$。</li>
+  <li>$N_s$：共享专家数。</li>
+  <li>$y \in \mathbb{R}^d$：层输出。</li>
+</ul>
+
+<p>用一张数据流图把两支的分工与投影位置摆清楚：</p>
+
+<pre class="diagram">                    LatentMoE 层数据流（公式 F2）
+
+        输入 x ∈ R^d (模型全宽 d)
+        │
+        ├─────────────────────── 共享支（全宽 d，不走隐空间）──────────────────┐
+        │                                                                    │
+        │   E_1^shared(x) ∈ R^d,  ...,  E_{N_s}^shared(x) ∈ R^d  (无路由)    │
+        │        │                              │                             │
+        │        └──────────────┬───────────────┘                             │
+        │                       ▼                                             │
+        │                  Σ E_j^shared(x)                                    │
+        │                       │                                             │
+        │                       ▼                                             │
+        │                  （等待路由支结果）──────────────────────────────► (+) ──► y ∈ R^d
+        │                                                                     ▲
+        │   路由支（隐空间 ℓ）                                                  │
+        │   z = W_↓ x ∈ R^ℓ   （W_↓: d→ℓ 下投影，router 仍在 d 维工作）        │
+        │   │                                                                  │
+        │   ├──► E_{i1}^routed(z) ─┐                                           │
+        │   ├──► E_{i2}^routed(z) ─┤   p_i 加权聚合                            │
+        │   ├──► ...              ─┤   （top-k 个，全在 ℓ 维）                  │
+        │   ├──► E_{ik}^routed(z) ─┘                                           │
+        │   │                  │                                               │
+        │   │                  ▼                                               │
+        │   │             u ∈ R^ℓ                                              │
+        │   │                  │                                               │
+        │   │                  ▼                                               │
+        │   │       W_↑ u ∈ R^d   （W_↑: ℓ→d 上投影）──────────────────────────┘
+        │   │
+        （共享支与路由支都在全宽 d 上相加得到 y）</pre>
+
+<p>注意几个容易看错的地方。第一，<strong>共享专家不走隐空间</strong>——它们直接吃 $x \in \mathbb{R}^d$、输出 $\mathbb{R}^d$，不经过 $W_\downarrow$/$W_\uparrow$；只有路由分支走隐空间。第二，<strong>router 仍在全宽 $d$ 工作</strong>——门控决策 $p_i$ 从 $x$ 计算，只有路由 payload（送进专家的向量）与路由专家计算进入 $\ell$。第三，$W_\downarrow$ 与 $W_\uparrow$ 是<strong>所有路由专家共享</strong>的两个投影，不是每个专家各有一份。</p>
+
+<p>两个分支的职责差异如下：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>对比项</th><th>共享分支</th><th>路由分支</th></tr></thead>
+<tbody>
+<tr><td>输入空间</td><td>$\mathbb{R}^d$（全宽）</td><td>$\mathbb{R}^\ell$（隐空间）</td></tr>
+<tr><td>是否参与 top-$k$ 路由</td><td>否，所有 token 必经</td><td>是，每 token 选 $k$ 个</td></tr>
+<tr><td>是否经 $W_\downarrow$/$W_\uparrow$</td><td>否</td><td>是，两端各一次</td></tr>
+<tr><td>router 在哪里工作</td><td>—</td><td>router 在 $d$ 维给 $p_i$，专家在 $\ell$ 维计算</td></tr>
+<tr><td>FFN 输入输出维度</td><td>$\mathbb{R}^d \to \mathbb{R}^d$</td><td>$\mathbb{R}^\ell \to \mathbb{R}^\ell$</td></tr>
+<tr><td>承担的知识</td><td>通用变换（所有 token 共享）</td><td>差异化变换（按 token 路由）</td></tr>
+</tbody>
+</table>
+</div>
+
+<details>
+<summary>补充：与 MLA（多头潜在注意力）的"投影到潜在空间"思想类比</summary>
+<p>教学解释。 LatentMoE 的"down-projection 压到隐空间、up-projection 投回"与多头潜在注意力（MLA）把 KV 压到低维隐空间再投回的做法形似——两者都用共享投影把后续计算搬进更窄的空间以省通信与存储。这个类比只帮助理解"投影到隐空间"这一局部手法。失效边界：MLA 压的是 attention 的 K/V（用于跨 token 交互与 KV cache 压缩），LatentMoE 压的是路由专家的输入输出（用于缩小路由部分开销）；两者压的对象、目的与可承受的压缩比都不同，不能把 MLA 的压缩比结论搬到 LatentMoE。正式判断仍以公式 F2 为准。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 LatentMoE 层公式 F2，标出哪部分在 $d$ 维、哪部分在 $\ell$ 维。</li>
+  <li>说明共享专家是否经过 $W_\downarrow$/$W_\uparrow$，router 在 $d$ 还是 $\ell$ 工作。</li>
+  <li>指出 $W_\downarrow$ 与 $W_\uparrow$ 是每个专家各有一份，还是所有路由专家共享。</li>
+</ul>
+
+<p>结构看清楚了。那把路由宽度从 $d$ 压到 $\ell$ 到底省了多少、省下的预算花到哪里？</p>
+
+<h2 id="s3-compression-reinvestment">压缩比与 Reinvestment：省下的预算花到哪里</h2>
+
+<p>把路由宽度从 $d$ 压到 $\ell$，最直接的效果是路由部分的开销按比例缩小。论文 Figure 1 的标题给出定量关系（论断 C3、公式 F3）：<strong>路由 dispatch 通信量与路由专家权重大小都大致按 $d/\ell$ 比例缩小</strong>。注意"大致"——down/up-projection 本身有计算成本，所以这是路由部分的缩小比例，不是整个 MoE 层的加速比（下一章展开）。</p>
+
+<p><strong>教学示例。</strong> 取 $d=4096$、$\ell=1024$，压缩比 $d/\ell = 4$。对照上一章的 dispatch 量：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>top-$k$</th><th>标准 MoE 每 token dispatch</th><th>LatentMoE 每 token dispatch</th><th>缩小比例</th></tr></thead>
+<tbody>
+<tr><td>$k=8$</td><td>$8 \times 4096 = 32768$ 个数</td><td>$8 \times 1024 = 8192$ 个数</td><td>$4\times$</td></tr>
+<tr><td>$k=16$</td><td>$16 \times 4096 = 65536$ 个数</td><td>$16 \times 1024 = 16384$ 个数</td><td>$4\times$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>路由专家的 FFN 权重也同步缩小：原本每个专家的输入是 $d$ 维、权重矩阵正比于 $d$，现在输入是 $\ell$ 维、权重矩阵正比于 $\ell$，单个路由专家的权重大小也缩小约 $4\times$。router 与共享专家仍在 $d$ 维，不受这个比例影响。</p>
+
+<p>那么省下的预算花到哪里？论文给出的策略是 <strong>reinvestment</strong>（论断 C4、公式 F4）：把节省的预算同时投入到更大的专家数 $N$ 与更高的 top-$k$，按同一因子 $\alpha = d/\ell$ 放大。这样组合数从 $\binom{N}{k}$ 涨到 $\binom{\alpha N}{\alpha k}$，专家搭配的多样性显著提升，从而在保持服务成本大致不变的前提下提升准确率。</p>
+
+<p><strong>教学示例（贯穿推进）。</strong> 在 $d=4096, \ell=1024$（$\alpha = 4$）的基础上，取初始 $N=8, k=2$。reinvestment 后 $N' = \alpha N = 32$、$k' = \alpha k = 8$。组合数变化：</p>
+
+<p>$$\binom{8}{2} = 28 \;\longrightarrow\; \binom{32}{8} = 10{,}518{,}300$$</p>
+
+<p>组合数从 28 涨到约 1052 万——一个 token 能走的专家搭配数暴涨了约 37 万倍，而路由部分的服务成本（通信 + 显存带宽）按上面的比例基本不变。这就是 LatentMoE 区别于"单纯压缩"的关键：<strong>它不是让模型更小，而是把同样的服务预算换成更多专家、更高 top-k，换取更强的专家专门化潜力</strong>。</p>
+
+<p>这里有一个关键约束（论断 C4）。论文把非线性容量定义为 $\text{top-}k \times \text{专家中间维度}$。压缩 $d\to\ell$ 时保持非线性容量不变（设计原则 III：保持 $K$ 与中间维度 $m$ 不变，$U_\text{eff}=K\cdot m$ 不变）；reinvestment（设计原则 V）按 $\alpha$ 放大 $K$ 与 $N$，$m$ 保持不变，$U_\text{eff}$ 随 $K$ 放大而<strong>提升</strong>——这是 reinvestment 提升准确率的机制之一。两种情况下中间维度 $m$ 都不缩小：压缩 $\ell$ 只缩路由专家的输入输出宽度，不是缩小中间维度；放大 $k$ 时 $m$ 也不动（否则单专家表达能力下降）。这与 DeepSeekMoE 的"细粒度分割"（把专家切小、激活数同步增加以保持计算量守恒）思路不同——LatentMoE 压的是宽度，DeepSeekMoE 切的是专家本身。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>对比项</th><th>标准 MoE（全宽路由）</th><th>LatentMoE（隐空间路由 + reinvestment）</th></tr></thead>
+<tbody>
+<tr><td>路由专家输入宽度</td><td>$d$</td><td>$\ell$（$\ell < d$）</td></tr>
+<tr><td>每 token dispatch 量</td><td>$k \cdot d$</td><td>$k \cdot \ell$，缩小 $d/\ell$ 倍</td></tr>
+<tr><td>单个路由专家权重大小</td><td>正比于 $d$</td><td>正比于 $\ell$，缩小 $d/\ell$ 倍</td></tr>
+<tr><td>典型 reinvestment</td><td>—</td><td>$N \to \alpha N$、$k \to \alpha k$，$\alpha = d/\ell$</td></tr>
+<tr><td>组合数</td><td>$\binom{N}{k}$</td><td>$\binom{\alpha N}{\alpha k}$，显著增长</td></tr>
+<tr><td>非线性容量（$k \times$ 中间维度）</td><td>—</td><td>压缩时不变（原则 III）；reinvestment 时随 $K$ 放大而提升（$m$ 不变，原则 V）</td></tr>
+</tbody>
+</table>
+</div>
+
+<details class="code-details">
+<summary>可运行代码：验证压缩比下 dispatch 量缩小与 reinvestment 后组合数变化</summary>
+<div class="code-block">
+<pre><code class="language-python">import math
+
+# 教学例子：d=4096, ell=1024, 压缩比 4x
+d, ell = 4096, 1024
+alpha = d / ell
+print(f"=== 压缩比：d={d}, ell={ell}, alpha=d/ell={alpha} ===")
+
+# 1) 每 token 的路由 dispatch 量对比
+print("\n--- 每 token 路由 dispatch 量（个数）---")
+for k in [8, 16]:
+    dispatch_std = k * d
+    dispatch_lat = k * ell
+    print(f"top-{k}: 标准 MoE={dispatch_std}, LatentMoE={dispatch_lat}, "
+          f"缩小 {dispatch_std / dispatch_lat}x")
+
+# 2) reinvestment 把 N=8, k=2 放大到 N'=32, k'=8
+print("\n--- reinvestment：N=8, k=2 → N'=alpha*N, k'=alpha*k ---")
+N, k = 8, 2
+N_prime = int(alpha * N)
+k_prime = int(alpha * k)
+comb_before = math.comb(N, k)
+comb_after = math.comb(N_prime, k_prime)
+print(f"reinvestment 前: N={N}, k={k}, 组合数 C({N},{k})={comb_before}")
+print(f"reinvestment 后: N'={N_prime}, k'={k_prime}, 组合数 C({N_prime},{k_prime})={comb_after}")
+print(f"组合数增长倍数: {comb_after / comb_before:.2f}")
+
+# 3) 投影参数量（粗略估计，W_down + W_up）
+proj_params = 2 * d * ell
+print(f"\n投影参数量（W_down + W_up）: 2*{d}*{ell} = {proj_params}")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">=== 压缩比：d=4096, ell=1024, alpha=d/ell=4.0 ===
+
+--- 每 token 路由 dispatch 量（个数）---
+top-8: 标准 MoE=32768, LatentMoE=8192, 缩小 4.0x
+top-16: 标准 MoE=65536, LatentMoE=16384, 缩小 4.0x
+
+--- reinvestment：N=8, k=2 → N'=alpha*N, k'=alpha*k ---
+reinvestment 前: N=8, k=2, 组合数 C(8,2)=28
+reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
+组合数增长倍数: 375653.57
+
+投影参数量（W_down + W_up）: 2*4096*1024 = 8388608</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>k * d</code> 与 <code>k * ell</code> 对应正文 dispatch 量公式，<code>dispatch_std / dispatch_lat</code> 对应压缩比 $d/\ell$（公式 F3）；<code>math.comb</code> 对应组合数 $\binom{N}{k} \to \binom{\alpha N}{\alpha k}$（公式 F4）；<code>2 * d * ell</code> 对应两个投影矩阵的参数量。</p>
+<p><b>观察重点</b>：压缩比 4x 下 dispatch 量严格缩小 4 倍（与 $d/\ell$ 一致）；reinvestment 把组合数从 28 涨到 1052 万（约 37 万倍）——"服务成本基本不变、组合多样性显著增长"同时成立。投影参数量约 839 万，是 reinvestment 节省下的预算要消化的成本之一。</p>
+<p><b>教学简化</b>：代码只数 dispatch 量与组合数的"个数"，不涉及真实网络传输、专家权重矩阵形状与 batch 维度；投影参数量是粗略估计（$2 \cdot d \cdot \ell$），真实投影还有偏置与归一化。组合数假设 router 无约束地选任意 $k$ 个，实际还受负载均衡影响。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>手算 $d=4096, \ell=1024$ 时 top-8 与 top-16 的 dispatch 量缩小比例。</li>
+  <li>说出 reinvestment 通常把 $N$ 与 $k$ 按什么因子放大，并用 $N=8, k=2, \alpha=4$ 复算组合数变化。</li>
+  <li>说明"压缩时保持非线性容量不变、reinvestment 时随 $K$ 放大而提升"分别指什么，以及它与 DeepSeekMoE 的细粒度分割有何不同。</li>
+</ul>
+
+<p>压缩比听起来越大越好——但 $\ell$ 能不能无限压小？</p>
+
+<h2 id="s4-compression-limits">压缩下限与投影成本：为什么不能无限压窄</h2>
+
+<p>LatentMoE 的压缩比 $d/\ell$ 受三条约束，不能无限放大。</p>
+
+<p><strong>约束一：任务相关的"特征秩"下限。</strong> 论文设计原则 4 指出，存在一个任务相关的"特征秩"（feature rank），它给 $\ell$ 设了下限——把 $\ell$ 压到低于此下限会损害模型质量（论断 C5）。这个下限不是普适常数，而是依赖任务与数据，需要实验确定。论文在 16B 参数规模的消融实验中发现，压缩比到 4 时模型质量仍可保持（数字 N4）；再压缩需配合 reinvestment 才不损失。</p>
+
+<p><strong>约束二：down/up-projection 本身有计算成本。</strong> 两个投影矩阵 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 与 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 各要做一次矩阵乘法，这部分计算在标准 MoE 里不存在。论文在万亿参数规模（K2-1T）的投影分析中估计，这部分额外计算约 9%（数字 N5）。因此压缩比 $d/\ell$ 不等于整体加速比——只压缩了路由部分的通信与权重流量，投影还有成本（论断 C5）。</p>
+
+<p><strong>约束三：只压缩不 reinvestment 会掉点。</strong> 论文消融实验显示，单纯压缩 $\ell$ 而不增加 $N$ 与 $k$ 会让质量下降；同时按 $\alpha = d/\ell$ 放大 $N$ 与 $k$ 才能保持甚至提升质量（数字 N4）。这与第 3 章的 reinvestment 策略直接呼应——reinvestment 不是可选项，而是 LatentMoE 维持质量的必要条件。</p>
+
+<div class="callout callout-yellow">
+<p><b>注意边界：</b>压缩比 $d/\ell = 4$ 不意味着整个 MoE 层快 4 倍。第一，只压缩了路由部分的通信与权重流量，router 与共享专家仍在 $d$ 维。第二，down/up-projection 本身有计算成本（约 9%，数字 N5）。第三，$\ell$ 受特征秩下限约束，不能无限压小。LatentMoE 解决的是路由部分的开销，不解决 router 与共享专家的开销。</p>
+</div>
+
+<p>LatentMoE 的适用边界由此清晰：它解决"路由部分随 top-$k$ 与 $d$ 线性增长的通信与显存带宽开销"这一个问题；不解决 router 打分计算（仍在 $d$）、共享专家开销（仍在 $d$）、训练侧负载均衡。收益依赖任务特征秩与 reinvestment 配置，不保证在所有任务上都比标准 MoE 更好。</p>
+
+<details>
+<summary>补充：NVIDIA LatentMoE 论文的五条设计原则</summary>
+<p>论文 §2 提出五条硬件-软件协同设计原则，本页正文点出了与核心机制直接相关的几条。完整列表如下，供对照：</p>
+<ol>
+  <li>低延迟推理是显存带宽受限的（accuracy per parameter matters）。</li>
+  <li>高吞吐推理是通信受限的（routing volume scales with tokens × top-k × routed width）。</li>
+  <li>压缩时保持非线性容量（top-$k$ × 专家中间维度不变，$U_\text{eff}$ 不变）。</li>
+  <li>不要过度压缩特征（任务相关的特征秩下限）。</li>
+  <li>利用组合稀疏性（同时增加 $N$ 与 $k$ 以扩大组合空间）。</li>
+</ol>
+<p>原则 1、2 对应 S1 的动机；原则 3（压缩时保持非线性容量不变）与原则 5（reinvestment 放大 $N,k$、$U_\text{eff}$ 提升）对应 S3；原则 4 对应本节约束一。来源：[L] §2。</p>
+</details>
+
+<details>
+<summary>补充：Nemotron-3 Super/Ultra 的 LatentMoE 配置</summary>
+<p>NVIDIA 的 Nemotron-3 Super 与 Ultra 是首批采用 LatentMoE 的公开模型（数字 N2、N3）：</p>
+<ul>
+  <li>Super：路由路径 $4096 \to 1024 \to 4096$（压缩 4x），120B 总参/12B 激活。</li>
+  <li>Ultra：路由路径 $8192 \to 2048 \to 8192$（压缩 4x），550B 总参/55B 激活；每 MoE 层 512 路由专家、top-22、1 共享专家；路由专家中间维度 5120、共享专家中间维度 10240。</li>
+</ul>
+<p>两个模型保持相同的 4x 压缩比，Ultra 把宽度与深度同时放大。来源：[L] §4；[R] Nemotron-3 Ultra 笔记。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出 LatentMoE 压缩比受哪三条约束。</li>
+  <li>说明"压缩比 4x 不等于整体快 4x"的两个理由。</li>
+  <li>说明只压缩不 reinvestment 会发生什么，并指出 reinvestment 是可选项还是必要条件。</li>
+</ul>
+
+<p>LatentMoE 是通用架构概念；K3 在此基础上做了什么？</p>
+
+<h2 id="s5-stable-latent-moe">与 Stable LatentMoE 的关系：LatentMoE 的稳定化变体</h2>
+
+<p>LatentMoE 作为通用架构由 NVIDIA 论文（Elango et al., 2026）系统提出；Kimi K3 的 <strong>Stable LatentMoE</strong> 是 LatentMoE 主结构 + 三件稳定化的合称（论断 C6）。两者主结构一致——都是"共享专家全宽 + 路由专家隐空间 + 两端投影"；区别在于 K3 在此基础上加了三件稳定化，以应对 $N=896, k=16$（稀疏度 56）的极端稀疏与 2.8T 规模下的两个失败模式：路由分支激活爆炸与近千专家负载失衡。</p>
+
+<p>三件稳定化这里只点名，完整机制见<a href="../stable-latent-moe/index.html">Stable LatentMoE 概念页</a>：</p>
+<ul>
+  <li><strong>Normalized LatentMoE</strong>：在 $W_\uparrow$ 前加 RMSNorm，稳定路由聚合 $u$ 的尺度。这使 K3 的 Eq. 11 在 $W_\uparrow$ 作用于 $\mathrm{RMSNorm}(u)$ 而非 $u$ 本身——这是 K3 相对原始 LatentMoE 公式 F2 的一处差异。</li>
+  <li><strong>SiTU-GLU</strong>：有界激活函数，防止路由分支连续矩阵乘法链（$W_\downarrow \to$ 路由 FFN $\to W_\uparrow$）的激活爆炸。</li>
+  <li><strong>Quantile Balancing</strong>：分位点平衡，替代固定步长 bias 更新，解决近千专家负载失衡。</li>
+</ul>
+
+<p>用 K3 的实际配置把抽象符号填满（数字 N1）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>符号</th><th>含义</th><th>K3 取值</th></tr></thead>
+<tbody>
+<tr><td>$d$</td><td>模型隐层宽度</td><td>7168</td></tr>
+<tr><td>$\ell$</td><td>路由隐空间宽度</td><td>3584（压缩 2x）</td></tr>
+<tr><td>$N$</td><td>路由专家总数</td><td>896</td></tr>
+<tr><td>$k$</td><td>每 token 激活路由专家数</td><td>16</td></tr>
+<tr><td>$N_s$</td><td>共享专家数</td><td>2</td></tr>
+<tr><td>—</td><td>稀疏度 $N/k$</td><td>56</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>K3 的压缩比是 $d/\ell = 7168/3584 = 2$，比 Nemotron-3 的 4x 保守。这并非 K3 不想压得更窄，而是 2.8T 规模与极端稀疏下，再压窄会放大激活爆炸的风险——这正是三件稳定化要兜住的问题。</p>
+
+<p>两者的关系可以用一张图概括：</p>
+
+<pre class="diagram">LatentMoE（通用架构，NVIDIA 论文 [L]）
+   │
+   │  + 三件稳定化（K3 报告 §2.3）
+   │    · Normalized LatentMoE（W_↑ 前加 RMSNorm）
+   │    · SiTU-GLU（有界激活）
+   │    · Quantile Balancing（分位点平衡）
+   │
+   ▼
+Stable LatentMoE（K3 的变体）
+   · d=7168, ℓ=3584（压缩 2x）
+   · N=896 路由专家, k=16, N_s=2 共享专家
+   · 稀疏度 56，规模 2.8T</pre>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>对比项</th><th>LatentMoE（通用）</th><th>Stable LatentMoE（K3）</th></tr></thead>
+<tbody>
+<tr><td>主结构</td><td>共享全宽 + 路由隐空间 + 两端投影</td><td>相同</td></tr>
+<tr><td>$W_\uparrow$ 作用对象</td><td>$u$（公式 F2）</td><td>$\mathrm{RMSNorm}(u)$（K3 Eq. 11）</td></tr>
+<tr><td>激活函数</td><td>常规（如 SwiGLU）</td><td>SiTU-GLU（有界）</td></tr>
+<tr><td>负载均衡</td><td>常规（辅助损失或固定步长 bias）</td><td>Quantile Balancing（分位点）</td></tr>
+<tr><td>典型压缩比</td><td>4x（Nemotron-3）</td><td>2x（K3）</td></tr>
+<tr><td>稳定化是否必需</td><td>视规模与稀疏度而定</td><td>N=896, k=16, 2.8T 规模下必需</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说明 LatentMoE 与 Stable LatentMoE 的关系。</li>
+  <li>说出 Stable LatentMoE 在 LatentMoE 基础上加了哪三件稳定化。</li>
+  <li>指出 K3 的 Eq. 11 相对通用 LatentMoE 公式 F2 多了什么（$W_\uparrow$ 作用对象的差异）。</li>
+  <li>用 K3 的数字回答：压缩比是多少？为什么比 Nemotron-3 保守？</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>C1（LatentMoE 正式定义：路由分支两端加 $W_\downarrow$/$W_\uparrow$，路由专家在 $\ell$ 维计算，共享专家与 router 仍在 $d$ 维）：[L] Elango et al., 2026, arXiv:2601.18089, Figure 1(b) 与 §2。C2（标准 MoE 全宽路由开销：dispatch 通信与专家权重读取随 top-$k$ 与 $d$ 线性增长；低延迟场景显存带宽受限、高吞吐场景通信受限）：[L] §1 与 §2，设计原则 1、2；前置页 <a href="../moe-serving/index.html">moe-serving</a> §3。C3（路由部分开销按 $d/\ell$ 比例缩小）：[L] Figure 1 caption（"reduces routed parameter loads and all-to-all traffic by a factor of d/ℓ"）。C4（Reinvestment：按 $\alpha = d/\ell$ 放大 $N$ 与 $K$；中间维度 $m$ 保持不变，非线性容量 $U_\text{eff}=K\cdot m$ 随 $K$ 放大而提升）：[L] Figure 1 caption 与设计原则 V。区分：设计原则 III 指压缩阶段（$d\to\ell$ 时 $K,m$ 均不变、$U_\text{eff}$ 不变），设计原则 V 指 reinvestment（放大 $K$、$m$ 不变、$U_\text{eff}$ 提升）。C5（压缩下限与投影成本：特征秩下限、投影自身成本、不 reinvestment 会掉点）：[L] 设计原则 4；[R] Sebastian Raschka, "Latent MoE"（投影不等于整体加速）；[L] §3 消融实验。C6（Stable LatentMoE = LatentMoE + 三件稳定化）：[K3] Kimi K3 技术报告 §2.3；<a href="../stable-latent-moe/index.html">stable-latent-moe 概念页</a>。C7（router 仍在 $d$ 维工作）：[L] §2（"the router still computes gating decisions from the model's hidden representation"）。</p>
+
+<h3>核心公式与来源</h3>
+<p>F1（标准 MoE 层 $y = \sum g_i E_i$）：引自前置页 <a href="../moe-serving/index.html">moe-serving</a> 第 2 章 F1；[L] §1 标准 MoE 定义。F2（LatentMoE 层 $u = \sum p_i E_i^{\text{routed}}(W_\downarrow x)$，$y = \sum E_j^{\text{shared}}(x) + W_\uparrow u$）：由 [L] Figure 1(b) 结构描述与 [K3] Eq. 11（去掉 RMSNorm 回到通用形式）综合得出。F3（路由部分开销缩小比例 $\approx d/\ell$）：[L] Figure 1 caption。F4（reinvestment：$N \to \alpha N$、$k \to \alpha k$，$\alpha = d/\ell$）：[L] Figure 1 caption。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>N1（K3 配置：$d=7168, \ell=3584, N=896, k=16, N_s=2$，稀疏度 56）：[K3] §2.3 与官方 <code>config.json</code>（<code>moonshotai/Kimi-K3</code>）。N2（Nemotron-3 Super：$4096 \to 1024 \to 4096$，120B 总参/12B 激活）：[L] §4；[R] "Latent MoE"。N3（Nemotron-3 Ultra：$8192 \to 2048 \to 8192$，550B 总参/55B 激活，512 路由专家、top-22、1 共享专家，中间维度 5120/10240）：[R] "Nemotron 3 Ultra and Latent MoE Scaling"。N4（16B 消融：压缩比到 4 时质量保持，再压缩需 reinvestment）：[L] §3 消融实验。N5（投影额外计算约 9%，K2-1T 规模投影）：[L] "Projected Serving Impact at Trillion-Parameter Scale"。N6（iso-accuracy 下 LatentMoE 投影约 3.5x 加速，标准 MoE 需多约 350B 参数）：[L] Figure 2 与 §4；本页正文未直接引用 N6，仅在此登记。</p>
+
+<h3>教学示例</h3>
+<p>E1（S1）：$d=4096$、top-8/top-16 的 dispatch 量为构造数字，展示路由开销随 $k$ 线性增长；不代表真实模型配置。E2（S3）：$d=4096, \ell=1024$（压缩 4x）、$N=8, k=2 \to N'=32, k'=8$ 的 reinvestment 为构造数字，便于手算 dispatch 量缩小比例与组合数变化；配套可运行代码已实际执行，输出与页面一致。K3（$d=7168, \ell=3584$）与 Nemotron-3 Super（$4096 \to 1024 \to 4096$）作为真实配置对照，非教学构造。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>"把路由专家放进隐空间"只描述 LatentMoE 的结构改造，不断言隐空间具体学到了什么表示。与 MLA 的"投影到潜在空间"类比（S2 折叠块）只解释"用共享投影把后续计算搬进更窄空间"这一局部手法，失效边界已在该折叠块内说明——MLA 压的是 K/V，LatentMoE 压的是路由专家输入输出，两者压的对象、目的与可承受的压缩比都不同。"非线性容量 = top-$k$ × 专家中间维度"是论文给出的定义，本页只使用不重新推导。</p>
+
+<h3>教学简化及其限制</h3>
+<p>（1）dispatch 量用"个数"（$k \times d$ 或 $k \times \ell$）度量，真实传输还涉及 batch 维度、数据类型字节宽与通信库实现（如 DeepEP）；本页只比较相对比例，不涉及绝对字节量。（2）组合数 $\binom{N}{k}$ 假设 router 无约束地选任意 $k$ 个，实际还受负载均衡约束（见<a href="../deepseek-moe/index.html">DeepSeekMoE</a> §3.3 与<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>的 Quantile Balancing），真实可达组合数更少。（3）路由打分细节（sigmoid/softmax、aux-loss-free 偏置）不展开，正文用"router 给出门控权重 $p_i$"的抽象形式，细节见<a href="../moe-serving/index.html">moe-serving</a> §2 与<a href="../deepseek-moe/index.html">deepseek-moe</a>。（4）投影参数量 $2 \cdot d \cdot \ell$ 是粗略估计，真实投影还有偏置与归一化。（5）性能结论（N4、N6）依赖论文实验配置（16B 消融、万亿参数投影），不可外推到任意规模；N6 为投影值非实测。</p>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

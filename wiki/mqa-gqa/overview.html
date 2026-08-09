@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MQA 与 GQA · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 注意力变体 · KV cache 压缩</span>
+      <h1>MQA 与 GQA</h1>
+      <p class="lead">让多个 query 头共享更少的 K/V 头，压缩自回归推理时的 KV cache——MQA 共享 1 组，GQA 共享 G 组（MHA 与 MQA 的插值）。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>是什么</h2>
+    <p>Multi-Query Attention（MQA，Shazeer 2019）让所有 query 头共享同一组 key/value 头，把每 token 的 KV cache 从 $2 h d_k$ 减到 $2 d_k$（减少 $h$ 倍）。Grouped-Query Attention（GQA，Ainslie 2023）把 query 头分成 $G$ 组、每组共享一组 K/V，是 MHA（$G=h$）与 MQA（$G=1$）之间的插值。两者都通过减少 K/V 头数压缩自回归推理时的 KV cache，保留全局 softmax 注意力结构。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><strong>推理瓶颈在内存带宽而非算力</strong>。自回归解码每生成一个 token，都要把之前所有 token 的 K/V 从 HBM 加载一遍。Shazeer 2019 §2.4.1 的性能分析给出内存访问/算术比值 $\Theta(n/d + 1/b)$——序列长 $n$ 接近模型维度 $d$ 或 batch $b$ 小时，GPU 在等数据而非算。</li>
+      <li><strong>KV cache 随头数与序列长度线性增长</strong>。MHA 每 token 每 layer cache $2 h d_k$，真实规模下（$h=128,d_k=128,l=80,n=4096$）单条请求的 cache 可达 21.5 GB（fp16），占满显存。</li>
+      <li><strong>GPU 算力增长快于带宽增长</strong>。V100→H100 的 FP32 算力增长 4.3 倍，带宽只增长 3.7 倍——带宽瓶颈随硬件演进越来越严重。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>MQA 的"multi-query"指 query 头保持多头</strong>，不是"增加 query 头"。减的是 K/V 头数（$h\to 1$），query 头数仍是 $h$。所有 query 头读同一组 K 和 V，cache 减 $h$ 倍。</li>
+      <li><strong>GQA 是连续谱旋钮</strong>。$G=h$ 端是 MHA（每头独立 K/V），$G=1$ 端是 MQA（全共享），中间任意 $G$ 都是有效插值。每减一个 K/V 头，cache 减 $2 d_k$。</li>
+      <li><strong>uptraining 让已有 MHA 模型不必从头重训</strong>。两步：把 $h$ 个 K/V 投影矩阵按组均值池化为 $G$ 个（优于选第一个或随机初始化），再用原预训练计算量的 5% 继续预训练。</li>
+      <li><strong>MQA 减得太狠有代价</strong>。质量轻微下降，大模型上训练不稳定。GQA 找到折中点——Ainslie 2023 在 T5-XXL 上选定 $G=8$。</li>
+      <li><strong>减的是带宽与显存，不是算力</strong>。每个 query 头仍要对全部前序 token 做 softmax 加权和，$O(n^2)$ 算力不变；算术强度（FLOP/byte）反而提升，从带宽受限转为更接近算力受限。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>GQA-8 质量接近 MHA、速度接近 MQA</strong>（Ainslie 2023 Table 1，T5-XXL）：MHA 1.51s/47.2、MQA 0.24s/46.6、GQA-8 0.28s/47.1。$G=8$ 是 Figure 6 消融后选定的折中点，已成主流 LLM 标配（Llama 2 70B、Llama 3、Mistral 等）。</li>
+      <li><strong>不解决 $O(n^2)$ 算力</strong>。每个 query 头仍对全部前序 token 做 softmax 加权和，$QK^\top$ 仍是 $n\times n$ 矩阵。算力瓶颈要靠 Flash Attention（改 IO 实现）或 Linear Attention（改公式降阶）。</li>
+      <li><strong>不引入位置信息</strong>。位置仍需 RoPE 等外接编码，与 MQA/GQA 正交可叠加。</li>
+      <li><strong>与 MLA 是两条不同的 KV 压缩路线</strong>。MQA/GQA 共享头——被缓存的每个 K/V 仍是完整 $d_k$ 维 head 向量、只是份数减少；MLA（DeepSeek-V2）不共享头，而是把所有头的 K/V 联合压成 $d_c$ 维潜向量 $c_t^{KV}$ 再用上投影重建，cache = $(d_c + d_h^R)$。机制完全不同，详见 <a href="index.html">深度教学</a> 与 <a href="../mla/index.html">MLA 概念页</a>。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

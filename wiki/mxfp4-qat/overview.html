@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MXFP4 量化感知训练 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 量化 / 部署优化</span>
+      <h1>MXFP4 量化感知训练</h1>
+      <p class="lead">把 MoE 大模型的专家权重压到 4-bit 微缩浮点格式 MXFP4，并在训练前向就模拟这种量化、反向用直通估计器传梯度，使模型部署时用真正的 4-bit 权重仍保持训练精度。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>一句话定位</h2>
+    <p>MXFP4 量化感知训练（MXFP4 QAT）是一种部署导向的量化方法：把模型权重编码到 4-bit 浮点格式 MXFP4（OCP 微缩浮点，每 32 个权重共享一个 scale），训练时让前向模拟这一量化、反向用 STE 传梯度，使模型在被压到 4-bit 后仍像训练时那样准。Kimi K3 把它用在 896 个 MoE 路由专家上，覆盖 SFT 与 RL 全后训练。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><strong>MoE 专家权重主导显存</strong>。K3 有 896 个路由专家（每层 896 个，92 个 MoE 层），全部权重必须驻留显存（稀疏激活只省计算不省显存），约 2.71T 参数、BF16 下约 5.4 TB。这是部署成本的主要来源。</li>
+      <li><strong>4-bit 能省约 4 TB</strong>。压到 MXFP4 后约 1.44 TB，压缩约 3.76×。省下的量级是 TB 级，足以改变部署可行性。</li>
+      <li><strong>训练后量化（PTQ）会掉点</strong>。若训练时全精度、推理时才量化，模型从未见过量化引入的离散误差，质量下降显著。</li>
+      <li><strong>RL 还多一层 mismatch</strong>。RL 的训练 target 来自 rollout（推理），若 rollout 与训练量化方案不同，target 与梯度指向不同分布，会让 RL 崩坏或收敛到错误方向。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>共享 scale + 窄元素</strong>。MXFP4 把 32 个权重组成一块，共享一个 8-bit 的 power-of-two scale（承担动态范围），每个权重自己只存 4-bit 浮点元素（承担块内相对精度）。这是"4-bit 仍可用"的关键——动态范围交给 scale，元素只分辨相对差异。</li>
+      <li><strong>QAT 让训练"看见"量化</strong>。前向先把权重"量化再反量化"得到近似权重，用近似权重算损失；反向用直通估计器（STE）把梯度原样传回原始权重。模型每个前向都见到量化偏差，权重会朝"量化后仍能减小损失"的方向调整。</li>
+      <li><strong>STE 是"透明的窗户"</strong>。量化里的最近邻舍入不可导，STE 直接令导数为 1，让梯度穿过它。这不保证最优，但让训练能进行。</li>
+      <li><strong>RL 必须 rollout 与训练同方案</strong>。K3 让 rollout 与训练共享同一 MXFP4（权重）+ MXFP8（激活）方案，target 与梯度指向同一分布，消除 train-inference mismatch。</li>
+      <li><strong>选择性量化</strong>。只量化 MoE 路由专家权重（占参数绝大部分、稀疏激活），非专家组件（attention、shared expert、router、lm_head）保持高精度——它们频繁参与每 token 计算、对精度敏感、参数占比小。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>MXFP4 不是 4-bit 整数量化</strong>。元素是 4-bit 浮点（E2M1：1 符号 + 2 指数 + 1 尾数），有独立指数位，与定点整数不同。成立条件：OCP MXFP4 规范。</li>
+      <li><strong>QAT 不恢复精度，只补偿</strong>。权重仍以 4-bit 部署；QAT 让模型适应量化精度损失，补偿多少取决于训练数据与 QAT 配置。成立条件：QAT 贯穿足够长训练。</li>
+      <li><strong>train-inference match 是 RL 量化的硬要求</strong>。rollout 与训练量化方案任一不一致即引入 mismatch。成立条件：同一量化方案、同一 scale 选择、同一数值路径。</li>
+      <li><strong>非专家组件不能盲目量化</strong>。attention、router 对数值精度极敏感，量化会破坏稳定性。成立条件：选择性量化策略（config.json 的 <code>ignore</code> 列表印证）。</li>
+    </ul>
+
+    <p>想看机制细节（块结构图、反量化公式、单权重 QAT 一步手算、可运行代码、config.json 字段）请进入 <a href="index.html">深度教学</a>。</p>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

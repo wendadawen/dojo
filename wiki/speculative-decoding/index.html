@@ -1,0 +1,1353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>投机解码（Speculative Decoding）：用小模型猜、大模型核的无损推理加速</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">投机解码</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">投机解码：用小模型猜、大模型核的无损推理加速</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<p>让一个 70B 模型生成 100 个 token，为什么必须串行调用 100 次大模型？每次调用要把全部约 140GB 权重从显存读一遍，却只用它算 1 个 token 的概率——剩下的算力白白空转。能不能把这些空转的算力用来「猜」未来几个 token、再让大模型一次核对？投机解码（Speculative Decoding）就是回答这个问题的方法：用一个小而快的 draft 模型自回归地猜若干个候选 token，大 target 模型一次性并行验证，按修改版拒绝采样规则接受匹配的、修正不匹配的，从而在不改变输出分布的前提下减少大模型的串行调用次数。Chen et al. 2023 把同一机制称为 Speculative Sampling。</p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding." arXiv:2211.17192, ICML 2023 Oral；Chen, Borgeaud, Irving, Lespiau, Sifre, Jumper. "Accelerating Large Language Model Decoding with Speculative Sampling." arXiv:2302.01318, DeepMind 2023。</p>
+</blockquote>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>自回归解码慢在哪里，为什么「并行验证多个 token」几乎不增加成本？</li>
+    <li>Draft-then-Verify 一轮做了什么，每个 token 在什么条件下被接受或拒绝？</li>
+    <li>为什么这个接受/拒绝规则能保证输出分布与纯 target 采样完全相同？</li>
+    <li>接受率 $\alpha$ 和草稿长度 $\gamma$ 如何决定加速比，什么时候反而更慢？</li>
+    <li>贪心解码下规则如何退化，与采样情形的关系是什么？</li>
+  </ul>
+</section>
+
+<h2 id="why-sequential-slow">为什么串行解码慢——内存带宽留下的「免费午餐」</h2>
+
+<p>自回归解码的工作方式是：每次把已生成的 token 序列喂给模型，模型做一次前向传播，得到下一个位置上的概率分布，从中采样一个 token，再把它拼回序列、重复下一步。每一步都依赖上一步的输出，因此必须串行。这里的「一次前向传播」会用到一个叫 KV cache 的机制——把历史 token 的注意力键值缓存下来，避免重复计算——但每一步仍然要把模型的全部权重从显存读一遍。</p>
+
+<p>关键在于单 token 前向传播的瓶颈是什么。一个 70B 参数的模型在 FP16 下权重约 140GB；H100 显卡 HBM 带宽 3.35 TB/s（见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型</a>）。教学计算：把全部权重从 HBM 读到计算单元的理论下限约为 $140\text{ GB} / 3.35\text{ TB/s} \approx 42$ 毫秒，与具体生成什么 token 无关。相比之下，算出一个 token 概率所需的乘加运算量相对很低，计算单元（SM / Tensor Core）大量时间在等权重到达——单步解码是<strong>内存带宽受限</strong>（memory-bandwidth bound），而非计算受限。</p>
+
+<p>这一点带来一个反直觉的机会。Transformer 的因果注意力让一次前向传播可以同时对序列每个位置输出分布（见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>）。如果把输入序列延长 $\gamma$ 个位置，同一次前向传播就额外给出了 $\gamma$ 个位置上的分布，而墙钟时间几乎不变——因为瓶颈是「把权重读一遍」这件事，读一遍权重之后，多用它算几个位置的乘积几乎不增加时间，多余的算术落在原本空闲的计算单元上。这就是投机解码的硬件前提：</p>
+
+<pre class="diagram">单 token 解码（标准）        γ+1 token 验证（投机）
+┌──────────────────┐         ┌──────────────────────────────┐
+│ 读权重 140GB     │ 42ms    │ 读权重 140GB                 │ 42ms
+│ 算 1 个位置      │ ≈0      │ 算 γ+1 个位置                │ ≈0+ε
+│ 总计             │ ≈42ms   │ 总计                         │ ≈42ms
+└──────────────────┘         └──────────────────────────────┘
+        ↓                              ↓
+   产出 1 token                  产出 1~γ+1 token
+</pre>
+
+<p>教学解释。 把「读权重」理解为「开车去仓库取货」：取一次货的开车时间是固定的，不管取一件还是取 $\gamma+1$ 件，开车时间都一样；只要这 $\gamma+1$ 件货值得取，跑一趟就更划算。这个类比只帮助理解「读权重」与「算位置」的时间量级差异。它不覆盖批量推理下的吞吐竞争（高并发时多个请求要抢同一份带宽），也不覆盖流水线并行下的气泡问题；正式判断仍以单流低负载下的带宽分析与第 4 章的加速比公式为准。</p>
+
+<p>这条「免费午餐」有一个硬条件：单流低负载。当批处理规模变大、多个请求已经把计算单元占满时，「空闲算力」就不存在了，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力，反而降低总吞吐。这个边界在第 4 章和第 6 章再展开。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用一句话说出为什么单 token 解码是带宽受限而非计算受限。</li>
+  <li>「验证 $\gamma$ 个 token」与「生成 1 个 token」墙钟时间为何相近？说出硬件原因。</li>
+  <li>这条「验证几乎免费」的结论在什么负载条件下不成立？</li>
+</ul>
+
+<p>硬件允许我们「免费」核对 $\gamma$ 个 token——但核对什么？这 $\gamma$ 个候选 token 从哪里来？下一章讲 draft 模型如何提供候选、target 模型如何核对。</p>
+
+<h2 id="draft-then-verify">Draft-then-Verify——一轮做了什么</h2>
+
+<p>投机解码用两个模型协同：一个小的 draft 模型 $q$（快但可能不准），一个大的 target 模型 $p$（慢但准，其分布 $p$ 是希望最终采样的目标分布）。每轮（一个 "superstep"）做五件事：</p>
+
+<pre class="diagram">输入：当前前缀 prefix、draft 模型 q、target 模型 p、草稿长度 γ
+
+步骤 1 (Draft)     q 自回归采样 γ 个 token：x₁,x₂,…,x_γ
+                   保留每步分布 q₁,…,q_γ
+                            │
+步骤 2 (Verify)    p 对 [prefix + x₁,…,x_γ] 做单次前向 ──┐
+                   得 γ+1 个位置分布 p₁,…,p_γ, p_{γ+1}     │ 一次调用
+                            │                              │
+步骤 3 (Accept/   对 i=1..γ 逐位计算 a_i = min(1, p_i(x_i)/q_i(x_i))
+       Reject)    以概率 a_i 接受 x_i                       │
+                            │                              │
+              ┌─────────────┴─────────────┐                │
+        首个拒绝 i*                 全部接受                │
+              │                          │                  │
+步骤 4 (Resample)  从残差            步骤 5 (Bonus)        │
+                  p'_{i*} =         从 p_{γ+1} 免费       │
+                  norm(max(0,       采样一个 token         │
+                  p_{i*}-q_{i*}))                          │
+                  重采样 1 个,     产出 γ+1 个 token       │
+                  丢弃 i* 之后                              │
+                  的 draft,                                 │
+                  产出 i* 个 token                          │
+                            │                              │
+                            └──────────────────────────────┘
+                            ↓
+                  本轮产出 1 ~ γ+1 个 token
+                  （最差：首轮即拒，仍产出 1 个重采样 token）
+</pre>
+
+<p>逐步说明。 步骤 1：draft 模型用普通自回归方式采样 $\gamma$ 个 token $x_1,\dots,x_\gamma$，每步都记下分布 $q_i$（即 draft 在第 $i$ 步给各 token 的概率）。步骤 2：把前缀和 $\gamma$ 个 draft token 拼成一条序列，target 模型做<strong>一次</strong>前向传播，因为因果注意力，同时得到 $\gamma+1$ 个位置上的分布 $p_1,\dots,p_{\gamma+1}$（最后一个 $p_{\gamma+1}$ 是 bonus 位置，见步骤 5）。步骤 3：从左到右逐位判断。对第 $i$ 个 draft token $x_i$，计算接受概率</p>
+
+$$a_i = \min\!\left(1, \frac{p_i(x_i)}{q_i(x_i)}\right).$$
+
+<p>这个公式有三条边界，对应三种情形：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>条件</th><th>$p_i(x_i)/q_i(x_i)$</th><th>接受概率 $a_i$</th><th>动作</th></tr></thead>
+<tbody>
+<tr><td>$p_i(x_i) \geq q_i(x_i)$</td><td>$\geq 1$</td><td>$1$</td><td>必接受</td></tr>
+<tr><td>$p_i(x_i) < q_i(x_i)$</td><td>$\in (0,1)$</td><td>$p_i(x_i)/q_i(x_i)$</td><td>概率接受</td></tr>
+<tr><td>$p_i(x_i) = 0$</td><td>$0$</td><td>$0$</td><td>必拒绝</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>直觉是：如果 target 觉得这个 token 至少和 draft 一样可能（$p \geq q$），就放心接受；如果 target 觉得 draft 高估了它（$p < q$），就以两者比值概率接受，比值越低越倾向于拒绝。这听起来像调参，但第 3 章会证明这个比值恰好让输出分布回到 $p$，不是任意选择。</p>
+
+<p>步骤 4：在<strong>首个</strong>被拒绝的位置 $i^\*$，丢弃 $x_{i^\*}$ 及其后的全部 draft token，从残差分布</p>
+
+$$p'_{i^\*}(x) = \frac{\max\!\big(0,\ p_{i^\*}(x) - q_{i^\*}(x)\big)}{\sum_{x'} \max\!\big(0,\ p_{i^\*}(x') - q_{i^\*}(x')\big)}$$
+
+<p>重采样一个 token 作为该位置最终输出，并结束本轮（不再验证后续 draft token）。残差分布把 target 比 draft「多给」的概率拿出来重新分配——直观上是在修正 draft 高估某些 token 造成的偏差。为什么不能直接从 $p$ 重采样？因为接受步骤已经偏向 $q$ 高的 token，必须用残差把被低估的部分补回去；第 3 章会严格证明这一点。注意：若 $p_i \leq q_i$ 处处成立（$p$ 被 $q$ 支配），则 $\max(0, p_i - q_i)$ 全为零、残差归一化无定义，但此时 $\min(1, p_i/q_i) = 1$ 处处成立、永不拒绝，残差分支根本不会被触发。</p>
+
+<p>步骤 5：若 $\gamma$ 个 draft token 全部被接受，target 同一次前向传播已经给出了第 $\gamma+1$ 个位置的分布 $p_{\gamma+1}$，可以免费从中采样一个 bonus token——「免费」是因为它复用了已经做过的那一次前向传播，不需要额外调用 target。本轮最多产出 $\gamma+1$ 个 token。</p>
+
+<p>一轮的最差情况是首个 draft token 就被拒绝：此时仍从残差重采样出 1 个 token，产出与纯 target 解码相同（1 个 token，1 次 target 调用），只是浪费了 draft 的工作。因此投机解码从不比纯解码产出更少——它只可能更快，不可能更慢（单流下；高并发的退化见第 4 章）。</p>
+
+<details>
+<summary>Draft-then-Verify 一轮的伪代码（把五步形式化）</summary>
+<p>以下是伪代码，不是 Python。它形式化上面五步，便于后续对照公式与代码。</p>
+<div class="code-block">
+<pre><code class="language-text">输入：
+  当前前缀 prefix
+  draft 模型 q 与 target 模型 p（共享词表）
+  草稿长度 γ（正整数）
+
+状态：
+  本轮产出序列 out ← 空列表
+
+核心步骤：
+  # 步骤 1：Draft
+  for i ← 1 to γ:
+      从 q_i(· | prefix + out + 已采样的 draft) 采样 x_i
+      记录分布 q_i
+
+  # 步骤 2：Verify（一次 target 调用）
+  令 S ← prefix + [x_1, …, x_γ]
+  一次 p 前向传播，得 p_1, …, p_γ, p_{γ+1}
+
+  # 步骤 3-4：逐位接受/拒绝
+  rejected ← false
+  for i ← 1 to γ:
+      a_i ← min(1, p_i(x_i) / q_i(x_i))
+      以概率 a_i 接受：
+          把 x_i 加入 out
+      否则（首个拒绝）：
+          从 p'_i(x) = norm(max(0, p_i(x) - q_i(x))) 重采样一个 token y
+          把 y 加入 out
+          rejected ← true
+          break
+
+  # 步骤 5：Bonus（仅当全部接受）
+  if not rejected:
+      从 p_{γ+1} 采样一个 token b
+      把 b 加入 out
+
+输出：out（长度为 1 ~ γ+1）
+</code></pre>
+</div>
+<p>注意 $p_i, q_i$ 都是给定前缀与之前 token 的条件分布，伪代码中省略条件记号以突出主线。每轮的 target 调用次数始终为 1，draft 调用次数始终为 $\gamma$，与接受多少无关。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出 $\gamma$ 个 draft token 是怎么来的、为什么 target 只需要一次前向传播。</li>
+  <li>给定 $p(x)=0.4$、$q(x)=0.5$，算出 $a(x)$ 并说出是必接受还是概率接受。</li>
+  <li>说出残差分布在什么条件下才会被触发、什么条件下永远不会被触发。</li>
+  <li>说出 bonus token 在什么条件下产生、为什么叫「免费」。</li>
+</ul>
+
+<p>机制讲完了——但为什么接受概率要写成 $\min(1, p/q)$？为什么拒绝后要从 $\max(0, p-q)$ 重采样而不是直接从 $p$？这些选择不是任意调参，下一章证明它们组合起来恰好让输出分布回到 $p$。</p>
+
+<h2 id="why-distribution-preserved">为什么这条规则能保分布——单位置证明</h2>
+
+<p>这一章回答投机解码最核心的问题：为什么这条接受/拒绝规则能保证输出分布与纯 target 采样<strong>完全相同</strong>（lossless）？答案浓缩成一句话：因为接受步骤偏置了分布，残差重采样恰好把偏置的部分补回去。下面把这句话展开成可手算的证明。</p>
+
+<p>先固定一个位置 $i$，省略条件记号，记 $p = p_i$、$q = q_i$。考虑某个特定 token $x$ 最终被「采出」的概率 $\Pr[\text{emit } x]$。它有两条互斥路径：</p>
+
+<p><strong>路径 A</strong>：draft 采样到 $x$ 且被接受。概率为 $q(x) \cdot a(x) = q(x) \cdot \min\!\left(1, \frac{p(x)}{q(x)}\right) = \min(q(x), p(x))$。</p>
+
+<p><strong>路径 B</strong>：某个 token 被拒（不一定是 $x$），从残差重采样到 $x$。这条路径要分两步算。</p>
+
+<p>先算「任意 token 被拒」的总概率 $\beta$。路径 A 在所有 token 上求和给出「被接受」的总概率 $\sum_{x'} \min(q(x'), p(x'))$，因此</p>
+
+$$\beta = 1 - \sum_{x'} \min(q(x'), p(x')).$$
+
+<p>再算残差分布的归一化常数。注意一个恒等式：对任意实数 $a, b$，$\min(a, b) + \max(0, b - a) = b$（若 $b \geq a$ 则 $\min=a, \max=b-a$，和为 $b$；若 $b < a$ 则 $\min=b, \max=0$，和仍为 $b$）。把 $a = q(x'), b = p(x')$ 代入并对所有 $x'$ 求和，得</p>
+
+$$\sum_{x'} \max\!\big(0,\ p(x') - q(x')\big) = \sum_{x'} \big(p(x') - \min(p(x'), q(x'))\big) = 1 - \sum_{x'} \min(p(x'), q(x')) = \beta.$$
+
+<p>所以残差分布 $p'(x) = \max(0, p(x) - q(x)) / \beta$ 的归一化常数<strong>恰好等于拒绝概率 $\beta$</strong>——这不是巧合，是 $\min + \max$ 恒等式的直接推论。于是路径 B 的概率为「拒绝」乘以「拒绝后重采样到 $x$」：</p>
+
+$$\beta \cdot p'(x) = \beta \cdot \frac{\max(0, p(x) - q(x))}{\beta} = \max\!\big(0,\ p(x) - q(x)\big).$$
+
+<p>两条路径相加（互斥，故可直接相加）：</p>
+
+$$\Pr[\text{emit } x] = \min\!\big(q(x), p(x)\big) + \max\!\big(0,\ p(x) - q(x)\big) = p(x).$$
+
+<p>最后一步再次用 $\min(a,b) + \max(0, b-a) = b$（取 $a = q(x), b = p(x)$）。这就证明了：在任意一个位置上，投机解码最终采出 $x$ 的概率恰好等于 target 分布 $p(x)$。逐位置成立则按归纳法对整轮、整条序列成立——输出分布与纯 target 采样在数学上完全相同（仅受硬件数值精度影响）。这是投机解码「无损」性质的全部依据。</p>
+
+<details>
+<summary>完整推导：单位置输出分布等于 p 的五步展开</summary>
+<p>把上面散在各处的步骤收拢成一条可逐行复算的推导链。固定位置 $i$，省略条件记号。</p>
+<p>已知：$p(x), q(x)$ 为同一词表上的概率分布；$a(x) = \min(1, p(x)/q(x))$；$p'(x) = \max(0, p(x)-q(x)) / Z$，$Z = \sum_{x'} \max(0, p(x')-q(x'))$。</p>
+<p>第 1 步（路径 A 概率）：</p>
+<p>$$\Pr[\text{draft } x \text{ and accept}] = q(x) \cdot a(x) = q(x) \cdot \min\!\left(1, \frac{p(x)}{q(x)}\right) = \min(q(x), p(x)).$$</p>
+<p>第 2 步（任意拒绝概率）：</p>
+<p>$$\beta = 1 - \sum_{x'} \Pr[\text{draft } x' \text{ and accept}] = 1 - \sum_{x'} \min(q(x'), p(x')).$$</p>
+<p>第 3 步（残差归一化常数等于 $\beta$）：用恒等式 $\min(a,b) + \max(0, b-a) = b$，取 $a = q(x'), b = p(x')$，对所有 $x'$ 求和：</p>
+<p>$$Z = \sum_{x'} \max(0, p(x') - q(x')) = \sum_{x'} (p(x') - \min(p(x'), q(x'))) = 1 - \sum_{x'} \min(p(x'), q(x')) = \beta.$$</p>
+<p>第 4 步（路径 B 概率）：「发生拒绝且重采样到 $x$」= 拒绝概率 $\times$ 残差条件概率：</p>
+<p>$$\beta \cdot p'(x) = \beta \cdot \frac{\max(0, p(x) - q(x))}{Z} = \beta \cdot \frac{\max(0, p(x) - q(x))}{\beta} = \max(0, p(x) - q(x)).$$</p>
+<p>第 5 步（总和）：路径 A 与路径 B 互斥，相加：</p>
+<p>$$\Pr[\text{emit } x] = \min(q(x), p(x)) + \max(0, p(x) - q(x)) = p(x),$$</p>
+<p>最后一步再用一次 $\min(a,b) + \max(0, b-a) = b$（取 $a = q(x), b = p(x)$）。证毕。</p>
+</details>
+
+<p>这个证明还顺手给出接受率的一个有用形式。第 3 章的 $\beta$ 是「拒绝概率」，那么「平均接受概率」$\alpha = 1 - \beta = \sum_x \min(p(x), q(x))$。用恒等式 $\min(a, b) = (a + b - |a - b|)/2$ 代入：</p>
+
+$$\alpha = \sum_x \min(p(x), q(x)) = \sum_x \frac{p(x) + q(x) - |p(x) - q(x)|}{2} = 1 - \frac{1}{2}\sum_x |p(x) - q(x)| = 1 - \mathrm{TV}(p, q),$$
+
+<p>其中 $\mathrm{TV}(p, q) = \frac{1}{2}\sum_x |p(x) - q(x)|$ 是两个分布的总变差距离（total variation distance）。这说明 $\alpha$ 是分布相似度的度量：draft 越像 target、$\mathrm{TV}$ 越小、$\alpha$ 越接近 1。$\alpha = 1$ 当且仅当 $p = q$（draft 与 target 完全一致），此时每个 token 必接受。$\alpha = 0$ 当且仅当 $p$ 与 $q$ 支撑集不相交（draft 永远猜不中 target 会采的 token），此时每个 token 必拒。</p>
+
+<p>最后看贪心解码的退化情形。贪心解码（greedy decoding）是每步取 argmax 的解码方式，对应 $p$ 与 $q$ 都退化为点质量分布——即 $p$ 把全部概率放在 target 的 argmax 上、$q$ 把全部概率放在 draft 的 argmax 上。此时 $p(x)/q(x)$ 只可能取两个值：若 draft 的 argmax 与 target 的 argmax 相同，则 $p(x) = q(x) = 1$、比值为 1、$\min(1, 1) = 1$，接受；若不同，则 $p(x) = 0$、比值为 0、$\min(1, 0) = 0$，拒绝。残差分布 $\mathrm{norm}(\max(0, p - q))$ 退化为 target 的 argmax 处概率 1，即直接取 target 的 argmax。因此贪心情形下规则退化为「逐位检查 draft 的 argmax 是否等于 target 的 argmax，遇到不等处取 target 的 argmax 并停止」——输出与纯 target 贪心解码逐 token 一致。这是投机解码最易懂的入口，工程中也常用；但它只是采样情形（$p, q$ 为一般分布）的特例，不是另一套机制。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出单位置 $\Pr[\text{emit } x]$ 的两条路径分解。</li>
+  <li>说出残差分布的归一化常数为什么恰好等于拒绝概率 $\beta$（指出用了哪条恒等式）。</li>
+  <li>说出 $\alpha$ 与 $\mathrm{TV}(p, q)$ 的关系，并据此判断「draft 越像 target」时 $\alpha$ 如何变化。</li>
+  <li>说出贪心情形下规则如何退化为 argmax 匹配。</li>
+</ul>
+
+<p>现在我们相信规则保分布——那么实际跑起来能快多少？这取决于接受率和草稿长度，下一章用期望 token 数和加速比公式量化。</p>
+
+<h2 id="how-much-faster">能快多少——期望 token 数与加速比</h2>
+
+<p>第 3 章给出 $\alpha = \sum_x \min(p(x), q(x))$ 作为单位置平均接受概率。这一章把 $\alpha$ 代入两个公式：期望 token 数和加速比。</p>
+
+<p><strong>期望 token 数</strong>。假设各位置接受率近似独立同分布（i.i.d.）、均为 $\alpha$。每个 draft token 被接受的概率独立为 $\alpha$，因此「连续接受 $k$ 个后首次失败」服从截断几何分布。一轮最多产出 $\gamma + 1$ 个 token（全接受加 bonus）、最少产出 1 个（首轮即拒仍重采样 1 个）。Leviathan et al. 2023 Theorem 3.8 给出期望产出：</p>
+
+$$\mathbb{E}[L] = \frac{1 - \alpha^{\gamma+1}}{1 - \alpha}.$$
+
+<p>这是截断几何级数 $\sum_{k=0}^{\gamma} \alpha^k$ 的闭式。两条边界帮助理解：</p>
+
+<ul>
+  <li>$\alpha = 1$（draft 与 target 完全一致）：取极限 $\mathbb{E}[L] = \gamma + 1$，每轮必产出 $\gamma + 1$ 个 token（全接受加 bonus）。</li>
+  <li>$\alpha = 0$（draft 永远猜不中）：$\mathbb{E}[L] = 1$，每轮必拒、产出 1 个重采样 token，与纯 target 解码相同。</li>
+</ul>
+
+<p>中间值：$\alpha = 0.8, \gamma = 5$ 时 $\mathbb{E}[L] = (1 - 0.8^6) / 0.2 = (1 - 0.262) / 0.2 = 3.69$ 个 token / 轮。</p>
+
+<p><strong>加速比</strong>。一轮的成本（以单步 target 调用为 1 单位）为 $\gamma \cdot c + 1$，其中 $c = T_{\text{draft}} / T_{\text{target}}$ 是单步 draft 与单步 target 的墙钟时间比。标准解码产出 1 token 成本为 1。加速比是「标准成本 / 投机成本」：</p>
+
+$$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \alpha)(1 + \gamma c)}.$$
+
+<p>代入 Leviathan et al. 2023 报告的 T5-XXL 实验参数（draft 是 T5-base，约 250M，比 target 11B 小得多，单步成本比 $c \approx 0.05$；平均接受率 $\alpha \approx 0.8$；草稿长度 $\gamma = 5$）：</p>
+
+<details>
+<summary>手算：α=0.8, γ=5, c=0.05 的 E[L] 与 S（复算 Leviathan 数字）</summary>
+<p>教学示例，数字来自 Leviathan et al. 2023 §3 实验部分（社区综述 howaiworks.ai 引用原文给出）。</p>
+<p>期望 token 数：</p>
+<p>$$\mathbb{E}[L] = \frac{1 - 0.8^{6}}{1 - 0.8} = \frac{1 - 0.262144}{0.2} = \frac{0.737856}{0.2} = 3.689 \text{ 个 token / 轮}.$$</p>
+<p>每轮成本：$1 + \gamma c = 1 + 5 \times 0.05 = 1.25$ 个 target 单位。</p>
+<p>加速比：</p>
+<p>$$S = \frac{3.689}{1.25} = 2.95 \times.$$</p>
+<p>这与 Leviathan et al. 2023 摘要报告的「T5-XXL 上 2×-3× 加速」一致。</p>
+</details>
+
+<details>
+<summary>反例手算：α=0.2, γ=5, c=0.05 时几乎不加速</summary>
+<p>教学示例，用于展示 $\alpha$ 低时加速消失。固定 $c = 0.05$、$\gamma = 5$，把 $\alpha$ 从 0.8 降到 0.2。</p>
+<p>期望 token 数：</p>
+<p>$$\mathbb{E}[L] = \frac{1 - 0.2^{6}}{1 - 0.2} = \frac{1 - 0.000064}{0.8} = \frac{0.999936}{0.8} \approx 1.25 \text{ 个 token / 轮}.$$</p>
+<p>每轮成本仍是 $1 + 5 \times 0.05 = 1.25$ 个 target 单位。</p>
+<p>加速比：</p>
+<p>$$S = \frac{1.25}{1.25} = 1.00 \times.$$</p>
+<p>盈亏平衡——投机的开销（$\gamma$ 步 draft）恰好抵消了它带来的收益。$\alpha$ 再低就会 $S < 1$，反而变慢。这说明接受率是加速的核心杠杆。</p>
+</details>
+
+<p>从公式能读出三种使投机解码「不加速甚至变慢」的条件：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>条件</th><th>公式表现</th><th>直觉</th></tr></thead>
+<tbody>
+<tr><td>$\alpha$ 太低（draft 猜不准）</td><td>$1 - \alpha^{\gamma+1} \to 1$，$\mathbb{E}[L] \to 1$</td><td>几乎每轮首轮即拒，draft 工作白做</td></tr>
+<tr><td>$c$ 太大（draft 接近 target 规模）</td><td>$1 + \gamma c \to 1 + \gamma$，分母膨胀</td><td>draft 自身的串行成本抵消了 target 节省</td></tr>
+<tr><td>高负载批处理</td><td>「空闲算力」消失，验证位置挤占他人算力</td><td>单流公式 $S$ 不再适用，需看吞吐模型</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>第三种是工程中最隐蔽的退化。vLLM 在高查询率批处理下实测出现 1.4×-1.8× 减速——同一硬件、低负载时加速、高负载时减速，差别只在于「空闲算力」是否存在。这说明投机解码是<strong>用空闲算力换延迟</strong>的策略，不是无条件加速。</p>
+
+<p>草稿长度 $\gamma$ 也不是越大越好。增大 $\gamma$ 在分子上多加一项 $\alpha^{\gamma+1}$ 的衰减（边际收益递减），在分母上线性增加 $\gamma c$（成本线性增长）。$\alpha$ 越低、$c$ 越大，最优 $\gamma$ 越小。例如 $\alpha = 0.8, c = 0.05$ 时，把 $S = (1 - \alpha^{\gamma+1}) / [(1-\alpha)(1 + \gamma c)]$ 代入枚举 $\gamma = 5,6,7,8,9,10$ 可得 $S \approx 2.95, 3.04, 3.08, 3.09, 3.08, 3.05$，最优 $\gamma \approx 8$；$\alpha = 0.5$ 时最优 $\gamma$ 显著更小。「猜得更远」不等于「猜得更好」。（最优 $\gamma$ 的选择见 Leviathan et al. 2023 §3.5。）</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 $\mathbb{E}[L]$ 与 $S$ 的公式，并解释每个符号（$\alpha, \gamma, c$）。</li>
+  <li>给定 $\alpha=0.7, \gamma=4, c=0.1$，手算 $S$。</li>
+  <li>说出三种使 $S < 1$ 或减速的条件，并指出哪种与单流公式无关。</li>
+  <li>说出 $\gamma$ 是否越大越好、为什么。</li>
+</ul>
+
+<p>现在我们知道何时加速、何时不加速——但所有这些数字都假设「接受率 $\alpha$ 是个已知量」。最后一章把整条机制跑一遍，让抽象的 $\alpha$、$p$、$q$ 落到具体数字上。</p>
+
+<h2 id="worked-example">把机制跑一遍——3 个 token 的手算例子</h2>
+
+<p>教学示例。 这是一个为了手算构造的最小例子，不代表真实模型或工程推荐值。词表缩到 3 个 token $V = \{A, B, C\}$，草稿长度 $\gamma = 3$，前缀固定（省略条件记号）。</p>
+
+<p><strong>设定</strong>。draft 模型自回归采样 3 个 token，每步分布与采样结果如下：</p>
+
+<ul>
+  <li>$q_1 = (0.5, 0.3, 0.2)$，采样 $x_1 = A$</li>
+  <li>$q_2 = (0.4, 0.4, 0.2)$（给定 $A$），采样 $x_2 = B$</li>
+  <li>$q_3 = (0.2, 0.3, 0.5)$（给定 $A, B$），采样 $x_3 = C$</li>
+</ul>
+
+<p>target 模型对前缀 + $[A, B, C]$ 做一次前向，得到 4 个位置的分布（最后一个是 bonus 位置）：</p>
+
+<ul>
+  <li>$p_1 = (0.4, 0.4, 0.2)$</li>
+  <li>$p_2 = (0.3, 0.5, 0.2)$</li>
+  <li>$p_3 = (0.4, 0.4, 0.2)$</li>
+  <li>$p_4 = (0.5, 0.3, 0.2)$（bonus 位置）</li>
+</ul>
+
+<p><strong>逐位验证</strong>。把三个位置上的 $q_i, p_i, x_i$、比值 $p_i(x_i)/q_i(x_i)$、接受概率 $a_i$ 汇总：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>位置</th><th>draft token</th><th>$q_i(x_i)$</th><th>$p_i(x_i)$</th><th>$p_i(x_i)/q_i(x_i)$</th><th>接受概率 $a_i$</th><th>判定</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>$A$</td><td>$0.5$</td><td>$0.4$</td><td>$0.8$</td><td>$0.8$</td><td>概率接受（假设接受）</td></tr>
+<tr><td>2</td><td>$B$</td><td>$0.4$</td><td>$0.5$</td><td>$1.25$</td><td>$1.0$</td><td>必接受</td></tr>
+<tr><td>3</td><td>$C$</td><td>$0.5$</td><td>$0.2$</td><td>$0.4$</td><td>$0.4$</td><td>概率接受（假设拒绝）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>本例展示一条具体采样路径：pos 1 接受、pos 2 必接受、pos 3 拒绝。注意「假设接受」「假设拒绝」标明这是这条路径上的随机结果，不是期望——同一设定换一次随机数会得到不同路径。</p>
+
+<p><strong>残差重采样（pos 3）</strong>。在首个拒绝处 $i^\* = 3$，丢弃 $x_3 = C$ 及其后的 draft token（本例无后续），从残差分布重采样：</p>
+
+<p>$$\max(0, p_3 - q_3) = \big(\max(0, 0.4-0.2),\ \max(0, 0.4-0.3),\ \max(0, 0.2-0.5)\big) = (0.2, 0.1, 0).$$</p>
+
+<p>归一化常数 $Z = 0.2 + 0.1 + 0 = 0.3$，残差分布</p>
+
+<p>$$p'_3 = (0.2/0.3,\ 0.1/0.3,\ 0) = (2/3,\ 1/3,\ 0).$$</p>
+
+<p>从 $p'_3$ 采样——假设采到 $A$（概率 $2/3$）。本轮产出 $[A, B, A]$ 共 3 个 token。无 bonus，因为 pos 3 被拒后停止验证。</p>
+
+<p><strong>对照单位置证明（第 3 章）</strong>。在 pos 1 上验证 $\Pr[\text{emit } A] = p_1(A) = 0.4$：</p>
+
+<p>路径 A：$\min(q_1(A), p_1(A)) = \min(0.5, 0.4) = 0.4$。</p>
+
+<p>路径 B：$\max(0, p_1(A) - q_1(A)) = \max(0, 0.4 - 0.5) = 0$。</p>
+
+<p>总和：$0.4 + 0 = 0.4 = p_1(A)$ ✓。pos 1 上 $p_1 < q_1$，残差项为 0，全部概率走路径 A——这恰好因为 $p_1(A) < q_1(A)$ 时接受概率 $a = 0.8 < 1$，被「扣下」的部分由残差在别处补回，对 $A$ 本身而言是 0。</p>
+
+<details>
+<summary>完整手算：贯穿例子三个位置的全部接受/拒绝/残差计算</summary>
+<p>教学示例。 上面正文只展示了主路径（pos 1 接受、pos 2 必接受、pos 3 拒绝重采样到 $A$）。这里把三个位置的全部计算展开，便于逐行复算。</p>
+<p><strong>pos 1（draft $A$，本路径接受）</strong>：</p>
+<ul>
+<li>$q_1 = (0.5, 0.3, 0.2)$，$p_1 = (0.4, 0.4, 0.2)$</li>
+<li>$a_1(A) = \min(1, 0.4/0.5) = 0.8$（概率接受）</li>
+<li>路径 A 概率：$\min(q_1(A), p_1(A)) = \min(0.5, 0.4) = 0.4$</li>
+<li>路径 B 概率：$\max(0, 0.4 - 0.5) = 0$</li>
+<li>验证：$\Pr[\text{emit } A] = 0.4 + 0 = 0.4 = p_1(A)$ ✓</li>
+<li>同理 $\Pr[\text{emit } B] = \min(0.3, 0.4) + \max(0, 0.4-0.3) = 0.3 + 0.1 = 0.4 = p_1(B)$ ✓</li>
+<li>同理 $\Pr[\text{emit } C] = \min(0.2, 0.2) + \max(0, 0.2-0.2) = 0.2 + 0 = 0.2 = p_1(C)$ ✓</li>
+<li>pos 1 单位置接受率：$\alpha_1 = 0.4 + 0.3 + 0.2 = 0.9$</li>
+</ul>
+<p><strong>pos 2（draft $B$，必接受）</strong>：</p>
+<ul>
+<li>$q_2 = (0.4, 0.4, 0.2)$，$p_2 = (0.3, 0.5, 0.2)$</li>
+<li>$a_2(B) = \min(1, 0.5/0.4) = \min(1, 1.25) = 1.0$（必接受）</li>
+<li>路径 A 概率：$\min(q_2(B), p_2(B)) = \min(0.4, 0.5) = 0.4$</li>
+<li>路径 B 概率：$\max(0, 0.5 - 0.4) = 0.1$</li>
+<li>验证：$\Pr[\text{emit } B] = 0.4 + 0.1 = 0.5 = p_2(B)$ ✓</li>
+<li>pos 2 单位置接受率：$\alpha_2 = \min(0.3,0.4)+\min(0.4,0.5)+\min(0.2,0.2) = 0.3+0.4+0.2 = 0.9$</li>
+</ul>
+<p><strong>pos 3（draft $C$，本路径拒绝，重采样到 $A$）</strong>：</p>
+<ul>
+<li>$q_3 = (0.2, 0.3, 0.5)$，$p_3 = (0.4, 0.4, 0.2)$</li>
+<li>$a_3(C) = \min(1, 0.2/0.5) = 0.4$（概率接受，本路径拒绝）</li>
+<li>残差：$\max(0, p_3 - q_3) = (0.2, 0.1, 0)$，$Z = 0.3$，$p'_3 = (2/3, 1/3, 0)$</li>
+<li>路径 A 概率（对 $C$）：$\min(q_3(C), p_3(C)) = \min(0.5, 0.2) = 0.2$</li>
+<li>路径 B 概率（对 $C$）：$\max(0, 0.2 - 0.5) = 0$（$C$ 在残差中概率为 0，因为 $p_3(C) < q_3(C)$）</li>
+<li>验证：$\Pr[\text{emit } C] = 0.2 + 0 = 0.2 = p_3(C)$ ✓</li>
+<li>同理 $\Pr[\text{emit } A] = \min(0.2, 0.4) + \max(0, 0.4-0.2) = 0.2 + 0.2 = 0.4 = p_3(A)$ ✓</li>
+<li>同理 $\Pr[\text{emit } B] = \min(0.3, 0.4) + \max(0, 0.4-0.3) = 0.3 + 0.1 = 0.4 = p_3(B)$ ✓</li>
+<li>pos 3 单位置接受率：$\alpha_3 = 0.2 + 0.3 + 0.2 = 0.7$</li>
+</ul>
+<p><strong>对照期望产出（第 4 章）</strong>。三个位置的接受率 $(0.9, 0.9, 0.7)$，平均 $\bar{\alpha} = (0.9 + 0.9 + 0.7) / 3 = 2.5 / 3 \approx 0.833$。代入 $\mathbb{E}[L] = (1 - 0.833^4) / (1 - 0.833) \approx (1 - 0.481) / 0.167 \approx 3.11$ 个 token / 轮。本路径产出 3 个 token，与期望 $\approx 3.11$ 一致（具体路径可高于或低于期望）。若假设 pos 3 也接受，本轮会产出 4 个 token（含 bonus），高于期望——这与「期望」是平均值、单次可偏离一致。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定上面 3 个 $p_i$ 与 $q_i$，逐位算出 $a_i$。</li>
+  <li>在 pos 3 上手算残差分布的归一化。</li>
+  <li>在 pos 1 上验证单位置输出分布等于 $p_1$。</li>
+  <li>说出本例若 pos 3 也接受、产出会是几个 token（答案：4 个，含 bonus）。</li>
+</ul>
+
+<p>贯穿例子把机制、证明、加速比公式串通——最后一章把工程实例（K3 与 EAGLE-3）和论文实测做个交代，并说明本页的边界。</p>
+
+<h2 id="engineering-and-boundaries">工程实例与边界</h2>
+
+<p>K3 用 EAGLE-3 作为 draft 模型加速推理——EAGLE-3 是一种具体的 draft 架构，本页只引用其作为工程实例，不展开它的内部机制。EAGLE-3 与投机解码的完整概念页待生成，此处为占位（链接路径预留 <code>../../wiki/eagle-speculative/index.html</code>）。</p>
+
+<p>两篇奠基论文的实测结果：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>论文</th><th>target 模型</th><th>部署</th><th>实测加速</th><th>质量</th></tr></thead>
+<tbody>
+<tr><td>Leviathan et al. 2023 (arXiv:2211.17192, ICML 2023 Oral)</td><td>T5-XXL (11B)</td><td>单机</td><td>2×-3×</td><td>输出与原实现 identical</td></tr>
+<tr><td>Chen et al. 2023 (arXiv:2302.01318)</td><td>Chinchilla 70B</td><td>分布式</td><td>2-2.5×</td><td>不修改模型、不降采样质量</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两者都强调「不修改模型、不重训练」——投机解码是 off-the-shelf 的推理时优化。两篇论文独立提出相同机制，是这一思路自然成立的标志。</p>
+
+<p>本页的边界总结：</p>
+
+<ul>
+  <li><strong>解决</strong>：单流自回归解码的延迟（wall-clock latency per token）。</li>
+  <li><strong>不解决</strong>：吞吐（throughput）——高并发批处理下可能反而降低总吞吐（vLLM 实测高查询率下 1.4×-1.8× 减速）。</li>
+  <li><strong>需要</strong>：target 与 draft 共享 tokenizer；draft 单步成本远小于 target（$c \ll 1$）；批处理规模足够小或专用低负载场景。</li>
+  <li><strong>不展开</strong>：draft 模型的训练/蒸馏方法；EAGLE/Medusa/Lookahead 等具体 draft 架构；分布式部署拓扑；vLLM/TGI 等框架的 API；与量化、剪枝的叠加效果（这些是正交技术，可叠加但不属于本页主题）。</li>
+</ul>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出两篇论文的实测对象与加速比。</li>
+  <li>说出 K3 用哪个 draft 模型、对应概念页状态（占位）。</li>
+  <li>说出至少两条「本页不展开」的内容，并各给一个不展开的理由。</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+
+<p>[C1] 两篇论文独立提出：Leviathan, Kalman, Matias. arXiv:2211.17192, 提交 2022-11-30，ICML 2023 Oral，命名 "Speculative Decoding"；Chen, Borgeaud, Irving, Lespiau, Sifre, Jumper. arXiv:2302.01318, 提交 2023-02-02，命名 "Speculative Sampling"。两者机制本质相同。来源：两篇 arXiv 摘要与提交历史。</p>
+
+<p>[C2] 单流解码是内存带宽受限：Leviathan et al. 2023 §1 引言对 "parallel scoring of short continuations" 成本的论证；Chen et al. 2023 摘要 "the latency of parallel scoring of short continuations ... is comparable to that of sampling a single token from the larger target model"。适用条件：batch size 小。</p>
+
+<p>[C3-C6] Draft-then-Verify 流程、接受规则、残差分布、bonus token：Leviathan et al. 2023 §3 算法描述与 Algorithm 1；Chen et al. 2023 §2 算法描述与 Eq.(2)。残差分布在 $p \leq q$ 处处成立时不被触发，此条件由 $\min(1, p/q) = 1$ 处处成立保证。</p>
+
+<p>[C7] 贪心退化为 argmax 匹配：Leviathan et al. 2023 §3 末尾对 greedy 的讨论；社区综述（howaiworks.ai）一致复述。</p>
+
+<h3>核心公式与来源</h3>
+
+<p>[F1] 接受概率 $a(x) = \min(1, p(x)/q(x))$：Leviathan et al. 2023 §3.1 Eq.(1)；Chen et al. 2023 §2.1。边界 $p \geq q \Rightarrow a=1$、$p < q \Rightarrow a=p/q$、$p=0 \Rightarrow a=0$。</p>
+
+<p>[F2] 残差分布 $p'(x) = \max(0, p(x)-q(x)) / \sum_{x'} \max(0, p(x')-q(x'))$：Leviathan et al. 2023 §3.2 Algorithm 1 step 5-6；Chen et al. 2023 §2.2 Eq.(2)。</p>
+
+<p>[F3] 单位置输出分布 $\Pr[\text{emit } x] = \min(q(x), p(x)) + \max(0, p(x)-q(x)) = p(x)$：Leviathan et al. 2023 §3.3 Theorem 2（精确性证明）；Chen et al. 2023 §2.3 同结果。推导链见正文与折叠块，每步可手算复算，核心恒等式为 $\min(a,b) + \max(0, b-a) = b$。</p>
+
+<p>[F4] $\alpha = \sum_x \min(p(x), q(x)) = 1 - \mathrm{TV}(p, q)$：$\alpha$ 定义见 Leviathan et al. 2023 §3；TV 关系由 $\min(a,b) = (a+b-|a-b|)/2$ 推出（推导在正文）。</p>
+
+<p>[F5] $\mathbb{E}[L] = (1 - \alpha^{\gamma+1})/(1 - \alpha)$：Leviathan et al. 2023 §3 Theorem 3.8。截断几何级数闭式；i.i.d. 接受率假设。边界 $\alpha=1 \Rightarrow \gamma+1$、$\alpha=0 \Rightarrow 1$。</p>
+
+<p>[F6] $S = (1 - \alpha^{\gamma+1}) / [(1-\alpha)(1 + \gamma c)]$：Leviathan et al. 2023 §3.3 速度分析；社区综述（howaiworks.ai、aistackinsights.ai）明确给出此式。推导：每轮成本 $\gamma c + 1$、产出 $\mathbb{E}[L]$，$S = \mathbb{E}[L] / (1 + \gamma c)$。</p>
+
+<h3>外部数字与实验条件</h3>
+
+<p>[N1] Leviathan et al. 2023 摘要：T5-XXL (11B) target，2×-3× 加速，输出与标准 T5X 实现完全相同（identical outputs）。来源：arXiv:2211.17192 摘要原文。</p>
+
+<p>[N2] Chen et al. 2023 摘要：Chinchilla 70B，分布式部署，2-2.5× 加速，"without compromising the sample quality or making modifications to the model itself"。来源：arXiv:2302.01318 摘要原文。</p>
+
+<p>[N3] Leviathan et al. 2023 §3 实验部分（社区综述 howaiworks.ai 引用原文给出）：T5-base (约 250M) draft 给 T5-XXL (11B) target 打草稿，平均接受率 $\alpha \approx 0.8$，单步成本比 $c \approx 0.05$。与 [N1] 的 2-3× 用 [F6] 复算一致（$\alpha=0.8, \gamma=5, c=0.05 \Rightarrow S \approx 2.95$）。</p>
+
+<p>[N4] vLLM 官方博客 2024-10（社区综述 howaiworks.ai 引用）：高查询率批处理下，Llama 3 70B on 4×H100，speculative decoding 出现 1.4×-1.8× 减速。用于支撑 M4 边界。</p>
+
+<h3>教学示例</h3>
+
+<p>本页的教学数字均为人为构造，目的是便于手算：</p>
+
+<ul>
+  <li>S1 的「70B 权重 140GB / HBM 3.35 TB/s / 42ms 理论下限」：教学计算，数字来自 [gpu-execution-model] 页面的 H100 规格（80GB HBM3 @ 3.35 TB/s）与 70B 模型 FP16 权重约 140GB（2 字节/参数 × 70B）的常规换算。42ms 是带宽下限，不是实测单步延迟。</li>
+  <li>S4 的 $\alpha=0.8, \gamma=5, c=0.05$ 手算：数字来自 [N3]（Leviathan 原文实验参数），用于复算 [N1] 的 2-3× 加速。</li>
+  <li>S4 的 $\alpha=0.2$ 反例：纯粹构造，用于展示 $\alpha$ 低时加速消失。固定 $\gamma=5, c=0.05$ 以与正例对照。</li>
+  <li>S5 的贯穿例子（3 token 词表、$q_i, p_i$ 取一位小数）：纯粹构造，目的是覆盖接受、必接受、拒绝、残差重采样四种情形且残差和为 0.3 易归一化。不代表真实模型分布。</li>
+  <li>词表 $V = \{A, B, C\}$ 与 $p_i, q_i$ 的具体数字：构造为使单位置证明可在每个 $x \in V$ 上手算验证。</li>
+</ul>
+
+<h3>教学解释与类比边界</h3>
+
+<p>S1 的「开车去仓库取货」类比：只解释「读权重」与「算位置」的时间量级差异——开车时间固定、取一件和取 $\gamma+1$ 件开车时间相同。失效边界：不覆盖批量推理下的吞吐竞争（高并发时多个请求抢同一份带宽）；不覆盖流水线并行下的气泡问题；不覆盖 KV cache 读写开销。正式判断以单流带宽分析与第 4 章加速比公式为准。</p>
+
+<p>S2 的「target 觉得 draft 高估了就倾向于拒绝」直觉：只帮助理解接受概率 $\min(1, p/q)$ 的方向性。失效边界：不构成保分布的证明（证明在 S3）；不覆盖 $p < q$ 但仍被接受的随机性（概率接受不等于必拒绝）。</p>
+
+<h3>教学简化及其限制</h3>
+
+<ul>
+  <li>i.i.d. 接受率假设（[F5]、[F6]）：实际各位置接受率取决于具体前缀，并非独立同分布。Leviathan et al. 2023 明确这是近似；不影响公式作为期望的近似刻画。可推出：期望 token 数与加速比的近似值。不可推出：单次采样的确切 token 数。</li>
+  <li>词表缩小到 3 个 token（S5）：真实模型词表 3-30 万 token，无法手算；本简化是为了展示机制，不改变接受/拒绝规则的数学形式。可推出：规则在 3-token 词表上的行为。不可推出：真实大词表下的接受率（$\alpha$ 需要在真实分布上测量）。</li>
+  <li>概率取一位小数（S5）：为了手算方便；真实模型输出多位有效数字。不影响残差归一化的数学过程。</li>
+  <li>「单次前向传播给 $\gamma+1$ 个位置打分墙钟时间几乎相同」（S1）：在 batch size 1、低负载下成立；高负载批处理下不成立（[N4]）。本简化帮助理解硬件前提，但不构成所有场景的加速保证。</li>
+  <li>未展开 KV cache 的实现细节：假设其已存在。KV cache 是自回归解码的标准优化，与投机解码正交；不展开不影响对投机解码机制的理解。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

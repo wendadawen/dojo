@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlashKDA 与 KDA Context Parallelism：让 KDA 的串行状态在 GPU 上高效跑起来</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">FlashKDA 与 KDA Context Parallelism</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">FlashKDA 与 KDA Context Parallelism：让 KDA 的串行状态在 GPU 上高效跑起来</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="context-box">
+  <p class="context-box-title">本页所处的位置</p>
+  <div class="context-grid">
+    <div class="context-label">所属模型</div><div class="context-value">Kimi K3（69 层 KDA + 24 层 Gated MLA）</div>
+    <div class="context-label">机制定位</div><div class="context-value">KDA 递归状态的 GPU/分布式执行方案</div>
+    <div class="context-label">解决的问题</div><div class="context-value">KDA 串行状态更新与 GPU 并行偏好的冲突</div>
+    <div class="context-label">覆盖的四个 regime</div><div class="context-value">训练/prefill · 长 prefill 设备内 · 跨设备 · 投机解码</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>KDA 的串行状态更新为什么与 GPU 并行偏好冲突，为什么这个冲突在不同执行 regime 表现成不同瓶颈？</li>
+    <li>FlashKDA 如何把 intra-chunk 计算与 cross-chunk 状态传播重叠起来？</li>
+    <li>设备内 context parallelism 如何在单 rank 上并行一条长序列，且不产生跨设备通信？</li>
+    <li>KCP 为什么不能像 vanilla 线性注意力那样直接求和本地状态，它的 $M+\tilde S$ 分解如何让通信量与序列长度无关？</li>
+    <li>KDA 解码如何处理投机解码拒绝 draft token 时的状态回滚，又不让状态流量爆炸？</li>
+  </ul>
+</section>
+
+<section class="misconceptions">
+  <h2>最容易误解</h2>
+  <ul>
+    <li>"FlashKDA 就是把 chunkwise 形式实现一遍" —— chunkwise 形式 chunk 内并行、chunk 间串行，朴素实现两者交替会让 SM 在传播时空转；FlashKDA 的关键是把 intra-chunk 计算与 cross-chunk 状态传播<strong>重叠</strong>，不是简单实现。</li>
+    <li>"设备内 CP 和 KCP 是同一回事，都是跨设备" —— 设备内 CP 完全在单 rank 的 SMs 上切序列、无跨设备通信；KCP 是跨 device rank、需要一次 all-gather。</li>
+    <li>"KCP 只是把线性注意力的 CP 搬到 KDA" —— vanilla 线性注意力递归是纯加性，各 rank 本地状态可直接求和；KDA 的 delta rule 有 token-dependent $M_t$ 作用于入状态，本地段效果依赖入状态，不能直接求和——必须分解成 $M+\tilde S$。</li>
+    <li>"KDA 解码的回滚就是存状态快照" —— 状态快照能支持回滚但流量在大 batch 下占主导；方案是缓存更小的投影输入、片上重建。</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Kimi K3 Technical Report §5.1.1（FlashKDA、设备内 CP）、§5.1.2（KCP，Eq.17）、§5.4.2（KDA 解码 kernel）。KDA 递归公式 Eq.1 见 §2.1.1，完整机制见 <a href="../../wiki/kda/index.html">KDA 概念页</a>。</p>
+</blockquote>
+
+<h2 id="serial-vs-parallel">串行状态 vs GPU 并行——为什么 KDA 在四个 regime 瓶颈不同</h2>
+
+<p>KDA 把 softmax 注意力随序列长度增长的 KV cache 压成了一个<strong>固定大小的递归状态</strong> $S_t \in \mathbb{R}^{d_k \times d_v}$（K3 config.json 中 $d_k=d_v=128$，约 32KB）。省了显存，但代价是状态必须一步一步串行更新。K3 报告 §2.1.1 的 Eq.1<sup>[F1]</sup>给出单步更新：</p>
+
+$$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t).$$
+
+<p>关键在右边：$S_t$ 依赖 $S_{t-1}$。要算第 $t$ 步的状态，必须先有第 $t-1$ 步的状态。这是一个<strong>串行依赖</strong>。KDA 的机制、$M_t$ 的含义、channel-wise forget gate 的作用由 <a href="../../wiki/kda/index.html">KDA 概念页</a>完整讲解，本页只引用 Eq.1 与 $M_t$ 的结论。</p>
+
+<p>串行依赖和 GPU 的天性对立。一块 GPU（以 H100 为例）有 132 块 SM，每块 SM 内还有多个 warp 轮流占用计算单元——GPU 靠<strong>宽而均匀的并行</strong>隐藏延迟、撑满算力，详见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>。当一个计算必须一步步串行时，同一时刻只有少数 SM 在干活，其余的排队等状态。</p>
+
+<p>这个冲突不是抽象的——它在 KDA 的四个执行 regime 下表现成<strong>不同的瓶颈</strong>。K3 报告 §5.1.1 开门见山："The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime."<sup>[C1]</sup>所以 K3 为每个 regime 设计了专门的方案：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>执行 regime</th><th>串行依赖表现为</th><th>K3 的方案</th><th>本文章节</th></tr></thead>
+<tbody>
+<tr><td>训练 / prefill</td><td>chunkwise 形式里 intra-chunk 计算与 cross-chunk 状态传播交替，SM 在传播时空转</td><td>FlashKDA：重叠两阶段</td><td>S2</td></tr>
+<tr><td>长 prefill（纯 TP 部署）</td><td>每个 rank 只持少量 head，132 块 SM 大部分闲</td><td>设备内 CP：SM 级切序列</td><td>S3</td></tr>
+<tr><td>跨设备（序列超单卡）</td><td>线性注意力的"各 rank 求和"对 KDA 不成立</td><td>KCP：$M+\tilde S$ 分解 + prefix scan</td><td>S4</td></tr>
+<tr><td>解码（MTP 投机）</td><td>瓶颈从"利用并行"转为"管理原地更新的状态"</td><td>投影输入缓存 + 片上重建</td><td>S5</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>先看 chunkwise 形式（<a href="../../wiki/kda/index.html">KDA 页</a>已完整讲过）留下的空隙。chunkwise 把序列切成大小 $C$ 的 chunk：<strong>chunk 内并行 matmul</strong>（intra-chunk，所有位置同时算），<strong>chunk 间串行传 $S$</strong>（cross-chunk，$S[t]\to S[t+1]$）。朴素执行里这两阶段交替：</p>
+
+<pre class="diagram">朴素 chunkwise 的时间线（chunk 间有空隙）：
+
+  时间 ──►
+  chunk 1: [算 intra] [传 S→]            chunk 2: [算 intra] [传 S→]
+           ▲满载 SM    ▲少数 SM 推状态      ▲满载 SM    ▲少数 SM 推状态
+                       └── 空隙：多数 SM 闲                  └── 空隙
+
+  intra-chunk 计算和 cross-chunk 状态传播交替进行，传播时多数 SM 空转
+</pre>
+
+<p>这个空隙就是 S2 要解的第一个瓶颈。本章先建立"冲突根源 + 四 regime 定位"的框架，后续四章各解一个 regime。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用自己的话说出 KDA 串行状态与 GPU 并行偏好冲突的根源（用 Eq.1 的哪个符号回答）。</li>
+  <li>对照上表，指出四个 regime 各自的瓶颈定位。</li>
+  <li>说明 chunkwise 形式为何"比纯串行快但仍有空隙"——空隙出在哪两个阶段之间？</li>
+</ul>
+
+<p>四 regime 定位完。下面四章各解一个，顺序按 K3 报告 §5.1.1→§5.1.2→§5.4.2。S2 先解训练和 prefill。</p>
+
+<h2 id="flashkda">FlashKDA——把 chunk 内计算与 chunk 间状态传播重叠</h2>
+
+<p>上一章看到 chunkwise 形式里 intra-chunk 计算和 cross-chunk 状态传播交替、SM 在传播时空转。朴素实现的根源是：算 chunk $t$ 的 intra-chunk 时，cross-chunk 的 $S[t]\to S[t+1]$ 没法开始（要等 intra 算完才有 $S[t]$）；传 $S$ 时，intra 的 SM 又无事可做。两个阶段互相等待。</p>
+
+<p>FlashKDA<sup>[C2]</sup>是 K3 为此开发的 CUTLASS-based chunkwise kernel。它的核心动作是一个词：<strong>重叠</strong>。具体做法是把工作分解成两个独立调度的部分：</p>
+
+<ul>
+  <li><strong>token-parallel stages</strong>：chunk 内的 token 维度并行。一个 chunk 有 $C$ 个 token，intra-chunk 的位置-位置 attention 可以在 token 维度上铺开到多块 SM 同时算。</li>
+  <li><strong>head-parallel recurrence</strong>：chunk 间的 head 维度递归。KDA 有多个 head（K3 配置 96 个 head），不同 head 的状态递归<strong>互相独立</strong>——算 head $h$ 的 $S[t]\to S[t+1]$ 不需要等 head $h'$ 的 intra-chunk。</li>
+</ul>
+
+<p>各自独立调度后，chunk $t$ 的 intra-chunk 计算就能和 chunk $t-1 \to t$ 的状态传播<strong>同时</strong>进行：当 token-parallel 阶段在算 chunk $t$ 的 intra 时，head-parallel 阶段在传另一些 head 的状态。两阶段不再交替等待，而是流水线重叠。</p>
+
+<pre class="diagram">FlashKDA 的重叠时间线（对比 S1 的朴素版本）：
+
+  时间 ──►
+  head A: [算 intra t] [传 S] [算 intra t+1] [传 S]
+  head B:    [传 S] [算 intra t] [传 S] [算 intra t+1]
+  head C:       [传 S] [算 intra t] [传 S] [算 intra t+1]
+                 └── 两阶段重叠，SM 持续有活干 ──┘
+
+  token-parallel（chunk 内 token 维度）和 head-parallel（head 维度递归）独立调度
+  intra-chunk 计算与 cross-chunk 状态传播重叠，消除 S1 的空隙
+</pre>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>分解的部分</th><th>并行维度</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>token-parallel stages</td><td>chunk 内 token</td><td>算 intra-chunk 的位置-位置 attention</td></tr>
+<tr><td>head-parallel recurrence</td><td>head（96 个互相独立）</td><td>传 cross-chunk 状态 $S[t]\to S[t+1]$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>工程定位：FlashKDA 是 CUTLASS-based（NVIDIA 的高性能 kernel 模板库），同时服务<strong>训练和推理 prefill</strong>两个场景，并作为 <strong>flash-linear-attention</strong> 框架的一个后端自动分发——这意味着上层调用方不需要手写 dispatch，框架会自动选用 FlashKDA<sup>[C2]</sup>。CUTLASS 模板编程和 Tensor Core 的具体调度细节超出本页职责，<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面足够支撑这里的理解。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>朴素 chunkwise 实现里，SM 空转发生在哪个阶段（intra 还是 cross-chunk 的传播期）？</li>
+  <li>token-parallel 与 head-parallel 各自并行什么维度？为什么 head 之间可以独立递归？</li>
+  <li>说出 FlashKDA 服务的两个场景，以及它的后端宿主框架。</li>
+</ul>
+
+<p>FlashKDA 解决了 chunk 间的空隙。但如果序列长到一个 rank 的 head 都不够填满 SM 呢？S3 解设备内 CP。</p>
+
+<h2 id="intra-device-cp">设备内 context parallelism——单 rank 的 SM 级切序列</h2>
+
+<p>FlashKDA 让 chunk 内外重叠，但它仍然假设"序列在一个 rank 上跑完"。当 prefill 一条超长序列时，新的瓶颈出现：Tensor Parallelism（TP）的局限。</p>
+
+<p>TP 是把 attention 的不同 head 切到不同设备——设备 A 算 head 1–24，设备 B 算 head 25–48，以此类推。但 TP 切的是 head 维度，<strong>不缩短序列方向</strong>的递归步数。K3 报告 §5.1.1 原文："Tensor parallelism partitions heads across devices but never shortens the recurrence"<sup>[C3]</sup>。后果是：纯 TP 部署下 prefill 一条超长序列时，每个 rank 只持少量 head，132 块 SM 大部分闲着——递归还得一步步走，只是走的 head 少了。</p>
+
+<pre class="diagram">TP 切 head vs 设备内 CP 切序列（单 rank 内）：
+
+  纯 TP（head 切到多卡，序列不切）：
+    rank 0: head 1-24 ──► 序列 1→N 一步步走（只有 24 个 head，SM 大量空闲）
+    rank 1: head 25-48 ──► 序列 1→N 一步步走
+    递归步数没缩短，每 rank 的 SM 没填满
+
+  设备内 CP（序列切到单 rank 的多块 SM）：
+    rank 0 的 SM 0: 序列段 1     ┐
+    rank 0 的 SM 1: 序列段 2     │ 各 SM 并行算段转移
+    rank 0 的 SM 2: 序列段 3     │ 之后合并恢复每段入状态
+    ...                          ┘
+    序列方向被切短，SM 填满，且无跨设备通信
+</pre>
+
+<p>设备内 CP 能成立，靠的是一个<strong>关键观察</strong>：KDA 的状态转移 $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$ 是<strong>线性</strong>的——一段 token 的转移效果可以分解成"作用于入状态的部分"和"从零生成的部分"，<strong>独立于入状态预先算好</strong>，之后精确合并<sup>[C3]</sup>。这个性质是 S4 KCP 的前置，也是 S3 设备内 CP 的基础。具体怎么分解是 S4 的核心，这里先用结论：每段的 segment transition 可以独立计算。</p>
+
+<p>有了这个观察，<strong>SM 级 CP planner</strong>把序列切到单 rank 的多块 SM：每块 SM 算一段的 segment transition（独立于入状态），算完后合并恢复每段的<strong>精确初始状态</strong><sup>[C3]</sup>。关键区别在通信：</p>
+
+<ul>
+  <li>设备内 CP：完全在一个 rank 的 SMs 之间，<strong>无跨设备通信</strong>。SM 之间通过 shared memory / L2 协作，不走网络。</li>
+  <li>KCP（下一章）：跨 device rank，需要一次 all-gather。</li>
+</ul>
+
+<p>这个区别是 S3 和 S4 最容易混淆的点（见页首误解提示）。设备内 CP 解决的是"单 rank SM 没填满"，KCP 解决的是"序列超单卡"——两者层次不同。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>TP 切的是哪个维度？为什么它不缩短序列方向的递归？</li>
+  <li>"段转移可独立于入状态计算"依赖 KDA 递归的什么性质？（提示：看 Eq.1 里 $M_t$ 和加性项的关系）</li>
+  <li>设备内 CP 与 KCP 在通信上的根本区别是什么？</li>
+</ul>
+
+<p>S3 在单 rank 内切序列。如果序列长到一台设备装不下，要跨 device rank 呢？S4 解 KCP——这是本页技术含量最高的部分。</p>
+
+<h2 id="kcp">KCP——为什么不能直接求和，以及 M+S̃ 分解</h2>
+
+<p>跨设备时，最自然的想法是借鉴 vanilla 线性注意力的 context parallelism。但它对 KDA 不成立——这一章讲清楚为什么，以及 K3 的 KCP 怎么解决。</p>
+
+<h3 id="vanilla-la-cp">先看 vanilla 线性注意力为什么能直接求和</h3>
+
+<p><a href="../../wiki/linear-attention/index.html">线性注意力页</a>讲过，vanilla 线性注意力的因果递归是<strong>纯加性</strong>的<sup>[F3]</sup>：</p>
+
+$$s_i = s_{i-1} + \phi(k_i) v_i^\top.$$
+
+<p>注意右边<strong>没有</strong>任何矩阵作用于 $s_{i-1}$——新状态就是旧状态直接加一个外积。这意味着：如果把序列切成多段分给多个 rank，每个 rank 从 $s=0$ 起算本地段的累加，然后把前序 rank 的本地状态<strong>直接求和</strong>，就恢复了入状态<sup>[C4]</sup>。K3 报告 §5.1.2 原文："Prior context-parallel methods exploit the additive recurrence of vanilla linear attention by computing, on each rank, the state that the local tokens generate from S = 0 and summing these local states over the preceding ranks to recover the incoming state."</p>
+
+<pre class="diagram">vanilla 线性注意力的跨设备 CP（可直接求和）：
+
+  rank 0: s̃_0 = φ(k1)v1^T + φ(k2)v2^T   （从 s=0 起）
+  rank 1: s̃_1 = φ(k3)v3^T + φ(k4)v4^T   （从 s=0 起）
+  rank 2: s̃_2 = φ(k5)v5^T + φ(k6)v6^T   （从 s=0 起）
+
+  rank 2 的入状态 = s̃_0 + s̃_1  （直接求和前序 rank）
+  原因：递归纯加性，没有矩阵作用于入状态
+</pre>
+
+<h3 id="kda-cannot-sum">KDA 为什么不能：$M_t$ 作用于入状态</h3>
+
+<p>对比 KDA 的 Eq.1<sup>[F1]</sup>：</p>
+
+$$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t).$$
+
+<p>右边<strong>有</strong>一个 token-dependent 矩阵 $M_t$ 作用于入状态 $S_{t-1}$，然后才加写入 $\beta_t k_t v_t^\top$。这就是 delta rule 的"先擦后写"——先用 $M_t$ 擦除/衰减旧状态，再加新内容。<a href="../../wiki/kda/index.html">KDA 页</a>讲过这个几何，这里只用结论。</p>
+
+<p>后果：一段 token 对状态的效果<strong>依赖进入该段的状态</strong>。rank $i+1$ 从 $S=0$ 起算的本地状态 $\tilde S$，和它真正以 $S_T^{[i]}$ 为入状态算出的状态<strong>不一样</strong>——因为中间每步的 $M_t$ 作用于不同的 $S_{t-1}$。所以不能像 vanilla 线性注意力那样直接把各 rank 的 $\tilde S$ 求和<sup>[C4]</sup>。K3 报告原文："This direct summation, however, is insufficient for KDA. ... KDA's delta rule applies the token-dependent matrix $M_t$ to the incoming state before adding the current write. Consequently, the effect of a local sequence segment depends on the state entering that segment and cannot be determined from the state computed with S = 0 alone."</p>
+
+<h3 id="kcp-decomposition">KCP 的分解：累积转移 $M$ + 从零生成 $\tilde S$</h3>
+
+<p>KCP 的核心是把这个依赖<strong>显式分解</strong>出来<sup>[C4, F2]</sup>。考虑进入第 $(i+1)$ 个 context-parallel rank 的入状态 $S_T^{[i]}$，经 rank $i+1$ 内 $t$ 个本地 token 后的状态 $S_t^{[i+1]}$。K3 报告 Eq.17 给出：</p>
+
+$$\boxed{\,S_t^{[i+1]} = \tilde S_t^{[i+1]} + M_{t\leftarrow 1}^{[i+1]}\, S_T^{[i]},\,}$$
+
+<p>其中：</p>
+<ul>
+  <li>$M_{t\leftarrow 1}^{[i+1]} := \prod_{r\leftarrow 1}^{t} M_r \in \mathbb{R}^{d_k \times d_k}$ 是 rank $i+1$ 内前 $t$ 个本地 token 的 $M$ <strong>连乘</strong>（累积转移）。</li>
+  <li>$\tilde S_t^{[i+1]}$ 是同一个递归<strong>从 $S=0$ 起</strong>跑出的状态（从零生成）。</li>
+</ul>
+
+<p>两项的职责完全分开：$\tilde S$ 是"本地 token 自己生成的状态"，与入状态无关；$M_{t\leftarrow 1}$ 是"入状态要经过的累积变换"。关键是<strong>两项都可在入状态 $S_T^{[i]}$ 可用前本地算出</strong>——$\tilde S$ 从 0 起算，$M_{t\leftarrow 1}$ 是本地 token 的 $M$ 连乘，都不需要入状态<sup>[F2]</sup>。这就是各 rank 要交换的两个片段。</p>
+
+<p>把这个分解递推到所有 rank，$t=T_{i+1}$ 时离开 rank $i$ 的状态可以展开成所有前序 rank 的片段组合（Eq.17 的求和形式）：</p>
+
+$$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\leftarrow 1}^{[l]}\right) \tilde S_T^{[j]}.$$
+
+<p>每一项都是某个 rank 的本地片段（$\tilde S_T^{[j]}$）经过后续 rank 的累积转移（$M$ 连乘）传播过来。因为这些 rank 级更新<strong>满足结合律</strong>，入状态可以用 <strong>prefix scan</strong>（前缀扫描，一种并行算法）从 $S=0$ 起依次重组<sup>[C4]</sup>。</p>
+
+<h3 id="kcp-flow">一次 all-gather + prefix scan，通信量固定</h3>
+
+<p>整个 KCP 的流程是<sup>[C4]</sup>：</p>
+
+<ol>
+  <li>每个 rank 本地算自己的 $(M_{T\leftarrow 1}^{[i]},\, \tilde S_T^{[i]})$ 两个片段（在入状态可用前就能算）。</li>
+  <li><strong>一次 all-gather</strong>：所有 rank 把自己的两个片段广播给其他所有 rank。交换的是固定大小的状态（$S\in\mathbb{R}^{d_k\times d_v}$ 及同形状的 $M$）。</li>
+  <li>每个 rank 用收到的所有片段做 <strong>prefix scan</strong>：从 $S=0$ 起，按文档顺序依次应用 $S \leftarrow M_{T\leftarrow 1}^{[j]} S + \tilde S_T^{[j]}$，重组出本 rank 的入状态。</li>
+</ol>
+
+<pre class="diagram">KCP 的数据流（2 个 rank 示意）：
+
+  rank 1 本地算: (M累积_1, S̃_1) ──┐
+                                   │  一次 all-gather
+  rank 2 本地算: (M累积_2, S̃_2) ──┘  交换固定大小的状态片段
+
+  收到后 prefix scan（每个 rank 自己重组入状态）：
+    S_T^[0] = 0
+    S_T^[1] = S̃_1 + M累积_1 · S_T^[0] = S̃_1
+    S_T^[2] = S̃_2 + M累积_2 · S_T^[1]   ← rank 2 的入状态
+
+  通信量 = 固定大小的状态，与序列长度无关
+</pre>
+
+<p><strong>通信量固定</strong>是 KCP 相对 softmax CP 的核心优势。softmax 注意力的 context parallelism（如 Ring Attention）要交换随序列长度增长的 KV block——序列越长，通信越多<sup>[C4]</sup>。KCP 只 all-gather 固定大小的状态（config.json 中约 32KB），<strong>与序列长度无关</strong>，并达成线性计算扩展。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>方案</th><th>递归形式</th><th>本地段能否独立确定</th><th>跨设备通信量</th></tr></thead>
+<tbody>
+<tr><td>vanilla 线性注意力 CP</td><td>$s_i = s_{i-1} + \phi(k_i)v_i^\top$（纯加性）</td><td>能（直接求和）</td><td>固定（状态大小）</td></tr>
+<tr><td>KDA KCP</td><td>$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$（有 $M_t$）</td><td>不能（需 $M+\tilde S$ 分解）</td><td>固定（状态大小）</td></tr>
+<tr><td>softmax CP（Ring Attention）</td><td>—（KV cache 随长增长）</td><td>—</td><td>随序列长度增长</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="kcp-handcalc">手算验证：2 rank × 2 token 的 KDA 递归</h3>
+
+<p>教学示例。 取 $d_k=d_v=2$，教学构造 $\alpha=0.5$（标量，$\mathrm{Diag}(\alpha)=0.5I$）、$\beta=1$、单位向量 $k$。于是 $M_t = I - 0.5\,k_t k_t^\top$。序列 4 个 token 分给 2 个 rank，每 rank 2 个：</p>
+
+<ul>
+  <li>rank 1（token 1,2）：$k_1=(1,0), v_1=(1,2)$；$k_2=(0,1), v_2=(3,4)$。</li>
+  <li>rank 2（token 3,4）：$k_3=(1,0), v_3=(5,6)$；$k_4=(0,1), v_4=(7,8)$。</li>
+</ul>
+
+<p>对应的 $M$：$M_1=M_3=\begin{pmatrix}0.5&0\\0&1\end{pmatrix}$，$M_2=M_4=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}$。</p>
+
+<p><strong>顺序计算的 ground truth</strong>（从 $S_0=0$ 起一步步算）结果是 $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。下面用 KCP 分解重组，看能否得到同样的值。</p>
+
+<p>各 rank 本地算两个片段：</p>
+<ul>
+  <li>$M累积_1 = M_2 M_1 = \begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$；$\tilde S_1$ 从 $0$ 起算两步 $=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</li>
+  <li>$M累积_2 = M_4 M_3 = \begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$；$\tilde S_2$ 从 $0$ 起算两步 $=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。</li>
+</ul>
+
+<p>一次 all-gather 后，prefix scan 重组入状态：</p>
+
+<ul>
+  <li>$S_T^{[0]}=0$。</li>
+  <li>$S_T^{[1]}=\tilde S_1 + M累积_1\cdot 0=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</li>
+  <li>$S_T^{[2]}=\tilde S_2 + M累积_2\cdot S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+0.5I\cdot\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。</li>
+</ul>
+
+<p>$S_T^{[2]}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，与顺序计算的 $S_4$ <strong>完全一致</strong>。分解成立。</p>
+
+<details>
+<summary>完整手算：ground truth 4 步 + KCP 分解 3 步的逐矩阵代入</summary>
+<p><b>顺序计算 ground truth</b>（$S_0=0$）：</p>
+<p>$S_1 = M_1\cdot 0 + k_1 v_1^\top = 0 + \begin{pmatrix}1\\0\end{pmatrix}\begin{pmatrix}1&2\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}$。</p>
+<p>$S_2 = M_2 S_1 + k_2 v_2^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}1&2\\0&0\end{pmatrix} + \begin{pmatrix}0&0\\3&4\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</p>
+<p>$S_3 = M_3 S_2 + k_3 v_3^\top = \begin{pmatrix}0.5&0\\0&1\end{pmatrix}\begin{pmatrix}1&2\\3&4\end{pmatrix} + \begin{pmatrix}5&6\\0&0\end{pmatrix} = \begin{pmatrix}0.5&1\\3&4\end{pmatrix}+\begin{pmatrix}5&6\\0&0\end{pmatrix}=\begin{pmatrix}5.5&7\\3&4\end{pmatrix}$。</p>
+<p>$S_4 = M_4 S_3 + k_4 v_4^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}5.5&7\\3&4\end{pmatrix} + \begin{pmatrix}0&0\\7&8\end{pmatrix} = \begin{pmatrix}5.5&7\\1.5&2\end{pmatrix}+\begin{pmatrix}0&0\\7&8\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。</p>
+<p><b>KCP 分解的本地片段</b>：</p>
+<p>rank 1：$M累积_1=M_2 M_1=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}0.5&0\\0&1\end{pmatrix}=\begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$。$\tilde S_1$ 从 $0$ 起：第一步 $\tilde S_1^{(1)}=M_1\cdot 0+k_1 v_1^\top=\begin{pmatrix}1&2\\0&0\end{pmatrix}$；第二步 $\tilde S_1^{(2)}=M_2\tilde S_1^{(1)}+k_2 v_2^\top=\begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。故 $\tilde S_1=\begin{pmatrix}1&2\\3&4\end{pmatrix}$（与 $S_2$ 一致，因 $S_0=0$）。</p>
+<p>rank 2：$M累积_2=M_4 M_3=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}0.5&0\\0&1\end{pmatrix}=\begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$。$\tilde S_2$ 从 $0$ 起：第一步 $\tilde S_2^{(1)}=M_3\cdot 0+k_3 v_3^\top=\begin{pmatrix}5&6\\0&0\end{pmatrix}$；第二步 $\tilde S_2^{(2)}=M_4\tilde S_2^{(1)}+k_4 v_4^\top=\begin{pmatrix}5&6\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\7&8\end{pmatrix}=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。故 $\tilde S_2=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。</p>
+<p><b>prefix scan 重组</b>：$S_T^{[0]}=0$；$S_T^{[1]}=\tilde S_1+M累积_1\cdot 0=\begin{pmatrix}1&2\\3&4\end{pmatrix}$；$S_T^{[2]}=\tilde S_2+M累积_2\cdot S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+0.5I\cdot\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+\begin{pmatrix}0.5&1\\1.5&2\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。与 $S_4$ 一致，分解成立。</p>
+<p><b>对照：若误用 vanilla 线性注意力的直接求和</b>（错误做法）：$S_T^{[2]}\stackrel{?}{=}\tilde S_2+\tilde S_1=\begin{pmatrix}5&6\\7&8\end{pmatrix}+\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}6&8\\10&12\end{pmatrix}\neq\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。直接求和会得到错误结果，因为漏掉了 $M累积_2$ 对入状态的衰减作用。这就是"direct summation is insufficient for KDA"的数值体现。</p>
+</details>
+
+<p>这个例子把 KCP 的两个关键点都展示了：$\tilde S$ 是本地从零算的状态片段，$M累积$ 是入状态要经过的衰减变换。两者分开计算、一次 all-gather 交换、prefix scan 重组，就能在不串行走完整序列的前提下恢复每段入状态。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>vanilla 线性注意力的递归（F3）和 KDA 的递归（F1）在"作用于入状态"上有什么本质区别？这个区别为什么让直接求和对 KDA 失效？</li>
+  <li>写出 KCP 分解的两项（$M累积$ 和 $\tilde S$）各自代表什么，为什么都可在入状态可用前本地算出？</li>
+  <li>说出 KCP 通信量为何与序列长度无关，并与 softmax CP 对比。</li>
+  <li>在手算例子中，若误用直接求和（$\tilde S_2+\tilde S_1$）会得到什么错误结果？正确做法多了哪一步？</li>
+</ul>
+
+<p>训练/prefill/跨设备都解了。最后是解码——S5 讲投机解码的状态回滚。</p>
+
+<h2 id="kda-decoding">KDA 解码——投影输入缓存与状态重建</h2>
+
+<p>前面三章的瓶颈都是"利用并行"。解码的瓶颈不一样：它是<strong>管理原地更新的状态</strong>。K3 报告 §5.4.2 原文："the primary bottleneck shifts from exploiting parallelism to efficiently managing the evolving recurrent state, which is updated in place at every decoding step."<sup>[C5]</sup></p>
+
+<p>解码每生成一个 token，就原地更新一次状态 $S$。这在普通自回归解码里没问题。但 K3 用 <strong>MTP（multi-token prediction）投机解码</strong>：一次猜测多个 draft token，然后验证接受或拒绝。最小解释 MTP 的词汇：draft token 是猜测的待验证 token；verify 是检查；accept 是通过验证保留；reject 是未通过丢弃；bonus token 是验证后额外生成的确认 token。</p>
+
+<p>问题出在拒绝。K3 报告原文："if verification rejects a subset of the drafted tokens, the state has already advanced beyond the last accepted token and cannot be trivially rolled back."<sup>[C5]</sup> 状态已经按全部 draft token 更新过去了，但部分 draft token 被拒绝——状态停在了一个"不该停"的位置，无法平凡回滚到最后接受 token。</p>
+
+<pre class="diagram">投机解码的状态回滚问题：
+
+  draft: [t1] [t2] [t3] [t4]      ← 一次猜 4 个 draft token
+  状态:  S→a  S→b  S→c  S→d       ← 状态已经按 4 个 token 一路更新到 S_d
+  verify:  ✓    ✗    ✓    ?        ← 验证：t2 被拒绝
+  需要:   状态回滚到 t1 之后（即 S→a 之后的位置），再继续
+
+  问题: 状态是原地更新的，已经推进到 S_d，没有"回到 S_a"的快照
+</pre>
+
+<h3 id="naive-snapshot">朴素方案与代价</h3>
+
+<p>最直接的回滚办法是<strong>为每个 draft 位置存一个状态快照</strong>——算完 $S_a$ 存一份，算完 $S_b$ 存一份，依此类推。拒绝时回到对应快照。但这有个致命代价：状态流量被乘上了 draft 长度<sup>[C5]</sup>。K3 报告原文："Maintaining a state snapshot for each draft position would enable rollback, but would also multiply state traffic — a cost that dominates at the large batch sizes typical of online serving." 在线服务的大 batch 下，这个流量占主导，不可接受。</p>
+
+<h3 id="projection-cache">投影输入缓存：更小的载荷</h3>
+
+<p>K3 的关键观察是：<strong>任意接受前缀后的状态，由 draft token 的投影输入完全决定</strong>，而投影输入比状态小得多<sup>[C5]</sup>。这里的"投影输入"指 draft token 经过 $W_{q/k/v/\beta/\alpha}$ 投影后的 $q,k,v,\beta,\alpha$——它们是 KDA 更新 Eq.1 的全部输入。KDA 更新是确定性的：给定相同输入序列，状态唯一。所以只要缓存了投影输入，就能在任何时候重新跑一遍递归，重建出任意接受前缀的状态。</p>
+
+<p>方案是<sup>[C5]</sup>：</p>
+<ol>
+  <li><strong>只缓存 draft token 的投影输入</strong>（不存状态快照）。投影输入比状态小——状态是 $d_k\times d_v$ 的矩阵，投影输入是几个 $d_k$ 维向量。</li>
+  <li>验证后，<strong>在片上（on-chip，SM 内）重建接受 token 的状态</strong>：用缓存的投影输入重跑 KDA 递归，从最后一个确定状态算到接受前缀的末尾。</li>
+  <li><strong>写回已验证 token 和 bonus token 的状态</strong>，继续后续解码。</li>
+</ol>
+
+<pre class="diagram">状态快照（大流量）vs 投影输入缓存（小流量）：
+
+  状态快照方案（朴素，流量大）：
+    draft: [t1] [t2] [t3] [t4]
+    快照:  S_a   S_b   S_c   S_d    ← 每个 draft 位置存一份状态（d_k×d_v 矩阵）
+    流量 = draft 长度 × 状态大小（大 batch 下占主导）
+
+  投影输入缓存（K3 方案，流量小）：
+    draft: [t1] [t2] [t3] [t4]
+    缓存:  proj proj proj proj      ← 只存投影输入（几个 d_k 维向量）
+    拒绝 t2 后: 用 proj 在片上重跑递归，重建 S_a（接受前缀的状态）
+    流量 = draft 长度 × 投影输入大小（远小于状态）
+</pre>
+
+<p>这个方案由 K3 与并发工作 <strong>ReplaySSM</strong> 独立提出<sup>[C5]</sup>。"replay"正是这个机制的名字——把接受的 token 的状态"重放"出来。重建在一个<strong>融合 kernel</strong>里完成，覆盖短卷积、输入归一化、门控、KDA 递归、输出归一化。K3 报告称验证延迟随验证 token 数<strong>亚线性</strong>增长，且低于状态缓存基线<sup>[C5]</sup>。</p>
+
+<h3 id="decode-payload">一个重要的工程后果：载荷不变</h3>
+
+<p>投影缓存<strong>不离开 decode 阶段</strong><sup>[C5]</sup>。这意味着前缀缓存和 prefill–decode 分离（PD 分离，把 prefill 和 decode 分到不同设备的部署方式）与非投机服务<strong>使用相同的载荷</strong>——K3 报告原文："Because the projection caches never leave the decode stage, prefix caching and prefill–decode disaggregation operate on the same payload as in non-speculative serving." 投机解码的回滚机制被完全封装在 decode kernel 内部，不污染上层服务架构。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>解码的瓶颈和训练/prefill 的瓶颈有何不同？用"利用并行"和"管理状态"回答。</li>
+  <li>状态快照方案为什么在大 batch 下不可接受？</li>
+  <li>投影输入比状态小在哪里（状态是 $d_k\times d_v$ 矩阵，投影输入是什么）？为什么缓存投影输入就能重建状态？</li>
+  <li>投影缓存不离开 decode 阶段，对前缀缓存和 PD 分离有什么意义？</li>
+</ul>
+
+<p>四 regime 解完。下面是来源与教学说明。</p>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p><sup>[C1]</sup> KDA 串行状态与 GPU 并行偏好冲突，四 regime 瓶颈不同：Kimi K3 Technical Report §5.1.1，原文 "The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime. We design a dedicated kernel for each regime."<br>
+<sup>[C2]</sup> FlashKDA 重叠 intra-chunk 计算与 cross-chunk 状态传播：K3 报告 §5.1.1，原文 "We therefore develop FlashKDA [14], a CUTLASS-based chunkwise kernel that overlaps intra-chunk computation with cross-chunk state propagation. The kernel decomposes the work into token-parallel stages and a head-parallel recurrence, each scheduled and tuned independently... FlashKDA serves both training and inference prefill and is auto-dispatched as a backend of flash-linear-attention [139]."<br>
+<sup>[C3]</sup> 设备内 CP 的段转移可独立于入状态计算、SM 级切序列、无跨设备通信：K3 报告 §5.1.1，原文 "Tensor parallelism partitions heads across devices but never shortens the recurrence... The key observation is that the state transition of each segment can be evaluated independently of the incoming state and composed exactly afterward. An automatic SM-level context-parallel (CP) planner... partitions the sequence across the SMs of a single rank, evaluates the segment transitions in parallel, and merges them to recover each segment's exact initial state. In contrast to the cross-device KCP of §5.1.2, this parallelism is entirely intra-device and incurs no cross-device communication."<br>
+<sup>[C4]</sup> KDA 的 $M_t$ 使直接求和失效，KCP 的 $M+\tilde S$ 分解 + prefix scan + 一次 all-gather + 固定通信量：K3 报告 §5.1.2，原文 "This direct summation, however, is insufficient for KDA. Recall from Eq. 1 that KDA updates its state as $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$, where $M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t)$. KDA's delta rule applies the token-dependent matrix $M_t$ to the incoming state before adding the current write. Consequently, the effect of a local sequence segment depends on the state entering that segment..." 与 "we introduce KDA Context Parallelism (KCP), which decomposes the effect of each segment into two locally computable quantities, a cumulative transition acting on the incoming state and a state generated locally from zero" 与 "KCP requires only a fixed-size all-gather for recurrent-state synchronization and achieves linear compute scaling."<br>
+<sup>[C5]</sup> 解码缓存投影输入而非状态，片上重建，与 ReplaySSM 并发提出，投影缓存不离开 decode 阶段：K3 报告 §5.4.2，原文 "the primary bottleneck shifts from exploiting parallelism to efficiently managing the evolving recurrent state, which is updated in place at every decoding step. This in-place update becomes problematic in MTP-based speculative decoding: if verification rejects a subset of the drafted tokens, the state has already advanced beyond the last accepted token and cannot be trivially rolled back. Maintaining a state snapshot for each draft position would enable rollback, but would also multiply state traffic... The state after any accepted draft prefix, however, is fully determined by the projected inputs of the draft tokens, which are far smaller than the state itself. We therefore cache only these projected inputs, rebuild the states of accepted tokens on-chip, and write back the states of the verified and bonus tokens, a design independently proposed in the concurrent work ReplaySSM [25]." 与 "Because the projection caches never leave the decode stage, prefix caching and prefill–decode disaggregation operate on the same payload as in non-speculative serving."</p>
+
+<h3>核心公式与来源</h3>
+<p><sup>[F1]</sup> KDA 单步递归（Eq.1）：K3 报告 §2.1.1 Eq.1；由 <a href="../../wiki/kda/index.html">KDA 概念页</a> [F1] 完整讲解。本页引用不重推。<br>
+<sup>[F2]</sup> KCP 段效果分解（Eq.17）：K3 报告 §5.1.2 Eq.17。第一项 $\tilde S$ 是本地从零生成，第二项 $M累积\cdot S_{入}$ 是入状态经各 rank 本地 $M$ 累积传播。展开的求和形式（$S_T^{[i]}=\tilde S_T^{[i]}+\sum_{j}(\prod_l M)\tilde S_T^{[j]}$）由 Eq.17 第二行给出，依赖 rank 级更新的结合律。<br>
+<sup>[F3]</sup> vanilla 线性注意力加性递归：K3 报告 §5.1.2 所述 "additive recurrence of vanilla linear attention"；由 <a href="../../wiki/linear-attention/index.html">线性注意力页</a>完整讲解。本页用于对照说明"为何可直接求和而 KDA 不可"。</p>
+
+<h3>教学示例</h3>
+<p>S4 的 2 rank × 2 token KDA 递归：$d_k=d_v=2$，教学构造 $\alpha=0.5$（标量，$\mathrm{Diag}(\alpha)=0.5I$）、$\beta=1$、单位向量 $k$。rank 1（token 1,2）：$k_1=(1,0),v_1=(1,2)$；$k_2=(0,1),v_2=(3,4)$。rank 2（token 3,4）：$k_3=(1,0),v_3=(5,6)$；$k_4=(0,1),v_4=(7,8)$。构造目的：让"不能直接求和"和"$M+\tilde S$ 分解"在 2×2 矩阵上手算可见，$M累积=0.5I$ 干净。不代表真实 K3 数值（K3 的 $\alpha$ 由 scaled sigmoid 产出、范围 $(e^{-5},1)$、$d_k=128$、96 head）。ground truth $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，KCP 分解重组后一致；误用直接求和得 $\begin{pmatrix}6&8\\10&12\end{pmatrix}$（错误）。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>(1) "KDA 串行状态与 GPU 并行偏好冲突"是机制解释，服务 S1。失效边界：冲突的前提是 KDA 用递归状态（$S_t$ 依赖 $S_{t-1}$）；若用 softmax 的 KV cache（无递归依赖），瓶颈形态完全不同。<br>
+(2) "FlashKDA 重叠两阶段"是工程解释，服务 S2。失效边界：重叠的前提是 chunkwise 形式成立（chunk 内并行、chunk 间递归）且 head 间递归独立；若递归本身不可分块或 head 间有依赖，重叠无从谈起。<br>
+(3) "段转移可独立于入状态计算"是机制解释，服务 S3/S4。失效边界：依赖 KDA 状态转移的线性性（$M_t$ 和加性项可分离）；若递归非线性使段转移不可分离，设备内 CP 和 KCP 的分解都不成立。<br>
+(4) "投影输入比状态小"是量级解释，服务 S5。失效边界：投影输入是 $q,k,v,\beta,\alpha$ 等几个 $d_k$ 维向量，状态是 $d_k\times d_v$ 矩阵；具体比例依赖模型配置，本页只陈述"小得多"的定性结论，不引入未经证实的精确比例数字。</p>
+
+<h3>教学简化及其限制</h3>
+<p>(1) <strong>手算例子的参数简化</strong>：取 $d_k=d_v=2$、$\alpha=0.5$ 标量、$\beta=1$、单位 $k$。简化目的：让 $M_t$ 和 $M累积$ 在 2×2 矩阵上手算可见。限制：K3 实际 $d_k=128$、$\alpha$ 由 scaled sigmoid 产出（范围 $(e^{-5},1)$，非 0.5 标量）、$k$ 经 L2Norm 单位化但非坐标轴向量、96 head。手算数值不代表真实 K3 数值。<br>
+(2) <strong>无伪代码与可运行代码</strong>：四套方案都是 kernel/系统级机制。伪代码会与图示重复（KCP 的 prefix scan 流程已用图示表达，解码的重建流程也已用图示表达）；可运行代码需要 CUTLASS/分布式框架（flash-linear-attention、NCCL），超出教学职责。手算例子已足够验证 KCP 分解。<br>
+(3) <strong>CUTLASS/TMA/warp specialization 细节未展开</strong>：本页只点名 FlashKDA 是 CUTLASS-based。具体的 tile 调度、warp 分工、TMA 异步搬运属 GPU 编程实现，<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面足够支撑理解"重叠"。<br>
+(4) <strong>MTP 投机解码的最小解释</strong>：本页只用到 draft/verify/accept/reject/bonus 五个词汇并最小解释，不展开 draft 模型、接受策略、bonus 生成的完整算法（属独立服务概念）。<br>
+(5) <strong>无外部性能数字</strong>：K3 报告 §5.1/§5.4.2 未给出可定位的加速比/带宽基准表，本页不引入未经证实的外部数字。"substantially outperforms the Triton reference implementation"（C2）与"verification latency grows sub-linearly"（C5）为报告原文的定性结论，本页只复述不数值化。</p>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

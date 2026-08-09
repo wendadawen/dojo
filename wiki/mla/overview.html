@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-head Latent Attention（MLA）· 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 注意力机制</span>
+      <h1>Multi-head Latent Attention（MLA）</h1>
+      <p class="lead">把每个 token 的 K/V 压成一个低维潜向量缓存，注意力时用学习到的上投影重建——大幅减少 KV cache，同时保留全局 token-to-token 注意力。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>这个概念是什么</h2>
+    <p>MLA 是 DeepSeek-V2（2024 年 5 月，arXiv:2405.04434）提出的注意力机制。标准多头注意力（MHA）为每个头独立产生一份 K 和 V，推理时要为每个 token 缓存 $2 n_h d_h$ 个数；MLA 把 K 和 V 压成一个 $d_c$ 维潜向量 $\mathbf{c}_t^{KV}$（$d_c \ll d_h n_h$），只缓存它，注意力计算时用学习到的上投影从 $\mathbf{c}_t^{KV}$ 重建 K/V。注意力结构本身没变——仍是 query 对所有前序 token 的 softmax 加权和。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><b>自回归推理的 KV cache 瓶颈</b>：MHA 下每 token 每层缓存 $2 n_h d_h$ 个数；DeepSeek-V2 是 128 头 × 128 维 × 60 层，128K 上下文下整个 KV cache 约 256 GB（BF16）。</li>
+      <li><b>已有方法各有代价</b>：<em>GQA/MQA 概念页（待生成）</em>通过共享 K/V 头减 cache，但 MQA 性能明显变弱；GQA 是 cache 与性能的折中，cache 仍按 $n_g d_h$ 计。</li>
+      <li><b>想保留全局注意力质量</b>：稀疏注意力、滑动窗口、<a href="../../wiki/linear-attention/index.html">线性注意力</a>族都改了注意力结构（少看 token 或换 kernel）；MLA 不改注意力连接图，只压缩存储。</li>
+      <li><b>压缩维度可以远小于头数 × 头维</b>：DeepSeek-V2 $d_c = 512$，而 $d_h n_h = 16384$，比值 1/32。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><b>压成潜向量、用时重建</b>：用一个下投影矩阵 $W^{DKV}$ 把 $\mathbf{h}_t$ 压成 $\mathbf{c}_t^{KV} \in \mathbb{R}^{d_c}$；用两个上投影 $W^{UK}, W^{UV}$ 把 $\mathbf{c}_t^{KV}$ 还原成 $\mathbf{k}_t^C, \mathbf{v}_t^C$。缓存的是 $\mathbf{c}_t^{KV}$，不是 K/V 本身。</li>
+      <li><b>推理时连重建都可省——矩阵吸收</b>：注意力的 $\mathbf{q}^\top \mathbf{k}_t^C = \mathbf{q}^\top W^{UK} \mathbf{c}_t^{KV} = (W^{UK\,\top} \mathbf{q})^\top \mathbf{c}_t^{KV}$，所以推理时把 $W^{UK}$ 吸进 $W^Q$、$W^{UV}$ 吸进 $W^O$，就直接用 $\mathbf{c}_t^{KV}$ 当 key/value，$\mathbf{k}_t^C, \mathbf{v}_t^C$ 在路径上不出现。</li>
+      <li><b>RoPE 不能直接作用在压缩后的 K 上</b>：<em>RoPE 概念页（待生成）</em>是位置敏感的旋转矩阵 $R_t$，每个 token 不同；若作用在 $\mathbf{k}_t^C = W^{UK} \mathbf{c}_t^{KV}$ 上会变成 $R_t W^{UK} \mathbf{c}_t^{KV}$，$R_t W^{UK}$ 无法合并成固定矩阵，破坏吸收。所以 MLA 把 RoPE 单独拆出一个共享 key $\mathbf{k}_t^R$ 承载位置信息，content 部分保持可吸收。</li>
+      <li><b>注意力公式仍是全局 softmax</b>：MLA 的注意力对全部前序 token 求 softmax 加权和，只是 K/V 由潜向量重建（且推理时连重建都省了）。压缩的是存储，不是注意力连接图。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><b>cache 公式</b>：MHA = $2 n_h d_h l$、GQA = $2 n_g d_h l$、MQA = $2 d_h l$、MLA = $(d_c + d_h^R) l$（$d_h^R$ 来自解耦 RoPE key $\mathbf{k}_t^R$）。DeepSeek-V2 数值下 MLA/MHA $\approx 1/57$（减少约 98.2%）。<b>成立条件</b>：$d_c \ll d_h n_h$，且 $W^{UK}/W^{UV}$ 在推理时可被吸收。</li>
+      <li><b>摘要 93.3% 的 baseline 是 DeepSeek 67B（GQA），不是同配置 MHA</b>。同配置 MHA 下 MLA 的减少约 98.2%。引用 93.3% 时必须明确 baseline。</li>
+      <li><b>MLA 不解决 $O(N^2)$ 算力</b>：注意力仍要对前序所有 token 算 q·k 内积，算力是 $O(N^2)$；MLA 只压缩存储。</li>
+      <li><b>MLA 不是 GQA 的极端形式</b>：GQA 共享 K/V 头但每个被缓存的 K/V 仍是完整 head 维度 $d_h$；MLA 不共享头，而是把所有头的 K/V 压成一个潜向量再重建——机制完全不同。</li>
+      <li><b>K3 的两处改动</b>：（a）对所有 MLA 层用 NoPE（不施加 RoPE），免去解耦 RoPE 与扩展上下文时的频率调整；（b）加 input-dependent full-rank output gate $\mathbf{y}_t = W^O[\mathrm{Sigmoid}(W^g \mathbf{x}_t) \odot \tilde{\mathbf{o}}_t]$，$W^g$ 满秩，让每个 token 调制从全局注意力读出的通道。对应 <code>config.json</code> 中 <code>mla_use_nope=true</code>、<code>mla_use_output_gate=true</code>。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>投机解码 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 推理加速</span>
+      <h1>投机解码（Speculative Decoding）</h1>
+      <p class="lead">用小 draft 模型快速猜若干个候选 token，大 target 模型一次性并行验证，按修改版拒绝采样接受匹配的、修正不匹配的，在不改变输出分布的前提下减少大模型的串行调用次数。</p>
+      <p class="meta">更新于 2026-08-09 · 主要依据：Leviathan et al. 2023 (arXiv:2211.17192) + Chen et al. 2023 (arXiv:2302.01318)</p>
+    </header>
+
+    <!-- 快速阅读正文：是什么、为什么需要它、核心直觉、关键结论与边界。5 分钟内可扫读，不展开公式推导与手算例子。 -->
+
+    <h2>这个概念是什么</h2>
+    <p>投机解码是一种 LLM 推理加速方法。它用两个模型协同：一个小的 draft 模型 $q$（快但可能不准）自回归地猜 $\gamma$ 个候选 token，一个大的 target 模型 $p$（慢但准，其分布 $p$ 是希望最终采样的目标）对这 $\gamma$ 个候选做<strong>一次</strong>前向传播并行验证。验证用修改版拒绝采样：每个候选 token 以概率 $\min(1, p/q)$ 接受，首个被拒绝处从残差分布重采样一个 token 并停止，全接受则免费多采一个 bonus token。这样一轮最多产出 $\gamma+1$ 个 token、最少产出 1 个，但只需 1 次大模型调用。</p>
+    <p>同一机制由两篇论文独立提出：Leviathan, Kalman, Matias（Google，ICML 2023 Oral，命名 "Speculative Decoding"）与 Chen, Borgeaud 等（DeepMind，命名 "Speculative Sampling"）。本文前置概念见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型</a>（带宽受限）与 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>（因果注意力一次前向出每位置分布）。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><strong>自回归解码串行慢</strong>：每生成 1 个 token 要串行调用 1 次大模型，生成 100 个 token 就要 100 次串行调用。</li>
+      <li><strong>单步解码是内存带宽受限，不是计算受限</strong>：每次调用要把全部权重从显存读一遍（如 70B 模型约 140GB），算术运算量相对很低、计算单元大量空闲。把权重读一遍之后，多用它算几个位置的乘积几乎不增加时间。</li>
+      <li><strong>「算 1 个 token」与「验证 $\gamma+1$ 个 token」墙钟时间几乎相同</strong>：Transformer 因果注意力让一次前向传播同时给出序列每个位置的分布。这意味着「核对 $\gamma$ 个候选」几乎免费——前提是有值得核对的候选。</li>
+      <li><strong>大模型生成中有很多「容易」的 token</strong>：括号闭合、常见搭配、复制 prompt 片段等接近确定性，小 draft 模型也能猜对。这些 token 让小模型猜、大模型核对，比让大模型逐个生成更划算。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>两阶段</strong>：Draft（小模型自回归猜 $\gamma$ 个 token）→ Verify（大模型一次前向并行打分）→ 接受/拒绝/重采样。</li>
+      <li><strong>接受规则</strong>：对每个候选 token $x$，接受概率是 $\min(1, p(x)/q(x))$。若 target 觉得它至少和 draft 一样可能（$p \geq q$）必接受；若 target 觉得 draft 高估了它（$p < q$）以比值 $p/q$ 概率接受。直觉是「target 比 draft 更看好就放心接受，否则按比例接受」。</li>
+      <li><strong>残差重采样</strong>：首个拒绝处丢弃候选及之后所有 draft，从残差分布 $\mathrm{norm}(\max(0, p-q))$ 重采样一个 token 并停止。残差把 target 比 draft「多给」的概率拿出来重分配。</li>
+      <li><strong>Bonus token</strong>：若 $\gamma$ 个全接受，target 同一次前向已经给出了第 $\gamma+1$ 个位置的分布，免费多采一个 token。</li>
+      <li><strong>从不比纯解码产出更少</strong>：最差情况是首个候选就被拒，仍从残差重采样出 1 个 token，与纯 target 解码相同——只是浪费了 draft 的工作。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>输出分布与纯 target 采样完全相同（无损）</strong>。这是投机解码区别于量化、剪枝、蒸馏等近似加速的核心。证明：单位置上 $\Pr[\text{emit } x] = \min(q(x), p(x)) + \max(0, p(x)-q(x)) = p(x)$，两条互斥路径（draft 采到且接受 / 拒绝后残差重采样）相加恰好等于 $p(x)$。draft 只影响速度，不影响可能的输出集合。<em>成立条件</em>：使用残差重采样（不是直接从 $p$ 重采样，那会破坏分布）；仅受硬件数值精度影响。</li>
+      <li><strong>实测加速 2-3×</strong>。Leviathan et al. 2023 在 T5-XXL (11B) 上 2×-3×（输出 identical）；Chen et al. 2023 在 Chinchilla 70B 分布式部署上 2-2.5×（不修改模型、不降质量）。K3 用 EAGLE-3 作为 draft 模型（EAGLE-3 概念页占位待生成）。<em>成立条件</em>：单流低负载、draft 单步成本远小于 target（$c \ll 1$）、target 与 draft 共享 tokenizer。</li>
+      <li><strong>接受率 $\alpha$ 是加速的核心杠杆</strong>。$\alpha = \sum_x \min(p(x), q(x)) = 1 - \mathrm{TV}(p,q)$（总变差距离），draft 越像 target、$\alpha$ 越高。$\alpha \approx 0.8, \gamma=5, c=0.05$ 时加速约 $2.95\times$；$\alpha$ 降到 0.2 时几乎不加速。</li>
+      <li><strong>不是无条件加速</strong>。高负载批处理下「空闲算力」消失，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力——vLLM 实测在高查询率下出现 1.4×-1.8× <strong>减速</strong>。投机解码是「用空闲算力换延迟」的策略，单流低负载下加速、高并发下可能减速。</li>
+    </ul>
+
+    <p>想看完整机制、公式推导与 3-token 手算例子，进入 <a href="index.html">深度教学</a>。</p>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>
