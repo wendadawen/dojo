@@ -45,7 +45,7 @@
     </header>
 
     <h2>是什么</h2>
-    <p>SigLIP（Sigmoid Loss for Language-Image Pre-training，Zhai et al. 2023）是一种视觉-语言对比预训练的损失函数。模型架构与 CLIP（Radford et al. 2021）完全相同（图像塔常用 [ViT](../../wiki/vit/index.html) + 文本塔常用 Transformer + 共享嵌入空间 + 可学习温度），只是把 CLIP 的 softmax 对比损失换成 sigmoid 二分类损失：对 batch 内所有 $|B|\times|B|$ 个 (image, text) 对独立计算 $\log\sigma(z_{ij}(t\,x_i\cdot y_j-b))$，其中 $z_{ij}=+1$ 表示配对、$-1$ 表示不配对，$t$ 是可学习温度、$b$ 是可学习 bias。CLIP 的 softmax 分母 $\sum_j e^{t\,x_i\cdot y_j}$ 被去掉——每个对的梯度不再依赖 batch 内其他对。</p>
+    <p>SigLIP（Sigmoid Loss for Language-Image Pre-training，Zhai et al. 2023）是一种视觉-语言对比预训练的损失函数。模型架构与 CLIP（Radford et al. 2021）完全相同（图像塔常用 [ViT](../../wiki/vit/index.html) + 文本塔常用 Transformer + 共享嵌入空间 + 可学习温度），只是把 CLIP 的 softmax 对比损失换成 sigmoid 二分类损失：对 batch 内所有 $|B|\times|B|$ 个 (image, text) 对独立计算 $\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$，其中 $z_{ij}=+1$ 表示配对、$-1$ 表示不配对，$t$ 是可学习温度、$b$ 是可学习 bias。CLIP 的 softmax 分母 $\sum_j e^{t\,x_i\cdot y_j}$ 被去掉——每个对的梯度不再依赖 batch 内其他对。</p>
 
     <h2>为什么需要它</h2>
     <ul>
@@ -58,9 +58,9 @@
     <h2>核心直觉</h2>
     <ul>
       <li><strong>每个对独立</strong>。CLIP 把每个图像看作"$|B|$ 选 1"多分类，正确文本应胜过其他所有；SigLIP 把每个 (image, text) 对看作独立的"配不配"二分类，不要求"胜过其他文本"。</li>
-      <li><strong>无分母耦合</strong>。CLIP 每个对的损失通过分母 $\sum_j$ 与所有 $y_j$ 耦合；SigLIP 每对 $\log\sigma(z_{ij}(t\,x_i\cdot y_j-b))$ 只依赖该对的 $x_i, y_j, z_{ij}, t, b$，独立求和。</li>
+      <li><strong>无分母耦合</strong>。CLIP 每个对的损失通过分母 $\sum_j$ 与所有 $y_j$ 耦合；SigLIP 每对 $\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$ 只依赖该对的 $x_i, y_j, z_{ij}, t, b$，独立求和。</li>
       <li><strong>batch 解耦</strong>。softmax 依赖 batch 内 hard negative 池；sigmoid 不依赖——小 batch 下仍能产生固定幅度的梯度，因此 SigLIP 在 batch &lt; 16k 时显著优于 softmax（论文 §4.2）。</li>
-      <li><strong>可学习 bias $b$ 是关键</strong>。batch 内正对仅 $|B|$ 个、负对 $|B|^2-|B|$ 个，比例 $1:(|B|-1)$；$|B|=32\text{k}$ 时 1:32767。若没有 $b$，初始 logits 偏向"大多数负对"使训练初期产生大量错误方向梯度。$b$ 初始化为 $-10$，让 $\sigma(-b)=\sigma(10)\approx 0.99995$，等价于"初始时假设任何对都偏向正类"，抵消该不平衡。</li>
+      <li><strong>可学习 bias $b$ 是关键</strong>。batch 内正对仅 $|B|$ 个、负对 $|B|^2-|B|$ 个，比例 $1:(|B|-1)$；$|B|=32\text{k}$ 时 1:32767。若没有 $b$，初始 logits 偏向"大多数负对"使训练初期产生大量错误方向梯度。$b$ 初始化为 $-10$，让 $\sigma(b)=\sigma(-10)\approx 0.0000454$，等价于"初始时预测偏向负类"（与数据先验一致），少数正对的大梯度抵消多数负对的数量优势。</li>
       <li><strong>分布式友好</strong>。每个对独立计算使 chunked 实现成为可能——batch 可切分到多设备，逐次 swap 文本嵌入并累加损失，避免 all-gather（论文 §3.3）。</li>
     </ul>
 
