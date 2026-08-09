@@ -1,0 +1,1257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Muon 优化器：对动量矩阵做正交化后再更新参数</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Muon 优化器</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Muon 优化器：对动量矩阵做正交化后再更新参数</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>训练 transformer 时，某个隐藏层权重矩阵的动量更新经 SVD 分解后发现：最大的几个奇异值方向拿走了更新的绝大部分"能量"，而很多奇异值很小的方向几乎不被更新。Muon 要解决的就是这个问题——让每一个奇异值方向都获得均等的更新尺度。</p>
+</div>
+
+<div class="context-box">
+  <p class="context-box-title">概念定位</p>
+  <div class="context-grid">
+    <div class="context-label">是什么</div><div class="context-value">对神经网络隐藏层二维权重矩阵的动量更新做 Newton-Schulz 正交化后再作为更新方向的优化器</div>
+    <div class="context-label">提出者</div><div class="context-value">Keller Jordan 等，2024 年</div>
+    <div class="context-label">适用对象</div><div class="context-value">隐藏层二维权重矩阵（线性层权重、卷积核展平后）</div>
+    <div class="context-label">不适用</div><div class="context-value">标量/向量参数、embedding 层、输出层（这些用 AdamW）</div>
+    <div class="context-label">前置概念</div><div class="context-value">Newton-Schulz 正交化（占位页，待生成）</div>
+    <div class="context-label">改进方向</div><div class="context-value"><a href="../per-head-muon/index.html">Per-Head Muon</a> 把正交化从整块投影改为逐头进行</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>Muon 每一步对动量更新矩阵做了什么，为什么这样能改善二维权重矩阵的更新？</li>
+    <li>Newton-Schulz 迭代如何把"正交化一个矩阵"变成只靠矩阵乘法就能逐步逼近的计算？</li>
+    <li>Muon 与 SGD-momentum、AdamW 在更新方向的几何结构上有什么关键区别？</li>
+    <li>Muon 适用哪些参数、不适用哪些参数，为什么 embedding 和输出层仍用 AdamW？</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客）；Moonshot AI《Muon is Scalable for LLM Training》（2025，RMS 对齐缩放因子）；PyTorch 2.12 <code>torch.optim.Muon</code> 官方实现。</p>
+</blockquote>
+
+<h2 id="why-orthogonalize">动量更新矩阵为什么需要正交化</h2>
+
+<p>先回顾带动的随机梯度下降（SGD-momentum）。它维护一个动量缓冲矩阵 $M_t$，每步把当前梯度 $G_t$ 累积进去：</p>
+
+<p>$$M_t = \beta\, M_{t-1} + G_t,\qquad M_0 = 0,$$</p>
+
+<p>其中 $\beta$ 是动量系数（控制历史梯度保留比例），$G_t = \nabla_W \mathcal{L}(W_t)$ 是当前步对权重矩阵 $W_t$ 计算的梯度。参数更新为 $W_{t+1} = W_t - \eta\, M_t$，$\eta$ 为学习率。这里的"动量"指的就是这个累积历史梯度的缓冲区 $M_t$。</p>
+
+<p>对二维矩阵 $M_t$ 做奇异值分解 $M_t = U S V^\top$：$U$、$V$ 是正交矩阵，$S$ 是对角矩阵，对角元素 $s_i$ 称为奇异值，衡量更新在各个奇异值方向上的"幅度"。（矩阵的 SVD 与奇异值是理解本文的前置知识，完整讲解见 <a href="../newton-schulz/index.html">Newton-Schulz 正交化</a>，该页面当前为占位页，待生成。）</p>
+
+<p>Keller Jordan 在主源博客中报告了一项经验观察：SGD-momentum 和 Adam 产生的二维参数更新矩阵<strong>通常条件数很高</strong>，近似低秩——所有神经元的更新被少数几个方向主导。条件数定义为最大奇异值与最小奇异值之比；条件数高意味着各方向更新幅度悬殊。</p>
+
+<div class="callout callout-yellow">
+<p><b>教学示例</b>。 假设某个隐藏层权重矩阵的动量更新 $M_t$ 经 SVD 后奇异值为 $(0.9,\ 0.1)$，即 $M_t$ 在两个奇异值方向上的更新幅度相差 9 倍（条件数 $0.9/0.1 = 9$）。大奇异值方向拿走了绝大部分更新能量，小奇异值方向几乎不被更新。这里的数字是为便于手算构造的教学数字，不代表真实训练数据。</p>
+</div>
+
+<p>直接用这样的 $M_t$ 更新参数，等于只优化了少数方向。作者推测，正交化能有效放大那些在更新中幅度很小但对学习重要的"稀有方向"，抑制过度主导的少数方向。</p>
+
+<p>正交化的数学目标是找到与 $M_t$ 最近的半正交矩阵：</p>
+
+<p>$$\operatorname{Ortho}(G) = \arg\min_O \{\|O - G\|_F : O^\top O = I \text{ 或 } OO^\top = I\}.$$</p>
+
+<p>设 $G = USV^\top$，则这个最近半正交矩阵就是 $UV^\top$——把所有奇异值全置 1、保留奇异向量方向。对上面的 $(0.9,\ 0.1)$，正交化目标是把奇异值拉平到接近 $(1,\ 1)$，使两个方向获得均等的更新尺度。$O^\top O = I$ 表示列正交（用于行数 $\ge$ 列数的矩阵），$OO^\top = I$ 表示行正交。</p>
+
+<p>但直接做 SVD 取 $UV^\top$ 太慢。下一章看 Newton-Schulz 迭代如何只用矩阵乘法逼近这个目标。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>用自己的话说"动量更新矩阵条件数高"意味着什么。</li>
+  <li>说明正交化目标 $\operatorname{Ortho}(G)$ 为什么等价于把奇异值全置 1。</li>
+  <li>计算奇异值为 $(0.9,\ 0.1)$ 的矩阵的条件数。</li>
+</ul>
+
+<h2 id="newton-schulz-iteration">Newton-Schulz 迭代如何近似正交化</h2>
+
+<p>Newton-Schulz（NS）迭代用矩阵乘法的多项式逼近正交化，单步公式为：</p>
+
+<p>$$G' = \left(aI + b(GG^\top) + c(GG^\top)^2\right) G = aG + b(GG^\top)G + c(GG^\top)^2 G.$$</p>
+
+<p>其中 $a,b,c$ 是给定系数。这一步只用到矩阵乘法（$GG^\top$、$(GG^\top)G$ 等）和线性组合，<strong>没有 SVD、没有求逆</strong>。这是它能在 GPU 上高效运行的关键。</p>
+
+<p>要理解它为什么能正交化，看 SVD 下的等价形式。设 $G = USV^\top$，代入单步公式：</p>
+
+<p>$$G' = U\left(aS + bS^3 + cS^5\right)V^\top = U\,\phi(S)\,V^\top,$$</p>
+
+<p>其中 $\phi(x) = ax + bx^3 + cx^5$ 是一个五次多项式。也就是说，<strong>对矩阵施加一步 NS 迭代，等价于对它的每个奇异值施加一次多项式 $\phi$</strong>。矩阵迭代在 SVD 下退化为对奇异值的标量迭代。</p>
+
+<details>
+<summary>推导：从 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$ 到 $U\phi(S)V^\top$</summary>
+<p>已知 $G = USV^\top$，则 $G^\top = VS^\top U^\top$（$S$ 对角故 $S^\top = S$）。计算：</p>
+<p>$$GG^\top = (USV^\top)(VSU^\top) = US^2U^\top,$$</p>
+<p>$(GG^\top)^2 = (US^2U^\top)(US^2U^\top) = US^4U^\top$。代入单步公式：</p>
+<p>$$G' = (aI + b\,US^2U^\top + c\,US^4U^\top)(USV^\top) = U(aI + bS^2 + cS^4)SV^\top = U(aS + bS^3 + cS^5)V^\top.$$</p>
+<p>最后一步用了 $S$ 对角因此与 $I$ 可交换、$S^2 \cdot S = S^3$ 等。结果就是对角矩阵 $aS + bS^3 + cS^5 = \phi(S)$，每个对角元素为 $\phi(s_i)$。</p>
+</details>
+
+<p>应用 $N$ 步 NS 迭代的输出为 $U\,\phi^N(S)\,V^\top$，其中 $\phi^N$ 表示对 $S$ 的对角元素重复施加 $\phi$ 共 $N$ 次。只要 $\phi$ 把区间 $[0,1]$ 上的点都映射到接近 1，多次迭代后所有奇异值就都被拉平。</p>
+
+<p>这里有一个前提：初始奇异值必须落在 $\phi$ 的收敛域内。NS 迭代前先做<strong>谱范数归一化预处理</strong>：</p>
+
+<p>$$X = \frac{G}{\|G\|_F + \varepsilon},\qquad \varepsilon = 10^{-7}.$$</p>
+
+<p>其中 $\|G\|_F$ 是 Frobenius 范数（矩阵所有元素平方和的平方根）。归一化后所有奇异值落在 $[0,1]$，因为最大奇异值不超过 $\|G\|_F$。这个缩放是良性的：正交化满足 $\operatorname{Ortho}(cG) = \operatorname{Ortho}(G)$（对任意非零常数 $c$），所以缩放不改变正交化结果。此外，若 $G$ 的行数大于列数（$m > n$），先对 $G$ 做转置再迭代，迭代完成后再转回来，使迭代始终在 $m \le n$ 的矩阵上运行以减少计算量。</p>
+
+<p>系数 $(a,b,c)$ 有两组常用取值。基线系数 $(a,b,c) = (2,\ -1.5,\ 0.5)$ 来自经典五阶 NS 格式，多次迭代后奇异值收敛到 1。调优系数 $(a,b,c) = (3.4445,\ -4.7750,\ 2.0315)$ 是 Muon 公开实现的默认值，调优原则有两条：让 $a$ 尽量大，因为 $\phi'(0) = a$ 控制小奇异值的初始增长速率；以及对所有 $x \in [0,1]$，允许 $\lim_{N\to\infty}\phi^N(x) \in [0.7,\ 1.3]$，即奇异值不必精确收敛到 1，误差约 0.3 即可不影响训练损失曲线。默认迭代步数 $T = 5$。</p>
+
+<div class="callout callout-purple">
+<p><b>调优系数的目标是"快速进入容忍区间"，不是"精确收敛到 1"</b>。调优系数的 $\phi'(0)=3.4445$ 大于基线的 $2$，使小奇异值第一步增长更快；但大系数也让接近 1 的奇异值产生振荡，最终在 $[0.7,\ 1.3]$ 区间内波动而非收敛到 1。这种"不精确"是设计选择——正交化的关键是把奇异值谱拉平，不是精确求解。</p>
+</div>
+
+<p>NS 迭代的另一个工程优势是<strong>可在 bfloat16 精度下稳定运行</strong>。对比之下，SVD 太慢，Shampoo 使用的 coupled Newton iteration 需要至少 float32 精度才能避免数值不稳定。NS 迭代只用矩阵乘法，而现代 GPU 有 bfloat16 专用张量核心，这使得它在工程上可行。</p>
+
+<h3 id="handcalc-example">手算例子：把 diag(0.9, 0.1) 拉平</h3>
+
+<p>用贯穿例子 $G = \operatorname{diag}(0.9,\ 0.1)$ 展示 NS 迭代。先做谱范数归一化：$\|G\|_F = \sqrt{0.9^2 + 0.1^2} = \sqrt{0.82} \approx 0.9055$，所以归一化后奇异值为 $(0.9939,\ 0.1104)$。</p>
+
+<p>用基线系数 $\phi(x) = 2x - 1.5x^3 + 0.5x^5$ 做第一步。对大奇异值 $s_1 = 0.9939$：</p>
+
+<p>$$\phi(0.9939) = 2(0.9939) - 1.5(0.9939)^3 + 0.5(0.9939)^5 \approx 1.0001.$$</p>
+
+<p>对小奇异值 $s_2 = 0.1104$：</p>
+
+<p>$$\phi(0.1104) = 2(0.1104) - 1.5(0.1104)^3 + 0.5(0.1104)^5 \approx 0.2189.$$</p>
+
+<p>第一步后奇异值从 $(0.9939,\ 0.1104)$ 变为 $(1.0001,\ 0.2189)$：大奇异值已逼近 1，小奇异值从 0.11 提升到 0.22。第二步对小奇异值再施加 $\phi$：$\phi(0.2189) \approx 0.4222$。完整 5 步后两个奇异值都逼近 1。</p>
+
+<details>
+<summary>完整 5 步手算过程（基线系数）</summary>
+<p>教学示例。 初始（谱归一化后）奇异值 $(0.9939,\ 0.1104)$，基线系数 $\phi(x)=2x-1.5x^3+0.5x^5$。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>步数</th><th>大奇异值 $s_1$</th><th>小奇异值 $s_2$</th></tr></thead>
+<tbody>
+<tr><td>初始</td><td>0.9939</td><td>0.1104</td></tr>
+<tr><td>第 1 步</td><td>1.0001</td><td>0.2189</td></tr>
+<tr><td>第 2 步</td><td>1.0000</td><td>0.4222</td></tr>
+<tr><td>第 3 步</td><td>1.0000</td><td>0.7383</td></tr>
+<tr><td>第 4 步</td><td>1.0000</td><td>0.9826</td></tr>
+<tr><td>第 5 步</td><td>1.0000</td><td>1.0001</td></tr>
+</tbody>
+</table>
+</div>
+<p>5 步后两个奇异值都逼近 1，正交化完成。注意每步小奇异值的提升：0.11 → 0.22 → 0.42 → 0.74 → 0.98 → 1.00，越接近 1 提升越快（多项式在 1 附近斜率较大）。</p>
+</details>
+
+<details>
+<summary>调优系数 vs 基线系数：第 1 步小奇异值对照</summary>
+<p>教学示例。 对同一个初始小奇异值 $s_2 = 0.1104$：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>系数</th><th>$\phi(x)$</th><th>第 1 步 $\phi(0.1104)$</th></tr></thead>
+<tbody>
+<tr><td>基线 $(2,\ -1.5,\ 0.5)$</td><td>$2x - 1.5x^3 + 0.5x^5$</td><td>0.2189</td></tr>
+<tr><td>调优 $(3.4445,\ -4.7750,\ 2.0315)$</td><td>$3.4445x - 4.7750x^3 + 2.0315x^5$</td><td>0.3740</td></tr>
+</tbody>
+</table>
+</div>
+<p>调优系数的第 1 步把小奇异值从 0.11 提升到 0.37，大于基线的 0.22——$\phi'(0)=3.4445$ 让小奇异值初始增长更快。但调优系数对接近 1 的奇异值会让它下降到 0.7 左右（振荡），5 步后在 $[0.7,\ 1.3]$ 区间内波动，不精确收敛到 1。这是设计选择：快速进入容忍区间而非精确求解。</p>
+</details>
+
+<details class="code-details">
+<summary>可运行代码：用 numpy 复现 diag(0.9, 0.1) 的 5 步 NS 迭代</summary>
+<div class="code-block">
+<pre><code class="language-python">import math
+import numpy as np
+
+def newtonschulz5(G, a, b, c, steps=5, eps=1e-7):
+    """对 2D 矩阵 G 做 steps 步 Newton-Schulz 迭代。"""
+    X = G.astype(np.float64) / (np.linalg.norm(G) + eps)
+    if G.shape[0] > G.shape[1]:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if G.shape[0] > G.shape[1]:
+        X = X.T
+    return X
+
+# 贯穿例子
+G = np.diag(np.array([0.9, 0.1]))
+fro = np.linalg.norm(G)
+print(f"||G||_F = {fro:.6f}")
+X = G / (fro + 1e-7)
+print(f"谱归一化后奇异值 = {np.round(np.linalg.svd(X, compute_uv=False), 4)}")
+
+# 基线系数
+O_base = newtonschulz5(G, 2.0, -1.5, 0.5)
+sv_base = np.linalg.svd(O_base, compute_uv=False)
+print(f"基线系数 5 步后奇异值 = {np.round(sv_base, 4)}")
+
+# 调优系数
+O_tuned = newtonschulz5(G, 3.4445, -4.7750, 2.0315)
+sv_tuned = np.linalg.svd(O_tuned, compute_uv=False)
+print(f"调优系数 5 步后奇异值 = {np.round(sv_tuned, 4)}")
+
+# 验证基线系数下 O 接近正交矩阵
+print(f"基线 O^T O =\n{np.round(O_base.T @ O_base, 4)} (应接近 I)")
+</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">||G||_F = 0.905539
+谱归一化后奇异值 = [0.9939 0.1104]
+基线系数 5 步后奇异值 = [1.0001 1.    ]
+调优系数 5 步后奇异值 = [0.7529 0.7034]
+基线 O^T O =
+[[1.     0.    ]
+ [0.     1.0003]] (应接近 I)
+</code></pre>
+</div>
+<p><b>验证的机制</b>：代码实现了正文中的谱范数归一化、单步 NS 迭代公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$ 以及 $m>n$ 时的转置处理，对应 S2 的全部机制。</p>
+<p><b>观察重点</b>：基线系数 5 步后奇异值收敛到 $(1.0001,\ 1.0)$，$O^\top O \approx I$，正交化完成；调优系数 5 步后奇异值在 $(0.7529,\ 0.7034)$，落在 $[0.7,\ 1.3]$ 容忍区间内但不收敛到 1。两者都达成"拉平奇异值"的目标，调优系数更快进入容忍区间但不精确。</p>
+<p><b>教学简化</b>：用 numpy 的 float64 计算，真实工程用 bfloat16 在 GPU 上运行；只展示 2×2 对角矩阵，真实训练中矩阵远大于此；未包含动量累积与参数更新，只展示正交化这一步（完整流程见下一章）。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 NS 单步迭代公式，说明它只用矩阵乘法。</li>
+  <li>解释为什么 SVD 下矩阵迭代等价于对奇异值施加多项式 $\phi$。</li>
+  <li>说明谱范数归一化的作用，以及为什么 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$ 使缩放是良性的。</li>
+  <li>用基线系数计算 $\phi(0.1104)$ 的值，与正文对照。</li>
+</ul>
+
+<h2 id="full-algorithm">Muon 的完整更新流程与几何含义</h2>
+
+<p>把动量与正交化组合起来，Muon 一步更新的完整流程为：</p>
+
+<ol>
+  <li>计算当前梯度 $G_t = \nabla_W \mathcal{L}(W_t)$。</li>
+  <li>用 Nesterov momentum 累积动量。先构造前瞻动量 $\tilde{M}_t = G_t + \beta\, M_{t-1}$，再更新 $M_t = \beta\, M_{t-1} + G_t$（$M_0 = 0$）。Muon 默认用 Nesterov 版本，因为实验显示它在所有测试中都略优于普通 SGD-momentum。<strong>动量在正交化之前加入</strong>。</li>
+  <li>对动量矩阵做谱范数归一化预处理 $X = \tilde{M}_t / (\|\tilde{M}_t\|_F + \varepsilon)$。</li>
+  <li>做 5 步 NS 迭代正交化，得到 $O_t \approx U V^\top$（奇异值接近 1）。</li>
+  <li>参数更新 $W_{t+1} = W_t - \eta\, O_t$。</li>
+</ol>
+
+<details class="code-details">
+<summary>伪代码：Muon 一步完整更新</summary>
+<p>以下是伪代码，不是 Python。它展示 Muon 对单个二维权重矩阵的一步更新。</p>
+<div class="code-block">
+<pre><code class="language-text">输入：权重矩阵 W_t，当前梯度 G_t，上一步动量 M_{t-1}，
+      动量系数 β，学习率 η，NS 系数 (a,b,c)，NS 步数 T=5，ε=1e-7
+状态：动量缓冲 M（初始为 0）
+
+# 第 1 步：Nesterov 前瞻动量
+M̃_t ← G_t + β · M_{t-1}        # 前瞻动量（用于正交化）
+M_t ← β · M_{t-1} + G_t        # 更新动量缓冲（供下一步使用）
+
+# 第 2 步：谱范数归一化
+X ← M̃_t / (‖M̃_t‖_F + ε)
+若 rows(X) > cols(X)：X ← Xᵀ   # 保证 m ≤ n
+
+# 第 3 步：T 步 Newton-Schulz 迭代
+重复 T 次：
+    A ← X · Xᵀ
+    B ← b·A + c·(A·A)
+    X ← a·X + B·X
+若之前做过转置：X ← Xᵀ         # 转回原形状
+O_t ← X                        # 正交化后的更新矩阵
+
+# 第 4 步：参数更新
+W_{t+1} ← W_t - η · O_t
+
+输出：更新后的 W_{t+1} 与动量 M_t
+</code></pre>
+</div>
+</details>
+
+<p>关键在于第 2 步与第 4 步的组合：<strong>动量在正交化之前加入</strong>。这不是任意选择——作者报告使用动量对最佳经验性能是必要的，且 Nesterov 版本略优。前瞻动量 $\tilde{M}_t$ 是被正交化的对象，最终的更新方向是 $O_t \approx UV^\top$ 而非原始动量 $M_t$。</p>
+
+<h3 id="geometry-comparison">与 SGD-momentum、AdamW 的几何区别</h3>
+
+<p>三者改变的是更新方向的几何结构，而非简单的学习率缩放：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>优化器</th><th>更新方向</th><th>各奇异值方向步长</th><th>几何结构</th></tr></thead>
+<tbody>
+<tr><td>SGD-momentum</td><td>$M_t$（动量矩阵）</td><td>正比于奇异值大小</td><td>大奇异值方向更新猛、小方向更新不足</td></tr>
+<tr><td>AdamW</td><td>逐坐标归一化的动量</td><td>按元素二阶矩缩放</td><td>不考虑矩阵整体方向结构</td></tr>
+<tr><td>Muon</td><td>$O_t \approx UV^\top$（正交化后）</td><td>各方向趋于均等（奇异值接近 1）</td><td>矩阵级正交化，方向间相对尺度被重整</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>SGD-momentum 直接用 $M_t$ 更新，各奇异值方向步长正比于奇异值大小——大方向更新过猛、小方向更新不足（回到 S1 的条件数问题）。AdamW 逐坐标归一化（按元素二阶矩缩放每个参数），它不看矩阵整体的方向结构。（AdamW 是逐坐标自适应学习率加权重衰减的优化器，本文只用其作为对照。）Muon 对整个矩阵做正交化，改变的是方向间的相对尺度：把各奇异值拉平到接近 1，使各方向步长均等。</p>
+
+<h3 id="shampoo-relation">与 Shampoo 的关系</h3>
+
+<p>Muon 可视为"无累积 Shampoo"。Shampoo 是二阶预条件优化器，去除其 preconditioner accumulation 后，更新经 SVD 展开等价于正交化梯度：</p>
+
+<p>$$(G_t G_t^\top)^{-1/4} G_t (G_t^\top G_t)^{-1/4} = UV^\top.$$</p>
+
+<details>
+<summary>推导：Shampoo 无累积版本等价于 $UV^\top$</summary>
+<p>设 $G = USV^\top$，则 $G G^\top = US^2U^\top$，$G^\top G = VS^2V^\top$。展开：</p>
+<p>$$(G G^\top)^{-1/4} = (US^2U^\top)^{-1/4} = US^{-1/2}U^\top,$$</p>
+<p>$$(G^\top G)^{-1/4} = (VS^2V^\top)^{-1/4} = VS^{-1/2}V^\top.$$</p>
+<p>代入完整更新：</p>
+<p>$$(US^{-1/2}U^\top)(USV^\top)(VS^{-1/2}V^\top) = U \cdot S^{-1/2} \cdot S \cdot S^{-1/2} \cdot V^\top = U \cdot I \cdot V^\top = UV^\top.$$</p>
+<p>中间用了 $U^\top U = I$、$V^\top V = I$（正交矩阵性质）以及 $S^{-1/2} \cdot S \cdot S^{-1/2} = I$（对角矩阵可交换）。结果就是奇异值全置 1 的 $UV^\top$，与正交化目标一致。</p>
+</details>
+
+<p>所以 Muon 与无累积 Shampoo 的更新方向在数学上等价。区别在于：Muon 在正交化<strong>之前</strong>加入 momentum（Shampoo 不加）；Muon 用 Newton-Schulz 迭代替代 Shampoo 的逆四次根 $(GG^\top)^{-1/4}$ 计算，从而更高效、可在 bfloat16 下运行。</p>
+
+<h3 id="engineering-cost">工程开销与外部证据</h3>
+
+<p>NS 迭代的 FLOP 开销很低。对 $n \times m$ 矩阵（$m \le n$），每步 NS 迭代约需 $2(2nm^2 + m^3)$ matmul FLOPs，总开销上界为 $T \cdot m / B$（$T=5$ 为迭代步数，$B$ 为 batch size）。在典型 LM 训练场景下 FLOP 开销低于 1%：NanoGPT speedrun（$m=768$，$B=524288$）约 0.7%，Llama 405B（$m=16384$，$B=16\text{M}$）约 0.5%。</p>
+
+<p>Muon 的主要外部证据来自竞争性训练任务 NanoGPT speedrun（以 FineWeb 数据集训练 NanoGPT 达到 val loss 3.28 为目标）：2024-10-15 从 AdamW 切换到 Muon 首次创造训练速度记录，提速 35%；此后产生的 12 个新记录由 7 位不同研究者创造，Muon 在所有记录中保持为优化器选择。扩展验证中，用 8 张 H100 训练 1.5B 参数 transformer 达到 GPT-2 XL 级 HellaSwag 性能，Muon 需 10 小时而 AdamW 需 13.3 小时；CIFAR-10 训练至 94% 准确率的速度记录从 3.3 A100-seconds 提升到 2.6 A100-seconds。这些是外部事实数字，说明 Muon 在竞争性任务中的表现，不直接构成机制结论。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>按顺序说出 Muon 一步更新的五个步骤。</li>
+  <li>说明动量在正交化之前加入的原因。</li>
+  <li>对比 SGD-momentum 与 Muon 在大/小奇异值方向上步长的差异。</li>
+  <li>说明 AdamW 逐坐标归一化与 Muon 矩阵级正交化的区别。</li>
+</ul>
+
+<h2 id="applicability">Muon 的适用边界</h2>
+
+<p>Muon 并非全量替换 AdamW 的"更好版本"。它改变的是更新方向的几何结构，仅适用于特定参数类型。训练一个含 Muon 的网络时，参数按以下方式分组：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>参数类型</th><th>典型形状</th><th>优化器</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>隐藏层线性层权重</td><td>$[\text{dim}, \text{dim}]$</td><td>Muon</td><td>二维矩阵，正交化使其各方向均等更新</td></tr>
+<tr><td>卷积核（展平后三维）</td><td>$[\text{out}, \text{in}\cdot k^2]$</td><td>Muon</td><td>展平为二维后适用</td></tr>
+<tr><td>bias、LayerNorm scale/shift</td><td>$[\text{dim}]$ 或标量</td><td>AdamW</td><td>一维参数无法定义"奇异值方向"，正交化无意义</td></tr>
+<tr><td>embedding 层</td><td>$[\text{vocab}, \text{dim}]$</td><td>AdamW</td><td>modular norm theory 理论支持不同优化动力学</td></tr>
+<tr><td>输出层（lm_head/分类头）</td><td>$[\text{dim}, \text{vocab}]$</td><td>AdamW</td><td>经验结论，无理论解释</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>embedding 层用 AdamW 有理论支持：modular norm theory（Large et al. 2024）表明 embedding 层的优化动力学应当与其他层不同。输出层用 AdamW 则是纯经验结论——作者明确指出这"似乎不遵循理论，而是由经验驱动"。本文只引用 modular norm theory 的结论，不展开其推导。</p>
+
+<div class="callout callout-red">
+<p><b>常见误解</b>：Muon 不适用于所有二维参数。embedding 和 lm_head 虽是二维矩阵，但应用 AdamW。把"2D 参数"理解为"所有二维参数"会扩大适用范围。</p>
+</div>
+
+<h3 id="qkv-separate">QKV 应分开应用</h3>
+
+<p>训练 transformer 时，Muon 应分别应用于 Q、K、V 三个投影矩阵，而非合并为单一 QKV 矩阵后统一应用。这是 Vlado Boza 首先展示的经验结果：transformer 实现常把 QKV 参数化为一个输出再分割的单一线性层，但对其统一应用 Muon 效果不如分开应用。</p>
+
+<h3 id="rms-alignment">RMS 对齐缩放因子</h3>
+
+<p>正交化后的更新 $O_t \approx UV^\top$ 的各奇异值接近 1，但不同形状矩阵的"每元素平均更新幅度"（update RMS）不同。为了让 Muon 的 update RMS 与 AdamW 一致（便于复用 AdamW 调好的学习率与权重衰减），Moonshot AI 提出了 RMS 对齐缩放因子：</p>
+
+<p>$$\gamma = 0.2 \cdot \sqrt{\max(m, n)}.$$</p>
+
+<p>更新式变为 $W_{t+1} = W_t - \eta\, \gamma\, O_t$。这个缩放因子的来源是正交化矩阵的 RMS 性质。矩阵 $W \in \mathbb{R}^{n \times m}$ 的 RMS 定义为 $\|W\|_F / \sqrt{nm}$。对满秩矩阵 $UV^\top$（秩 $r = \min(m,n)$）：</p>
+
+<p>$$\operatorname{RMS}(UV^\top) = \frac{\|UV^\top\|_F}{\sqrt{nm}} = \sqrt{\frac{r}{nm}} = \sqrt{\frac{1}{\max(m,n)}}.$$</p>
+
+<details>
+<summary>推导：RMS(UVᵀ) = √(1/max(m,n))</summary>
+<p>设 $U \in \mathbb{R}^{n \times r}$，$V \in \mathbb{R}^{m \times r}$，$U^\top U = I$，$V^\top V = I$（列正交），$r = \min(m,n)$。则 $UV^\top \in \mathbb{R}^{n \times m}$，其 Frobenius 范数平方为：</p>
+<p>$$\|UV^\top\|_F^2 = \sum_{i=1}^{n}\sum_{j=1}^{m} (UV^\top)_{ij}^2 = \sum_{i,j} \left(\sum_{k=1}^{r} U_{ik} V_{jk}\right)^2.$$</p>
+<p>展开平方并交换求和顺序：</p>
+<p>$$= \sum_{k=1}^{r} \sum_{l=1}^{r} \left(\sum_{i=1}^{n} U_{ik} U_{il}\right) \left(\sum_{j=1}^{m} V_{jk} V_{jl}\right).$$</p>
+<p>由 $U^\top U = I$ 知 $\sum_i U_{ik} U_{il} = \delta_{kl}$（克罗内克 δ），同理 $\sum_j V_{jk} V_{jl} = \delta_{kl}$。所以：</p>
+<p>$$= \sum_{k=1}^{r} \delta_{kk} \cdot \delta_{kk} = \sum_{k=1}^{r} 1 = r.$$</p>
+<p>因此 $\|UV^\top\|_F = \sqrt{r}$，$\operatorname{RMS}(UV^\top) = \sqrt{r}/\sqrt{nm} = \sqrt{r/(nm)}$。满秩时 $r = \min(m,n)$，化简得 $\sqrt{1/\max(m,n)}$。</p>
+</details>
+
+<p>所以 $0.2 \cdot \sqrt{\max(m,n)} \cdot O_t$ 的 RMS 为 $0.2 \cdot \sqrt{\max(m,n)} \cdot \sqrt{1/\max(m,n)} = 0.2$，与 AdamW 的典型 update RMS（约 0.2–0.4）对齐。<strong>此缩放因子是 Moonshot 改进，非 Keller Jordan 原始博客内容</strong>；PyTorch 2.12 官方实现已采用。对前面的 2×2 例子，$\gamma = 0.2 \cdot \sqrt{2} \approx 0.283$，基线系数收敛后 $O_t \approx I$ 的 RMS 约 0.707，缩放后约 0.2。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>PyTorch 2.12 <code>torch.optim.Muon</code> 默认超参</th><th>值</th></tr></thead>
+<tbody>
+<tr><td>lr</td><td>1e-3</td></tr>
+<tr><td>weight_decay</td><td>0.1</td></tr>
+<tr><td>momentum</td><td>0.95</td></tr>
+<tr><td>nesterov</td><td>True</td></tr>
+<tr><td>ns_coefficients</td><td>(3.4445, -4.775, 2.0315)</td></tr>
+<tr><td>ns_steps</td><td>5</td></tr>
+<tr><td>eps</td><td>1e-7</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>最后回顾几个常见误解。第一，Muon 不是"更好的 Adam 平替"——它改变的是更新方向几何结构，仅适用于隐藏层二维权重矩阵，收益与模型结构和参数类型相关。第二，Newton-Schulz 迭代是近似正交化而非精确——调优系数允许奇异值在 $[0.7,\ 1.3]$ 区间内波动，正交化的关键是"拉平"而非"精确"。第三，Muon 不适用于所有二维参数——embedding 和输出层虽是二维但应用 AdamW。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>列出哪些参数用 Muon、哪些用 AdamW，并各给一个原因。</li>
+  <li>说明 embedding 用 AdamW 的理论依据与输出层用 AdamW 的依据性质区别。</li>
+  <li>说明 QKV 分开应用的原因。</li>
+  <li>解释 $0.2 \cdot \sqrt{\max(m,n)}$ 缩放因子解决什么问题。</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>C1（Muon 定义）、C2（仅隐藏层 2D，embedding/输出层用 AdamW）、C3（动量在正交化前加入，Nesterov 默认）、C4（更新矩阵条件数高）、C5（正交化放大稀有方向）、C6（与 Shampoo 关系）、C7（QKV 分开）、C8（bfloat16 稳定）：均来自 Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客 https://kellerjordan.github.io/posts/muon/）。C2 中 embedding 用 AdamW 的理论依据为 modular norm theory（Large et al. 2024《Scalable Optimization in the Modular Norm》，arXiv:2405.14813），本文只引用结论。</p>
+
+<h3>核心公式与来源</h3>
+<p>F1（NS 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$）、F2（SVD 下 $U\phi(S)V^\top$）、F3（N 步复合 $U\phi^N(S)V^\top$）、F4（正交化目标 $\arg\min\|O-G\|_F$ 等价 $UV^\top$）、F5（谱范数归一化与 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$）、F6（Shampoo 无累积 = $UV^\top$）：均来自 Keller Jordan 2024 博客。F7（RMS 对齐缩放因子 $\gamma=0.2\sqrt{\max(m,n)}$ 与 $\operatorname{RMS}(UV^\top)=\sqrt{1/\max(m,n)}$）：来自 Moonshot AI《Muon is Scalable for LLM Training》（2025），推导参考苏剑林博客（kexue.fm）。F1–F5 由主源直接给出；F6 由主源给出 SVD 展开步骤，本页折叠块补全过程；F7 由 Moonshot 给出结论，本页折叠块补全 RMS 推导。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>N1（调优系数 $(3.4445, -4.7750, 2.0315)$）、N2（基线系数 $(2, -1.5, 0.5)$）、N3（迭代步数 5）、N4（$\varepsilon=10^{-7}$）、N5（允许 $\phi^N(x)\in[0.7,1.3]$）、N8（FLOP 开销 NanoGPT 0.7% / Llama 405B 0.5%）、N9（1.5B transformer 10 vs 13.3 H100-hours）、N10（CIFAR-10 3.3→2.6 A100-seconds）：来自 Keller Jordan 2024 博客。N6（2024-10-15 首次记录，提速 35%）、N7（12 个记录，7 位研究者）：来自同一博客。N11（PyTorch 2.12 默认 lr=1e-3, weight_decay=0.1, momentum=0.95, nesterov=True, ns_steps=5）：来自 PyTorch 2.12 文档 <code>torch.optim.Muon</code>。N12（贡献者 Jordan、Jin、Boza、You、Cesista、Newhouse、Bernstein）：来自博客 Citation。</p>
+
+<h3>教学示例</h3>
+<p>贯穿例子 $G = \operatorname{diag}(0.9,\ 0.1)$ 为人为构造的教学数字，目的是让奇异值拉平过程可手算：条件数 9（少数方向主导），谱归一化后 $(0.9939,\ 0.1104)$，5 步基线系数 NS 后逼近 $(1,\ 1)$。不代表真实训练数据或工程推荐值。可运行代码用 numpy float64 复现，便于读者独立验证。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>"正交化把奇异值拉平到接近 1"只解释 SVD 下奇异值被多项式映射这一局部关系，不保证正交化对任意矩阵都收敛——收敛要求初始奇异值落在 $\phi$ 的收敛域（由谱范数归一化保证）。"放大稀有方向、抑制主导方向"是作者推测（speculate），不作为已证结论。"无累积 Shampoo"的定位只解释 Muon 与去除累积的 Shampoo 在更新方向上的等价性，不覆盖 Shampoo 的完整 preconditioner accumulation 机制。</p>
+
+<h3>教学简化及其限制</h3>
+<p>三项简化：第一，可运行代码用 numpy float64，真实工程用 bfloat16 在 GPU 上运行，精度行为有差异但机制一致。第二，只展示 2×2 对角矩阵，真实训练中矩阵远大于此（如 $768 \times 768$ 或更大），但 NS 迭代机制完全相同。第三，伪代码与代码只展示单步更新与正交化，未展示学习率调度、权重衰减（除 RMS 对齐外）、梯度裁剪等工程细节。这些简化不影响对 Muon 核心机制的理解，但不能直接作为生产训练代码。
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

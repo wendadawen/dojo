@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoonEP 完美均衡专家并行 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · MoE 训练系统</span>
+      <h1>MoonEP 完美均衡专家并行</h1>
+      <p class="lead">MoonEP 是 Moonshot AI 在 K3 训练系统里提出的 MoE 训练专家并行方案：通过在线规划和迁移"冗余专家"让每个 EP rank 恰好收到 S×K 个 token，把负载、通信 buffer 形状和每层计算形状都变成静态已知。</p>
+      <p class="meta">更新于 2026-08-09 · 依据 K3 技术报告 §5.2.1 与 §E</p>
+    </header>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><strong>传统 EP 负载随 router 偏好动态变化</strong>：每个 EP rank 收到多少 token 完全由 router 决定，而 router 偏好随每个 micro-batch、每一层都在变，导致有的 rank 过载、有的空转，训练吞吐被拖累。</li>
+      <li><strong>激活形状动态变化导致显存碎片</strong>：routed-expert 每层收到的 token 数都不一样，张量形状无法静态确定，显存碎片严重。</li>
+      <li><strong>每层都要 host-device 同步</strong>：传统 EP 每层 per-expert token 数变化，CPU 必须在每层与 GPU 同步一次拿到真实计算形状再 launch kernel，流水线被 stall。</li>
+      <li><strong>最坏不均衡下 buffer 量级大</strong>：DeepEP 等传统方案在最坏不均衡下要支持零拷贝数据路径需要 S×K×R 的通信 buffer，任何 rank 都可能收到接近全网总量的 token。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>冗余专家 = 临时副本，不是常驻副本</strong>：把某个 home rank 上的专家临时复制到另一个 rank 上，让那个 rank 在本地处理原本要发出去的 token；forward 预取、backward 梯度暂存本地 reduce buffer 后 reduce 回 home rank，用完即弃。</li>
+      <li><strong>完美均衡 = 每 rank 恰好收到 S×K token</strong>：总量守恒保证这总是可能——R 个 rank 各收 S×K，总和 S×K×R 恰好等于全网发出的 token-expert pair 总数。MoonEP 用冗余专家做载体把过载 rank 的 token 迁到空转 rank。</li>
+      <li><strong>E/R 是有证明的上界，不是经验值</strong>：构造性证明显示存在规划让每 rank 的远端 token 全来自同一 home rank，而一个 home rank 至多 E/R 个本地专家，故每 rank 至多 E/R 个冗余专家即保证可行解。该界基本紧——存在最坏构造需要 ⌈E(R−1)/R²⌉ ≈ E/R 个冗余专家。</li>
+      <li><strong>完美均衡一次性解决三个问题</strong>：每 rank 恒收 S×K → 通信 buffer 固定 S×K（DeepEP 最坏要 S×K×R）→ 所有层计算形状静态已知 → 消除每层 host 同步。三个工程收益同源。</li>
+      <li><strong>零拷贝 dispatch</strong>：planning kernel 预计算每个 token 的目的地，token 直接发到远端 expert-grouped 位置，返回 buffer view 免中间拷贝。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>MoonEP 不解决 per-expert 偏斜</strong>：完美均衡只保证 rank 间总量相等，rank 内部 per-expert token 数仍可能偏斜；由独立的 Expert-GEMM workload-aware scheduler 处理，shared expert 分到独立 stream 重叠。</li>
+      <li><strong>MoonEP 不是 router 训练手段</strong>：router 是否均衡训练由辅助损失负责，MoonEP 只在 router 输出给定后做规划，不修改 router。把"router 均衡"和"EP 后 rank 均衡"混为一谈是常见误解。</li>
+      <li><strong>与 ECHO/UltraEP 的核心区别</strong>：后者预设冗余数或施加 token cap，训练可能因无解而中断且需手动调参；MoonEP 用 E/R 这个有证明的、基本紧的界预留槽位，保证总有可行解。</li>
+      <li><strong>与 DeepEP 的关系是扩展不是替代</strong>：MoonEP 保留 DeepEP 总体计算流，只是在其上增加在线规划与冗余专家迁移；最坏 buffer 从 S×K×R 降到 S×K。MoonEP 是训练方案，不适用于推理场景（推理 EP 见 <a href="../../wiki/moe-serving/index.html">MoE 推理与服务基础</a>）。</li>
+      <li><strong>边界</strong>：MoonEP 不解决内存碎片（由 §5.2.2 memory-efficient training 独立处理）、不解决 router 训练；本页不引用 MoonEP 开源仓库源码，只依据 K3 报告 §5.2.1 与 §E 的文字描述。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

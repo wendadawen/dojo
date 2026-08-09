@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>辅助损失无关路由 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · MoE 训练 · 负载均衡</span>
+      <h1>辅助损失无关路由</h1>
+      <p class="lead">MoE 训练时给每个专家一个 bias，加到路由分数上只参与"选谁"、不进 mixture weight，再用"过载减、欠载增"的固定小步规则更新 bias，从而不引入任何辅助损失项也能保持专家负载均衡。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <!-- 快速阅读正文：是什么、为什么需要它、核心直觉、关键结论与边界。5 分钟内可扫读，不展开公式推导与手算例子。 -->
+
+    <h2>是什么</h2>
+    <p>辅助损失无关路由（Auxiliary-Loss-Free Routing）是 DeepSeek 在 2024 年 8 月（arXiv:2408.15664）提出、并在 DeepSeek-V3 上线的 MoE 负载均衡方法。它给每个专家一个不进梯度的 bias：bias 加到路由分数上只决定 top-k <em>选谁</em>，不进入"被选中后给多少权重"的归一化权重；bias 不被反向传播学习，而是每步训练后用"过载减、欠载增"的固定小步 sign 规则更新。这样在<strong>不写任何辅助损失项</strong>的情况下也能保持专家负载均衡，避免了传统辅助损失的"干扰梯度"。关于 MoE、router、top-k、专家并行的概念见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><strong>MoE 训练有路由坍塌风险。</strong> 路由器一旦早期偏向某几个专家，被选中的专家得到更多梯度、特化更快，下一轮更可能被选——正反馈导致少数专家包揽多数 token，其余训不动。</li>
+      <li><strong>传统辅助损失方案有代价。</strong> 经典做法是在损失里加 $L_{bal}=\alpha\sum f_i P_i$ 一类项推动均衡，但 $\alpha$ 难调：过大会引入混进主梯度的"干扰梯度"、损害主任务性能；过小压不住坍塌。</li>
+      <li><strong>专家并行训练怕负载不均。</strong> 把专家分片到多张 GPU 后，热专家所在那张卡成瓶颈，其余卡空转，吞吐下降。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>bias 只调"选谁"，不调"用多少"。</strong> 选谁由 $s_{i,t}+b_i$ 是否进入 top-k 决定；被选中后的门控权重 $g_{i,t}$ 取原始分数 $s_{i,t}$，归一化分母也不含 $b$。所以 bias 完全不影响 mixture weight。</li>
+      <li><strong>bias 不进反向传播。</strong> 它不是模型参数，每步训练结束后单独按规则更新。这就是"loss-free"的来源——没有辅助损失项，也就没有混进主目标的额外梯度。</li>
+      <li><strong>更新规则：固定步长 sign。</strong> 每步统计每个专家收到的 token 数 $c_i$ 与平均 $\bar c_i$，按 $b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i)$ 更新：欠载（$\bar c_i>c_i$）则加 $\gamma$，过载则减 $\gamma$。每步走固定小步，单步稳定。</li>
+      <li><strong>sign 丢幅度。</strong> 差 1 个 token 和差 100 个 token 走相同步长——这是它的简洁来源，也是它在专家数极多时失效的根。</li>
+      <li><strong>慢速调度。</strong> 单步 bias 调整通常不足以改写 top-k 选择，需要训练步数积累才能逐步逼近均衡。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>DeepSeek-V3 实际配置：</strong> 256 routed expert + 1 shared，top-8；$\gamma=0.001$ 用于前 14.3T token，最后 500B token 设 $\gamma=0$ 冻结 bias；推理阶段 bias 被吸收进 router 权重，前向无需显式加 $b_i$。</li>
+      <li><strong>只解决批级负载均衡，不解决序列内均衡。</strong> 序列内可能每个 token 都激活同一组专家——DeepSeek-V3 另加 $\alpha=0.0001$ 的 sequence-wise balance loss 互补处理。</li>
+      <li><strong>不保证单步完美均衡。</strong> sign 走固定小步，需要大量训练步数积累。</li>
+      <li><strong>专家数极多时 sign 收敛过慢。</strong> K3 把专家池扩到 896 后这个缺陷被放大，K3 改用 <a href="../quantile-balancing/index.html">Quantile Balancing</a> 从路由分数分位数一步算出 bias，仍属 aux-loss-free 家族，只换 bias 的更新规则。</li>
+    </ul>
+
+    <h2>主要依据</h2>
+    <p>Wang et al., <em>Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts</em>, arXiv:2408.15664 (2024-08)；DeepSeek-V3 Technical Report, arXiv:2412.19437 §2.2, Eq.16-19。想看公式推导与 4 专家 top-2 的手算例子，进入<a href="index.html">深度教学</a>。</p>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

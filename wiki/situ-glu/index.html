@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SiTU-GLU（Sigmoid Tanh Unit GLU）：用 softcap 同时限制 SwiGLU 的门与值，给乘积一个固定上界</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-links { gap: 1em; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">SiTU-GLU</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">SiTU-GLU（Sigmoid Tanh Unit GLU）：用 softcap 同时限制 SwiGLU 的门与值，给乘积一个固定上界</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<div class="callout callout-blue">
+<p>神经网络一层 FFN 的输出常常是两个数的乘积——如果两个数都没有上界，乘积会怎么涨？Kimi K3 在 2.8 万亿参数 + Stable LatentMoE 四连矩阵相乘的结构下恰好遇到这件事：单个坐标的 pre-activation 可以大到 100、1000，乘积就到 10000、1000000，直接撑爆低精度训练。给输出加个 clip 就够了吗？clip 的梯度在饱和后是 0——模型进了饱和区就死。SiTU-GLU 要回答的是：能不能让两个乘性因子<b>自己</b>平滑饱和到固定上界，同时保留 SwiGLU 在原点附近的近线性响应？</p>
+</div>
+
+<div class="context-box">
+  <p class="context-box-title">本文所处的位置</p>
+  <div class="context-grid">
+    <div class="context-label">是什么</div><div class="context-value">一种把 SwiGLU 的门支线性因子与值支同时换成 softcap $\beta\tanh(x/\beta)$ 的 GLU 变体。</div>
+    <div class="context-label">解决什么</div><div class="context-value">SwiGLU 两个乘性因子都无界，K3 Stable LatentMoE 路由分支的四连矩阵相乘把它们放大到激活爆炸；hard clamping 饱和后梯度归零。SiTU-GLU 想同时拿到平滑有界与饱和区非零梯度。</div>
+    <div class="context-label">提出场景</div><div class="context-value">Kimi K3 Technical Report §2.3.2 与附录 §B。</div>
+    <div class="context-label">家族角色</div><div class="context-value">GLU 家族下游成员，SwiGLU 的"有界化"版本。家族派生见 <a href="../../wiki/glu/index.html">GLU 概念页</a>。</div>
+  </div>
+</div>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>用一句话说清 SiTU-GLU 在做什么，并说明它解决什么问题（Q1）。</li>
+    <li>从公式说明为什么 SiTU-GLU 同时实现"近原点近似 SwiGLU"和"输出有界 100"（Q2）。</li>
+    <li>手算 $x=0$、$x=10$、$x=100$ 三个标量输入的 SiTU-GLU 输出，并对比同输入下 SwiGLU 的无界增长（Q3）。</li>
+    <li>说明 softcap 与 hard clamping 在饱和区梯度上的关键差别（Q4）。</li>
+    <li>说明 SiTU-GLU 在 K3 中的使用位置与不解决的问题（Q5）。</li>
+  </ul>
+</section>
+
+<section class="misconceptions">
+  <h2>最容易误解</h2>
+  <ul>
+    <li><b>"SiTU-GLU 就是把 SwiGLU 输出 clip 到 100"</b>——不对。SiTU-GLU 在乘积的两个因子<b>内部</b>套 softcap，不是对最终输出做 clip。clip 饱和后梯度为 0，softcap 平滑饱和、保留非零梯度。</li>
+    <li><b>"SiTU-GLU 一定比 SwiGLU 训练更稳/性能更好"</b>——不对。K3 §2.3.2 末段只承诺"保留 SwiGLU 局部响应同时控制两因子"的结构有界性，不承诺训练或性能。报告未给 SiTU-GLU vs SwiGLU 对照实验。</li>
+    <li><b>"只套门支就够了"</b>——不对。K3 §B 明确"to the up branch ... preventing either branch from dominating the product"。值支不套则乘积仍无界。</li>
+    <li><b>"softcap 在饱和区等价于 hard clamping"</b>——不对。两者输出在远点都接近 $\pm\beta$，但 softcap 导数指数衰减非零，hard clamping 导数严格为 0。</li>
+  </ul>
+</section>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Kimi K3 Technical Report §2.3.2 与附录 §B（Eq.12/18/19），通过本地存档 <code>/tmp/kimi-k3-research/k3-report.txt</code> 逐条核对。SwiGLU/GLU 家族相关结论引用 Shazeer 2020 / Dauphin 2017，已登记于 <a href="../../wiki/glu/research/evidence.md">GLU 概念页 evidence.md</a>，本文不重复。</p>
+</blockquote>
+
+<h2 id="why-bound">为什么需要给 SwiGLU 加上界——激活爆炸从哪里来</h2>
+
+<p>Transformer 一层 FFN 的核心运算可以拆成"两份线性投影、再逐元素相乘"的形式。SwiGLU 是当前最常用的版本，公式（Shazeer 2020 §2 Eq.(5)，家族派生与记号差异见 <a href="../../wiki/glu/index.html">GLU 概念页</a>）为</p>
+
+<p>$$\mathrm{SwiGLU}(x)=\big(W_g x\cdot\sigma(W_g x)\big)\odot\big(W_u x\big),$$</p>
+
+<p>其中 $x$ 是输入向量，$W_g,W_u$ 是两套权重矩阵，$\sigma(z)=1/(1+e^{-z})$ 是 sigmoid（把任意实数压到 $(0,1)$），$\odot$ 是逐元素乘积（两个同形向量逐位相乘）。门分支 $W_g x\cdot\sigma(W_g x)$ 是 Swish 激活在 $W_g x$ 上的取值，值分支 $W_u x$ 是一份纯线性投影。</p>
+
+<p>关键问题在两个乘性因子的"无界性"上：</p>
+
+<ul>
+  <li>门分支的<b>线性因子</b> $W_g x$：当 $W_g x\to+\infty$ 时，$\sigma(W_g x)\to 1$，门支退化为 $W_g x\cdot 1 = W_g x$——线性无界。</li>
+  <li>值分支 $W_u x$：本来就是线性，没有上界。</li>
+</ul>
+
+<p>两支同时大时，乘积 $\approx (W_g x)\cdot(W_u x)$，量级是 $O(x^2)$。在常规规模下这点并不致命，但 K3 在 Stable LatentMoE 的路由分支里把 $W_\downarrow$、专家 FFN、$W_\upagger$ 接成<b>四连矩阵相乘</b>，加上 2.8 万亿参数规模，单个坐标的 pre-activation 就可能到 100、1000，乘积到 10000、1000000——这种"激活爆炸"在低精度算术（FP8/INT8）下直接溢出（K3 §2.3 开头与 §2.3.2 第二段）。</p>
+
+<p>那为什么不直接换回原始 GLU（用 sigmoid 门而不是 Swish 门）？K3 §2.3.2 第二段给出两个理由：第一，GLU 的 sigmoid 门虽然有界，但值分支 $W_u x$ 仍然无界——乘积仍无界；第二，GLU 不保留 Swish 在原点附近"正侧近似线性、负侧压到 0"的响应形状（Swish 在 $x>0$ 时近似 $x$、在 $x<0$ 时压到 0，这种近原点线性 + 负尾衰减的形状是 SwiGLU 在大模型上经验有效的关键之一）。需要的是一个"<b>同时控制两支、又保留 SwiGLU 局部响应</b>"的方案。</p>
+
+<p>这个方案就是 SiTU-GLU。它的核心组件是 <b>softcap</b> 函数（K3 §2.3.2 Eq.(12) 前定义式）：</p>
+
+<p>$$\mathrm{softcap}(x,\beta)=\beta\tanh(x/\beta),$$</p>
+
+<p>其中 $\tanh$ 是双曲正切，把任意实数压到 $(-1,1)$；乘上 $\beta$ 后输出被压到 $(-\beta,\beta)$。K3 设定 $\beta_1=4$（门支）和 $\beta_2=25$（值支）。</p>
+
+<p>一句话定位：<b>SiTU-GLU 是一种把 SwiGLU 的门支线性因子和值支同时换成 softcap 的 GLU 变体，让两乘性因子都平滑饱和，乘积上界锁在 $\beta_1\beta_2=100$</b>。它在 K3 §2.3.2 提出，是 Stable LatentMoE 抑制激活爆炸的核心组件之一。</p>
+
+<p>下表把三个家族成员的"门支线性因子""门支激活""值支"对照列出（K3 §2.3.2 第二段与 Fig.4 内容）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>变体</th><th>门支线性因子</th><th>门支激活</th><th>值支</th><th>乘积上界</th></tr></thead>
+<tbody>
+<tr><td>GLU（Dauphin 2017）</td><td>—</td><td>$\sigma(x)$（有界 $(0,1)$）</td><td>$x$（无界）</td><td>无界（值支无界）</td></tr>
+<tr><td>SwiGLU（Shazeer 2020）</td><td>$x$（无界）</td><td>$\sigma(x)$（有界 $(0,1)$）</td><td>$x$（无界）</td><td>无界（两支线性因子都无界）</td></tr>
+<tr class="highlight-row"><td>SiTU-GLU（K3）</td><td>$\beta_1\tanh(x/\beta_1)$（有界 $(-\beta_1,\beta_1)$）</td><td>$\sigma(x)$（有界 $(0,1)$）</td><td>$\beta_2\tanh(x/\beta_2)$（有界 $(-\beta_2,\beta_2)$）</td><td>$\beta_1\beta_2=100$（两支都饱和时）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>表中 $x$ 是 pre-activation 的占位记号；具体在 SiTU-GLU 里，门支的 $x$ 是 $W_g x$、值支的 $x$ 是 $W_u x$。可以看出：GLU 和 SwiGLU 的乘积都至少有一个无界因子，SiTU-GLU 把两个线性因子都换成有界的 softcap，乘积才有界。这正是 K3 §B 第二段"preventing either branch from dominating the product"的几何含义。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>指出 SwiGLU 的两个无界乘性因子分别是哪两个；</li>
+  <li>解释 GLU 的 sigmoid 门有界但 K3 仍不直接采用 GLU 的两个原因。</li>
+</ul>
+
+<h2 id="formula-and-example">SiTU-GLU 的公式与手算</h2>
+
+<p>SiTU-GLU 的正式定义由 K3 §2.3.2 Eq.(12) 给出：</p>
+
+<p>$$\mathrm{SiTU\text{-}GLU}(x)=\Big[\beta_1\tanh\!\Big(\frac{W_g x}{\beta_1}\Big)\odot\sigma(W_g x)\Big]\odot\Big[\beta_2\tanh\!\Big(\frac{W_u x}{\beta_2}\Big)\Big],$$</p>
+
+<p>逐项说明每个符号：</p>
+
+<ul>
+  <li>$x$：输入向量。</li>
+  <li>$W_g, W_u$：门分支与值分支的权重矩阵，沿用 K3 §2.3.2 Eq.(12) 记法。</li>
+  <li>$\beta_1=4$：门支的 soft-cap 超参（K3 §2.3.2 末段设定）。</li>
+  <li>$\beta_2=25$：值支的 soft-cap 超参（K3 §2.3.2 末段设定）。</li>
+  <li>门支 $\beta_1\tanh(W_g x/\beta_1)\odot\sigma(W_g x)$：把 Swish 门 $W_g x\cdot\sigma(W_g x)$ 的<b>线性因子</b> $W_g x$ 换成 softcap $\beta_1\tanh(W_g x/\beta_1)$，<b>保留</b> $\sigma(W_g x)$ 因子不变（K3 §2.3.2 第二段 "to the linear factor of the Swish gate"）。sigmoid 已经把负侧门压到 0，所以 softcap 在门支主要负责控制大正侧。</li>
+  <li>值支 $\beta_2\tanh(W_u x/\beta_2)$：把线性值 $W_u x$ 换成 softcap。同样的构造套到值支上，"preventing either branch from dominating the product"（K3 §B 第二段）。</li>
+  <li>$\odot$：逐元素乘积，所有量同形。</li>
+</ul>
+
+<p>用三个边界检查验证公式确实在做"两支都平滑饱和"：</p>
+
+<ul>
+  <li><b>$W_g x=0$</b>：门支 $\beta_1\tanh(0)\cdot\sigma(0)=0\cdot 0.5=0$，值支 $\beta_2\tanh(0)=0$，输出 0——原点直通零，与 SwiGLU 一致。</li>
+  <li><b>$W_g x\to+\infty$</b>：门支 $\beta_1\cdot 1\cdot 1=\beta_1=4$（$\tanh\to 1$、$\sigma\to 1$），值支 $\beta_2\cdot 1=\beta_2=25$，输出 $\to\beta_1\beta_2=100$——正侧饱和到上界。</li>
+  <li><b>$W_g x\to-\infty$</b>：门支 $\beta_1\cdot(-1)\cdot 0=0$（$\tanh\to -1$ 但被 $\sigma\to 0$ 杀掉），值支 $\beta_2\cdot(-1)=-\beta_2=-25$，输出 $\to 0$——负侧被 sigmoid 压到 0。</li>
+</ul>
+
+<p>所以 SiTU-GLU 的<b>正侧上界</b>是 $\beta_1\beta_2=100$，<b>负侧</b>因 sigmoid 杀尾实际接近 0——这正是 K3 §B 想要的"保留 Swish 负尾衰减"形状。</p>
+
+<p>教学示例。 取标量 $x$（设两支 pre-act 均为 $x$ 以隔离函数行为，这是为隔离函数本身性质做的教学简化，不代表真实 FFN 的两支会共享同一 $W$），用 $\beta_1=4,\beta_2=25$ 算三个点：</p>
+
+<p>$$g(x)=4\tanh(x/4)\cdot\sigma(x),\quad u(x)=25\tanh(x/25),\quad y(x)=g(x)\cdot u(x).$$</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>$x$</th><th>门支 $g(x)$</th><th>值支 $u(x)$</th><th>SiTU-GLU $y(x)$</th><th>SwiGLU $x\sigma(x)\cdot x$</th></tr></thead>
+<tbody>
+<tr><td>$0$</td><td>$0\cdot 0.5=0$</td><td>$0$</td><td>$0$</td><td>$0$</td></tr>
+<tr><td>$10$</td><td>$4\tanh(2.5)\cdot\sigma(10)\approx 3.9463$</td><td>$25\tanh(0.4)\approx 9.4987$</td><td>$\approx 37.485$</td><td>$\approx 99.995$</td></tr>
+<tr><td>$100$</td><td>$4\tanh(25)\cdot\sigma(100)\approx 4$</td><td>$25\tanh(4)\approx 24.983$</td><td>$\approx 99.933$（接近上界 100）</td><td>$=10000$（无界增长）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>读这张表要看到三件事：</p>
+
+<ul>
+  <li><b>$x=0$ 与 SwiGLU 同值</b>：原点附近 SiTU-GLU 与 SwiGLU 几乎重合，softcap 还没起作用——这是下一章要展开的"近原点一阶等价"的数值体现。</li>
+  <li><b>$x=10$ 时 SiTU-GLU 已被压住</b>：SwiGLU 同点输出 99.995，SiTU-GLU 输出 37.485——softcap 在 $x=10$ 时已经显著起作用（$\tanh(10/4)=\tanh(2.5)\approx 0.987$，门支线性因子已被压到接近 $\beta_1=4$；$\tanh(10/25)=\tanh(0.4)\approx 0.380$，值支还在近似线性区）。</li>
+  <li><b>$x=100$ 时 SiTU-GLU 接近上界 100</b>：SwiGLU 同点输出 10000——无界增长 100 倍。这正是 K3 在 Stable LatentMoE 路由分支要解决的"激活爆炸"。</li>
+</ul>
+
+<details>
+<summary>补充：$x=2$ 与 $x=50$ 两个中间点的完整手算</summary>
+<p>这两个点用来验证从原点到饱和的过渡是<b>平滑</b>的（不是台阶）。</p>
+<p>取 $x=2$：$g=4\tanh(0.5)\sigma(2)=4\times 0.4621\times 0.8808\approx 1.6281$；$u=25\tanh(0.08)=25\times 0.0798\approx 1.9957$；$y\approx 3.2493$。对照 SwiGLU $2\sigma(2)\cdot 2\approx 3.5232$——SiTU-GLU 已略低，softcap 开始轻微压低门支（$\tanh(0.5)=0.4621$ vs 线性 $0.5$），但还远未饱和。</p>
+<p>取 $x=50$：$g=4\tanh(12.5)\sigma(50)\approx 4$（门支完全饱和）；$u=25\tanh(2)\approx 25\times 0.9640\approx 24.101$；$y\approx 96.403$。对照 SwiGLU $50\sigma(50)\cdot 50=2500$——SiTU-GLU 已经在 96 附近，逼近上界 100 但仍有距离（因为 $\tanh(2)$ 还没到 1）。</p>
+<p>结论：从 $x=0$ 到 $x=100$，SiTU-GLU 的输出从 0 平滑过渡到 99.93，没有任何"台阶"或断点。softcap 的平滑性来自 $\tanh$ 的 $C^\infty$ 性质。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>给定标量 $x$ 与 $\beta_1,\beta_2$，写出 SiTU-GLU 的运算三步（门支、值支、相乘）；</li>
+  <li>解释 $x=0$、$x=10$、$x=100$ 三个点的输出差别，并指出上界 100 在哪个点逼近。</li>
+</ul>
+
+<h2 id="local-and-bound">近原点像 SwiGLU、远点饱和——两个性质怎么同时成立</h2>
+
+<p>读到这一章，读者可能会有疑问：一个函数怎么可能"近原点和 SwiGLU 一样、远点又被压到 100"？这两件事看上去矛盾——如果近原点和 SwiGLU 一样，那它就该和 SwiGLU 一起无界增长才对。答案的关键是 softcap 的<b>局部展开</b>与<b>远点饱和</b>两件事在不同区域生效，互不冲突。</p>
+
+<p><b>局部展开</b>。K3 §B Eq.(18) 给出：对 $|z|\ll\beta$ 的标量 $z$，</p>
+
+<p>$$\beta\tanh\!\Big(\frac{z}{\beta}\Big)=z+O\!\Big(\Big(\frac{z}{\beta}\Big)^3\Big).$$</p>
+
+<p>代入 SiTU-GLU 公式 F1：</p>
+
+<ul>
+  <li>门支：$\beta_1\tanh(W_g x/\beta_1)\cdot\sigma(W_g x)=\big(W_g x+O((W_g x/\beta_1)^3)\big)\cdot\sigma(W_g x)$。当 $|W_g x|\ll 4$ 时，$O$ 项可忽略，门支退化为 Swish 门 $W_g x\cdot\sigma(W_g x)$。</li>
+  <li>值支：$\beta_2\tanh(W_u x/\beta_2)=W_u x+O((W_u x/\beta_2)^3)$。当 $|W_u x|\ll 25$ 时，值支退化为线性值 $W_u x$。</li>
+  <li>乘积：两支都在近原点时，$\mathrm{SiTU\text{-}GLU}(x)\approx (W_g x\cdot\sigma(W_g x))\odot(W_u x)=\mathrm{SwiGLU}(x)$——一阶等价。</li>
+</ul>
+
+<p>所以"近原点像 SwiGLU"的精确含义是：<b>当 $|W_g x|\ll\beta_1=4$ 且 $|W_u x|\ll\beta_2=25$ 时，SiTU-GLU 与 SwiGLU 在局部展开到一阶相同</b>。第二项 $O((z/\beta)^3)$ 是个三次小量，决定了 SiTU-GLU 与 SwiGLU 在近原点的偏离程度。</p>
+
+<details>
+<summary>补充：$\beta\tanh(z/\beta)=z+O((z/\beta)^3)$ 的推导（用 $\tanh$ 的泰勒展开）</summary>
+<p>已知 $\tanh u = u - u^3/3 + O(u^5)$（标准泰勒展开，对 $|u|\ll 1$ 有效）。代入 $u=z/\beta$：</p>
+<p>$$\tanh(z/\beta) = (z/\beta) - \frac{(z/\beta)^3}{3} + O((z/\beta)^5).$$</p>
+<p>两边乘 $\beta$：</p>
+<p>$$\beta\tanh(z/\beta) = z - \frac{z^3}{3\beta^2} + O\!\Big(\frac{z^5}{\beta^4}\Big) = z + O\!\Big(\Big(\frac{z}{\beta}\Big)^3\Big).$$</p>
+<p>最后一项写法说明：$O((z/\beta)^3)$ 量纲上对应 $\beta\cdot(z/\beta)^3=z^3/\beta^2$ 量级，与 $-z^3/(3\beta^2)$ 同阶。K3 §B Eq.(18) 的 $O$ 记号是残差阶数，不指明系数。</p>
+<p>对 $z=0.5,\beta=4$ 验证：$\beta\tanh(z/\beta)=4\tanh(0.125)\approx 4\times 0.12435\approx 0.49741$，与 $z=0.5$ 差 $-0.00259$；理论 $-z^3/(3\beta^2)=-0.125/(3\times 16)\approx -0.00260$。吻合到四位有效数字。</p>
+</details>
+
+<p><b>输出上界</b>。K3 §B Eq.(19) 给出：每个输出坐标满足</p>
+
+<p>$$|\mathrm{SiTU\text{-}GLU}(x)|\le\beta_1\beta_2=100.$$</p>
+
+<p>证明很短（K3 §B Eq.(19) 原文）：因为 $|\tanh(z)|<1$ 对任意有限 $z$ 成立，且 $0<\sigma(z)<1$ 对任意有限 $z$ 成立，所以</p>
+
+<p>$$|\beta_1\tanh(W_g x/\beta_1)\cdot\sigma(W_g x)\cdot\beta_2\tanh(W_u x/\beta_2)|\le\beta_1\cdot 1\cdot 1\cdot\beta_2\cdot 1=\beta_1\beta_2=100.$$</p>
+
+<p>关键观察：<b>"两支都套 softcap"是上界成立的必要条件</b>。如果只套门支、值支仍为 $W_u x$（线性无界），上界立即失效——这正是误解 3 的根源。K3 §B 第二段原文 "Kimi K3 applies the same construction to the up branch ... preventing either branch from dominating the product" 明确把这一点列为设计理由。</p>
+
+<details>
+<summary>补充：上界证明的逐项拆解</summary>
+<p>逐项分析四个因子的界（设 $z_g=W_g x/\beta_1$，$z_u=W_u x/\beta_2$，$s_g=W_g x$，$s_u=W_u x$）：</p>
+<ul>
+  <li>$\beta_1$：常数 $\beta_1=4$。</li>
+  <li>$|\tanh(z_g)|<1$：$\tanh$ 的值域是 $(-1,1)$，开区间；对任意有限 $z_g$ 严格小于 1。</li>
+  <li>$\sigma(s_g)\in(0,1)$：sigmoid 的值域，开区间。</li>
+  <li>$\beta_2$：常数 $\beta_2=25$。</li>
+  <li>$|\tanh(z_u)|<1$：同上。</li>
+</ul>
+<p>四项相乘：$\beta_1\cdot 1\cdot 1\cdot\beta_2\cdot 1=\beta_1\beta_2=100$。注意是严格不等式——$|\mathrm{SiTU\text{-}GLU}|$ 严格小于 100，但可以任意接近（在 $|W_g x|,|W_u x|\to\infty$ 时极限为 100）。</p>
+<p>这就是为什么 §B 用 $\le$ 而非 $<$：上界 100 是可达的极限，但对有限输入严格小于。</p>
+</details>
+
+<p><b>极限行为</b>。K3 §B Eq.(18) 后一句给出：当 $\beta_1,\beta_2\to\infty$ 时，SiTU-GLU <b>逐点收敛</b>到 SwiGLU。这是因为 $\tanh(u)\to u$ 当 $u\to 0$（$\tanh$ 在原点附近近似线性），所以 $\beta\tanh(z/\beta)\to z$ 当 $\beta\to\infty$。形式上：</p>
+
+<p>$$\lim_{\beta_1,\beta_2\to\infty}\mathrm{SiTU\text{-}GLU}(x)=(W_g x\cdot\sigma(W_g x))\odot(W_u x)=\mathrm{SwiGLU}(x).$$</p>
+
+<p>这个极限把 SiTU-GLU 与 SwiGLU 的关系说清楚了：<b>SiTU-GLU 是 SwiGLU 的"有界化"版本</b>，把"线性因子 $x$"换成"线性因子的有界化 $\beta\tanh(x/\beta)$"。$\beta$ 越大、有界化越弱、越接近 SwiGLU；$\beta$ 越小、有界化越强、上界越紧。K3 选 $\beta_1=4,\beta_2=25$ 是工程设定（C4），让门支上界 4、值支上界 25、乘积上界 100——这个选择没有对照实验，不是普适最优。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 $\beta\tanh(z/\beta)$ 在 $|z|\ll\beta$ 时的局部展开式；</li>
+  <li>解释为什么 $\beta_1,\beta_2\to\infty$ 时 SiTU-GLU 收敛到 SwiGLU；</li>
+  <li>指出若只套门支、值支不套，上界 100 是否还成立。</li>
+</ul>
+
+<h2 id="softcap-vs-clip">为什么是 softcap 而不是 clip——饱和区里梯度差别</h2>
+
+<p>读者到这里可能又会问：既然只是想要"两支有界、乘积有界"，为什么不直接对 $W_g x$ 和 $W_u x$ 做 hard clamping $\mathrm{clip}(x,c)=\min(\max(x,-c),c)$？输出在远点也接近 $\pm c$，岂不是更简单？K3 §B 末段直接回答了这个问题，关键差别在<b>饱和区的梯度</b>。</p>
+
+<p>先看两种函数的输出与导数对比。设 $c=\beta$（同样的阈值参数）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>函数</th><th>定义</th><th>输出 $|x|\gg c$</th><th>导数 $|x|\ll c$</th><th>导数 $|x|>c$</th></tr></thead>
+<tbody>
+<tr><td>hard clamping</td><td>$\mathrm{clip}(x,c)=\min(\max(x,-c),c)$</td><td>$\pm c$（严格等于）</td><td>$1$</td><td>$0$（严格为 0，边界不可导）</td></tr>
+<tr class="highlight-row"><td>softcap</td><td>$\beta\tanh(x/\beta)$</td><td>$\to\pm\beta$（极限，不严格等于）</td><td>$\approx 1$（局部展开）</td><td>$1-\tanh^2(x/\beta)$，指数衰减非零</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>关键行是最后一列：</p>
+
+<ul>
+  <li><b>hard clamping 的导数</b>在 $|x|>c$ 时严格为 0。这意味着一旦某个 pre-activation 进入饱和区（$|x|>c$），梯度反向传播到这里就被截断——这个坐标"死"了，模型没法把它拉回非饱和区。</li>
+  <li><b>softcap 的导数</b> $1-\tanh^2(x/\beta)$ 在 $|x|\to\infty$ 时<b>指数衰减趋于 0 但不严格为 0</b>。即使坐标已深饱和，仍能传梯度（虽然量级很小），模型可以缓慢把它拉回非饱和区。</li>
+</ul>
+
+<p>K3 §B 末段原文（C8）：</p>
+
+<blockquote class="meta">
+<p>"Unlike hard clamping of gate pre-activations, the smooth cap preserves nonzero gradients away from saturation boundaries, which we find to give better training behavior."</p>
+</blockquote>
+
+<p>翻译：与对门 pre-activation 做 hard clamping 不同，smooth cap 在远离饱和边界处保留非零梯度，我们观察到这给出更好的训练行为。</p>
+
+<details>
+<summary>补充：$\tanh$ 的指数渐近形式与 softcap 饱和区梯度</summary>
+<p>$\tanh$ 的指数表示为 $\tanh z = 1 - \frac{2}{e^{2z}+1}$。当 $z\to+\infty$ 时 $e^{2z}\to\infty$，所以 $\tanh z\to 1 - 0 = 1$；更精确地，$\tanh z = 1 - 2e^{-2z}+O(e^{-4z})$。导数 $\tanh'(z)=1-\tanh^2 z$ 在 $z\to+\infty$ 时为 $1-(1-2e^{-2z})^2\approx 4e^{-2z}$。</p>
+<p>代入 softcap 的导数（链式法则）：$\frac{d}{dx}[\beta\tanh(x/\beta)]=\beta\cdot\tanh'(x/\beta)\cdot(1/\beta)=\tanh'(x/\beta)=1-\tanh^2(x/\beta)$。当 $x\gg\beta$ 时，$\tanh(x/\beta)\approx 1-2e^{-2x/\beta}$，导数 $\approx 4e^{-2x/\beta}$——指数衰减。</p>
+<p>对 $x=100,\beta=4$（饱和深度 25 倍 $\beta$）：导数 $\approx 4e^{-50}\approx 7.7\times 10^{-22}$——极小但非零。对 $x=100,\beta=25$（饱和深度 4 倍 $\beta$）：导数 $\approx 4e^{-8}\approx 1.3\times 10^{-3}$——虽小但仍有梯度。</p>
+<p>对照 hard clamping 在 $|x|>c$ 时导数严格为 0。差别是"虽然小到几乎没用、但仍非零"vs"严格 0"——这是"远点仍能缓慢学"与"远点彻底不学"的差别。</p>
+</details>
+
+<p>这里要做一个边界澄清（误解 5）：K3 §B 末段说的"away from saturation boundaries"不是"饱和后梯度恒非零"，而是<b>远离饱和边界处非零</b>。进入深饱和后梯度指数衰减，不是恒定非零——但它<b>始终严格大于 0</b>，不像 hard clamping 那样在 $|x|>c$ 时直接归零。这一差别是 K3 §B 选择 softcap 而非 hard clamping 的核心依据。</p>
+
+<p>另外要注意：K3 §B 末段那句"better training behavior"是<b>经验陈述</b>，不是对照实验结论。报告没有给 SiTU-GLU vs (SwiGLU + clip) 的对照训练曲线，只是说"我们观察到"。读者不应据此把"softcap 比 clip 更好"扩大成普适结论。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 clip 与 softcap 在 $|x|>c$（或 $|x|>\beta$）时的导数；</li>
+  <li>解释为什么"饱和后梯度仍非零"对训练有利；</li>
+  <li>指出 K3 §B 末段"better training behavior"是经验陈述还是对照实验结论。</li>
+</ul>
+
+<h2 id="usage-and-boundary">在 K3 中的使用位置与不解决的问题</h2>
+
+<p>SiTU-GLU 在 K3 中有两个使用位置（K3 §2.3 + §4 对比表）：</p>
+
+<ul>
+  <li><b>Stable LatentMoE 路由分支 FFN</b>：抑制 §2.3 开头描述的"四连矩阵相乘 + 2.8T 规模"激活爆炸。这是 SiTU-GLU 的核心使用场景。</li>
+  <li><b>Dense FFN</b>：K2→K3 架构对比表（§4）显示激活函数从 K2 的 SwiGLU 整体换成 SiTU-GLU。</li>
+</ul>
+
+<p>SiTU-GLU 在 Stable LatentMoE 的三件套中只占一项：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>组件</th><th>负责</th><th>K3 章节</th></tr></thead>
+<tbody>
+<tr><td>RMSNorm</td><td>前置 up-projection，减少 routed 表征对尺度变化的敏感性</td><td>§2.3.1</td></tr>
+<tr class="highlight-row"><td>SiTU-GLU</td><td>抑制激活爆炸（控制两支乘性因子有界）</td><td>§2.3.2</td></tr>
+<tr><td>Quantile Balancing（QB）</td><td>负载均衡（896 专家池下的 Top-k 路由平衡）</td><td>§2.3.3</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>这三件套是<b>并列</b>的，各管一件事。SiTU-GLU 不解决 QB 的负载均衡问题，QB 也不解决激活爆炸——它们是 K3 在 Stable LatentMoE 上针对两个不同失败模式（§2.3 开头列出的两条）的独立对策。</p>
+
+<p>SiTU-GLU 不解决的问题：</p>
+
+<ul>
+  <li><b>不解决 Quantile Balancing 的负载均衡</b>：QB 是 §2.3.3 的独立组件，处理 896 专家池下"负载不均"问题。SiTU-GLU 只管激活的数值有界性，不干预路由分布。</li>
+  <li><b>不解决 MLA 注意力内部的稳定性</b>：K3 用 KDA–MLA 混合注意力机制，注意力的稳定性是另一个独立问题，与 SiTU-GLU 无关。</li>
+  <li><b>不保证训练损失一定下降</b>：K3 §2.3.2 末段只承诺"preserves the local response of SwiGLU while controlling both factors"——这是<b>结构上的有界性</b>保证，不是训练或性能保证。报告未给 SiTU-GLU vs SwiGLU 的对照实验。</li>
+  <li><b>不解决 low-precision 算术的全部问题</b>：SiTU-GLU 降低溢出风险，但低精度训练还有舍入误差、累加顺序、优化器状态精度等问题，需要专门方案。</li>
+</ul>
+
+<p>收尾的几条常见误解（与开头"最容易误解"对应）：</p>
+
+<ul>
+  <li><b>"SiTU-GLU 就是把 SwiGLU 输出 clip 到 100"</b>——不对（S4 已展开）。SiTU-GLU 在乘积的两个因子<b>内部</b>套 softcap，不是对最终输出做 clip。</li>
+  <li><b>"SiTU-GLU 一定比 SwiGLU 训练更稳/性能更好"</b>——不对（本节）。K3 §2.3.2 末段只承诺结构有界性，未给性能对照实验。</li>
+  <li><b>"$\beta_1=4,\beta_2=25$ 是普适最优"</b>——不对（S3 已展开）。这是 K3 的工程设定，无对照实验。</li>
+  <li><b>"只套门支就够"</b>——不对（S3 已展开）。值支不套则上界立即失效。</li>
+  <li><b>"softcap 在饱和区等价于 hard clamping"</b>——不对（S4 已展开）。两者输出在远点都接近 $\pm\beta$，但 softcap 导数指数衰减非零、hard clamping 导数严格为 0。</li>
+</ul>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>说出 SiTU-GLU 在 K3 的两个使用位置；</li>
+  <li>指出 SiTU-GLU 在 Stable LatentMoE 三件套中只负责哪一项；</li>
+  <li>指出 SiTU-GLU 不解决的一类问题（举一个非 QB、非 MLA 的例子也可）。</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<ul>
+  <li>C1（SiTU-GLU 定义）：Kimi K3 Technical Report §2.3.2 Eq.(12)。本地存档 <code>/tmp/kimi-k3-research/k3-report.txt:498-502</code>。</li>
+  <li>C2（softcap 套到门支线性因子与值支）：K3 §2.3.2 第二段与 §B 第二段。本地 <code>k3-report.txt:497-498, 2763-2766</code>。</li>
+  <li>C3（SwiGLU 两因子无界、GLU sigmoid 门有界但不保留 Swish 形状）：K3 §2.3.2 第二段。本地 <code>k3-report.txt:492-496</code>。</li>
+  <li>C4（$\beta_1=4, \beta_2=25$ 工程设定）：K3 §2.3.2 末段。本地 <code>k3-report.txt:541-542</code>。</li>
+  <li>C5（softcap 局部展开 $z+O((z/\beta)^3)$，一阶等价 SwiGLU）：K3 §B Eq.(18)。本地 <code>k3-report.txt:2768-2774</code>。</li>
+  <li>C6（$\beta_1,\beta_2\to\infty$ 逐点收敛到 SwiGLU）：K3 §B Eq.(18) 后一句。本地 <code>k3-report.txt:2773-2774</code>。</li>
+  <li>C7（输出上界 $\beta_1\beta_2=100$）：K3 §B Eq.(19)。本地 <code>k3-report.txt:2776-2779</code>。</li>
+  <li>C8（softcap vs hard clamping，饱和区非零梯度，better training behavior）：K3 §B 末段。本地 <code>k3-report.txt:2780-2781</code>。</li>
+  <li>C9（K3 Stable LatentMoE 路由分支激活爆炸、四连矩阵相乘）：K3 §2.3 开头。本地 <code>k3-report.txt:429-432, 461-463</code>。</li>
+  <li>C10（K2→K3 激活函数 SwiGLU→SiTU-GLU）：K3 §4 对比表。本地 <code>k3-report.txt:756</code>。</li>
+</ul>
+
+<h3>核心公式与来源</h3>
+<ul>
+  <li>F1 SiTU-GLU 定义：K3 §2.3.2 Eq.(12)。</li>
+  <li>F2 softcap $\beta\tanh(x/\beta)$：K3 §2.3.2 Eq.(12) 前定义式。</li>
+  <li>F3 局部展开 $\beta\tanh(z/\beta)=z+O((z/\beta)^3)$：K3 §B Eq.(18)。</li>
+  <li>F4 上界 $|\mathrm{SiTU\text{-}GLU}|\le\beta_1\beta_2$：K3 §B Eq.(19)。</li>
+  <li>F5 极限 $\beta_1,\beta_2\to\infty$ 收敛到 SwiGLU：K3 §B Eq.(18) 后一句。</li>
+  <li>F6 SwiGLU $\mathrm{SwiGLU}(x)=(W_g x\cdot\sigma(W_g x))\odot(W_u x)$：Shazeer 2020 §2 Eq.(5)，经 <a href="../../wiki/glu/research/evidence.md">GLU 概念页 evidence F6</a> 已登记。</li>
+  <li>F7 $\tanh'(z)=1-\tanh^2(z)$：标准定义（基础记号）。</li>
+  <li>F8 $\mathrm{clip}(x,c)=\min(\max(x,-c),c)$：标准定义（基础记号）。</li>
+  <li>F9 clip 导数：标准定义（基础记号）。</li>
+</ul>
+
+<h3>外部数字与实验条件</h3>
+<ul>
+  <li>N1：K3 设定 $\beta_1=4,\beta_2=25$，输出上界 $\beta_1\beta_2=100$。来源：K3 §2.3.2 末段 + §B Eq.(19)。</li>
+  <li>N2：K2→K3 激活函数对比表行 SwiGLU→SiTU-GLU。来源：K3 §4 对比表。无具体性能数字。</li>
+</ul>
+
+<h3>教学示例</h3>
+<ul>
+  <li>贯穿手算例子：标量 $x\in\{0,10,100\}$，设两支 pre-act 均为 $x$（隔离函数行为）。构造目的：让读者看到原点附近与 SwiGLU 同值、远点逼近上界 100、负侧被 sigmoid 杀到 0 三个关键点。数字为教学构造，不代表真实 FFN 两支共享同一权重。</li>
+  <li>$x=2$、$x=50$ 中间点手算（折叠块）：验证从原点到饱和的过渡平滑。</li>
+  <li>$z=0.5,\beta=4$ 验证局部展开（折叠块）：$4\tanh(0.125)\approx 0.49741$，理论 $-z^3/(3\beta^2)\approx -0.00260$，吻合。</li>
+  <li>$x=100,\beta=4/25$ 的梯度数值（折叠块）：导数 $\approx 1.4\times 10^{-21}$（深饱和）与 $\approx 1.3\times 10^{-3}$（浅饱和），验证"非零但极小"。</li>
+  <li>对照 SwiGLU 在 $x=0/10/100$ 的输出 $0/99.995/10000$：构造目的是直观展示"无界增长 100 倍"，对照 SiTU-GLU 的 99.93。</li>
+</ul>
+
+<h3>教学解释与类比边界</h3>
+<ul>
+  <li>"softcap 平滑饱和到 $\pm\beta$"——只解释 $\tanh$ 值域 $(-1,1)$ 乘 $\beta$ 后压到 $(-\beta,\beta)$ 的<b>数值范围</b>关系。失效边界：$\beta\tanh(x/\beta)$ 严格小于 $\pm\beta$（开区间），不是严格等于；只有在 $|x|\to\infty$ 极限时才趋于 $\pm\beta$。</li>
+  <li>"SiTU-GLU 是 SwiGLU 的有界化版本"——只解释 $\beta\tanh(x/\beta)$ 替换 SwiGLU 中线性因子 $x$ 这一<b>结构关系</b>，依据 §B 极限行为 $\beta\to\infty$ 收敛到 SwiGLU。失效边界：$\beta_1,\beta_2$ 有限时 SiTU-GLU 与 SwiGLU 数值不同，不能在工程计算中互相替换。</li>
+  <li>"饱和区仍能传梯度"——只解释 $1-\tanh^2(x/\beta)$ 严格非零这一<b>导数性质</b>。失效边界：深饱和时梯度指数衰减接近 0，"非零"是数学严格性、不是工程意义上的"有用梯度"。</li>
+</ul>
+
+<h3>教学简化及其限制</h3>
+<ul>
+  <li>设两支 pre-act 均为同一标量 $x$。简化理由：隔离 SiTU-GLU 函数本身的行为，不被 $W_g,W_u$ 的具体值干扰。可推出：原点近线性、正侧饱和到上界、负侧 sigmoid 杀尾三个性质。不可推出：真实 FFN 中两支 pre-act 分布不同时的精确输出——那需要 $W_g x$ 与 $W_u x$ 各自的分布。</li>
+  <li>用标量代替向量。简化理由：SiTU-GLU 的逐元素性质使得标量分析直接推广到向量。可推出：每个坐标独立满足上界。不可推出：不同坐标间的相关性或联合分布性质。</li>
+  <li>hard clamping 用 $\mathrm{clip}(x,c)=\min(\max(x,-c),c)$ 单一定义，不展开 clip 在不同框架中的变体（如梯度截断 clip-by-value、clip-by-norm）。简化理由：本文只需对比"输出截断、梯度归零"这一最简形式。可推出：softcap 在饱和区梯度优于 clip 这一结论。不可推出：所有梯度截断技术的对比。</li>
+  <li>Stable LatentMoE 四连矩阵相乘只用一句话提及，不展开 $W_\downarrow$/expert/$W_\uparrow$ 的具体结构。简化理由：本文焦点是 SiTU-GLU，不是 MoE 架构。可推出：激活爆炸的动机语境。不可推出：四连矩阵的具体维度与计算图——属 Stable LatentMoE 概念页。</li>
+  <li>$\tanh,\sigma,\odot,W x$、hard clamping、$O(\cdot)$ 作为基础记号内联一行定义，不建独立概念页。简化理由：基础数学原语级（类比 $+$、$\exp$），与 <a href="../../wiki/glu/index.html">GLU 概念页</a>处理一致。可推出：SiTU-GLU 所需最小判断。不可推出：这些原语的完整理论。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

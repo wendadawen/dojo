@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quantile Balancing · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · MoE 负载均衡</span>
+      <h1>Quantile Balancing</h1>
+      <p class="lead">从一次前向传播的路由分数分位数直接算出每个专家的 bias，替代 DeepSeek-V3 的固定步长 sign 更新，在 896 专家时仍能几步内收敛到均衡负载。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <!-- 快速阅读正文 -->
+
+    <h2>这是什么</h2>
+    <p>Quantile Balancing（QB）是 Kimi K3 的 MoE 负载均衡方法。它不引入任何损失项，而是直接从一次前向传播的路由分数分布算出每个专家的 bias 应该是多少——不是走一小步，而是一步跳到精确解。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><b>DeepSeek-V3 的 sign 更新在大规模专家时失效</b>：bias 用 $b \leftarrow b + \gamma \cdot \text{sign}(\bar{\ell} - \ell_j)$ 固定步长更新，sign 只保留负载误差的方向不保留幅度。896 专家时收敛慢且震荡，部分专家训练不足。</li>
+      <li><b>$\gamma$ 的两难</b>：大 $\gamma$ 路由震荡，小 $\gamma$ 适应太慢。一个超参数无法同时满足快速纠正和稳定收敛。</li>
+      <li><b>不均衡拖慢训练</b>：专家并行训练中，负载不均会导致部分 GPU 空闲等待，降低集群利用率。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><b>bias 只影响"选谁"，不进权重</b>：Top-k 选择时加 bias，但归一化权重只用原始分数计算。bias 完全在梯度优化之外。</li>
+      <li><b>Top-(k+1) 取 cutoff</b>：不是做 Top-k，而是做 Top-(k+1)，第 (k+1) 个就是"进 Top-k 必须超过的线"。省去单独的 token 侧分位数计算。</li>
+      <li><b>margin = raw score − cutoff</b>：衡量每个专家对每个 token 的吸引力减去门槛。旧 bias 只通过 cutoff 间接进入。</li>
+      <li><b>bias = −分位数</b>：每个专家的 bias 设为其 margin 分布的 $(1-k/n)$ 分位数的负值，恰好使 $q = mk/n$ 个 margin 超过阈值——即目标负载。再减均值去掉公共偏移。</li>
+      <li><b>sign 是 SignSGD，QB 是精确解</b>：两者求解同一个对偶目标，sign 只保留梯度方向走固定步，QB 直接跳到 coordinate minimizer。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><b>QB 无需超参数</b>：不依赖 $\gamma$ 类步长，分位数本身就是最优解。近 $10^3$ 专家时几步内收敛。</li>
+      <li><b>训练用直方图估计分位数</b>：百万级 margins 无法全量收集，改用 per-expert 直方图。各 rank scatter-add 本地 counts，一次 all-reduce 汇总，从 pooled counts 恢复分位数。通信量 $nB$ 整数/layer/step，与 token 数无关。</li>
+      <li><b>推理冻结 bias</b>：训练结束后 bias 固定，推理是纯 Top-k 选择加冻结 bias，无分位数计算。</li>
+      <li><b>不改变路由稀疏性</b>：Top-k 固定，QB 只调 bias 不调 $k$。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoonViT-V2 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · K3 视觉编码器</span>
+      <h1>MoonViT-V2</h1>
+      <p class="lead">Kimi K3 的视觉编码器，一个 27 层 ViT，选择从零训练（next-token prediction）而非 SigLIP 对比预训练初始化，让原生多模态与长上下文同时稳定可行。</p>
+      <p class="meta">更新于 2026-08-09 · 主要依据：K3 报告 §2.4 + 官方 config.json</p>
+    </header>
+
+    <h2>是什么</h2>
+    <p>MoonViT-V2 把图像和视频的像素变成 LLM 能读的视觉 token，是 K3"文本/图像/视频同一 backbone 同一 context"原生多模态架构里的视觉通路。它是一个 27 层、约 0.4B 参数的 Vision Transformer，输出经一个轻量 MLP 投影器映射进 LLM。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li>主流多模态 LLM 用 SigLIP 等对比预训练模型初始化视觉编码器，但 K3 报告发现这种初始化在接入 LLM 联合优化时<strong>梯度不稳定</strong>——SigLIP 初始化的 MoonViT-3D 梯度范数持续更高且频繁尖峰。</li>
+      <li>对比损失偏向"全局语义"，而 LLM 需要的是细粒度的文本与结构线索——预训练目标和最终用途不对齐。</li>
+      <li>K3 要原生多模态 + 1M token 长上下文，还需要在 token 预算内塞下高分辨率图像与多帧视频，这要求架构层面的 token 压缩设计。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>从零 + 同目标。</strong>不加载预训练视觉权重，训练目标就是 LLM 的 next-token prediction。编码器表征从一开始就被"帮 LLM 预测下一个词"塑造，而不是被"图文配不配"塑造。</li>
+      <li><strong>架构服务稳定。</strong>报告把 RMSNorm 和"去除所有 bias"明确定位为"进一步稳定从零优化"的设计，不是任意惯例——和从零训练这一选择配套。</li>
+      <li><strong>一套参数两种模态。</strong>图像和视频用同一套权重；视频注意力拆成帧内空间 + 帧间时间两趟，再加时间池化，避免全对全开销爆炸。</li>
+      <li><strong>pixel-shuffle 压 token。</strong>投影前把 2×2 空间邻域搬进通道维，token 数除以 4，是<strong>无损重排</strong>（压序列长度不压信息量）。3584×3584 的图经此一步从 65536 token 压到 16384 token，在 1M 上下文内可负担。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>MoonViT-V2 在视觉评测上<strong>匹配</strong> SigLIP 初始化的 baseline；报告据此得出：对比预训练作为多模态大模型视觉编码器初始化，在规模上<strong>并非必要</strong>。</li>
+      <li>边界一：结论限定于"作为多模态 LM 视觉编码器初始化"场景，不等于 SigLIP 没用——它在零样本分类等通用视觉任务上仍有效。</li>
+      <li>边界二：结论在 K3 规模（约 2.78T 参数 MoE 主干）下成立，更小规模或不同主干下不保证。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

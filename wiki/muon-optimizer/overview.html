@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Muon 优化器 · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 优化器</span>
+      <h1>Muon 优化器</h1>
+      <p class="lead">对神经网络隐藏层二维权重矩阵的动量更新做 Newton-Schulz 正交化后再作为更新方向的优化器，使各奇异值方向获得均等更新尺度。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li>SGD-momentum 和 Adam 产生的二维权重矩阵更新<strong>条件数很高</strong>，近似低秩——少数奇异值方向拿走绝大部分更新能量，很多方向几乎不被更新。</li>
+      <li>直接用这样的更新矩阵更新参数，等于只优化了少数方向，"稀有方向"（幅度小但对学习重要）被忽略。</li>
+      <li>直接做 SVD 取正交化结果太慢，需要一种只用矩阵乘法就能逼近正交化的高效方法。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>动量在正交化之前加入</strong>：先按 Nesterov momentum 累积历史梯度得到动量矩阵，再对它正交化，而不是对原始梯度正交化。</li>
+      <li><strong>正交化 = 把奇异值拉平到接近 1</strong>：矩阵做 SVD 后，把所有奇异值替换为 1、保留奇异向量方向，等价于取 $UV^\top$。这样各奇异值方向的更新尺度趋于均等。</li>
+      <li><strong>Newton-Schulz 迭代用矩阵乘法逼近正交化</strong>：单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$ 在 SVD 下等价于对每个奇异值施加多项式 $\phi(x)=ax+bx^3+cx^5$。重复 5 步后奇异值被拉平。</li>
+      <li><strong>谱范数归一化保证收敛</strong>：迭代前先把矩阵除以它的 Frobenius 范数，使奇异值落在 $[0,1]$，多项式才能把它们逐步推向 1。这个缩放不改变正交化结果。</li>
+      <li><strong>只需 bfloat16 精度</strong>：NS 迭代只用矩阵乘法，可在 bfloat16 下稳定运行（SVD 和 Shampoo 的某些变体需要 float32），这是它在 GPU 上可行的关键。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>仅用于隐藏层二维权重矩阵</strong>：线性层权重、卷积核（展平后）。标量/向量参数（bias、LayerNorm）用 AdamW——一维参数无法定义"奇异值方向"。</li>
+      <li><strong>embedding 层和输出层（lm_head）虽是二维但也用 AdamW</strong>：前者有 modular norm theory 理论支持，后者是经验结论（无理论解释）。</li>
+      <li><strong>QKV 应分开应用</strong>：训练 transformer 时 Muon 分别应用于 Q、K、V 三个投影矩阵，而非合并为单一 QKV 矩阵。</li>
+      <li><strong>NS 迭代是近似而非精确</strong>：调优系数 $(3.4445, -4.7750, 2.0315)$ 允许奇异值在 $[0.7, 1.3]$ 区间内波动，正交化的关键是"拉平"而非"精确求解"。</li>
+      <li><strong>与 Shampoo 的关系</strong>：Muon 可视为"无累积 Shampoo + momentum"，用 NS 迭代替代 Shampoo 的逆四次根计算。机制细节见 <a href="index.html">深度教学</a>。</li>
+      <li><strong>RMS 对齐缩放因子</strong>（Moonshot 改进，PyTorch 2.12 采用）：正交化后的更新乘以 $0.2\sqrt{\max(m,n)}$，使 update RMS 与 AdamW 一致，便于复用 AdamW 调好的超参。</li>
+    </ul>
+
+    <p>想了解 Newton-Schulz 迭代的 SVD 推导、手算例子、与 Shampoo 的等价证明和完整算法伪代码，进入 <a href="index.html">深度教学</a>。Muon 的按头切分改进见 <a href="../per-head-muon/index.html">Per-Head Muon</a>。</p>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

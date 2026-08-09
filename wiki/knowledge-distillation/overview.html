@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>知识蒸馏（Knowledge Distillation）· 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · 模型压缩 / 训练</span>
+      <h1>知识蒸馏（Knowledge Distillation）</h1>
+      <p class="lead">用教师模型的软概率分布训练更小的学生模型，把教师对类间相似度的判断传给学生。</p>
+      <p class="meta">更新于 2026-08-09</p>
+    </header>
+
+    <h2>这是什么</h2>
+    <p>知识蒸馏（Knowledge Distillation，KD）是一种模型压缩技术：训练一个体量更小的学生模型去匹配大教师模型在温度 $T$ 下输出的概率分布，必要时同时用硬标签做交叉熵校准。核心想法是教师 softmax 输出的非目标类概率携带了"类间相似度"信息——硬标签把这部分全置零丢弃，KD 把它作为监督信号传给学生。</p>
+
+    <h2>为什么需要它</h2>
+    <ul>
+      <li><b>部署成本</b>：训练阶段可以堆 ensemble、用大模型，但部署阶段有延迟、显存、能耗约束。需要把训练阶段的能力压缩到一份可部署的小模型里。</li>
+      <li><b>硬标签丢信息</b>：硬标签是 one-hot，非目标类全零，丢掉了"错得离哪个类近"的类间关系信息（Hinton 称为"暗知识"）。</li>
+      <li><b>ensemble 难部署</b>：10 个模型 ensemble 推理要跑 10 次。KD 把 ensemble 能力吸收到一个单模型里，部署成本回到 1 次。</li>
+    </ul>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><b>暗知识在非目标类里</b>：一张 "7" 的图，硬标签只说"这是 7"；教师软分布可能说"7 概率 0.92，9 概率 0.048，8 概率 0.018"——后者多告诉你 7 像 9 多于像 8。</li>
+      <li><b>温度软化放大暗知识</b>：教师原始 softmax 往往很尖（最大类 0.99），非目标类概率被压在 0.001 量级，梯度信号弱。除以温度 $T>1$ 把 logits 差距压缩、非目标类概率显著放大，让暗知识可见。</li>
+      <li><b>两项损失加权</b>：KD 损失 = $\alpha \cdot T^2 \cdot \mathrm{KL}(\text{教师软分布} \| \text{学生软分布}) + (1-\alpha)\cdot \mathrm{CE}(\text{硬标签}, \text{学生标准分布})$。软项学教师对类间关系的判断，硬项保证推理时仍能命中正确标签。</li>
+      <li><b>$T^2$ 是数学补偿不是加权</b>：温度让 logits 缩小为 $z/T$，KL 梯度被压低约 $1/T^2$ 倍。乘 $T^2$ 把梯度恢复到与硬项可比的量级，让 $\alpha$ 和 $T$ 解耦调参。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><b>MNIST 上有效</b>：2×800 学生硬标签训练 146 错误，蒸馏后降到 74，几乎追平 2×1200 教师的 67 错误（Hinton 2015）。</li>
+      <li><b>语音 ensemble 可压缩</b>：10 模型 ensemble 的 WER 10.7% 可蒸馏到单一模型的 10.7%，帧准确率 60.8% 接近 ensemble 61.1%。</li>
+      <li><b>学生不超过教师</b>：KD 学生最多接近教师能力，不会显著超越。要超过教师需要额外的非蒸馏训练信号（任务奖励、RL 探索等）。K3 的 MOPD 是 on-policy 蒸馏变体，把"谁生成轨迹"从教师改为学生，但学生上限仍受教师限制——见 <a href="../mopd/index.html">MOPD 概念页</a>。</li>
+      <li><b>需要师生同输出空间</b>：logit-based KD 要求师生分类类别（或词表）一致。教师未收敛时软分布不可靠，$T$ 取值需与师生容量匹配——大教师配大 $T$，小学生配小 $T$。</li>
+    </ul>
+
+    <!-- 快速阅读正文：是什么、为什么需要它、核心直觉、关键结论与边界。5 分钟内可扫读，不展开公式推导与手算例子。 -->
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>

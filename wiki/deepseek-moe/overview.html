@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeekMoE · 快速阅读 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">深度教学 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念快速阅读 · MoE 架构</span>
+      <h1>DeepSeekMoE</h1>
+      <p class="lead">DeepSeekMoE 把每个专家切成更小的多个专家、再隔离出对所有 token 恒激活的共享专家，在不涨每 token 计算量的前提下让专家学得更专注、更不重叠。</p>
+      <p class="meta">更新于 2026-08-09 · 依据 Dai et al. 2024 (arXiv:2401.06066)</p>
+    </header>
+
+    <h2>为什么需要它</h2>
+    <p>传统 top-K MoE（背景见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>）专家数量有限，有两个毛病：</p>
+    <ul>
+      <li><strong>知识混合</strong>：一个专家收到的 token 涵盖多种知识，被迫把截然不同的东西塞进同一份参数，难以同时利用。</li>
+      <li><strong>知识冗余</strong>：不同专家都可能需要通用知识（如基本语法），于是各自学一份，参数重复。</li>
+    </ul>
+    <p>两者共同妨碍"专家专门化"——让每个专家获得互不重叠且聚焦的知识。</p>
+
+    <h2>核心直觉</h2>
+    <ul>
+      <li><strong>把专家切小</strong>：每个专家 FFN 中间维度缩为 $1/m$，专家数从 $N$ 变 $mN$、每 token 激活数从 $K$ 变 $mK$。每 token 计算量 $= mK \times (1/m) = K$，一分没涨；但组合数从 $\binom{N}{K}$ 涨到 $\binom{mN}{mK}$（论文例子：120 → 44 亿）。</li>
+      <li><strong>隔离共享专家</strong>：$K_s$ 个专家对所有 token 恒激活、不参与 router 打分，专门承载通用知识；路由专家只承载专门知识，不必再各学一份通用知识。</li>
+      <li><strong>连带调整维持守恒</strong>：引入 $K_s$ 个共享专家后，路由专家总数从 $mN$ 降为 $mN - K_s$、每 token 激活路由专家从 $mK$ 降为 $mK - K_s$；总激活仍是 $mK$，计算量仍守恒。</li>
+      <li><strong>共享专家不参与路由的原因</strong>：通用知识每个 token 都要用，让它参与 router 竞争要么占 top-k 名额、要么偶尔落选，两种都会重新引入冗余或缺失。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li><strong>三架构计算量恒定</strong>：标准 top-K、细粒度分割、完整 DeepSeekMoE 的专家参数与每 token 计算成本相同——这是所有性能对比的前提。</li>
+      <li><strong>实证</strong>：DeepSeekMoE 2B 与 GShard 2.9B（1.5× 专家参数与计算）性能相当；16B 与 LLaMA2 7B 性能相当，仅需约 39.6% 计算；145B 与 DeepSeek 67B 性能相当，仅需 28.5%（可能 18.2%）计算。</li>
+      <li><strong>边界</strong>：性能结论依赖论文实验配置（2B/16B/145B），不可外推到任意规模；组合数变多是机制潜力，性能提升靠实验验证，不能单从机制断言。</li>
+      <li><strong>后续继承</strong>：DeepSeek-V3 继承 shared+routed 组织但改了路由打分（sigmoid + 偏置）；<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>（K3）也继承了这一组织，在其上做隐空间路由与稳定化。</li>
+    </ul>
+
+    <footer>Dojo · 快速阅读 · 想看机制细节进入深度教学</footer>
+  </main>
+</body>
+</html>
