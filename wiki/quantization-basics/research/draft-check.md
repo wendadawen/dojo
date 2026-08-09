@@ -1,0 +1,39 @@
+# 量化基础初稿检查
+
+- 输入版本：scope.md / evidence.md / outline.md / glossary.md 均已写入 `wiki/quantization-basics/research/`，规划完成条件已满足
+- 大纲落实：
+  - 页面开头（钩子 + context-box 四要素 + learning-goals 5 条 + blockquote.meta 主要依据）：已落实
+  - S1 量化要解决什么问题（why-quantize）：已落实，含 N1 压缩比与核心权衡 callout
+  - S2 均匀量化怎么把浮点变成整数（uniform-quantization）：已落实，含 F1 仿射公式、F2 对称特例、符号定义、边界验证、ASCII 图示、E1 手算结果在正文、舍入约定折叠块
+  - S3 量化误差从哪来（quantization-error）：已落实，含三来源定义、per-tensor 单点故障 callout、E2 离群值结论在正文、完整手算折叠块
+  - S4 对称/非对称 与 量化粒度（symmetry-and-granularity）：已落实，含 F3 非对称公式、zero-point 推导折叠块、粒度三档对照表、有效位宽折叠块、粒度须与位宽一起声明 callout
+  - S5 PTQ vs QAT 与 浮点 block-wise 量化（ptq-vs-qat）：已落实，含 PTQ/QAT 定义、F4 STE 约束、伪代码折叠块、可运行代码折叠块、PTQ vs QAT 对照表、STE 透明窗户教学解释 callout、QAT 不恢复精度 callout、MXFP4 块结构与对 mxfp4-qat 的链接
+  - 文末来源与教学说明（sources-and-teaching-notes）：已落实，含核心论断 C1–C9、核心公式 F1–F4、外部数字 N1–N4、教学示例、教学解释与类比边界、教学简化及其限制
+- 学习目标闭环：
+  - Q1（量化要解决什么问题、为什么会引入精度损失）：由 S1 正文完整回答（动机 + 压缩比 + 网格变粗引入误差）
+  - Q2（如何用对称均匀量化编码并反量化）：由 S2 正文完整回答（F1/F2 公式 + E1 手算结果 $s=0.8, x_q=[2,4,7], \hat{x}=[1.6,3.2,5.6]$ 在正文）
+  - Q3（对称/非对称、粒度差别）：由 S4 正文完整回答（对称/非对称公式与适用场景 + 三档粒度对照表 + 有效位宽 4.25 bit 在折叠块但结论"块 32 时约 4.25 bit"在正文 callout 后段落）
+  - Q4（误差三来源、离群值放大）：由 S3 正文完整回答（三来源定义 + E2 离群值结论 $s\approx7.143, x_q=[0,0,1,7]$ 在正文）
+  - Q5（PTQ/QAT 差别、MXFP4 优势）：由 S5 正文完整回答（PTQ/QAT 定义 + STE 约束 + MXFP4 块结构 + 两点优势 + 对 mxfp4-qat 链接）
+  - 折叠块全部收起时正文仍能回答全部 5 个学习目标：是（手算完整过程、推导、伪代码、可运行代码均放折叠块，正文只保留公式、结论与机制说明）
+- 代码运行：
+  - 代码块 1（S5 可运行代码"对称均匀量化与离群值放大"）：
+    - 运行命令：`python3 wiki/quantization-basics/research/run_embedded_code.py`（从页面代码块提取后执行）
+    - 退出码：0
+    - 实际输出与页面"预期输出"块逐行一致：
+      - E1 scale=0.8、x_q=[2,4,7]、x_hat=[1.6,3.2,5.6]、error=[0.4,-0.2,0.0]、s/2=0.4
+      - E2 scale=7.1429、x_q=[0,0,1,7]、x_hat=[0.0,0.0,7.1429,50.0]、error=[-1.2,-3.4,1.5429,0.0]
+      - E3 块 A scale=0.8、块 B scale=7.1429、正常块精度恢复
+    - 浮点显示问题已通过 `round(s, 4)` 修正，输出与手算一致
+  - 代码块 2（S5 伪代码"QAT 前向伪量化 + 反向 STE"）：标为 language-text 伪代码，非可运行语言，无需执行
+- 机械检查：
+  - 命令：`python3 .dojo/scripts/validate.py wiki/quantization-basics/index.html`
+  - 结果：`validation ok: wiki/quantization-basics/index.html`，退出码 0
+  - 命令：`python3 .dojo/scripts/validate.py wiki/quantization-basics/overview.html`
+  - 结果：`validation ok: wiki/quantization-basics/overview.html`，退出码 0
+  - 无残留占位符 `【...】`、无 `@content`/`@component`/`TODO`/`TBD` 标记、无重复 id、无指向缺失 id 的锚点、无断裂本地引用
+- 公式渲染与交互：
+  - KaTeX 公式（$...$ 与 $$...$$）由外壳脚本自动渲染；F1/F2/F3/F4 与正文公式语法已按 KaTeX 约定书写（\mathrm{round}、\mathrm{clip}、\frac、\big 等均合法）
+  - 折叠块 details/summary、代码块复制按钮、章节折叠按钮、侧边目录、暗亮模式切换由外壳脚本提供，已沿用外壳类名
+  - 浏览器实际打开未执行（本环境无浏览器），但 validate.py 通过且 HTML 结构与模板一致
+- 写作偏差：无。大纲的章节、学习目标、前置知识引用、贯穿例子 $[1.2,3.4,5.6]$（含离群值版本）、误解和边界、过渡均已落实；MXFP4 部分按大纲只给块结构与两点优势，完整 QAT 细节链接到 mxfp4-qat 页面，未越界展开

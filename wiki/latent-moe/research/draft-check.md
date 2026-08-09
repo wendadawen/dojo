@@ -1,0 +1,22 @@
+# LatentMoE 初稿检查
+
+- 输入版本：scope.md / evidence.md / outline.md / glossary.md 均已完成，规划完成条件满足。
+- 大纲落实：
+  - 页面开头（钩子 + 一句话 + context-box + learning-goals + 常见误解 callout + 主要依据 blockquote）：已落实。
+  - S1 扩大专家池的代价（对应 Q1，C2，F1）：已落实，含 $d=4096$ 教学示例。
+  - S2 LatentMoE 层结构（对应 Q2，C1，C7，F2）：已落实，含完整公式、符号定义、ASCII 图示、共享/路由分支对照表、MLA 类比折叠块。
+  - S3 压缩比与 Reinvestment（对应 Q3，C3，C4，F3，F4）：已落实，含 $d=4096,\ell=1024$ 教学示例、$N=8,k=2 \to N'=32,k'=8$ 组合数手算、可运行代码折叠块、标准/LatentMoE 对照表。
+  - S4 压缩下限与投影成本（对应 Q4，C5，N4，N5）：已落实，含三条约束、边界 callout、五条设计原则折叠块、Nemotron-3 配置折叠块。
+  - S5 与 Stable LatentMoE 的关系（对应 Q5，C6，N1）：已落实，含 K3 配置表、关系图示、通用/Stable 对照表。
+  - 文末来源与教学说明（必有）：已落实，含核心论断与来源、核心公式与来源、外部数字与实验条件、教学示例、教学解释与类比边界、教学简化及其限制六个小节。
+- 学习目标闭环：
+  - Q1（标准 MoE 路由开销 + LatentMoE 结构变化）：由 S1 正文完整回答（dispatch 通信与专家权重读取随 $k \cdot d$ 线性增长；LatentMoE 用 $W_\downarrow$/$W_\uparrow$ 把路由专家放进 $\ell$）。
+  - Q2（共享/路由分支宽度与投影 + 完整公式）：由 S2 正文完整回答（公式 F2 + 符号定义 + 数据流图 + 对照表）。
+  - Q3（开销缩小比例 + reinvest 去向）：由 S3 正文完整回答（$d/\ell$ 比例 + 同时放大 $N$ 与 $k$ + 组合数手算）。
+  - Q4（压缩比约束）：由 S4 正文完整回答（特征秩下限 + 投影成本 + 只压缩不 reinvestment 会掉点）。
+  - Q5（与 Stable LatentMoE 的关系）：由 S5 正文完整回答（= LatentMoE + 三件稳定化 + K3 配置对照）。
+  - 全部目标由正文章节完整回答，无折叠块独占。
+- 代码运行：S3 可运行代码块——运行命令 `python3`（内联执行），退出码 0，实际输出与页面"预期输出"块一致（top-8: 32768→8192 缩小 4x；top-16: 65536→16384 缩小 4x；C(8,2)=28→C(32,8)=10518300；投影参数量 8388608）。无其他可运行代码块。
+- 机械检查：`python3 .dojo/scripts/validate.py wiki/latent-moe/index.html` → 退出码 0，输出 `validation ok: wiki/latent-moe/index.html`。
+- 公式渲染与交互：KaTeX delimiters 已配置（`$$...$$` display、`$...$` inline）；折叠块用 `<details>` 标签；章节 id 显式指定（s1-standard-moe-cost 等），目录与折叠按钮依赖的 id 齐全；前置概念页链接（moe-serving、deepseek-moe、stable-latent-moe）均指向已存在页面。
+- 写作偏差：无。大纲全部章节、学习目标、前置知识、贯穿例子、误解和边界、过渡均已按 outline.md 落实，未引入范围外内容。
