@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeek Sparse Attention（DSA）：只读最相关的 k 个位置</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">DSA</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="5 分钟快速阅读">快速阅读</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">DeepSeek Sparse Attention（DSA）：只读最相关的 k 个位置</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：arXiv:2512.02556《DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models》（2025-12-02 提交版 LaTeX 源码）、DeepSeek-V3.2-Exp 官方开源推理实现（HuggingFace，commit <code>194c67e</code>）、vLLM 实现（commit <code>5ac2684</code>）</p>
+</blockquote>
+
+<p>一个模型已经读进 128K token 的上下文，现在要生成第 128001 个 token。这一步里，注意力要把新 token 的查询与前面 128000 个位置逐一比对，算出 128000 个分数，再按分数加权求和。下一个 token 到来时，这件事从头再做一遍——而且这次是 128001 个位置。</p>
+
+<p>问题不在于这些计算做错了什么，而在于其中绝大部分位置对当前这一步几乎没有贡献。DeepSeek Sparse Attention（DSA）针对的正是这件事：先用一个成本极低的打分器给历史中每个位置评一个相关性分数，只让分数最高的 $k$ 个位置参与完整的注意力计算。主注意力的代价因此从"与序列长度平方成正比"变成"与序列长度成正比"。</p>
+
+<section class="learning-goals">
+  <h2>读完你能回答</h2>
+  <ul>
+    <li>长上下文为什么必须动注意力，滑动窗口和线性注意力为什么不是同一条路？</li>
+    <li>lightning indexer 如何给一个历史位置打分，为什么它比主注意力便宜得多？</li>
+    <li>top-k 选择如何接回主注意力，为什么所有注意力头必须读同一批位置？</li>
+    <li>indexer 的打分能力从哪来，为什么需要两个阶段的续训？</li>
+    <li>DSA 省下了什么、没省下什么，什么情况下它完全不起作用？</li>
+  </ul>
+</section>
+
+<div class="callout callout-gray">
+<p><b>进入本页前需要的基础</b>：注意力机制中 query（查询向量，代表"当前位置想找什么"）、key（键向量，代表"每个历史位置提供什么"）、value（值向量，代表"取用时实际读到的内容"）三者的分工，以及"多头"的含义（同一层里并行跑多套 query/key/value 投影，各自关注不同模式）。这些在<a href="../standard-attention/index.html">标准注意力</a>概念页有完整讲解，不熟悉的话建议先读那一页。</p>
+<p>其余前置概念（<a href="../mla/index.html">MLA</a>、<a href="../mqa-gqa/index.html">MQA/GQA</a>、<a href="../rope/index.html">RoPE</a>、<a href="../quantization-basics/index.html">量化基础</a>、<a href="../linear-attention/index.html">线性注意力</a>、<a href="../kda/index.html">KDA</a>）在正文首次用到处都给了链接，读到那里再看即可。</p>
+</div>
+
+<div class="context-box">
+  <p class="context-box-title">全文贯穿例子</p>
+  <div class="context-grid">
+    <div class="context-label">序列长度</div><div class="context-value">8 个位置，第 8 个是当前 query（真实场景是 128K，这里缩小到能手算）</div>
+    <div class="context-label">选取数量</div><div class="context-value">$k = 3$（真实模型中 $k = 2048$）</div>
+    <div class="context-label">indexer 规模</div><div class="context-value">2 个头、每头 2 维（真实模型中 64 个头、每头 128 维）</div>
+    <div class="context-label">数字性质</div><div class="context-value">全部人为构造，为教学示例，不代表真实权重或推荐值</div>
+  </div>
+</div>
+
+<p>下面先把代价的结构说清楚——只有知道钱花在哪里，才能判断该砍哪一刀。</p>
+
+<h2 id="cost-structure">长上下文里，注意力的代价长在哪里</h2>
+
+<p>标准的<a href="../standard-attention/index.html">稠密注意力</a>规定：每个位置的查询要和它之前的每一个位置比对一次。序列里第 1 个位置只有 1 个对象可比，第 2 个有 2 个，第 8 个有 8 个。把 8 个位置的比对次数加起来是 $1+2+\cdots+8 = 36$ 次。</p>
+
+<p>把序列翻倍到 16 个位置，比对次数变成 $1+2+\cdots+16 = 136$ 次。长度翻了 1 倍，工作量涨了将近 4 倍。写成一般形式，长度 $L$ 的序列需要 $L(L+1)/2$ 次配对，量级是 $O(L^2)$。这就是"平方"的含义：序列每长一点，代价涨得比长度本身快得多。</p>
+
+<p>推理时这件事还有第二层。生成阶段每次只产生一个新 token，它的查询要和全部历史位置比对，因此每生成一个 token 都要把整个 KV cache（缓存下来的历史 key/value 条目）从显存里读一遍。128K 上下文下这是每步都要搬动的大块数据，瓶颈往往不在算得快不快，而在数据搬不搬得过来。</p>
+
+<div class="callout callout-yellow">
+<p>这里要区分两种"让注意力更快"。FlashAttention 一类的工作改的是<b>怎么算</b>——通过分块和减少显存往返，让同一批计算跑得更快，算出的结果与朴素实现完全一致，读的仍是全部位置。本页讨论的是另一件事：<b>能不能少读</b>。两者互不冲突，可以叠加。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>序列从 8 个位置增长到 16 个位置，配对次数从多少变到多少？</li>
+  <li>生成一个新 token 时，为什么整个 KV cache 都要被读一遍？</li>
+  <li>如果一个方法让稠密注意力的 kernel 快了 3 倍，它减少了配对次数吗？</li>
+</ul>
+
+<h2 id="two-routes">两条减负路线，以及 DSA 选的那条</h2>
+
+<p>既然要少读，就得决定读哪些。这里有两条方向完全不同的路。</p>
+
+<p><b>路线一：按位置固定地砍。</b>最典型的是滑动窗口——只看最近的若干个位置，更早的一律不看。它便宜且实现简单，但代价直接：窗口之外的信息不是被降权，是被彻底丢掉。如果关键信息恰好在很远的位置（长文档问答里这是常态），窗口方案就失效了。</p>
+
+<p><b>路线二：换掉注意力本身的形式。</b><a href="../linear-attention/index.html">线性注意力</a>及其现代变体（如 <a href="../kda/index.html">KDA</a>）不再为每个位置保留一份 KV 条目，而是把历史压进一个固定大小的状态里递推。代价随长度线性增长，KV cache 也不再随长度膨胀，但换来的是精确检索能力的损失——固定大小的状态无法无损保留任意长历史里的任意细节。</p>
+
+<p>DSA 走的是第三条：<b>保留 softmax 注意力的完整形式，只减少每个查询实际读取的位置数，并且让"读哪些"由内容决定而不是由位置决定。</b>被选中的位置照旧做完整的注意力计算，因此精确检索能力保留；没被选中的位置这一步不参与，因此代价下降；而选择依据是学出来的相关性分数，所以很远处的关键位置照样能被选中。</p>
+
+<p>在贯穿例子上看这个差别。假设 8 个位置里，与当前查询真正相关的是第 2 和第 7 个位置（分数的具体算法下一章给出）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>方案</th><th>第 8 个位置读取的位置</th><th>读取数量</th><th>关键信息是否保留</th></tr></thead>
+<tbody>
+<tr><td>稠密注意力</td><td>1, 2, 3, 4, 5, 6, 7, 8</td><td>8</td><td>全部保留</td></tr>
+<tr><td>滑动窗口（最近 3 个）</td><td>6, 7, 8</td><td>3</td><td>第 2 个位置丢失</td></tr>
+<tr><td>DSA（$k=3$）</td><td>2, 7, 8</td><td>3</td><td>保留，代价是放弃了低分的第 6 个位置</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>三种方案的读取数量对比说明了 DSA 的取向：读取量与滑动窗口相同，但选中的是"分数高的"而非"位置近的"。滑动窗口丢掉了远处的第 2 个位置，DSA 保留了它，代价是放弃了近处但低分的第 6 个位置。</p>
+
+<div class="callout callout-purple">
+<p>"由内容决定"是 DSA 与固定模式稀疏的分界线，也是它的成本所在：必须先给每个位置算出一个分数，才知道该选谁。这个打分器本身若不够便宜，省下的计算就被它自己吃掉了。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>滑动窗口在什么场景下会失效，为什么 DSA 在同样场景下不会？</li>
+  <li>线性注意力和 DSA 在"KV cache 是否随长度增长"这一点上有什么不同？</li>
+  <li>为什么 DSA 必须额外付出一笔打分的成本，而滑动窗口不需要？</li>
+</ul>
+
+<h2 id="lightning-indexer">lightning indexer 如何用极低成本给每个位置打分</h2>
+
+<p>打分器的任务比主注意力轻得多。主注意力算出的分数要直接用作加权系数，参与最终输出的构造，因此精度要求高。打分器只需要给出一个<b>排序</b>：谁比谁更值得读。排序对数值误差的容忍度远高于加权求和，这就是它能被大幅简化的空间。</p>
+
+<p>DSA 的打分器叫 lightning indexer（闪电索引器）。它给查询 token $\mathbf{h}_t$ 与它之前的 token $\mathbf{h}_s$ 算一个 index score：</p>
+
+$$I_{t, s} = \sum_{j=1}^{H^I} w_{t, j}^I \cdot \mathrm{ReLU}\left(\mathbf{q}^{I}_{t, j} \cdot \mathbf{k}^{I}_{s}\right)$$
+
+<ul>
+  <li>$t$：当前查询 token 的位置；$s$：被打分的历史位置。论文的表述是"在 $t$ 之前的 token"；官方实现的因果掩码用 <code>triu_(1)</code> 从对角线上方开始屏蔽，对角线本身不屏蔽，因此 $s$ 实际取遍 $t$ 之前的位置<b>以及 $t$ 自身</b>。本页按实现口径处理，贯穿例子中当前位置 8 也参与打分。</li>
+  <li>$H^I$：indexer 的头数。这是 indexer 自己的头，与主注意力的头无关。</li>
+  <li>$j$：indexer 头的索引，从 1 取到 $H^I$。</li>
+  <li>$\mathbf{q}^I_{t,j} \in \mathbb{R}^{d^I}$：indexer 第 $j$ 头在位置 $t$ 的 query 向量，由 $\mathbf{h}_t$ 导出，$d^I$ 是 indexer 每头的维度。</li>
+  <li>$\mathbf{k}^I_s \in \mathbb{R}^{d^I}$：位置 $s$ 的 indexer key，由 $\mathbf{h}_s$ 导出。注意它<b>不带头下标</b>——全部 indexer 头共用同一个 $\mathbf{k}^I_s$。</li>
+  <li>$w^I_{t,j} \in \mathbb{R}$：第 $j$ 头的标量权重，也由 $\mathbf{h}_t$ 导出，决定这个头的意见在总分里占多少比重。</li>
+  <li>$\mathrm{ReLU}(x) = \max(x, 0)$：把负的点积截成 0。</li>
+</ul>
+
+<p>这个式子是定义式，不是推导结论，因此不展开推导。理解它的方式是代入算一遍：每个 indexer 头拿自己的 query 与该位置的 key 做点积，负值截成 0，再按各头的权重加权求和，得到这个位置的总分。</p>
+
+<h3 id="indexer-example">在贯穿例子上手算</h3>
+
+<p>教学示例。取 $H^I = 2$、$d^I = 2$，当前查询在位置 8。indexer 的两个 query 向量与两个头权重是</p>
+
+$$\mathbf{q}^I_{8,1} = (1, 0),\quad \mathbf{q}^I_{8,2} = (0, 1),\quad w^I_{8,1} = 1.0,\quad w^I_{8,2} = 0.5$$
+
+<p>这样取是为了让点积一眼可算：头 1 只看 key 的第一维，头 2 只看第二维。8 个位置的 indexer key 与算出的分数：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>$s$</th><th>$\mathbf{k}^I_s$</th><th>头 1 点积</th><th>ReLU 后</th><th>头 2 点积</th><th>ReLU 后</th><th>$I_{8,s}$</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>$(2, 0)$</td><td>$+2.00$</td><td>2.00</td><td>$0.00$</td><td>0.00</td><td>2.00</td></tr>
+<tr><td>2</td><td>$(1, 3)$</td><td>$+1.00$</td><td>1.00</td><td>$+3.00$</td><td>3.00</td><td>2.50</td></tr>
+<tr><td>3</td><td>$(-1, 0.5)$</td><td>$-1.00$</td><td>0.00</td><td>$+0.50$</td><td>0.50</td><td>0.25</td></tr>
+<tr><td>4</td><td>$(0.5, -2)$</td><td>$+0.50$</td><td>0.50</td><td>$-2.00$</td><td>0.00</td><td>0.50</td></tr>
+<tr><td>5</td><td>$(0, 0)$</td><td>$0.00$</td><td>0.00</td><td>$0.00$</td><td>0.00</td><td>0.00</td></tr>
+<tr><td>6</td><td>$(0.5, 0.5)$</td><td>$+0.50$</td><td>0.50</td><td>$+0.50$</td><td>0.50</td><td>0.75</td></tr>
+<tr><td>7</td><td>$(2, 4)$</td><td>$+2.00$</td><td>2.00</td><td>$+4.00$</td><td>4.00</td><td>4.00</td></tr>
+<tr><td>8</td><td>$(1, 4)$</td><td>$+1.00$</td><td>1.00</td><td>$+4.00$</td><td>4.00</td><td>3.00</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>以 $s=2$ 为例代入：头 1 得 $(1,0)\cdot(1,3) = 1$，头 2 得 $(0,1)\cdot(1,3) = 3$，两者都为正无需截断，加权得 $1.0 \times 1 + 0.5 \times 3 = 2.5$。</p>
+
+<p>位置 3 和位置 4 展示了 ReLU 的作用。$s=3$ 在头 1 上点积为 $-1$，被截成 0，最终分数只由头 2 贡献；$s=4$ 反过来。ReLU 的效果是：某个头认为该位置"负相关"时，这个头不会把总分往下拉，只是不投赞成票。</p>
+
+<details>
+<summary>剩余六个位置的完整代入过程</summary>
+<p>教学示例，全部数字人为构造。</p>
+<p>$s=1$：头 1 $(1,0)\cdot(2,0) = 2$，ReLU 后 2；头 2 $(0,1)\cdot(2,0) = 0$，ReLU 后 0。总分 $1.0\times 2 + 0.5\times 0 = 2.00$。</p>
+<p>$s=3$：头 1 $(1,0)\cdot(-1,0.5) = -1$，ReLU 截成 0；头 2 $(0,1)\cdot(-1,0.5) = 0.5$，ReLU 后 0.5。总分 $1.0\times 0 + 0.5\times 0.5 = 0.25$。</p>
+<p>$s=4$：头 1 $(1,0)\cdot(0.5,-2) = 0.5$，ReLU 后 0.5；头 2 $(0,1)\cdot(0.5,-2) = -2$，ReLU 截成 0。总分 $1.0\times 0.5 + 0.5\times 0 = 0.50$。</p>
+<p>$s=5$：两个头点积都是 0。总分 0.00。这个位置对当前查询没有任何相关性信号。</p>
+<p>$s=6$：头 1 $(1,0)\cdot(0.5,0.5) = 0.5$；头 2 $(0,1)\cdot(0.5,0.5) = 0.5$。总分 $1.0\times 0.5 + 0.5\times 0.5 = 0.75$。</p>
+<p>$s=7$：头 1 $(1,0)\cdot(2,4) = 2$；头 2 $(0,1)\cdot(2,4) = 4$。总分 $1.0\times 2 + 0.5\times 4 = 4.00$，是全部位置中最高的。</p>
+<p>$s=8$：当前 token 对自身打分。头 1 得 1，头 2 得 4，总分 $1.0\times 1 + 0.5\times 4 = 3.00$。</p>
+</details>
+
+<h3 id="why-cheap">便宜来自五处</h3>
+
+<p>论文明确指出，由于 lightning indexer 头数少且可以在 FP8 下实现，其计算效率非常突出（C6）。把便宜的来源拆开看，一共五处：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>来源</th><th>indexer</th><th>V3.2 的主注意力</th></tr></thead>
+<tbody>
+<tr><td>头数</td><td>$H^I = 64$</td><td>128 个注意力头</td></tr>
+<tr><td>每头维度</td><td>$d^I = 128$</td><td>latent 512 维 + rope 64 维</td></tr>
+<tr><td>激活函数 / 归一化方式</td><td>ReLU（逐元素，无需跨序列归一化）</td><td>softmax（需沿序列维归一化）</td></tr>
+<tr><td>精度</td><td>可在 <a href="../quantization-basics/index.html">FP8</a> 下计算</td><td>论文只声称 indexer 可 FP8 实现，未给出主注意力的精度对照</td></tr>
+<tr><td>输出</td><td>每对 token 一个标量分数</td><td>还要用分数去加权聚合 value</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>关于 ReLU，论文给出的理由是"出于吞吐考虑"（C5），没有进一步展开。教学解释：softmax 需要先在整行上求指数和才能得出任何一个归一化结果，是一个跨全序列的规约操作；ReLU 逐元素独立，不需要这类规约。这一解释只用于说明两种运算在实现结构上的差别，论文本身未给出这个论证。</p>
+
+<div class="callout callout-red">
+<p>便宜不等于复杂度降低。indexer 仍然要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$。它改变的是<b>每一对 token 的单价</b>，不是配对的数量。这一点在最后一章会重新算账。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>写出 index score 的公式，并说明 $w^I_{t,j}$ 与 $\mathbf{q}^I_{t,j}$ 各由哪个 token 导出。</li>
+  <li>为什么 $\mathbf{k}^I_s$ 没有头下标，这与主注意力的 key 有什么不同？</li>
+  <li>贯穿例子中位置 3 的分数为什么只有 0.25，哪一步把它压低了？</li>
+  <li>indexer 便宜的五个来源分别是什么，其中哪一个降低了复杂度？</li>
+</ul>
+
+<h2 id="token-selection">top-k 选择，以及候选集为什么必须跨头共享</h2>
+
+<p>有了每个位置的分数，选择这一步很直接：取分数最高的 $k$ 个位置，只让这些位置的 key-value 条目参与注意力。论文把这个组件称为 fine-grained token selection mechanism（细粒度 token 选择），本页在提到它时也会用"top-k 选择"这个更短的说法，两者指同一件事：</p>
+
+$$\mathbf{u}_t = \mathrm{Attn}\left(\mathbf{h}_t, \left\{ \mathbf{c}_s \mid I_{t, s} \in \mathrm{Top\text{-}k}\left(I_{t, :}\right) \right\}\right)$$
+
+<ul>
+  <li>$\mathbf{c}_s$：位置 $s$ 的 key-value 条目。在 V3.2 中它是 <a href="../mla/index.html">MLA</a> 的 latent 向量。</li>
+  <li>$\mathrm{Top\text{-}k}(I_{t,:})$：$I_{t,:}$ 这一行分数里最大的 $k$ 个。</li>
+  <li>$\mathbf{u}_t$：位置 $t$ 的注意力输出。</li>
+  <li>$k$：选取的位置数。V3.2 中 $k = 2048$。注意区分：这个斜体 $k$ 表示数量，而 key 向量一律写作 $\mathbf{k}^I_s$。</li>
+</ul>
+
+<p>接回贯穿例子。上一章算出的 8 个分数按降序是 $s=7$（4.00）、$s=8$（3.00）、$s=2$（2.50）、$s=1$（2.00）、$s=6$（0.75）、$s=4$（0.50）、$s=3$（0.25）、$s=5$（0.00）。取 $k=3$ 得到选中集合 $\{2, 7, 8\}$——这正是第二章表格里 DSA 那一行的来源。</p>
+
+<p>实现上，这个"只对选中位置做注意力"通常通过掩码达成：官方推理实现构造一个掩码张量，把未选中位置置为 $-\infty$，加到注意力分数上再做 softmax（$e^{-\infty} = 0$，这些位置的权重变成 0）。数学结果与"只对 $k$ 个位置计算"一致，但要注意这只是参考实现的表达方式——掩码版本仍然把全部位置算了一遍，真正的性能收益要靠专门的稀疏注意力 kernel 才能拿到。</p>
+
+<h3 id="shared-candidates">为什么所有头读同一批位置</h3>
+
+<p>按"多头注意力各头关注不同模式"的直觉，似乎应该让每个头各选自己的 top-k。DSA 没有这么做：<b>该 token 的全部 query 头共享同一个候选集</b>。</p>
+
+<p>原因是 kernel 效率。论文引用 NSA 指出，在 kernel 层面每个 key-value 条目必须被多个 query 共享才能保证计算效率（C4）。如果每个头独立选择，一个 token 就会产生多套互不相同的不规则位置列表，显存访问模式随之碎片化——而稀疏计算的收益本来就依赖于把分散的读取整理成规整的批量访问。</p>
+
+<pre class="diagram">每头独立选择（DSA 没有采用）
+  头 1 ──► 读位置 {2, 7, 8}   ┐
+  头 2 ──► 读位置 {1, 3, 7}   ├─ 每头一套不同的访存模式
+  头 3 ──► 读位置 {2, 5, 6}   ┘   同一位置被反复零散读取
+
+共享候选集（DSA 的做法）
+  indexer ──► 一套位置 {2, 7, 8}
+                    │
+        ┌───────────┼───────────┐
+      头 1        头 2        头 3   ── 全部头读同一批条目
+                                        一次读取，多个 query 复用</pre>
+
+<p>论文把这两件事分成两层来讲。选择 MLA 作为承载 DSA 的注意力，理由是续训——V3.2 是从 V3.1-Terminus 继续训练而来，沿用原有的 MLA 是前提。而在 MLA 内部选用 <a href="../mqa-gqa/index.html">MQA</a> 模式，理由才是上面说的 kernel 层约束：MQA 模式下一个 latent 向量本就被该 token 的全部 query 头共享，与"共享候选集"的要求天然吻合。</p>
+
+<div class="callout callout-blue">
+<p>这是一处算法设计被硬件约束反向决定的例子。"每头独立选择"在表达能力上不会更差，但它在 kernel 上跑不快，因此没有被采用。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>贯穿例子中 $k=3$ 选出了哪三个位置，它们的分数各是多少？</li>
+  <li>用掩码把未选中位置置为 $-\infty$，与真正的稀疏 kernel 在结果和性能上分别有什么区别？</li>
+  <li>如果让每个注意力头独立选 top-k，会在实现上带来什么问题？</li>
+  <li>MLA 的 MQA 模式为什么与共享候选集的要求吻合？</li>
+</ul>
+
+<h2 id="training">indexer 的打分能力是训出来的</h2>
+
+<p>前面一直假设 indexer 能打出有意义的分数。但 indexer 是新增的参数模块——$\mathbf{q}^I$、$\mathbf{k}^I$、$w^I$ 的投影矩阵都是新权重。随机初始化时它打出的分数与相关性毫无关系，此时做 top-k 等于随机丢掉大部分历史位置。</p>
+
+<p>所以 DSA 不能直接加到一个训练好的稠密模型上。DeepSeek 的做法是从 V3.1-Terminus 的一个已扩展到 128K 上下文的 base checkpoint 出发，做两个阶段的续训。</p>
+
+<h3 id="dense-warmup">阶段一：dense warm-up，让 indexer 学会模仿主注意力</h3>
+
+<p>这一阶段的思路是：主注意力已经训练好了，它对每个位置的注意力分数本身就代表了"哪些位置重要"这一判断。让 indexer 去拟合这个已有的判断，就得到了一个有意义的初始打分器。</p>
+
+<p>具体做法是保持稠密注意力不变，冻结除 lightning indexer 外的全部模型参数。目标分布这样构造：对第 $t$ 个查询 token，先把主注意力分数跨全部注意力头求和，再沿序列维度做 L1 归一化，得到 $p_{t,:} \in \mathbb{R}^{t}$。然后用 KL 散度作为 indexer 的训练目标：</p>
+
+$$\mathcal{L}^{I} = \sum_t D_{\mathrm{KL}}\left(p_{t,:} \,\|\, \mathrm{Softmax}\left(I_{t,:}\right)\right)$$
+
+<p>KL 散度衡量两个概率分布的差异，此处的作用是把 indexer 分数经 softmax 后的分布拉向目标分布 $p_{t,:}$。注意 indexer 在推理时用 ReLU 而不用 softmax；softmax 只出现在训练损失里，用于把分数转成可与 $p_{t,:}$ 比较的分布。</p>
+
+<details>
+<summary>目标分布 $p_{t,:}$ 的构造过程（教学示例数字）</summary>
+<p>教学示例，主注意力分数为人为构造。假设主注意力有 4 个头，对 8 个位置的注意力分数分别为：</p>
+<p>头 1：$(0.30, 0.05, 0.02, 0.03, 0.05, 0.10, 0.25, 0.20)$<br>
+头 2：$(0.10, 0.30, 0.05, 0.02, 0.03, 0.05, 0.25, 0.20)$<br>
+头 3：$(0.05, 0.25, 0.05, 0.05, 0.05, 0.10, 0.25, 0.20)$<br>
+头 4：$(0.15, 0.20, 0.03, 0.02, 0.05, 0.05, 0.30, 0.20)$</p>
+<p>第一步，跨头逐位置求和。位置 1 得 $0.30+0.10+0.05+0.15 = 0.60$，位置 2 得 $0.05+0.30+0.25+0.20 = 0.80$，依此类推，8 个位置的和为</p>
+<p>$(0.60,\ 0.80,\ 0.15,\ 0.12,\ 0.18,\ 0.30,\ 1.05,\ 0.80)$</p>
+<p>第二步，沿序列维做 L1 归一化。总和为 $0.60+0.80+0.15+0.12+0.18+0.30+1.05+0.80 = 4.00$，逐项除以 4.00 得目标分布</p>
+<p>$p_{8,:} = (0.1500,\ 0.2000,\ 0.0375,\ 0.0300,\ 0.0450,\ 0.0750,\ 0.2625,\ 0.2000)$</p>
+<p>各项之和为 1.0，是一个合法的概率分布。位置 7 的目标概率最高（0.2625），位置 4 最低（0.0300）——KL 损失要让 indexer 的分布呈现同样的相对高低关系。</p>
+</details>
+
+<h3 id="sparse-training">阶段二：sparse training，让整个模型适应稀疏</h3>
+
+<p>indexer 有了初始能力后，引入细粒度 token 选择，并放开全部模型参数一起优化，让模型适应 DSA 的稀疏模式。indexer 仍继续对齐主注意力分布，但这次只在被选中的集合上计算：</p>
+
+$$\mathcal{L}^{I} = \sum_t D_{\mathrm{KL}}\left(p_{t,\mathcal{S}_t} \,\|\, \mathrm{Softmax}\left(I_{t,\mathcal{S}_t}\right)\right), \quad \mathcal{S}_t = \left\{ s \mid I_{t,s} \in \mathrm{Top\text{-}k}\left(I_{t,:}\right) \right\}$$
+
+<p>其中 $\mathcal{S}_t$ 是位置 $t$ 选中的位置集合。KL 的作用域从"全部位置"收窄到"选中的位置"，因为未被选中的位置不参与注意力，它们的相对排序不再影响输出。</p>
+
+<p>这一阶段还有一处关键安排：indexer 的输入从计算图上 detach，以便独立优化。indexer 的训练信号只来自 $\mathcal{L}^I$，主模型的优化只依据语言建模损失（C10）。两条梯度路径互不干扰。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>项</th><th>dense warm-up</th><th>sparse training</th></tr></thead>
+<tbody>
+<tr><td>注意力形态</td><td>保持稠密</td><td>引入 top-k 稀疏，$k = 2048$</td></tr>
+<tr><td>可训练参数</td><td>只有 lightning indexer</td><td>全部参数</td></tr>
+<tr><td>KL 作用域</td><td>全部在前位置</td><td>只在选中集合 $\mathcal{S}_t$ 上</td></tr>
+<tr><td>学习率</td><td>$10^{-3}$</td><td>$7.3 \times 10^{-6}$</td></tr>
+<tr><td>训练步数</td><td>1000 步</td><td>15000 步</td></tr>
+<tr><td>每步规模</td><td>16 条 128K 序列</td><td>480 条 128K 序列</td></tr>
+<tr><td>合计 token</td><td>2.1B</td><td>943.7B</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两阶段的规模差异说明了它们的分工：warm-up 只是给 indexer 一个合理起点，2.1B token 足够；让整个模型适应稀疏模式则是一次 943.7B token 的续训，是前者的约 450 倍。这也回答了"能不能把 DSA 直接装到别的模型上"——不能，这 943.7B token 的续训不是可省略的步骤。</p>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>warm-up 阶段冻结了哪些参数，为什么这一阶段必须保持稠密注意力？</li>
+  <li>目标分布 $p_{t,:}$ 经过哪两步从主注意力分数得到？</li>
+  <li>为什么 sparse training 阶段的 KL 只在 $\mathcal{S}_t$ 上计算？</li>
+  <li>"indexer 输入从计算图 detach"这一处理造成的结果是什么？</li>
+  <li>如果跳过两阶段续训，直接给一个稠密模型加上 indexer 并开启 top-k，会发生什么？</li>
+</ul>
+
+<h2 id="engineering">工程落地：从 hidden state 到稀疏注意力的完整链路</h2>
+
+<p>前面讲的是机制。这一章看它在真实推理实现中由哪些部件构成。本章内容以 DeepSeek 官方开源推理实现与 vLLM 实现为依据，属于实现层事实，论文正文未涉及这些细节。</p>
+
+<h3 id="forward-path">前向链路</h3>
+
+<p>从 hidden state 出发，先分出三条投影：</p>
+
+<pre class="diagram">hidden state h
+  │
+  ├─ wq_a + q_norm ──► qr（query 低秩 latent）
+  │                     │
+  │                     ├──► 主注意力自己的 q 投影 ──► q
+  │                     │
+  │                     └──► wq_b(qr) ──► q^I（64 头 × 128 维）
+  │
+  ├─ wk(h) + k_norm ──► k^I（不分头，128 维）
+  │
+  └─ wkv_a ──► KV latent ──► 主 KV cache</pre>
+
+<p>其中 q 与主 KV cache 归主注意力，q^I 与 k^I 归 indexer。indexer 拿到这两样后的处理是一条直线：</p>
+
+<pre class="diagram">q^I, k^I
+  │
+  ▼
+RoPE（只对前 64 维施加，非 interleaved）
+  │
+  ▼
+Hadamard 变换（rotate_activation）
+  │
+  ▼
+量化到 FP8 ──► k^I 写入 indexer 自己的 k_cache（FP8 值 + scale）
+  │
+  ▼
+FP8 index kernel ──► index score I（每个位置一个标量）
+  │
+  ▼
+top-k 选择 ──► topk_indices（选中的位置）</pre>
+
+<p>最后两路汇合，主注意力只按 indexer 给出的位置去读自己的 KV cache：</p>
+
+<pre class="diagram">q + 主 KV cache + topk_indices
+  │
+  ▼
+稀疏 MLA
+  │
+  ▼
+注意力输出 u</pre>
+
+<p>图中各节点的含义：<code>wq_a</code> 与 <code>q_norm</code> 产出 query 的低秩 latent <code>qr</code>，主注意力和 indexer 都从它出发再各投影一层（前者用自己的 q 投影，后者用 <code>wq_b</code>）；<code>wk</code> 是 indexer 专有的 key 投影，<code>k_norm</code> 是作用在 indexer key 上的 LayerNorm；<code>wkv_a</code> 产出主注意力的 KV latent。竖线与箭头表示前向传播方向。要注意的是 indexer 一路最终只输出一件东西——选中的位置；它不参与输出的加权计算。</p>
+
+<p>链路中有三处值得单独说明。</p>
+
+<p><b>indexer 使用独立的 RoPE 通道与独立的 key。</b>indexer 的 key 由 hidden state 重新投影得到（<code>wk(x)</code> 再经 <code>k_norm</code>），与主注意力的 key 无关；indexer 的 query 则由主注意力的 query 低秩 latent <code>qr</code> 再投影一层（<code>wq_b(qr)</code>）得到，这一段与主注意力共用。两者随后各自施加 <a href="../rope/index.html">RoPE</a>，且官方实现中有两处注释明确写着 indexer 的 rope 不是 interleaved 的，与主注意力的应用方式不同（C12）；vLLM 同样为 indexer 单独构造了一份 rope 模块。也就是说，indexer 的独立性体现在 key 投影、RoPE 通道与 key cache 三处，query 一侧则复用了主注意力已经算出的低秩 latent。</p>
+
+<p><b>量化前做一次 Hadamard 变换。</b>官方实现在把 q、k 量化到 FP8 之前调用 <code>rotate_activation</code>，即一次带 $1/\sqrt{d}$ 缩放的 Hadamard 变换（C13）。教学解释：这类变换会把向量中的异常大值能量摊到各维度上，减少低精度量化的误差——这是低精度计算中的常见预处理。需要说明的是，这个动机是推断，官方代码只给出了实现，没有说明理由。</p>
+
+<p><b>indexer 有自己的一份 key cache。</b>官方实现为 indexer 注册了独立的 <code>k_cache</code>（FP8）与 <code>k_scale_cache</code>；vLLM 中对应一个独立的 <code>DeepseekV32IndexerCache</code>。它与主 KV cache 并存，两者互不复用。</p>
+
+<h3 id="fp8-kernel">FP8 index kernel 的四步</h3>
+
+<p>index score 的实际计算由一个专用 FP8 kernel 完成。官方实现的 docstring 把计算链写成四步（C6）：</p>
+
+<details class="code-details">
+<summary>index kernel 的四步计算链（伪代码）</summary>
+<div class="code-block">
+<pre><code class="language-text">以下是伪代码，不是 Python。对应官方 fp8_index 的计算链。
+
+输入：q（FP8，形状 [batch, m, h, d]）        —— indexer query，h 个头、d 维
+      q_s（FP32，形状 [batch, m, h]）        —— 已折叠了 w^I 与缩放因子的每头权重
+      k（FP8，形状 [batch, n, d]）           —— indexer key，不分头
+      k_s（FP32，形状 [batch, n]）           —— key 侧的量化 scale
+状态：logits（FP32，形状 [n_block, h]）
+输出：index_score（FP32，形状 [batch, m, n]）
+
+步骤 1：FP8 矩阵乘
+    logits ← q @ kᵀ                      对应公式中的 q^I_{t,j} · k^I_s
+
+步骤 2：ReLU 后乘 query 侧权重
+    对每个 (头 j, 位置 s)：
+        logits[s, j] ← max(logits[s, j], 0) × q_s[j]
+                                         对应 w^I_{t,j} · ReLU(·)
+
+步骤 3：沿头维求和
+    logits_sum[s] ← Σ_j logits[s, j]     对应公式中的 Σ_{j=1}^{H^I}
+
+步骤 4：乘 key 侧量化 scale
+    index_score[s] ← logits_sum[s] × k_s[s]
+                                         把 FP8 量化的比例还原回真实数值
+</code></pre>
+</div>
+</details>
+
+<p>四步与公式的对应关系是直接的：步骤 1 是点积，步骤 2 是 ReLU 与加权，步骤 3 是对头求和。步骤 4 没有出现在公式里——它属于 FP8 量化的还原，把量化时除掉的比例乘回来。另一处实现与公式的差别是：$w^I_{t,j}$ 在实现中被额外乘上了 $1/\sqrt{H^I}$ 与 softmax 缩放因子，然后合进 <code>q_s</code>，这属于实现层的缩放约定。</p>
+
+<details class="code-details">
+<summary>用 numpy 复现 index score 与 top-k（验证前面的手算）</summary>
+<div class="code-block">
+<pre><code class="language-python">import numpy as np
+
+# 教学示例：8 个位置的序列，第 8 个位置是当前 query。
+# H_I = 2 个 indexer 头，d_I = 2 维，k = 3。
+
+# q^I_{8,j}：indexer 第 j 头在位置 8 的 query 向量（由 h_8 导出）
+q_indexer = np.array([
+    [1.0, 0.0],   # j = 1
+    [0.0, 1.0],   # j = 2
+])
+
+# w^I_{8,j}：第 j 头的标量权重（同样由 h_8 导出）
+w_indexer = np.array([1.0, 0.5])
+
+# k^I_s：位置 s 的 indexer key，全部 indexer 头共用同一个 k^I_s
+k_indexer = np.array([
+    [2.0,  0.0],   # s = 1
+    [1.0,  3.0],   # s = 2
+    [-1.0, 0.5],   # s = 3
+    [0.5, -2.0],   # s = 4
+    [0.0,  0.0],   # s = 5
+    [0.5,  0.5],   # s = 6
+    [2.0,  4.0],   # s = 7
+    [1.0,  4.0],   # s = 8
+])
+
+# 按 F1 逐位置计算 index score
+index_scores = []
+for s in range(8):
+    per_head = []
+    for j in range(2):
+        dot = float(q_indexer[j] @ k_indexer[s])
+        relu = max(dot, 0.0)
+        per_head.append((dot, relu))
+    score = sum(w_indexer[j] * per_head[j][1] for j in range(2))
+    index_scores.append(score)
+    print(
+        f"s={s + 1}  "
+        f"head1: dot={per_head[0][0]:+.2f} relu={per_head[0][1]:.2f}  "
+        f"head2: dot={per_head[1][0]:+.2f} relu={per_head[1][1]:.2f}  "
+        f"I_8,{s + 1}={score:.2f}"
+    )
+
+index_scores = np.array(index_scores)
+
+# 细粒度 token 选择：取 index score 最大的 k 个位置
+top_k = 3
+selected = np.sort(np.argsort(-index_scores, kind="stable")[:top_k]) + 1
+print(f"\nk={top_k} 时选中的位置: {selected.tolist()}")
+
+# k >= L 时选择不产生任何裁剪
+top_k_large = 8
+selected_large = np.sort(np.argsort(-index_scores, kind="stable")[:top_k_large]) + 1
+print(f"k={top_k_large} 时选中的位置: {selected_large.tolist()}（序列长 8，未裁剪）")
+</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">s=1  head1: dot=+2.00 relu=2.00  head2: dot=+0.00 relu=0.00  I_8,1=2.00
+s=2  head1: dot=+1.00 relu=1.00  head2: dot=+3.00 relu=3.00  I_8,2=2.50
+s=3  head1: dot=-1.00 relu=0.00  head2: dot=+0.50 relu=0.50  I_8,3=0.25
+s=4  head1: dot=+0.50 relu=0.50  head2: dot=-2.00 relu=0.00  I_8,4=0.50
+s=5  head1: dot=+0.00 relu=0.00  head2: dot=+0.00 relu=0.00  I_8,5=0.00
+s=6  head1: dot=+0.50 relu=0.50  head2: dot=+0.50 relu=0.50  I_8,6=0.75
+s=7  head1: dot=+2.00 relu=2.00  head2: dot=+4.00 relu=4.00  I_8,7=4.00
+s=8  head1: dot=+1.00 relu=1.00  head2: dot=+4.00 relu=4.00  I_8,8=3.00
+
+k=3 时选中的位置: [2, 7, 8]
+k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</code></pre>
+</div>
+<p><b>验证的机制</b>：循环体逐头计算 $\mathbf{q}^I_{t,j} \cdot \mathbf{k}^I_s$ 与 ReLU 截断，加权求和对应公式的 $\sum_j w^I_{t,j} \cdot \mathrm{ReLU}(\cdot)$；<code>argsort</code> 部分对应细粒度 token 选择。变量映射：<code>q_indexer</code> 对应 $\mathbf{q}^I_{8,j}$，<code>w_indexer</code> 对应 $w^I_{8,j}$，<code>k_indexer</code> 对应 $\mathbf{k}^I_s$，<code>index_scores</code> 对应 $I_{8,s}$。</p>
+<p><b>观察重点</b>：$s=3$ 与 $s=4$ 的输出中各有一个头的点积为负、ReLU 后变成 0，这两个位置的最终分数只由另一个头贡献。以及最后两行的对比：$k=3$ 时选中 3 个位置，$k=8$ 时全部 8 个位置都被选中——此时 top-k 不产生任何裁剪。</p>
+<p><b>教学简化</b>：这段代码用 FP64 逐元素循环计算，真实实现是 FP8 矩阵乘 + 融合 kernel，且量化前还有 Hadamard 变换与 RoPE。代码只验证 index score 的算术定义与选择逻辑，不反映真实的数值精度与性能特征。</p>
+</details>
+
+<h3 id="dcp-merge">KV cache 被切分时，top-k 如何保持精确</h3>
+
+<p>服务端常把 KV cache 按 rank 切分到多张卡上（vLLM 中称 decode context parallel，DCP）。此时每张卡只持有全部历史位置的一部分，各自只能算出自己那部分的局部 top-k。要得到全局 top-k，是否必须把整行分数都传一遍？</p>
+
+<p>不必。vLLM 的实现给出了论证：如果某个 token 属于全局 top-k，那么全局范围内至多有 $k-1$ 个 token 排在它前面；它所在的那张卡上排在它前面的 token 只会更少，因此它必然也在本卡的局部 top-k 内。于是只交换各卡的局部 top-k 候选就足够，结果与把整行分数全部聚合完全等价，而传输量从整行分数降到 $\text{卡数} \times k$ 个候选（C14，来源为 vLLM 实现，非论文内容）。</p>
+
+<details>
+<summary>这个论证为什么是精确的而非近似</summary>
+<p>反证。设 token $x$ 属于全局 top-k，但不属于它所在卡的局部 top-k。不属于局部 top-k 意味着该卡上至少有 $k$ 个 token 的分数排在 $x$ 之前。这 $k$ 个 token 也都在全局范围内，因此全局至少有 $k$ 个 token 排在 $x$ 之前，即 $x$ 的全局排名至少是第 $k+1$ 位，与 $x$ 属于全局 top-k 矛盾。</p>
+<p>因此"全局 top-k 的成员必定出现在其所属卡的局部 top-k 中"成立，收集全部卡的局部 top-k 候选不会漏掉任何全局 top-k 成员。这是精确算法，不是近似。</p>
+<p>需要注意的是，vLLM 中这条合并路径有实现约束：要求 CuteDSL，且 <code>index_topk</code> 取值为 512、1024 或 2048 之一。这些是实现层限制，与上面的正确性论证无关。</p>
+</details>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>画出从 hidden state 到 index score 的链路，说明中间经过哪几步变换。</li>
+  <li>indexer 的 key cache 与主 KV cache 是什么关系，两者能否复用？</li>
+  <li>index kernel 的四步中，哪一步不对应公式里的任何一项，它在做什么？</li>
+  <li>为什么只交换各卡的局部 top-k 候选就能得到精确的全局 top-k？</li>
+</ul>
+
+<h2 id="accounting">省了什么、没省什么、什么时候不该用</h2>
+
+<p>把账算清楚。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>项</th><th>DSA 带来的变化</th><th>依据</th></tr></thead>
+<tbody>
+<tr><td>主注意力计算复杂度</td><td>从 $O(L^2)$ 降到 $O(Lk)$</td><td>论文明确声称</td></tr>
+<tr><td>lightning indexer 复杂度</td><td>仍是 $O(L^2)$，未降低</td><td>论文明确声称</td></tr>
+<tr><td>indexer 每对 token 的单价</td><td>远低于 V3.1-Terminus 中的 MLA</td><td>论文明确声称</td></tr>
+<tr><td>KV cache 显存</td><td>不减少</td><td>从实现推出</td></tr>
+<tr><td>额外显存</td><td>增加一份 indexer 的 key cache</td><td>从实现推出</td></tr>
+<tr><td>模型效果</td><td>未观察到明显回退</td><td>论文明确声称，有条件</td></tr>
+<tr><td>短序列（$L \le k$）</td><td>无收益，应走稠密路径</td><td>论文与实现一致</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="not-linear">DSA 没有把注意力变成线性</h3>
+
+<p>$O(Lk)$ 在 $k$ 固定时对 $L$ 是线性的，容易让人得出"DSA 把注意力复杂度降到线性"的结论。这个结论不成立：indexer 仍要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$。论文对此的处理是明确承认这一点，并给出论证——indexer 相比 V3.1-Terminus 中的 MLA 需要的计算量少得多。</p>
+
+<p>准确的说法是：DSA 把主项从平方变成线性，同时把残留的平方项的系数压得很低。整体不是线性。</p>
+
+<h3 id="no-memory-saving">DSA 不省 KV cache</h3>
+
+<p>"只读 $k$ 个位置，那是不是只需要存这 $k$ 个位置"——不是。每个查询选出的 $k$ 个位置各不相同，后续 token 可能选到任何历史位置，因此全部历史位置的 KV 条目都必须完整保留。</p>
+
+<p>这一点在两套实现中都能直接看到：主 KV cache 按最大序列长度分配，不随 $k$ 缩减；而 indexer 还额外需要自己的一份 key cache。所以 DSA 在显存上是<b>略有增加</b>而非减少。这条结论是从实现推出的，论文没有以否定句的形式声称它。</p>
+
+<div class="callout callout-yellow">
+<p>容易与 MLA 的效果混淆。MLA 通过低秩压缩减少<b>每个位置存多少</b>，这确实省 KV cache；DSA 改变的是<b>每次读哪些位置</b>。V3.2 同时具备两者，但省显存的功劳属于 MLA，不属于 DSA。</p>
+</div>
+
+<h3 id="short-sequence">短序列下 DSA 不起作用</h3>
+
+<p>当序列长度不超过 $k$ 时，top-k 会把全部位置都选进来——选择不产生任何裁剪，但 indexer 的计算照样发生，成为纯开销。贯穿例子的最后一行验证了这一点：8 个位置、$k=8$ 时，选中集合就是全部 8 个位置。</p>
+
+<p>真实模型中 $k = 2048$，因此这个失效区间是序列长度不足约 2048 的场景。两套实现对此都有专门处理：论文说明官方为短序列 prefill 特别实现了一个 masked MHA 模式来模拟 DSA，它在短上下文条件下效率更高；vLLM 的判据是当该批 <b>prefill</b> 请求的最大序列长度不超过 <code>index_topk</code>、且未强制走 MQA 时，置 <code>use_dense_mha=True</code> 走稠密路径（消费侧还有进一步的条件判断）。两者方向一致，但这个具体判据来自 vLLM 实现，不是论文给出的数字。</p>
+
+<h3 id="parity">效果上的代价</h3>
+
+<p>论文报告，V3.2-Exp 在显著提升长序列计算效率的同时，与 V3.1-Terminus 相比在短上下文和长上下文任务上均未观察到明显的性能下降。这条结论的成立条件需要一并记住：标准 benchmark 的评测时间为 2025 年 9 月，对比对象是 V3.1-Terminus，且两者的训练设置被严格对齐——正是这种对齐才让"性能差异来自稀疏注意力"这一归因成立。</p>
+
+<p>论文的 parity 论证还包含另外两组独立证据。一是人类偏好侧：以 ChatbotArena 作为间接评估，V3.1-Terminus 与 V3.2-Exp 在 2025 年 11 月 10 日取得的 Elo 分数相近，而两者的后训练策略相同。二是长上下文侧：V3.2-Exp 发布后有若干独立评测使用了此前未见过的测试集，其中 AA-LCR 上 V3.2-Exp 在 reasoning 模式下比 V3.1-Terminus 高 4 分，Fiction.liveBench 上多项指标持续更优。三组证据的时间点与测试集各不相同，这是"不回退"这一结论的完整依据。</p>
+
+<p>论文另给出 H800 集群上的推理成本曲线，按 2 USD/GPU 小时估算，展示 token 成本随序列位置的变化。本页只取其定性结论（长上下文下端到端显著加速），不复述曲线读数。</p>
+
+<h3 id="boundary">适用边界小结</h3>
+
+<ul>
+  <li><b>解决</b>：长上下文下主注意力的计算量与访存量，使长序列训练与推理成本显著下降。</li>
+  <li><b>不解决</b>：KV cache 显存占用；短序列场景的效率；不改变注意力的数学形式，因此不带来线性注意力那类的常数状态优势。</li>
+  <li><b>成立条件</b>：序列长度显著大于 $k$；模型已完成 DSA 续训；有配套的 FP8 index kernel 与稀疏注意力 kernel；KV 条目跨 query 头共享。</li>
+  <li><b>条件不满足时</b>：$L \le k$ 时 indexer 成为纯开销；未经续训直接开启 top-k 会显著掉点；缺少共享候选集时 kernel 无法高效实现。</li>
+</ul>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>为什么不能说"DSA 把注意力复杂度降到线性"？</li>
+  <li>DSA 对 KV cache 显存的净影响是增加、减少还是不变，为什么？</li>
+  <li>$k = 2048$ 时，什么长度的序列上 DSA 不产生收益，此时实现会怎么做？</li>
+  <li>"未观察到明显性能回退"这一结论的成立条件有哪些？</li>
+</ul>
+
+<h2 id="positioning">与相邻方法的定位</h2>
+
+<p>DSA 常与几类方法混在一起讨论。用前面几章建立的判据把它们分开。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>方法</th><th>改变什么</th><th>KV cache 是否减少</th><th>是否需要专门训练</th></tr></thead>
+<tbody>
+<tr><td>DSA</td><td>每个查询读哪些位置（内容决定）</td><td>不减少，略增</td><td>需要，两阶段续训</td></tr>
+<tr><td>滑动窗口</td><td>每个查询读哪些位置（位置决定）</td><td>可减少（窗口外可丢弃）</td><td>视方案而定</td></tr>
+<tr><td>线性注意力 / KDA</td><td>注意力的数学形式</td><td>减少，替换为固定大小状态</td><td>需要，从头设计与训练</td></tr>
+<tr><td>FlashAttention</td><td>稠密注意力怎么算（分块、访存）</td><td>不变</td><td>不需要，结果等价</td></tr>
+<tr><td>MLA</td><td>每个位置存什么（低秩压缩）</td><td>减少</td><td>需要，架构层设计</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>与 NSA（Native Sparse Attention）的关系需要单独说明。两者同属可训练稀疏注意力，DSA 论文引用 NSA 来支撑"kernel 层面每个 key-value 条目必须被多个 query 共享"这一约束。但 NSA 是另一篇论文的另一套设计，DSA 不是它的重命名或简化版；本页只用到 NSA 支撑的那一条约束，不展开其机制。</p>
+
+<div class="callout callout-gray">
+<p>名称歧义：DSA 在本页特指 DeepSeek Sparse Attention。它不是"动态稀疏注意力"（dynamic sparse attention）这一类方法的统称，也与计算机基础课程里的 Data Structures and Algorithms、密码学里的 Digital Signature Algorithm 无关。</p>
+</div>
+
+<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
+<ul>
+  <li>被问到"DSA 和 FlashAttention 有什么区别"时，用一句话如何回答？</li>
+  <li>DSA 与 MLA 在 V3.2 中同时存在，各自负责什么？</li>
+  <li>DSA 与 NSA 的关系是什么，能否说 DSA 是 NSA 的改进版？</li>
+</ul>
+
+<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>S1 = arXiv:2512.02556《DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models》，DeepSeek-AI，2025，arXiv 源码 2025-12-02 提交版，<code>sections/01-method.tex</code>（§ DeepSeek-V3.2 Architecture 及其子节）。S2 = DeepSeek-V3.2-Exp 官方开源推理实现，<code>huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp</code>，commit <code>194c67e12b1b0d6df0ef373ddcf215bc84027409</code>，<code>inference/</code> 目录。S3 = 同仓库同 commit 的 <code>config.json</code>。S4 = vLLM，<code>github.com/vllm-project/vllm</code>，commit <code>5ac2684976ee22c04fe0d2f968c6cf6096b383f2</code>。</p>
+<p>C1 DSA 是 V3.2 相对 V3.1-Terminus 的唯一架构改动：S1 § DeepSeek Sparse Attention 首段。C2 V3.2 与 V3.2-Exp 架构完全相同：同上首句。C3 DSA 由 lightning indexer 与细粒度 token 选择两部分组成：S1 § DeepSeek Sparse Attention，Prototype of DSA 段。C4 论文把"从 V3.1-Terminus 续训"作为把 DSA 实例化在 MLA 之上的理由，把"kernel 层面每个 key-value 条目必须被多个 query 共享"作为在 MLA 中选用 MQA 模式的理由：S1 § Instantiate DSA Under MLA 段，其中 kernel 层约束引用 NSA（Yuan et al., 2025）。C5 选 ReLU 出于吞吐考虑：S1 § DeepSeek Sparse Attention。C6 indexer 头数少且可 FP8 实现故效率突出：同上；计算链见 S2 <code>inference/kernel.py</code> 中 <code>fp8_index</code> 的 docstring 与 <code>fp8_index_kernel</code>。C7 主注意力复杂度 $O(L^2) \to O(Lk)$、indexer 仍 $O(L^2)$：S1 § Inference Costs。C8 短序列 prefill 用 masked MHA 模式模拟 DSA：同上末段；vLLM 对应判据见 S4 <code>vllm/model_executor/layers/attention/sparse_mla_attention.py</code> 中 <code>use_dense_mha</code> 的赋值，消费方见 <code>vllm/model_executor/layers/attention/mla_attention.py</code>。C9 DSA 不减少 KV cache 且 indexer 需额外 key cache：从实现推出，依据 S2 <code>inference/model.py</code> 中 <code>Indexer</code> 注册的 <code>k_cache</code>/<code>k_scale_cache</code> 与 <code>MLA</code> 注册的 <code>kv_cache</code>/<code>pe_cache</code>，以及 S4 中独立的 <code>DeepseekV32IndexerCache</code>。C10 indexer 输入 detach、两条优化信号隔离：S1 § Sparse Training Stage。C11 未观察到明显性能回退：S1 § Parity Evaluation 全节三段——Standard Benchmark 段（2025 年 9 月，对比 V3.1-Terminus）、Human Preference 段（ChatbotArena Elo，2025 年 11 月 10 日）、Long Context Eval 段（AA-LCR 上 reasoning 模式高 4 分、Fiction.liveBench 多项指标更优）。C12 indexer 的 key 由 hidden state 独立投影、query 复用主注意力的低秩 latent、RoPE 通道独立且非 interleaved：S2 <code>inference/model.py</code> 中 <code>Indexer.forward</code> 的 <code>q = self.wq_b(qr)</code>、<code>k = self.k_norm(self.wk(x))</code>，其中 <code>qr</code> 由 <code>MLA.forward</code> 的 <code>q_norm(wq_a(x))</code> 传入；两处 "rope in indexer is not interleaved" 注释；S4 中 <code>indexer_rope_emb</code> 的构造与注释，以及 indexer 接收主注意力 <code>q_c</code> 的调用。C13 量化前施加 Hadamard 变换：S2 <code>inference/model.py</code> 中 <code>rotate_activation</code> 的定义与调用。C14 DCP 下局部 top-k 合并的精确性：S4 <code>vllm/model_executor/layers/sparse_attn_indexer.py</code> 中 <code>_merge_dcp_topk_global</code> 的 docstring。</p>
+
+<h3>核心公式与来源</h3>
+<p>F1 index score（正文 lightning indexer 一章）：S1 § DeepSeek Sparse Attention，Equation 1；符号说明同段。F2 稀疏注意力输出（正文 top-k 选择一章）：同节 Equation 2。F3 dense warm-up 的 indexer 损失（正文训练一章）：S1 § Dense Warm-up Stage，Equation 3；目标分布 $p_{t,:}$ 的构造见同段文字。F4 sparse training 的 indexer 损失：S1 § Sparse Training Stage，Equation 4。四条公式均为原文定义式，页面未做代数变形，不存在需要标注的推导链。正文提到的一处实现与公式差异（$w^I_{t,j}$ 在实现中额外乘 $1/\sqrt{H^I}$ 与 softmax 缩放并合入 <code>q_s</code>）依据 S2 <code>inference/model.py</code> 中 <code>Indexer.forward</code> 对 <code>weights</code> 的计算。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>$H^I = 64$、$d^I = 128$：S3 的 <code>index_n_heads</code>、<code>index_head_dim</code>，与 S2 <code>inference/model.py</code> 中 <code>ModelArgs</code> 的默认值一致。$k = 2048$：S1 § Sparse Training Stage 文字（"select 2048 key-value tokens for each query token"）与 S3 的 <code>index_topk</code> 一致。主注意力 128 头、61 层、hidden 7168、kv_lora_rank 512、qk_rope_head_dim 64：S3 对应字段。warm-up 学习率 $10^{-3}$、1000 步、每步 16 条 128K 序列、合计 2.1B token：S1 § Dense Warm-up Stage。sparse training 学习率 $7.3\times 10^{-6}$、15000 步、每步 480 条 128K 序列、合计 943.7B token：S1 § Sparse Training Stage。续训起点上下文长度 128K：S1 § Continued Pre-Training 首段。推理成本图的估算口径（H800 集群、2 USD/GPU 小时）：S1 § Inference Costs。效果结论的实验条件：评测时间 2025 年 9 月，对比对象 V3.1-Terminus，两者训练设置严格对齐，见 S1 § Parity Evaluation。</p>
+
+<h3>教学示例</h3>
+<p>全文贯穿例子（8 个位置、$k=3$、$H^I=2$、$d^I=2$，以及 $\mathbf{q}^I_{8,j}$、$w^I_{8,j}$、$\mathbf{k}^I_s$ 的全部数值）为人为构造，不代表真实权重或推荐配置。构造目的是让 index score 可完全手算，同时满足三个条件：8 个分数两两不等使 top-k 无并列歧义；至少两个位置在某个头上点积为负以展示 ReLU 截断（$s=3$、$s=4$）；$k=3$ 的选中集合与"最近 3 个位置"不同，以便对比内容决定与位置决定的差别。训练一章中 warm-up 目标分布的 4 个头、8 个位置的主注意力分数同样为人为构造，用于展示"跨头求和 + L1 归一化"两步。可运行代码的输入与上述数值一致，输出为实际运行结果。</p>
+
+<h3>教学解释与类比边界</h3>
+<p>"ReLU 逐元素独立、softmax 需要跨序列规约"是对 C5 的教学解释。论文只说选 ReLU 出于吞吐考虑，未给出这一论证；该解释仅用于说明两种运算在实现结构上的差别，不可当作论文结论，也不能据此推断二者在效果上的优劣。</p>
+<p>"Hadamard 变换把异常大值能量摊到各维度以减少低精度量化误差"是对 C13 的教学解释。S2 只给出了实现，未说明动机；这一动机属于推断。</p>
+<p>"打分器只需给出排序，因此对数值误差的容忍度高于加权求和"是教学解释，用于说明 indexer 可被简化的空间。它解释的是设计动机的方向，不是论文给出的论证，也不构成对具体精度可降到何种程度的判断。</p>
+
+<h3>教学简化及其限制</h3>
+<p>贯穿例子把 128K 序列缩到 8 个位置、64 头缩到 2 头、128 维缩到 2 维。这一简化保留了 index score 的算术定义、ReLU 的作用与 top-k 的选择逻辑，可支持"公式如何代入计算""ReLU 何时截断""$k \ge L$ 时不产生裁剪"这三类结论；不可用于推断真实模型的分数分布形态、稀疏模式的实际稠密度，或任何性能数字。</p>
+<p>正文用掩码（未选中位置置 $-\infty$）说明 top-k 如何接回注意力，这与官方参考实现的做法一致，但掩码版本仍把全部位置算了一遍。它在数学上等价于只对 $k$ 个位置计算，不等价于性能上的收益——真实收益依赖专门的稀疏注意力 kernel。这一点已在正文标明，不可据此认为掩码实现即可获得论文报告的加速。</p>
+<p>可运行代码用 FP64 逐元素循环实现，真实实现是 FP8 矩阵乘加融合 kernel，且量化前还有 RoPE 与 Hadamard 变换。代码只验证算术定义与选择逻辑，不反映真实的数值精度、访存行为与性能特征。</p>
+<p>工程一章的前向链路图省略了张量并行切分、CUDA graph 捕获、投机解码路径与 chunked prefill 的分块细节。它可支持"部件如何串联""两份 cache 各自存什么"这类结构性判断，不可当作部署实现的依据。</p>
+<p>本页讲机制时不区分 DeepSeek-V3.2-Exp 与 DeepSeek-V3.2，依据是 S1 明确声称两者架构完全相同（C2）。涉及评测时间、成本估算口径与实现仓库时，均按上述来源分别标注，未做跨版本合并。</p>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>
