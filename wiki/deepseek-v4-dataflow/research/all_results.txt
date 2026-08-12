@@ -1,0 +1,396 @@
+########## t1_sinkhorn
+hc_mult=4  mix_hc=24  sinkhorn_iters=20  hc_eps=1e-06
+
+形状: pre (2, 8, 4)  post (2, 8, 4)  comb (2, 8, 4, 4)
+
+=== pre / post 的取值范围（对应报告 Eq.6/Eq.7）===
+pre  = sigmoid(...)+eps   范围 [0.014202, 0.999308]   理论 (0,1)+eps
+post = 2*sigmoid(...)     范围 [0.001431, 1.997781]   理论 (0,2)
+
+=== comb 是否双随机（报告称投影到双随机流形）===
+行和 (sum over -1): min=0.96947336  max=1.01962757  平均偏离1=6.025e-03
+列和 (sum over -2): min=0.99999887  max=0.99999923  平均偏离1=9.891e-07
+comb 全为正: True
+
+实测结论：官方 kernel 最后一步是列归一化，因此列和精确=1，行和仅近似=1。
+
+=== 迭代轮数对收敛的影响（同一输入，改变 iters）===
+ iters          行和最大偏离1          列和最大偏离1
+     1        1.151e+00        3.760e-02
+     2        8.777e-01        2.146e-06
+     3        5.809e-01        1.848e-06
+     5        2.325e-01        1.311e-06
+    10        9.254e-02        1.132e-06
+    20        3.053e-02        1.132e-06
+    40        1.117e-02        1.073e-06
+   100        7.186e-03        1.073e-06
+   400        2.237e-03        1.013e-06
+
+实测事实：列和在 iters>=2 即精确为 1（1e-6 量级，来自 hc_eps）；
+行和收敛慢得多，iters=20 时最大仍偏离约 3e-2，需 iters~400 才降到 1e-3。
+即官方配置下 comb 是「精确列随机 + 近似行随机」，而非严格双随机。
+
+=== 双随机的作用：残差混合不放大信号 ===
+残差输入 L2 范数总和: 63.5552
+经 comb 混合后 L2 范数: 52.9969
+比值: 0.8339   （双随机矩阵为压缩映射，比值 <= 1）
+仅行归一化(不做 Sinkhorn) 比值: 0.8769
+  其列和范围 [0.0000, 2.6222] —— 列和不受控，某些残差通道会被反复放大
+
+########## t1b_sinkhorn_scale
+comb 的 logits 尺度 = |mixes * hc_scale[2]|。测不同尺度下 iters=20 的收敛情况。
+
+  logits尺度      iters=20 行和偏离      iters=20 列和偏离        达到行和<1e-3 所需iters
+      0.01          1.132e-06          1.132e-06                        1
+       0.1          1.132e-06          1.132e-06                        2
+       0.3          1.132e-06          1.073e-06                        3
+       1.0          3.362e-05          1.132e-06                       11
+       3.0          3.462e-02          1.132e-06                      231
+      10.0          7.113e-02          1.132e-06                      916
+
+结论：logits 尺度 <=0.1 时 iters=20 远超收敛所需，行和与列和都精确为 1；
+尺度越大（矩阵越尖锐）行和收敛越慢。官方 hc_scale 为可学习门控且初始化较小，
+因此 iters=20 是与「近均匀初值」匹配的取值，而非任意情形都严格双随机。
+
+########## t2_compressor
+=== CSA 层（compress_ratio=4，config.json 中偶数层取值）===
+overlap=True  coff=2
+wkv 输出维度 = 128 = coff(2) x head_dim(64)
+ape 形状 = (4, 128) = (ratio, coff*head_dim)   对应报告 B_a,B_b in R^(m x c)
+输入 seqlen=64 -> 压缩条目数 16 = 64/4，序列压缩到 1/ratio
+softmax 归一化宽度 = 8 = 2m (m=4)  <- 报告称在 2m 个元素上归一化
+
+=== HCA 层（compress_ratio=128，config.json 中奇数层取值）===
+overlap=False  coff=1
+wkv 输出维度 = 64 = coff(1) x head_dim(64)
+输入 seqlen=512 -> 压缩条目数 4 = 512/128
+softmax 归一化宽度 = 128 = m (m=128)  <- 非 overlap，仅 m 个条目
+
+=== 压缩权重确实是数据相关的 softmax（不是均值池化）===
+compressor 输出 与 均值池化 的相对差异: 0.7607
+  非 0 => 压缩是学习到的加权求和，权重由 wgate 从隐藏状态算出
+
+=== decode 增量压缩 与 prefill 一次性压缩 是否一致（HCA, ratio=128 便于对齐）===
+prefill 输出形状 (1, 1, 64)   decode 最终输出形状 (1, 1, 64)
+最大绝对差异: 1.132e-06  （同一 state 缓冲区语义一致）
+
+########## t3_kvcache
+num_hidden_layers=61   head_dim=512  rope=64  window=128  index_topk=1024
+CSA 层(ratio=4，带 Indexer): 30 层，层号 [2, 4, 6, 8, 10]...[56, 58, 60]
+HCA 层(ratio=128，无 Indexer): 31 层，层号 [0, 1, 3, 5, 7]...[55, 57, 59]
+两类层交替：前 12 层 ratio = [128, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128]
+
+每个 KV 条目字节数 = 64x2(BF16 RoPE) + 448x1(FP8) = 576 B
+  纯 BF16 存储则为 1024 B，混合存储降到 56.2%  <- 报告称「近一半」
+
+=== 1M 上下文下每层 KV 条目数 ===
+CSA (ratio=4)      滑窗 128 + 压缩 262144 = 262272 条目/层
+HCA (ratio=128)    滑窗 128 + 压缩 8192 = 8320 条目/层
+
+主注意力 KV cache @1M = 4.36 GiB
+Indexer KV cache @1M  = 1.88 GiB  (30 个 CSA 层 x 262144 条目 x 128 维 bf16)
+合计 = 6.23 GiB
+
+报告基线 BF16 GQA8(head_dim=128) @1M = 244.00 GiB
+V4-Pro 主注意力 / 基线 = 1.79%
+V4-Pro 含 Indexer / 基线 = 2.55%
+报告 2.3.4 称「约 2%」—— 与主注意力 KV cache 口径一致（Indexer 缓存另计）
+
+=== 单 token 注意力候选集规模（决定 FLOPs）===
+CSA 层：滑窗 128 + Indexer 选出 min(index_topk, 可用压缩条目) 个
+  上下文      4096: 压缩条目    1024 个，实选 1024 个 -> 候选集 1152
+  上下文     65536: 压缩条目   16384 个，实选 1024 个 -> 候选集 1152
+  上下文   1048576: 压缩条目  262144 个，实选 1024 个 -> 候选集 1152
+HCA 层：滑窗 128 + 全部压缩条目（无稀疏选择）
+  上下文      4096: 压缩条目      32 个 -> 候选集     160
+  上下文     65536: 压缩条目     512 个 -> 候选集     640
+  上下文   1048576: 压缩条目    8192 个 -> 候选集    8320
+
+关键：CSA 层候选集在上下文 >= 4096 后固定为 1152（topk 截断），
+      HCA 层随上下文线性增长但斜率仅 1/128。二者共同使注意力开销近似与长度脱钩。
+
+########## t4_sparse_attn
+=== 1. attn_sink 极小时退化为标准 MQA 注意力 ===
+最大绝对差异 = 5.364e-07   -> sparse_attn 是带索引门控的标准注意力
+
+=== 2. attn_sink 的作用：注意力权重和可以小于 1 ===
+  attn_sink=  -1e+30: 平均注意力权重之和 = 1.000000
+  attn_sink=    -2.0: 平均注意力权重之和 = 0.997301
+  attn_sink=     0.0: 平均注意力权重之和 = 0.980408
+  attn_sink=     2.0: 平均注意力权重之和 = 0.871899
+  attn_sink=     5.0: 平均注意力权重之和 = 0.258218
+  sink 越大，模型越可以「不看任何 KV」，即整层注意力输出趋近 0
+
+=== 3. -1 索引被完全排除 ===
+「32 位置但后16个为-1」 vs 「只有前16个位置」 最大差异 = 0.000e+00
+  -> -1 既不贡献 value 也不占 softmax 分母，等价于该位置不存在
+
+=== 4. 滑窗索引与压缩索引拼接后一起进 softmax（model.py Attention.forward）===
+model.py: topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
+          o = sparse_attn(q, kv, attn_sink, topk_idxs, scale)
+  含义：滑窗的未压缩 KV 与选中的压缩 KV 处于同一个 softmax 归一化空间，
+        而非两条分支各算一次注意力再加权求和。
+  拼接后输出 与 仅滑窗输出 的差异 = 1.5697  (非0，证明压缩条目参与同一归一化)
+
+########## t5_moe
+n_routed_experts=384  num_experts_per_tok=6  n_shared_experts=1
+scoring_func=sqrtsoftplus  topk_method=noaux_tc  routed_scaling_factor=2.5
+num_hash_layers=3  norm_topk_prob=True
+
+=== 1. sqrt(softplus) vs sigmoid（V3 用 sigmoid，V4 改为 sqrtsoftplus）===
+   logit      sigmoid   sqrt(softplus)
+    -6.0     0.002473         0.049756
+    -3.0     0.047426         0.220425
+    -1.0     0.268941         0.559698
+     0.0     0.500000         0.832555
+     1.0     0.731059         1.145976
+     3.0     0.952574         1.746020
+     6.0     0.997527         2.449995
+    12.0     0.999994         3.464103
+  sigmoid 上界为 1（饱和）；sqrt(softplus) 无上界，约按 sqrt(z) 增长
+  logit=12 时：sigmoid=0.999994（已饱和），sqrt(softplus)=3.4641（仍在增长）
+  含义：高置信路由不会被压缩到同一数值，专家间亲和度差异得以保留
+
+=== 2. bias 只影响选择、不影响权重（model.py Gate.forward）===
+带 bias 选中的专家(第0个token): [0, 335, 260, 287, 9, 318]
+不带 bias 选中的专家           : [335, 260, 287, 9, 318, 351]
+专家0 是否被 bias 挤进来: True
+专家0 的原始分数=0.731402，加 bias 后=5.731402
+但它拿到的路由权重基于原始分数计算，bias 未进入权重
+  -> 这是 auxiliary-loss-free 负载均衡：用 bias 调节各专家被选中的频率，
+     同时不扭曲专家输出的加权系数，因此无需辅助损失的梯度干预
+
+=== 3. 前 3 层 Hash 路由：与隐藏状态无关 ===
+model.py Gate.__init__:  self.hash = layer_id < args.n_hash_layers
+model.py Gate.forward :  indices = self.tid2eid[input_ids]   # 按 token ID 查表
+tid2eid 形状 = (129280, 6) = (vocab_size, num_experts_per_tok)
+token 100 -> 专家 [162, 76, 337, 151, 40, 370]
+token 100（另一处出现，隐藏状态不同）-> 专家 [162, 76, 337, 151, 40, 370]  （完全相同）
+token 5000 -> 专家 [141, 372, 21, 287, 296, 34]
+  -> 同一 token ID 在任何上下文中都路由到同一组专家，路由结果与该层输入无关
+
+=== 4. 权重清单交叉验证（model.safetensors.index.json）===
+含 gate.tid2eid 的层: [0, 1, 2]   （共 3 层，等于 num_hash_layers）
+含 gate.bias 的层数 : 58  层号范围 3..60
+  61 层中 58 层有 bias，缺失的层 = [0, 1, 2]
+  -> 与 model.py 一致：hash 层 self.bias=None，其余层才有 bias
+
+########## t6_real_weights
+读取 model-00001-of-00064.safetensors 头部 88 字节，含 0 个张量
+读取 model-00002-of-00064.safetensors 头部 259688 字节，含 2336 个张量
+读取 model-00004-of-00064.safetensors 头部 260544 字节，含 2343 个张量
+读取 model-00005-of-00064.safetensors 头部 259640 字节，含 2336 个张量
+读取 model-00063-of-00064.safetensors 头部 392 字节，含 4 个张量
+读取 model-00064-of-00064.safetensors 头部 253080 字节，含 2342 个张量
+
+张量名                                              dtype      形状
+------------------------------------------------------------------------------------------
+embed.weight                                     BF16       [129280, 7168]
+layers.0.attn.wq_a.weight                        F8_E4M3    [1536, 7168]
+layers.0.attn.wq_b.weight                        F8_E4M3    [65536, 1536]
+layers.0.attn.wkv.weight                         F8_E4M3    [512, 7168]
+layers.0.attn.kv_norm.weight                     BF16       [512]
+layers.0.attn.wo_a.weight                        F8_E4M3    [16384, 4096]
+layers.0.attn.wo_b.weight                        F8_E4M3    [7168, 16384]
+layers.0.attn.attn_sink                          F32        [128]
+layers.0.attn.compressor.wkv.weight              BF16       [512, 7168]
+layers.0.attn.compressor.wgate.weight            BF16       [512, 7168]
+layers.0.attn.compressor.ape                     F32        [128, 512]
+layers.0.hc_attn_fn                              F32        [24, 28672]
+layers.0.hc_attn_base                            F32        [24]
+layers.0.hc_attn_scale                           F32        [3]
+layers.0.ffn.gate.weight                         BF16       [384, 7168]
+layers.0.ffn.gate.tid2eid                        I64        [129280, 6]
+layers.0.ffn.experts.0.w1.weight                 I8         [3072, 3584]
+layers.0.ffn.experts.0.w1.scale                  F8_E8M0    [3072, 224]
+layers.0.ffn.shared_experts.w1.weight            F8_E4M3    [3072, 7168]
+layers.2.attn.indexer.wq_b.weight                F8_E4M3    [8192, 1536]
+layers.2.attn.indexer.weights_proj.weight        BF16       [64, 7168]
+layers.2.attn.indexer.compressor.wkv.weight      BF16       [256, 7168]
+layers.2.attn.indexer.compressor.ape             F32        [4, 256]
+layers.2.attn.compressor.wkv.weight              BF16       [1024, 7168]
+layers.3.ffn.gate.bias                           F32        [384]
+head.weight                                      BF16       [129280, 7168]
+norm.weight                                      BF16       [7168]
+mtp.0.e_proj.weight                              F8_E4M3    [7168, 7168]
+mtp.0.h_proj.weight                              F8_E4M3    [7168, 7168]
+mtp.0.hc_head_fn                                 F32        [4, 28672]
+
+########## t7_end2end
+=== 配置（缩小版，结构与官方同构）===
+n_layers=6  compress_ratios=(128, 128, 4, 128, 4, 128)
+hc_mult=4  n_hash_layers=2  window_size=128
+score_func=sqrtsoftplus  index_topk=16
+
+=== 逐层类型（读实际构造出的模块）===
+  层0: HCA(ratio=128,无Indexer)          indexer=False kv_cache=(1, 132, 128)  路由=Hash查表
+  层1: HCA(ratio=128,无Indexer)          indexer=False kv_cache=(1, 132, 128)  路由=Hash查表
+  层2: CSA(ratio=4,overlap,带Indexer)    indexer=True  kv_cache=(1, 256, 128)  路由=分数topk(带bias)
+  层3: HCA(ratio=128,无Indexer)          indexer=False kv_cache=(1, 132, 128)  路由=分数topk(带bias)
+  层4: CSA(ratio=4,overlap,带Indexer)    indexer=True  kv_cache=(1, 256, 128)  路由=分数topk(带bias)
+  层5: HCA(ratio=128,无Indexer)          indexer=False kv_cache=(1, 132, 128)  路由=分数topk(带bias)
+
+=== prefill：真实前向 ===
+输入 input_ids (1, 256) -> logits (1, 512)
+logits dtype=torch.float32  是否含 NaN/Inf: False
+logits 范围 [-0.9381, 0.8628]
+
+=== decode：逐 token 增量前向 ===
+  start_pos=256: 输入 (1, 1) -> logits (1, 512)  NaN=False
+  start_pos=257: 输入 (1, 1) -> logits (1, 512)  NaN=False
+  start_pos=258: 输入 (1, 1) -> logits (1, 512)  NaN=False
+  start_pos=259: 输入 (1, 1) -> logits (1, 512)  NaN=False
+
+=== MTP 模块 ===
+MTP 输入 hidden (1, 256, 4, 256)（含 hc_mult=4 份残差流）-> logits (1, 512)
+
+端到端跑通：官方 model.py 架构代码未修改，仅替换 CUDA 算子为 PyTorch 等价实现。
+
+########## t8_trace
+=== prefill seqlen=512，dim=256, head_dim=128, n_heads=8 ===
+
+--- 各级张量形状（forward hook 实测）---
+  embed                  in=(1, 512)               out=(1, 512, 256)
+  L0.attn.wq_a           in=(1, 512, 256)          out=(1, 512, 128)
+  L0.attn.wq_b           in=(1, 512, 128)          out=(1, 512, 1024)
+  L0.attn.wkv            in=(1, 512, 256)          out=(1, 512, 128)
+  L0.attn.compressor     in=(1, 512, 256)          out=(1, 4, 128)
+  L0.attn.wo_b           in=(1, 512, 256)          out=(1, 512, 256)
+  L0.attn                in=(1, 512, 256)          out=(1, 512, 256)
+  L0.ffn.gate            in=(512, 256)             out=None
+  L0.ffn                 in=(1, 512, 256)          out=(1, 512, 256)
+  L0.block               in=(1, 512, 4, 256)       out=(1, 512, 4, 256)
+  L1.attn.wq_a           in=(1, 512, 256)          out=(1, 512, 128)
+  L1.attn.wq_b           in=(1, 512, 128)          out=(1, 512, 1024)
+  L1.attn.wkv            in=(1, 512, 256)          out=(1, 512, 128)
+  L1.attn.compressor     in=(1, 512, 256)          out=(1, 128, 128)
+  L1.attn.indexer        in=(1, 512, 256)          out=(1, 512, 16)
+  L1.attn.wo_b           in=(1, 512, 256)          out=(1, 512, 256)
+  L1.attn                in=(1, 512, 256)          out=(1, 512, 256)
+  L1.ffn.gate            in=(512, 256)             out=None
+  L1.ffn                 in=(1, 512, 256)          out=(1, 512, 256)
+  L1.block               in=(1, 512, 4, 256)       out=(1, 512, 4, 256)
+  L2.attn.wq_a           in=(1, 512, 256)          out=(1, 512, 128)
+  L2.attn.wq_b           in=(1, 512, 128)          out=(1, 512, 1024)
+  L2.attn.wkv            in=(1, 512, 256)          out=(1, 512, 128)
+  L2.attn.compressor     in=(1, 512, 256)          out=(1, 4, 128)
+  L2.attn.wo_b           in=(1, 512, 256)          out=(1, 512, 256)
+  L2.attn                in=(1, 512, 256)          out=(1, 512, 256)
+  L2.ffn.gate            in=(512, 256)             out=None
+  L2.ffn                 in=(1, 512, 256)          out=(1, 512, 256)
+  L2.block               in=(1, 512, 4, 256)       out=(1, 512, 4, 256)
+  L3.attn.wq_a           in=(1, 512, 256)          out=(1, 512, 128)
+  L3.attn.wq_b           in=(1, 512, 128)          out=(1, 512, 1024)
+  L3.attn.wkv            in=(1, 512, 256)          out=(1, 512, 128)
+  L3.attn.compressor     in=(1, 512, 256)          out=(1, 128, 128)
+  L3.attn.indexer        in=(1, 512, 256)          out=(1, 512, 16)
+  L3.attn.wo_b           in=(1, 512, 256)          out=(1, 512, 256)
+  L3.attn                in=(1, 512, 256)          out=(1, 512, 256)
+  L3.ffn.gate            in=(512, 256)             out=None
+  L3.ffn                 in=(1, 512, 256)          out=(1, 512, 256)
+  L3.block               in=(1, 512, 4, 256)       out=(1, 512, 4, 256)
+
+--- sparse_attn 实际候选集（每层一次调用）---
+   层 q形状                    kv形状                 topk_idxs                  最大有效候选
+   0 (1, 512, 8, 128)       (1, 516, 128)        (1, 512, 132)                 132
+   1 (1, 512, 8, 128)       (1, 640, 128)        (1, 512, 144)                 144
+   2 (1, 512, 8, 128)       (1, 516, 128)        (1, 512, 132)                 132
+   3 (1, 512, 8, 128)       (1, 640, 128)        (1, 512, 144)                 144
+
+对照：window_size=128, index_topk=16, ratio=4 时压缩条目=512/4=128 -> CSA 候选=128+min(16,128)=144
+      ratio=128 时压缩条目=512/128=4 -> HCA 候选=128+4=132
+
+最终 logits: (1, 512)
+
+########## t9_mhc_params
+=== 一个 Block 内的 mHC 调用序列（hc_mult=4, dim=64）===
+Block 输入残差流: (1, 16, 4, 64)  <- [b, s, hc_mult, d]，即 4 份并行残差流
+
+  1. hc_pre : 残差流 (1, 16, 4, 64) -> 子层输入 (1, 16, 64)
+           同时产出 post(1, 16, 4) 与 comb(1, 16, 4, 4)（comb 为 Sinkhorn 后的混合矩阵）
+  2. hc_post: 子层输出 (1, 16, 64) + 残差流 (1, 16, 4, 64) -> 新残差流 (1, 16, 4, 64)
+  3. hc_pre : 残差流 (1, 16, 4, 64) -> 子层输入 (1, 16, 64)
+           同时产出 post(1, 16, 4) 与 comb(1, 16, 4, 4)（comb 为 Sinkhorn 后的混合矩阵）
+  4. hc_post: 子层输出 (1, 16, 64) + 残差流 (1, 16, 4, 64) -> 新残差流 (1, 16, 4, 64)
+Block 输出残差流: (1, 16, 4, 64)
+
+即：残差流始终是 hc_mult 份；每次进子层前归约成 1 份，出子层后再扩回 hc_mult 份。
+一个 Block 有 attn 和 ffn 两个子层，故 hc_pre/hc_post 各调用 2 次。
+
+=== mHC 参数开销（每层）===
+hc_attn_fn/hc_ffn_fn 形状 = (24, 28672) = (24, 28672)
+每层 mHC 参数 = 2 x (24 x 28672 + 24 + 3) = 1,376,310
+61 层合计 = 83,954,910 ≈ 0.084B
+（已用真实权重核对：layers.0.hc_attn_fn 形状 F32 [24, 28672]，与 (mix_hc, hc_mult*dim) 一致）
+
+=== 用真实权重清单核对总参数量 ===
+index.json metadata total_size = 864,704,792,696 字节 = 0.79 TiB
+（这是磁盘字节数：专家为 FP4 打包、多数其他参数为 FP8，故字节数 < 参数个数 x 2）
+
+单个专家参数 = 3 x 7168 x 3072 = 66,060,288
+路由专家总量 = 61 层 x 384 个 x 66,060,288 = 1.547T
+共享专家总量 = 61 x 66,060,288 = 4.03B
+每 token 激活的专家参数 = 61 层 x (6+1) 个 x 66,060,288 = 28.21B
+
+README 宣称：总参数 1.6T，激活 49B
+实算路由专家占 1.547T，已接近 1.6T 主体；激活专家参数 28.2B，
+加注意力/embedding/mHC 等非专家部分后与 49B 量级一致。
+
+########## t10_paramcount
+合并全部文件头，得到张量总数 = 145,116
+量化 scale 张量元素数（不计入参数量）= 49,150,268,416
+
+=== 参数量分组统计（不含 scale）===
+  路由专家(61层)             1547.40 B   占比  96.8%
+  MTP 模块                  25.84 B   占比   1.6%
+  注意力(61层)                19.47 B   占比   1.2%
+  共享专家(61层)                4.03 B   占比   0.3%
+  embedding                0.93 B   占比   0.1%
+  lm_head                  0.93 B   占比   0.1%
+  MoE gate(61层)            0.17 B   占比   0.0%
+  mHC(61层)                 0.08 B   占比   0.0%
+  层内 norm                  0.00 B   占比   0.0%
+  其他                       0.00 B   占比   0.0%
+  合计                    1598.84 B = 1.599 T
+
+README 宣称总参数 1.6T -> 实测 1.599T  ✓
+
+=== 每 token 激活参数（推理时实际参与的权重）===
+  单个路由专家        = 66.06 M
+  激活的路由专家      = 61 层 x 6 个 = 24.18 B
+  非专家部分(含共享专家/注意力/mHC/gate/norm/lm_head) = 24.68 B
+  合计激活            = 48.85 B
+  README 宣称 49B 激活 -> 实测 48.9B  （embedding 查表不计入 GEMM 激活）
+
+=== 注意力内部构成（单层，用真实形状）===
+  layers.0.attn.attn_sink                            F32      [128]
+  layers.0.attn.compressor.ape                       F32      [128, 512]
+  layers.0.attn.compressor.norm.weight               BF16     [512]
+  layers.0.attn.compressor.wgate.weight              BF16     [512, 7168]
+  layers.0.attn.compressor.wkv.weight                BF16     [512, 7168]
+  layers.0.attn.kv_norm.weight                       BF16     [512]
+  layers.0.attn.q_norm.weight                        BF16     [1536]
+  layers.0.attn.wkv.weight                           F8_E4M3  [512, 7168]
+  layers.0.attn.wo_a.weight                          F8_E4M3  [16384, 4096]
+  layers.0.attn.wo_b.weight                          F8_E4M3  [7168, 16384]
+  layers.0.attn.wq_a.weight                          F8_E4M3  [1536, 7168]
+  layers.0.attn.wq_b.weight                          F8_E4M3  [65536, 1536]
+  layers.2.attn.attn_sink                            F32      [128]
+  layers.2.attn.compressor.ape                       F32      [4, 1024]
+  layers.2.attn.compressor.norm.weight               BF16     [512]
+  layers.2.attn.compressor.wgate.weight              BF16     [1024, 7168]
+  layers.2.attn.compressor.wkv.weight                BF16     [1024, 7168]
+  layers.2.attn.indexer.compressor.ape               F32      [4, 256]
+  layers.2.attn.indexer.compressor.norm.weight       BF16     [128]
+  layers.2.attn.indexer.compressor.wgate.weight      BF16     [256, 7168]
+  layers.2.attn.indexer.compressor.wkv.weight        BF16     [256, 7168]
+  layers.2.attn.indexer.weights_proj.weight          BF16     [64, 7168]
+  layers.2.attn.indexer.wq_b.weight                  F8_E4M3  [8192, 1536]
+  layers.2.attn.kv_norm.weight                       BF16     [512]
+  layers.2.attn.q_norm.weight                        BF16     [1536]
+  layers.2.attn.wkv.weight                           F8_E4M3  [512, 7168]
+  layers.2.attn.wo_a.weight                          F8_E4M3  [16384, 4096]
+  layers.2.attn.wo_b.weight                          F8_E4M3  [7168, 16384]
+  layers.2.attn.wq_a.weight                          F8_E4M3  [1536, 7168]
+  layers.2.attn.wq_b.weight                          F8_E4M3  [65536, 1536]
+
