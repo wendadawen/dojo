@@ -652,7 +652,11 @@
 <h1 class="title">Multi-head Latent Attention（MLA）：把每 token 的 K/V 压成低维潜向量缓存</h1>
 <p class="reading-time" id="readingTime"></p>
 
-<p>设想一个 128K 上下文的模型在自回归生成。每生成一个新 token，它必须为前序所有 token 保留 key（K）和 value（V），否则下一步注意力没有 key/value 可用。标准多头注意力（MHA）下，每 token 每层要缓存 $2 n_h d_h$ 个数（$n_h$ 为头数、$d_h$ 为每头维度，见下表贯穿例子）——DeepSeek-V2 是 128 头 × 128 维 × 60 层，共 $1{,}966{,}080$ 个数/token，BF16（2 字节/数）下约 3.75 MB/token，128K 上下文下整个 KV cache 约 480 GB。怎么把这个数减到 1/57 同时不掉点？这就是 MLA 要解决的问题。</p>
+<blockquote class="meta">
+<p><b>主要依据</b>：DeepSeek-V2 论文（arXiv:2405.04434，§2.1，Eq.1–19 + Table 1）；Kimi K3 技术报告 §2.1.2；Kimi-K3 官方 <code>config.json</code>。</p>
+</blockquote>
+
+<p>设想一个 128K 上下文的模型在自回归生成。每生成一个新 token，它必须为前序所有 token 保留 key（K）和 value（V），否则下一步注意力没有 key/value 可用。标准多头注意力（MHA）下，每 token 每层要缓存 $2 n_h d_h$ 个数（$n_h$ 为头数、$d_h$ 为每头维度，见下文教学示例）——DeepSeek-V2 是 128 头 × 128 维 × 60 层，共 $1{,}966{,}080$ 个数/token，BF16（2 字节/数）下约 3.75 MB/token，128K 上下文下整个 KV cache 约 480 GB。怎么把这个数减到 1/57 同时不掉点？这就是 MLA 要解决的问题。</p>
 
 <p>MLA 把每 token 的 K 和 V 压成一个低维潜向量 $\mathbf{c}_t^{KV}$ 缓存，注意力时再用学习到的上投影把 K 和 V 重建出来——压缩存储、保留全局注意力。</p>
 
@@ -660,34 +664,16 @@
   <h2>读完你能回答</h2>
   <ul>
     <li>MLA 用低秩联合压缩如何减少 KV cache，同时保留全局 token-to-token 注意力？</li>
-    <li>为什么 MLA 要把 RoPE（旋转位置编码，见 S3）解耦，不能直接对压缩潜向量应用 RoPE？</li>
+    <li>为什么 MLA 要把 RoPE（旋转位置编码，见"为什么 RoPE 要解耦"一章）解耦，不能直接对压缩潜向量应用 RoPE？</li>
     <li>MLA 的 KV cache 每 token 占多少元素，相比 MHA / GQA / MQA 减少多少？</li>
     <li>推理时如何通过"矩阵吸收"避免显式重建 K 和 V？</li>
     <li>K3 在 DeepSeek-V2 MLA 上做的两处改动——NoPE 与 input-dependent full-rank output gate——各自解决什么问题？</li>
   </ul>
 </section>
 
-<blockquote class="meta">
-<p><b>主要依据</b>：DeepSeek-V2 论文（arXiv:2405.04434，§2.1，Eq.1–19 + Table 1）；Kimi K3 技术报告 §2.1.2；Kimi-K3 官方 <code>config.json</code>。</p>
-</blockquote>
+<p>下面先看 MHA 下 KV cache 是怎么来的——这能让本页看清楚 MLA 到底压缩了什么。</p>
 
-<div class="context-box">
-  <p class="context-box-title">贯穿例子的维度配置</p>
-  <div class="context-grid">
-    <div class="context-label">每头维度 $d_h$</div><div class="context-value">4</div>
-    <div class="context-label">头数 $n_h$</div><div class="context-value">2</div>
-    <div class="context-label">KV 压缩维度 $d_c$</div><div class="context-value">3</div>
-    <div class="context-label">解耦 RoPE 维度 $d_h^R$（RoPE 在 S3 讲解，此处先列维度）</div><div class="context-value">2</div>
-    <div class="context-label">层数 $l$</div><div class="context-value">1（先看单层）</div>
-    <div class="context-label">输入 $\mathbf{h}_t$</div><div class="context-value">$(1, 0, 1, 0)$</div>
-  </div>
-</div>
-
-<p class="chapter-summary">教学示例。 上表数字是为便于手算构造的，不代表真实模型配置；DeepSeek-V2 与 K3 的真实数值在第 4 章给出。这个例子会在每一章推进一个新层次——S1 看压缩、S2 看矩阵吸收、S3 看解耦 RoPE、S5 看 output gate。</p>
-
-<p>下面先看 MHA 下 KV cache 是怎么来的——这能让我们看清楚 MLA 到底压缩了什么。</p>
-
-<h2 id="kv-joint-compression">S1 · MLA 压缩了什么——KV 联合压缩的核心机制</h2>
+<h2 id="kv-joint-compression">MLA 压缩了什么——KV 联合压缩的核心机制</h2>
 
 <p>标准 MHA 对第 $t$ 个 token 的输入 $\mathbf{h}_t \in \mathbb{R}^d$ 用三个投影矩阵产生所有头拼接的 query/key/value<sup>[F1]</sup>：</p>
 
@@ -712,18 +698,18 @@
   <li>$\mathbf{c}_t^{KV} \in \mathbb{R}^{d_c}$ 是 KV 联合压缩的潜向量，<b>这是 MLA 推理时实际缓存的量</b>。</li>
   <li>$d_c \ll d_h n_h$（DeepSeek-V2：$d_c = 512$，$d_h n_h = 16384$，比值 $1/32$）。</li>
   <li>$W^{DKV} \in \mathbb{R}^{d_c \times d}$ 是下投影；$W^{UK}, W^{UV} \in \mathbb{R}^{d_h n_h \times d_c}$ 是 K、V 的上投影。</li>
-  <li>$\mathbf{k}_t^C, \mathbf{v}_t^C$ 是"content"部分的 K/V（上标 $C$ 表示 content，区别于 S3 要讲的 RoPE 部分）。</li>
+  <li>$\mathbf{k}_t^C, \mathbf{v}_t^C$ 是"content"部分的 K/V（上标 $C$ 表示 content，区别于 RoPE 解耦一章要讲的 RoPE 部分）。</li>
 </ul>
 
 <p>Query 也走了一道压缩<sup>[F3]</sup>：</p>
 
 <p>$$\mathbf{c}_t^Q = W^{DQ} \mathbf{h}_t, \qquad \mathbf{q}_t^C = W^{UQ} \mathbf{c}_t^Q.$$</p>
 
-<p>$\mathbf{c}_t^Q \in \mathbb{R}^{d_c'}$ 是 query 压缩潜向量，$d_c'$ 在 DeepSeek-V2 与 K3 都是 1536。Query 不进 cache（每次前向都重算），压缩它只是为了 S2 的矩阵吸收服务。</p>
+<p>$\mathbf{c}_t^Q \in \mathbb{R}^{d_c'}$ 是 query 压缩潜向量，$d_c'$ 在 DeepSeek-V2 与 K3 都是 1536。Query 不进 cache（每次前向都重算），压缩它只是为了下一章的矩阵吸收服务。</p>
 
 <p>关键点：注意力公式本身没变——仍是对所有前序 token 的 softmax 加权和。只是 $\mathbf{k}_t^C, \mathbf{v}_t^C$ 不再直接来自 $W^K \mathbf{h}_t$，而是来自 $\mathbf{c}_t^{KV}$ 的上投影<sup>[C2]</sup>。压缩的是<b>存储</b>，不是注意力连接图：MLA 仍是全局 token-to-token attention，与稀疏注意力、滑动窗口注意力、线性注意力都不同。</p>
 
-<p>用贯穿例子手算压缩。取 $\mathbf{h}_t = (1, 0, 1, 0) \in \mathbb{R}^4$，$d_c = 3$，构造</p>
+<p>教学示例。取 $\mathbf{h}_t = (1, 0, 1, 0) \in \mathbb{R}^4$，$d_c = 3$（教学构造，不代表真实模型参数），构造</p>
 
 <p>$$W^{DKV} = \begin{pmatrix} 1 & 0 & 0 & 0 \\ 0 & 1 & 0 & 0 \\ 0 & 0 & 1 & 0 \end{pmatrix} \in \mathbb{R}^{3 \times 4},$$</p>
 
@@ -740,20 +726,20 @@
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 $\mathbf{c}_t^{KV}$ 的形状、$\mathbf{k}_t^C$ 的形状（用贯穿例子的维度）。</li>
+  <li>写出 $\mathbf{c}_t^{KV}$ 的形状、$\mathbf{k}_t^C$ 的形状（用教学示例的维度）。</li>
   <li>MLA 的注意力是否仍是全局 softmax？给一句话理由。</li>
-  <li>$\mathbf{c}_t^{KV}$ 与 $\mathbf{c}_t^Q$ 哪个进 cache、哪个不进？为什么？</li>
+  <li>$\mathbf{c}_t^{KV}$ 与 $\mathbf{c}_t^Q$ 哪个进 cache、哪个不进？为什么。</li>
 </ul>
 
-<p>cache 已经从 $2 n_h d_h$ 降到 $d_c$。但推理时还要不要显式算出 $\mathbf{k}_t^C, \mathbf{v}_t^C$？下一章讲怎么把这一步也省掉。</p>
+<p>本章把 cache 从 $2 n_h d_h$ 降到 $d_c$。但推理时仍要显式重建 K/V——下一章讲矩阵吸收如何省掉这一步。</p>
 
-<h2 id="matrix-absorption">S2 · 推理时不重建 K/V——矩阵吸收</h2>
+<h2 id="matrix-absorption">推理时不重建 K/V——矩阵吸收</h2>
 
 <p>注意力的核心项是 $\mathbf{q}^\top \mathbf{k}_t^C$。代入 $\mathbf{k}_t^C = W^{UK} \mathbf{c}_t^{KV}$ 得到<sup>[F5]</sup></p>
 
 <p>$$\mathbf{q}^\top \mathbf{k}_t^C = \mathbf{q}^\top W^{UK} \mathbf{c}_t^{KV} = (W^{UK\,\top} \mathbf{q})^\top \mathbf{c}_t^{KV}.$$</p>
 
-<p>关键观察：$W^{UK}$ 可以从 key 侧"搬"到 query 侧——定义等价 query $\mathbf{q}' = W^{UK\,\top} \mathbf{q}$（此处 $\mathbf{q}$ 即 S1 的 content query $\mathbf{q}_t^C = W^{UQ} \mathbf{c}_t^Q$），注意力分数就等于 $\mathbf{q}'^\top \mathbf{c}_t^{KV}$。这意味着推理时把 $W^{UK}$ 吸收进 query 投影（论文原文作 "absorbed into $W^Q$"，沿用 MHA 符号；MLA 语境下实际是吸进 $W^{UQ}$，合并后 $\mathbf{q}' = W^{UK\,\top} W^{UQ} \mathbf{c}_t^Q$），就再也不用显式算 $\mathbf{k}_t^C$——直接用 $\mathbf{c}_t^{KV}$ 当 key<sup>[C4]</sup>。</p>
+<p>关键观察：$W^{UK}$ 可以从 key 侧"搬"到 query 侧——定义等价 query $\mathbf{q}' = W^{UK\,\top} \mathbf{q}$（此处 $\mathbf{q}$ 即上一章的 content query $\mathbf{q}_t^C = W^{UQ} \mathbf{c}_t^Q$），注意力分数就等于 $\mathbf{q}'^\top \mathbf{c}_t^{KV}$。这意味着推理时把 $W^{UK}$ 吸收进 query 投影（论文原文作 "absorbed into $W^Q$"，沿用 MHA 符号；MLA 语境下实际是吸进 $W^{UQ}$，合并后 $\mathbf{q}' = W^{UK\,\top} W^{UQ} \mathbf{c}_t^Q$），就再也不用显式算 $\mathbf{k}_t^C$——直接用 $\mathbf{c}_t^{KV}$ 当 key<sup>[C4]</sup>。</p>
 
 <p>同理，$\mathbf{v}_t^C = W^{UV} \mathbf{c}_t^{KV}$ 代入 $\mathbf{o}_t = \sum_j \mathrm{softmax}(\cdot) \mathbf{v}_j^C$ 后，$W^{UV}$ 可以外推吸进 $W^O$：</p>
 
@@ -772,7 +758,7 @@
 
 <p>关键限制：吸收要求 $W^{UK}$ 不依赖位置——即作用在 $\mathbf{c}_t^{KV}$ 上的变换是固定的。如果对 $\mathbf{k}_t^C$ 加了 RoPE 这样的位置敏感变换，吸收就失效——这是下一章要解决的问题。</p>
 
-<p>用贯穿例子手算吸收。为便于手算，下面取第 $i$ 个头视角：$\mathbf{q}_{t,i} \in \mathbb{R}^{d_h} = \mathbb{R}^4$、$W^{UK}_i \in \mathbb{R}^{d_h \times d_c} = \mathbb{R}^{4 \times 3}$（即 $W^{UK} \in \mathbb{R}^{d_h n_h \times d_c} = \mathbb{R}^{8 \times 3}$ 第 $i$ 个头对应的子块），吸收关系 $\mathbf{q}_{t,i}^\top W^{UK}_i \mathbf{c}_t^{KV} = (W^{UK\,\top}_i \mathbf{q}_{t,i})^\top \mathbf{c}_t^{KV}$ 与全头视角等价。取 $\mathbf{q}_{t,i} = (1, 1, 0, 0) \in \mathbb{R}^4$、$W^{UK}_i = \begin{pmatrix} 1 & 0 & 0 \\ 0 & 1 & 0 \\ 0 & 0 & 1 \\ 0 & 0 & 0 \end{pmatrix} \in \mathbb{R}^{4 \times 3}$，则</p>
+<p>教学示例。为便于手算，下面取第 $i$ 个头视角：$\mathbf{q}_{t,i} \in \mathbb{R}^{d_h} = \mathbb{R}^4$、$W^{UK}_i \in \mathbb{R}^{d_h \times d_c} = \mathbb{R}^{4 \times 3}$（即 $W^{UK} \in \mathbb{R}^{d_h n_h \times d_c} = \mathbb{R}^{8 \times 3}$ 第 $i$ 个头对应的子块），吸收关系 $\mathbf{q}_{t,i}^\top W^{UK}_i \mathbf{c}_t^{KV} = (W^{UK\,\top}_i \mathbf{q}_{t,i})^\top \mathbf{c}_t^{KV}$ 与全头视角等价。取 $\mathbf{q}_{t,i} = (1, 1, 0, 0) \in \mathbb{R}^4$、$W^{UK}_i = \begin{pmatrix} 1 & 0 & 0 \\ 0 & 1 & 0 \\ 0 & 0 & 1 \\ 0 & 0 & 0 \end{pmatrix} \in \mathbb{R}^{4 \times 3}$，则</p>
 
 <p>$$\mathbf{q}_{t,i}' = W^{UK\,\top}_i \mathbf{q}_{t,i} = (1, 1, 0) \in \mathbb{R}^3,$$</p>
 
@@ -797,14 +783,14 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 $\mathbf{q}' = W^{UK\,\top} \mathbf{q}$ 的形状（用贯穿例子：$\mathbf{q}$ 是 4 维、$W^{UK}$ 是 $4 \times 3$，$\mathbf{q}'$ 是几维？）。</li>
+  <li>写出 $\mathbf{q}' = W^{UK\,\top} \mathbf{q}$ 的形状（用教学示例：$\mathbf{q}$ 是 4 维、$W^{UK}$ 是 $4 \times 3$，$\mathbf{q}'$ 是几维？）。</li>
   <li>为什么 $W^{UV}$ 能吸进 $W^O$ 而不是 $W^Q$？给一句话理由。</li>
-  <li>矩阵吸收的前提是什么？什么情况下会失效？</li>
+  <li>矩阵吸收的前提是什么？什么情况下会失效。</li>
 </ul>
 
-<p>矩阵吸收看上去很美，但有个隐藏前提——$W^{UK}$ 必须与位置无关。可是 MHA 系模型几乎都用 RoPE 给 K 加位置信息，怎么办？下一章讲这个冲突和 MLA 的解法。</p>
+<p>本章说明推理时可通过矩阵吸收避免重建 K/V。但吸收要求 $W^{UK}$ 与位置无关，而 RoPE 会破坏这一点——下一章讲解耦 RoPE 如何化解冲突。</p>
 
-<h2 id="decoupled-rope">S3 · 为什么 RoPE 要解耦——位置编码与矩阵吸收的冲突</h2>
+<h2 id="decoupled-rope">为什么 RoPE 要解耦——位置编码与矩阵吸收的冲突</h2>
 
 <p><a href="../../wiki/rope/index.html">RoPE（旋转位置编码）</a>给出一个事实：RoPE 把位置 $t$ 编码为一个旋转矩阵 $R_t$，作用在 q 和 k 上是 $R_t \mathbf{q}$、$R_t \mathbf{k}$，且不同 token 的 $R_t$ 不同。本文只用这个事实，不展开 RoPE 的几何推导。</p>
 
@@ -831,9 +817,9 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <p>$$\mathbf{o}_{t,i} = \sum_{j=1}^{t} \mathrm{Softmax}_j\!\left(\frac{\mathbf{q}_{t,i}^\top \mathbf{k}_{j,i}}{\sqrt{d_h + d_h^R}}\right) \mathbf{v}_{j,i}^C.$$</p>
 
-<p>content 部分 $\mathbf{k}_t^C = W^{UK} \mathbf{c}_t^{KV}$ 不施加 RoPE，仍可被吸进 $W^Q$；RoPE 部分 $\mathbf{k}_t^R$ 不能吸收。$\mathbf{k}_t^R$ 由 $\mathbf{h}_t$ 直接投影（论文 Eq.(15) $W^{KR}\mathbf{h}_t$，不经 $\mathbf{c}_t^{KV}$），推理时不再保留 $\mathbf{h}_t$，故 $\mathbf{k}_t^R$ 须事先算好单独缓存。因此 MLA 的 KV cache 从 S1 的 $d_c$ 变成 $d_c + d_h^R$<sup>[C1]</sup>。</p>
+<p>content 部分 $\mathbf{k}_t^C = W^{UK} \mathbf{c}_t^{KV}$ 不施加 RoPE，仍可被吸进 $W^Q$；RoPE 部分 $\mathbf{k}_t^R$ 不能吸收。$\mathbf{k}_t^R$ 由 $\mathbf{h}_t$ 直接投影（论文 Eq.(15) $W^{KR}\mathbf{h}_t$，不经 $\mathbf{c}_t^{KV}$），推理时不再保留 $\mathbf{h}_t$，故 $\mathbf{k}_t^R$ 须事先算好单独缓存。因此 MLA 的 KV cache 从 KV 联合压缩一章的 $d_c$ 变成 $d_c + d_h^R$<sup>[C1]</sup>。</p>
 
-<p>用贯穿例子手算解耦。沿用 S2 的单头视角，取 $\mathbf{q}_{t,i}^R = (1, 0) \in \mathbb{R}^2$、$\mathbf{k}_t^R = (0, 1) \in \mathbb{R}^2$（这里略去 RoPE 旋转本身，用固定值表示"已经被 RoPE 旋转过的结果"），content 部分沿用 S1、S2 的单头 content query $\mathbf{q}_{t,i}^C = (1, 1, 0, 0)$、$\mathbf{k}_{t,i}^C = (1, 0, 1, 0)$。拼接后：</p>
+<p>教学示例。沿用上一章的单头视角，取 $\mathbf{q}_{t,i}^R = (1, 0) \in \mathbb{R}^2$、$\mathbf{k}_t^R = (0, 1) \in \mathbb{R}^2$（这里略去 RoPE 旋转本身，用固定值表示"已经被 RoPE 旋转过的结果"），content 部分沿用前两章的单头 content query $\mathbf{q}_{t,i}^C = (1, 1, 0, 0)$、$\mathbf{k}_{t,i}^C = (1, 0, 1, 0)$。拼接后：</p>
 
 <p>$$\mathbf{q}_{t,i} = [\mathbf{q}_{t,i}^C; \mathbf{q}_{t,i}^R] = (1, 1, 0, 0, 1, 0) \in \mathbb{R}^6,$$</p>
 <p>$$\mathbf{k}_{t,i} = [\mathbf{k}_{t,i}^C; \mathbf{k}_t^R] = (1, 0, 1, 0, 0, 1) \in \mathbb{R}^6.$$</p>
@@ -852,13 +838,13 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
   <li>说明为什么 RoPE 不能作用在 $\mathbf{k}_t^C$ 上而要单独拆出 $\mathbf{k}_t^R$。给一句话理由。</li>
-  <li>MLA cache 公式 $(d_c + d_h^R) l$ 中两项分别来自哪里？</li>
-  <li>注意力分母为什么从 $\sqrt{d_h}$ 变成 $\sqrt{d_h + d_h^R}$？</li>
+  <li>MLA cache 公式 $(d_c + d_h^R) l$ 中两项分别来自哪里。</li>
+  <li>注意力分母为什么从 $\sqrt{d_h}$ 变成 $\sqrt{d_h + d_h^R}$。</li>
 </ul>
 
-<p>到这里 MLA 的核心机制已经讲完。下面用真实数值看 cache 到底减少了多少，以及与 GQA/MQA 的对比。</p>
+<p>本章解决了 RoPE 与矩阵吸收的冲突。但 cache 到底减少了多少——下一章用真实数值与 MHA/GQA/MQA 对照。</p>
 
-<h2 id="kv-cache-comparison">S4 · KV cache 到底减少了多少——与 MHA / GQA / MQA 对照</h2>
+<h2 id="kv-cache-comparison">KV cache 到底减少了多少——与 MHA / GQA / MQA 对照</h2>
 
 <p>把四种机制的每 token 每层 KV cache 元素数并排放<sup>[C7, F2, N2]</sup>：</p>
 
@@ -908,12 +894,12 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 <ul>
   <li>写出四种机制的每 token 每层 cache 公式。</li>
   <li>用 DeepSeek-V2 数值算 MLA vs MHA 的比值。</li>
-  <li>摘要的 93.3% 是相对什么 baseline？同配置下 MLA 对 MHA 的减少比例是多少？</li>
+  <li>摘要的 93.3% 是相对什么 baseline？同配置下 MLA 对 MHA 的减少比例是多少。</li>
 </ul>
 
-<p>MLA 本体讲完了。最后一章看 K3 在此基础上做了哪两处改动，以及为什么。</p>
+<p>本章用真实数值确认 MLA cache 约为 MHA 的 1/57。但 K3 在此基础上还有改动——下一章讲 NoPE 与 output gate。</p>
 
-<h2 id="k3-gated-mla">S5 · K3 的 Gated MLA——NoPE 与 full-rank output gate</h2>
+<h2 id="k3-gated-mla">K3 的 Gated MLA——NoPE 与 full-rank output gate</h2>
 
 <p>K3 §2.1.2 在 DeepSeek-V2 MLA 上做了两处改动。<sup>[C5, C6]</sup></p>
 
@@ -927,17 +913,17 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
   <li><b>免去扩展上下文时调整 RoPE 频率基的麻烦</b>：常规 RoPE 模型在扩长上下文时往往要 retune 频率基（如 $\theta$）或用 YaRN 这类外推方法；K3 的 MLA 层根本没用 RoPE，自然不需要调整。<sup>[C5]</sup></li>
 </ul>
 
-<p>与 S3 的关系：NoPE 意味着 K3 的 MLA 层不存在"RoPE 与矩阵吸收冲突"的问题——S3 描述的解耦 RoPE 分支在 K3 下不施加 RoPE 旋转（<code>rotary_emb = None</code>），但分支结构仍保留（$\mathbf{k}_t^R$ 仍创建并缓存，见 S4 callout）。</p>
+<p>与 RoPE 解耦一章的关系：NoPE 意味着 K3 的 MLA 层不存在"RoPE 与矩阵吸收冲突"的问题——RoPE 解耦一章描述的解耦 RoPE 分支在 K3 下不施加 RoPE 旋转（<code>rotary_emb = None</code>），但分支结构仍保留（$\mathbf{k}_t^R$ 仍创建并缓存，见上一章 callout）。</p>
 
 <h3 id="k3-output-gate">改动二：input-dependent full-rank output gate</h3>
 
-<p>K3 给 MLA 末加了一道 channel-wise 乘性 gate<sup>[F6]</sup>（下面公式中的 $\mathbf{x}_t$ 即前文输入 $\mathbf{h}_t$——K3 报告记为 $\mathbf{x}_t$，本文 S5 沿用报告符号以与引文一致）：</p>
+<p>K3 给 MLA 末加了一道 channel-wise 乘性 gate<sup>[F6]</sup>（下面公式中的 $\mathbf{x}_t$ 即前文输入 $\mathbf{h}_t$——K3 报告记为 $\mathbf{x}_t$，本章沿用报告符号以与引文一致）：</p>
 
 <p>$$\mathbf{y}_t = W^O \left[ \mathrm{Sigmoid}(W^g \mathbf{x}_t) \odot \tilde{\mathbf{o}}_t \right].$$</p>
 
 <p>其中：</p>
 <ul>
-  <li>$\tilde{\mathbf{o}}_t$ 是未 gate 的 MLA 输出（即 S1 公式里 $W^O$ 输入端的拼接向量 $[\mathbf{o}_{t,1}; \ldots; \mathbf{o}_{t,n_h}]$，$W^O$ 之前；区别于 $W^O$ 之后的 $\mathbf{u}_t$，仅强调"ungated"）。</li>
+  <li>$\tilde{\mathbf{o}}_t$ 是未 gate 的 MLA 输出（即第一章公式里 $W^O$ 输入端的拼接向量 $[\mathbf{o}_{t,1}; \ldots; \mathbf{o}_{t,n_h}]$，$W^O$ 之前；区别于 $W^O$ 之后的 $\mathbf{u}_t$，仅强调"ungated"）。</li>
   <li>$W^g$ 是 gate 的投影矩阵，将 $\mathbf{x}_t \in \mathbb{R}^d$ 投影到 $\tilde{\mathbf{o}}_t$ 的维度（即 $W^O$ 输入端 $d_h n_h$ 维），故 $W^g \in \mathbb{R}^{d_h n_h \times d}$（K3 报告未明确给出此维度，本页按公式结构推断）。$W^g$ <b>满秩</b>（K3 §2.1.2："The gate projection $W^g$ is full rank, matching the new parameterization used by KDA in Kimi K3."；该参数化改动的原始出处见 §2.1.1 Full-rank gate 段）。</li>
   <li>$\mathrm{Sigmoid}(W^g \mathbf{x}_t) \in (0,1)^d$ 是逐通道的门信号，对 $\tilde{\mathbf{o}}_t$ 做通道级缩放。</li>
   <li>$\odot$ 是逐元素乘（Hadamard 积）。</li>
@@ -946,7 +932,7 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <p>作用：让每个 token 根据当前输入 $\mathbf{x}_t$ 调制从全局注意力读出的通道——哪些通道需要保留、哪些需要抑制。$W^g$ 满秩保证 gate 不退化到低维子空间，每个通道都能被独立调制。</p>
 
-<p>用贯穿例子手算 gate。为便于手算，下面取 $n_h=1$ 退化视角（此时 $d_h n_h = d_h = 4$，$W^g \in \mathbb{R}^{4 \times 4}$）。取 $\mathbf{x}_t = (1, 0, -1, 0)$、$W^g = I_4$（单位阵便于手算）、$\tilde{\mathbf{o}}_t = (1, 2, 3, 4)$（假设值——$\tilde{\mathbf{o}}_t$ 是注意力输出拼接，此处不追踪其来源，仅展示 gate 效果），则</p>
+<p>教学示例。为便于手算，下面取 $n_h=1$ 退化视角（此时 $d_h n_h = d_h = 4$，$W^g \in \mathbb{R}^{4 \times 4}$）。取 $\mathbf{x}_t = (1, 0, -1, 0)$、$W^g = I_4$（单位阵便于手算）、$\tilde{\mathbf{o}}_t = (1, 2, 3, 4)$（假设值——$\tilde{\mathbf{o}}_t$ 是注意力输出拼接，此处不追踪其来源，仅展示 gate 效果），则</p>
 
 <p>$$\mathrm{Sigmoid}(W^g \mathbf{x}_t) = \mathrm{Sigmoid}(\mathbf{x}_t) = (\mathrm{Sig}(1), \mathrm{Sig}(0), \mathrm{Sig}(-1), \mathrm{Sig}(0)),$$</p>
 
@@ -966,11 +952,11 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
   <li>指出 K3 的两处改动各是什么。给一句话说明各自的动机。</li>
-  <li>NoPE 解决了 DeepSeek-V2 MLA 中的什么冲突？（提示：S3）</li>
-  <li>$W^g$ 满秩为什么重要？若 $W^g$ 秩为 1 会发生什么？</li>
+  <li>NoPE 解决了 DeepSeek-V2 MLA 中的什么冲突？（提示：见 RoPE 解耦一章）。</li>
+  <li>$W^g$ 满秩为什么重要？若 $W^g$ 秩为 1 会发生什么。</li>
 </ul>
 
-<p>四问已答完：MLA 用低秩压缩 + 矩阵吸收把 KV cache 减到 MHA 的 $\approx 1/57$、保留全局注意力；解耦 RoPE 解决了位置编码与吸收的冲突；K3 用 NoPE 直接绕开这个冲突，并加了 input-dependent full-rank output gate 提升通道级表达力。</p>
+<p>回顾全文学习目标：MLA 用低秩联合压缩把每 token 的 K/V 压成 $d_c$ 维潜向量，配合矩阵吸收避免推理时重建 K/V，每 token 每层 cache 从 MHA 的 $2 n_h d_h$ 降到 $d_c + d_h^R$（DeepSeek-V2 数值下约为 MHA 的 1/57），同时保留全局注意力；RoPE 解耦解决了位置编码与吸收的冲突；K3 用 NoPE 绕开这一冲突，并加 input-dependent full-rank output gate 提升通道级表达力。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
@@ -1009,7 +995,7 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <h3>教学示例</h3>
 <p>
-贯穿例子的小维度配置 $d_h=4, n_h=2, d_c=3, d_h^R=2, l=1$、$\mathbf{h}_t = (1, 0, 1, 0)$、$W^{DKV}$ 取前 3 行单位阵、$W^{UK}$ 取前 3 列单位阵补零行、$\mathbf{q} = (1,1,0,0)$、$\mathbf{q}_t^R = (1,0)$、$\mathbf{k}_t^R = (0,1)$、$\mathbf{x}_t = (1,0,-1,0)$、$W^g = I_4$、$\tilde{\mathbf{o}}_t = (1,2,3,4)$ 全部为便于手算的教学构造，不代表真实模型参数或推荐配置。构造目的：让读者能逐步追踪 $\mathbf{h}_t \to \mathbf{c}_t^{KV} \to \mathbf{k}_t^C$、矩阵吸收、解耦 RoPE 拼接、output gate 的每一步数值。
+本文在各章手算处使用同一组小维度教学构造，参数在首次使用时给出并标注"教学构造，不代表真实模型参数"，后续章节沿用。构造目的：让读者能逐步追踪 $\mathbf{h}_t \to \mathbf{c}_t^{KV} \to \mathbf{k}_t^C$、矩阵吸收、解耦 RoPE 拼接、output gate 的每一步数值。
 </p>
 
 <h3>教学解释与类比边界</h3>
@@ -1019,10 +1005,10 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <h3>教学简化及其限制</h3>
 <p>
-- <b>(1) cache 公式</b>：本文按 DeepSeek-V2 公式 $(d_c + d_h^R) l$ 计算 K3 MLA cache。官方源码已确认 K3 NoPE 下 RoPE 分支仍保留（见 S4 callout），故 $(d_c + d_h^R) = 576$ 是准确值而非估计。可推出 MLA cache 远小于 MHA 的结论。<br>
-- <b>(2) 贯穿例子维度</b>：$d_h=4, n_h=2$ 便于手算但不反映真实头数（128/96）；可推出压缩机制与吸收等价性；不可推出真实模型精度或训练动态。<br>
-- <b>(3) RoPE 旋转</b>：S3 用固定值 $\mathbf{k}_t^R = (0,1)$ 表示"已被 RoPE 旋转过的结果"，不展示 RoPE 旋转矩阵 $R_t$ 的具体数值；可推出"位置信息被单独编码"的机制；不可推出 RoPE 的几何推导。<br>
-- <b>(4) K3 混合调度</b>：本文只说"24 层 MLA + 69 层 KDA"，不展开 attn_res_block_size=12、Block AttnRes、KCP 等调度细节；可推出 MLA 是 K3 的一部分；不可推出 K3 的完整前向数据流。
+- <b>(1) cache 公式</b>：简化做法：按 DeepSeek-V2 公式 $(d_c + d_h^R) l$ 计算 K3 MLA cache，官方源码确认 NoPE 下 RoPE 分支仍保留，故 $(d_c + d_h^R) = 576$ 是准确值。可推出：MLA cache 远小于 MHA。不可推出：K3 整体显存占用（未计 KDA 层、激活、权重）。<br>
+- <b>(2) 教学示例维度</b>：简化做法：用 $d_h=4, n_h=2$ 的小维度便于手算。可推出：压缩机制与吸收等价性。不可推出：真实模型精度或训练动态。<br>
+- <b>(3) RoPE 旋转</b>：简化做法：用固定值 $\mathbf{k}_t^R = (0,1)$ 表示"已被 RoPE 旋转过的结果"，不展示旋转矩阵 $R_t$ 的具体数值。可推出：位置信息被单独编码的机制。不可推出：RoPE 的几何推导。<br>
+- <b>(4) K3 混合调度</b>：简化做法：只说"24 层 MLA + 69 层 KDA"，不展开 attn_res_block_size=12、Block AttnRes、KCP 等调度细节。可推出：MLA 是 K3 的一部分。不可推出：K3 的完整前向数据流。
 </p>
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

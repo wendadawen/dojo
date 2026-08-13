@@ -680,7 +680,17 @@
   </ul>
 </section>
 
-<p>本文使用一个 $N=3$、$d=2$ 的小例子贯穿全文：3 个 token、每个 key/value 是 2 维向量。数字足够小，全部可以手算复算。设三个 token 的查询、键、值分别为（每行是一个 token 的向量）：</p>
+<h2 id="softmax-bottleneck">softmax 注意力——O(N²) 瓶颈在哪一步</h2>
+
+<p>标准 Transformer 的自注意力用三个矩阵 $Q, K, V \in \mathbb{R}^{N \times d}$ 计算输出，其中 $N$ 是序列长度、$d$ 是每个注意力头的维度。softmax 注意力定义为<sup>[C1, F1]</sup>：</p>
+
+$$V' = \mathrm{softmax}\!\left(\frac{Q K^T}{\sqrt{d}}\right) V \tag{F1}$$
+
+<p>这里 softmax 是把任意实数分数转成和为 1 的正数概率的函数（标准 softmax 注意力的完整讲解见 <a href="../standard-attention/index.html">standard-attention 概念页</a>，本文只使用其公式）。$\sqrt{d}$ 是缩放因子，用于稳定 softmax 数值；为了便于手算，下面暂略去它。</p>
+
+<p>关键看 $Q K^T$ 这一步。$Q$ 是 $N \times d$、$K^T$ 是 $d \times N$，乘积 $Q K^T$ 是 $N \times N$ 的矩阵——每个元素是某对 query 与 key 的内积。也就是说，每两个 token 之间都要算一次相似度。</p>
+
+<p>教学示例。 取 $N=3$、$d=2$，3 个 token、每个 key/value 是 2 维向量，数字足够小可全部手算（教学构造，不代表真实模型参数）。令 $Q = K$ 以减少变量，设三个 token 的向量如下：</p>
 
 <div class="table-scroll">
 <table>
@@ -693,21 +703,11 @@
 </table>
 </div>
 
-<p class="chapter-summary">教学示例。 上表的数字是为便于手算构造的，不代表真实模型输入。令 $Q = K$ 是为了减少变量；下文会用同一组数字在每一章推进一个新层次——先看 $N \times N$ 矩阵的形状、再看核分解后的聚合、再看因果递归、最后看不同核选择对权重分布的影响。</p>
-
-<h2 id="softmax-bottleneck">softmax 注意力的 O(N²) 瓶颈在哪一步</h2>
-
-<p>标准 Transformer 的自注意力用三个矩阵 $Q, K, V \in \mathbb{R}^{N \times d}$ 计算输出，其中 $N$ 是序列长度、$d$ 是每个注意力头的维度。softmax 注意力定义为：</p>
-
-$$V' = \mathrm{softmax}\!\left(\frac{Q K^T}{\sqrt{d}}\right) V \tag{F1}$$
-
-<p>这里 softmax 是把任意实数分数转成和为 1 的正数概率的函数（标准 softmax 注意力的完整讲解见 <em>standard-attention 概念页（待生成）</em>，本文只使用其公式）。$\sqrt{d}$ 是缩放因子，用于稳定 softmax 数值；为了便于手算，下面暂略去它。</p>
-
-<p>关键看 $Q K^T$ 这一步。$Q$ 是 $N \times d$、$K^T$ 是 $d \times N$，乘积 $Q K^T$ 是 $N \times N$ 的矩阵——每个元素是某对 query 与 key 的内积。也就是说，每两个 token 之间都要算一次相似度。在我们的 $N=3, d=2$ 例子中：</p>
+<p>代入上面的例子：</p>
 
 $$Q K^T = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix} \begin{pmatrix} 1 & 0 & 1 \\ 0 & 1 & 1 \end{pmatrix} = \begin{pmatrix} 1 & 0 & 1 \\ 0 & 1 & 1 \\ 1 & 1 & 2 \end{pmatrix}$$
 
-<p>结果是 $3 \times 3$ 矩阵。当 $N$ 变成 3000、30000、300000 时，这个矩阵的元素数量分别是 $9 \times 10^6$、$9 \times 10^8$、$9 \times 10^{10}$——按 $N^2$ 增长。计算这一步需要 $O(N^2 d)$ 次乘加（$N \times N$ 矩阵每个元素是 $d$ 维向量的内积，需要 $d$ 次乘加，所以总共 $N^2 \times d$ 次），存储需要 $O(N^2)$ 内存，<b>瓶颈就在这里</b>。</p>
+<p>结果是 $3 \times 3$ 矩阵。当 $N$ 变成 3000、30000、300000 时，这个矩阵的元素数量分别是 $9 \times 10^6$、$9 \times 10^8$、$9 \times 10^{10}$——按 $N^2$ 增长。计算这一步需要 $O(N^2 d)$ 次乘加（$N \times N$ 矩阵每个元素是 $d$ 维向量的内积，需要 $d$ 次乘加，所以总共 $N^2 \times d$ 次），存储需要 $O(N^2)$ 内存，<b>瓶颈就在这里</b><sup>[C1]</sup>。</p>
 
 <pre class="diagram">N=3:    N=6:         N=300000:
 ┌─────┐  ┌──────────┐  ┌────────────────────────┐
@@ -729,20 +729,20 @@ $$Q K^T = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix} \begin{pmatrix} 
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>给定 $N=4, d=2$，$Q K^T$ 是什么形状？这一步共需要算多少次内积？</li>
+  <li>给定 $N=4, d=2$，指出 $Q K^T$ 的形状，并说明这一步共需要算多少次内积。</li>
   <li>用一句话说明为什么 $N$ 翻倍时 softmax 注意力计算量大约变成 4 倍。</li>
-  <li>自回归生成中 KV cache 为什么必须随 $N$ 增长？</li>
+  <li>说明自回归生成中 KV cache 为什么必须随 $N$ 增长。</li>
 </ul>
 
-<p>瓶颈已经定位在 $Q K^T$ 这一步。下一章要回答：能不能不构造 $N \times N$ 矩阵，直接得到 $V'$？</p>
+<p>本章定位了 softmax 注意力的 $O(N^2)$ 瓶颈在 $Q K^T$ 这一步。但不构造 $N \times N$ 矩阵能否直接得到 $V'$——下一章用核函数与结合律回答。</p>
 
-<h2 id="kernel-associativity">用核函数 φ 把相似度分解，再用结合律重排</h2>
+<h2 id="kernel-associativity">核函数与结合律——把相似度分解并重排</h2>
 
-<p>softmax 注意力中 $Q K^T$ 的每个元素是 $\exp(Q_i \cdot K_j / \sqrt{d})$（这里恢复 $\sqrt{d}$ 是为了准确性；S1 的略去只用于 $QK^T$ 形状演示）。把它写成"先算相似度、再加权求和"的形式：</p>
+<p>softmax 注意力中 $Q K^T$ 的每个元素是 $\exp(Q_i \cdot K_j / \sqrt{d})$（这里恢复 $\sqrt{d}$ 是为了准确性；上一章的略去只用于 $QK^T$ 形状演示）。把它写成"先算相似度、再加权求和"的形式：</p>
 
 $$V'_i = \frac{\sum_{j=1}^{N} \mathrm{sim}(Q_i, K_j)\, V_j}{\sum_{j=1}^{N} \mathrm{sim}(Q_i, K_j)} \tag{F2 之前}$$
 
-<p>softmax 注意力取 $\mathrm{sim}(q, k) = \exp(q^T k / \sqrt{d})$。但这个公式本身不依赖 softmax——任何非负相似度函数 $\mathrm{sim}$ 都能定义一种注意力。<b>非负</b>是必要约束：分母作归一化用，必须为正；如果 $\mathrm{sim}$ 可能为负或零，分母可能为 0 或负，输出不再是合法的加权平均。</p>
+<p>softmax 注意力取 $\mathrm{sim}(q, k) = \exp(q^T k / \sqrt{d})$。但这个公式本身不依赖 softmax——任何非负相似度函数 $\mathrm{sim}$ 都能定义一种注意力<sup>[C2]</sup>。<b>非负</b>是必要约束：分母作归一化用，必须为正；如果 $\mathrm{sim}$ 可能为负或零，分母可能为 0 或负，输出不再是合法的加权平均。</p>
 
 <p>关键假设来了：假如 $\mathrm{sim}$ 可以分解为某特征映射 $\phi$ 的内积，即</p>
 
@@ -756,7 +756,7 @@ $$V'_i = \frac{\phi(Q_i)^T \sum_{j=1}^{N} \phi(K_j) V_j^T}{\phi(Q_i)^T \sum_{j=1
 
 $$(\phi(Q)\, \phi(K)^T)\, V \;=\; \phi(Q)\, (\phi(K)^T V) \tag{结合律}$$
 
-<p>等号两边由矩阵乘法结合律得到，是恒等变形。但计算顺序不同：左边先算 $\phi(Q)\phi(K)^T$（$N \times N$ 矩阵），再乘 $V$；右边先算 $\phi(K)^T V$（$d' \times d$ 矩阵，与 $N$ 无关），再与 $\phi(Q)$ 相乘。<b>右边避免了构造 $N \times N$ 矩阵</b>。</p>
+<p>等号两边由矩阵乘法结合律得到，是恒等变形。但计算顺序不同：左边先算 $\phi(Q)\phi(K)^T$（$N \times N$ 矩阵），再乘 $V$；右边先算 $\phi(K)^T V$（$d' \times d$ 矩阵，与 $N$ 无关），再与 $\phi(Q)$ 相乘。<b>右边避免了构造 $N \times N$ 矩阵</b><sup>[C3, F2]</sup>。</p>
 
 <pre class="diagram">softmax 顺序（O(N²)）：           线性注意力顺序（O(N)）：
                                    
@@ -770,7 +770,7 @@ $$(\phi(Q)\, \phi(K)^T)\, V \;=\; \phi(Q)\, (\phi(K)^T V) \tag{结合律}$$
       N×d                               N×d
 </pre>
 
-<p>用我们的 $N=3, d=2$ 例子手算。教学简化。 取 $\phi(x) = x + 1$，这是保证非负的最简教学选择（当 $x \geq 0$ 时 $\phi(x) > 0$；注意这并非 Katharopoulos 论文使用的 $\mathrm{elu}+1$，论文版本在下一章解释）。先算 $\phi(K)$：</p>
+<p>用本页的 $N=3, d=2$ 例子手算。教学示例。 取 $\phi(x) = x + 1$，这是保证非负的最简教学选择（当 $x \geq 0$ 时 $\phi(x) > 0$；注意这并非 Katharopoulos 论文使用的 $\mathrm{elu}+1$，论文版本在下一章解释）。先算 $\phi(K)$：</p>
 
 $$\phi(K) = K + 1 = \begin{pmatrix} 2 & 1 \\ 1 & 2 \\ 2 & 2 \end{pmatrix}$$
 
@@ -787,7 +787,7 @@ $$\phi(K)^T \mathbf{1} = \begin{pmatrix} 2 & 1 & 2 \\ 1 & 2 & 2 \end{pmatrix} \b
 $$V'_1 = \frac{\phi(Q_1)^T (\phi(K)^T V)}{\phi(Q_1)^T (\phi(K)^T \mathbf{1})} = \frac{(2, 1) \begin{pmatrix} 4 & 3 \\ 3 & 4 \end{pmatrix}}{(2, 1) \begin{pmatrix} 5 \\ 5 \end{pmatrix}} = \frac{(11, 10)}{15} \approx (0.733, 0.667)$$
 
 <details>
-<summary>完整数字代入：用直接求和验证重排结果一致</summary>
+<summary>展开：用直接求和验证重排结果一致</summary>
 <p>直接按 $V'_1 = \frac{\sum_j \phi(Q_1)^T \phi(K_j) V_j}{\sum_j \phi(Q_1)^T \phi(K_j)}$ 算：</p>
 <ul>
 <li>$\phi(Q_1)^T \phi(K_1) = (2,1) \cdot (2,1) = 5$</li>
@@ -808,12 +808,12 @@ $$V'_1 = \frac{\phi(Q_1)^T (\phi(K)^T V)}{\phi(Q_1)^T (\phi(K)^T \mathbf{1})} = 
   <li>用一句话说明 $\mathrm{sim}$ 为什么必须非负。</li>
   <li>写出 $(\phi(Q)\phi(K)^T)V$ 的重排结果。</li>
   <li>解释为什么重排后时间复杂度与 $N$ 成一次关系而不是二次。</li>
-  <li>在我们的 $N=3$ 例子中，$\phi(K)^T V$ 是什么形状？它依赖 $N$ 吗？</li>
+  <li>在我们的 $N=3$ 例子中，指出 $\phi(K)^T V$ 的形状，并说明它是否依赖 $N$。</li>
 </ul>
 
-<p>$O(N)$ 的训练前向已经有了。但生成场景下还要每步重算 $\sum_j \phi(K_j) V_j^T$ 吗？下一章用因果掩码把递归形式挖出来。</p>
+<p>本章用核分解与结合律把训练前向降到 $O(N)$。但生成场景下还要每步重算聚合吗——下一章用因果掩码挖出递归形式。</p>
 
-<h2 id="causal-recurrence">因果掩码下变成固定大小的递归状态</h2>
+<h2 id="causal-recurrence">因果掩码——变成固定大小的递归状态</h2>
 
 <p>自回归生成中，第 $i$ 个 token 只能看到前 $i$ 个 token，不能"偷看未来"。这通过因果掩码实现：把 $\sum_{j=1}^{N}$ 改为 $\sum_{j=1}^{i}$。线性注意力在因果掩码下变成：</p>
 
@@ -829,7 +829,7 @@ $$z_i = z_{i-1} + \phi(K_i) \qquad \text{(normalizer memory)} \tag{F3}$$
 
 $$V'_i = \frac{\phi(Q_i)^T s_i}{\phi(Q_i)^T z_i} \tag{F3}$$
 
-<p>$s_i$ 是 $d' \times d$ 矩阵（外积 $\phi(K_i) V_i^T$ 的累积），$z_i$ 是 $d'$ 维向量。<b>两者的形状都与 $N$ 无关</b>。每生成一个新 token 时，只需把新的 $\phi(K_i) V_i^T$ 加到 $s_{i-1}$ 上、把 $\phi(K_i)$ 加到 $z_{i-1}$ 上，然后算一次 $V'_i$——时间和内存都是 $O(d \cdot d')$（典型 $d'=d$ 时为 $O(d^2)$），与序列长度 $N$ 无关。</p>
+<p>$s_i$ 是 $d' \times d$ 矩阵（外积 $\phi(K_i) V_i^T$ 的累积），$z_i$ 是 $d'$ 维向量。<b>两者的形状都与 $N$ 无关</b><sup>[C4, F3]</sup>。每生成一个新 token 时，只需把新的 $\phi(K_i) V_i^T$ 加到 $s_{i-1}$ 上、把 $\phi(K_i)$ 加到 $z_{i-1}$ 上，然后算一次 $V'_i$——时间和内存都是 $O(d \cdot d')$（典型 $d'=d$ 时为 $O(d^2)$），与序列长度 $N$ 无关。</p>
 
 <pre class="diagram">生成第 i 个 token 时：
                                     ┌─────────────────────┐
@@ -849,7 +849,7 @@ $$V'_i = \frac{\phi(Q_i)^T s_i}{\phi(Q_i)^T z_i} \tag{F3}$$
    输出第 i 个 token
 </pre>
 
-<p>用我们的 $N=3, d=2$ 例子手算递归。教学简化。 仍取 $\phi(x) = x + 1$。从 $s_0 = \begin{pmatrix} 0 & 0 \\ 0 & 0 \end{pmatrix}$, $z_0 = (0, 0)$ 开始：</p>
+<p>用本页的 $N=3, d=2$ 例子手算递归。教学示例。 仍取 $\phi(x) = x + 1$。从 $s_0 = \begin{pmatrix} 0 & 0 \\ 0 & 0 \end{pmatrix}$, $z_0 = (0, 0)$ 开始：</p>
 
 <p><b>第 1 步</b>：$\phi(K_1) = (2, 1)$, $V_1 = (1, 0)$</p>
 
@@ -876,7 +876,7 @@ $$s_3 = s_2 + \phi(K_3) V_3^T = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix} + \
 <p>第 3 个 token 能看到所有前 3 个 token，所以 $V'_3$ 用最终状态 $s_3, z_3$。<b>关键观察</b>：算 $V'_3$ 只用到 $s_3, z_3$ 两个状态，不需要重新访问 $\phi(K_1), V_1, \phi(K_2), V_2, \phi(K_3), V_3$——这就是"固定大小状态"的含义。</p>
 
 <details>
-<summary>用 $s_1, z_1$ 算 $V'_1$（因果）的完整代入</summary>
+<summary>展开：用 $s_1, z_1$ 算 $V'_1$（因果）的完整代入</summary>
 <p>第 1 个 token 只能看到第 1 个 token，所以 $V'_1$ 用<b>第 1 步</b>的状态 $s_1, z_1$（不是 $s_3, z_3$）：</p>
 <ul>
 <li>$\phi(Q_1) = (2, 1)$</li>
@@ -902,13 +902,13 @@ $$s_3 = s_2 + \phi(K_3) V_3^T = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix} + \
   <li>用一句话说明为什么 $s_3$ 等于非因果形式下的 $\phi(K)^T V$。</li>
 </ul>
 
-<p>复杂度优势有了。但 softmax 为什么不能也这样重排？下一章回答代价从哪里来。</p>
+<p>本章把因果掩码下的线性注意力写成固定大小递归状态。但 softmax 为什么不能也这样重排——下一章回答代价从哪里来。</p>
 
-<h2 id="expressivity-cost">表达力代价从公式的哪里来</h2>
+<h2 id="expressivity-cost">表达力代价——从公式的哪里来</h2>
 
 <p>回到 F2 的关键假设：$\mathrm{sim}(q, k) = \phi(q)^T \phi(k)$ 必须可分解为有限维 $\phi$ 内积且非负。softmax 核 $\exp(q^T k)$ 是否满足？</p>
 
-<p><b>不满足</b>。softmax 核 $\exp(q^T k)$ 的特征映射是<b>无穷维</b>的（可由泰勒展开 $\exp(q^T k) = \sum_{n=0}^{\infty} \frac{(q^T k)^n}{n!}$ 看出，需要无穷多个单项式特征）。因此 softmax 注意力本身<b>不能</b>套用 F2 的重排——这正是线性注意力必须换核的原因。</p>
+<p><b>不满足</b>。softmax 核 $\exp(q^T k)$ 的特征映射是<b>无穷维</b>的（可由泰勒展开 $\exp(q^T k) = \sum_{n=0}^{\infty} \frac{(q^T k)^n}{n!}$ 看出，需要无穷多个单项式特征）。因此 softmax 注意力本身<b>不能</b>套用 F2 的重排——这正是线性注意力必须换核的原因<sup>[C5]</sup>。</p>
 
 <p>换核有两条主要路径：</p>
 
@@ -918,7 +918,7 @@ $$s_3 = s_2 + \phi(K_3) V_3^T = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix} + \
 
 $$\phi(x) = \mathrm{elu}(x) + 1 \tag{F4}$$
 
-<p>$\mathrm{elu}(x) \in (-1, +\infty)$，所以 $\phi(x) > 0$ 严格成立——满足非负约束。选 $\mathrm{elu}$ 而非 $\mathrm{relu}$ 是为了"避免负值区域梯度为 0"（$\mathrm{relu}(x)+1$ 在 $x < 0$ 时梯度为 0，训练可能卡死）。这个 $\phi$ <b>不是</b>在近似 softmax 核，而是直接定义了一个新的非负核。</p>
+<p>$\mathrm{elu}(x) \in (-1, +\infty)$，所以 $\phi(x) > 0$ 严格成立——满足非负约束。选 $\mathrm{elu}$ 而非 $\mathrm{relu}$ 是为了"避免负值区域梯度为 0"（$\mathrm{relu}(x)+1$ 在 $x < 0$ 时梯度为 0，训练可能卡死）。这个 $\phi$ <b>不是</b>在近似 softmax 核，而是直接定义了一个新的非负核<sup>[C5, F4]</sup>。</p>
 
 <h3 id="performer-random-features">路径 2：随机特征近似 softmax 核（Performer）</h3>
 
@@ -926,11 +926,11 @@ $$\phi(x) = \mathrm{elu}(x) + 1 \tag{F4}$$
 
 $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \exp(\omega_m^T x)\big) \tag{F5}$$
 
-<p>每个分量都是正数（$\exp(\cdot) > 0$），满足非负约束。关键是<b>无偏</b>：$\mathbb{E}[\phi(q)^T \phi(k)] = \exp(q^T k) = \mathrm{softmax\ kernel}(q, k)$。但单次采样有非零方差，所以是近似而非精确。本文不展开 FAVOR+ 的正交随机特征细节。</p>
+<p>每个分量都是正数（$\exp(\cdot) > 0$），满足非负约束。关键是<b>无偏</b>：$\mathbb{E}[\phi(q)^T \phi(k)] = \exp(q^T k) = \mathrm{softmax\ kernel}(q, k)$<sup>[C5, F5]</sup>。但单次采样有非零方差，所以是近似而非精确。本页不展开 FAVOR+ 的正交随机特征细节。</p>
 
 <h3 id="weight-comparison">两种核的权重分布对比</h3>
 
-<p>用我们的 $N=3, d=2$ 例子展示表达力差异。教学示例。 取 $Q_3 = (1, 1)$，对比它在三种核下对 $K_1, K_2, K_3$ 的注意力权重。为简化对比，下表 softmax 列暂略 $\sqrt{d}$ 缩放（完整应为 $\exp(Q_3 \cdot K_j / \sqrt{2})$；略去不影响"指数聚焦 vs 线性放大"的定性对比）：</p>
+<p>用本页的 $N=3, d=2$ 例子展示表达力差异。教学示例。 取 $Q_3 = (1, 1)$，对比它在三种核下对 $K_1, K_2, K_3$ 的注意力权重。为简化对比，下表 softmax 列暂略 $\sqrt{d}$ 缩放（完整应为 $\exp(Q_3 \cdot K_j / \sqrt{2})$；略去不影响"指数聚焦 vs 线性放大"的定性对比）：</p>
 
 <div class="table-scroll">
 <table>
@@ -945,9 +945,9 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
 
 <p>关键观察：$Q_3$ 与 $K_3$ 的内积（$2$）是与 $K_1, K_2$ 内积（$1$）的 2 倍。softmax 把这个 2 倍差异<b>指数放大</b>成 $0.576 / 0.212 \approx 2.72$ 倍权重比（即 $e^{2-1} = e$；softmax 归一化不改变权重间的比例，所以权重比等于相似度比）；$\mathrm{elu}+1$ 核只放大到 $0.400 / 0.300 \approx 1.33$ 倍。<b>softmax 的"指数聚焦"能力是线性核所没有的</b>——这就是表达力代价的具体来源。</p>
 
-<p>形式化地说：softmax 的 $\exp(\cdot)$ 把"显著差异"指数放大、把"无关项"指数压制；线性核（如 $\mathrm{elu}+1$）只是线性放大差异，没有这种"聚焦"能力。Katharopoulos 2020 的实验反映了这一代价：MNIST 生成 bits/dim 上 linear 0.644 vs softmax 0.621（线性略差），WSJ 语音识别 PER 上 linear 8.08 vs softmax 5.12（线性明显差）。</p>
+<p>形式化地说：softmax 的 $\exp(\cdot)$ 把"显著差异"指数放大、把"无关项"指数压制；线性核（如 $\mathrm{elu}+1$）只是线性放大差异，没有这种"聚焦"能力。Katharopoulos 2020 的实验反映了这一代价：MNIST 生成 bits/dim 上 linear 0.644 vs softmax 0.621（线性略差），WSJ 语音识别 PER 上 linear 8.08 vs softmax 5.12（线性明显差）<sup>[N2]</sup>。</p>
 
-<div class="callout callout-green">
+<div class="callout callout-yellow">
 <p><b>适用边界</b>：线性注意力在 $N$ 较小（$N \lesssim d^2$）时不占优——softmax 的常数项更小、IO 模式更友好、表达力更强。线性注意力的优势在两种场景：(1) 长序列训练（$N \gg d^2$ 时 $O(N d^2)$ 显著小于 $O(N^2 d)$）；(2) 自回归推理（固定大小 $s_i, z_i$ 替代 $O(N)$ KV cache）。如果任务对表达力要求高、序列不长，仍应使用 softmax 注意力。</p>
 </div>
 
@@ -956,10 +956,10 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
   <li>用一句话说明为什么 softmax 核不能精确线性化。</li>
   <li>指出 $\mathrm{elu}(x) + 1$ 中"+1"的作用，以及选 $\mathrm{elu}$ 而非 $\mathrm{relu}$ 的理由。</li>
   <li>列出至少一个适用线性注意力、一个适用 softmax 的场景。</li>
-  <li>在我们的对比表中，softmax 与 $\mathrm{elu}+1$ 核的最高/最低权重比分别是多少？说明了什么？</li>
+  <li>在我们的对比表中，指出 softmax 与 $\mathrm{elu}+1$ 核的最高/最低权重比，并说明其含义。</li>
 </ul>
 
-<p>四问已答完：softmax 注意力的 $O(N^2)$ 瓶颈在 $Q K^T$ 这一步（S1）；线性注意力用核分解 $\phi(q)^T \phi(k)$ 与结合律重排把计算量降到 $O(N)$（S2）；因果掩码下变成固定大小递归状态 $s_i, z_i$，使推理代价与序列长度无关（S3）；代价来自 softmax 核无穷维、必须换近似核，失去了"指数聚焦"能力（S4）。这正是 K3 中 KDA 选择线性注意力家族的基础——它支持固定大小 KV 状态的常数时间推理，代价是表达力下降，由 delta rule、gated delta network 等后续工作进一步弥补。</p>
+<p>四问已答完：softmax 注意力的 $O(N^2)$ 瓶颈在 $Q K^T$ 这一步；线性注意力用核分解 $\phi(q)^T \phi(k)$ 与结合律重排把计算量降到 $O(N)$；因果掩码下变成固定大小递归状态 $s_i, z_i$，使推理代价与序列长度无关；代价来自 softmax 核无穷维、必须换近似核，失去了"指数聚焦"能力。这正是 K3 中 KDA 选择线性注意力家族的基础——它支持固定大小 KV 状态的常数时间推理，代价是表达力下降，由 delta rule、gated delta network 等后续工作进一步弥补。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
@@ -993,9 +993,9 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
 <h3>教学示例</h3>
 
 <ul>
-<li>$N=3, d=2$ 贯穿例子：$Q = K = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix}$, $V = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix}$。构造目的：数字小到全可手算（最大值 $2$），令 $Q = K$ 减少变量，所有分量非负使教学简化 $\phi(x) = x + 1$ 可用。</li>
+<li>$N=3, d=2$ 教学示例：$Q = K = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix}$, $V = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix}$。构造目的：数字小到全可手算（最大值 $2$），令 $Q = K$ 减少变量，所有分量非负使教学简化 $\phi(x) = x + 1$ 可用。</li>
 <li>教学简化 $\phi(x) = x + 1$：当 $x \geq 0$ 时与 $\mathrm{elu}(x)+1$ 等价，便于手算；<b>不可</b>用于负分量（$x = -2$ 时 $x + 1 = -1 < 0$ 违反非负约束）。Katharopoulos 论文实际用 $\mathrm{elu}+1$ 正是为了处理负分量。</li>
-<li>S4 对比表中"暂略 $\sqrt{d}$ 缩放"：完整 softmax 应为 $\exp(Q_3 \cdot K_j / \sqrt{2})$；略去缩放不影响"指数聚焦 vs 线性放大"的定性对比。</li>
+<li>对比表中"暂略 $\sqrt{d}$ 缩放"：完整 softmax 应为 $\exp(Q_3 \cdot K_j / \sqrt{2})$；略去缩放不影响"指数聚焦 vs 线性放大"的定性对比。</li>
 </ul>
 
 <h3>教学解释与类比边界</h3>
@@ -1008,12 +1008,11 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
 <h3>教学简化及其限制</h3>
 
 <ul>
-<li>略去 $\sqrt{d}$ 缩放：不影响复杂度分析与机制讲解；正式计算应保留。</li>
-<li>略去多头机制：不影响线性化原理；多头只是把 $d$ 维空间分成多个独立子空间各自做注意力。</li>
-<li>略去位置编码：与线性化无关；线性注意力可结合 RoPE、NoPE 等多种位置方案。</li>
-<li>略去梯度计算：Katharopoulos §3.3 给出 $O(N)$ 梯度算法（cumsum 技巧），不影响前向机制理解。</li>
-<li>教学 $\phi(x) = x + 1$：仅适用于非负输入；论文实际 $\phi = \mathrm{elu}+1$ 处理一般情况。</li>
-<li>略去 Performer 的 FAVOR+ 细节（正交随机特征、MSE 公式、无偏性证明）：与线性注意力主线相关但不影响 Q1–Q4 回答；属于 Performer 论文自身的核心贡献。</li>
+<li>略去 $\sqrt{d}$ 缩放。可推出：复杂度分析与机制讲解。不可推出：正式数值计算。</li>
+<li>略去多头与位置编码。可推出：线性化原理。不可推出：多头子空间划分与 RoPE、NoPE 等位置方案的具体结合。</li>
+<li>略去梯度计算。可推出：前向机制理解。不可推出：Katharopoulos §3.3 的 $O(N)$ 梯度算法（cumsum 技巧）。</li>
+<li>教学 $\phi(x) = x + 1$。可推出：非负输入下的手算验证。不可推出：负分量场景（$x = -2$ 时 $x + 1 = -1 < 0$ 违反非负约束），论文实际 $\phi = \mathrm{elu}+1$ 处理一般情况。</li>
+<li>略去 Performer 的 FAVOR+ 细节（正交随机特征、MSE 公式、无偏性证明）。可推出：线性注意力主线与四问回答。不可推出：Performer 论文自身的核心贡献。</li>
 </ul>
 
 

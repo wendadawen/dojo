@@ -656,6 +656,8 @@
 <p><b>主要依据</b>：Zhai, Mustafa, Kolesnikov, Beyer. "Sigmoid Loss for Language Image Pre-Training." ICCV 2023 Oral, arXiv:2303.15343v4（2023-09-27）, §3.1 CLIP softmax 损失公式、§3.2 SigLIP 损失公式与 bias 初始化、§3.3 chunked 实现、§4.2 batch size 影响、§4.4 SigLiT 84.5%、§4.5 SigLIP from scratch 72.1%、Table 1 / Table 2 实验数据、摘要 batch=1M 边际收益消失结论。</p>
 </blockquote>
 
+<p>用 4 个 TPUv4、2 天训练，SigLIP 达到 ImageNet zero-shot 84.5%；同等水平的 CLIP 需要约 2500 TPUv3-days。这一算力差距的核心不在模型架构——两者都是双塔 + 共享嵌入空间 + 可学习温度——而在损失函数：SigLIP 把 CLIP 的 softmax 对比损失换成逐对 sigmoid 二分类损失，每个 (image, text) 对独立判断"配不配"，不依赖 batch 内其他对。本文回答：这一替换的形式差异在哪、可学习 bias $b$ 为什么是关键、batch size 与损失如何解耦、以及 SigLIP 在小算力场景的优势与边界。前置概念为 <a href="../../wiki/vit/index.html">ViT</a>（图像塔架构）与 <a href="../../wiki/standard-attention/index.html">标准注意力</a>（softmax 形式与数值稳定 trick）。</p>
+
 <section class="learning-goals">
   <h2>读完你能回答</h2>
   <ul>
@@ -669,32 +671,21 @@
 <section class="misconceptions">
   <h2>最容易误解</h2>
   <ul>
-    <li>以为 SigLIP 是新模型架构——<strong>正确</strong>：SigLIP 是损失函数的更换；模型架构（双塔 + 共享嵌入空间 + 温度）与 CLIP 完全相同，图像塔常用 [ViT](../../wiki/vit/index.html)，文本塔常用 Transformer</li>
-    <li>以为 SigLIP 总是比 CLIP 好——<strong>正确</strong>：论文 §4.2 显示 sigmoid 显著优于 softmax 仅在 batch &lt; 16k；batch 增大时优势缩小；batch &gt; 32k 后多语言 retrieval 反而下降；softmax 在"batch 内有真实相似样本"时可能强制判别更细</li>
+    <li>以为 SigLIP 是新模型架构——<strong>正确</strong>：SigLIP 是损失函数的更换；模型架构（双塔 + 共享嵌入空间 + 温度）与 CLIP 完全相同，图像塔常用 <a href="../../wiki/vit/index.html">ViT</a>，文本塔常用 Transformer</li>
+    <li>以为 SigLIP 总是比 CLIP 好——<strong>正确</strong>：论文 §4.2 显示 sigmoid 显著优于 softmax 仅在 batch &lt; 16k；batch 增大时优势缩小；batch &gt; 32k 后多语言 retrieval 反而下降</li>
     <li>以为只要把 CLIP 的 softmax 换成 sigmoid 就能 work，不需要 bias——<strong>正确</strong>：可学习 bias $b$ 是 SigLIP 公式中的关键组成；论文 §3.2 明确指出没有 $b$ 时初始 logits 因"1 正 vs $|B|-1$ 负"严重失衡而使训练初期产生大量错误方向梯度</li>
     <li>以为 SigLIP 用 sigmoid 是为了避免 softmax 数值不稳定——<strong>正确</strong>：数值稳定性是次要收益；论文 §1 明确动机是"conceptually decouples the batch size from the definition of the task"——把 batch size 与损失定义解耦；softmax 数值问题早已通过 log-sum-exp trick 解决</li>
-    <li>以为 MoonViT-V2 不从 SigLIP 初始化是因为 SigLIP 不好——<strong>正确</strong>：K3 选择从零训练更稳定，与 SigLIP 质量无关；MoonViT-V2 的目标是"视频 + 自定义训练目标"，与 SigLIP 的"静态图像 + 对比损失"目标不同；详见 [MoonViT-V2](../../wiki/moonvit-v2/index.html) 概念页</li>
+    <li>以为 MoonViT-V2 不从 SigLIP 初始化是因为 SigLIP 不好——<strong>正确</strong>：K3 选择从零训练更稳定，与 SigLIP 质量无关；MoonViT-V2 的目标是"视频 + 自定义训练目标"，与 SigLIP 的"静态图像 + 对比损失"目标不同；详见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a> 概念页</li>
   </ul>
 </section>
-
-<div class="context-box">
-  <p class="context-box-title">阅读上下文</p>
-  <div class="context-grid">
-    <div class="context-label">是什么</div><div class="context-value">Zhai et al. 2023 提出的对比损失：把 CLIP 的 softmax 对比损失换成逐对 sigmoid 二分类损失，每个 (image, text) 对独立计算</div>
-    <div class="context-label">为什么需要</div><div class="context-value">CLIP softmax 分母 $\sum_j e^{t x_i\cdot y_j}$ 让每个对的梯度依赖整个 batch；小 batch 下 hardest negative 太弱、梯度噪声大；分布式训练需要 expensive all-gather</div>
-    <div class="context-label">本文是哪些概念的前置</div><div class="context-value">SigLIP-2、mSigLIP、EVA-CLIP、DFN 等；以及理解 K3 MoonViT-V2 选择"不从 SigLIP 初始化"的设计判断</div>
-    <div class="context-label">前置概念</div><div class="context-value">[ViT](../../wiki/vit/index.html)（图像塔架构）、[标准注意力](../../wiki/standard-attention/index.html)（softmax 形式与数值稳定 trick）</div>
-    <div class="context-label">不展开</div><div class="context-value">SigLIP-2 / mSigLIP / chunked 分布式实现 / WebLI 数据 curation / 多语言 retrieval 评估 / 表示几何性质（Lee et al. 2024 Simplex ETF）</div>
-  </div>
-</div>
 
 <h2 id="clip-softmax-global-coupling">CLIP softmax 损失的"全局耦合"问题——为什么需要换掉它</h2>
 
 <p>用 32k batch 训 CLIP，要把每个对 (image $i$, text $j$) 的相似度 $x_i\cdot y_j$ 与整个 batch 的所有相似度聚合到一起算 softmax——分母 $\sum_j e^{t x_i\cdot y_j}$ 依赖 batch 内所有 $y_j$。能不能让每个 (image, text) 对只看自己就被评分？这是 SigLIP 要回答的问题。</p>
 
-<p>理解 SigLIP 之前要先看清 CLIP 的损失怎么算。CLIP（Radford et al. 2021）用双塔架构：图像塔 $f$ 把图像 $I_i$ 映射到嵌入 $f(I_i)$，文本塔 $g$ 把文本 $T_j$ 映射到嵌入 $g(T_j)$；嵌入经 L2 归一化得 $x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$，落在共享嵌入空间；图像塔常用 [ViT](../../wiki/vit/index.html)（已讲过 patch + Transformer 编码机制），文本塔常用 Transformer。CLIP 的训练目标是对 batch 内 $|B|$ 个 (image, text) 配对样本，让正对的相似度高于负对——这通过 softmax 损失实现（softmax 在 [标准注意力](../../wiki/standard-attention/index.html) 概念页已给出，这里只使用其结果）：</p>
+<p>理解 SigLIP 之前要先看清 CLIP 的损失怎么算。CLIP（Radford et al. 2021）用双塔架构：图像塔 $f$ 把图像 $I_i$ 映射到嵌入 $f(I_i)$，文本塔 $g$ 把文本 $T_j$ 映射到嵌入 $g(T_j)$；嵌入经 L2 归一化得 $x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$，落在共享嵌入空间；图像塔常用 <a href="../../wiki/vit/index.html">ViT</a>（已讲过 patch + Transformer 编码机制），文本塔常用 Transformer。CLIP 的训练目标是对 batch 内 $|B|$ 个 (image, text) 配对样本，让正对的相似度高于负对——这通过 softmax 损失实现（softmax 在 <a href="../../wiki/standard-attention/index.html">标准注意力</a> 概念页已给出，这里只使用其结果）：</p>
 
-<p>$$\mathcal{L}_{\text{CLIP}}=-\frac{1}{2|B|}\sum_{i=1}^{|B|}\left(\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_i\cdot y_j}}+\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_j\cdot y_i}}\right).\quad\text{F2, Zhai 2023 §3.1}$$</p>
+<p>$$\mathcal{L}_{\text{CLIP}}=-\frac{1}{2|B|}\sum_{i=1}^{|B|}\left(\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_i\cdot y_j}}+\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_j\cdot y_i}}\right).$$ <sup>[F2]</sup></p>
 
 <p>逐项解释：</p>
 
@@ -739,9 +730,9 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]   ← 第 4 行 softmax：分母依
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 CLIP softmax 损失 $\mathcal{L}_{\text{CLIP}}$ 公式并说出分母 $\sum_j e^{t\,x_i\cdot y_j}$ 依赖整个 batch 的哪些量</li>
-  <li>用一句话说出"每个对的梯度信号是相对 hardest negative 的优势"这一性质</li>
-  <li>说出小 batch 下 softmax 的两个问题（hardest negative 弱导致梯度噪声大、分布式 all-gather 通信开销）</li>
+  <li>写出 CLIP softmax 损失 $\mathcal{L}_{\text{CLIP}}$ 公式并说出分母 $\sum_j e^{t\,x_i\cdot y_j}$ 依赖整个 batch 的哪些量。</li>
+  <li>用一句话说出"每个对的梯度信号是相对 hardest negative 的优势"这一性质。</li>
+  <li>说出小 batch 下 softmax 的两个问题（hardest negative 弱导致梯度噪声大、分布式 all-gather 通信开销）。</li>
 </ul>
 
 <p>知道了"分母依赖 batch"是问题所在。下一章看 SigLIP 怎么把它去掉——逐对独立的二分类损失。</p>
@@ -750,16 +741,16 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]   ← 第 4 行 softmax：分母依
 
 <p>SigLIP 把 CLIP 的 softmax 损失换成 sigmoid 二分类损失。同一 batch 内 $|B|$ 个 (image, text) 配对样本，构成 $|B|\times|B|=|B|^2$ 个对；每个对独立判断"配不配"——是独立的二分类问题。损失形式是：</p>
 
-<p>$$\mathcal{L}_{\text{SigLIP}}=-\frac{1}{|B|}\sum_{i=1}^{|B|}\sum_{j=1}^{|B|}\log\frac{1}{1+e^{z_{ij}(-t\,x_i\cdot y_j-b)}}=-\frac{1}{|B|}\sum_{i,j}\log\sigma(z_{ij}(t\,x_i\cdot y_j+b)).\quad\text{F1, Zhai 2023 §3.2}$$</p>
+<p>$$\mathcal{L}_{\text{SigLIP}}=-\frac{1}{|B|}\sum_{i=1}^{|B|}\sum_{j=1}^{|B|}\log\frac{1}{1+e^{z_{ij}(-t\,x_i\cdot y_j-b)}}=-\frac{1}{|B|}\sum_{i,j}\log\sigma(z_{ij}(t\,x_i\cdot y_j+b)).$$ <sup>[F1]</sup></p>
 
-<p>论文原文写作 $\log\frac{1}{1+e^{z_{ij}(-t\,x_i\cdot y_j-b)}}$；由 sigmoid 定义 $\sigma(a)=1/(1+e^{-a})$（[F3]）等价改写为右侧 $\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$ 形式。逐项解释：</p>
+<p>论文原文写作 $\log\frac{1}{1+e^{z_{ij}(-t\,x_i\cdot y_j-b)}}$；由 sigmoid 定义 $\sigma(a)=1/(1+e^{-a})$<sup>[F3]</sup>等价改写为右侧 $\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$ 形式。逐项解释：</p>
 
 <ul>
-  <li><strong>$x_i, y_j$</strong>：与 CLIP 共享，L2 归一化的图像与文本嵌入（[F4]：$x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$）。</li>
+  <li><strong>$x_i, y_j$</strong>：与 CLIP 共享，L2 归一化的图像与文本嵌入<sup>[F4]</sup>：$x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$。</li>
   <li><strong>$z_{ij}\in\{+1,-1\}$</strong>：配对标签。当 $i=j$（batch 内第 $i$ 张图像与第 $i$ 段文本是配对样本）时 $z_{ii}=+1$；当 $i\neq j$（不配对）时 $z_{ij}=-1$。这与 CLIP 的"对角线为正、非对角线为负"对应，只是 SigLIP 用 $\pm 1$ 显式编码。</li>
-  <li><strong>$t=\exp(t')$</strong>：可学习温度，与 CLIP 共享（[F5]）；$t'$ 初始化为 $\log 10$ 即 $t=10$（[F6]）。</li>
-  <li><strong>$b$</strong>：可学习 bias，<em>SigLIP 新增项</em>（CLIP 无此项）。初始化 $b=-10$（[F6]）。下一章专门讲它的作用。</li>
-  <li><strong>$\sigma$</strong>：sigmoid 函数 $\sigma(a)=1/(1+e^{-a})$（[F3]）。</li>
+  <li><strong>$t=\exp(t')$</strong>：可学习温度，与 CLIP 共享<sup>[F5]</sup>；$t'$ 初始化为 $\log 10$ 即 $t=10$<sup>[F6]</sup>。</li>
+  <li><strong>$b$</strong>：可学习 bias，<em>SigLIP 新增项</em>（CLIP 无此项）。初始化 $b=-10$<sup>[F6]</sup>。下一章专门讲它的作用。</li>
+  <li><strong>$\sigma$</strong>：sigmoid 函数 $\sigma(a)=1/(1+e^{-a})$<sup>[F3]</sup>。</li>
   <li><strong>$-\frac{1}{|B|}\sum_{i,j}$</strong>：对 $|B|^2$ 个对求和后除以 $|B|$（注意不是除以 $|B|^2$——论文 §3.2 原文如此，与 CLIP 的 $-\frac{1}{2|B|}$ 对应；这意味着正对与负对的权重不同，下一章解释原因）。</li>
 </ul>
 
@@ -788,7 +779,7 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 <tr><td>归一化</td><td>softmax 分母 $\sum_j e^{t\,x_i\cdot y_j}$</td><td>无分母，每对独立</td></tr>
 <tr><td>方向</td><td>对称两次：image→text + text→image</td><td>一次性对 $|B|^2$ 对求和</td></tr>
 <tr><td>损失类型</td><td>cross-entropy on softmax（多分类）</td><td>binary cross-entropy on sigmoid（二分类）</td></tr>
-<tr><td>bias 项</td><td>无</td><td>有可学习 $b$（[F6] 初始化 $-10$）</td></tr>
+<tr><td>bias 项</td><td>无</td><td>有可学习 $b$<sup>[F6]</sup>初始化 $-10$</td></tr>
 </tbody>
 </table>
 </div>
@@ -802,10 +793,10 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 SigLIP 损失 $\mathcal{L}_{\text{SigLIP}}$ 公式的两种等价形式</li>
-  <li>说出 $z_{ij}$ 的含义与取值（$i=j$ 时 $+1$、$i\neq j$ 时 $-1$）</li>
-  <li>说出 SigLIP 与 CLIP 的 4 项形式差异（无分母、单向、二分类、有 bias）</li>
-  <li>说出"每个对的梯度不依赖 batch 内其他对"这一关键性质</li>
+  <li>写出 SigLIP 损失 $\mathcal{L}_{\text{SigLIP}}$ 公式的两种等价形式。</li>
+  <li>说出 $z_{ij}$ 的含义与取值（$i=j$ 时 $+1$、$i\neq j$ 时 $-1$）。</li>
+  <li>说出 SigLIP 与 CLIP 的 4 项形式差异（无分母、单向、二分类、有 bias）。</li>
+  <li>说出"每个对的梯度不依赖 batch 内其他对"这一关键性质。</li>
 </ul>
 
 <p>形式清楚了。但 $b$ 这个新项为什么需要？为什么 CLIP 不需要它？下一章讲 $b$ 与 $t$ 的职责。</p>
@@ -814,7 +805,7 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 
 <p>SigLIP 公式中有两个可学习标量：温度 $t$ 与 bias $b$。温度 $t$ 与 CLIP 共享，$b$ 是 SigLIP 新增项。两者职责不同：</p>
 
-<p><strong>温度 $t=\exp(t')$</strong>：控制相似度被放大的程度。$t$ 越大，正对与负对的 logit 差异越大、损失梯度越强；$t$ 越小，差异被压缩、梯度变弱。论文 §3.1 末段明确"$t$ 参数化为 $\exp(t')$，$t'$ 是全局可学习参数"——这与 CLIP 一致。初始化 $t'=\log 10$ 即 $t=10$（[F6]）。</p>
+<p><strong>温度 $t=\exp(t')$</strong>：控制相似度被放大的程度。$t$ 越大，正对与负对的 logit 差异越大、损失梯度越强；$t$ 越小，差异被压缩、梯度变弱。论文 §3.1 末段明确"$t$ 参数化为 $\exp(t')$，$t'$ 是全局可学习参数"——这与 CLIP 一致。初始化 $t'=\log 10$ 即 $t=10$<sup>[F6]</sup>。</p>
 
 <p><strong>bias $b$：抵消初始正负样本不平衡</strong>。batch 内正对仅 $|B|$ 个（对角线）、负对 $|B|^2-|B|$ 个（非对角线）；正负比例 $1:(|B|-1)$。在 $|B|=32\text{k}$ 时比例为 $1:32767$。在 $|B|=1\text{M}$ 时比例为 $1:999999$。</p>
 
@@ -836,7 +827,7 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 <p><strong>$b$ 的作用</strong>：初始 $b=-10$，使初始 logit $a=z_{ij}(t\cdot 0+b)=z_{ij}\cdot(-10)$。正对 $z=+1$ → $a=-10$ → $\sigma(-10)\approx 0.0000454$ → $\log\sigma(-10)\approx -10$；负对 $z=-1$ → $a=10$ → $\sigma(10)\approx 0.99995$ → $\log\sigma(10)\approx -0.00005$。表面上正对单对损失远大于负对单对损失（$-10$ vs $-0.00005$），但因为 $b$ 让初始模型预测偏向<em>负类</em>（$\sigma(b)=\sigma(-10)\approx 0.0000454$，与"负对远多于正对"的数据先验一致），少数正对的大梯度（$\sigma(10)\approx 1$）抵消多数负对的数量优势（每个负对梯度 $\approx 0$）——$b$ 起到了"先验偏置"作用，让训练从合理起点开始。</p>
 
 <details>
-<summary>补充：$|B|=4$、$t=10$、$b=-10$、初始 $x_i\cdot y_j=0$ 的完整损失手算</summary>
+<summary>展开：$|B|=4$、$t=10$、$b=-10$、初始 $x_i\cdot y_j=0$ 的完整损失手算</summary>
 <p>教学示例。 设 $|B|=4$，4 张图像 + 4 段文本构成 4×4=16 个对，4 个正对（对角线 $i=j$）+ 12 个负对（非对角线 $i\neq j$）。设 $t=10$、$b=-10$，初始时 $x_i\cdot y_j=0$（嵌入未训练）。</p>
 <p>对正对 $(i,i)$：$z_{ii}=+1$，logit $a=z_{ii}(t\cdot 0+b)=1\times(0+(-10))=-10$，$\sigma(-10)=1/(1+e^{10})\approx 0.00004540$，损失 $\log\sigma(-10)\approx -10.0000454$。4 个正对总损失 $\approx 4\times(-10.0000454)=-40.0002$。</p>
 <p>对负对 $(i,j), i\neq j$：$z_{ij}=-1$，logit $a=z_{ij}(t\cdot 0+b)=(-1)\times(0+(-10))=10$，$\sigma(10)=1/(1+e^{-10})\approx 0.99995460$，损失 $\log\sigma(10)\approx -0.0000454$。12 个负对总损失 $\approx 12\times(-0.0000454)=-0.0005$。</p>
@@ -849,16 +840,16 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 
 <p><strong>CLIP 为什么不需要 $b$</strong>？softmax 的分母 $\sum_j e^{t\,x_i\cdot y_j}$ 已经隐式做了"相对优势"的归一化——每个对的损失是相对量（"正对 softmax 概率"），不存在"绝对数量失衡"问题。即使负对数量压倒性多，softmax 分母让每个对的梯度由"正对相对 hardest negative 的优势"决定，不会被负对绝对数量主导。SigLIP 把每个对独立化后，必须显式引入 $b$ 处理失衡——这是 SigLIP 公式中容易被忽视但论文 §3.2 明确强调的关键设计。</p>
 
-<div class="callout callout-red">
+<div class="callout callout-yellow">
 <p><strong>常见误解</strong>。 SigLIP 不是"把 CLIP 的 softmax 换成 sigmoid 就完事"——可学习 bias $b$ 是公式中的关键组成。论文 §3.2 明确指出没有 $b$ 时初始 logits 因"1 正 vs $|B|-1$ 负"严重失衡而使训练初期产生大量错误方向梯度。$b=-10$ 通过让 $\sigma(b)=\sigma(-10)\approx 0.0000454$，使初始模型预测偏向负类（与数据先验一致），少数正对的大梯度抵消多数负对的数量优势。博客介绍时常省略 $b$，只写 $-\log\sigma(z_{ij}\cdot t\,x_i\cdot y_j)$——这会让人误以为"直接换 sigmoid 就能 work"。</p>
 </div>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>说出 $t'=\log 10$ 即 $t=10$、$b=-10$ 的初始化值（[F6]）</li>
-  <li>说出"若没有 $b$，初始损失被负对主导、梯度方向错误"的机制</li>
-  <li>算出 $b=-10$ 时 $\sigma(b)=\sigma(-10)\approx 0.0000454$（手算或代入）</li>
-  <li>说出 CLIP 为什么不需要 $b$（softmax 分母隐式做了相对归一化，不存在绝对数量失衡问题）</li>
+  <li>说出 $t'=\log 10$ 即 $t=10$、$b=-10$ 的初始化值<sup>[F6]</sup>。</li>
+  <li>说出"若没有 $b$，初始损失被负对主导、梯度方向错误"的机制。</li>
+  <li>算出 $b=-10$ 时 $\sigma(b)=\sigma(-10)\approx 0.0000454$（手算或代入）。</li>
+  <li>说出 CLIP 为什么不需要 $b$（softmax 分母隐式做了相对归一化，不存在绝对数量失衡问题）。</li>
 </ul>
 
 <p>公式与符号全清楚了。下一章看 SigLIP 在不同 batch size 与算力条件下的实际表现，以及 K3 选择"不从 SigLIP 初始化"的衔接。</p>
@@ -915,11 +906,11 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 
 <ul>
   <li><strong>32k 接近最优</strong>：ImageNet zero-shot 在 32k 达 73.2%，更大 batch 几乎不再提升；论文 §4.2 末段也报告 softmax 损失需要 98k 才达最优但仍不如 sigmoid。</li>
-  <li><strong>多语言 retrieval 反而下降</strong>：32k → 240k，XM avg 从 34.9 降到 32.7，中文 XM zh 从 32.5 大幅降到 23.7。论文 §4.3 推测是大 batch 让模型见到更多同语言的 hard negative，但不一定带来 retrieval 能力提升。</li>
+  <li><strong>多语言 retrieval 反而下降</strong>：32k → 240k，XM avg 从 34.9 降到 32.7，中文 XM zh 从 32.5 大幅降到 23.7。论文 §4.3 报告了这一现象但未给出明确归因。</li>
   <li><strong>1M 边际收益快速消失</strong>：摘要明确"we push the batch size to the extreme, up to one million, and find that the benefits of growing batch size quickly diminish, with a more reasonable batch size of 32k being sufficient"。论文未给出 1M 的具体精度数字，只给结论。</li>
 </ul>
 
-<div class="callout callout-green">
+<div class="callout callout-blue">
 <p><strong>核心结论</strong>（Zhai 2023 摘要 + §4.2 + §4.3）：<em>32k batch 对 SigLIP 已足够；继续增大 batch 收益快速递减、多语言 retrieval 反而下降</em>。这一结论是 SigLIP 在小算力场景可行的根本原因——不需要 CLIP 那种 32k+ batch + 大量 all-gather 通信。</p>
 </div>
 
@@ -933,16 +924,15 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 <tr><td>SigLIP 在大 batch 下仍可用</td><td>batch ≤ 32 k 接近最优</td><td>batch &gt; 32 k 后 INet-0 几乎不再提升；多语言 retrieval 反而下降；batch = 1 M 边际收益快速消失</td></tr>
 <tr><td>可学习 bias $b$ 抵消初始失衡</td><td>batch 较大、正负比例严重失衡（如 1:32767）</td><td>batch 极小（如 1:1）时 $b$ 作用减弱</td></tr>
 <tr><td>SigLIP 不需 all-gather</td><td>单设备或 chunked 实现</td><td>严格最优 retrieval 性能仍可能依赖大 batch + 多设备</td></tr>
-<tr><td>SigLIP 适用于"batch 内无真实相似样本"</td><td>通用 web 数据（每对独立）</td><td>batch 内有真实相似样本（false-negative 风险）时 softmax 可能强制更细判别（mixpeek 2025 综述观点，非论文结论）</td></tr>
 </tbody>
 </table>
 </div>
 
 <div class="callout callout-yellow">
-<p><strong>常见误解</strong>。 SigLIP 不是普遍比 CLIP 好。论文 §4.2 明确显示 sigmoid 显著优于 softmax 仅在 batch &lt; 16k；batch 增大时优势缩小。脱离 batch size 谈"SigLIP 比 CLIP 好"是误读。此外，在"batch 内有真实相似样本"（如图像 augmentation 后的同源样本）的场景，softmax 可能强制判别更细——这是 false-negative 风险下的边界（mixpeek 2025 综述观点，非论文原文结论）。</p>
+<p><strong>常见误解</strong>。 SigLIP 不是普遍比 CLIP 好。论文 §4.2 明确显示 sigmoid 显著优于 softmax 仅在 batch &lt; 16k；batch 增大时优势缩小。脱离 batch size 谈"SigLIP 比 CLIP 好"是误读。</p>
 </div>
 
-<p><strong>K3 选择"不从 SigLIP 初始化"的衔接</strong>。SigLIP 的训练目标是"静态图像 + 对比损失"，学到的视觉表示适合图像-文本检索、zero-shot 分类等任务。MoonViT-V2 是 K3 的视觉编码器，目标是"视频 + 自定义训练目标"——K3 选择从零训练更稳定，与 SigLIP 质量无关，是设计取向不同。MoonViT-V2 已有独立概念页 [MoonViT-V2](../../wiki/moonvit-v2/index.html)。理解 SigLIP 是理解"为什么 K3 可以选择不从 SigLIP 初始化"的前置——既知道 SigLIP 学到的表示适合什么、也知道 MoonViT-V2 的目标为什么与之不同。</p>
+<p><strong>K3 选择"不从 SigLIP 初始化"的衔接</strong>。SigLIP 的训练目标是"静态图像 + 对比损失"，学到的视觉表示适合图像-文本检索、zero-shot 分类等任务。MoonViT-V2 是 K3 的视觉编码器，目标是"视频 + 自定义训练目标"——K3 选择从零训练更稳定，与 SigLIP 质量无关，是设计取向不同。MoonViT-V2 已有独立概念页 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a>。理解 SigLIP 是理解"为什么 K3 可以选择不从 SigLIP 初始化"的前置——既知道 SigLIP 学到的表示适合什么、也知道 MoonViT-V2 的目标为什么与之不同。</p>
 
 <details>
 <summary>补充：SigLIP 与 CLIP 的分布式 chunked 实现对比</summary>
@@ -951,11 +941,11 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>说出 SigLiT 84.5% 的训练条件（4 TPUv4 / 2 天 / batch 20k / ViT-g/14 frozen）</li>
-  <li>说出 SigLIP from scratch 72.1% / 32 TPUv4 / 2 天 对照 CLIP 72.6% / ~2500 TPUv3-days 的算力差距</li>
-  <li>说出 32k 最优、&gt; 32k ImageNet zero-shot 几乎不再提升、多语言 retrieval 反而下降、1 M 边际收益消失</li>
-  <li>说出至少一个 SigLIP 不普遍最优的边界（batch &lt; 16k 才显著优势 / batch 内有真实相似样本时 softmax 可能更优 / 极小 batch 时 $b$ 作用减弱）</li>
-  <li>说出 K3 选择"不从 SigLIP 初始化"的原因（设计取向不同——视频 vs 静态图像；与 SigLIP 质量无关）</li>
+  <li>说出 SigLiT 84.5% 的训练条件（4 TPUv4 / 2 天 / batch 20k / ViT-g/14 frozen）。</li>
+  <li>说出 SigLIP from scratch 72.1% / 32 TPUv4 / 2 天 对照 CLIP 72.6% / ~2500 TPUv3-days 的算力差距。</li>
+  <li>说出 32k 最优、&gt; 32k ImageNet zero-shot 几乎不再提升、多语言 retrieval 反而下降、1 M 边际收益消失。</li>
+  <li>说出至少一个 SigLIP 不普遍最优的边界（batch &lt; 16k 才显著优势 / 极小 batch 时 $b$ 作用减弱）。</li>
+  <li>说出 K3 选择"不从 SigLIP 初始化"的原因（设计取向不同——视频 vs 静态图像；与 SigLIP 质量无关）。</li>
 </ul>
 
 <p>SigLIP 把对比学习的损失从"全局 softmax 耦合"换成"逐对 sigmoid 独立"，让 batch size 与损失定义解耦；理解了它，就理解了为什么 4 个 TPUv4 / 2 天能训出 84.5% zero-shot 模型，也理解了 K3 MoonViT-V2 选择"不从 SigLIP 初始化"的前提。</p>
@@ -973,7 +963,7 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 <p><strong>[C8] batch size 32k 接近最优；超过 32k 后 ImageNet zero-shot 几乎不再提升，多语言 retrieval 反而下降；1M 边际收益快速消失</strong>：Zhai 2023 摘要 + §4.2 + §4.3 + Table 2。1M 数字论文未给出具体精度，只给"快速递减"结论。</p>
 
 <h3>核心公式与来源</h3>
-<p><strong>[F1] SigLIP 损失</strong>：Zhai 2023 §3.2 公式。原文写作 $\log\frac{1}{1+e^{z_{ij}(-t\,x_i\cdot y_j-b)}}$；由 sigmoid 定义等价改写为 $\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$。推导见 S2 折叠块。</p>
+<p><strong>[F1] SigLIP 损失</strong>：Zhai 2023 §3.2 公式。原文写作 $\log\frac{1}{1+e^{z_{ij}(-t\,x_i\cdot y_j-b)}}$；由 sigmoid 定义等价改写为 $\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$。推导见"SigLIP 损失公式"章折叠块。</p>
 <p><strong>[F2] CLIP softmax 损失（对照）</strong>：Zhai 2023 §3.1 公式（CLIP/InfoNCE 形式，含对称 image→text + text→image 两项）。</p>
 <p><strong>[F3] Sigmoid 函数 $\sigma(a)=1/(1+e^{-a})$</strong>：标准定义，Zhai 2023 §3.2 隐式使用。</p>
 <p><strong>[F4] 嵌入归一化 $x_i=f(I_i)/\|f(I_i)\|_2$, $y_j=g(T_j)/\|g(T_j)\|_2$</strong>：Zhai 2023 §3.1 末段（与 CLIP 共享）。</p>
@@ -987,21 +977,21 @@ x_4  [ - ▓ ] [ - ▓ ] [ - ▓ ] [ + ▓ ]
 <p><strong>[N4] 极限 batch size 1M</strong>：摘要 + §4.2 报告将 batch 推至 1M，发现"the benefits of growing batch size quickly diminish"。论文未给出 1M 的具体精度数字，只给结论性陈述。</p>
 
 <h3>教学示例</h3>
-<p><strong>$|B|=4$ 的 SigLIP 损失手算（S2、S3）</strong>：构造目的——把 F1 公式落到可手算的最小 batch；展示 4 个正对 + 12 个负对的逐项求和、$b$ 抵消初始失衡的机制。设 $t=10$、$b=-10$、初始 $x_i\cdot y_j=0$；正对 $\log\sigma(-10)\approx -10.0000454$、负对 $\log\sigma(10)\approx -0.0000454$。非论文一手数据，使用论文初始化值与简化假设（嵌入未训练时 $x_i\cdot y_j=0$）。</p>
-<p><strong>正负比例对照表 $|B|=4/32\text{k}/1\text{M}$（S3）</strong>：构造目的——把"1 正 vs $|B|-1$ 负"的不平衡量化可视化；32k 时 1:32767、1M 时 1:999999。使用论文 batch 配置。</p>
-<p><strong>$b=-10$ 时 $\sigma(b)\approx 0.0000454$ 的计算（S3）</strong>：构造目的——把 $b$ 的"先验偏置"作用量化。$\sigma(-10)=1/(1+e^{10})\approx 0.00004540$。</p>
+<p><strong>$|B|=4$ 的 SigLIP 损失手算（"SigLIP 损失公式"章与"可学习温度与 bias"章）</strong>：构造目的——把 F1 公式落到可手算的最小 batch；展示 4 个正对 + 12 个负对的逐项求和、$b$ 抵消初始失衡的机制。设 $t=10$、$b=-10$、初始 $x_i\cdot y_j=0$；正对 $\log\sigma(-10)\approx -10.0000454$、负对 $\log\sigma(10)\approx -0.0000454$。非论文一手数据，使用论文初始化值与简化假设（嵌入未训练时 $x_i\cdot y_j=0$）。</p>
+<p><strong>正负比例对照表 $|B|=4/32\text{k}/1\text{M}$（"可学习温度与 bias"章）</strong>：构造目的——把"1 正 vs $|B|-1$ 负"的不平衡量化可视化；32k 时 1:32767、1M 时 1:999999。使用论文 batch 配置。</p>
+<p><strong>$b=-10$ 时 $\sigma(b)\approx 0.0000454$ 的计算（"可学习温度与 bias"章）</strong>：构造目的——把 $b$ 的"先验偏置"作用量化。$\sigma(-10)=1/(1+e^{10})\approx 0.00004540$。</p>
 
 <h3>教学解释与类比边界</h3>
-<p><strong>"每个对的梯度信号是相对 hardest negative 的优势"类比</strong>（S1）：服务"CLIP softmax 分母耦合全 batch"的局部关系。失效边界——它不覆盖 softmax 在"batch 内有真实相似样本"场景下的判别优势（mixpeek 2025 综述指出 softmax 强制判别更细）；也不覆盖温度 $t$ 极端值时 softmax 行为。正式判断以 F2 公式与论文 §4.2 实验为准。</p>
-<p><strong>"$b=-10$ 让初始模型预测偏向负类"对应关系</strong>（S3）：服务"$b$ 抵消初始正负不平衡"的局部关系。失效边界——它不意味着 $b$ 是固定先验（$b$ 是可学习的，训练中会调整）；也不覆盖训练后期 $b$ 的最终值与负采样策略的关系（论文 §4.5 图 6 显示 $b$ 最终值与 batch 组成有关）。正式判断以 F1、F6 与论文 §3.2 为准。</p>
-<p><strong>"SigLIP 把对比学习从多分类换成二分类"对应关系</strong>（S2 末段）：服务"SigLIP 形式差异"的局部关系。失效边界——它不意味着二分类一定比多分类好；也不覆盖 false-negative 场景下 softmax 可能更优的边界。正式判断以 F1、F2 与论文 §4.2 实验为准。</p>
+<p><strong>"每个对的梯度信号是相对 hardest negative 的优势"类比</strong>（第一章）：服务"CLIP softmax 分母耦合全 batch"的局部关系。失效边界——它不覆盖温度 $t$ 极端值时 softmax 行为。正式判断以 F2 公式与论文 §4.2 实验为准。</p>
+<p><strong>"$b=-10$ 让初始模型预测偏向负类"对应关系</strong>（"可学习温度与 bias"章）：服务"$b$ 抵消初始正负不平衡"的局部关系。失效边界——它不意味着 $b$ 是固定先验（$b$ 是可学习的，训练中会调整）；也不覆盖训练后期 $b$ 的最终值与负采样策略的关系（论文 §4.5 图 6 显示 $b$ 最终值与 batch 组成有关）。正式判断以 F1、F6 与论文 §3.2 为准。</p>
+<p><strong>"SigLIP 把对比学习从多分类换成二分类"对应关系</strong>（"SigLIP 损失公式"章末段）：服务"SigLIP 形式差异"的局部关系。失效边界——它不意味着二分类一定比多分类好。正式判断以 F1、F2 与论文 §4.2 实验为准。</p>
 
 <h3>教学简化及其限制</h3>
-<p><strong>简化一：CLIP softmax 公式直接引用，不展开 InfoNCE 推导</strong>。省略了 InfoNCE 的来历（Oord et al. 2018 CPC）、互信息估计的理论背景、softmax 的梯度推导。成立条件——读者已读或可读 [标准注意力](../../wiki/standard-attention/index.html) 概念页了解 softmax 形式；不影响的结论——SigLIP 与 CLIP 的形式差异由 F1、F2 直接给出。</p>
-<p><strong>简化二：$|B|=4$ 手算用 $t=10, b=-10$ 与 $x_i\cdot y_j=0$ 的简化假设</strong>。省略了真实训练中嵌入迅速学到结构、$x_i\cdot y_j$ 不为 0 的情况。成立条件——初始状态 $x_i\cdot y_j\approx 0$ 是合理近似（嵌入未训练时随机初始化）；不影响的结论——$b$ 抵消初始失衡的机制不依赖 $x_i\cdot y_j$ 具体值。</p>
-<p><strong>简化三：只引用 SigLiT 84.5% 与 SigLIP 72.1% 两个代表数字</strong>。省略了 SigLiT B/8 L 79.8%、SigLIP 16k batch 71.0% 等中间配置，以及多语言 mSigLIP 的完整 36 种语言结果。成立条件——84.5% 与 72.1% 是论文摘要与 §4.4 §4.5 的核心代表数字；不影响的结论——SigLIP 在小算力场景的算力优势由这两个数字与 CLIP ~2500 TPUv3-days 对照充分支持。</p>
-<p><strong>简化四：不展开 chunked 分布式实现的完整伪代码</strong>。省略了论文图 1 的 chunked 实现细节（device 间 swap 文本嵌入、cross-device sum）。成立条件——chunked 实现是工程优化，不影响理解损失函数；不影响的结论——SigLIP 不需 all-gather 的工程优势由 §3.3 一句话说明即可。</p>
-<p><strong>简化五：MoonViT-V2 设计只一句话提及</strong>。省略 MoonViT-V2 的具体机制（27 层、从零训练、RMSNorm、去 bias、视频分解注意力）。成立条件——MoonViT-V2 已有独立概念页 [MoonViT-V2](../../wiki/moonvit-v2/index.html)；不影响的结论——本文只说明 K3 选择"不从 SigLIP 初始化"的衔接，不展开 MoonViT-V2 本身。</p>
+<p><strong>简化一：CLIP softmax 公式直接引用，不展开 InfoNCE 推导</strong>。可推出：SigLIP 与 CLIP 的形式差异由 F1、F2 直接给出。不可推出：InfoNCE 的来历（Oord et al. 2018 CPC）、互信息估计的理论背景、softmax 的梯度推导。</p>
+<p><strong>简化二：$|B|=4$ 手算用 $t=10, b=-10$ 与 $x_i\cdot y_j=0$ 的简化假设</strong>。可推出：$b$ 抵消初始失衡的机制不依赖 $x_i\cdot y_j$ 具体值。不可推出：真实训练中嵌入迅速学到结构后 $x_i\cdot y_j$ 不为 0 的行为。</p>
+<p><strong>简化三：只引用 SigLiT 84.5% 与 SigLIP 72.1% 两个代表数字</strong>。可推出：SigLIP 在小算力场景的算力优势由这两个数字与 CLIP ~2500 TPUv3-days 对照充分支持。不可推出：SigLiT B/8 L 79.8%、SigLIP 16k batch 71.0% 等中间配置及多语言 mSigLIP 的完整 36 种语言结果。</p>
+<p><strong>简化四：不展开 chunked 分布式实现的完整伪代码</strong>。可推出：SigLIP 不需 all-gather 的工程优势由 §3.3 一句话说明即可。不可推出：论文图 1 的 chunked 实现细节（device 间 swap 文本嵌入、cross-device sum）。</p>
+<p><strong>简化五：MoonViT-V2 设计只一句话提及</strong>。可推出：K3 选择"不从 SigLIP 初始化"的衔接原因。不可推出：MoonViT-V2 的具体机制（27 层、从零训练、RMSNorm、去 bias、视频分解注意力），详见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a> 概念页。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

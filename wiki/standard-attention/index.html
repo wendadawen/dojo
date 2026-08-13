@@ -653,8 +653,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §3.2.1 缩放点积注意力、§3.2.2 多头注意力、§3.2.3 因果遮罩、§4.1 复杂度对比。</p>
+<p><b>主要依据</b>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §3.2.1 缩放点积注意力、§3.2.2 多头注意力、§3.2.3 因果遮罩、§4 复杂度对比。</p>
 </blockquote>
+
+<p>处理一个 2048 token 的序列时，传统 RNN 要让第 1 个 token 的信息经过 2047 步非线性变换才能传到最后一个 token——路径长度 $O(n)$、且整个序列无法并行。Vaswani et al. 2017 提出的标准 Transformer 注意力让任意两个位置直接交互：用查询向量与键向量的点积算相似度，除以 $\sqrt{d_k}$ 稳定数值，softmax 归一化为权重，对值向量加权求和——路径降到 $O(1)$、全序列可并行。这一"缩放点积 + softmax + 多头"的基础操作是 MLA、Flash Attention、Linear Attention、RoPE 等所有变体的共同前置。本文回答：标准注意力解决什么问题、公式每步为何如此设计、$O(n^2)$ 瓶颈在哪、哪些问题它本身不解决。</p>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
@@ -676,16 +678,6 @@
   </ul>
 </section>
 
-<div class="context-box">
-  <p class="context-box-title">阅读上下文</p>
-  <div class="context-grid">
-    <div class="context-label">是什么</div><div class="context-value">Vaswani 2017 提出的"缩放点积 + softmax + 加权求和 + 多头"的标准注意力机制</div>
-    <div class="context-label">为什么需要</div><div class="context-value">让序列中任意两个位置直接交互（路径 $O(1)$），替代 RNN 的逐步传递（路径 $O(n)$）</div>
-    <div class="context-label">本文是哪些概念的前置</div><div class="context-value">MLA、KDA、Block AttnRes、Flash Attention、Linear Attention、RoPE 等所有注意力变体</div>
-    <div class="context-label">不展开</div><div class="context-value">Flash/Linear 的实现机制、MLA 的 KV 压缩、RoPE 的位置编码、加性注意力</div>
-  </div>
-</div>
-
 <h2 id="why-attention">注意力要解决什么问题——从 RNN 的"逐步传递"到"直接查询"</h2>
 
 <p>读一句话"The cat sat on the mat because it was tired."——这里的"it"指什么？人类一眼看出指"cat"，但模型怎么知道？传统 RNN 把"cat"的信息编码进第 1 步的隐状态 $h_1$，再传递给 $h_2$、$h_3$……直到"it"所在的第 8 步才读到。这条路径有两个问题：</p>
@@ -695,7 +687,7 @@
   <li><strong>顺序操作 $O(n)$</strong>：$h_t$ 必须等 $h_{t-1}$ 算完才能开始，整个序列无法沿时间轴并行，GPU 的并行算力无法发挥。</li>
 </ul>
 
-<p>标准注意力（Vaswani et al. 2017）换了一个思路：让"it"这个位置主动生成一个<em>查询向量 $q$</em>，去匹配前文每个位置的<em>键向量 $k$</em>，按匹配程度对那个位置的<em>值向量 $v$</em> 加权求和——一步到位，且所有位置可并行计算。</p>
+<p>标准注意力（Vaswani et al. 2017）换了一个思路<sup>[C1]</sup>：让"it"这个位置主动生成一个<em>查询向量 $q$</em>，去匹配前文每个位置的<em>键向量 $k$</em>，按匹配程度对那个位置的<em>值向量 $v$</em> 加权求和——一步到位，且所有位置可并行计算。</p>
 
 <div class="table-scroll">
 <table>
@@ -707,7 +699,7 @@
 </tbody>
 </table>
 </div>
-<p class="chapter-summary">来源：Vaswani et al. 2017, §4.1 Table 1。$n$ 是序列长度，$d$ 是隐藏维度。当 $n<d$ 时自注意力比 RNN 计算量更小，且可全并行。</p>
+<p class="chapter-summary"><sup>[C8, N2]</sup> $n$ 是序列长度，$d$ 是隐藏维度。当 $n<d$ 时自注意力比 RNN 计算量更小，且可全并行。</p>
 
 <p>这里出现三个新词——<em>查询（query, $q$）</em>、<em>键（key, $k$）</em>、<em>值（value, $v$）</em>——它们的角色可以借用数据库类比来理解，但需要注意边界。</p>
 
@@ -718,7 +710,7 @@
 
 <p>自注意力下 $Q,K,V$ 同源：它们都来自同一输入 $X\in\mathbb{R}^{n\times d_{model}}$ 的不同线性投影：</p>
 
-<p>$$Q=XW^Q,\qquad K=XW^K,\qquad V=XW^V,$$</p>
+<p>$$Q=XW^Q,\qquad K=XW^K,\qquad V=XW^V,$$<sup>[F6]</sup></p>
 
 <p>其中 $W^Q,W^K\in\mathbb{R}^{d_{model}\times d_k}$、$W^V\in\mathbb{R}^{d_{model}\times d_v}$ 是可学习参数。<em>同源</em>意味着 $Q,K,V$ 不是三种不同的输入数据，而是同一序列在不同子空间的"视角"——$W^Q$ 决定哪些维度用作查询特征、$W^K$ 决定哪些用作键特征、$W^V$ 决定哪些用作返回内容。概念页 <em>矩阵乘法</em>（待生成）解释 $XW$ 的维度规则与计算；概念页 <em>向量点积</em>（待生成）解释 $q\cdot k$ 的几何含义。</p>
 
@@ -726,9 +718,9 @@
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>用一句话说出 RNN 在长程依赖上的两个局限（路径长 $O(n)$、顺序操作 $O(n)$）</li>
-  <li>用一句话说出注意力如何让任意两位置直接交互（路径 $O(1)$）</li>
-  <li>说出"自注意力下 $Q,K,V$ 同源"这一性质，并解释"同源"的含义（来自同一 $X$ 的不同投影）</li>
+  <li>用一句话说出 RNN 在长程依赖上的两个局限（路径长 $O(n)$、顺序操作 $O(n)$）。</li>
+  <li>用一句话说出注意力如何让任意两位置直接交互（路径 $O(1)$）。</li>
+  <li>说出"自注意力下 $Q,K,V$ 同源"这一性质，并解释"同源"的含义（来自同一 $X$ 的不同投影）。</li>
 </ul>
 
 <p>本章说明了注意力要做什么——"动态对齐 + 加权聚合"。但具体怎么"匹配"、怎么"加权"？下一章给出标准公式。</p>
@@ -737,7 +729,7 @@
 
 <p>标准注意力把"查询-匹配-加权聚合"这件事压成一行公式：</p>
 
-<p>$$\text{Attention}(Q,K,V)=\text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V.\qquad\text{F1, Vaswani 2017 §3.2.1 Eq.(1)}$$</p>
+<p>$$\text{Attention}(Q,K,V)=\text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V.$$<sup>[F1]</sup></p>
 
 <p>把它拆成四步流程，每步说明输入输出形状：</p>
 
@@ -815,26 +807,26 @@
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 $\text{softmax}(QK^\top/\sqrt{d_k})V$ 并说出 $Q,K,V,d_k,K^\top$ 每个符号</li>
-  <li>说出 $QK^\top$ 的形状（$n\times m$）与每个元素的含义（$q_i\cdot k_j$）</li>
-  <li>算出 2×2 例子中 $QK^\top$（$\begin{pmatrix}1 & 0\\0 & 1\end{pmatrix}$）与 softmax 后的 $A$（$\begin{pmatrix}0.670 & 0.330\\0.330 & 0.670\end{pmatrix}$）</li>
-  <li>说出 $AV$ 输出每行是值向量的凸组合（基于 softmax 行和为 1）</li>
+  <li>写出 $\text{softmax}(QK^\top/\sqrt{d_k})V$ 并说出 $Q,K,V,d_k,K^\top$ 每个符号。</li>
+  <li>说出 $QK^\top$ 的形状（$n\times m$）与每个元素的含义（$q_i\cdot k_j$）。</li>
+  <li>算出 2×2 例子中 $QK^\top$（$\begin{pmatrix}1 & 0\\0 & 1\end{pmatrix}$）与 softmax 后的 $A$（$\begin{pmatrix}0.670 & 0.330\\0.330 & 0.670\end{pmatrix}$）。</li>
+  <li>说出 $AV$ 输出每行是值向量的凸组合（基于 softmax 行和为 1）。</li>
 </ul>
 
 <p>公式全有了，但 $\sqrt{d_k}$ 这步还没解释清楚——为什么是 $\sqrt{d_k}$ 而不是 $d_k$ 或不除？下一章专门看这个。</p>
 
 <h2 id="why-sqrt-dk">为什么除以 √d_k——缩放因子的方差推导与不缩放的后果</h2>
 
-<p>$\sqrt{d_k}$ 这一步是公式中唯一的非显然项。Vaswani et al. 2017 在正文只用一句话引出（"我们怀疑大 $d_k$ 时点积变大、把 softmax 推到梯度极小的区域"），完整推导藏在脚注 4 里。本节把脚注展开。</p>
+<p>$\sqrt{d_k}$ 这一步是公式中唯一的非显然项。Vaswani et al. 2017 在正文只用一句话引出（"我们怀疑大 $d_k$ 时点积变大、把 softmax 推到梯度极小的区域"），完整推导藏在脚注 1 里。本文把脚注展开。</p>
 
 <p>先给直觉：点积 $q\cdot k=\sum_{i=1}^{d_k}q_i k_i$ 是 $d_k$ 项之和。当 $d_k$ 大时，即使每项都"随机小"，总和也会"随机大"——量级随 $\sqrt{d_k}$ 增长。下面用方差推导把它形式化。</p>
 
 <p><strong>推导目标</strong>：求 $q\cdot k$ 在 $q,k$ 各分量随机初始化时的方差。已知 $q_i,k_i\overset{iid}{\sim}$ 均值 0、方差 1（标准初始化与 LN 后的近似，见概念页 <em>方差</em> 待生成）。求 $\text{Var}(q\cdot k)$。</p>
 
-<p><strong>关键结论</strong>：$\text{Var}(q\cdot k)=d_k$，故 $\text{std}(q\cdot k)=\sqrt{d_k}$。除以 $\sqrt{d_k}$ 把标准差归一到 1，使 softmax 输入不饱和。完整推导放折叠块：</p>
+<p><strong>关键结论</strong>：$\text{Var}(q\cdot k)=d_k$<sup>[C3, F3]</sup>，故 $\text{std}(q\cdot k)=\sqrt{d_k}$。除以 $\sqrt{d_k}$ 把标准差归一到 1，使 softmax 输入不饱和。完整推导放折叠块：</p>
 
 <details>
-<summary>推导：$\text{Var}(q\cdot k)=d_k$ 的完整步骤（Vaswani 2017 §3.2.1 脚注 4）</summary>
+<summary>展开：$\text{Var}(q\cdot k)=d_k$ 的完整步骤（Vaswani 2017 §3.2.1 脚注 1）</summary>
 <p>设 $q_i,k_i$ 独立同分布、均值 0、方差 1。</p>
 <p><strong>第一步</strong>：求单项 $q_i k_i$ 的方差。$q_i,k_i$ 独立时 $E[q_i k_i]=E[q_i]E[k_i]=0\cdot 0=0$；</p>
 <p>$$\text{Var}(q_i k_i)=E[(q_i k_i)^2]-E[q_i k_i]^2=E[q_i^2]E[k_i^2]-0=1\cdot 1=1.$$</p>
@@ -845,20 +837,20 @@
 <p>本推导依赖三个假设：$q,k$ 分量独立（独立性使方差可加）；均值 0（BN/LN 后基本成立）；方差 1（标准初始化基本成立）。训练后期这些假设可能不严格成立，但通常仍可用，因为 LN 把激活控制在单位量级。</p>
 </details>
 
-<p><strong>不缩放的后果</strong>。$d_k=64$ 时 $\text{std}(q\cdot k)=8$，$n$ 个 key 中最大 logit 与典型值差值常达 16+（如 $n=256$ 时 $E[\max]\approx 8\sqrt{2\ln 256}\approx 27$）。$e^{16}\approx 8.89\times 10^6$，让某个 key 几乎独占权重。softmax 输出近 one-hot 后梯度也近零：</p>
+<p><strong>不缩放的后果</strong><sup>[C4]</sup>。$d_k=64$ 时 $\text{std}(q\cdot k)=8$，$n$ 个 key 中最大 logit 与典型值差值常达 16+（如 $n=256$ 时 $E[\max]\approx 8\sqrt{2\ln 256}\approx 27$）。$e^{16}\approx 8.89\times 10^6$，让某个 key 几乎独占权重。softmax 输出近 one-hot 后梯度也近零：</p>
 
 <details>
 <summary>补充：softmax 雅可比 $\partial p_i/\partial z_j=p_i(\delta_{ij}-p_j)$ 与梯度消失</summary>
 <p>对 $p_i=e^{z_i}/\sum_l e^{z_l}$ 求偏导，用商法则：</p>
-<p>$$\frac{\partial p_i}{\partial z_j}=\frac{e^{z_i}\delta_{ij}\cdot\sum_l e^{z_l}-e^{z_i}\cdot e^{z_j}}{(\sum_l e^{z_l})^2}=p_i\delta_{ij}-p_i p_j=p_i(\delta_{ij}-p_j).$$</p>
+<p>$$\frac{\partial p_i}{\partial z_j}=\frac{e^{z_i}\delta_{ij}\cdot\sum_l e^{z_l}-e^{z_i}\cdot e^{z_j}}{(\sum_l e^{z_l})^2}=p_i\delta_{ij}-p_i p_j=p_i(\delta_{ij}-p_j).$$<sup>[F4]</sup></p>
 <p>当某个 $p_j\to 1$、其它 $p_i\to 0$ 时：(a) 对角项 $\partial p_j/\partial z_j=p_j(1-p_j)\to 1\cdot 0=0$；(b) 非对角项 $\partial p_i/\partial z_j=p_i(0-p_j)\to 0$。所有项几乎为零，梯度信号近零，训练停滞。</p>
 </details>
 
 <p>下面用教学构造的数字看"不缩放 vs 缩放"的对比。</p>
 
 <details>
-<summary>教学示例：$d_k=64$、$n=256$ 个 key 随机初始化时未缩放 vs 缩放的最大权重对照</summary>
-<p><strong>教学构造</strong>（非论文一手数据，参考 jethroodeyemi.github.io 2026 的实测验证）。设 $d_k=64$、$n=256$ 个 key，$q,k$ 各分量 $N(0,1)$，2000 次试验取均值。</p>
+<summary>展开：$d_k=64$、$n=256$ 个 key 随机初始化时未缩放 vs 缩放的最大权重对照</summary>
+<p><strong>教学示例</strong>。教学构造，非论文一手数据（参考 jethroodeyemi.github.io 2026 的实测验证）。设 $d_k=64$、$n=256$ 个 key，$q,k$ 各分量 $N(0,1)$，2000 次试验取均值。</p>
 <div class="table-scroll">
 <table>
 <thead><tr><th>$d_k$</th><th>未缩放最大权重</th><th>未缩放熵（nats）</th><th>缩放后最大权重</th><th>缩放后熵</th></tr></thead>
@@ -874,25 +866,25 @@
 
 <p><strong>为什么不除 $d_k$ 而除 $\sqrt{d_k}$</strong>。除 $d_k$ 会把方差压到 $1/d_k$，让 logit 过小、softmax 输出近均匀分布（无信息）；除 $\sqrt{d_k}$ 恰好把方差归一到 1，是"刚好不饱和也不退化"的中间选择。从温度角度看，softmax 的尖锐程度由 $\text{logit}/T$ 决定；$\sqrt{d_k}$ 等价于固定温度 $T=\sqrt{d_k}$，把 logit 标准差标定到 1。</p>
 
-<p><strong>与加性注意力对比</strong>。Vaswani 2017 §3.2.1 第 1 段提到：小 $d_k$ 时未缩放点积注意力与加性注意力（Bahdanau 2014，用一个前馈网络算分数）表现相近；大 $d_k$ 时未缩放点积显著退化。论文引入 $\sqrt{d_k}$ 缩放后，点积注意力保留了"用矩阵乘法高效实现"的优势，又不再退化——这是标准注意力选择缩放点积而非加性的根本原因。本页不展开加性注意力的机制。</p>
+<p><strong>与加性注意力对比</strong>。论文 §3.2.1 提到<sup>[C2]</sup>：小 $d_k$ 时未缩放点积注意力与加性注意力（Bahdanau 2014，用一个前馈网络算分数）表现相近；大 $d_k$ 时未缩放点积显著退化。论文引入 $\sqrt{d_k}$ 缩放后，点积注意力保留了"用矩阵乘法高效实现"的优势，又不再退化——这是标准注意力选择缩放点积而非加性的根本原因。本页不展开加性注意力的机制。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 $\text{Var}(q\cdot k)=d_k$ 的推导起点（$q_i,k_i$ 独立同分布、均值 0、方差 1）与结论</li>
-  <li>说出 $\sqrt{d_k}$ 来自"标准差归一到 1"，不是经验常数</li>
-  <li>说出不除时 softmax 饱和与梯度近零的链条（logit 大 → 输出近 one-hot → 雅可比近零）</li>
-  <li>说出为什么除 $\sqrt{d_k}$ 而不是 $d_k$（除 $d_k$ 让方差过小、分布退化为均匀）</li>
+  <li>写出 $\text{Var}(q\cdot k)=d_k$ 的推导起点（$q_i,k_i$ 独立同分布、均值 0、方差 1）与结论。</li>
+  <li>说出 $\sqrt{d_k}$ 来自"标准差归一到 1"，不是经验常数。</li>
+  <li>说出不除时 softmax 饱和与梯度近零的链条（logit 大 → 输出近 one-hot → 雅可比近零）。</li>
+  <li>说出为什么除 $\sqrt{d_k}$ 而不是 $d_k$（除 $d_k$ 让方差过小、分布退化为均匀）。</li>
 </ul>
 
 <p>单头公式全清楚了。但实际 Transformer 不用单头 $d_{model}=512$ 维，而是拆成 8 个 $d_k=64$ 的头并行做。下一章看多头。</p>
 
 <h2 id="multi-head-attention">多头注意力——拆分子空间、拼接、参数量等价</h2>
 
-<p>单头 $d_{model}$ 维注意力只能学一种"查询-键"匹配模式。但语言中关系是多类的：语法依赖（主谓）、共指关系（"it"指代谁）、位置模式（前一个词、后一个词）。Vaswani et al. 2017 §3.2.2 设计多头让模型在不同子空间并行关注不同关系。</p>
+<p>单头 $d_{model}$ 维注意力只能学一种"查询-键"匹配模式。但语言中关系是多类的：语法依赖（主谓）、共指关系（"it"指代谁）、位置模式（前一个词、后一个词）。Vaswani et al. 2017 设计多头<sup>[C5]</sup>让模型在不同子空间并行关注不同关系。</p>
 
 <p>多头公式：</p>
 
-<p>$$\text{MultiHead}(Q,K,V)=\text{Concat}(\text{head}_1,\ldots,\text{head}_h)W^O.\qquad\text{F2, Vaswani 2017 §3.2.2 Eq.(2)}$$</p>
+<p>$$\text{MultiHead}(Q,K,V)=\text{Concat}(\text{head}_1,\ldots,\text{head}_h)W^O.$$<sup>[F2]</sup></p>
 
 <p>其中每个头</p>
 
@@ -935,23 +927,23 @@
 
 <p>$W^K,W^V,W^O$ 同理。所以多头不是"增加参数量"，而是"把同一参数预算分配到多个子空间"。</p>
 
-<p><strong>论文数字</strong>（Vaswani 2017 §3.2.2 与 Table 3）：基础模型 $d_{model}=512$、$h=8$、$d_k=d_v=64$、$W^O\in\mathbb{R}^{512\times 512}$。8 个头各在 64 维子空间做注意力，每个头输出 $n\times 64$，沿最后一维拼接得 $n\times (8\times 64)=n\times 512$，再乘 $W^O$ 得 $n\times 512$。$h\cdot d_k=8\times 64=512=d_{model}$，参数量等价成立。</p>
+<p><strong>论文数字</strong><sup>[N1]</sup>：基础模型 $d_{model}=512$、$h=8$、$d_k=d_v=64$、$W^O\in\mathbb{R}^{512\times 512}$。8 个头各在 64 维子空间做注意力，每个头输出 $n\times 64$，沿最后一维拼接得 $n\times (8\times 64)=n\times 512$，再乘 $W^O$ 得 $n\times 512$。$h\cdot d_k=8\times 64=512=d_{model}$，参数量等价成立。</p>
 
 <div class="callout callout-blue">
 <p><strong>常见误解</strong>。 多头 ≠ 多个独立的注意力模型；不是"8 个不同的注意力模块并行工作"，而是"同一输入投影到 8 个子空间分别做注意力"。各头的独立性来自投影矩阵 $W_i^Q,W_i^K,W_i^V$ 的独立初始化与独立学习，不是模型结构上的"8 个独立网络"。把多头理解成"8 个独立模型"会误以为总计算量是单头的 8 倍——实际上 $h\cdot d_k=d_{model}$ 让总计算量与单头 $d_{model}$ 维等价。</p>
 </div>
 
-<p><strong>多头"子空间分化"是设计目标</strong>。Vaswani 2017 §3.2.2 第 2 段原文："Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions."这是设计目标，不保证每个头一定学到可解释的不同关系——Michel et al. 2019 报告训练后部分头高度冗余；本页只引论文设计目标，不展开冗余讨论。</p>
+<p><strong>多头"子空间分化"是设计目标</strong>。论文原文<sup>[C6]</sup>："Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions."这是设计目标，不保证每个头一定学到可解释的不同关系——Michel et al. 2019 报告训练后部分头高度冗余；本页只引论文设计目标，不展开冗余讨论。</p>
 
-<p><strong>因果遮罩</strong>（自回归解码）。当注意力用于解码器自回归生成时，第 $t$ 个 token 不能看到未来的 token（否则训练时直接"抄答案"）。实现上把未来位置的分数设为 $-\infty$，softmax 后权重为 0：</p>
+<p><strong>因果遮罩</strong>（自回归解码）<sup>[C7]</sup>。当注意力用于解码器自回归生成时，第 $t$ 个 token 不能看到未来的 token（否则训练时直接"抄答案"）。实现上把未来位置的分数设为 $-\infty$，softmax 后权重为 0：</p>
 
-<p>$$\text{MaskedAttention}(Q,K,V)=\text{softmax}\!\left(\frac{QK^\top+M}{\sqrt{d_k}}\right)V,\qquad M_{ij}=\begin{cases}0 & j\le i\\ -\infty & j>i\end{cases}.\quad\text{F5, Vaswani 2017 §3.2.3}$$</p>
+<p>$$\text{MaskedAttention}(Q,K,V)=\text{softmax}\!\left(\frac{QK^\top+M}{\sqrt{d_k}}\right)V,\qquad M_{ij}=\begin{cases}0 & j\le i\\ -\infty & j>i\end{cases}.$$<sup>[F5]</sup></p>
 
 <p>下面用 3×3 教学例子展示遮罩效果。</p>
 
 <details>
-<summary>教学示例：3×3 因果遮罩下的 softmax 计算</summary>
-<p><strong>教学构造</strong>。 设 $n=3$，已算好缩放后的分数矩阵 $QK^\top/\sqrt{d_k}=\begin{pmatrix}0.5 & 1.0 & 0.8\\0.3 & 0.7 & 1.2\\0.4 & 0.6 & 0.9\end{pmatrix}$。因果遮罩矩阵 $M=\begin{pmatrix}0 & -\infty & -\infty\\0 & 0 & -\infty\\0 & 0 & 0\end{pmatrix}$（下三角含对角为 0，上三角为 $-\infty$）。</p>
+<summary>展开：3×3 因果遮罩下的 softmax 计算</summary>
+<p><strong>教学示例</strong>。 设 $n=3$，已算好缩放后的分数矩阵 $QK^\top/\sqrt{d_k}=\begin{pmatrix}0.5 & 1.0 & 0.8\\0.3 & 0.7 & 1.2\\0.4 & 0.6 & 0.9\end{pmatrix}$。因果遮罩矩阵 $M=\begin{pmatrix}0 & -\infty & -\infty\\0 & 0 & -\infty\\0 & 0 & 0\end{pmatrix}$（下三角含对角为 0，上三角为 $-\infty$）。</p>
 <p>加遮罩后：</p>
 <p>$$\frac{QK^\top}{\sqrt{d_k}}+M=\begin{pmatrix}0.5 & -\infty & -\infty\\0.3 & 0.7 & -\infty\\0.4 & 0.6 & 0.9\end{pmatrix}.$$</p>
 <p>softmax 每行：</p>
@@ -967,18 +959,18 @@
 
 <p>多头公式全部讲完了。完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出多头公式 $\text{Concat}(\text{head}_1,\ldots,\text{head}_h)W^O$ 并解释每个 $W_i^Q,W_i^K,W_i^V,W^O$ 的形状与作用</li>
-  <li>算出论文设置下 8 个头拼接的维度（$8\times 64=512=d_{model}$）</li>
-  <li>说出 $h\cdot d_k=d_{model}$ 时总参数量与单头等价（$h\cdot d_{model}\cdot d_k=d_{model}^2$）</li>
-  <li>说出多头与"多个独立模型"的区别（同源投影、共享参数预算）</li>
-  <li>说出因果遮罩的形式（上三角 $-\infty$）与作用（softmax 后权重为 0，防止看未来 token）</li>
+  <li>写出多头公式 $\text{Concat}(\text{head}_1,\ldots,\text{head}_h)W^O$ 并解释每个 $W_i^Q,W_i^K,W_i^V,W^O$ 的形状与作用。</li>
+  <li>算出论文设置下 8 个头拼接的维度（$8\times 64=512=d_{model}$）。</li>
+  <li>说出 $h\cdot d_k=d_{model}$ 时总参数量与单头等价（$h\cdot d_{model}\cdot d_k=d_{model}^2$）。</li>
+  <li>说出多头与"多个独立模型"的区别（同源投影、共享参数预算）。</li>
+  <li>说出因果遮罩的形式（上三角 $-\infty$）与作用（softmax 后权重为 0，防止看未来 token）。</li>
 </ul>
 
 <p>现在有了完整的标准注意力机制。下一章看它的复杂度瓶颈与边界——这决定了哪些问题必须由后续变体解决。</p>
 
 <h2 id="complexity-and-boundaries">复杂度、瓶颈与边界——标准注意力不能做什么</h2>
 
-<p>知道机制后，本节回答"它在哪里会失效、为什么需要变体"。</p>
+<p>知道机制后，本页回答"它在哪里会失效、为什么需要变体"。</p>
 
 <p><strong>复杂度拆解</strong>。单层自注意力的计算分三部分：</p>
 
@@ -1006,9 +998,9 @@
 <p>两者都"解决" $O(n^2)$ 瓶颈但方式完全不同：Flash 是"算得更快但算的是同一件事"，Linear 是"算一件近似的事"。</p>
 </div>
 
-<p><strong>注意力本身不引入位置信息</strong>。标准注意力对输入序列的行重排不变——把 $Q,K,V$ 的行同时重排，输出也对应重排，每行的相对注意力分布不变。这是 permutation-invariant 性质。位置信息必须由外接的位置编码注入：原论文用正弦位置编码（Vaswani 2017 §3.5），现代 LLM 多用 RoPE（旋转位置编码，见概念页 <em>RoPE</em>）。</p>
+<p><strong>注意力本身不引入位置信息</strong>。标准注意力对输入序列的行重排不变——把 $Q,K,V$ 的行同时重排，输出也对应重排，每行的相对注意力分布不变。这是 permutation-invariant 性质。位置信息必须由外接的位置编码注入：原论文用正弦位置编码<sup>[C9]</sup>，现代 LLM 多用 <a href="../rope/index.html">RoPE（旋转位置编码）</a>。</p>
 
-<p><strong>注意力不压缩 KV</strong>。自回归推理时每个 token 要把它的 $K,V$ 存进 KV cache 供后续 token 查询；$n$ 个 token 与 $h$ 个头让 cache 大小 $O(n\cdot h\cdot d_k)$。长上下文与多头让 KV cache 成为推理显存的主要瓶颈——这是 MLA（Multi-head Latent Attention，见概念页 <em>MLA</em>）要解决的问题：把 KV 压缩到低维潜在向量。</p>
+<p><strong>注意力不压缩 KV</strong>。自回归推理时每个 token 要把它的 $K,V$ 存进 KV cache 供后续 token 查询；$n$ 个 token 与 $h$ 个头让 cache 大小 $O(n\cdot h\cdot d_k)$。长上下文与多头让 KV cache 成为推理显存的主要瓶颈——这是 <a href="../mla/index.html">MLA（Multi-head Latent Attention）</a>要解决的问题：把 KV 压缩到低维潜在向量。</p>
 
 <p><strong>注意力不保证多头可解释</strong>。论文设计目标是子空间分化，但 Michel et al. 2019（"Are Sixteen Heads Really Better than One?"）报告训练后部分头高度冗余，删除部分头不降低性能。本页只引论文设计目标，多头冗余的实验结果不在核心论断内。</p>
 
@@ -1030,24 +1022,26 @@
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>说出 $O(n^2)$ 瓶颈具体在哪一步（$QK^\top$ 产生 $n\times n$ 矩阵）</li>
-  <li>说出标准注意力不引入位置信息，需外接位置编码（如 RoPE）</li>
-  <li>说出至少两个后续变体分别解决什么标准注意力的边界问题（如 Flash 解决 $O(n^2)$、MLA 解决 KV cache、RoPE 解决位置）</li>
-  <li>说出 Flash 与 Linear Attention 的区别（一个改实现不改公式，一个改公式）</li>
+  <li>说出 $O(n^2)$ 瓶颈具体在哪一步（$QK^\top$ 产生 $n\times n$ 矩阵）。</li>
+  <li>说出标准注意力不引入位置信息，需外接位置编码（如 RoPE）。</li>
+  <li>说出至少两个后续变体分别解决什么标准注意力的边界问题（如 Flash 解决 $O(n^2)$、MLA 解决 KV cache、RoPE 解决位置）。</li>
+  <li>说出 Flash 与 Linear Attention 的区别（一个改实现不改公式，一个改公式）。</li>
 </ul>
+
+<p>回顾本文开篇的问题：标准注意力用"查询-键点积 + $\sqrt{d_k}$ 缩放 + softmax 归一 + 多头拼接"让任意两位置直接交互，把路径长度从 $O(n)$ 降到 $O(1)$、让全序列可并行——这是它解决动态对齐与加权聚合的核心贡献。但 $O(n^2)$ 复杂度、位置信息缺失、KV cache 膨胀三个问题它本身不解决，分别交由 Flash/Linear Attention、RoPE、MLA 等变体处理。理解了标准注意力保住什么、替换什么，就掌握了阅读所有注意力变体的共同基础。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
 <h3>核心论断与来源</h3>
 <ul>
-<li><strong>C1 注意力解决动态对齐 + 加权聚合问题</strong>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §1 第 3 段与 §4.1 Table 1。</li>
+<li><strong>C1 注意力解决动态对齐 + 加权聚合问题</strong>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §1 第 3 段与 §4 Table 1。</li>
 <li><strong>C2 缩放点积公式</strong>：Vaswani et al. 2017, §3.2.1, Eq.(1)。</li>
-<li><strong>C3 $\sqrt{d_k}$ 来自方差推导</strong>：Vaswani et al. 2017, §3.2.1 脚注 4。</li>
-<li><strong>C4 不缩放时 softmax 饱和、梯度近零</strong>：Vaswani et al. 2017, §3.2.1 脚注 4 描述"extremely small gradients"；softmax 雅可比是标准推导。</li>
+<li><strong>C3 $\sqrt{d_k}$ 来自方差推导</strong>：Vaswani et al. 2017, §3.2.1 脚注 1。</li>
+<li><strong>C4 不缩放时 softmax 饱和、梯度近零</strong>：Vaswani et al. 2017, §3.2.1 脚注 1 描述"extremely small gradients"；softmax 雅可比是标准推导。</li>
 <li><strong>C5 多头公式与拼接</strong>：Vaswani et al. 2017, §3.2.2, Eq.(2)。</li>
 <li><strong>C6 多头子空间分化（设计目标）</strong>：Vaswani et al. 2017, §3.2.2 第 2 段。</li>
-<li><strong>C7 因果遮罩</strong>：Vaswani et al. 2017, §3.2.3 第 2 段。</li>
-<li><strong>C8 复杂度 $O(n^2 d_k)$ 与空间 $O(n^2)$</strong>：Vaswani et al. 2017, §4.1 Table 1。</li>
+<li><strong>C7 因果遮罩</strong>：Vaswani et al. 2017, §3.2.3。</li>
+<li><strong>C8 复杂度 $O(n^2 d_k)$ 与空间 $O(n^2)$</strong>：Vaswani et al. 2017, §4 Table 1。</li>
 <li><strong>C9 注意力位置无关</strong>：Vaswani et al. 2017, §3.5（位置编码章节暗示）。</li>
 </ul>
 
@@ -1055,16 +1049,16 @@
 <ul>
 <li><strong>F1 Attention 公式</strong>：$\text{Attention}(Q,K,V)=\text{softmax}(QK^\top/\sqrt{d_k})V$，Vaswani 2017 §3.2.1 Eq.(1)。</li>
 <li><strong>F2 多头公式</strong>：$\text{MultiHead}(Q,K,V)=\text{Concat}(\text{head}_1,\ldots,\text{head}_h)W^O$，Vaswani 2017 §3.2.2 Eq.(2)。</li>
-<li><strong>F3 方差推导</strong>：$\text{Var}(q\cdot k)=d_k$（$q_i,k_i$ 独立同分布、均值 0、方差 1），Vaswani 2017 §3.2.1 脚注 4；本页展开为完整推导。</li>
+<li><strong>F3 方差推导</strong>：$\text{Var}(q\cdot k)=d_k$（$q_i,k_i$ 独立同分布、均值 0、方差 1），Vaswani 2017 §3.2.1 脚注 1；本页展开为完整推导。</li>
 <li><strong>F4 softmax 雅可比</strong>：$\partial p_i/\partial z_j=p_i(\delta_{ij}-p_j)$，softmax 标准结果，由商法则直接推出；论文未显式给出，本页用于支撑 C4。</li>
-<li><strong>F5 因果遮罩</strong>：$\text{softmax}((QK^\top+M)/\sqrt{d_k})V$，$M_{ij}=0$ 当 $j\le i$、$M_{ij}=-\infty$ 当 $j>i$，Vaswani 2017 §3.2.3 第 2 段。</li>
+<li><strong>F5 因果遮罩</strong>：$\text{softmax}((QK^\top+M)/\sqrt{d_k})V$，$M_{ij}=0$ 当 $j\le i$、$M_{ij}=-\infty$ 当 $j>i$，Vaswani 2017 §3.2.3。</li>
 <li><strong>F6 同源投影</strong>：$Q=XW^Q,K=XW^K,V=XW^V$，Vaswani 2017 §3.2.2 第 1 段。</li>
 </ul>
 
 <h3>外部数字与实验条件</h3>
 <ul>
 <li><strong>N1 论文超参数</strong>：$d_{model}=512$、$h=8$、$d_k=d_v=64$、$W^O\in\mathbb{R}^{512\times 512}$，Vaswani 2017 §3.2.2 与 Table 3。</li>
-<li><strong>N2 复杂度对比</strong>：RNN $O(nd^2)$ / $O(n)$ / $O(n)$；CNN $O(knd^2)$ / $O(1)$ / $O(\log_k n)$；自注意力 $O(n^2 d)$ / $O(1)$ / $O(1)$，Vaswani 2017 §4.1 Table 1。</li>
+<li><strong>N2 复杂度对比</strong>：RNN $O(nd^2)$ / $O(n)$ / $O(n)$；CNN $O(knd^2)$ / $O(1)$ / $O(\log_k n)$；自注意力 $O(n^2 d)$ / $O(1)$ / $O(1)$，Vaswani 2017 §4 Table 1。</li>
 </ul>
 
 <h3>教学示例</h3>
@@ -1083,11 +1077,11 @@
 
 <h3>教学简化及其限制</h3>
 <ul>
-<li><strong>2×2 例子用对角 $Q,K$</strong>：让 $QK^\top$ 退化为对角矩阵，简化手算。简化掉的是：真实模型的 $Q,K$ 是 LN 后的稠密向量，$QK^\top$ 每个元素都非零；本页简化让"对角位置完全对齐、非对角位置正交"，便于展示 softmax 与 $AV$ 形状变化，不代表真实分布。</li>
-<li><strong>3×3 遮罩例子直接给出缩放后分数</strong>：跳过 $QK^\top$ 与 $\div\sqrt{d_k}$ 的具体计算。简化掉的是：从 $Q,K$ 到分数的形状变化已在 2×2 例子展示；3×3 例子聚焦遮罩对 softmax 的影响。</li>
-<li><strong>方差推导假设 $q,k$ 分量独立同分布、均值 0、方差 1</strong>：这是初始化时的近似，训练后期可能不严格成立。简化掉的是：训练后 $q,k$ 分布的协方差结构；本页只引论文脚注的标准推导，不展开训练后期的修正。</li>
-<li><strong>不展开 softmax 数值稳定实现</strong>：max 减法只在折叠块一句话提示，不进入正文。简化掉的是：工程实现中 $e^{z_i}$ 在大 $z$ 时的溢出处理；本页只讲数学定义。</li>
-<li><strong>不展开加性注意力的完整机制</strong>：只在 S3 一句话作对照。简化掉的是：Bahdanau 2014 的前馈打分网络细节；本页只引论文 §3.2.1 的对比结论。</li>
+<li><strong>2×2 例子用对角 $Q,K$</strong>：用对角矩阵让 $QK^\top$ 退化为对角矩阵，便于手算。可推出：softmax 与 $AV$ 的形状变化、每步输入输出维度。不可推出：真实模型 $Q,K$ 为 LN 后稠密向量时 $QK^\top$ 每个元素都非零的分布特征。</li>
+<li><strong>3×3 遮罩例子直接给出缩放后分数</strong>：跳过从 $Q,K$ 到 $QK^\top/\sqrt{d_k}$ 的计算，聚焦遮罩对 softmax 的影响。可推出：上三角权重为 0、自回归注意力模式。不可推出：从原始 $Q,K$ 出发的完整四步流程（已在 2×2 例子展示）。</li>
+<li><strong>方差推导假设 $q,k$ 分量独立同分布、均值 0、方差 1</strong>：采用初始化时的标准近似。可推出：$\text{Var}(q\cdot k)=d_k$、除以 $\sqrt{d_k}$ 把标准差归一到 1。不可推出：训练后期 $q,k$ 分布的协方差结构与实际偏离程度。</li>
+<li><strong>不展开 softmax 数值稳定实现</strong>：max 减法只在折叠块一句话提示，不进入正文。可推出：softmax 的数学定义与归一性质。不可推出：工程实现中 $e^{z_i}$ 在大 $z$ 时的溢出处理细节。</li>
+<li><strong>不展开加性注意力的完整机制</strong>：只在缩放点积公式一章一句话作对照。可推出：标准注意力选择缩放点积而非加性注意力的原因。不可推出：Bahdanau 2014 前馈打分网络的具体结构与训练特性。</li>
 </ul>
 
 

@@ -652,19 +652,11 @@
 <h1 class="title">MXFP4 量化感知训练：把 MoE 权重压到 4-bit 且让模型适应它</h1>
 <p class="reading-time" id="readingTime"></p>
 
-<div class="callout callout-blue">
-<p>把一个 2.8 万亿（2.8T）参数级的 MoE 大模型从 BF16 换成 4-bit 部署，显存能从约 5.4 TB 压到约 1.44 TB——但模型从未在 4-bit 下训练过，推理时权重突然"差一点"，质量会掉。怎么让模型在被压到 4-bit 后仍像训练时那样准？</p>
-</div>
+<blockquote class="meta">
+<p><b>主要依据</b>：Kimi K3 技术报告 §4.1.4 "Deployment-Aware Post-Training"；HuggingFace <code>moonshotai/Kimi-K3</code> 仓库 <code>config.json</code> 的 <code>quantization_config</code> 字段；OCP Microscaling Formats v1.0（Rouhani et al. 2023，arXiv:2310.10537）。</p>
+</blockquote>
 
-<div class="context-box">
-  <p class="context-box-title">概念定位</p>
-  <div class="context-grid">
-    <div class="context-label">概念类型</div><div class="context-value">量化方法（部署优化）</div>
-    <div class="context-label">应用对象</div><div class="context-value">MoE 大模型后训练与部署</div>
-    <div class="context-label">主要来源</div><div class="context-value">Kimi K3 技术报告 §4.1.4 + 官方 config.json</div>
-    <div class="context-label">关键收益</div><div class="context-value">专家权重显存压缩约 3.76×</div>
-  </div>
-</div>
+<p>把一个 2.8 万亿（2.8T）参数级的 MoE 大模型从 BF16 换成 4-bit 部署，显存能从约 5.4 TB 压到约 1.44 TB——压缩约 3.76×——但模型从未在 4-bit 下训练过，推理时权重突然"差一点"，质量会掉。Kimi K3 用 MXFP4 量化感知训练（QAT）应对这一问题——它是 K3 在 MoE 大模型后训练与部署中采用的量化方法。本文以 K3 技术报告 §4.1.4 与官方 config.json 为依据，回答：模型被压到 4-bit 后，怎么仍像训练时那样准？</p>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
@@ -677,13 +669,9 @@
   </ul>
 </section>
 
-<blockquote class="meta">
-<p><b>主要依据</b>：Kimi K3 技术报告 §4.1.4 "Deployment-Aware Post-Training"；HuggingFace <code>moonshotai/Kimi-K3</code> 仓库 <code>config.json</code> 的 <code>quantization_config</code> 字段；OCP Microscaling Formats v1.0（Rouhani et al. 2023，arXiv:2310.10537）。</p>
-</blockquote>
+<p>本文依赖两个前置概念。MoE 层结构（router、专家、稀疏激活）见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>，本文只使用其结论。量化基础（伪量化、直通估计器 STE 的最小说明）见 <a href="../quantization-basics/index.html">量化基础</a>，本文仅引用其结论，不重复推导。</p>
 
-<p>本文依赖两个前置概念。MoE 层结构（router、专家、稀疏激活）见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>，本文只使用其结论。量化基础（伪量化、直通估计器 STE 的最小说明）属 <em>quantization-basics</em> 概念页——该页面尚未生成，本文仅引用其结论，不重复推导。</p>
-
-<h2 id="s1-experts-memory">把 896 个 MoE 专家压到 4-bit，能省多少显存？</h2>
+<h2 id="s1-experts-memory">MoE 专家权重——896 个专家压到 4-bit 能省多少显存</h2>
 
 <p>MoE 模型把 Transformer 层里的 FFN 换成"一排专家加一个 router"。router 为每个 token 只选 top-k 个专家计算，其余专家不计算——这叫<strong>稀疏激活</strong>。K3 有 896 个路由专家，每个 token 仅激活 16 个（见官方 config.json 的 <code>num_experts_per_token: 16</code>），另有 2 个共享专家处理所有 token。</p>
 
@@ -694,7 +682,7 @@
 <p>BF16 下每参数 2 字节，这些专家权重约 $5.4$ TB。压到 MXFP4（每元素 4 bit、每 32 元素共享 1 字节 scale）后约 $1.44$ TB，压缩约 $3.76\times$。省下来的显存是约 4 TB 的量级——这正是"为什么值得为专家付出 QAT 的训练成本"。</p>
 
 <details>
-<summary>完整手算：每个专家参数量与 BF16/MXFP4 显存</summary>
+<summary>展开：每个专家参数量与 BF16/MXFP4 显存</summary>
 <p>教学示例。输入取自官方 config.json：<code>routed_expert_hidden_size = 3584</code>、<code>moe_intermediate_size = 3072</code>、<code>num_experts = 896</code>（每层）、<code>num_hidden_layers = 93</code>、<code>first_k_dense_replace = 1</code>（前 1 层为 dense FFN，其余 92 层为 MoE）。每个路由专家是 3 投影 FFN（gate/up/down，各为 $3584 \times 3072$ 或 $3072 \times 3584$），所以单专家参数量：</p>
 <p>$$3 \times 3584 \times 3072 = 33{,}030{,}144 \approx 33.03\mathrm{M}.$$</p>
 <p>92 个 MoE 层 × 每层 896 个专家 = 82,432 个专家，合计：</p>
@@ -706,16 +694,17 @@
 <p>这是数量级估算，忽略了权重张量的对齐 padding 与 latent MoE 结构的内部细节；用于判断"值得量化"，不作为精确部署数字。每权重的有效位宽 $= 4 + 8/32 = 4.25$ bit，相对 BF16 的 16 bit 理论压缩 $= 16 / 4.25 \approx 3.76\times$，与上面按总字节数算出的结果一致——这是一个交叉验证。</p>
 </details>
 
-<p>对照一下：非专家组件（attention 投影、共享专家、router、lm_head）参数量远小于专家参数总量（约 2.71T），而且每个 token 都要计算，既不是显存瓶颈，也不是量化首选。这为后文 S5 "只量化专家"的选择埋下伏笔。</p>
+<p>对照一下：非专家组件（attention 投影、共享专家、router、lm_head）参数量远小于专家参数总量（约 2.71T），而且每个 token 都要计算，既不是显存瓶颈，也不是量化首选。这为后文"选择性量化"一章埋下伏笔。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
   <li>给定 K3 的 routed_expert_hidden_size=3584、intermediate=3072、num_experts=896（每层）、num_hidden_layers=93、first_k_dense_replace=1，估算路由专家的总参数量与 BF16/MXFP4 下的显存。</li>
-  <li>为什么"稀疏激活"能省计算却不能省显存？</li>
-  <li>省下的显存量级是 GB 还是 TB？</li>
+  <li>为什么"稀疏激活"能省计算却不能省显存。</li>
+  <li>省下的显存量级是 GB 还是 TB。</li>
 </ul>
+<p>本章算清了专家权重的显存量级。但这些权重要怎么编码成 4-bit 才可用——下一章讲 MXFP4 的编码格式。</p>
 
-<h2 id="s2-mxfp4-encoding">MXFP4 是怎么编码一个权重的</h2>
+<h2 id="s2-mxfp4-encoding">MXFP4 编码——一个权重值怎么用 4-bit 表示</h2>
 
 <p>先看为什么"每个值独立 4-bit"不够用。一个 4-bit 数最多有 16 个离散级。若每个权重独立用 4-bit，又要同时覆盖从 $0.001$ 到 $10$ 的范围，那相对精度会极差——大值和小值共用同一组离散级，小值几乎无法分辨。</p>
 
@@ -747,7 +736,7 @@
 <p>下面用一个 4 元素的教学块（真实块大小是 32）手算。设块共享 scale 已确定为 $s_b = 0.25$（真实实现中由该块 32 个权重的最大幅度按 OCP 规范的 power-of-two 规则选定，本页不展开该选取算法）。</p>
 
 <details>
-<summary>完整手算：两个 4 元素块的量化、反量化与误差</summary>
+<summary>展开：两个 4 元素块的量化、反量化与误差</summary>
 <p>教学示例。设块共享 scale $s_b = 0.25$，块大小教学缩写为 4（真实为 32）。E2M1 正数可表示值为 $\{0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0\}$。</p>
 <p><strong>块 1</strong>（恰好都可表示）：原始权重 $[0.50,\ -0.25,\ 1.00,\ 0.75]$。归一化 $x_i / s_b = [2.0,\ -1.0,\ 4.0,\ 3.0]$，全部落在 E2M1 可表示值内，量化无损。存储：1 字节 scale + $4 \times 4$ bit = $1 + 2 = 3$ 字节（BF16 需 8 字节）。反量化：</p>
 <p>$$\hat{x}_i = 0.25 \times [2.0,\ -1.0,\ 4.0,\ 3.0] = [0.50,\ -0.25,\ 1.00,\ 0.75],$$</p>
@@ -770,13 +759,14 @@
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
   <li>给定 $s_b = 0.25$ 与一个 4 元素块 $[0.50,\ 0.30,\ 0.45,\ 0.20]$，写出归一化、E2M1 最近邻量化、反量化与误差。</li>
-  <li>用一句话说明：为什么"共享 scale + 窄元素"比"每个值独立 4-bit"表达力强？</li>
+  <li>用一句话说明：为什么"共享 scale + 窄元素"比"每个值独立 4-bit"表达力强。</li>
   <li>估算 MXFP4 每权重的有效位宽，以及相对 BF16 的理论压缩比。</li>
 </ul>
+<p>本章说明了 MXFP4 的编码与量化误差。但误差已定，模型怎么在训练中适应它——下一章讲 QAT 的前向伪量化与反向 STE。</p>
 
-<h2 id="s3-qat-mechanism">QAT 在前向和反向做了什么，与 PTQ 差在哪</h2>
+<h2 id="s3-qat-mechanism">QAT 机制——前向和反向做了什么，与 PTQ 差在哪</h2>
 
-<p>S2 块 2 已经显示：4-bit 离散级粗、最近邻舍入会把权重"四舍五入"到最近的 E2M1 值，于是反量化得到的 $\hat{w}$ 不等于原始权重 $w$。这就是量化误差。问题是：训练时用全精度 $w$、推理时才用 $\hat{w}$，模型从未见过这个偏差——质量会掉多少？</p>
+<p>上一章块 2 已经显示：4-bit 离散级粗、最近邻舍入会把权重"四舍五入"到最近的 E2M1 值，于是反量化得到的 $\hat{w}$ 不等于原始权重 $w$。这就是量化误差。问题是：训练时用全精度 $w$、推理时才用 $\hat{w}$，模型从未见过这个偏差——质量会掉多少？</p>
 
 <p><strong>训练后量化（PTQ）</strong>就是这种做法：训练全程用全精度 $w$ 算前向和损失，推理时才把 $w$ 量化成 $\hat{w}$ 使用。模型训练时从未见过 $\hat{w}$ 与 $w$ 的偏差，推理时这些偏差对模型来说是分布外的。</p>
 
@@ -793,7 +783,7 @@
 <p>下面手算单权重的一步。</p>
 
 <details>
-<summary>完整手算：单权重 QAT 一步（fake-quant 前向 + STE 反向）</summary>
+<summary>展开：单权重 QAT 一步（fake-quant 前向 + STE 反向）</summary>
 <p>教学示例。设单个权重 $w = 0.80$，所在块的共享 scale $s_b = 0.25$（教学给定；真实由块内最大幅度按 OCP 规则选）。</p>
 <p><strong>前向伪量化</strong>：</p>
 <ul>
@@ -811,7 +801,7 @@
 <p>下面的可运行代码实现了 E2M1 量化、块 1 与块 2、以及单权重的 QAT 一步，可直接运行验证上面的手算。</p>
 
 <details class="code-details">
-<summary>可运行代码：MXFP4 量化模拟与 QAT 一步（验证 S2/S3 的手算）</summary>
+<summary>代码：MXFP4 量化模拟与 QAT 一步</summary>
 <div class="code-block">
 <pre><code class="language-python"># 教学示例：MXFP4 的最小量化模拟（E2M1，块大小教学缩写为 4）
 E2M1_LEVELS = [0.0, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]  # 正数可表示值
@@ -875,7 +865,7 @@ w=0.8, 量化后 w_hat=0.75, 前向偏差=0.0500
 上游梯度 g=1.0, STE 传回 w 的梯度=1.0
 </code></pre>
 </div>
-<p><b>验证的机制</b>：<code>nearest_e2m1</code> 对应 F1 中的 $\mathrm{FP4}(q_i)$ 量化；<code>mxfp4_quantize</code> 对应反量化 $\hat{x}_i = s_b \cdot q_i$；<code>ste_grad</code> 对应 F2 的 $\partial\hat{w}/\partial w \equiv 1$。</p>
+<p><b>验证的机制</b>：<code>nearest_e2m1</code> 对应 <sup>[F1]</sup> 中的 $\mathrm{FP4}(q_i)$ 量化；<code>mxfp4_quantize</code> 对应反量化 $\hat{x}_i = s_b \cdot q_i$；<code>ste_grad</code> 对应 <sup>[F2]</sup> 的 $\partial\hat{w}/\partial w \equiv 1$。</p>
 <p><b>观察重点</b>：块 1 误差全零（值恰好可表示）；块 2 误差非零（粗离散级 + 舍入）；单权重 $w=0.80$ 量化后 $\hat{w}=0.75$、前向偏差 $0.05$；STE 把上游梯度 $1.0$ 原样传回 $w$。</p>
 <p><b>教学简化</b>：本代码用 Python 列表与 <code>min</code> 模拟 E2M1 最近邻，不涉及真实硬件的打包位布局与 scale 选取算法；块大小教学缩写为 4，真实 MXFP4 块为 32。它只验证量化与 STE 的算术，不模拟真实训练的批量张量与梯度反传。</p>
 </details>
@@ -890,17 +880,18 @@ w=0.8, 量化后 w_hat=0.75, 前向偏差=0.0500
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>fake-quant 前向为什么用 $\hat{w}$ 而不是 $w$ 算损失？</li>
-  <li>STE 为什么能让梯度穿过不可导的"最近邻舍入"步骤？</li>
+  <li>fake-quant 前向为什么用 $\hat{w}$ 而不是 $w$ 算损失。</li>
+  <li>STE 为什么能让梯度穿过不可导的"最近邻舍入"步骤。</li>
   <li>给定 $w = 0.80$、$s_b = 0.25$，写出 $\hat{w}$ 与 STE 传回 $\partial L/\partial w$ 的值。</li>
   <li>用一句话说出 PTQ 与 QAT 在"训练时是否模拟量化"上的关键差别。</li>
 </ul>
+<p>本章讲清了 QAT 的机制与 PTQ 的差别。但 K3 不只在 SFT 做 QAT，还要贯穿 RL——下一章讲 RL 中 rollout 与训练的量化一致性。</p>
 
-<h2 id="s4-rl-consistency">K3 怎么把 QAT 贯穿 SFT 和 RL，且不产生 train-inference mismatch</h2>
+<h2 id="s4-rl-consistency">RL 一致性——QAT 怎么贯穿 SFT 和 RL 且不产生 mismatch</h2>
 
 <p>先给一个最小的 RL 框架（不展开 RL 算法本身）。RL 中模型一边自己生成数据（rollout，即推理），一边据此更新参数（训练）。rollout 的输出经过奖励塑形成为训练 target——也就是"模型在学自己产出的东西"。这个"自产自销"的结构是后面 mismatch 问题的根源。</p>
 
-<p>SFT 阶段做 QAT 的理由直接来自 S3：监督微调时模型就在 MXFP4 量化下训练，权重朝"量化后仍能减小 SFT 损失"的方向调整。模型在监督信号下就适应了量化精度损失。</p>
+<p>SFT 阶段做 QAT 的理由直接来自上一章：监督微调时模型就在 MXFP4 量化下训练，权重朝"量化后仍能减小 SFT 损失"的方向调整。模型在监督信号下就适应了量化精度损失。</p>
 
 <p>RL 阶段多一层要求。RL 的训练 target 来自 rollout 的输出，而 rollout 本身就是一次推理——也就是说，rollout 用的量化方案决定了 target 来自哪个分布。若 rollout（推理）用量化方案 A、训练用量化方案 B，则：</p>
 
@@ -934,16 +925,17 @@ w=0.8, 量化后 w_hat=0.75, 前向偏差=0.0500
 
 <p>这里也带出 draft model 的一致性问题。K3 用 EAGLE-3 风格的 draft model 做投机解码加速（draft 的具体结构不是本页主题，不展开）。K3 让 draft model 沿用与 target model 相同的 QAT 配置——MoE 专家权重 MXFP4、激活 MXFP8、非专家保持高精度。这样 target 与 draft 的量化行为一致，避免投机解码里 draft 与 target 的数值路径分裂。</p>
 
-<p>再点破一个误解：<strong>"QAT 让模型恢复量化精度"是错的</strong>（S3 已说过，这里再强调一遍在 RL 语境下的含义）：QAT 不是让 RL 拿回量化前的精度，而是让 rollout 与训练在同一个量化分布上对齐——对齐的是"分布"，不是"精度"。</p>
+<p>再点破一个误解：<strong>"QAT 让模型恢复量化精度"是错的</strong>（上一章已说过，这里再强调一遍在 RL 语境下的含义）：QAT 不是让 RL 拿回量化前的精度，而是让 rollout 与训练在同一个量化分布上对齐——对齐的是"分布"，不是"精度"。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>为什么 RL 中 rollout 与训练量化方案不一致会产生 train-inference mismatch？</li>
+  <li>为什么 RL 中 rollout 与训练量化方案不一致会产生 train-inference mismatch。</li>
   <li>说出 K3 消除该 mismatch 的具体做法。</li>
-  <li>为什么 SFT 阶段也要做 QAT，而不只是 RL 做？（提示：SFT 不做的话，RL 起点就已经在"训练未模拟量化"的分布上。）</li>
+  <li>为什么 SFT 阶段也要做 QAT，而不只是 RL 做。（提示：SFT 不做的话，RL 起点就已经在"训练未模拟量化"的分布上。）</li>
 </ul>
+<p>本章解决了 RL 中的 train-inference mismatch。但 K3 不是把所有组件都量化——下一章讲选择性量化的组件划分。</p>
 
-<h2 id="s5-selective-quant">K3 量化了哪些组件、不量化哪些，为什么</h2>
+<h2 id="s5-selective-quant">选择性量化——K3 量化了哪些组件、不量化哪些</h2>
 
 <p>把前面几章的结论汇总成一张选择表。K3 不是把整个模型都压到 4-bit，而是<strong>选择性量化</strong>。表中"latent MoE 投影"指 MoE 层中除路由专家 per-expert 权重外的公共投影部分（如 MoE 层输入/输出的公共线性变换），与路由专家的 per-expert 权重相对——它在每个 token 上都参与计算，属于"公共路径"而非"稀疏激活的专家"。</p>
 
@@ -966,7 +958,7 @@ w=0.8, 量化后 w_hat=0.75, 前向偏差=0.0500
 <p>这张表的依据不只是 K3 报告的文字描述，还能在官方 config.json 里直接核对。K3 的 <code>quantization_config</code> 字段记录了量化格式与不量化的模块列表。</p>
 
 <details>
-<summary>config.json 的 quantization_config 字段（节选）</summary>
+<summary>补充：config.json 的 quantization_config 字段（节选）</summary>
 <p>来源：HuggingFace <code>moonshotai/Kimi-K3</code> 仓库 <code>config.json</code>，<code>text_config.quantization_config</code> 字段。</p>
 <pre><code class="language-json">"quantization_config": {
   "config_groups": {
@@ -1011,14 +1003,15 @@ w=0.8, 量化后 w_hat=0.75, 前向偏差=0.0500
 <ul>
   <li>列出 K3 量化与非量化的组件各有哪些。</li>
   <li>用一句话解释"为什么量化专家、不量化 attention"的工程理由。</li>
-  <li>从 config.json 的哪个字段可以读出"非专家保持高精度"这个结论？</li>
+  <li>从 config.json 的哪个字段可以读出"非专家保持高精度"这个结论。</li>
 </ul>
+<p>回顾全文：MoE 专家权重占参数绝大部分，是量化首选；MXFP4 用共享 scale + 4-bit 浮点元素实现 3.76× 压缩；QAT 在前向模拟量化、反向用 STE 传梯度，让模型适应精度损失；RL 中 rollout 与训练共享同一量化方案消除 mismatch；非专家组件保持高精度以保稳定性。这五点共同回答了开篇的问题——模型被压到 4-bit 后，怎么仍像训练时那样准。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
 <h3>核心论断与来源</h3>
 <ul>
-<li>C1（K3 把 MoE 专家权重量化到 MXFP4、激活 MXFP8、QAT 贯穿 SFT+RL）：Kimi K3 技术报告 §4.1.4 "Deployment-Aware Post-Training"，原文约行 922–928。</li>
+<li>C1（K3 把 MoE 专家权重量化到 MXFP4、激活 MXFP8、QAT 贯穿 SFT+RL）：Kimi K3 技术报告 §4.1.4 "Deployment-Aware Post-Training"，原文约行 928–932。</li>
 <li>C2（RL 中 rollout 与训练共享同一量化方案、消除 train-inference mismatch）：K3 报告 §4.1.4，原文 "During RL, rollout and training share the same quantization scheme — eliminating the train–inference mismatch."</li>
 <li>C3（非专家组件保持高精度）：K3 报告 §4.1.4，原文 "all non-expert components (attention projections, latent MoE projections, shared experts, and MoE routers) remain in higher precision."</li>
 <li>C4（draft model 沿用同一 QAT 配置）：K3 报告 §4.1.4，原文 "Draft fine-tuning follows the post-training QAT configuration (§ 4.1.4), with MoE expert weights in MXFP4 and their input activations in MXFP8..."</li>
@@ -1050,18 +1043,18 @@ w=0.8, 量化后 w_hat=0.75, 前向偏差=0.0500
 
 <h3>教学解释与类比边界</h3>
 <ul>
-<li>"STE 是透明的窗户"（S3 callout）：只帮助理解 STE 公式里 $\partial\hat{w}/\partial w \equiv 1$ 这一项的来历。失效边界：不保证收敛到量化前最优、不处理梯度 magnitude 失真。正式判断以 STE 约束和损失函数条件为准。</li>
-<li>"共享 scale 承担动态范围、元素承担块内相对精度"（S2）：教学解释，帮助理解"4-bit 为何仍可用"。失效边界：该分工只在块内值幅度相近时有效；若块内同时存在极大与极小值，小值会被大值主导的 scale 挤掉精度——这是 MXFP4 的已知局限，本页不展开。</li>
-<li>RL 最小框架（S4，"rollout 产出训练 target"）：教学框架，只支撑 mismatch 论证，不展开 RL 算法（PPO 目标、优势函数、KL 散度等）。</li>
+<li>"STE 是透明的窗户"（QAT 机制一章）：只帮助理解 STE 公式里 $\partial\hat{w}/\partial w \equiv 1$ 这一项的来历。失效边界：不保证收敛到量化前最优、不处理梯度 magnitude 失真。正式判断以 STE 约束和损失函数条件为准。</li>
+<li>"共享 scale 承担动态范围、元素承担块内相对精度"（MXFP4 编码一章）：教学解释，帮助理解"4-bit 为何仍可用"。失效边界：该分工只在块内值幅度相近时有效；若块内同时存在极大与极小值，小值会被大值主导的 scale 挤掉精度——这是 MXFP4 的已知局限，本页不展开。</li>
+<li>RL 最小框架（RL 一致性一章，"rollout 产出训练 target"）：教学框架，只支撑 mismatch 论证，不展开 RL 算法（PPO 目标、优势函数、KL 散度等）。</li>
 </ul>
 
 <h3>教学简化及其限制</h3>
 <ul>
-<li>块大小教学缩写为 4（真实为 32）：便于手算，不改变机制。可推出结论：量化与反量化算术、误差来源。不可推出：真实 32 元素块的统计特性、scale 选取的边界情况。</li>
-<li>scale $s_b$ 教学给定而非推导：本页用"按块内最大幅度选 power-of-two 使归一化值落入 E2M1 表示范围"这一表述，不展开 OCP 规范的精确 floor/ceil 选取算法（避免引入未核对细节）。可推出：反量化算术。不可推出：scale 选取的边界情况与硬件实现。</li>
-<li>可运行代码用 Python 列表与 <code>min</code> 模拟 E2M1 最近邻：不涉及真实硬件的打包位布局、不模拟批量张量与梯度反传。可验证：量化/反量化/STE 的算术与手算一致。不可推出：真实训练的数值稳定性与性能。</li>
-<li>N3 估算忽略对齐 padding 与 latent MoE 内部结构：用于判断"值得量化"的数量级，不作为精确部署数字。</li>
-<li>本文不展开 NVFP4（块 16、FP8 scale）与 MXFP4 的精度对比、不展开 OAS/MBS 等 MXFP 精度增强方法——属格式族细化，不影响"K3 用 MXFP4 + QAT"的主线。</li>
+<li>块大小教学缩写为 4（真实为 32），便于手算，不改变机制。可推出：量化与反量化算术、误差来源。不可推出：真实 32 元素块的统计特性、scale 选取的边界情况。</li>
+<li>scale $s_b$ 教学给定而非推导，本页用"按块内最大幅度选 power-of-two 使归一化值落入 E2M1 表示范围"这一表述，不展开 OCP 规范的精确选取算法。可推出：反量化算术。不可推出：scale 选取的边界情况与硬件实现。</li>
+<li>可运行代码用 Python 列表与 <code>min</code> 模拟 E2M1 最近邻，不涉及真实硬件的打包位布局、不模拟批量张量与梯度反传。可推出：量化/反量化/STE 的算术与手算一致。不可推出：真实训练的数值稳定性与性能。</li>
+<li>N3 估算忽略对齐 padding 与 latent MoE 内部结构，用于判断"值得量化"的数量级。可推出：显存压缩的量级与量化收益判断。不可推出：精确部署数字。</li>
+<li>本文不展开 NVFP4（块 16、FP8 scale）与 MXFP4 的精度对比、不展开 OAS/MBS 等 MXFP 精度增强方法，属格式族细化。可推出：K3 用 MXFP4 + QAT 的主线结论。不可推出：不同微缩浮点格式的精度对比。</li>
 </ul>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
