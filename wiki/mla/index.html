@@ -901,6 +901,7 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 
 <div class="callout callout-purple">
 <p><b>K3 NoPE 对 cache 的影响</b>。K3 §2.1.2 说"对所有 MLA 层用 NoPE，不施加位置编码于 query 和 key"。官方源码（<code>modeling_kimi_linear.py</code>）确认了实际行为：<code>self.rotary_emb = None</code>——不施加 RoPE 旋转，但 RoPE 分支的投影结构（$W^{KR}$、$W^{QR}$）仍无条件保留，$\mathbf{k}_t^R$ 仍被创建、拼进 key 并缓存（<code>forward</code> 中无 <code>if self.use_nope</code> 分支跳过它）。因此 K3 MLA cache 仍按 $(d_c + d_h^R) = 576$ 计算，与 DeepSeek-V2 一致——NoPE 只是不旋转，不删除 RoPE 分支。<sup>[N6]</sup></p>
+<p><b>为什么不旋转还保留 $\mathbf{k}_t^R$ 分支？</b>不旋转时 $\mathbf{k}_t^R = W^{KR} \mathbf{h}_t$ 不携带位置信息，退化为一个从 $\mathbf{h}_t$ 直接投影的内容匹配分支（不经 $d_c$ 维压缩）。社区深度分析（besthub.dev）指出保留这 64 维分支的原因是"compatibility with existing MLA infrastructure and avoid extra projection, without sacrificing performance"——删掉它会改变 <code>kv_a_proj_with_mqa</code> 输出维度，需要重写所有 MLA kernel（vLLM、DeepEP 等推理引擎的 MLA 实现都假设 key 有 <code>[k_nope | k_pe]</code> 结构）。Moonshot 团队确认 K3 加回 RoPE 后效果无明显变化，遵循最简洁原则移除旋转，但分支结构保留以兼容基础设施<sup>[N7]</sup>。K3 能用 NoPE 的前提是 KDA 层通过 DeltaNet 衰减机制提供了隐式位置编码，MLA 层不需要额外的位置信号。</p>
 </div>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
@@ -1003,6 +1004,7 @@ MLA:   h_t ──► c_t^KV=W^DKV h_t ──► cache {c_t^KV}
 - <b>N4</b>：K3 <code>config.json</code>（<code>q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128, mla_use_output_gate=true, mla_use_nope=true, num_attention_heads=96, hidden_size=7168, num_hidden_layers=93</code>）。<br>
 - <b>N5</b>：K3 MLA 层位 <code>linear_attn_config.full_attn_layers</code>，共 24 层。<br>
 - <b>N6</b>：K3 NoPE 对 cache 的影响——官方源码 <code>modeling_kimi_linear.py</code> 确认：<code>self.rotary_emb = None</code>（不旋转），但 RoPE 分支（$\mathbf{k}_t^R$）仍无条件创建并缓存（<code>forward</code> 中无 <code>if self.use_nope</code> 跳过分支）。故 cache 仍按 $(d_c + d_h^R) = 576$ 计算。<code>assert self.use_nope</code> 表明当前实现只支持 NoPE=true。
+- <b>N7</b>：保留 $\mathbf{k}_t^R$ 分支的原因——社区深度分析 besthub.dev "Inside K3" 文章指出"extra 64-dim concatenation kept to preserve compatibility with existing MLA infrastructure and avoid extra projection, without sacrificing performance"；Moonshot 团队确认加回 RoPE 效果无明显变化（tahou.com 报道）。vLLM 的 K3 MLA 实现（<code>vllm.models.kimi_k3</code>）同样保留 <code>qk_rope_head_dim</code> 且 <code>rotary_emb=None</code>，fused kernel 文档称不传 positions 即"NoPE fast path"。
 </p>
 
 <h3>教学示例</h3>
