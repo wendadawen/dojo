@@ -4,11 +4,11 @@
 
 ## 1. 输入与写作边界
 
-输入为 `research/` 下的 scope.md、evidence.md、outline.md、glossary.md，外壳 `.dojo/templates/concept/index.html` 和组件库 `.dojo/templates/concept/components.html`，正文写法参考 `guides/concept/content-examples.md`。输入缺失或规划完成条件未满足时，不得开始写作。不得参考 `wiki/` 下已有页面的写作风格。
+输入为 `research/` 下的 scope.md、evidence.md、outline.md、glossary.md，外壳 `.dojo/templates/concept/index.html` 和组件库 `.dojo/templates/concept/components.html`，正文写法参考 `guides/concept/content-examples.md`，格式规范遵循 `guides/concept/style-guide.md`。输入缺失或规划完成条件未满足时，不得开始写作。不得参考 `wiki/` 下已有页面的写作风格。
 
-必须按 outline.md 落实：页面开头、章节标题和顺序、每章教学任务、前置知识引用位置、贯穿例子的推进、讲解材料及职责、正文与折叠块分工、误解和边界的处理位置。
+必须按 outline.md 落实：页面开头、章节标题和顺序、每章教学任务、前置知识引用位置、教学示例的推进、讲解材料及职责、正文与折叠块分工、误解和边界的处理位置。
 
-不得自行增删或重排核心章节、增加新的学习目标、更换贯穿例子、改变前置知识映射、把正文必要内容移入折叠块、使用证据不足或无法消歧的论断。
+不得自行增删或重排核心章节、增加新的学习目标、更换教学示例、改变前置知识映射、把正文必要内容移入折叠块、使用证据不足或无法消歧的论断。
 
 写作中发现缺口时停止相关部分写作：缺核心事实或证据返回规划阶段；大纲无法成立返回规划阶段；仅需补充不改变大纲的连接句、符号说明或局部计算时在本阶段补充。不得用范围外的新内容填补缺口。
 
