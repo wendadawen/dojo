@@ -653,8 +653,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Shazeer 2019, "Fast Transformer Decoding: One Write-Head is All You Need", arXiv:1911.02150, §2.4.1 性能分析、§3 多查询注意力定义；Ainslie 2023, "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints", EMNLP 2023, arXiv:2305.13245, §2 分组查询注意力、§2.1/§3.1 uptraining、Table 1 实验、Figure 6 折中点选择。</p>
+<p><b>主要依据</b>：Shazeer 2019, "Fast Transformer Decoding: One Write-Head is All You Need", arXiv:1911.02150, §3 多查询注意力定义、§3.1 性能分析与"减 h 倍"结论；Ainslie 2023, "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints", EMNLP 2023, arXiv:2305.13245, §2 分组查询注意力、§2.1 uptraining 转换方法、Table 1 实验、Figure 6 折中点选择。</p>
 </blockquote>
+
+<p>自回归推理每生成一个 token，都要从 HBM 把整个 KV cache 搬一遍——$h=128$ 头、$n=4096$ 长、$l=80$ 层的真实模型，单条请求的 KV cache 约 21.5 GB（fp16）。搬运量随头数 $h$ 与序列长度 $n$ 线性增长，GPU 在等数据而非算。MQA（Shazeer 2019）让所有 query 头共享一组 K/V 把 cache 减到 1/h，GQA（Ainslie 2023）在 MHA 与 MQA 之间插值、选定 $G=8$ 作折中点——两者都走"共享头"这条路压缩 cache。本文是 MLA（低秩压缩）的前置，不展开 MLA 压缩公式、Flash Attention 的 IO 实现与 Linear Attention 的核分解。本文回答：共享头如何压缩 cache、代价是什么、与走低秩压缩的 MLA 有何根本区别。</p>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
@@ -677,16 +679,6 @@
   </ul>
 </section>
 
-<div class="context-box">
-  <p class="context-box-title">阅读上下文</p>
-  <div class="context-grid">
-    <div class="context-label">是什么</div><div class="context-value">MQA 让所有 query 头共享一组 K/V，GQA 把 query 头分 G 组、每组共享一组 K/V；两者都通过减少 K/V 头数压缩自回归推理的 KV cache</div>
-    <div class="context-label">为什么需要</div><div class="context-value">自回归推理时每步都要把整个 KV cache 从 HBM 加载一遍，cache 随头数 h 与序列长度 n 线性增长，成为内存带宽与显存瓶颈</div>
-    <div class="context-label">本文是哪些概念的前置</div><div class="context-value">MLA（Multi-head Latent Attention）——MLA 走低秩压缩而非共享头，理解本页才能理解 MLA 在压缩什么、为什么另起一条路</div>
-    <div class="context-label">不展开</div><div class="context-value">MLA 的压缩公式与矩阵吸收、Flash Attention 的 IO 实现、Linear Attention 的核分解、训练 kernel 适配</div>
-  </div>
-</div>
-
 <h2 id="why-mha-bandwidth-bound">为什么 MHA 推理受内存带宽限制——KV cache 如何随头数与序列长度增长</h2>
 
 <p>训练 Transformer 时，整个序列并行送入模型，所有位置的 K/V 一次性算出，GPU 的并行算力得到充分利用。但自回归推理（生成式解码）完全不同：生成第 1 个 token 时只知道输入 prompt；生成第 2 个 token 时才知道第 1 个 token；每生成一个新 token，都要重新对"之前所有 token"做一次注意力。</p>
@@ -704,9 +696,9 @@ Token1 Token2 Token3 Token4    生成t=1 → 生成t=2 → 生成t=3 → 生成t
 
 <p>KV cache 的来源是标准多头注意力（MHA）的投影机制——本文不重复推导，详见概念页 <a href="../standard-attention/index.html">标准 Transformer 注意力</a>。MHA 下每个 token 在每层要为每个头存一份 K（$d_k$ 维）和一份 V（$d_k$ 维），所以：</p>
 
-<p>$$\text{KV cache}_{\text{MHA}} = 2\,h\,d_k\quad\text{（每 token 每 layer 的元素数）}\qquad\text{F1}$$</p>
+<p>$$\text{KV cache}_{\text{MHA}} = 2\,h\,d_k\quad\text{（每 token 每 layer 的元素数）}$$<sup>[F1]</sup></p>
 
-<p>说明：Shazeer 2019 §2.2 区分 key 维度 $d_k$ 与 value 维度 $d_v$，但实践沿用 Vaswani 2017 设定 $d_v = d_k$，故本页 cache 公式统一记 $d_k$（K、V 各一份，每份 $d_k$ 元素）。</p>
+<p>说明：Shazeer 2019 区分 key 维度 $d_k$ 与 value 维度 $d_v$，但实践沿用 Vaswani 2017 设定 $d_v = d_k$，故本页 cache 公式统一记 $d_k$（K、V 各一份，每份 $d_k$ 元素）。</p>
 
 <p>$n$ 个 token、$l$ 层时总元素数为 $2 h d_k n l$。逐项含义：</p>
 
@@ -723,7 +715,7 @@ Token1 Token2 Token3 Token4    生成t=1 → 生成t=2 → 生成t=3 → 生成t
 </table>
 </div>
 
-<p>下面用贯穿本页的教学数字把它落到可手算的程度。</p>
+<p>下面用一个教学示例把它落到可手算的程度。</p>
 
 <div class="callout callout-yellow">
 <p><strong>教学示例</strong>。 设 $h=4$（4 个注意力头）、$d_k=64$（每头 64 维）、$l=1$（1 层）、$n=10$（10 个 token）。数字为便于手算构造，不代表真实模型规模。</p>
@@ -732,34 +724,33 @@ Token1 Token2 Token3 Token4    生成t=1 → 生成t=2 → 生成t=3 → 生成t
 <p>10 个 token 1 层共 $512\times 10 = 5120$ 元素。用 fp16（每元素 2 字节）存储为 $5120\times 2 = 10240$ 字节 $\approx 10$ KB。这个量级在小配置下无足轻重——但推广到真实规模（$h=128,d_k=128,l=80,n=4096$）时 MHA cache 约 21.5 GB（fp16，$2\times128\times128\times4096\times80\times2\approx 2.15\times10^{10}$ 字节），单条请求就占满可观显存。</p>
 </div>
 
-<p>Shazeer 2019 §2.4.1 的性能分析指出，incremental MHA 每步解码的"内存访问量 / 算术运算量"比值随：</p>
+<p>Shazeer 2019 §3.1 的性能分析指出，incremental MHA 每步解码的"内存访问量 / 算术运算量"比值随：</p>
 
-<p>$$\Theta\!\left(\frac{n}{d} + \frac{1}{b}\right)\qquad\text{F5, Shazeer 2019 §2.4.1}$$</p>
+<p>$$\Theta\!\left(\frac{n}{d} + \frac{1}{b}\right)$$<sup>[F5]</sup></p>
 
-<p>增长，其中 $n$ 是当前序列长度、$d$ 是模型维度、$b$ 是 batch size。当 $n$ 接近 $d$ 或 batch $b$ 小时，这个比值接近 1——意味着每做一次运算就要搬一字节数据，GPU 在等内存而非算。现代 GPU 的算力增长（V100→A100→H100，FP32 从 15.7→19.5→67 TFLOPS）远快于内存带宽增长（900→2039→3352 GB/s），这个剪刀差让带宽瓶颈随硬件演进越来越严重。</p>
+<p>增长，其中 $n$ 是当前序列长度、$d$ 是模型维度、$b$ 是 batch size。当 $n$ 接近 $d$ 或 batch $b$ 小时，这个比值接近 1——意味着每做一次运算就要搬一字节数据，GPU 在等内存而非算。现代 GPU 的算力增长（V100→A100→H100，FP32 从 15.7→19.5→67 TFLOPS）远快于内存带宽增长（900→2039→3352 GB/s），这个剪刀差让带宽瓶颈随硬件演进越来越严重。<sup>[N6]</sup></p>
 
 <details>
 <summary>补充：roofline 模型与"算术强度"的含义</summary>
 <p>算术强度（arithmetic intensity）指每字节数据对应的浮点运算次数（FLOP/byte）。GPU 的峰值算力与内存带宽之比给出一个"脊点"——算术强度低于脊点时程序受带宽限制（GPU 在等数据），高于脊点时受算力限制（GPU 在满载计算）。自回归解码每步加载整个 KV cache 却只做一次注意力，算术强度极低，落在带宽受限区。增大 batch $b$ 可摊薄固定开销（对应 $1/b$ 项减小），但当 $n/d$ 主导时只能靠减少 cache 本身——这正是 MQA/GQA 的切入点。</p>
 </details>
 
-<p>本章的结论：自回归推理时 MHA 的瓶颈是 <strong>内存带宽</strong>（每步加载 KV cache）而非 <strong>算力</strong>，而 KV cache 随头数 $h$ 与序列长度 $n$ 线性增长。<strong>减少 $h$ 这个系数</strong>就能等比例减少每步搬运的数据量——这是 MQA 与 GQA 的共同切入点。</p>
+<p>本章的结论：自回归推理时 MHA 的瓶颈是 <strong>内存带宽</strong>（每步加载 KV cache）而非 <strong>算力</strong>，而 KV cache 随头数 $h$ 与序列长度 $n$ 线性增长。<strong>减少 $h$ 这个系数</strong>就能等比例减少每步搬运的数据量——这是 MQA 与 GQA 的共同切入点。<sup>[C1]</sup></p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 MHA 每 token 每 layer 的 KV cache 公式（$2 h d_k$）并说出每项含义</li>
-  <li>说出自回归推理的瓶颈在内存带宽而非算力（GPU 在等数据）</li>
-  <li>算出 $h=4,d_k=64,l=1,n=10$ 下 MHA 的 cache 元素数（每 token 512，10 token 5120）</li>
-  <li>说出性能比值 $\Theta(n/d + 1/b)$ 中 $n/d$ 项的系数是 $h$（这决定了减 $h$ 能等比例减该项）</li>
+  <li>写出 MHA 每 token 每 layer 的 KV cache 公式（$2 h d_k$）并说出每项含义。</li>
+  <li>说出自回归推理的瓶颈在内存带宽而非算力，并算出 $h=4,d_k=64,l=1,n=10$ 下 MHA 的 cache 元素数（每 token 512，10 token 5120）。</li>
+  <li>说出性能比值 $\Theta(n/d + 1/b)$ 中 $n/d$ 项的系数是 $h$，这决定了减 $h$ 能等比例减该项。</li>
 </ul>
 
 <p>瓶颈定位在"每头一份 K 和 V 的全量加载"。那能不能少存几份？下一章看 MQA 的极端做法——所有头共享一份。</p>
 
 <h2 id="mqa-shared-kv">MQA——所有 query 头共享一组 K/V，cache 减到 1/h</h2>
 
-<p>Shazeer 2019 §3 提出 Multi-Query Attention（MQA），核心改动一句话：<em>"the different heads share a single set of keys and values"</em>（所有不同的头共享同一组 K 和 V）。query 头仍然保持多头（$h$ 个），但 K/V 投影去掉头维度，全模型只有一组 K 和一组 V。</p>
+<p>Shazeer 2019 §3 提出 Multi-Query Attention（MQA），核心改动一句话：<em>"the different heads share a single set of keys and values"</em>（所有不同的头共享同一组 K 和 V）。query 头仍然保持多头（$h$ 个），但 K/V 投影去掉头维度，全模型只有一组 K 和一组 V。<sup>[C3]</sup></p>
 
-<p>回顾 MHA 的投影张量形状（Shazeer 2019 §2.2 的 einsum 记法）：$P^Q\in\mathbb{R}^{h\times d\times d_k}$、$P^K\in\mathbb{R}^{h\times d\times d_k}$、$P^V\in\mathbb{R}^{h\times d\times d_v}$、$P^O\in\mathbb{R}^{h\times d\times d_v}$——四个投影都有头维度 $h$。MQA 把 $P^K$、$P^V$ 的头维度去掉：</p>
+<p>回顾 MHA 的投影张量形状（Shazeer 2019 的 einsum 记法）：$P^Q\in\mathbb{R}^{h\times d\times d_k}$、$P^K\in\mathbb{R}^{h\times d\times d_k}$、$P^V\in\mathbb{R}^{h\times d\times d_v}$、$P^O\in\mathbb{R}^{h\times d\times d_v}$——四个投影都有头维度 $h$。MQA 把 $P^K$、$P^V$ 的头维度去掉：</p>
 
 <div class="table-scroll">
 <table>
@@ -785,17 +776,17 @@ Q₄ ──► attn₄ ◄── K₄,V₄          Q₄ ──► attn₄ ┘
 
 <p>因为全模型只有一组 K 和一组 V，每 token 每 layer 的 KV cache 从 $2 h d_k$ 降到 $2 d_k$：</p>
 
-<p>$$\text{KV cache}_{\text{MQA}} = 2\,d_k\quad\text{（每 token 每 layer）}\qquad\text{F2, Shazeer 2019 §3}$$</p>
+<p>$$\text{KV cache}_{\text{MQA}} = 2\,d_k\quad\text{（每 token 每 layer）}$$<sup>[F2]</sup></p>
 
-<p>减少倍数正好是 $h$。Shazeer 2019 §3.1 末段直接给出分析结论：<em>"We have reduced the offensive n/d by a factor of h"</em>——把性能比值 $\Theta(n/d + 1/b)$ 里的 $n/d$ 项系数减为 $1/h$。</p>
+<p>减少倍数正好是 $h$。Shazeer 2019 §3.1 直接给出分析结论：<em>"We have reduced the offensive n/d by a factor of h"</em>——把性能比值 $\Theta(n/d + 1/b)$ 里的 $n/d$ 项系数减为 $1/h$。<sup>[C2, C4]</sup></p>
 
 <div class="callout callout-yellow">
-<p><strong>教学示例（续）</strong>。 复用 S1 的 $h=4,d_k=64,l=1,n=10$。MQA 每 token 每 layer 的 cache：</p>
+<p><strong>教学示例（续）</strong>。 沿用上面的 $h=4,d_k=64,l=1,n=10$。MQA 每 token 每 layer 的 cache：</p>
 <p>$$2\times d_k = 2\times 64 = 128\text{ 元素/token}.$$</p>
-<p>10 个 token 1 层共 $128\times 10 = 1280$ 元素，fp16 为 $2560$ 字节 $\approx 2.5$ KB。与 S1 的 MHA（5120 元素、10 KB）对照，减少 4 倍——正好是头数 $h=4$。</p>
+<p>10 个 token 1 层共 $128\times 10 = 1280$ 元素，fp16 为 $2560$ 字节 $\approx 2.5$ KB。与前面 MHA 的手算（5120 元素、10 KB）对照，减少 4 倍——正好是头数 $h=4$。</p>
 </div>
 
-<p><strong>代价</strong>。Shazeer 2019 abstract 报告 MQA <em>"incur only minor quality degradation from the baseline"</em>——质量轻微下降。Ainslie 2023 进一步在 §1 与 Appendix A 指出：MQA 在大模型与长输入任务上 <em>"can lead to quality degradation"</em>，且 <em>"can lead to training instability during fine-tuning"</em>——训练不稳定。质量代价的来源在概念上可理解：MHA 的设计目标是让不同头关注不同子空间（Vaswani 2017 §3.2.2），共享 K/V 把所有头的"键空间"与"值空间"压成一份，query 头虽然仍能学不同的"提问方式"，但能检索的内容被压缩到一个子空间。</p>
+<p><strong>代价</strong>。Shazeer 2019 abstract 报告 MQA <em>"incur only minor quality degradation from the baseline"</em>——质量轻微下降。Ainslie 2023 进一步在 §1 与 Appendix A 指出：MQA 在大模型与长输入任务上 <em>"can lead to quality degradation"</em>，且 <em>"can lead to training instability during fine-tuning"</em>——训练不稳定。质量代价的来源在概念上可理解：MHA 的设计目标是让不同头关注不同子空间（Vaswani 2017 §3.2.2），共享 K/V 把所有头的"键空间"与"值空间"压成一份，query 头虽然仍能学不同的"提问方式"，但能检索的内容被压缩到一个子空间。<sup>[C5]</sup></p>
 
 <details>
 <summary>补充：MQA 在工程实现上的"广播"问题</summary>
@@ -804,10 +795,9 @@ Q₄ ──► attn₄ ◄── K₄,V₄          Q₄ ──► attn₄ ┘
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 MQA 的 $P^K$ 形状（$\mathbb{R}^{d\times d_k}$，无头维度）并对比 MHA（$\mathbb{R}^{h\times d\times d_k}$）</li>
-  <li>算出 $h=4,d_k=64$ 下 MQA 每 token 的 cache（128 元素），并说出减少倍数（4 倍 = $h$）</li>
-  <li>说出 MQA 的代价（质量轻微下降、大模型训练不稳定）</li>
-  <li>说出 Shazeer 2019 §3.1 的分析结论（$n/d$ 项系数减为 $1/h$）</li>
+  <li>写出 MQA 的 $P^K$ 形状（$\mathbb{R}^{d\times d_k}$，无头维度）并对比 MHA（$\mathbb{R}^{h\times d\times d_k}$）。</li>
+  <li>算出 $h=4,d_k=64$ 下 MQA 每 token 的 cache（128 元素），并说出减少倍数（4 倍 = $h$）。</li>
+  <li>说出 MQA 的代价（质量轻微下降、大模型训练不稳定）与 Shazeer 2019 §3.1 的分析结论（$n/d$ 项系数减为 $1/h$）。</li>
 </ul>
 
 <p>MQA 减得太狠——直接砍到 1 组，质量有代价。能不能少减一点、找个中间点？下一章看 GQA 如何插值。</p>
@@ -818,7 +808,7 @@ Q₄ ──► attn₄ ◄── K₄,V₄          Q₄ ──► attn₄ ┘
 
 <p>关键性质：<strong>$G=h$ 等价于 MHA，$G=1$ 等价于 MQA</strong>。GQA 是 MHA 与 MQA 的插值，$G$ 是谱上的旋钮。</p>
 
-<p>$$\text{KV cache}_{\text{GQA}} = 2\,G\,d_k\quad\text{（每 token 每 layer）}\qquad\text{F3, Ainslie 2023 §2}$$</p>
+<p>$$\text{KV cache}_{\text{GQA}} = 2\,G\,d_k\quad\text{（每 token 每 layer）}$$<sup>[F3, C6]</sup></p>
 
 <pre class="diagram">MHA（G=h=4）        GQA-2（G=2）           MQA（G=1）
 
@@ -832,12 +822,12 @@ cache: 2·4·d_k      cache: 2·2·d_k        cache: 2·1·d_k
 </pre>
 
 <div class="callout callout-yellow">
-<p><strong>教学示例（续）</strong>。 复用 $h=4,d_k=64,l=1,n=10$，取 $G=2$（GQA-2）。每 token 每 layer 的 cache：</p>
+<p><strong>教学示例（续）</strong>。 沿用上面的 $h=4,d_k=64,l=1,n=10$，取 $G=2$（GQA-2）。每 token 每 layer 的 cache：</p>
 <p>$$2\times G\times d_k = 2\times 2\times 64 = 256\text{ 元素/token}.$$</p>
 <p>10 个 token 1 层共 $256\times 10 = 2560$ 元素，fp16 为 $5120$ 字节 $\approx 5$ KB。介于 MHA（5120 元素、10 KB）与 MQA（1280 元素、2.5 KB）之间——$G=2$ 把 cache 减半（相比 MHA），保留了两份 K/V 头的表达力。</p>
 </div>
 
-<p><strong>uptraining：从已有 MHA 检查点升级到 GQA</strong>。Ainslie 2023 §2.1 与 §3.1 给出两步配方，让已有 MHA 模型不必从头重训：</p>
+<p><strong>uptraining：从已有 MHA 检查点升级到 GQA</strong>。Ainslie 2023 §2.1 与 §3.1 给出两步配方，让已有 MHA 模型不必从头重训：<sup>[C7, N4]</sup></p>
 
 <ol>
   <li><strong>检查点转换</strong>：把 MHA 检查点里 $h$ 个 K/V 投影矩阵按组<em>均值池化</em>（mean pooling）为 $G$ 个。Ainslie 2023 §2.1 报告均值池化优于"选第一个头"或"随机初始化"，理由是 <em>"the degree to which information is preserved from the pre-trained model"</em>——保留的预训练信息越多效果越好。</li>
@@ -866,21 +856,20 @@ cache: 2·4·d_k      cache: 2·2·d_k        cache: 2·1·d_k
 </div>
 <p class="chapter-summary">来源：Ainslie 2023 Table 1。质量为 CNN/DailyMail、arXiv、PubMed、MediaSum、MultiNews、WMT EnDe、TriviaQA 的平均。MQA/GQA 仅用于 decoder self-attention 与 cross-attention，encoder self-attention 仍 MHA。</p>
 
-<p>GQA-8-XXL 质量 47.1 接近 MHA-XXL 47.2（差 0.1），推理 0.28s 接近 MQA-XXL 0.24s（慢 0.04s）——Ainslie 2023 §4 称 <em>"GQA achieves significant additional quality gains, achieving performance close to MHA-XXL with speed close to MQA"</em>。G=8 是 Figure 6 消融后选定的折中点，原文 <em>"We selected 8 groups as a favorable middle ground"</em>——从 G=1（MQA）到 G=8 推理开销适度增加，继续增大 G 收益递减。</p>
+<p>GQA-8-XXL 质量 47.1 接近 MHA-XXL 47.2（差 0.1），推理 0.28s 接近 MQA-XXL 0.24s（慢 0.04s）——Ainslie 2023 abstract 称 <em>"Uptrained GQA achieves quality close to multi-head attention with comparable speed to MQA"</em>。G=8 是 Figure 6 消融后选定的折中点，论文称其为 favorable middle ground——从 G=1（MQA）到 G=8 推理开销适度增加，继续增大 G 收益递减。<sup>[C8, N3]</sup></p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>写出 GQA 的 cache 公式（$2 G d_k$）并说出 $G=h$ 等价 MHA、$G=1$ 等价 MQA</li>
-  <li>说出 uptraining 两步（均值池化 K/V 投影 + 5% 继续预训练）</li>
-  <li>说出 GQA-8 在 T5-XXL 上的结论（质量 47.1 接近 MHA 47.2、速度 0.28s 接近 MQA 0.24s）</li>
-  <li>说出 GQA 相比 MQA 的额外好处（训练稳定）</li>
+  <li>写出 GQA 的 cache 公式（$2 G d_k$）并说出 $G=h$ 等价 MHA、$G=1$ 等价 MQA。</li>
+  <li>说出 uptraining 两步（均值池化 K/V 投影 + 5% 继续预训练）与 GQA 相比 MQA 的额外好处（训练稳定）。</li>
+  <li>说出 GQA-8 在 T5-XXL 上的结论（质量 47.1 接近 MHA 47.2、速度 0.28s 接近 MQA 0.24s）。</li>
 </ul>
 
 <p>三种机制分别讲完了。下一章把它们并排放一起手算，看清连续谱。</p>
 
 <h2 id="handcalc-spectrum">手算对比——4 头 MHA / 2 组 GQA / 1 组 MQA 的 KV cache 连续谱</h2>
 
-<p>把 S1–S3 的三次手算合并成一张表，固定 $h=4,d_k=64,l=1,n=10$ 的教学数字：</p>
+<p>把前面三次手算合并成一张表，固定 $h=4,d_k=64,l=1,n=10$ 的教学数字：</p>
 
 <div class="table-scroll">
 <table>
@@ -924,10 +913,9 @@ cache: 2·4·d_k      cache: 2·2·d_k        cache: 2·1·d_k
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>算出 $h=4,d_k=64,l=1,n=10$ 下 MHA / GQA-2 / MQA 的每 token cache（512 / 256 / 128）</li>
-  <li>说出 $G$ 是连续谱旋钮、两端分别是 MHA（$G=h$）与 MQA（$G=1$）</li>
-  <li>说出每减一个 K/V 头 cache 减 $2 d_k$（线性下降、无突变）</li>
-  <li>说出真实规模 $h=128$ 下 MHA 与 MQA 的 cache 量级差（约 128 倍）</li>
+  <li>算出 $h=4,d_k=64,l=1,n=10$ 下 MHA / GQA-2 / MQA 的每 token cache（512 / 256 / 128），并说出每减一个 K/V 头 cache 减 $2 d_k$。</li>
+  <li>说出 $G$ 是连续谱旋钮、两端分别是 MHA（$G=h$）与 MQA（$G=1$）。</li>
+  <li>说出真实规模 $h=128$ 下 MHA 与 MQA 的 cache 量级差（约 128 倍）。</li>
 </ul>
 
 <p>连续谱清楚了。但这是"共享头"这一条路。还有另一条路——压缩 K/V 本身。下一章点出区别，作为 MLA 的前置。</p>
@@ -958,30 +946,31 @@ cache: 2·4·d_k      cache: 2·2·d_k        cache: 2·1·d_k
   <li><strong>MLA（低秩压缩）</strong>：不共享头。把所有头的 K/V 联合压成一个 $d_c$ 维潜向量 $c_t^{KV}$，推理时再用学习到的上投影为每个头重建 K/V。是"把所有 head 信息压到一个低维潜向量"。</li>
 </ul>
 
-<p>两者目标相同（减 KV cache），但机制完全不同。DeepSeek-V2 配置下（$n_h=128,d_h=128,d_c=512,d_h^R=64$）MLA cache = 576 元素/token/layer，比 MHA 的 $2\times 128\times 128=32768$ 小得多（约 1/57）；注意 MLA(576) 反而大于 MQA(256)，MLA 的优势是相比 MHA/GQA 基线在更小 cache 下保质量，而 MQA 质量略低于 MHA（DeepSeek-V2 §2.1.4 报告 MLA 在保持质量的同时减少 93.3% KV cache，对比对象是 DeepSeek 67B 的 GQA 基线）。</p>
+<p>两者目标相同（减 KV cache），但机制完全不同。DeepSeek-V2 配置下（$n_h=128,d_h=128,d_c=512,d_h^R=64$）MLA cache = 576 元素/token/layer，比 MHA 的 $2\times 128\times 128=32768$ 小得多（约 1/57）；注意 MLA(576) 反而大于 MQA(256)，MLA 的优势是相比 MHA/GQA 基线在更小 cache 下保质量，而 MQA 质量略低于 MHA（DeepSeek-V2 §2.1.4 报告 MLA 在保持质量的同时减少 93.3% KV cache，对比对象是 DeepSeek 67B 的 GQA 基线）。<sup>[C9, F4, N5]</sup></p>
 
-<p><strong>为什么说本页是 MLA 的前置</strong>。理解了"KV cache 来自每头一份 K 和 V"（本页 S1）才能理解 MLA 在压缩什么——它压缩的正是这"每头一份 K 和 V"的联合表示。理解了"共享头有质量代价"（本页 S2）才能理解 MLA 为什么另起一条路——不共享头、用低秩压缩保留各头独立性，从而在更小 cache 下保住质量。MLA 的完整压缩公式、矩阵吸收与解耦 RoPE 见概念页 <a href="../mla/index.html">MLA</a>。</p>
+<p><strong>为什么说本页是 MLA 的前置</strong>。理解了"KV cache 来自每头一份 K 和 V"（MHA 章节）才能理解 MLA 在压缩什么——它压缩的正是这"每头一份 K 和 V"的联合表示。理解了"共享头有质量代价"（MQA 章节）才能理解 MLA 为什么另起一条路——不共享头、用低秩压缩保留各头独立性，从而在更小 cache 下保住质量。MLA 的完整压缩公式、矩阵吸收与解耦 RoPE 见概念页 <a href="../mla/index.html">MLA</a>。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>说出 MQA/GQA 不解决的两个问题（$O(n^2)$ 算力、位置信息）</li>
-  <li>说出共享头与低秩压缩的机制区别（前者少存几份完整 head，后者把所有 head 信息压成低维潜向量）</li>
-  <li>写出四种机制的 cache 公式（$2 h d_k$ / $2 G d_k$ / $2 d_k$ / $(d_c+d_h^R)$）</li>
-  <li>说出本页为什么是 MLA 的前置（理解 cache 来源才能理解 MLA 在压缩什么；理解共享头代价才能理解 MLA 为什么另起一条路）</li>
+  <li>说出 MQA/GQA 不解决的两个问题（$O(n^2)$ 算力、位置信息）。</li>
+  <li>说出共享头与低秩压缩的机制区别（前者少存几份完整 head，后者把所有 head 信息压成低维潜向量），并写出四种机制的 cache 公式（$2 h d_k$ / $2 G d_k$ / $2 d_k$ / $(d_c+d_h^R)$）。</li>
+  <li>说出本页为什么是 MLA 的前置（理解 cache 来源才能理解 MLA 在压缩什么；理解共享头代价才能理解 MLA 为什么另起一条路）。</li>
 </ul>
+
+<p>回顾本文的五个问题：MHA 推理受内存带宽限制，因为每步要从 HBM 加载随 $h$ 与 $n$ 线性增长的 KV cache；MQA 共享一组 K/V 把 cache 减到 1/h，代价是质量下降与训练不稳定；GQA 在 MHA 与 MQA 间插值，uptraining 以 5% 算力从 MHA 检查点升级，$G=8$ 是质量与速度的折中点；三种机制在 K/V 头数从 $h$ 到 1 的连续谱上，每减一个头 cache 减 $2 d_k$；MQA/GQA 走共享头路线，MLA 走低秩压缩路线，机制完全不同——理解了共享头及其代价，才能理解 MLA 为什么另起一条路。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
 <h3>核心论断与来源</h3>
 <ul>
 <li><strong>C1 自回归推理瓶颈是内存带宽而非算力</strong>：Shazeer 2019, arXiv:1911.02150, §1 第 2 段 "the speed of incremental Transformer inference on modern computing hardware is limited by the memory bandwidth necessary to reload the large 'keys' and 'values' tensors"。</li>
-<li><strong>C2 内存访问/算术比值 Θ(n/d + 1/b)</strong>：Shazeer 2019 §2.4.1 Performance Analysis；§3.1 "We have reduced the offensive n/d by a factor of h"。</li>
-<li><strong>C3 MQA 共享一组 K/V</strong>：Shazeer 2019 §3 "Multi-query attention is identical except that the different heads share a single set of keys and values."；§2.2 给出 MHA 的 einsum 形状作为对照。</li>
+<li><strong>C2 内存访问/算术比值 Θ(n/d + 1/b)</strong>：Shazeer 2019 §3.1 Performance Analysis；同节 "We have reduced the offensive n/d by a factor of h"。</li>
+<li><strong>C3 MQA 共享一组 K/V</strong>：Shazeer 2019 §3 "Multi-query attention is identical except that the different heads share a single set of keys and values."；同文 MHA 回顾部分给出 einsum 形状作为对照。</li>
 <li><strong>C4 MQA cache 减为 2 d_k（减少 h 倍）</strong>：由 C3 直接推出；Shazeer 2019 §3.1 "reduced...by a factor of h"。</li>
 <li><strong>C5 MQA 质量代价与训练不稳定</strong>：Shazeer 2019 abstract "incur only minor quality degradation"；Ainslie 2023 §1 "MQA can lead to quality degradation"；Ainslie 2023 Appendix A "multi-query attention can lead to training instability during fine-tuning...Uptrained grouped-query attention models, however, appear to be stable."</li>
 <li><strong>C6 GQA 分 G 组、是 MHA 与 MQA 的插值</strong>：Ainslie 2023, arXiv:2305.13245, §2 "Grouped-query attention divides query heads into G groups, each of which shares a single key head and value head."；Figure 2。</li>
 <li><strong>C7 uptraining 均值池化 + 5% 继续预训练</strong>：Ainslie 2023 §2.1 "The projection matrices for key and value heads are mean pooled...works better than selecting a single key and value head or randomly initializing"；§3.1 "pre-trained for a small proportion α of its original training steps"；α=0.05 见实验配置；Figure 4、Figure 5 消融。</li>
-<li><strong>C8 GQA-8 在 T5-XXL 上质量接近 MHA、速度接近 MQA</strong>：Ainslie 2023 Table 1（MHA-XXL 1.51s/47.2、MQA-XXL 0.24s/46.6、GQA-8-XXL 0.28s/47.1）；§4 "We selected 8 groups as a favorable middle ground"；Figure 6。</li>
+<li><strong>C8 GQA-8 在 T5-XXL 上质量接近 MHA、速度接近 MQA</strong>：Ainslie 2023 Table 1（MHA-XXL 1.51s/47.2、MQA-XXL 0.24s/46.6、GQA-8-XXL 0.28s/47.1）；abstract "Uptrained GQA achieves quality close to multi-head attention with comparable speed to MQA"；Figure 6 选定 G=8 为折中点。</li>
 <li><strong>C9 MQA/GQA 与 MLA 是两条不同的 KV 压缩路线</strong>：Shazeer 2019 §3（MQA 共享机制）；Ainslie 2023 §2（GQA 分组机制）；DeepSeek-V2 §2.1.2 Eq.(9)–(11)（MLA 压缩公式）、§2.1.4 Table 1（四种机制 cache 对照）。</li>
 </ul>
 
@@ -991,16 +980,17 @@ cache: 2·4·d_k      cache: 2·2·d_k        cache: 2·1·d_k
 <li><strong>F2 MQA 每 token 每 layer KV cache = 2 d_k</strong>：由 C3（共享一组 K/V）直接推出；Shazeer 2019 §3.1。</li>
 <li><strong>F3 GQA 每 token 每 layer KV cache = 2 G d_k</strong>：由 C6（G 组各一组 K/V）直接推出；Ainslie 2023 §2。</li>
 <li><strong>F4 MLA 每 token 每 layer KV cache = (d_c + d_h^R)</strong>：DeepSeek-V2 §2.1.4 Table 1；本页只引公式对照，不展开 $c_t^{KV}=W^{DKV}h_t$ 等机制（属 MLA 页）。</li>
-<li><strong>F5 内存访问/算术比值 Θ(n/d + 1/b)</strong>：Shazeer 2019 §2.4.1、§3.1。</li>
+<li><strong>F5 内存访问/算术比值 Θ(n/d + 1/b)</strong>：Shazeer 2019 §3.1。</li>
 </ul>
 
 <h3>外部数字与实验条件</h3>
 <ul>
-<li><strong>N1 Shazeer 2019 定性结论</strong>：abstract "much faster to decode" 且 "incur only minor quality degradation"；实验在 WMT 翻译与语言建模任务上。具体 BLEU 与速度倍数因 PDF 一手数据未取到精确值，本页不引用二手数字。</li>
+<li><strong>N1 Shazeer 2019 定性结论</strong>：abstract "much faster to decode" 且 "incur only minor quality degradation"；实验在 WMT14 英德翻译与 Billion Word 语言建模任务上。二手转述报告 WMT14 test BLEU 28.5（MQA）vs 28.4（MHA，beam-4）、解码延迟 46µs→3.8µs/token，但本页不引用一手 PDF 之外的精确数字，仅取 abstract 定性结论。</li>
 <li><strong>N2 Ainslie 2023 Table 1 T5-XXL 数据</strong>：MHA-XXL 1.51s/47.2、MQA-XXL 0.24s/46.6、GQA-8-XXL 0.28s/47.1、MHA-Large 0.37s/46.0。评估数据集为 CNN/DailyMail、arXiv、PubMed、MediaSum、MultiNews、WMT EnDe、TriviaQA 的平均。MQA/GQA 仅用于 decoder self-attention 与 cross-attention，encoder self-attention 仍 MHA。</li>
-<li><strong>N3 G=8 折中点</strong>：Ainslie 2023 §4 "We selected 8 groups as a favorable middle ground"；Figure 6 消融。</li>
+<li><strong>N3 G=8 折中点</strong>：Ainslie 2023 论文选定 8 组作为折中点（favorable middle ground）；Figure 6 消融。原文措辞未逐一核对，仅取其选定 G=8 的事实。</li>
 <li><strong>N4 uptraining 开销</strong>：α=5%，T5-XXL 规模约 600 TPUv3 chip-days；Ainslie 2023 §3.1。</li>
 <li><strong>N5 DeepSeek-V2 MLA 配置</strong>：$n_h=128,d_h=128,d_c=512,d_h^R=64$；MLA cache = 576 元素/token/layer，对应 MHA = 32768，比值约 1/57；DeepSeek-V2 §2.1.4 Table 1。</li>
+<li><strong>N6 GPU 算力与带宽对比</strong>：V100/A100/H100（SXM 版本）FP32 算力 15.7/19.5/67 TFLOPS、HBM 带宽 900/2039/3352 GB/s，源自 NVIDIA 官方数据手册。算力增长约 4.3 倍、带宽增长约 3.7 倍，剪刀差使带宽瓶颈随硬件演进加剧。</li>
 </ul>
 
 <h3>教学示例</h3>
@@ -1018,11 +1008,11 @@ cache: 2·4·d_k      cache: 2·2·d_k        cache: 2·1·d_k
 
 <h3>教学简化及其限制</h3>
 <ul>
-<li><strong>手算例子用 $h=4,d_k=64,l=1,n=10$</strong>：数字小便于手算，与真实模型规模（$h=128,d_k=128,l=80,n=4096$）差很多量级。简化掉的是：真实模型的 cache 量级、batch 与框架开销、PagedAttention 分页；本页在 S4 折叠块给出真实规模推算作量级感补充。</li>
-<li><strong>不展开 Shazeer 2019 性能比值的完整推导</strong>：只引 $\Theta(n/d+1/b)$ 结论与"减 h 倍"的分析结果。简化掉的是：roofline 模型的完整推导、GPU 算力与带宽的具体对比数字；S1 折叠块给出 roofline 直觉补充。</li>
-<li><strong>不展开 uptraining 的消融细节</strong>：只引两步配方与 α=5%。简化掉的是：Figure 4 三种转换方法的详细对比、Figure 5 的 α 影响曲线、Appendix A 的训练稳定性分析；S3 折叠块给出关键结论补充。</li>
-<li><strong>不展开 MLA 机制</strong>：只引 cache 公式对照与"低秩压缩 vs 共享头"的思路区别。简化掉的是：MLA 的压缩公式 $c_t^{KV}=W^{DKV}h_t$、矩阵吸收 $W^{UK}$ 吸进 $W^Q$、解耦 RoPE；属 MLA 概念页。</li>
-<li><strong>不引用 Shazeer 2019 的具体速度倍数</strong>：因 PDF 一手数据未取到精确数值，只引 abstract 的定性结论"much faster"。简化掉的是：具体 BLEU 与速度倍数；不引用二手数字避免以讹传讹。</li>
+<li>手算例子用 $h=4,d_k=64,l=1,n=10$。可推出：三种机制的 cache 元素数与连续谱关系。不可推出：真实模型的 cache 量级、batch 与框架开销、PagedAttention 分页；本文在折叠块给出真实规模推算作量级感补充。</li>
+<li>不展开 Shazeer 2019 性能比值的完整推导，只引 $\Theta(n/d+1/b)$ 结论与"减 h 倍"的分析结果。可推出：减 $h$ 能等比例减带宽开销。不可推出：roofline 模型的完整推导、GPU 算力与带宽的具体对比推导；MHA 章节折叠块给出 roofline 直觉补充。</li>
+<li>不展开 uptraining 的消融细节，只引两步配方与 α=5%。可推出：uptraining 能从已有 MHA 检查点低成本得到 GQA。不可推出：Figure 4 三种转换方法的详细对比、Figure 5 的 α 影响曲线、Appendix A 的训练稳定性分析；GQA 章节折叠块给出关键结论补充。</li>
+<li>不展开 MLA 机制，只引 cache 公式对照与"低秩压缩 vs 共享头"的思路区别。可推出：MQA/GQA 与 MLA 是两条不同的压缩路线。不可推出：MLA 的压缩公式 $c_t^{KV}=W^{DKV}h_t$、矩阵吸收 $W^{UK}$ 吸进 $W^Q$、解耦 RoPE；属 MLA 概念页。</li>
+<li>不引用 Shazeer 2019 的具体速度倍数，只引 abstract 的定性结论"much faster"。可推出：MQA 显著加速解码。不可推出：具体 BLEU 与速度倍数；二手转述数字存在失真风险，本文不引用。</li>
 </ul>
 
 

@@ -652,11 +652,11 @@
 <h1 class="title">EAGLE-3 投机解码 draft 模型：复用 target 隐藏状态的单层 draft</h1>
 <p class="reading-time" id="readingTime"></p>
 
-<p>给一个 70B 模型用投机解码加速推理，draft 模型该是什么？传统答案是「找一个独立小语言模型」，比如用 LLaMA2-7B 给 LLaMA2-70B 打草稿。但小模型有两难：太弱（如 TinyLLaMA）接受率低，α 趋近 0，加速消失；太强（如 7B 给 70B 打草稿）draft 自身成本 c 接近 target，加速比退化。EAGLE 系列给出反直觉的答案：<strong>不训练独立小模型，直接复用 target 模型已经算出的隐藏状态作为 draft 输入</strong>。EAGLE-3 把这个思路推到极致：draft 只有单层 transformer decoder，复用 target 的低、中、高三层特征融合作为输入、直接预测 token 分布，并用 training-time test 训练让自己在多步预测中保持接受率不衰减。在 Vicuna 13B 上 EAGLE-3 比 vanilla decoding 快 5.6x。</p>
-
 <blockquote class="meta">
 <p><b>主要依据</b>：Li et al. 2024, "EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty", arXiv:2401.15077, ICML 2024；Li et al. 2025, "EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test", arXiv:2503.01840, NeurIPS 2025；Kimi K3 Technical Report §4.1.4 Draft Model Fine-Tuning。</p>
 </blockquote>
+
+<p>给一个 70B 模型用投机解码加速推理，draft 模型该是什么？传统答案是「找一个独立小语言模型」，比如用 LLaMA2-7B 给 LLaMA2-70B 打草稿。但小模型有两难：太弱（如 TinyLLaMA）接受率低，α 趋近 0，加速消失；太强（如 7B 给 70B 打草稿）draft 自身成本 c 接近 target，加速比退化。EAGLE 系列给出反直觉的答案：<strong>不训练独立小模型，直接复用 target 模型已经算出的隐藏状态作为 draft 输入</strong>。EAGLE-3 把这个思路推到极致：draft 只有单层 transformer decoder，复用 target 的低、中、高三层特征融合作为输入、直接预测 token 分布，并用 training-time test 训练让自己在多步预测中保持接受率不衰减。在 Vicuna 13B 上 EAGLE-3 比 vanilla decoding 快 5.6x。EAGLE-3 如何用单层 decoder 做到这一点？本文从思路转向、架构改变、推理 pipeline、训练方法到 K3 工程实例逐一拆解。</p>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
@@ -673,7 +673,7 @@
 
 <p>投机解码的加速比取决于两个量：接受率 α 和 draft 与 target 的单步成本比 c。前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 给出加速比公式 $S = (1 - \alpha^{\gamma+1}) / [(1-\alpha)(1 + \gamma c)]$，α 越接近 1、c 越接近 0、加速越高。理想 draft 要「分布 q 接近 target 分布 p」（α 高）且「单步成本低」（c 低）。</p>
 
-<p>传统独立小模型 draft 同时优化这两个量很困难。LLaMA2 系列有 7B、13B、70B 三个尺寸——用 7B 给 70B 打草稿看起来合理，但 7B 自身单步成本 c 不可忽略（约 0.05-0.1），且 7B 与 70B 分布差距让 α 不够高；用 TinyLLaMA（1.1B）做 draft 又因分布差距过大、α 趋近 0、几乎不接受。EAGLE 论文 [C1] 直接给出训练成本对比：TinyLLaMA 用 3000B tokens 训练，而 EAGLE 只需 2-4B tokens [N5]——因为 EAGLE 不训练一个完整小语言模型，只训练一个复用 target feature 的小 draft 头。</p>
+<p>传统独立小模型 draft 同时优化这两个量很困难。LLaMA2 系列有 7B、13B、70B 三个尺寸——用 7B 给 70B 打草稿看起来合理，但 7B 自身单步成本 c 不可忽略（约 0.05-0.1），且 7B 与 70B 分布差距让 α 不够高；用 TinyLLaMA（1.1B）做 draft 又因分布差距过大、α 趋近 0、几乎不接受。EAGLE 论文 <sup>[C1]</sup> 直接给出训练成本对比：TinyLLaMA 用 3000B tokens 训练，而 EAGLE 只需 2-4B tokens <sup>[N5]</sup>——因为 EAGLE 不训练一个完整小语言模型，只训练一个复用 target feature 的小 draft 头。</p>
 
 <p>EAGLE 的核心思路可以一句话概括：<strong>target 模型在每一步前向传播中已经算出了丰富的内部隐藏状态，让 draft 复用这些状态作为输入，而不是从 token 序列重新学一个独立小模型</strong>。这样 draft 自身参数量极少（EAGLE-3 只有单层 decoder），单步成本 c 接近 0；同时 draft 决策直接基于 target 的内部表示，与 target 决策边界更贴近，α 更高。</p>
 
@@ -689,7 +689,7 @@
 </table>
 </div>
 
-<p>这里要澄清一个关键边界：<strong>EAGLE 系列只替换 draft 角色，不改变投机解码的接受/拒绝规则</strong>。draft-then-verify 流程、拒绝采样规则、残差分布、bonus token、lossless 性质都来自通用投机解码框架，见 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 第 2、3 章。EAGLE-3 的输出分布仍与纯 target 采样完全相同 [C10]，只是用更小、更准的 draft 提高了 α、从而提高了加速比。</p>
+<p>这里要澄清一个关键边界：<strong>EAGLE 系列只替换 draft 角色，不改变投机解码的接受/拒绝规则</strong>。draft-then-verify 流程、拒绝采样规则、残差分布、bonus token、lossless 性质都来自通用投机解码框架，见 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「Draft-then-Verify」与「为什么这条规则能保分布」两章。EAGLE-3 的输出分布仍与纯 target 采样完全相同 <sup>[C10]</sup>，只是用更小、更准的 draft 提高了 α、从而提高了加速比。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
@@ -702,7 +702,7 @@
 
 <h2 id="eagle-1-feature-ar">EAGLE-1 的核心机制——在 feature 空间做自回归</h2>
 
-<p>EAGLE-1 复用 target feature 的方式有两个关键观察 [C2]：</p>
+<p>EAGLE-1 复用 target feature 的方式有两个关键观察 <sup>[C2]</sup>：</p>
 
 <p><strong>观察 1：feature 层自回归比 token 层更规律</strong>。token 序列是自然语言的离散变换，相邻 token 之间的关系受语法、语义、上下文多重因素影响，预测难度大。target 模型的 second-to-top-layer feature（lm_head 之前的隐藏状态）是 model 内部的连续表示，已经聚合了上下文信息，相邻位置的 feature 之间关系更平滑、更可预测。在 feature 空间做自回归、再用 target 的 lm_head 把 feature 映射到 token 分布，比直接在 token 空间自回归更稳定。</p>
 
@@ -730,7 +730,7 @@
                    采样得到 draft token x_{t+1}
 </pre>
 
-<p>EAGLE-1 的 draft 输出是 feature（不是 token），再过 target 共享的 lm_head 才得到 token 分布 q、采样得到 draft token。这一点与 EAGLE-3 直接预测 token 是关键区别，下一章展开。EAGLE-1 在 LLaMA2-Chat 70B 上延迟加速 2.7x-3.5x、吞吐翻倍 [N1]，证明「复用 target feature」的思路有效。</p>
+<p>EAGLE-1 的 draft 输出是 feature（不是 token），再过 target 共享的 lm_head 才得到 token 分布 q、采样得到 draft token。这一点与 EAGLE-3 直接预测 token 是关键区别，下一章展开。EAGLE-1 在 LLaMA2-Chat 70B 上延迟加速 2.7x-3.5x、吞吐翻倍 <sup>[N1]</sup>，证明「复用 target feature」的思路有效。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
@@ -743,7 +743,7 @@
 
 <h2 id="eagle-3-changes">EAGLE-3 的两项架构改变——直接 token 预测 + 多层特征融合</h2>
 
-<p>EAGLE-3 在 EAGLE-1 基础上做了两项架构改变 [C3]，每一项解决一个具体问题。</p>
+<p>EAGLE-3 在 EAGLE-1 基础上做了两项架构改变 <sup>[C3]</sup>，每一项解决一个具体问题。</p>
 
 <h3 id="change-1-direct-token">改变 1：放弃 feature 预测，改为直接 token 预测</h3>
 
@@ -753,11 +753,11 @@
 
 <h3 id="change-2-multi-layer-fusion">改变 2：用 low/mid/high 三层 feature 融合替代 top-layer 单层 feature</h3>
 
-<p>EAGLE-1 只用 target 的 second-to-top-layer feature。这一层 feature 主要承载 next-token 预测信息，但丢失了低层句法/词法、中层语义信息。EAGLE-3 改为融合 target 的低、中、高三层 feature [C3]：</p>
+<p>EAGLE-1 只用 target 的 second-to-top-layer feature。这一层 feature 主要承载 next-token 预测信息，但丢失了低层句法/词法、中层语义信息。EAGLE-3 改为融合 target 的低、中、高三层 feature <sup>[C3]</sup>：</p>
 
 $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
-<p>其中 $l_t, m_t, h_t \in \mathbb{R}^k$ 分别是 target 在第 $t$ 个位置上 low/mid/high 三层 feature，$[\cdot;\cdot;\cdot]$ 是拼接得到 $3k$ 维向量，$W_{\text{fuse}} \in \mathbb{R}^{k \times 3k}$ 是无偏融合矩阵（K3 命名为 $W_{E3}$），$g_t \in \mathbb{R}^k$ 是融合后的 feature [F1]。低层 feature 对采样误差更鲁棒（不随采样噪声快速恶化），高层 feature 定位全局语义——融合后的 $g_t$ 比单层 top-layer feature 信息更全面。</p>
+<p>其中 $l_t, m_t, h_t \in \mathbb{R}^k$ 分别是 target 在第 $t$ 个位置上 low/mid/high 三层 feature，$[\cdot;\cdot;\cdot]$ 是拼接得到 $3k$ 维向量，$W_{\text{fuse}} \in \mathbb{R}^{k \times 3k}$ 是无偏融合矩阵（K3 命名为 $W_{E3}$），$g_t \in \mathbb{R}^k$ 是融合后的 feature <sup>[F1]</sup>。低层 feature 对采样误差更鲁棒（不随采样噪声快速恶化），高层 feature 定位全局语义——融合后的 $g_t$ 比单层 top-layer feature 信息更全面。</p>
 
 <h3 id="arch-summary">架构总览</h3>
 
@@ -786,12 +786,12 @@ target 模型前向 ──► 取 low/mid/high 三层 feature
 <tr><td>输入 feature</td><td>second-to-top-layer 单层</td><td>low/mid/high 三层融合</td></tr>
 <tr><td>输出空间</td><td>预测 feature f̂，再过 lm_head</td><td>直接输出 token 分布 q（仍过共享 lm_head）</td></tr>
 <tr><td>训练方法</td><td>标准监督（ground-truth feature）</td><td>training-time test（draft 见到自己输出）</td></tr>
-<tr><td>性能（13B target）</td><td>2-3x 加速</td><td>5.6x 加速 [N3]</td></tr>
+<tr><td>性能（13B target）</td><td>2-3x 加速</td><td>5.6x 加速 <sup>[N3]</sup></td></tr>
 </tbody>
 </table>
 </div>
 
-<p>EAGLE-3 在 Vicuna 13B 上比 vanilla decoding 快 5.6x、比 EAGLE-1 快 1.8x [N3]；最高加速 6.5x、相比 EAGLE-2 提升约 1.4x；在 SGLang 框架中 batch size 64 时吞吐提升 1.38x [N2]。这些数字是辅助参考，核心是两项架构改变让 draft 容量更聚焦于 token 预测、信息输入更全面。</p>
+<p>EAGLE-3 在 Vicuna 13B 上比 vanilla decoding 快 5.6x、比 EAGLE-1 快 1.8x <sup>[N3]</sup>；最高加速 6.5x、相比 EAGLE-2 提升约 1.4x；在 SGLang 框架中 batch size 64 时吞吐提升 1.38x <sup>[N2]</sup>。这些数字是辅助参考，核心是两项架构改变让 draft 容量更聚焦于 token 预测、信息输入更全面。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
@@ -800,11 +800,11 @@ target 模型前向 ──► 取 low/mid/high 三层 feature
   <li>说出 EAGLE-3 draft 的层数，与 EAGLE-1 对比。</li>
 </ul>
 
-<p>架构讲完了——但推理时单层 decoder 怎么自回归生成 γ 个 token？为什么后续步骤要用自己的输出替代 target feature？下一章用贯穿例子手算走一遍。</p>
+<p>本章讲完 EAGLE-3 的两项架构改变——但推理时单层 decoder 怎么自回归生成 γ 个 token？为什么后续步骤要用自己的输出替代 target feature？下一章用教学示例手算走一遍。</p>
 
 <h2 id="inference-pipeline">推理时的自回归 draft——单层 decoder 如何生成 γ 个 draft token</h2>
 
-<p>EAGLE-3 推理 pipeline 分三步（论文 Figure 5）[C4]。设当前前缀长度为 $t$，草稿长度 $\gamma$。</p>
+<p>EAGLE-3 推理 pipeline 分三步（论文 Figure 5）<sup>[C4]</sup>。设当前前缀长度为 $t$，草稿长度 $\gamma$。</p>
 
 <h3 id="prefill">Prefill 阶段（target 前向）</h3>
 
@@ -812,13 +812,13 @@ target 模型前向 ──► 取 low/mid/high 三层 feature
 
 <h3 id="draft-step-1">Draft 步骤 1：用 target 真实 feature</h3>
 
-<p>draft 的第一步可以用 target 真实的 $g_1, \ldots, g_t$，因为这些位置 target 已经算过。输入 $\text{concat}(g_1, \ldots, g_t, e_{t+1})$，过单层 decoder 得到输出 $a_{t+1}$，再过共享 lm_head 得到 $q_1$，采样得到第一个 draft token $x_{t+2}$ [F2]：</p>
+<p>draft 的第一步可以用 target 真实的 $g_1, \ldots, g_t$，因为这些位置 target 已经算过。输入 $\text{concat}(g_1, \ldots, g_t, e_{t+1})$，过单层 decoder 得到输出 $a_{t+1}$，再过共享 lm_head 得到 $q_1$，采样得到第一个 draft token $x_{t+2}$ <sup>[F2]</sup>：</p>
 
 $$a_{t+1} = \text{DraftLayer}([g_{1:t};\, e_{t+1}]),\qquad q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1}).$$
 
 <h3 id="draft-step-2-onward">Draft 步骤 2 及以后：用 draft 自己的输出替代 target feature</h3>
 
-<p>第二步开始，新位置 $t+1$ 的 target feature $g_{t+1}$ 尚未算出——因为 target 还没验证 draft token。draft 只能用自己的上一步输出 $a_{t+1}$ 替代 $g_{t+1}$ [C4]。输入 $\text{concat}(g_1, \ldots, g_t, a_{t+1}, e_{t+2})$，过单层 decoder 得到 $a_{t+2}$，过 lm_head 得到 $q_2$，采样得到 $x_{t+3}$。第三步及之后同理，用 $a_{t+2}$ 替代 $g_{t+2}$，以此类推。</p>
+<p>第二步开始，新位置 $t+1$ 的 target feature $g_{t+1}$ 尚未算出——因为 target 还没验证 draft token。draft 只能用自己的上一步输出 $a_{t+1}$ 替代 $g_{t+1}$ <sup>[C4]</sup>。输入 $\text{concat}(g_1, \ldots, g_t, a_{t+1}, e_{t+2})$，过单层 decoder 得到 $a_{t+2}$，过 lm_head 得到 $q_2$，采样得到 $x_{t+3}$。第三步及之后同理，用 $a_{t+2}$ 替代 $g_{t+2}$，以此类推。</p>
 
 <pre class="diagram">EAGLE-3 推理 pipeline 三步（γ = 3）：
 
@@ -848,9 +848,9 @@ $$a_{t+1} = \text{DraftLayer}([g_{1:t};\, e_{t+1}]),\qquad q_1 = \mathrm{softmax
 
 <p><strong>「自替代」引入噪声</strong>。$a_{t+1}$ 是 draft 单层 decoder 的输出，是 $g_{t+1}$ 的近似，与真实 $g_{t+1}$ 有偏差。这个偏差会随 draft 深度累积——第二步的输入已经包含一个近似 $a_{t+1}$，第三步又叠加 $a_{t+2}$ 的偏差，深度越大、噪声越显著。如果不专门训练，draft 在深度预测中接受率会快速衰减。这正是 EAGLE-3 引入 training-time test 的原因，下一章展开。</p>
 
-<h3 id="worked-example">贯穿手算例子：prefix = "How can I"，γ = 3</h3>
+<h3 id="worked-example">教学示例：prefix = "How can I"，γ = 3</h3>
 
-<p>教学示例。 这是一个为了手算构造的最小例子，不代表真实模型或工程推荐值。设 hidden size $k = 4$，词表 $V = \{\text{I}, \text{do}, \text{it}, \text{now}, \langle\text{other}\rangle\}$（5 个 token）。token embedding 用 one-hot（前 4 个 token 各占一维；$\langle\text{other}\rangle$ 用全零向量），便于手算。</p>
+<p>教学示例。这是一个为了手算构造的最小例子，不代表真实模型或工程推荐值。设 hidden size $k = 4$，词表 $V = \{\text{I}, \text{do}, \text{it}, \text{now}, \langle\text{other}\rangle\}$（5 个 token）。token embedding 用 one-hot（前 4 个 token 各占一维；$\langle\text{other}\rangle$ 用全零向量），便于手算。</p>
 
 <p>教学简化：把 draft 单层 decoder 简化为线性变换 + tanh 激活，省略 attention 子层、MLP、layer norm；这些被省略的组件不改变「自替代」机制的数学结构。简化后 draft 步骤为 $a = \tanh(W_a \cdot [g_{\text{prev}};\, e_{\text{sampled}}])$，$q = \mathrm{softmax}(W_{\text{lm}} \cdot a)$。</p>
 
@@ -895,8 +895,8 @@ $$q_3 \approx [0.143,\, 0.166,\, 0.142,\, 0.363,\, 0.187].$$
 <p>本轮产出 3 个 draft token：$[\text{do}, \text{it}, \text{now}]$。target 一次前向验证，按拒绝采样规则接受。</p>
 
 <details>
-<summary>完整手算：三步的全部中间值与偏差对照</summary>
-<p>教学示例。 上面正文展示了三步的主干计算。这里把每步的全部中间值与最后对照「自替代」偏差展开，便于逐行复算。</p>
+<summary>展开：三步的全部中间值与偏差对照</summary>
+<p>教学示例。上面正文展示了三步的主干计算。这里把每步的全部中间值与最后对照「自替代」偏差展开，便于逐行复算。</p>
 <p><strong>Step 1（输入 $(g_{\text{can}}, e_{\text{I}})$，target 真实 $g$）</strong>：</p>
 <ul>
 <li>输入向量：$[0.4, 0.2, 0.1, 0.6, 0, 1, 0, 0]$</li>
@@ -928,7 +928,7 @@ $$q_3 \approx [0.143,\, 0.166,\, 0.142,\, 0.363,\, 0.187].$$
 </details>
 
 <details class="code-details">
-<summary>伪代码：EAGLE-3 推理 pipeline 三步形式化</summary>
+<summary>代码：EAGLE-3 推理 pipeline 三步形式化</summary>
 <p>以下是伪代码，不是 Python。它形式化 EAGLE-3 推理时 draft 生成 γ 个 token 的过程。</p>
 <div class="code-block">
 <pre><code class="language-text">输入：
@@ -962,7 +962,7 @@ Verify 阶段（一次 target 前向）：
   得 γ+1 个位置分布 p_1, ..., p_γ, p_{γ+1}
   按 speculative-decoding 的拒绝采样规则接受/拒绝
 
-输出：1 ~ γ+1 个最终 token（见 speculative-decoding 第 2 章）
+输出：1 ~ γ+1 个最终 token（见 speculative-decoding 的 Draft-then-Verify 一章）
 </code></pre>
 </div>
 <p>关键行是 <code>g_seq ← g_seq + [a]</code>——下一步把本步的 draft 输出 $a$ 当作新位置的 $g$ 输入。这是「自替代」在伪代码中的体现。每轮的 target 前向次数始终为 1（验证阶段），draft 单层 decoder 调用 γ 次。</p>
@@ -980,7 +980,7 @@ Verify 阶段（一次 target 前向）：
 
 <h2 id="training-ttt-loss">训练 draft 模型——training-time test 与接受率损失</h2>
 
-<p>EAGLE-3 训练时的核心问题是「train-inference mismatch」：若训练时只用 ground-truth $g$ 与 ground-truth token，draft 永远见不到「自己的近似 $a$ 作为输入」的情形；推理时遇到自替代会失配，接受率随深度快速衰减。EAGLE-3 用 training-time test（TTT）解决这个 mismatch [C5]。</p>
+<p>EAGLE-3 训练时的核心问题是「train-inference mismatch」：若训练时只用 ground-truth $g$ 与 ground-truth token，draft 永远见不到「自己的近似 $a$ 作为输入」的情形；推理时遇到自替代会失配，接受率随深度快速衰减。EAGLE-3 用 training-time test（TTT）解决这个 mismatch <sup>[C5]</sup>。</p>
 
 <h3 id="ttt-method">training-time test 的核心思想</h3>
 
@@ -992,7 +992,7 @@ Verify 阶段（一次 target 前向）：
   <li>第 3、4、... 轮：同理用 $a^{(2)}$ 替代下一步 $g$，继续展开。</li>
 </ul>
 
-<p>用因果 mask 让位置 $i$ 只能看到位置 $\leq i$ 的真实 token 与 $\leq i-1$ 的 draft 预测。这样训练时 draft 就在模拟推理时「自替代」的噪声环境，学会在 $a$ 替代 $g$ 的输入下仍输出有效分布 [C5]。</p>
+<p>用因果 mask 让位置 $i$ 只能看到位置 $\leq i$ 的真实 token 与 $\leq i-1$ 的 draft 预测。这样训练时 draft 就在模拟推理时「自替代」的噪声环境，学会在 $a$ 替代 $g$ 的输入下仍输出有效分布 <sup>[C5]</sup>。</p>
 
 <pre class="diagram">TTT 训练时的因果 mask（论文 Figure 6 简化）：
 
@@ -1023,23 +1023,23 @@ Verify 阶段（一次 target 前向）：
 
 <h3 id="loss-functions">两种损失函数：L_E3 与 L_LK</h3>
 
-<p>EAGLE-3 论文版训练损失是 token-level 负对数似然 [F3]：</p>
+<p>EAGLE-3 论文版训练损失是 token-level 负对数似然 <sup>[F3]</sup>：</p>
 
 $$L_{E3} = -\sum_{i=1}^{K} \log\, q(t_{t+i} \mid g_{1:t},\, a_{t+1:t+i-1}).$$
 
 <p>其中 $K$ 是 TTT unroll 长度，$t_{t+i}$ 是 ground-truth token，$q$ 是 draft 模型在第 $i$ 步的输出分布，$g_{1:t}$ 是 target 真实融合 feature，$a_{t+1:t+i-1}$ 是 draft 自己前几步的输出（作为 $g$ 替代）。这个损失让 draft 在多步展开中每一步都贴近 ground-truth token。（注：$K$ 表 unroll 长度，与前文 hidden size 的 $k$ 区分。）</p>
 
-<p>K3 报告版改用 LK loss [F4]，直接对接受率 $\alpha$ 求负对数：</p>
+<p>K3 报告版改用 LK loss <sup>[F4]</sup>，直接对接受率 $\alpha$ 求负对数：</p>
 
 $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
-<p>其中 $p$ 是 target 分布、$q$ 是 draft 分布、$V$ 是词表，$p$ 与 $q$ 都在 temperature=1 评估、不加额外的 ground-truth cross-entropy 项 [C6]。这是接受率 $\alpha = \sum_x \min(p, q)$ 的负对数。</p>
+<p>其中 $p$ 是 target 分布、$q$ 是 draft 分布、$V$ 是词表，$p$ 与 $q$ 都在 temperature=1 评估、不加额外的 ground-truth cross-entropy 项 <sup>[C6]</sup>。这是接受率 $\alpha = \sum_x \min(p, q)$ 的负对数。</p>
 
 <h3 id="lk-vs-kl">为什么 LK loss 比常规 KL 散度更直接</h3>
 
-<p>前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 第 3 章证明 $\alpha = \sum_x \min(p, q) = 1 - \mathrm{TV}(p, q)$，其中 $\mathrm{TV}(p, q) = \frac{1}{2}\sum_x |p(x) - q(x)|$ 是总变差距离 [F5]。$\alpha$ 是分布相似度的直接度量——$\alpha = 1$ 当且仅当 $p = q$。</p>
+<p>前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「为什么这条规则能保分布」一章证明 $\alpha = \sum_x \min(p, q) = 1 - \mathrm{TV}(p, q)$，其中 $\mathrm{TV}(p, q) = \frac{1}{2}\sum_x |p(x) - q(x)|$ 是总变差距离 <sup>[F5]</sup>。$\alpha$ 是分布相似度的直接度量——$\alpha = 1$ 当且仅当 $p = q$。</p>
 
-<p>K3 报告 [C6] 明确指出：「minimizing the conventional KL-divergence surrogate does not guarantee maximizing this rate for a capacity-limited draft model」。原因是 KL 散度（无论 $\mathrm{KL}(p \| q)$ 还是 $\mathrm{KL}(q \| p)$）只是分布距离的代理，与 $\alpha$ 不直接等价。capacity-limited draft 模型在 KL 下可能学到「分布平均形状接近」但「具体 token 的 $\min(p, q)$ 之和不最大」的解——KL 是 smooth 的距离，对个别 token 的偏差惩罚不直接对应 $\min(p, q)$ 的损失。</p>
+<p>K3 报告 <sup>[C6]</sup> 明确指出：「minimizing the conventional KL-divergence surrogate does not guarantee maximizing this rate for a capacity-limited draft model」。原因是 KL 散度（无论 $\mathrm{KL}(p \| q)$ 还是 $\mathrm{KL}(q \| p)$）只是分布距离的代理，与 $\alpha$ 不直接等价。capacity-limited draft 模型在 KL 下可能学到「分布平均形状接近」但「具体 token 的 $\min(p, q)$ 之和不最大」的解——KL 是 smooth 的距离，对个别 token 的偏差惩罚不直接对应 $\min(p, q)$ 的损失。</p>
 
 <details>
 <summary>补充：从 α = 1 - TV(p, q) 出发说明 LK loss 的梯度方向</summary>
@@ -1066,27 +1066,27 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <h3 id="k3-mtp-init">MTP 层初始化</h3>
 
-<p>K3 在预训练阶段使用了 multi-token-prediction（MTP）层——这是一种让模型一次预测多个未来 token 的预训练目标。MTP 层结构镜像 backbone block、单层 decoder，与 EAGLE-3 draft 架构天然匹配。K3 把预训练好的 MTP 层 fine-tune 成 EAGLE-3-style draft 模型：target 模型冻结、只更新 draft 层和 feature-fusion 投影 $W_{E3}$ [C7]。TTT unroll 长度为 7 步 [N4]——即训练时 draft 展开 7 步（K3 报告未给出推理时 γ 的具体值，训练 unroll 与推理 γ 的对应关系属设计意图、非报告明示）。</p>
+<p>K3 在预训练阶段使用了 multi-token-prediction（MTP）层——这是一种让模型一次预测多个未来 token 的预训练目标。MTP 层结构镜像 backbone block、单层 decoder，与 EAGLE-3 draft 架构天然匹配。K3 把预训练好的 MTP 层 fine-tune 成 EAGLE-3-style draft 模型：target 模型冻结、只更新 draft 层和 feature-fusion 投影 $W_{E3}$ <sup>[C7]</sup>。TTT unroll 长度为 7 步 <sup>[N4]</sup>——即训练时 draft 展开 7 步。K3 报告未给出推理时 γ 的具体值；γ 是部署时可配置的草稿长度参数。</p>
 
 <h3 id="k3-feature-fusion">三层 feature 来源与 W_E3 初始化</h3>
 
-<p>K3 的 draft 输入融合 target 的 low/mid/high feature，分别取自第 1、第 4、最后一个 AttnRes blocks 的输出 [C8]（AttnRes 是 K3 的注意力残差块，见 K3 报告 §2.2）。融合矩阵 $W_{E3}$ 初始化为 $[0\, 0\, I]$（列拼接的零矩阵、零矩阵、单位矩阵），使得初始 fused feature 等于 high-level feature $h_h$——这正是 MTP 层预训练时用的输入。这样初始化让 fine-tune 开始时 draft 的输入分布与预训练时一致，训练中 $W_{E3}$ 逐渐学到 incorporate low/mid feature [C8]。</p>
+<p>K3 的 draft 输入融合 target 的 low/mid/high feature，分别取自第 1、第 4、最后一个 AttnRes blocks 的输出 <sup>[C8]</sup>（AttnRes 是 K3 的注意力残差块，见 K3 报告 §2.2）。融合矩阵 $W_{E3}$ 初始化为 $[0\, 0\, I]$（列拼接的零矩阵、零矩阵、单位矩阵），使得初始 fused feature 等于 high-level feature $h_h$——这正是 MTP 层预训练时用的输入。这样初始化让 fine-tune 开始时 draft 的输入分布与预训练时一致，训练中 $W_{E3}$ 逐渐学到 incorporate low/mid feature <sup>[C8]</sup>。</p>
 
 <h3 id="k3-qat-config">QAT 配置：draft 与 target 共享</h3>
 
-<p>K3 的 draft fine-tuning 沿用后训练 QAT 配置 [C9]：MoE 专家权重 MXFP4、输入激活 MXFP8、非专家模块保持高精度。这与 target 共享同一 QAT 方案，消除 train-inference mismatch——draft 训练时见到的量化精度与推理时一致。QAT 机制的完整讲解见 <a href="../../wiki/mxfp4-qat/index.html">MXFP4 量化感知训练</a>，本页只引用其配置。</p>
+<p>K3 的 draft fine-tuning 沿用后训练 QAT 配置 <sup>[C9]</sup>：MoE 专家权重 MXFP4、输入激活 MXFP8、非专家模块保持高精度。这与 target 共享同一 QAT 方案，消除 train-inference mismatch——draft 训练时见到的量化精度与推理时一致。QAT 机制的完整讲解见 <a href="../../wiki/mxfp4-qat/index.html">MXFP4 量化感知训练</a>，本页只引用其配置。</p>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th>配置项</th><th>K3 的选择</th><th>来源</th></tr></thead>
 <tbody>
-<tr><td>draft 初始化</td><td>预训练 MTP 层（镜像 backbone、单层 decoder）</td><td>[C7]</td></tr>
-<tr><td>fine-tune 范围</td><td>target 冻结，只更新 draft 层 + $W_{E3}$</td><td>[C7]</td></tr>
-<tr><td>三层 feature 来源</td><td>1st、4th、final AttnRes blocks 输出</td><td>[C8]</td></tr>
-<tr><td>$W_{E3}$ 初始化</td><td>$[0\, 0\, I]$，初始 fused = $h_h$</td><td>[C8]</td></tr>
-<tr><td>TTT unroll 长度</td><td>7 步</td><td>[N4]</td></tr>
-<tr><td>损失函数</td><td>$L_{\text{LK}} = -\log \sum_x \min(p, q)$</td><td>[F4]</td></tr>
-<tr><td>QAT 配置</td><td>MoE 专家 MXFP4 + 激活 MXFP8，非专家高精度</td><td>[C9]</td></tr>
+<tr><td>draft 初始化</td><td>预训练 MTP 层（镜像 backbone、单层 decoder）</td><td><sup>[C7]</sup></td></tr>
+<tr><td>fine-tune 范围</td><td>target 冻结，只更新 draft 层 + $W_{E3}$</td><td><sup>[C7]</sup></td></tr>
+<tr><td>三层 feature 来源</td><td>1st、4th、final AttnRes blocks 输出</td><td><sup>[C8]</sup></td></tr>
+<tr><td>$W_{E3}$ 初始化</td><td>$[0\, 0\, I]$，初始 fused = $h_h$</td><td><sup>[C8]</sup></td></tr>
+<tr><td>TTT unroll 长度</td><td>7 步</td><td><sup>[N4]</sup></td></tr>
+<tr><td>损失函数</td><td>$L_{\text{LK}} = -\log \sum_x \min(p, q)$</td><td><sup>[F4]</sup></td></tr>
+<tr><td>QAT 配置</td><td>MoE 专家 MXFP4 + 激活 MXFP8，非专家高精度</td><td><sup>[C9]</sup></td></tr>
 </tbody>
 </table>
 </div>
@@ -1096,9 +1096,9 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 <p>EAGLE-3 的边界与不展开内容总结：</p>
 
 <ul>
-  <li><strong>解决</strong>：单流自回归解码的延迟（与投机解码边界一致，见 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 第 6 章）。</li>
-  <li><strong>不解决</strong>：高并发批处理的吞吐；EAGLE-3 在 SGLang batch=64 时吞吐提升 1.38x [N2]，但更高批处理下仍可能退化。</li>
-  <li><strong>不改变</strong>：投机解码的接受/拒绝规则、残差分布、bonus token；输出分布与纯 target 采样完全相同（lossless）[C10]。</li>
+  <li><strong>解决</strong>：单流自回归解码的延迟（与投机解码边界一致，见 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「工程实例与边界」一章）。</li>
+  <li><strong>不解决</strong>：高并发批处理的吞吐；EAGLE-3 在 SGLang batch=64 时吞吐提升 1.38x <sup>[N2]</sup>，更高批处理下加速退化（与投机解码边界一致）。</li>
+  <li><strong>不改变</strong>：投机解码的接受/拒绝规则、残差分布、bonus token；输出分布与纯 target 采样完全相同（lossless）<sup>[C10]</sup>。</li>
   <li><strong>不展开</strong>：EAGLE-2 的动态 draft tree。EAGLE-3 沿用 EAGLE-2 的 context-aware 动态 tree，但其剪枝机制不是 EAGLE-3 的核心创新，本页只在边界处提及。</li>
   <li><strong>不展开</strong>：tree attention / tree mask 的实现。这是验证阶段对多候选并行打分的工程实现，与 draft 模型本身正交。</li>
   <li><strong>不展开</strong>：与 Medusa、Lookahead、SpecDec 等其他 draft 方法的对比；这些是与 EAGLE 并列的方案。</li>
@@ -1113,6 +1113,8 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
   <li>说出 K3 draft fine-tuning 的 QAT 配置。</li>
   <li>说出至少两条 EAGLE-3 不展开或边界的内容，并各给一个理由。</li>
 </ul>
+
+<p>回到开篇的五个问题：EAGLE 系列复用 target 隐藏状态替代独立小模型，draft 单步成本趋近 0、分布更贴近 target，同时降低成本与提高接受率；EAGLE-3 在 EAGLE-1 基础上做两项改变——直接 token 预测释放容量、多层特征融合补全信息；推理时单层 decoder 第一步用 target 真实 feature、后续自替代，因为新位置的 target feature 在验证前不存在；training-time test 让 draft 训练时体验自替代噪声，K3 用 LK loss 直接优化接受率而非 KL 代理；K3 把预训练 MTP 层 fine-tune 成 EAGLE-3 draft，与 target 共享 QAT 配置。本文到此结束，下一节给出所有论断、公式、数字的来源与教学说明。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
@@ -1136,7 +1138,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <p>[C9] K3 draft fine-tuning 沿用 QAT 配置：K3 报告 §4.1.4 末段。原文「Draft fine-tuning follows the post-training QAT configuration (§ 4.1.4), with MoE expert weights in MXFP4 and their input activations in MXFP8, while non-expert modules remain in higher precision.」</p>
 
-<p>[C10] EAGLE 系列不改变投机解码框架、lossless：投机解码框架见 Leviathan et al. 2023 (arXiv:2211.17192) §3 Theorem 2；EAGLE-1 摘要「maintaining the distribution of the generated text」；EAGLE-3 摘要「ensuring lossless performance」；前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 第 3 章已证明。</p>
+<p>[C10] EAGLE 系列不改变投机解码框架、lossless：投机解码框架见 Leviathan et al. 2023 (arXiv:2211.17192) §3 Theorem 2；EAGLE-1 摘要「maintaining the distribution of the generated text」；EAGLE-3 摘要「ensuring lossless performance」；前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「为什么这条规则能保分布」一章已证明。</p>
 
 <h3>核心公式与来源</h3>
 
@@ -1148,7 +1150,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <p>[F4] K3 LK loss $L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x), q(x))$：K3 报告 §4.1.4 Eq.(16)。</p>
 
-<p>[F5] 接受率 $\alpha = \sum_x \min(p, q) = 1 - \mathrm{TV}(p, q)$：Leviathan et al. 2023 §3（α 定义）；$\alpha = 1 - \mathrm{TV}(p, q)$ 由 $\min(a, b) = (a + b - |a - b|)/2$ 推出。前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 第 3 章已证明。</p>
+<p>[F5] 接受率 $\alpha = \sum_x \min(p, q) = 1 - \mathrm{TV}(p, q)$：Leviathan et al. 2023 §3（α 定义）；$\alpha = 1 - \mathrm{TV}(p, q)$ 由 $\min(a, b) = (a + b - |a - b|)/2$ 推出。前置概念页 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「为什么这条规则能保分布」一章已证明。</p>
 
 <h3>外部数字与实验条件</h3>
 
@@ -1167,26 +1169,26 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 <p>本页的教学数字均为人为构造，目的是便于手算：</p>
 
 <ul>
-  <li>S4 的「prefix = How can I、γ = 3、k = 4、词表 5 token」手算例子：纯粹构造，目的是覆盖「第一步真实 g、后续自替代 a」三步并让 L2 偏差可计算。$g_{\text{how}}, g_{\text{can}}, g_{\text{I}}$ 取一位小数；$W_a, W_{\text{lm}}$ 的非零元素选择让 $W_a \cdot \text{input}$ 的每行只需 2-3 次乘法即可手算。不代表真实模型分布或权重。</li>
-  <li>S4 的 token embedding 用 one-hot：真实模型用学习的 dense embedding（k 维，k 通常 4096+）。本简化是为了手算可行性，不改变「自替代」机制的数学结构。</li>
-  <li>S4 的 draft 单层 decoder 简化为「线性变换 + tanh」：真实 EAGLE-3 draft 是完整的 transformer decoder 层（含 self-attention、MLP、layer norm）。本简化省略的组件不改变「输入 concat(g, e)、输出 a、a 进入下一步作为 g 替代」的机制主线。</li>
-  <li>S5 的 TTT 因果 mask 图示：简化版，只展示「第 1 轮真实、第 2、3 轮自替代」的时序关系，不展示具体的 attention 计算细节。</li>
+  <li>推理时自回归 draft 一章的「prefix = How can I、γ = 3、k = 4、词表 5 token」手算例子：纯粹构造，目的是覆盖「第一步真实 g、后续自替代 a」三步并让 L2 偏差可计算。$g_{\text{how}}, g_{\text{can}}, g_{\text{I}}$ 取一位小数；$W_a, W_{\text{lm}}$ 的非零元素选择让 $W_a \cdot \text{input}$ 的每行只需 2-3 次乘法即可手算。不代表真实模型分布或权重。</li>
+  <li>教学示例的 token embedding 用 one-hot：真实模型用学习的 dense embedding（k 维，k 通常 4096+）。本简化是为了手算可行性，不改变「自替代」机制的数学结构。</li>
+  <li>教学示例的 draft 单层 decoder 简化为「线性变换 + tanh」：真实 EAGLE-3 draft 是完整的 transformer decoder 层（含 self-attention、MLP、layer norm）。本简化省略的组件不改变「输入 concat(g, e)、输出 a、a 进入下一步作为 g 替代」的机制主线。</li>
+  <li>训练 draft 模型一章的 TTT 因果 mask 图示：简化版，只展示「第 1 轮真实、第 2、3 轮自替代」的时序关系，不展示具体的 attention 计算细节。</li>
 </ul>
 
 <h3>教学解释与类比边界</h3>
 
-<p>S5 的「TTT 像在带噪声的数据上练答」类比：只帮助理解 TTT 的动机——让 draft 训练时见到推理时会遇到的「自替代」噪声。失效边界：不覆盖具体的因果 mask 实现（mask 细节见论文 Figure 6）；不保证 TTT 一定能完全消除深度衰减（消除程度取决于训练数据与 unroll 长度）；不等价于「在推理时实时 fine-tune」（TTT 是训练阶段一次性完成、推理时 draft 参数固定）。正式判断仍以训练损失公式 [F3][F4] 和论文实验为准。</p>
+<p>训练 draft 模型一章的「TTT 像在带噪声的数据上练答」类比：只帮助理解 TTT 的动机——让 draft 训练时见到推理时会遇到的「自替代」噪声。失效边界：不覆盖具体的因果 mask 实现（mask 细节见论文 Figure 6）；不保证 TTT 一定能完全消除深度衰减（消除程度取决于训练数据与 unroll 长度）；不等价于「在推理时实时 fine-tune」（TTT 是训练阶段一次性完成、推理时 draft 参数固定）。正式判断仍以训练损失公式 [F3][F4] 和论文实验为准。</p>
 
-<p>S1 的「EAGLE 系列只替换 draft 角色」表述：只帮助划清 EAGLE-3 与投机解码框架的边界。失效边界：不覆盖 EAGLE-3 与 tree attention、动态 draft tree 等验证侧组件的协同（这些见 [S6 边界] 不展开部分）；不覆盖 EAGLE-3 在 batch 推理下的具体行为（与单流情形不同）。</p>
+<p>思路转向一章的「EAGLE 系列只替换 draft 角色」表述：只帮助划清 EAGLE-3 与投机解码框架的边界。失效边界：不覆盖 EAGLE-3 与 tree attention、动态 draft tree 等验证侧组件的协同（这些见工程实例与边界一章的不展开部分）；不覆盖 EAGLE-3 在 batch 推理下的具体行为（与单流情形不同）。</p>
 
 <h3>教学简化及其限制</h3>
 
 <ul>
-  <li>词表缩小到 5 个 token（S4 手算例子）：真实模型词表 3-30 万 token，无法手算。本简化是为了展示「自替代」机制，不改变接受/拒绝规则的数学形式。可推出：机制在 5-token 词表上的行为。不可推出：真实大词表下的接受率（α 需在真实分布上测量）。</li>
-  <li>token embedding 用 one-hot（S4）：真实模型用 dense embedding。本简化让「输入向量」可直接写出，不改变 draft 单层 decoder 的输入输出结构。可推出：单步计算的代数过程。不可推出：真实 embedding 下的数值表现。</li>
-  <li>draft 单层 decoder 简化为「线性 + tanh」（S4）：真实 EAGLE-3 draft 是完整 transformer decoder 层。本简化让手算可行，不改变「自替代」机制。可推出：第一步真实 g、后续用 a 替代的代数结构。不可推出：真实 decoder 下的接受率（需要完整模型实测）。</li>
-  <li>TTT 因果 mask 简化为示意图（S5）：真实的 mask 涉及多轮展开的具体位置配对，本简化只展示时序关系。可推出：训练时 draft 见到自己的输出作为输入。不可推出：具体 attention 计算细节。</li>
-  <li>K3 工程实例只列配置项（S6）：K3 报告未给出具体训练数据集、训练步数、学习率等细节；本页只引用报告明确给出的配置（MTP 初始化、$W_{E3}$、三层 feature 来源、TTT 长度、QAT 配置）。可推出：K3 用 EAGLE-3 的工程选择。不可推出：训练超参数与实测加速比。</li>
+  <li>词表缩小到 5 个 token（教学示例）：真实模型词表 3-30 万 token，无法手算。本简化是为了展示「自替代」机制，不改变接受/拒绝规则的数学形式。可推出：机制在 5-token 词表上的行为。不可推出：真实大词表下的接受率（α 需在真实分布上测量）。</li>
+  <li>token embedding 用 one-hot（教学示例）：真实模型用 dense embedding。本简化让「输入向量」可直接写出，不改变 draft 单层 decoder 的输入输出结构。可推出：单步计算的代数过程。不可推出：真实 embedding 下的数值表现。</li>
+  <li>draft 单层 decoder 简化为「线性 + tanh」（教学示例）：真实 EAGLE-3 draft 是完整 transformer decoder 层。本简化让手算可行，不改变「自替代」机制。可推出：第一步真实 g、后续用 a 替代的代数结构。不可推出：真实 decoder 下的接受率（需要完整模型实测）。</li>
+  <li>TTT 因果 mask 简化为示意图（训练 draft 模型一章）：真实的 mask 涉及多轮展开的具体位置配对，本简化只展示时序关系。可推出：训练时 draft 见到自己的输出作为输入。不可推出：具体 attention 计算细节。</li>
+  <li>K3 工程实例只列配置项（工程实例一章）：K3 报告未给出具体训练数据集、训练步数、学习率等细节；本页只引用报告明确给出的配置（MTP 初始化、$W_{E3}$、三层 feature 来源、TTT 长度、QAT 配置）。可推出：K3 用 EAGLE-3 的工程选择。不可推出：训练超参数与实测加速比。</li>
 </ul>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

@@ -652,18 +652,13 @@
 <h1 class="title">LatentMoE：把路由专家放进紧凑隐空间，扩大专家池不让通信与显存带宽线性增长</h1>
 <p class="reading-time" id="readingTime"></p>
 
+<blockquote class="meta">
+<p><b>主要依据</b>：Elango et al., 2026, "LatentMoE: Toward Optimal Accuracy per FLOP and Parameter in Mixture of Experts", arXiv:2601.18089（NVIDIA，引用为 [L]）；Kimi K3 技术报告 §2.3（引用为 [K3]）；逐条定位见文末"来源与教学说明"。</p>
+</blockquote>
+
 <p>一个 MoE 层有 256 个路由专家、每 token 激活 8 个，想扩到 896 个专家、每 token 激活 16 个——直觉上"专家多了、每个 token 走的路径多了"应该更好。但在分布式部署里，每多一个被选中的专家，就要把整个 $d$ 维向量送过去、把 $d$ 维变换后的向量取回来，还要从显存读一份 $d$ 维的专家权重。扩大路由倍数时，这部分通信与显存带宽随路由倍数线性增长，常常比 FLOPs 本身更先到瓶颈。LatentMoE 用两次投影把路由专家放进更窄的隐空间，让这部分开销不再随全宽 $d$ 走。</p>
 
-<p>一句话说清本页内容：LatentMoE 是一种 MoE 架构，把路由专家的输入输出从模型全宽 $d$ 投影到更窄的隐空间 $\ell$（$\ell < d$）再计算，使扩大专家池时路由通信与专家权重流量不再随路由倍数线性增长。它要解决的是标准 MoE 在分布式部署下"路由部分开销随 $d$ 线性增长"的瓶颈，并把节省的预算重新投入到更多专家与更高 top-k。</p>
-
-<div class="context-box">
-  <p class="context-box-title">开始之前</p>
-  <div class="context-grid">
-    <div class="context-label">本页位置</div><div class="context-value">讲清 LatentMoE 这一通用架构概念（以 NVIDIA 论文 arXiv:2601.18089 为主源）；K3 的 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 是它的稳定化变体，由独立概念页负责</div>
-    <div class="context-label">读者设定</div><div class="context-value">已了解 top-K MoE 的基本概念（router、top-k、加权和）与 shared+routed 专家组织；若没有，先读<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 2、3 章与<a href="../deepseek-moe/index.html">《DeepSeekMoE》</a></div>
-    <div class="context-label">不讲什么</div><div class="context-value">Stable LatentMoE 的三件稳定化（RMSNorm 位置、SiTU-GLU、Quantile Balancing）——见<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>；路由打分细节；MoE 服务部署的工程细节</div>
-  </div>
-</div>
+<p>本页以 NVIDIA 论文 arXiv:2601.18089 为主源，讲清 LatentMoE 通用架构——它把路由专家的输入输出从模型全宽 $d$ 投影到更窄的隐空间 $\ell$（$\ell < d$）再计算，使扩大专家池时路由通信与专家权重流量不再随路由倍数线性增长，并把节省的预算重新投入到更多专家与更高 top-k。K3 的 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 是它的稳定化变体，由独立概念页负责。读者应已了解 top-K MoE 的基本概念（router、top-k、加权和）与 shared+routed 专家组织；若没有，先读<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 2、3 章与<a href="../deepseek-moe/index.html">《DeepSeekMoE》</a>。本页要回答：LatentMoE 用什么结构变化缓解路由开销？省下的预算花到哪里？压缩比能不能无限放大？</p>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
@@ -676,23 +671,20 @@
   </ul>
 </section>
 
-<div class="callout callout-blue">
-<p><b>最容易误解：</b>LatentMoE 不是把整个模型压窄——只压窄路由分支；共享专家与 router 仍在全宽 $d$ 工作。压缩比 $d/\ell = 4$ 也不意味着整个 MoE 层快 4 倍——只压缩了路由部分的通信与权重流量，down/up-projection 本身还有计算成本。</p>
-</div>
+<section class="misconceptions">
+  <h2>最容易误解</h2>
+  <p>LatentMoE 不是把整个模型压窄——只压窄路由分支；共享专家与 router 仍在全宽 $d$ 工作。压缩比 $d/\ell = 4$ 也不意味着整个 MoE 层快 4 倍——只压缩了路由部分的通信与权重流量，down/up-projection 本身还有计算成本。</p>
+</section>
 
-<blockquote class="meta">
-<p><b>主要依据</b>：Elango et al., 2026, "LatentMoE: Toward Optimal Accuracy per FLOP and Parameter in Mixture of Experts", arXiv:2601.18089（NVIDIA，引用为 [L]）；Kimi K3 技术报告 §2.3（引用为 [K3]）；逐条定位见文末"来源与教学说明"。</p>
-</blockquote>
-
-<h2 id="s1-standard-moe-cost">扩大专家池的代价：标准 MoE 的全宽路由开销</h2>
+<h2 id="standard-moe-cost">扩大专家池的代价——标准 MoE 的全宽路由开销</h2>
 
 <p>先回顾标准 MoE 层的结构（完整机制见<a href="../moe-serving/index.html">前置概念页</a>第 2 章）。一层里有 $N$ 个路由专家（每个是一个小 FFN），每来一个 token，router 给所有专家打分，只让得分最高的 $k$ 个（top-$k$）专家真正计算，最后按门控权重 $g_i$ 加权求和：</p>
 
 <p>$$y(x)=\sum_{i\in S_k(x)} g_i(x)\cdot E_i(x)$$</p>
 
-<p>这里 $x \in \mathbb{R}^d$ 是 token 的输入向量，$d$ 是模型隐层宽度；$E_i(x)$ 是第 $i$ 个路由专家对 $x$ 的输出，仍是 $d$ 维；$S_k(x)$ 是 router 为 $x$ 选中的 $k$ 个专家下标集合；$g_i(x)$ 是门控权重。关键事实是：<strong>每个被选中的路由专家都接收完整的 $d$ 维 token、输出 $d$ 维，专家 FFN 的权重矩阵也在 $d$ 维空间</strong>（论断 C2）。</p>
+<p>这里 $x \in \mathbb{R}^d$ 是 token 的输入向量，$d$ 是模型隐层宽度；$E_i(x)$ 是第 $i$ 个路由专家对 $x$ 的输出，仍是 $d$ 维；$S_k(x)$ 是 router 为 $x$ 选中的 $k$ 个专家下标集合；$g_i(x)$ 是门控权重。关键事实是：<strong>每个被选中的路由专家都接收完整的 $d$ 维 token、输出 $d$ 维，专家 FFN 的权重矩阵也在 $d$ 维空间</strong><sup>[C2]</sup>。</p>
 
-<p>在分布式部署里（专家并行 EP，把专家分片到多张 GPU，见<a href="../moe-serving/index.html">前置页</a>第 3 章），这一点会变成真实的开销。每个"token–专家"对都要 dispatch 一个 $d$ 维向量到选中专家所在的卡、combine 一个 $d$ 维向量回来，这一步通常用 all-to-all 通信实现。同时每个被选中的专家要从 GPU 高速显存（HBM）读一份 $d$ 维的 FFN 权重才能算——在低延迟场景下，这部分读取常常是延迟大头（论断 C2、设计原则 1、2）。</p>
+<p>在分布式部署里（专家并行 EP，把专家分片到多张 GPU，见<a href="../moe-serving/index.html">前置页</a>第 3 章），这一点会变成真实的开销。每个"token–专家"对都要 dispatch 一个 $d$ 维向量到选中专家所在的卡、combine 一个 $d$ 维向量回来，这一步通常用 all-to-all 通信实现。同时每个被选中的专家要从 GPU 高速显存（HBM）读一份 $d$ 维的 FFN 权重才能算——在低延迟场景下，这部分读取常常是延迟大头<sup>[C2]</sup>（设计原则 1、2）。</p>
 
 <p><strong>教学示例。</strong> 取 $d=4096$。若每 token 激活 $k=8$ 个路由专家，那么每 token 的路由 dispatch 量是 $k \times d = 8 \times 4096 = 32768$ 个数；扩到 $k=16$ 时翻倍到 $65536$ 个数。每个被选中的专家还要从 HBM 读一份 $d$ 维权重的 FFN，这部分流量也随 $k$ 线性增长。扩大路由倍数（$N$ 与 $k$ 同时放大）时，dispatch 通信量 $\propto k \cdot d$、专家权重读取量 $\propto k \cdot d$——FLOPs 也涨，但通信与带宽常常先到瓶颈。</p>
 
@@ -705,17 +697,19 @@
   <li>说明为什么"扩大专家池"在分布式部署下会让通信与显存带宽先到瓶颈，而不是 FLOPs。</li>
 </ul>
 
-<h2 id="s2-latent-moe-layer">LatentMoE 的层结构：共享分支全宽、路由分支隐空间</h2>
+<p>本章明确了标准 MoE 的路由部分开销随 $d$ 线性增长的瓶颈。但 LatentMoE 如何用投影把路由专家搬进更窄的隐空间——下一章讲层结构。</p>
 
-<p>LatentMoE 沿用 DeepSeekMoE 提出的"共享专家 + 路由专家"组织（见<a href="../deepseek-moe/index.html">DeepSeekMoE 概念页</a>）：共享专家对所有 token 恒激活、承载通用变换；路由专家参与 top-$k$ 选择、承载差异化变换。在此之上，LatentMoE 做了一个关键改造——<strong>把路由分支的两端各加一次共享线性投影，让路由专家在一个比 $d$ 更窄的隐空间 $\ell$ 里工作</strong>（论断 C1）。</p>
+<h2 id="latent-moe-layer">LatentMoE 的层结构——共享分支全宽、路由分支隐空间</h2>
+
+<p>LatentMoE 沿用 DeepSeekMoE 提出的"共享专家 + 路由专家"组织（见<a href="../deepseek-moe/index.html">DeepSeekMoE 概念页</a>）：共享专家对所有 token 恒激活、承载通用变换；路由专家参与 top-$k$ 选择、承载差异化变换。在此之上，LatentMoE 做了一个关键改造——<strong>把路由分支的两端各加一次共享线性投影，让路由专家在一个比 $d$ 更窄的隐空间 $\ell$ 里工作</strong><sup>[C1]</sup>。</p>
 
 <p>具体做法分三步。第一，下投影 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 把 token 从模型全宽 $d$ 压到隐空间 $\ell$：</p>
 
 <p>$$z = W_\downarrow x, \qquad z \in \mathbb{R}^\ell, \quad \ell < d.$$</p>
 
-<p>第二，router 仍从全宽 $x \in \mathbb{R}^d$ 计算门控决策（论断 C7），选出的 top-$k$ 个路由专家在隐空间 $\mathbb{R}^\ell$ 内对 $z$ 做变换 $E_i^{\text{routed}}: \mathbb{R}^\ell \to \mathbb{R}^\ell$，输出仍是 $\ell$ 维；这些 $\ell$ 维输出按门控权重加权聚合得到 $u \in \mathbb{R}^\ell$。第三，上投影 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 把 $u$ 投回全宽 $d$。共享专家则不走隐空间——直接吃 $x \in \mathbb{R}^d$、输出 $\mathbb{R}^d$。</p>
+<p>第二，router 仍从全宽 $x \in \mathbb{R}^d$ 计算门控决策<sup>[C7]</sup>，选出的 top-$k$ 个路由专家在隐空间 $\mathbb{R}^\ell$ 内对 $z$ 做变换 $E_i^{\text{routed}}: \mathbb{R}^\ell \to \mathbb{R}^\ell$，输出仍是 $\ell$ 维；这些 $\ell$ 维输出按门控权重加权聚合得到 $u \in \mathbb{R}^\ell$。第三，上投影 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 把 $u$ 投回全宽 $d$。共享专家则不走隐空间——直接吃 $x \in \mathbb{R}^d$、输出 $\mathbb{R}^d$。</p>
 
-<p>把两支合起来，LatentMoE 层的完整公式为（公式 F2）：</p>
+<p>把两支合起来，LatentMoE 层的完整公式为<sup>[F2]</sup>：</p>
 
 <p>$$u = \sum_{i \in T_k(x)} p_i \cdot E_i^{\text{routed}}(W_\downarrow x), \qquad y = \sum_{j=1}^{N_s} E_j^{\text{shared}}(x) + W_\uparrow u$$</p>
 
@@ -798,9 +792,9 @@
 
 <p>结构看清楚了。那把路由宽度从 $d$ 压到 $\ell$ 到底省了多少、省下的预算花到哪里？</p>
 
-<h2 id="s3-compression-reinvestment">压缩比与 Reinvestment：省下的预算花到哪里</h2>
+<h2 id="compression-reinvestment">压缩比与 Reinvestment——省下的预算花到哪里</h2>
 
-<p>把路由宽度从 $d$ 压到 $\ell$，最直接的效果是路由部分的开销按比例缩小。论文 Figure 1 的标题给出定量关系（论断 C3、公式 F3）：<strong>路由 dispatch 通信量与路由专家权重大小都大致按 $d/\ell$ 比例缩小</strong>。注意"大致"——down/up-projection 本身有计算成本，所以这是路由部分的缩小比例，不是整个 MoE 层的加速比（下一章展开）。</p>
+<p>把路由宽度从 $d$ 压到 $\ell$，最直接的效果是路由部分的开销按比例缩小。论文 Figure 1 的标题给出定量关系<sup>[C3, F3]</sup>：<strong>路由 dispatch 通信量与路由专家权重大小都大致按 $d/\ell$ 比例缩小</strong>。注意"大致"——down/up-projection 本身有计算成本，所以这是路由部分的缩小比例，不是整个 MoE 层的加速比（下一章展开）。</p>
 
 <p><strong>教学示例。</strong> 取 $d=4096$、$\ell=1024$，压缩比 $d/\ell = 4$。对照上一章的 dispatch 量：</p>
 
@@ -816,15 +810,15 @@
 
 <p>路由专家的 FFN 权重也同步缩小：原本每个专家的输入是 $d$ 维、权重矩阵正比于 $d$，现在输入是 $\ell$ 维、权重矩阵正比于 $\ell$，单个路由专家的权重大小也缩小约 $4\times$。router 与共享专家仍在 $d$ 维，不受这个比例影响。</p>
 
-<p>那么省下的预算花到哪里？论文给出的策略是 <strong>reinvestment</strong>（论断 C4、公式 F4）：把节省的预算同时投入到更大的专家数 $N$ 与更高的 top-$k$，按同一因子 $\alpha = d/\ell$ 放大。这样组合数从 $\binom{N}{k}$ 涨到 $\binom{\alpha N}{\alpha k}$，专家搭配的多样性显著提升，从而在保持服务成本大致不变的前提下提升准确率。</p>
+<p>那么省下的预算花到哪里？论文给出的策略是 <strong>reinvestment</strong><sup>[C4, F4]</sup>：把节省的预算同时投入到更大的专家数 $N$ 与更高的 top-$k$，按同一因子 $\alpha = d/\ell$ 放大。这样组合数从 $\binom{N}{k}$ 涨到 $\binom{\alpha N}{\alpha k}$，专家搭配的多样性显著提升，从而在保持服务成本大致不变的前提下提升准确率。</p>
 
-<p><strong>教学示例（贯穿推进）。</strong> 在 $d=4096, \ell=1024$（$\alpha = 4$）的基础上，取初始 $N=8, k=2$。reinvestment 后 $N' = \alpha N = 32$、$k' = \alpha k = 8$。组合数变化：</p>
+<p><strong>教学示例（沿用上面的参数）。</strong> 在 $d=4096, \ell=1024$（$\alpha = 4$）的基础上，取初始 $N=8, k=2$。reinvestment 后 $N' = \alpha N = 32$、$k' = \alpha k = 8$。组合数变化：</p>
 
 <p>$$\binom{8}{2} = 28 \;\longrightarrow\; \binom{32}{8} = 10{,}518{,}300$$</p>
 
 <p>组合数从 28 涨到约 1052 万——一个 token 能走的专家搭配数暴涨了约 37 万倍，而路由部分的服务成本（通信 + 显存带宽）按上面的比例基本不变。这就是 LatentMoE 区别于"单纯压缩"的关键：<strong>它不是让模型更小，而是把同样的服务预算换成更多专家、更高 top-k，换取更强的专家专门化潜力</strong>。</p>
 
-<p>这里有一个关键约束（论断 C4）。论文把非线性容量定义为 $\text{top-}k \times \text{专家中间维度}$。压缩 $d\to\ell$ 时保持非线性容量不变（设计原则 III：保持 $K$ 与中间维度 $m$ 不变，$U_\text{eff}=K\cdot m$ 不变）；reinvestment（设计原则 V）按 $\alpha$ 放大 $K$ 与 $N$，$m$ 保持不变，$U_\text{eff}$ 随 $K$ 放大而<strong>提升</strong>——这是 reinvestment 提升准确率的机制之一。两种情况下中间维度 $m$ 都不缩小：压缩 $\ell$ 只缩路由专家的输入输出宽度，不是缩小中间维度；放大 $k$ 时 $m$ 也不动（否则单专家表达能力下降）。这与 DeepSeekMoE 的"细粒度分割"（把专家切小、激活数同步增加以保持计算量守恒）思路不同——LatentMoE 压的是宽度，DeepSeekMoE 切的是专家本身。</p>
+<p>这里有一个关键约束<sup>[C4]</sup>。论文把非线性容量定义为 $\text{top-}k \times \text{专家中间维度}$。压缩 $d\to\ell$ 时保持非线性容量不变（设计原则 III：保持 $K$ 与中间维度 $m$ 不变，$U_\text{eff}=K\cdot m$ 不变）；reinvestment（设计原则 V）按 $\alpha$ 放大 $K$ 与 $N$，$m$ 保持不变，$U_\text{eff}$ 随 $K$ 放大而<strong>提升</strong>——这是 reinvestment 提升准确率的机制之一。两种情况下中间维度 $m$ 都不缩小：压缩 $\ell$ 只缩路由专家的输入输出宽度，不是缩小中间维度；放大 $k$ 时 $m$ 也不动（否则单专家表达能力下降）。这与 DeepSeekMoE 的"细粒度分割"（把专家切小、激活数同步增加以保持计算量守恒）思路不同——LatentMoE 压的是宽度，DeepSeekMoE 切的是专家本身。</p>
 
 <div class="table-scroll">
 <table>
@@ -841,7 +835,7 @@
 </div>
 
 <details class="code-details">
-<summary>可运行代码：验证压缩比下 dispatch 量缩小与 reinvestment 后组合数变化</summary>
+<summary>代码：验证压缩比下 dispatch 量缩小与 reinvestment 后组合数变化</summary>
 <div class="code-block">
 <pre><code class="language-python">import math
 
@@ -888,7 +882,7 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
 
 投影参数量（W_down + W_up）: 2*4096*1024 = 8388608</code></pre>
 </div>
-<p><b>验证的机制</b>：<code>k * d</code> 与 <code>k * ell</code> 对应正文 dispatch 量公式，<code>dispatch_std / dispatch_lat</code> 对应压缩比 $d/\ell$（公式 F3）；<code>math.comb</code> 对应组合数 $\binom{N}{k} \to \binom{\alpha N}{\alpha k}$（公式 F4）；<code>2 * d * ell</code> 对应两个投影矩阵的参数量。</p>
+<p><b>验证的机制</b>：<code>k * d</code> 与 <code>k * ell</code> 对应正文 dispatch 量公式，<code>dispatch_std / dispatch_lat</code> 对应压缩比 $d/\ell$<sup>[F3]</sup>；<code>math.comb</code> 对应组合数 $\binom{N}{k} \to \binom{\alpha N}{\alpha k}$<sup>[F4]</sup>；<code>2 * d * ell</code> 对应两个投影矩阵的参数量。</p>
 <p><b>观察重点</b>：压缩比 4x 下 dispatch 量严格缩小 4 倍（与 $d/\ell$ 一致）；reinvestment 把组合数从 28 涨到 1052 万（约 37 万倍）——"服务成本基本不变、组合多样性显著增长"同时成立。投影参数量约 839 万，是 reinvestment 节省下的预算要消化的成本之一。</p>
 <p><b>教学简化</b>：代码只数 dispatch 量与组合数的"个数"，不涉及真实网络传输、专家权重矩阵形状与 batch 维度；投影参数量是粗略估计（$2 \cdot d \cdot \ell$），真实投影还有偏置与归一化。组合数假设 router 无约束地选任意 $k$ 个，实际还受负载均衡影响。</p>
 </details>
@@ -902,18 +896,18 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
 
 <p>压缩比听起来越大越好——但 $\ell$ 能不能无限压小？</p>
 
-<h2 id="s4-compression-limits">压缩下限与投影成本：为什么不能无限压窄</h2>
+<h2 id="compression-limits">压缩下限与投影成本——为什么不能无限压窄</h2>
 
 <p>LatentMoE 的压缩比 $d/\ell$ 受三条约束，不能无限放大。</p>
 
-<p><strong>约束一：任务相关的"特征秩"下限。</strong> 论文设计原则 4 指出，存在一个任务相关的"特征秩"（feature rank），它给 $\ell$ 设了下限——把 $\ell$ 压到低于此下限会损害模型质量（论断 C5）。这个下限不是普适常数，而是依赖任务与数据，需要实验确定。论文在 16B 参数规模的消融实验中发现，压缩比到 4 时模型质量仍可保持（数字 N4）；再压缩需配合 reinvestment 才不损失。</p>
+<p><strong>约束一：任务相关的"特征秩"下限。</strong> 论文设计原则 4 指出，存在一个任务相关的"特征秩"（feature rank），它给 $\ell$ 设了下限——把 $\ell$ 压到低于此下限会损害模型质量<sup>[C5]</sup>。这个下限不是普适常数，而是依赖任务与数据，需要实验确定。论文在 16B 参数规模的消融实验中发现，压缩比到 4 时模型质量仍可保持<sup>[N4]</sup>；再压缩需配合 reinvestment 才不损失。</p>
 
-<p><strong>约束二：down/up-projection 本身有计算成本。</strong> 两个投影矩阵 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 与 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 各要做一次矩阵乘法，这部分计算在标准 MoE 里不存在。论文在万亿参数规模（K2-1T）的投影分析中估计，这部分额外计算约 9%（数字 N5）。因此压缩比 $d/\ell$ 不等于整体加速比——只压缩了路由部分的通信与权重流量，投影还有成本（论断 C5）。</p>
+<p><strong>约束二：down/up-projection 本身有计算成本。</strong> 两个投影矩阵 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 与 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 各要做一次矩阵乘法，这部分计算在标准 MoE 里不存在。论文在万亿参数规模（K2-1T）的投影分析中估计，这部分额外计算约 9%<sup>[N5]</sup>。因此压缩比 $d/\ell$ 不等于整体加速比——只压缩了路由部分的通信与权重流量，投影还有成本<sup>[C5]</sup>。</p>
 
-<p><strong>约束三：只压缩不 reinvestment 会掉点。</strong> 论文消融实验显示，单纯压缩 $\ell$ 而不增加 $N$ 与 $k$ 会让质量下降；同时按 $\alpha = d/\ell$ 放大 $N$ 与 $k$ 才能保持甚至提升质量（数字 N4）。这与第 3 章的 reinvestment 策略直接呼应——reinvestment 不是可选项，而是 LatentMoE 维持质量的必要条件。</p>
+<p><strong>约束三：只压缩不 reinvestment 会掉点。</strong> 论文消融实验显示，单纯压缩 $\ell$ 而不增加 $N$ 与 $k$ 会让质量下降；同时按 $\alpha = d/\ell$ 放大 $N$ 与 $k$ 才能保持甚至提升质量<sup>[N4]</sup>。这与"压缩比与 Reinvestment"一章的 reinvestment 策略直接呼应——reinvestment 不是可选项，而是 LatentMoE 维持质量的必要条件。</p>
 
 <div class="callout callout-yellow">
-<p><b>注意边界：</b>压缩比 $d/\ell = 4$ 不意味着整个 MoE 层快 4 倍。第一，只压缩了路由部分的通信与权重流量，router 与共享专家仍在 $d$ 维。第二，down/up-projection 本身有计算成本（约 9%，数字 N5）。第三，$\ell$ 受特征秩下限约束，不能无限压小。LatentMoE 解决的是路由部分的开销，不解决 router 与共享专家的开销。</p>
+<p><b>注意边界：</b>压缩比 $d/\ell = 4$ 不意味着整个 MoE 层快 4 倍。第一，只压缩了路由部分的通信与权重流量，router 与共享专家仍在 $d$ 维。第二，down/up-projection 本身有计算成本（约 9%<sup>[N5]</sup>）。第三，$\ell$ 受特征秩下限约束，不能无限压小。LatentMoE 解决的是路由部分的开销，不解决 router 与共享专家的开销。</p>
 </div>
 
 <p>LatentMoE 的适用边界由此清晰：它解决"路由部分随 top-$k$ 与 $d$ 线性增长的通信与显存带宽开销"这一个问题；不解决 router 打分计算（仍在 $d$）、共享专家开销（仍在 $d$）、训练侧负载均衡。收益依赖任务特征秩与 reinvestment 配置，不保证在所有任务上都比标准 MoE 更好。</p>
@@ -928,12 +922,12 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
   <li>不要过度压缩特征（任务相关的特征秩下限）。</li>
   <li>利用组合稀疏性（同时增加 $N$ 与 $k$ 以扩大组合空间）。</li>
 </ol>
-<p>原则 1、2 对应 S1 的动机；原则 3（压缩时保持非线性容量不变）与原则 5（reinvestment 放大 $N,k$、$U_\text{eff}$ 提升）对应 S3；原则 4 对应本节约束一。来源：[L] §2。</p>
+<p>原则 1、2 对应"扩大专家池的代价"一章的动机；原则 3（压缩时保持非线性容量不变）与原则 5（reinvestment 放大 $N,k$、$U_\text{eff}$ 提升）对应"压缩比与 Reinvestment"一章；原则 4 对应本节约束一。来源：[L] §2。</p>
 </details>
 
 <details>
 <summary>补充：Nemotron-3 Super/Ultra 的 LatentMoE 配置</summary>
-<p>NVIDIA 的 Nemotron-3 Super 与 Ultra 是首批采用 LatentMoE 的公开模型（数字 N2、N3）：</p>
+<p>NVIDIA 的 Nemotron-3 Super 与 Ultra 是首批采用 LatentMoE 的公开模型<sup>[N2, N3]</sup>：</p>
 <ul>
   <li>Super：路由路径 $4096 \to 1024 \to 4096$（压缩 4x），120B 总参/12B 激活。</li>
   <li>Ultra：路由路径 $8192 \to 2048 \to 8192$（压缩 4x），550B 总参/55B 激活；每 MoE 层 512 路由专家、top-22、1 共享专家；路由专家中间维度 5120、共享专家中间维度 10240。</li>
@@ -950,9 +944,9 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
 
 <p>LatentMoE 是通用架构概念；K3 在此基础上做了什么？</p>
 
-<h2 id="s5-stable-latent-moe">与 Stable LatentMoE 的关系：LatentMoE 的稳定化变体</h2>
+<h2 id="stable-latent-moe-relationship">与 Stable LatentMoE 的关系——LatentMoE 的稳定化变体</h2>
 
-<p>LatentMoE 作为通用架构由 NVIDIA 论文（Elango et al., 2026）系统提出；Kimi K3 的 <strong>Stable LatentMoE</strong> 是 LatentMoE 主结构 + 三件稳定化的合称（论断 C6）。两者主结构一致——都是"共享专家全宽 + 路由专家隐空间 + 两端投影"；区别在于 K3 在此基础上加了三件稳定化，以应对 $N=896, k=16$（稀疏度 56）的极端稀疏与 2.8T 规模下的两个失败模式：路由分支激活爆炸与近千专家负载失衡。</p>
+<p>LatentMoE 作为通用架构由 NVIDIA 论文（Elango et al., 2026）系统提出；Kimi K3 的 <strong>Stable LatentMoE</strong> 是 LatentMoE 主结构 + 三件稳定化的合称<sup>[C6]</sup>。两者主结构一致——都是"共享专家全宽 + 路由专家隐空间 + 两端投影"；区别在于 K3 在此基础上加了三件稳定化，以应对 $N=896, k=16$（稀疏度 56）的极端稀疏与 2.8T 规模下的两个失败模式：路由分支激活爆炸与近千专家负载失衡。</p>
 
 <p>三件稳定化这里只点名，完整机制见<a href="../stable-latent-moe/index.html">Stable LatentMoE 概念页</a>：</p>
 <ul>
@@ -961,7 +955,7 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
   <li><strong>Quantile Balancing</strong>：分位点平衡，替代固定步长 bias 更新，解决近千专家负载失衡。</li>
 </ul>
 
-<p>用 K3 的实际配置把抽象符号填满（数字 N1）：</p>
+<p>用 K3 的实际配置把抽象符号填满<sup>[N1]</sup>：</p>
 
 <div class="table-scroll">
 <table>
@@ -999,7 +993,7 @@ Stable LatentMoE（K3 的变体）
 <thead><tr><th>对比项</th><th>LatentMoE（通用）</th><th>Stable LatentMoE（K3）</th></tr></thead>
 <tbody>
 <tr><td>主结构</td><td>共享全宽 + 路由隐空间 + 两端投影</td><td>相同</td></tr>
-<tr><td>$W_\uparrow$ 作用对象</td><td>$u$（公式 F2）</td><td>$\mathrm{RMSNorm}(u)$（K3 Eq. 11）</td></tr>
+<tr><td>$W_\uparrow$ 作用对象</td><td>$u$<sup>[F2]</sup></td><td>$\mathrm{RMSNorm}(u)$（K3 Eq. 11）</td></tr>
 <tr><td>激活函数</td><td>常规（如 SwiGLU）</td><td>SiTU-GLU（有界）</td></tr>
 <tr><td>负载均衡</td><td>常规（辅助损失或固定步长 bias）</td><td>Quantile Balancing（分位点）</td></tr>
 <tr><td>典型压缩比</td><td>4x（Nemotron-3）</td><td>2x（K3）</td></tr>
@@ -1016,6 +1010,8 @@ Stable LatentMoE（K3 的变体）
   <li>用 K3 的数字回答：压缩比是多少？为什么比 Nemotron-3 保守？</li>
 </ul>
 
+<p>回顾本页的学习目标：LatentMoE 用"路由分支两端加共享投影"的结构变化，把路由专家从全宽 $d$ 搬进隐空间 $\ell$，使路由 dispatch 通信与专家权重流量按 $d/\ell$ 比例缩小；省下的预算通过 reinvestment（按 $\alpha = d/\ell$ 放大 $N$ 与 $k$）换成更多专家与更高 top-k，组合数显著增长而服务成本基本不变；压缩比受特征秩下限、投影自身成本与 reinvestment 必要性三条约束，不能无限放大；K3 的 Stable LatentMoE 在此主结构上加了 RMSNorm、SiTU-GLU、Quantile Balancing 三件稳定化以应对 2.8T 规模与极端稀疏。这就是 LatentMoE 的完整图景。</p>
+
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
 <h3>核心论断与来源</h3>
@@ -1025,16 +1021,20 @@ Stable LatentMoE（K3 的变体）
 <p>F1（标准 MoE 层 $y = \sum g_i E_i$）：引自前置页 <a href="../moe-serving/index.html">moe-serving</a> 第 2 章 F1；[L] §1 标准 MoE 定义。F2（LatentMoE 层 $u = \sum p_i E_i^{\text{routed}}(W_\downarrow x)$，$y = \sum E_j^{\text{shared}}(x) + W_\uparrow u$）：由 [L] Figure 1(b) 结构描述与 [K3] Eq. 11（去掉 RMSNorm 回到通用形式）综合得出。F3（路由部分开销缩小比例 $\approx d/\ell$）：[L] Figure 1 caption。F4（reinvestment：$N \to \alpha N$、$k \to \alpha k$，$\alpha = d/\ell$）：[L] Figure 1 caption。</p>
 
 <h3>外部数字与实验条件</h3>
-<p>N1（K3 配置：$d=7168, \ell=3584, N=896, k=16, N_s=2$，稀疏度 56）：[K3] §2.3 与官方 <code>config.json</code>（<code>moonshotai/Kimi-K3</code>）。N2（Nemotron-3 Super：$4096 \to 1024 \to 4096$，120B 总参/12B 激活）：[L] §4；[R] "Latent MoE"。N3（Nemotron-3 Ultra：$8192 \to 2048 \to 8192$，550B 总参/55B 激活，512 路由专家、top-22、1 共享专家，中间维度 5120/10240）：[R] "Nemotron 3 Ultra and Latent MoE Scaling"。N4（16B 消融：压缩比到 4 时质量保持，再压缩需 reinvestment）：[L] §3 消融实验。N5（投影额外计算约 9%，K2-1T 规模投影）：[L] "Projected Serving Impact at Trillion-Parameter Scale"。N6（iso-accuracy 下 LatentMoE 投影约 3.5x 加速，标准 MoE 需多约 350B 参数）：[L] Figure 2 与 §4；本页正文未直接引用 N6，仅在此登记。</p>
+<p>N1（K3 配置：$d=7168, \ell=3584, N=896, k=16, N_s=2$，稀疏度 56）：[K3] §2.3 与官方 <code>config.json</code>（<code>moonshotai/Kimi-K3</code>）。N2（Nemotron-3 Super：$4096 \to 1024 \to 4096$，120B 总参/12B 激活）：[L] §4；[R] "Latent MoE"。N3（Nemotron-3 Ultra：$8192 \to 2048 \to 8192$，550B 总参/55B 激活，512 路由专家、top-22、1 共享专家，中间维度 5120/10240）：[R] "Nemotron 3 Ultra and Latent MoE Scaling"。N4（16B 消融：压缩比到 4 时质量保持，再压缩需 reinvestment）：[L] §3 消融实验。N5（投影额外计算约 9%，K2-1T 规模投影）：[L] "Projected Serving Impact at Trillion-Parameter Scale"。N6（iso-accuracy 下 LatentMoE 在吞吐-延迟 Pareto 前沿上给出 1.24x–3.46x 加速，标准 MoE 需多约 350B 参数）：[L] Figure 2 与 §4；本页正文未直接引用 N6，仅在此登记。</p>
 
 <h3>教学示例</h3>
-<p>E1（S1）：$d=4096$、top-8/top-16 的 dispatch 量为构造数字，展示路由开销随 $k$ 线性增长；不代表真实模型配置。E2（S3）：$d=4096, \ell=1024$（压缩 4x）、$N=8, k=2 \to N'=32, k'=8$ 的 reinvestment 为构造数字，便于手算 dispatch 量缩小比例与组合数变化；配套可运行代码已实际执行，输出与页面一致。K3（$d=7168, \ell=3584$）与 Nemotron-3 Super（$4096 \to 1024 \to 4096$）作为真实配置对照，非教学构造。</p>
+<p>E1（"扩大专家池的代价"一章）：$d=4096$、top-8/top-16 的 dispatch 量为构造数字，展示路由开销随 $k$ 线性增长；不代表真实模型配置。E2（"压缩比与 Reinvestment"一章）：$d=4096, \ell=1024$（压缩 4x）、$N=8, k=2 \to N'=32, k'=8$ 的 reinvestment 为构造数字，便于手算 dispatch 量缩小比例与组合数变化；配套可运行代码已实际执行，输出与页面一致。K3（$d=7168, \ell=3584$）与 Nemotron-3 Super（$4096 \to 1024 \to 4096$）作为真实配置对照，非教学构造。</p>
 
 <h3>教学解释与类比边界</h3>
-<p>"把路由专家放进隐空间"只描述 LatentMoE 的结构改造，不断言隐空间具体学到了什么表示。与 MLA 的"投影到潜在空间"类比（S2 折叠块）只解释"用共享投影把后续计算搬进更窄空间"这一局部手法，失效边界已在该折叠块内说明——MLA 压的是 K/V，LatentMoE 压的是路由专家输入输出，两者压的对象、目的与可承受的压缩比都不同。"非线性容量 = top-$k$ × 专家中间维度"是论文给出的定义，本页只使用不重新推导。</p>
+<p>"把路由专家放进隐空间"只描述 LatentMoE 的结构改造，不断言隐空间具体学到了什么表示。与 MLA 的"投影到潜在空间"类比（"LatentMoE 的层结构"一章折叠块）只解释"用共享投影把后续计算搬进更窄空间"这一局部手法，失效边界已在该折叠块内说明——MLA 压的是 K/V，LatentMoE 压的是路由专家输入输出，两者压的对象、目的与可承受的压缩比都不同。"非线性容量 = top-$k$ × 专家中间维度"是论文给出的定义，本页只使用不重新推导。</p>
 
 <h3>教学简化及其限制</h3>
-<p>（1）dispatch 量用"个数"（$k \times d$ 或 $k \times \ell$）度量，真实传输还涉及 batch 维度、数据类型字节宽与通信库实现（如 DeepEP）；本页只比较相对比例，不涉及绝对字节量。（2）组合数 $\binom{N}{k}$ 假设 router 无约束地选任意 $k$ 个，实际还受负载均衡约束（见<a href="../deepseek-moe/index.html">DeepSeekMoE</a> §3.3 与<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>的 Quantile Balancing），真实可达组合数更少。（3）路由打分细节（sigmoid/softmax、aux-loss-free 偏置）不展开，正文用"router 给出门控权重 $p_i$"的抽象形式，细节见<a href="../moe-serving/index.html">moe-serving</a> §2 与<a href="../deepseek-moe/index.html">deepseek-moe</a>。（4）投影参数量 $2 \cdot d \cdot \ell$ 是粗略估计，真实投影还有偏置与归一化。（5）性能结论（N4、N6）依赖论文实验配置（16B 消融、万亿参数投影），不可外推到任意规模；N6 为投影值非实测。</p>
+<p>（1）dispatch 量用"个数"（$k \times d$ 或 $k \times \ell$）度量。可推出：相对比例（缩小 $d/\ell$ 倍）。不可推出：绝对字节量（真实传输还涉及 batch 维度、数据类型字节宽与通信库实现如 DeepEP）。</p>
+<p>（2）组合数 $\binom{N}{k}$ 假设 router 无约束地选任意 $k$ 个。可推出：组合数增长量级。不可推出：真实可达组合数（实际受负载均衡约束，见<a href="../deepseek-moe/index.html">DeepSeekMoE</a> §3.3 与<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>的 Quantile Balancing，真实可达组合数更少）。</p>
+<p>（3）路由打分细节（sigmoid/softmax、aux-loss-free 偏置）不展开，正文用"router 给出门控权重 $p_i$"的抽象形式。可推出：路由决策的存在与作用。不可推出：路由打分的具体实现（细节见<a href="../moe-serving/index.html">moe-serving</a> §2 与<a href="../deepseek-moe/index.html">deepseek-moe</a>）。</p>
+<p>（4）投影参数量 $2 \cdot d \cdot \ell$ 为粗略估计。可推出：投影参数量量级。不可推出：精确参数量（真实投影还有偏置与归一化）。</p>
+<p>（5）性能结论依赖论文实验配置。可推出：论文实验条件下的结论（16B 消融、万亿参数投影）。不可推出：任意规模的外推结论（N6 为投影值非实测，不可外推到任意规模）。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

@@ -652,24 +652,20 @@
 <h1 class="title">FlashKDA 与 KDA Context Parallelism：让 KDA 的串行状态在 GPU 上高效跑起来</h1>
 <p class="reading-time" id="readingTime"></p>
 
-<div class="context-box">
-  <p class="context-box-title">本页所处的位置</p>
-  <div class="context-grid">
-    <div class="context-label">所属模型</div><div class="context-value">Kimi K3（69 层 KDA + 24 层 Gated MLA）</div>
-    <div class="context-label">机制定位</div><div class="context-value">KDA 递归状态的 GPU/分布式执行方案</div>
-    <div class="context-label">解决的问题</div><div class="context-value">KDA 串行状态更新与 GPU 并行偏好的冲突</div>
-    <div class="context-label">覆盖的四个 regime</div><div class="context-value">训练/prefill · 长 prefill 设备内 · 跨设备 · 投机解码</div>
-  </div>
-</div>
+<blockquote class="meta">
+<p><b>主要依据</b>：Kimi K3 Technical Report §5.1.1（FlashKDA、设备内 CP）、§5.1.2（KCP，Eq.17）、§5.4.2（KDA 解码 kernel）。KDA 递归公式 Eq.1 见 §2.1.1，完整机制见 <a href="../../wiki/kda/index.html">KDA 概念页</a>。</p>
+</blockquote>
+
+<p>Kimi K3 用 69 层 KDA 替换 softmax 注意力，把随序列增长的 KV cache 压成固定大小的递归状态——省了显存，但状态必须串行更新。一块 H100 有 132 块 SM 靠宽并行隐藏延迟，串行依赖却让多数 SM 排队等状态。这个冲突在四个执行 regime 下表现成不同瓶颈。K3 为每个 regime 设计了专门方案。本文讲解这四套方案——FlashKDA、设备内 CP、KCP、投影输入缓存——各自解决什么瓶颈，核心机制是什么。</p>
 
 <section class="learning-goals">
   <h2>读完你能回答</h2>
   <ul>
-    <li>KDA 的串行状态更新为什么与 GPU 并行偏好冲突，为什么这个冲突在不同执行 regime 表现成不同瓶颈？</li>
-    <li>FlashKDA 如何把 intra-chunk 计算与 cross-chunk 状态传播重叠起来？</li>
-    <li>设备内 context parallelism 如何在单 rank 上并行一条长序列，且不产生跨设备通信？</li>
-    <li>KCP 为什么不能像 vanilla 线性注意力那样直接求和本地状态，它的 $M+\tilde S$ 分解如何让通信量与序列长度无关？</li>
-    <li>KDA 解码如何处理投机解码拒绝 draft token 时的状态回滚，又不让状态流量爆炸？</li>
+    <li>KDA 的串行状态更新为什么与 GPU 并行偏好冲突，为什么这个冲突在不同执行 regime 表现成不同瓶颈。</li>
+    <li>FlashKDA 如何把 intra-chunk 计算与 cross-chunk 状态传播重叠起来。</li>
+    <li>设备内 context parallelism 如何在单 rank 上并行一条长序列，且不产生跨设备通信。</li>
+    <li>KCP 为什么不能像 vanilla 线性注意力那样直接求和本地状态，它的 $M+\tilde S$ 分解如何让通信量与序列长度无关。</li>
+    <li>KDA 解码如何处理投机解码拒绝 draft token 时的状态回滚，又不让状态流量爆炸。</li>
   </ul>
 </section>
 
@@ -683,30 +679,26 @@
   </ul>
 </section>
 
-<blockquote class="meta">
-<p><b>主要依据</b>：Kimi K3 Technical Report §5.1.1（FlashKDA、设备内 CP）、§5.1.2（KCP，Eq.17）、§5.4.2（KDA 解码 kernel）。KDA 递归公式 Eq.1 见 §2.1.1，完整机制见 <a href="../../wiki/kda/index.html">KDA 概念页</a>。</p>
-</blockquote>
-
 <h2 id="serial-vs-parallel">串行状态 vs GPU 并行——为什么 KDA 在四个 regime 瓶颈不同</h2>
 
-<p>KDA 把 softmax 注意力随序列长度增长的 KV cache 压成了一个<strong>固定大小的递归状态</strong> $S_t \in \mathbb{R}^{d_k \times d_v}$（K3 config.json 中 $d_k=d_v=128$，约 32KB）。省了显存，但代价是状态必须一步一步串行更新。K3 报告 §2.1.1 的 Eq.1<sup>[F1]</sup>给出单步更新：</p>
+<p>KDA 把 softmax 注意力随序列长度增长的 KV cache 压成了一个<strong>固定大小的递归状态</strong> $S_t \in \mathbb{R}^{d_k \times d_v}$（K3 config.json 中 $d_k=d_v=128$，约 32KB<sup>[N1]</sup>）。省了显存，但代价是状态必须一步一步串行更新。K3 报告 §2.1.1 的 Eq.1<sup>[F1]</sup>给出单步更新：</p>
 
 $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t).$$
 
 <p>关键在右边：$S_t$ 依赖 $S_{t-1}$。要算第 $t$ 步的状态，必须先有第 $t-1$ 步的状态。这是一个<strong>串行依赖</strong>。KDA 的机制、$M_t$ 的含义、channel-wise forget gate 的作用由 <a href="../../wiki/kda/index.html">KDA 概念页</a>完整讲解，本页只引用 Eq.1 与 $M_t$ 的结论。</p>
 
-<p>串行依赖和 GPU 的天性对立。一块 GPU（以 H100 为例）有 132 块 SM，每块 SM 内还有多个 warp 轮流占用计算单元——GPU 靠<strong>宽而均匀的并行</strong>隐藏延迟、撑满算力，详见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>。当一个计算必须一步步串行时，同一时刻只有少数 SM 在干活，其余的排队等状态。</p>
+<p>串行依赖和 GPU 的天性对立。一块 GPU（以 H100 为例）有 132 块 SM<sup>[N3]</sup>，每块 SM 内还有多个 warp 轮流占用计算单元——GPU 靠<strong>宽而均匀的并行</strong>隐藏延迟、撑满算力，详见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>。当一个计算必须一步步串行时，同一时刻只有少数 SM 在干活，其余的排队等状态。</p>
 
 <p>这个冲突不是抽象的——它在 KDA 的四个执行 regime 下表现成<strong>不同的瓶颈</strong>。K3 报告 §5.1.1 开门见山："The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime."<sup>[C1]</sup>所以 K3 为每个 regime 设计了专门的方案：</p>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>执行 regime</th><th>串行依赖表现为</th><th>K3 的方案</th><th>本文章节</th></tr></thead>
+<thead><tr><th>执行 regime</th><th>串行依赖表现为</th><th>K3 的方案</th><th>对应章节</th></tr></thead>
 <tbody>
-<tr><td>训练 / prefill</td><td>chunkwise 形式里 intra-chunk 计算与 cross-chunk 状态传播交替，SM 在传播时空转</td><td>FlashKDA：重叠两阶段</td><td>S2</td></tr>
-<tr><td>长 prefill（纯 TP 部署）</td><td>每个 rank 只持少量 head，132 块 SM 大部分闲</td><td>设备内 CP：SM 级切序列</td><td>S3</td></tr>
-<tr><td>跨设备（序列超单卡）</td><td>线性注意力的"各 rank 求和"对 KDA 不成立</td><td>KCP：$M+\tilde S$ 分解 + prefix scan</td><td>S4</td></tr>
-<tr><td>解码（MTP 投机）</td><td>瓶颈从"利用并行"转为"管理原地更新的状态"</td><td>投影输入缓存 + 片上重建</td><td>S5</td></tr>
+<tr><td>训练 / prefill</td><td>chunkwise 形式里 intra-chunk 计算与 cross-chunk 状态传播交替，SM 在传播时空转</td><td>FlashKDA：重叠两阶段</td><td>FlashKDA</td></tr>
+<tr><td>长 prefill（纯 TP 部署）</td><td>每个 rank 只持少量 head，132 块 SM 大部分闲</td><td>设备内 CP：SM 级切序列</td><td>设备内 CP</td></tr>
+<tr><td>跨设备（序列超单卡）</td><td>线性注意力的"各 rank 求和"对 KDA 不成立</td><td>KCP：$M+\tilde S$ 分解 + prefix scan</td><td>KCP</td></tr>
+<tr><td>解码（MTP 投机）</td><td>瓶颈从"利用并行"转为"管理原地更新的状态"</td><td>投影输入缓存 + 片上重建</td><td>KDA 解码</td></tr>
 </tbody>
 </table>
 </div>
@@ -723,16 +715,16 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
   intra-chunk 计算和 cross-chunk 状态传播交替进行，传播时多数 SM 空转
 </pre>
 
-<p>这个空隙就是 S2 要解的第一个瓶颈。本章先建立"冲突根源 + 四 regime 定位"的框架，后续四章各解一个 regime。</p>
+<p>这个空隙就是 FlashKDA 要解的第一个瓶颈。本章先建立"冲突根源 + 四 regime 定位"的框架，后续四章各解一个 regime。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
   <li>用自己的话说出 KDA 串行状态与 GPU 并行偏好冲突的根源（用 Eq.1 的哪个符号回答）。</li>
   <li>对照上表，指出四个 regime 各自的瓶颈定位。</li>
-  <li>说明 chunkwise 形式为何"比纯串行快但仍有空隙"——空隙出在哪两个阶段之间？</li>
+  <li>说明 chunkwise 形式为何"比纯串行快但仍有空隙"——空隙出在哪两个阶段之间。</li>
 </ul>
 
-<p>四 regime 定位完。下面四章各解一个，顺序按 K3 报告 §5.1.1→§5.1.2→§5.4.2。S2 先解训练和 prefill。</p>
+<p>本章建立了冲突根源与四 regime 定位的框架。但框架只是开始，每个 regime 还需要专门方案——下一章讲 FlashKDA 如何重叠 chunk 内计算与 chunk 间状态传播。</p>
 
 <h2 id="flashkda">FlashKDA——把 chunk 内计算与 chunk 间状态传播重叠</h2>
 
@@ -742,12 +734,12 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
 
 <ul>
   <li><strong>token-parallel stages</strong>：chunk 内的 token 维度并行。一个 chunk 有 $C$ 个 token，intra-chunk 的位置-位置 attention 可以在 token 维度上铺开到多块 SM 同时算。</li>
-  <li><strong>head-parallel recurrence</strong>：chunk 间的 head 维度递归。KDA 有多个 head（K3 配置 96 个 head），不同 head 的状态递归<strong>互相独立</strong>——算 head $h$ 的 $S[t]\to S[t+1]$ 不需要等 head $h'$ 的 intra-chunk。</li>
+  <li><strong>head-parallel recurrence</strong>：chunk 间的 head 维度递归。KDA 有多个 head（K3 配置 96 个 head<sup>[N2]</sup>），不同 head 的状态递归<strong>互相独立</strong>——算 head $h$ 的 $S[t]\to S[t+1]$ 不需要等 head $h'$ 的 intra-chunk。</li>
 </ul>
 
 <p>各自独立调度后，chunk $t$ 的 intra-chunk 计算就能和 chunk $t-1 \to t$ 的状态传播<strong>同时</strong>进行：当 token-parallel 阶段在算 chunk $t$ 的 intra 时，head-parallel 阶段在传另一些 head 的状态。两阶段不再交替等待，而是流水线重叠。</p>
 
-<pre class="diagram">FlashKDA 的重叠时间线（对比 S1 的朴素版本）：
+<pre class="diagram">FlashKDA 的重叠时间线（对比上一章的朴素版本）：
 
   时间 ──►
   head A: [算 intra t] [传 S] [算 intra t+1] [传 S]
@@ -756,7 +748,7 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
                  └── 两阶段重叠，SM 持续有活干 ──┘
 
   token-parallel（chunk 内 token 维度）和 head-parallel（head 维度递归）独立调度
-  intra-chunk 计算与 cross-chunk 状态传播重叠，消除 S1 的空隙
+  intra-chunk 计算与 cross-chunk 状态传播重叠，消除上一章的空隙
 </pre>
 
 <div class="table-scroll">
@@ -773,12 +765,12 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>朴素 chunkwise 实现里，SM 空转发生在哪个阶段（intra 还是 cross-chunk 的传播期）？</li>
-  <li>token-parallel 与 head-parallel 各自并行什么维度？为什么 head 之间可以独立递归？</li>
+  <li>朴素 chunkwise 实现里，SM 空转发生在哪个阶段（intra 还是 cross-chunk 的传播期）。</li>
+  <li>token-parallel 与 head-parallel 各自并行什么维度，为什么 head 之间可以独立递归。</li>
   <li>说出 FlashKDA 服务的两个场景，以及它的后端宿主框架。</li>
 </ul>
 
-<p>FlashKDA 解决了 chunk 间的空隙。但如果序列长到一个 rank 的 head 都不够填满 SM 呢？S3 解设备内 CP。</p>
+<p>本章讲了 FlashKDA 通过重叠消除 chunk 间空隙。但 FlashKDA 仍假设序列在一个 rank 上跑完，长 prefill 下纯 TP 填不满 SM——下一章讲设备内 CP 如何在单 rank 的 SM 级切序列。</p>
 
 <h2 id="intra-device-cp">设备内 context parallelism——单 rank 的 SM 级切序列</h2>
 
@@ -801,7 +793,7 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
     序列方向被切短，SM 填满，且无跨设备通信
 </pre>
 
-<p>设备内 CP 能成立，靠的是一个<strong>关键观察</strong>：KDA 的状态转移 $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$ 是<strong>线性</strong>的——一段 token 的转移效果可以分解成"作用于入状态的部分"和"从零生成的部分"，<strong>独立于入状态预先算好</strong>，之后精确合并<sup>[C3]</sup>。这个性质是 S4 KCP 的前置，也是 S3 设备内 CP 的基础。具体怎么分解是 S4 的核心，这里先用结论：每段的 segment transition 可以独立计算。</p>
+<p>设备内 CP 能成立，靠的是一个<strong>关键观察</strong>：KDA 的状态转移 $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$ 是<strong>线性</strong>的——一段 token 的转移效果可以分解成"作用于入状态的部分"和"从零生成的部分"，<strong>独立于入状态预先算好</strong>，之后精确合并<sup>[C3]</sup>。这个性质是 KCP 的前置，也是设备内 CP 的基础。具体怎么分解是 KCP 章的核心，这里先用结论：每段的 segment transition 可以独立计算。</p>
 
 <p>有了这个观察，<strong>SM 级 CP planner</strong>把序列切到单 rank 的多块 SM：每块 SM 算一段的 segment transition（独立于入状态），算完后合并恢复每段的<strong>精确初始状态</strong><sup>[C3]</sup>。关键区别在通信：</p>
 
@@ -810,16 +802,16 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
   <li>KCP（下一章）：跨 device rank，需要一次 all-gather。</li>
 </ul>
 
-<p>这个区别是 S3 和 S4 最容易混淆的点（见页首误解提示）。设备内 CP 解决的是"单 rank SM 没填满"，KCP 解决的是"序列超单卡"——两者层次不同。</p>
+<p>这个区别是设备内 CP 和 KCP 最容易混淆的点（见页首误解提示）。设备内 CP 解决的是"单 rank SM 没填满"，KCP 解决的是"序列超单卡"——两者层次不同。</p>
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>TP 切的是哪个维度？为什么它不缩短序列方向的递归？</li>
-  <li>"段转移可独立于入状态计算"依赖 KDA 递归的什么性质？（提示：看 Eq.1 里 $M_t$ 和加性项的关系）</li>
-  <li>设备内 CP 与 KCP 在通信上的根本区别是什么？</li>
+  <li>TP 切的是哪个维度，为什么它不缩短序列方向的递归。</li>
+  <li>"段转移可独立于入状态计算"依赖 KDA 递归的什么性质（提示：看 Eq.1 里 $M_t$ 和加性项的关系）。</li>
+  <li>设备内 CP 与 KCP 在通信上的根本区别是什么。</li>
 </ul>
 
-<p>S3 在单 rank 内切序列。如果序列长到一台设备装不下，要跨 device rank 呢？S4 解 KCP——这是本页技术含量最高的部分。</p>
+<p>本章讲了设备内 CP 在单 rank 内切序列、无跨设备通信。但序列长到一台设备装不下时需要跨 device rank——下一章讲 KCP 为什么不能直接求和以及 $M+\tilde S$ 分解。</p>
 
 <h2 id="kcp">KCP——为什么不能直接求和，以及 M+S̃ 分解</h2>
 
@@ -899,7 +891,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
   通信量 = 固定大小的状态，与序列长度无关
 </pre>
 
-<p><strong>通信量固定</strong>是 KCP 相对 softmax CP 的核心优势。softmax 注意力的 context parallelism（如 Ring Attention）要交换随序列长度增长的 KV block——序列越长，通信越多<sup>[C4]</sup>。KCP 只 all-gather 固定大小的状态（config.json 中约 32KB），<strong>与序列长度无关</strong>，并达成线性计算扩展。</p>
+<p><strong>通信量固定</strong>是 KCP 相对 softmax CP 的核心优势。softmax 注意力的 context parallelism（如 Ring Attention）要交换随序列长度增长的 KV block——序列越长，通信越多<sup>[C4]</sup>。KCP 只 all-gather 固定大小的状态（config.json 中约 32KB<sup>[N1]</sup>），<strong>与序列长度无关</strong>，并达成线性计算扩展。</p>
 
 <div class="table-scroll">
 <table>
@@ -942,7 +934,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 <p>$S_T^{[2]}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，与顺序计算的 $S_4$ <strong>完全一致</strong>。分解成立。</p>
 
 <details>
-<summary>完整手算：ground truth 4 步 + KCP 分解 3 步的逐矩阵代入</summary>
+<summary>展开：ground truth 4 步 + KCP 分解 3 步的逐矩阵代入</summary>
 <p><b>顺序计算 ground truth</b>（$S_0=0$）：</p>
 <p>$S_1 = M_1\cdot 0 + k_1 v_1^\top = 0 + \begin{pmatrix}1\\0\end{pmatrix}\begin{pmatrix}1&2\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}$。</p>
 <p>$S_2 = M_2 S_1 + k_2 v_2^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}1&2\\0&0\end{pmatrix} + \begin{pmatrix}0&0\\3&4\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</p>
@@ -959,13 +951,13 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>vanilla 线性注意力的递归（F3）和 KDA 的递归（F1）在"作用于入状态"上有什么本质区别？这个区别为什么让直接求和对 KDA 失效？</li>
-  <li>写出 KCP 分解的两项（$M累积$ 和 $\tilde S$）各自代表什么，为什么都可在入状态可用前本地算出？</li>
+  <li>vanilla 线性注意力的递归<sup>[F3]</sup>和 KDA 的递归<sup>[F1]</sup>在"作用于入状态"上有什么本质区别，这个区别为什么让直接求和对 KDA 失效。</li>
+  <li>写出 KCP 分解的两项（$M累积$ 和 $\tilde S$）各自代表什么，为什么都可在入状态可用前本地算出。</li>
   <li>说出 KCP 通信量为何与序列长度无关，并与 softmax CP 对比。</li>
-  <li>在手算例子中，若误用直接求和（$\tilde S_2+\tilde S_1$）会得到什么错误结果？正确做法多了哪一步？</li>
+  <li>在手算例子中，若误用直接求和（$\tilde S_2+\tilde S_1$）会得到什么错误结果，正确做法多了哪一步。</li>
 </ul>
 
-<p>训练/prefill/跨设备都解了。最后是解码——S5 讲投机解码的状态回滚。</p>
+<p>本章讲了 KCP 的 $M+\tilde S$ 分解与固定通信量。但前三章的瓶颈都是利用并行，解码的瓶颈转为管理状态——下一章讲投影输入缓存如何支持投机解码的状态回滚。</p>
 
 <h2 id="kda-decoding">KDA 解码——投影输入缓存与状态重建</h2>
 
@@ -1022,19 +1014,19 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <p>完成本章后，用下面几个问题检查自己是否跟上：</p>
 <ul>
-  <li>解码的瓶颈和训练/prefill 的瓶颈有何不同？用"利用并行"和"管理状态"回答。</li>
-  <li>状态快照方案为什么在大 batch 下不可接受？</li>
-  <li>投影输入比状态小在哪里（状态是 $d_k\times d_v$ 矩阵，投影输入是什么）？为什么缓存投影输入就能重建状态？</li>
-  <li>投影缓存不离开 decode 阶段，对前缀缓存和 PD 分离有什么意义？</li>
+  <li>解码的瓶颈和训练/prefill 的瓶颈有何不同，用"利用并行"和"管理状态"回答。</li>
+  <li>状态快照方案为什么在大 batch 下不可接受。</li>
+  <li>投影输入比状态小在哪里（状态是 $d_k\times d_v$ 矩阵，投影输入是什么），为什么缓存投影输入就能重建状态。</li>
+  <li>投影缓存不离开 decode 阶段，对前缀缓存和 PD 分离有什么意义。</li>
 </ul>
 
-<p>四 regime 解完。下面是来源与教学说明。</p>
+<p>本章讲了投影输入缓存与片上重建。四套方案至此解完——下一章是来源与教学说明。</p>
 
 <h2 id="sources-and-teaching-notes">来源与教学说明</h2>
 
 <h3>核心论断与来源</h3>
 <p><sup>[C1]</sup> KDA 串行状态与 GPU 并行偏好冲突，四 regime 瓶颈不同：Kimi K3 Technical Report §5.1.1，原文 "The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime. We design a dedicated kernel for each regime."<br>
-<sup>[C2]</sup> FlashKDA 重叠 intra-chunk 计算与 cross-chunk 状态传播：K3 报告 §5.1.1，原文 "We therefore develop FlashKDA [14], a CUTLASS-based chunkwise kernel that overlaps intra-chunk computation with cross-chunk state propagation. The kernel decomposes the work into token-parallel stages and a head-parallel recurrence, each scheduled and tuned independently... FlashKDA serves both training and inference prefill and is auto-dispatched as a backend of flash-linear-attention [139]."<br>
+<sup>[C2]</sup> FlashKDA 重叠 intra-chunk 计算与 cross-chunk 状态传播：K3 报告 §5.1.1，原文 "We therefore develop FlashKDA [14], a CUTLASS-based chunkwise kernel that overlaps intra-chunk computation with cross-chunk state propagation. The kernel decomposes the work into token-parallel stages and a head-parallel recurrence, each scheduled and tuned independently... FlashKDA serves both training and inference prefill and is auto-dispatched as a backend of flash-linear-attention [141]."<br>
 <sup>[C3]</sup> 设备内 CP 的段转移可独立于入状态计算、SM 级切序列、无跨设备通信：K3 报告 §5.1.1，原文 "Tensor parallelism partitions heads across devices but never shortens the recurrence... The key observation is that the state transition of each segment can be evaluated independently of the incoming state and composed exactly afterward. An automatic SM-level context-parallel (CP) planner... partitions the sequence across the SMs of a single rank, evaluates the segment transitions in parallel, and merges them to recover each segment's exact initial state. In contrast to the cross-device KCP of §5.1.2, this parallelism is entirely intra-device and incurs no cross-device communication."<br>
 <sup>[C4]</sup> KDA 的 $M_t$ 使直接求和失效，KCP 的 $M+\tilde S$ 分解 + prefix scan + 一次 all-gather + 固定通信量：K3 报告 §5.1.2，原文 "This direct summation, however, is insufficient for KDA. Recall from Eq. 1 that KDA updates its state as $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$, where $M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t)$. KDA's delta rule applies the token-dependent matrix $M_t$ to the incoming state before adding the current write. Consequently, the effect of a local sequence segment depends on the state entering that segment..." 与 "we introduce KDA Context Parallelism (KCP), which decomposes the effect of each segment into two locally computable quantities, a cumulative transition acting on the incoming state and a state generated locally from zero" 与 "KCP requires only a fixed-size all-gather for recurrent-state synchronization and achieves linear compute scaling."<br>
 <sup>[C5]</sup> 解码缓存投影输入而非状态，片上重建，与 ReplaySSM 并发提出，投影缓存不离开 decode 阶段：K3 报告 §5.4.2，原文 "the primary bottleneck shifts from exploiting parallelism to efficiently managing the evolving recurrent state, which is updated in place at every decoding step. This in-place update becomes problematic in MTP-based speculative decoding: if verification rejects a subset of the drafted tokens, the state has already advanced beyond the last accepted token and cannot be trivially rolled back. Maintaining a state snapshot for each draft position would enable rollback, but would also multiply state traffic... The state after any accepted draft prefix, however, is fully determined by the projected inputs of the draft tokens, which are far smaller than the state itself. We therefore cache only these projected inputs, rebuild the states of accepted tokens on-chip, and write back the states of the verified and bonus tokens, a design independently proposed in the concurrent work ReplaySSM [25]." 与 "Because the projection caches never leave the decode stage, prefix caching and prefill–decode disaggregation operate on the same payload as in non-speculative serving."</p>
@@ -1044,21 +1036,29 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 <sup>[F2]</sup> KCP 段效果分解（Eq.17）：K3 报告 §5.1.2 Eq.17。第一项 $\tilde S$ 是本地从零生成，第二项 $M累积\cdot S_{入}$ 是入状态经各 rank 本地 $M$ 累积传播。展开的求和形式（$S_T^{[i]}=\tilde S_T^{[i]}+\sum_{j}(\prod_l M)\tilde S_T^{[j]}$）由 Eq.17 第二行给出，依赖 rank 级更新的结合律。<br>
 <sup>[F3]</sup> vanilla 线性注意力加性递归：K3 报告 §5.1.2 所述 "additive recurrence of vanilla linear attention"；由 <a href="../../wiki/linear-attention/index.html">线性注意力页</a>完整讲解。本页用于对照说明"为何可直接求和而 KDA 不可"。</p>
 
+<h3>外部数字与实验条件</h3>
+<p><sup>[N1]</sup> KDA 状态维度 $d_k=d_v=128$：K3 config.json。状态大小约 32KB（$128\times128\times2$ bytes，bf16）。<br>
+<sup>[N2]</sup> KDA head 数 96：K3 config.json。FlashKDA 的 head-parallel recurrence 以此为并行维度。<br>
+<sup>[N3]</sup> H100 SXM5 有 132 块 SM：NVIDIA H100 规格表。本页以 H100 为例说明 GPU 并行特性，非 K3 报告数据。<br>
+<sup>[N4]</sup> KDA 的 $\alpha$ 由 scaled sigmoid 产出，范围 $(e^{-5},1)$：K3 报告 §2.1.1。手算例子取 $\alpha=0.5$ 标量为教学构造，不代表真实范围。</p>
+
 <h3>教学示例</h3>
-<p>S4 的 2 rank × 2 token KDA 递归：$d_k=d_v=2$，教学构造 $\alpha=0.5$（标量，$\mathrm{Diag}(\alpha)=0.5I$）、$\beta=1$、单位向量 $k$。rank 1（token 1,2）：$k_1=(1,0),v_1=(1,2)$；$k_2=(0,1),v_2=(3,4)$。rank 2（token 3,4）：$k_3=(1,0),v_3=(5,6)$；$k_4=(0,1),v_4=(7,8)$。构造目的：让"不能直接求和"和"$M+\tilde S$ 分解"在 2×2 矩阵上手算可见，$M累积=0.5I$ 干净。不代表真实 K3 数值（K3 的 $\alpha$ 由 scaled sigmoid 产出、范围 $(e^{-5},1)$、$d_k=128$、96 head）。ground truth $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，KCP 分解重组后一致；误用直接求和得 $\begin{pmatrix}6&8\\10&12\end{pmatrix}$（错误）。</p>
+<p>KCP 章的 2 rank × 2 token KDA 递归：$d_k=d_v=2$，教学构造 $\alpha=0.5$（标量，$\mathrm{Diag}(\alpha)=0.5I$）、$\beta=1$、单位向量 $k$。rank 1（token 1,2）：$k_1=(1,0),v_1=(1,2)$；$k_2=(0,1),v_2=(3,4)$。rank 2（token 3,4）：$k_3=(1,0),v_3=(5,6)$；$k_4=(0,1),v_4=(7,8)$。构造目的：让"不能直接求和"和"$M+\tilde S$ 分解"在 2×2 矩阵上手算可见，$M累积=0.5I$ 干净。不代表真实 K3 数值（K3 的 $\alpha$ 由 scaled sigmoid 产出、范围 $(e^{-5},1)$、$d_k=128$、96 head）。ground truth $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，KCP 分解重组后一致；误用直接求和得 $\begin{pmatrix}6&8\\10&12\end{pmatrix}$（错误）。</p>
 
 <h3>教学解释与类比边界</h3>
-<p>(1) "KDA 串行状态与 GPU 并行偏好冲突"是机制解释，服务 S1。失效边界：冲突的前提是 KDA 用递归状态（$S_t$ 依赖 $S_{t-1}$）；若用 softmax 的 KV cache（无递归依赖），瓶颈形态完全不同。<br>
-(2) "FlashKDA 重叠两阶段"是工程解释，服务 S2。失效边界：重叠的前提是 chunkwise 形式成立（chunk 内并行、chunk 间递归）且 head 间递归独立；若递归本身不可分块或 head 间有依赖，重叠无从谈起。<br>
-(3) "段转移可独立于入状态计算"是机制解释，服务 S3/S4。失效边界：依赖 KDA 状态转移的线性性（$M_t$ 和加性项可分离）；若递归非线性使段转移不可分离，设备内 CP 和 KCP 的分解都不成立。<br>
-(4) "投影输入比状态小"是量级解释，服务 S5。失效边界：投影输入是 $q,k,v,\beta,\alpha$ 等几个 $d_k$ 维向量，状态是 $d_k\times d_v$ 矩阵；具体比例依赖模型配置，本页只陈述"小得多"的定性结论，不引入未经证实的精确比例数字。</p>
+<p>(1) "KDA 串行状态与 GPU 并行偏好冲突"是机制解释，服务"串行状态 vs GPU 并行"章。失效边界：冲突的前提是 KDA 用递归状态（$S_t$ 依赖 $S_{t-1}$）；若用 softmax 的 KV cache（无递归依赖），瓶颈形态完全不同。<br>
+(2) "FlashKDA 重叠两阶段"是工程解释，服务 FlashKDA 章。失效边界：重叠的前提是 chunkwise 形式成立（chunk 内并行、chunk 间递归）且 head 间递归独立；若递归本身不可分块或 head 间有依赖，重叠无从谈起。<br>
+(3) "段转移可独立于入状态计算"是机制解释，服务设备内 CP 与 KCP 章。失效边界：依赖 KDA 状态转移的线性性（$M_t$ 和加性项可分离）；若递归非线性使段转移不可分离，设备内 CP 和 KCP 的分解都不成立。<br>
+(4) "投影输入比状态小"是量级解释，服务 KDA 解码章。失效边界：投影输入是 $q,k,v,\beta,\alpha$ 等几个 $d_k$ 维向量，状态是 $d_k\times d_v$ 矩阵；具体比例依赖模型配置，本页只陈述"小得多"的定性结论，不引入未经证实的精确比例数字。</p>
 
 <h3>教学简化及其限制</h3>
-<p>(1) <strong>手算例子的参数简化</strong>：取 $d_k=d_v=2$、$\alpha=0.5$ 标量、$\beta=1$、单位 $k$。简化目的：让 $M_t$ 和 $M累积$ 在 2×2 矩阵上手算可见。限制：K3 实际 $d_k=128$、$\alpha$ 由 scaled sigmoid 产出（范围 $(e^{-5},1)$，非 0.5 标量）、$k$ 经 L2Norm 单位化但非坐标轴向量、96 head。手算数值不代表真实 K3 数值。<br>
-(2) <strong>无伪代码与可运行代码</strong>：四套方案都是 kernel/系统级机制。伪代码会与图示重复（KCP 的 prefix scan 流程已用图示表达，解码的重建流程也已用图示表达）；可运行代码需要 CUTLASS/分布式框架（flash-linear-attention、NCCL），超出教学职责。手算例子已足够验证 KCP 分解。<br>
-(3) <strong>CUTLASS/TMA/warp specialization 细节未展开</strong>：本页只点名 FlashKDA 是 CUTLASS-based。具体的 tile 调度、warp 分工、TMA 异步搬运属 GPU 编程实现，<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面足够支撑理解"重叠"。<br>
-(4) <strong>MTP 投机解码的最小解释</strong>：本页只用到 draft/verify/accept/reject/bonus 五个词汇并最小解释，不展开 draft 模型、接受策略、bonus 生成的完整算法（属独立服务概念）。<br>
-(5) <strong>无外部性能数字</strong>：K3 报告 §5.1/§5.4.2 未给出可定位的加速比/带宽基准表，本页不引入未经证实的外部数字。"substantially outperforms the Triton reference implementation"（C2）与"verification latency grows sub-linearly"（C5）为报告原文的定性结论，本页只复述不数值化。</p>
+<p>(1) <strong>手算例子参数简化</strong>：取 $d_k=d_v=2$、标量 $\alpha$、单位 $k$，让矩阵运算手算可见。可推出：KCP 的 $M+\tilde S$ 分解在数值上成立、直接求和会得到错误结果。不可推出：真实 K3 数值（$d_k=128$、$\alpha$ 由 scaled sigmoid 产出、$k$ 经 L2Norm 单位化但非坐标轴向量）。<br>
+(2) <strong>无伪代码与可运行代码</strong>：四套方案均以图示表达流程。可推出：每套方案的数据流与通信模式。不可推出：CUTLASS/分布式框架（flash-linear-attention、NCCL）层面的工程实现。<br>
+(3) <strong>CUTLASS/TMA/warp specialization 细节未展开</strong>：只点名 FlashKDA 是 CUTLASS-based。可推出：FlashKDA 通过 token-parallel 与 head-parallel 重叠两阶段。不可推出：tile 调度、warp 分工、TMA 异步搬运等 GPU 编程实现细节（<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面）。<br>
+(4) <strong>MTP 投机解码最小解释</strong>：只用到 draft/verify/accept/reject/bonus 五个词汇。可推出：拒绝 draft token 时状态需要回滚、投影输入缓存如何支持回滚。不可推出：draft 模型架构、接受策略、bonus 生成的完整算法。<br>
+(5) <strong>无外部性能数字</strong>：K3 报告 §5.1/§5.4.2 未给出可定位的加速比/带宽基准表。可推出："substantially outperforms the Triton reference implementation"（C2）与"verification latency grows sub-linearly"（C5）为报告原文定性结论。不可推出：具体加速比或带宽基准数值。</p>
+
+<p><strong>全文总结</strong>：KDA 的串行状态更新与 GPU 并行偏好的冲突，在四个执行 regime 下表现成不同瓶颈——训练/prefill 里 SM 空转（FlashKDA 用 token-parallel 与 head-parallel 重叠解决）、长 prefill 下纯 TP 填不满 SM（设备内 CP 在 SM 级切序列、无跨设备通信）、跨设备时直接求和失效（KCP 的 $M+\tilde S$ 分解让通信量与序列长度无关）、投机解码拒绝 draft token 时状态无法回滚（投影输入缓存 + 片上重建，不污染上层服务架构）。四套方案共同让 KDA 的递归状态在 GPU 和多设备上高效运行。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
