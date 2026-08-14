@@ -14,20 +14,15 @@
     empty: document.getElementById("empty-state"),
     clear: document.getElementById("clear-filters"),
     globalGraph: document.getElementById("global-graph"),
+    mapCount: document.getElementById("map-count"),
     mapDetails: document.getElementById("map-details"),
-    panel: document.getElementById("relation-panel"),
-    backdrop: document.getElementById("relation-backdrop"),
-    close: document.getElementById("close-relation"),
-    relationTitle: document.getElementById("relation-title"),
-    relationOpen: document.getElementById("relation-open"),
-    localGraph: document.getElementById("local-graph"),
-    incoming: document.getElementById("incoming-list"),
-    outgoing: document.getElementById("outgoing-list"),
+    resetMap: document.getElementById("reset-map"),
   };
   const state = { catalog: null, query: "", type: "", topic: "", view: "library" };
 
   function setStatus(message, isError = false) {
     elements.status.textContent = message;
+    elements.status.hidden = !message;
     elements.status.classList.toggle("is-error", isError);
   }
 
@@ -51,79 +46,76 @@
     if (!state.catalog) return;
     const pages = filteredPages();
     elements.grid.innerHTML = pages.map(model.renderCard).join("");
-    elements.count.textContent = `${pages.length} / ${state.catalog.pages.length} 篇`;
+    elements.count.textContent = pages.length === state.catalog.pages.length
+      ? `共 ${pages.length} 篇`
+      : `${pages.length} / ${state.catalog.pages.length} 篇`;
     elements.empty.hidden = pages.length !== 0;
   }
 
-  function renderRelationList(container, ids) {
+  function relationList(ids) {
     const pages = new Map(state.catalog.pages.map((page) => [page.id, page]));
-    container.innerHTML = ids.length
-      ? ids.map((id) => {
-        const page = pages.get(id);
-        if (!page) return "";
-        return `<div class="relation-list-item">
-          <button class="relation-link" type="button" data-relation-id="${model.escapeHtml(id)}">${model.escapeHtml(page.title)}</button>
-          <a href="${model.escapeHtml(page.path)}">打开</a>
-        </div>`;
-      }).join("")
-      : '<p class="subtitle">暂无站内链接</p>';
+    if (!ids.length) return '<p class="relation-empty">暂无关联文档</p>';
+    return `<ul class="relation-list">${ids.map((id) => {
+      const page = pages.get(id);
+      if (!page) return "";
+      return `<li><button type="button" data-map-id="${model.escapeHtml(id)}">${model.escapeHtml(page.title)}</button></li>`;
+    }).join("")}</ul>`;
   }
 
-  function openRelationPanel(id) {
-    const page = state.catalog.pages.find((item) => item.id === id);
-    if (!page) return;
-    elements.relationTitle.textContent = page.title;
-    elements.relationOpen.href = page.path;
-    renderRelationList(elements.incoming, page.incoming || []);
-    renderRelationList(elements.outgoing, page.outgoing || []);
-    elements.panel.hidden = false;
-    elements.backdrop.hidden = false;
-    elements.localGraph.textContent = "";
-    try {
-      graph.renderLocal(elements.localGraph, state.catalog, id, openRelationPanel);
-    } catch (error) {
-      elements.localGraph.textContent = `关系图加载失败：${error.message}`;
-    }
-    elements.close.focus();
-  }
-
-  function closeRelationPanel() {
-    elements.panel.hidden = true;
-    elements.backdrop.hidden = true;
-    graph.destroyLocal();
+  function relationGroup(title, note, ids) {
+    return `
+      <section class="relation-group">
+        <div class="relation-group-header">
+          <h4>${model.escapeHtml(title)}</h4>
+          <span>${ids.length} ${model.escapeHtml(note)}</span>
+        </div>
+        ${relationList(ids)}
+      </section>`;
   }
 
   function resetMapDetails() {
     elements.mapDetails.innerHTML = `
-      <h2>知识地图</h2>
-      <p>选择节点后查看它的入链和出链。</p>
-      <button type="button" id="reset-map" class="secondary-button">重置地图</button>`;
-    document.getElementById("reset-map").addEventListener("click", renderMap);
+      <div class="map-empty">
+        <span class="map-step">↗</span>
+        <h3>从一个节点开始</h3>
+        <p>点击节点查看它附近的一跳关系；悬停节点可查看简称，滚轮缩放，拖动画布移动。</p>
+      </div>`;
   }
 
   function renderMapDetails(id) {
     const page = state.catalog.pages.find((item) => item.id === id);
     if (!page) return;
     elements.mapDetails.innerHTML = `
-      <p class="eyebrow">${model.escapeHtml(model.typeLabel(page.type))}</p>
-      <h2>${model.escapeHtml(page.title)}</h2>
-      <p>${model.escapeHtml(page.description || "暂无摘要")}</p>
-      <p>入链 ${page.incoming_count || 0} · 出链 ${page.outgoing_count || 0}</p>
-      <a class="action-link" href="${model.escapeHtml(page.path)}">打开文章</a>
-      <button class="relation-link" type="button" data-relation-id="${model.escapeHtml(page.id)}">查看局部关系</button>
-      <button type="button" id="reset-map" class="secondary-button">重置地图</button>`;
-    document.getElementById("reset-map").addEventListener("click", renderMap);
+      <p class="detail-type type-${model.escapeHtml(page.type)}">${model.escapeHtml(model.typeLabel(page.type))}</p>
+      <h3>${model.escapeHtml(page.title)}</h3>
+      <p class="detail-description">${model.escapeHtml(page.description || "暂无摘要")}</p>
+      <div class="detail-actions">
+        <a class="detail-open" href="${model.escapeHtml(page.path)}">阅读文档&nbsp; ↗</a>
+        <span class="detail-hint">图中已突出相邻节点</span>
+      </div>
+      ${relationGroup("引用本文", "篇", page.incoming || [])}
+      ${relationGroup("本文引用", "篇", page.outgoing || [])}`;
   }
 
   function renderMap() {
     if (!state.catalog) return;
     resetMapDetails();
     const visibleIds = new Set(filteredPages().map((page) => page.id));
+    const edgeCount = state.catalog.edges.filter(
+      (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
+    ).length;
+    elements.mapCount.textContent = `${visibleIds.size} 个节点 · ${edgeCount} 条引用`;
     try {
-      graph.renderGlobal(elements.globalGraph, state.catalog, visibleIds, renderMapDetails);
+      graph.renderGlobal(
+        elements.globalGraph,
+        state.catalog,
+        visibleIds,
+        renderMapDetails,
+        resetMapDetails,
+      );
     } catch (error) {
-      elements.mapDetails.innerHTML = `<h2>知识地图不可用</h2><p>${model.escapeHtml(error.message)}</p>`;
-      setStatus("知识地图加载失败，全部内容仍可使用。", true);
+      elements.mapDetails.innerHTML = `<div class="map-empty"><h3>知识地图不可用</h3><p>${model.escapeHtml(error.message)}</p></div>`;
+      setStatus("知识地图加载失败，文档索引仍可使用。", true);
     }
   }
 
@@ -170,17 +162,15 @@
     });
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
     elements.clear.addEventListener("click", clearFilters);
-    document.getElementById("reset-map").addEventListener("click", renderMap);
-    elements.close.addEventListener("click", closeRelationPanel);
-    elements.backdrop.addEventListener("click", closeRelationPanel);
-    document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && !elements.panel.hidden) closeRelationPanel();
-    });
+    elements.resetMap.addEventListener("click", renderMap);
     document.addEventListener("click", (event) => {
       const open = event.target.closest("[data-open-path]");
       if (open) window.location.href = open.dataset.openPath;
-      const relation = event.target.closest("[data-relation-id]");
-      if (relation) openRelationPanel(relation.dataset.relationId);
+      const mapTarget = event.target.closest("[data-map-id]");
+      if (mapTarget) {
+        graph.focusGlobal(mapTarget.dataset.mapId);
+        renderMapDetails(mapTarget.dataset.mapId);
+      }
     });
   }
 
@@ -189,7 +179,7 @@
     elements.grid.innerHTML = `
       <article class="document-card">
         <div class="card-main">
-          <h2>无法加载 catalog.json</h2>
+          <h2>无法加载目录</h2>
           <p>请检查最近一次 GitHub Pages 构建是否成功。</p>
         </div>
       </article>`;
@@ -202,15 +192,17 @@
       state.catalog = await response.json();
       populateFilters();
       renderLibrary();
-      const warningText = state.catalog.warnings.length
-        ? `，${state.catalog.warnings.length} 条链接警告`
-        : "";
-      setStatus(`已加载 ${state.catalog.pages.length} 篇内容${warningText}`);
+      if (state.catalog.warnings.length) {
+        setStatus(`目录中有 ${state.catalog.warnings.length} 条链接警告。`, true);
+      } else {
+        setStatus("");
+      }
     } catch (error) {
       showLoadError(error);
     }
   }
 
   bindEvents();
+  resetMapDetails();
   load();
 }());

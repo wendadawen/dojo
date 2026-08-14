@@ -1,10 +1,5 @@
 (function attachDojoGraph(root) {
   let globalCy = null;
-  let localCy = null;
-
-  if (root.cytoscape && root.cytoscapeDagre) {
-    root.cytoscape.use(root.cytoscapeDagre);
-  }
 
   function cssVar(name, fallback) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
@@ -12,64 +7,99 @@
 
   function graphStyle() {
     const colors = {
-      text: cssVar("--muted", "#59636e"),
-      muted: cssVar("--muted", "#8c959f"),
-      accent: cssVar("--accent", "#0969da"),
-      green: cssVar("--green", "#1a7f37"),
-      orange: cssVar("--orange", "#bc4c00"),
-      purple: cssVar("--purple", "#8250df"),
-      focus: "#d29922",
+      ink: cssVar("--ink", "#171815"),
+      muted: cssVar("--muted", "#686a64"),
+      surface: cssVar("--surface", "#fffefa"),
+      accent: cssVar("--accent", "#284f44"),
+      paper: cssVar("--paper-node", "#9b5c35"),
+      note: cssVar("--note-node", "#7a6230"),
+      line: cssVar("--graph-line", "#7d807a"),
     };
+
     return [
       {
         selector: "node",
         style: {
-          label: "data(label)",
-          "font-size": 10,
-          "font-family": "system-ui, sans-serif",
-          color: colors.text,
-          "text-wrap": "wrap",
-          "text-max-width": 110,
-          "background-color": colors.muted,
-          width: 18,
-          height: 18,
+          label: "",
+          width: 15,
+          height: 15,
+          "background-color": colors.accent,
+          "border-width": 2,
+          "border-color": colors.surface,
+          "overlay-opacity": 0,
         },
       },
-      { selector: 'node[type = "concept"]', style: { "background-color": colors.accent } },
-      { selector: 'node[type = "paper"]', style: { "background-color": colors.green } },
-      { selector: 'node[type = "note"]', style: { "background-color": colors.orange } },
+      { selector: 'node[type = "paper"]', style: { "background-color": colors.paper } },
+      { selector: 'node[type = "note"]', style: { "background-color": colors.note } },
+      {
+        selector: "node.show-label",
+        style: {
+          label: "data(shortLabel)",
+          color: colors.ink,
+          "font-size": 9,
+          "font-family": "system-ui, sans-serif",
+          "font-weight": 600,
+          "text-background-color": colors.surface,
+          "text-background-opacity": .94,
+          "text-background-padding": 3,
+          "text-background-shape": "roundrectangle",
+          "text-margin-y": -12,
+          "text-wrap": "none",
+        },
+      },
+      {
+        selector: "node[degree >= 8]",
+        style: {
+          label: "data(shortLabel)",
+          color: colors.muted,
+          "font-size": 8,
+          "font-family": "system-ui, sans-serif",
+          "font-weight": 600,
+          "text-background-color": colors.surface,
+          "text-background-opacity": .9,
+          "text-background-padding": 2,
+          "text-background-shape": "roundrectangle",
+          "text-margin-y": -11,
+          "text-wrap": "none",
+        },
+      },
       {
         selector: "edge",
         style: {
-          width: 1,
-          opacity: .16,
-          "line-color": colors.muted,
-          "target-arrow-color": colors.muted,
+          width: 1.45,
+          opacity: .58,
+          "line-color": colors.line,
+          "target-arrow-color": colors.line,
           "target-arrow-shape": "triangle",
+          "arrow-scale": .7,
           "curve-style": "bezier",
+          "overlay-opacity": 0,
         },
       },
-      { selector: ".is-dimmed", style: { opacity: .12 } },
       {
-        selector: ".is-focused",
+        selector: ".is-dimmed",
+        style: { opacity: .09 },
+      },
+      {
+        selector: "edge.is-focused",
         style: {
-          opacity: 1,
-          width: 3,
-          "line-color": colors.purple,
-          "target-arrow-color": colors.purple,
+          opacity: .95,
+          width: 2.6,
+          "line-color": colors.accent,
+          "target-arrow-color": colors.accent,
         },
       },
       {
         selector: "node.is-focused",
-        style: { width: 26, height: 26, "border-width": 3, "border-color": colors.focus },
+        style: {
+          opacity: 1,
+          width: 25,
+          height: 25,
+          "border-width": 4,
+          "border-color": colors.surface,
+          "z-index": 20,
+        },
       },
-      {
-        selector: 'node[role = "center"]',
-        style: { width: 30, height: 30, "border-width": 3, "border-color": colors.focus },
-      },
-      { selector: 'node[role = "incoming"]', style: { "background-color": colors.accent } },
-      { selector: 'node[role = "outgoing"]', style: { "background-color": colors.green } },
-      { selector: 'node[role = "both"]', style: { "background-color": colors.purple } },
     ];
   }
 
@@ -82,12 +112,19 @@
     globalCy = null;
   }
 
-  function destroyLocal() {
-    if (localCy) localCy.destroy();
-    localCy = null;
+  function clearFocus(cy) {
+    cy.elements().removeClass("is-focused is-dimmed show-label");
   }
 
-  function renderGlobal(container, catalog, visibleIds, onSelect) {
+  function focusNode(cy, node) {
+    const neighborhood = node.closedNeighborhood();
+    clearFocus(cy);
+    cy.elements().not(neighborhood).addClass("is-dimmed");
+    neighborhood.addClass("is-focused");
+    node.addClass("show-label");
+  }
+
+  function renderGlobal(container, catalog, visibleIds, onSelect, onClear) {
     requireCytoscape();
     destroyGlobal();
     const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds);
@@ -95,44 +132,57 @@
       container,
       elements: [...elements.nodes, ...elements.edges],
       style: graphStyle(),
+      minZoom: .28,
+      maxZoom: 2.4,
+      wheelSensitivity: .22,
       layout: {
         name: "cose",
         animate: false,
         fit: true,
-        padding: 35,
-        nodeRepulsion: 9000,
-        idealEdgeLength: 95,
+        padding: 54,
+        randomize: true,
+        componentSpacing: 90,
+        nodeRepulsion: 14000,
+        nodeOverlap: 30,
+        idealEdgeLength: 112,
+        edgeElasticity: 85,
+        nestingFactor: 1.15,
+        gravity: .45,
+        numIter: 1800,
       },
     });
+
     globalCy.on("tap", "node", (event) => {
       const node = event.target;
-      const neighborhood = node.closedNeighborhood();
-      globalCy.elements().removeClass("is-focused is-dimmed");
-      globalCy.elements().not(neighborhood).addClass("is-dimmed");
-      neighborhood.addClass("is-focused");
+      focusNode(globalCy, node);
       onSelect(node.id());
     });
+
+    globalCy.on("mouseover", "node", (event) => {
+      const node = event.target;
+      if (!globalCy.$("node.is-focused").length) node.addClass("show-label");
+      container.style.cursor = "pointer";
+    });
+
+    globalCy.on("mouseout", "node", (event) => {
+      const node = event.target;
+      if (!node.hasClass("is-focused")) node.removeClass("show-label");
+      container.style.cursor = "";
+    });
+
     globalCy.on("tap", (event) => {
-      if (event.target === globalCy) {
-        globalCy.elements().removeClass("is-focused is-dimmed");
-      }
+      if (event.target !== globalCy) return;
+      clearFocus(globalCy);
+      if (onClear) onClear();
     });
   }
 
-  function renderLocal(container, catalog, centerId, onSelect) {
-    requireCytoscape();
-    destroyLocal();
-    const elements = root.DojoHomeModel.makeLocalGraph(catalog, centerId);
-    localCy = root.cytoscape({
-      container,
-      elements: [...elements.nodes, ...elements.edges],
-      style: graphStyle(),
-      layout: { name: "dagre", rankDir: "LR", nodeSep: 38, rankSep: 78, padding: 24 },
-    });
-    localCy.on("tap", "node", (event) => {
-      if (event.target.id() !== centerId) onSelect(event.target.id());
-    });
+  function focusGlobal(id) {
+    if (!globalCy) return;
+    const node = globalCy.$id(id);
+    if (!node.length) return;
+    focusNode(globalCy, node);
   }
 
-  root.DojoGraph = { renderGlobal, renderLocal, destroyGlobal, destroyLocal };
+  root.DojoGraph = { renderGlobal, destroyGlobal, focusGlobal };
 }(window));

@@ -22,6 +22,16 @@
     return TYPE_LABELS[type] || type || "未分类";
   }
 
+  function shortLabel(page) {
+    const title = String(page.title || "");
+    const colonIndex = title.search(/[：:]/);
+    const lead = colonIndex > 0 ? title.slice(0, colonIndex) : title;
+    if (lead.length <= 26) return lead;
+    const tag = String(page.tag || "").trim();
+    if (tag && tag.length <= 22) return tag;
+    return `${lead.slice(0, 24).trim()}…`;
+  }
+
   function filterPages(pages, state) {
     const query = normalize(state.query);
     return pages
@@ -53,10 +63,12 @@
       data: {
         id: page.id,
         label: page.title,
+        shortLabel: shortLabel(page),
         path: page.path,
         type: page.type,
         topics: page.topics || [],
         role,
+        degree: (page.incoming_count || 0) + (page.outgoing_count || 0),
       },
     };
   }
@@ -106,21 +118,16 @@
   }
 
   function renderCard(page) {
-    const topics = (page.topics || [])
-      .map((topic) => `<span class="topic-chip">${escapeHtml(topic)}</span>`)
-      .join("");
+    const topic = (page.topics || [])[0] || page.tag || "";
     return `
       <article class="document-card">
         <button class="card-main" type="button" data-open-path="${escapeHtml(page.path)}">
           <span class="card-meta">
             <span class="type-badge type-${escapeHtml(page.type)}">${escapeHtml(typeLabel(page.type))}</span>
-            ${topics}
+            ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
           </span>
           <h2>${escapeHtml(page.title)}</h2>
           <p>${escapeHtml(page.description || "暂无摘要")}</p>
-        </button>
-        <button class="relation-button" type="button" data-relation-id="${escapeHtml(page.id)}">
-          入链 ${page.incoming_count || 0} · 出链 ${page.outgoing_count || 0}
         </button>
       </article>`;
   }
