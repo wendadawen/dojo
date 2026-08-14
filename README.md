@@ -19,10 +19,14 @@ AI 会从 `AGENTS.md` 识别场景，并加载 `guides/` 下对应的场景指�
 ```text
 guides/       每个学习场景一份指南
 wiki/         学过的内容生成的可浏览页面（wiki/<name>/index.html）
-.dojo/        构建素材与脚本（HTML 模板、首页生成器、校验器）
-content.json  首页数据清单
-index.html    首页，双击即可离线浏览
+.dojo/        HTML 模板、目录构建器与校验器
+assets/       首页 CSS 与 JavaScript
+index.html    GitHub Pages 首页应用
 ```
+
+## 首页与知识地图
+
+GitHub Pages 发布时会扫描 `wiki/*/index.html`，自动生成文章目录和页面链接 Graph。新增文章只需提供页面元数据，不需要维护独立清单或重写 `index.html`。
 
 ## 在线访问
 

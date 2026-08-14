@@ -18,7 +18,7 @@
 
 ```text
 wiki/<name>/
-├── index.html        # 完整解析（教学页，首页登记）
+├── index.html        # 完整解析（Pages 构建自动发现）
 ├── overview.html     # 快速阅读（5 分钟扫读）
 └── research/
     └── draft-check.md

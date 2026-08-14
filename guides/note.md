@@ -57,4 +57,4 @@
 
 ## 发布
 
-以 `.dojo/templates/note/index.html` 为外壳，正文写入 `<!-- @content -->` 标记处，替换全部【…】占位符。自检通过后在 `content.json` 的 `notes` 分区登记，运行 `.dojo/scripts/generate_index.py`。对用户说明生成位置、卡片覆盖范围和未解决项。
+以 `.dojo/templates/note/index.html` 为外壳，正文写入 `<!-- @content -->` 标记处，替换全部【…】占位符，包括首页摘要、主题和标签。自检通过后只验证生成页面；首页目录和 Graph 由 GitHub Pages 构建自动发现。对用户说明生成位置、卡片覆盖范围和未解决项。

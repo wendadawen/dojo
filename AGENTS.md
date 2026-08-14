@@ -7,9 +7,9 @@
 ```text
 guides/       每个学习场景一份指南（AI 的操作入口）
 wiki/         学习产出的可浏览页面，按需创建（wiki/<name>/index.html）
-.dojo/        构建素材与脚本（模板、首页生成器、校验器），平时不用改
-content.json  首页数据清单
-index.html    首页（双击即可离线浏览）
+.dojo/        构建素材与脚本（模板、目录构建器、校验器），平时不用改
+assets/       首页 CSS 与 JavaScript
+index.html    GitHub Pages 首页应用
 ```
 
 ## 场景路由
@@ -26,8 +26,10 @@ index.html    首页（双击即可离线浏览）
 
 ## 项目约束
 
-- 可浏览内容统一生成 HTML，放入 `wiki/<name>/`，登记到 `content.json`，再运行 `.dojo/scripts/generate_index.py` 更新首页。
+- 可浏览内容统一生成 HTML，放入 `wiki/<name>/`。不要手工登记首页；GitHub Pages 构建会扫描 `wiki/*/index.html` 自动生成目录与 Graph 数据。
+- 新页面的 `<head>` 必须包含 `description`、`dojo:type`、`dojo:topics`、`dojo:tag` 元数据；页面关系自动来自 HTML 内部链接。
+- `index.html` 是稳定首页应用，不运行旧的 `.dojo/scripts/generate_index.py`，不因新增文章而重写。
 - 页面用相对路径引用 `libs/`（`wiki/<name>/` 深两层，即 `../../libs/...`）。
 - 生成页面后运行 `.dojo/scripts/validate.py <页面路径>`。
-- 全站纯静态、可离线双击浏览；不引入需要联网或构建服务的依赖。
+- 全站通过 GitHub Pages 静态发布；不引入运行时后端或在线 API。
 - 不自动 commit、push、重命名 GitHub 仓库或部署，除非用户明确要求。

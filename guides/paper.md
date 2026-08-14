@@ -12,11 +12,11 @@
 2. 依次执行三个阶段的规范：`guides/paper/plan.md`（规划）→ `guides/paper/write.md`（生产）→ `guides/paper/check.md`（质检）。
 3. 页面必须区分：论文明确声称、原文实验事实、你的解释与推断。
 4. 公式、数字、实验结论必须能定位回原文；不确定的信息明确标注，不凭记忆补全。
-5. 完成独立审查、修复和机械验证后，才更新 `content.json` 与首页。
+5. 完成独立审查、修复和机械验证后，确认页面 head 中的首页元数据已替换完成；首页由 GitHub Pages 构建自动发现。
 
 ## 交付
 
-- `wiki/<name>/index.html`（完整解析，首页登记）
+- `wiki/<name>/index.html`（完整解析，Pages 构建自动发现）
 - `wiki/<name>/overview.html`（快速阅读）
-- 更新后的 `content.json` 和 `index.html`
+- 页面 head 中完整的首页元数据
 - 对用户只说明：生成位置、快速阅读与完整解析入口、核心覆盖内容、验证结果、仍有的边界、递归生成的前置概念页。

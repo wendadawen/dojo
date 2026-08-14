@@ -68,10 +68,10 @@
 - `.dojo/scripts/validate.py` 退出码为 0
 - 每个声称可运行的代码块已重跑，实际结果与页面描述一致
 - 关键论断和数字已重新对照固定版本的论文原文
-- content.json 中条目 ID 和路径无重复，目标页面存在
+- 页面 `<head>` 中存在非占位的 `description`、`dojo:type=paper`、`dojo:topics`、`dojo:tag`
 - overview.html 存在且与 index.html 互相链接；概念页引用链接全部有效或已标注占位；递归生成的前置概念页均已通过各自质检
 
-满足后自动执行：更新 `content.json`，运行 `python3 .dojo/scripts/generate_index.py`，从首页实际打开论文页确认正常加载，只删除本次运行在明确临时目录中创建的临时文件，将发布结果追加到 review-3.md 末尾。任一条件不满足时不得更新 content.json 或首页。
+满足后自动执行：运行页面验证并确认元数据完整，不运行 `generate_index.py`，不手工修改 `index.html`；将发布结果追加到 review-3.md 末尾。
 
 ## 5. 审查任务包
 
