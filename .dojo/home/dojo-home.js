@@ -14,11 +14,22 @@
     empty: document.getElementById("empty-state"),
     clear: document.getElementById("clear-filters"),
     globalGraph: document.getElementById("global-graph"),
+    globalGraph3d: document.getElementById("global-graph-3d"),
     mapCount: document.getElementById("map-count"),
+    mapWorkspace: document.getElementById("map-workspace"),
     mapDetails: document.getElementById("map-details"),
     resetMap: document.getElementById("reset-map"),
+    graphModes: [...document.querySelectorAll("[data-graph-mode]")],
   };
-  const state = { catalog: null, query: "", type: "", topic: "", view: "library" };
+  const initialGraphMode = window.matchMedia("(max-width: 760px)").matches ? "2d" : "3d";
+  const state = {
+    catalog: null,
+    query: "",
+    type: "",
+    topic: "",
+    view: "library",
+    graphMode: initialGraphMode,
+  };
 
   function setStatus(message, isError = false) {
     elements.status.textContent = message;
@@ -42,10 +53,22 @@
     return model.filterPages(state.catalog.pages, state);
   }
 
+  function renderMath(container) {
+    if (!window.renderMathInElement || !container) return;
+    window.renderMathInElement(container, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "$", right: "$", display: false },
+      ],
+      throwOnError: false,
+    });
+  }
+
   function renderLibrary() {
     if (!state.catalog) return;
     const pages = filteredPages();
     elements.grid.innerHTML = pages.map(model.renderCard).join("");
+    renderMath(elements.grid);
     elements.count.textContent = pages.length === state.catalog.pages.length
       ? `共 ${pages.length} 篇`
       : `${pages.length} / ${state.catalog.pages.length} 篇`;
@@ -62,9 +85,9 @@
     }).join("")}</ul>`;
   }
 
-  function relationGroup(title, note, ids) {
+  function relationGroup(title, note, ids, direction) {
     return `
-      <section class="relation-group">
+      <section class="relation-group is-${model.escapeHtml(direction)}">
         <div class="relation-group-header">
           <h4>${model.escapeHtml(title)}</h4>
           <span>${ids.length} ${model.escapeHtml(note)}</span>
@@ -74,30 +97,31 @@
   }
 
   function resetMapDetails() {
-    elements.mapDetails.innerHTML = `
-      <div class="map-empty">
-        <span class="map-step">↗</span>
-        <h3>从一个节点开始</h3>
-        <p>点击节点查看它附近的一跳关系；悬停节点可查看简称，滚轮缩放，拖动画布移动。</p>
-      </div>`;
+    elements.mapDetails.replaceChildren();
+    elements.mapDetails.hidden = true;
+    elements.mapWorkspace.classList.remove("has-details");
+    requestAnimationFrame(graph.resize);
   }
 
   function renderMapDetails(id) {
     const page = state.catalog.pages.find((item) => item.id === id);
     if (!page) return;
+    elements.mapDetails.hidden = false;
+    elements.mapWorkspace.classList.add("has-details");
     elements.mapDetails.innerHTML = `
       <p class="detail-type type-${model.escapeHtml(page.type)}">${model.escapeHtml(model.typeLabel(page.type))}</p>
       <h3>${model.escapeHtml(page.title)}</h3>
-      <p class="detail-description">${model.escapeHtml(page.description || "暂无摘要")}</p>
+      <p class="detail-description">${model.escapeHtml(page.summary || page.description || "暂无摘要")}</p>
       <div class="detail-actions">
         <a class="detail-open" href="${model.escapeHtml(page.path)}">阅读文档&nbsp; ↗</a>
-        <span class="detail-hint">图中已突出相邻节点</span>
       </div>
-      ${relationGroup("引用本文", "篇", page.incoming || [])}
-      ${relationGroup("本文引用", "篇", page.outgoing || [])}`;
+      ${relationGroup("引用本文", "篇", page.incoming || [], "incoming")}
+      ${relationGroup("本文引用", "篇", page.outgoing || [], "outgoing")}`;
+    renderMath(elements.mapDetails);
+    requestAnimationFrame(graph.resize);
   }
 
-  function renderMap() {
+  async function renderMap() {
     if (!state.catalog) return;
     resetMapDetails();
     const visibleIds = new Set(filteredPages().map((page) => page.id));
@@ -105,18 +129,64 @@
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
     ).length;
     elements.mapCount.textContent = `${visibleIds.size} 个节点 · ${edgeCount} 条引用`;
+    elements.globalGraph.hidden = state.graphMode !== "2d";
+    elements.globalGraph3d.hidden = state.graphMode !== "3d";
+    graph.setMode(state.graphMode);
     try {
-      graph.renderGlobal(
-        elements.globalGraph,
-        state.catalog,
-        visibleIds,
-        renderMapDetails,
-        resetMapDetails,
-      );
+      if (state.graphMode === "3d") {
+        graph.destroyGlobal();
+        await graph.render3d(
+          elements.globalGraph3d,
+          state.catalog,
+          visibleIds,
+          renderMapDetails,
+          resetMapDetails,
+        );
+      } else {
+        graph.destroy3d();
+        graph.renderGlobal(
+          elements.globalGraph,
+          state.catalog,
+          visibleIds,
+          renderMapDetails,
+          resetMapDetails,
+        );
+      }
+      setStatus("");
     } catch (error) {
-      elements.mapDetails.innerHTML = `<div class="map-empty"><h3>知识地图不可用</h3><p>${model.escapeHtml(error.message)}</p></div>`;
-      setStatus("知识地图加载失败，文档索引仍可使用。", true);
+      if (state.graphMode === "3d") {
+        state.graphMode = "2d";
+        elements.graphModes.forEach((button) => {
+          const active = button.dataset.graphMode === "2d";
+          button.classList.toggle("is-active", active);
+          button.setAttribute("aria-pressed", String(active));
+        });
+        elements.globalGraph.hidden = false;
+        elements.globalGraph3d.hidden = true;
+        graph.destroy3d();
+        graph.renderGlobal(
+          elements.globalGraph,
+          state.catalog,
+          visibleIds,
+          renderMapDetails,
+          resetMapDetails,
+        );
+        setStatus("3D 不可用，当前显示 2D。", true);
+        return;
+      }
+      elements.mapDetails.innerHTML = `<div class="map-empty"><h3>知识地图错误</h3><p>${model.escapeHtml(error.message)}</p></div>`;
+      setStatus("知识地图错误。", true);
     }
+  }
+
+  function setGraphMode(mode) {
+    state.graphMode = mode;
+    elements.graphModes.forEach((button) => {
+      const active = button.dataset.graphMode === mode;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+    if (state.view === "map") renderMap();
   }
 
   function setView(view) {
@@ -128,7 +198,12 @@
       tab.classList.toggle("is-active", active);
       tab.setAttribute("aria-selected", String(active));
     });
-    if (view === "map" && state.catalog) renderMap();
+    if (view === "map" && state.catalog) {
+      renderMap();
+    } else {
+      graph.destroyGlobal();
+      graph.destroy3d();
+    }
   }
 
   function applyFilters() {
@@ -161,26 +236,32 @@
       applyFilters();
     });
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
+    elements.graphModes.forEach((button) => {
+      button.addEventListener("click", () => setGraphMode(button.dataset.graphMode));
+    });
     elements.clear.addEventListener("click", clearFilters);
-    elements.resetMap.addEventListener("click", renderMap);
+    elements.resetMap.addEventListener("click", () => {
+      graph.reset(state.graphMode);
+      resetMapDetails();
+    });
     document.addEventListener("click", (event) => {
       const open = event.target.closest("[data-open-path]");
       if (open) window.location.href = open.dataset.openPath;
       const mapTarget = event.target.closest("[data-map-id]");
       if (mapTarget) {
-        graph.focusGlobal(mapTarget.dataset.mapId);
+        graph.focusGlobal(mapTarget.dataset.mapId, state.graphMode === "3d");
         renderMapDetails(mapTarget.dataset.mapId);
       }
     });
   }
 
   function showLoadError(error) {
-    setStatus(`目录加载失败：${error.message}`, true);
+    setStatus(`目录错误：${error.message}`, true);
     elements.grid.innerHTML = `
       <article class="document-card">
         <div class="card-main">
-          <h2>无法加载目录</h2>
-          <p>请检查最近一次 GitHub Pages 构建是否成功。</p>
+          <h2>目录错误</h2>
+          <p>catalog.json 未能加载。</p>
         </div>
       </article>`;
   }
@@ -203,6 +284,11 @@
   }
 
   bindEvents();
+  elements.graphModes.forEach((button) => {
+    const active = button.dataset.graphMode === state.graphMode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
   resetMapDetails();
   load();
 }());

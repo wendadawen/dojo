@@ -116,15 +116,19 @@ def parse_page(root: Path, page_path: Path) -> dict:
         or (parser.leads[0] if parser.leads else "")
         or (parser.paragraphs[0] if parser.paragraphs else "")
     )
+    summary_meta = parser.meta.get("dojo:summary", "").strip()
+    summary = summary_meta or description
 
     return {
         "id": relative,
         "path": relative,
         "title": title,
         "description": clean_text(description),
+        "summary": clean_text(summary),
         "type": parser.meta.get("dojo:type", "").strip() or "unknown",
         "topics": split_topics(parser.meta.get("dojo:topics", "")),
         "tag": parser.meta.get("dojo:tag", "").strip(),
+        "_has_summary": bool(summary_meta),
         "_hrefs": parser.hrefs,
     }
 
@@ -154,6 +158,8 @@ def build_catalog(root: Path) -> dict:
     warnings: list[dict] = []
 
     for page in pages:
+        if not page.pop("_has_summary"):
+            warnings.append({"type": "missing_summary", "source": page["id"]})
         if page["type"] == "unknown":
             warnings.append({"type": "unclassified", "source": page["id"]})
         if not page["topics"]:

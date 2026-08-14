@@ -53,4 +53,4 @@
 
 ## 发布
 
-使用 `.dojo/templates/note/index.html`，替换全部占位符和 `<!-- @content -->`。页面元数据包括摘要、类型、主题和标签。首页目录与 Graph 由 GitHub Pages 构建自动生成。
+使用 `.dojo/templates/note/index.html`，替换全部占位符和 `<!-- @content -->`。页面元数据包括纯文本 `description`、可含 `$...$` 公式的 `dojo:summary`、类型、主题和标签。首页目录与 Graph 由 GitHub Pages 构建自动生成。
