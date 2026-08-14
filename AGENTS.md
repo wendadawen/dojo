@@ -7,8 +7,7 @@
 ```text
 guides/       每个学习场景一份指南（AI 的操作入口）
 wiki/         学习产出的可浏览页面，按需创建（wiki/<name>/index.html）
-.dojo/        构建素材与脚本（模板、目录构建器、校验器），平时不用改
-assets/       首页 CSS 与 JavaScript
+.dojo/        构建素材与脚本（模板、首页资源、目录构建器、校验器）
 index.html    GitHub Pages 首页应用
 ```
 

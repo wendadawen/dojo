@@ -19,8 +19,7 @@ AI 会从 `AGENTS.md` 识别场景，并加载 `guides/` 下对应的场景指�
 ```text
 guides/       每个学习场景一份指南
 wiki/         学过的内容生成的可浏览页面（wiki/<name>/index.html）
-.dojo/        HTML 模板、目录构建器与校验器
-assets/       首页 CSS 与 JavaScript
+.dojo/        HTML 模板、首页资源、目录构建器与校验器
 index.html    GitHub Pages 首页应用
 ```
 
