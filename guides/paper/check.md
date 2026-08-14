@@ -84,7 +84,7 @@
 - `.dojo/scripts/validate.py` 返回成功
 - 可运行代码的结果与页面描述一致
 - 关键论断和数字已重新核对固定版本论文
-- 页面 `<head>` 包含有效的 `description`、`dojo:type=paper`、`dojo:topics`、`dojo:tag`
+- 页面 `<head>` 包含有效的纯文本 `description`、可渲染 `dojo:summary`、`dojo:type=paper`、`dojo:topics`、`dojo:tag`
 - `overview.html` 与 `index.html` 相互链接
 - 页面引用的概念链接有效，或具有明确占位
 - 递归生成的前置概念页已完成各自质检

@@ -26,10 +26,15 @@
     const title = String(page.title || "");
     const colonIndex = title.search(/[：:]/);
     const lead = colonIndex > 0 ? title.slice(0, colonIndex) : title;
-    if (lead.length <= 26) return lead;
-    const tag = String(page.tag || "").trim();
-    if (tag && tag.length <= 22) return tag;
-    return `${lead.slice(0, 24).trim()}…`;
+    if (lead.length <= 24) return lead;
+    const parentheses = lead.match(/^(.+?)[（(]([^（）()]+)[）)]$/);
+    if (parentheses) {
+      const prefix = parentheses[1].trim();
+      const inner = parentheses[2].trim();
+      if (prefix.length <= 16) return prefix;
+      if (/^[A-Za-z][A-Za-z0-9-]{1,12}$/.test(inner)) return inner;
+    }
+    return `${lead.slice(0, 22).trim()}…`;
   }
 
   function filterPages(pages, state) {
@@ -42,6 +47,7 @@
         return normalize([
           page.title,
           page.description,
+          page.summary,
           page.tag,
           ...(page.topics || []),
         ].join(" ")).includes(query);
@@ -119,6 +125,7 @@
 
   function renderCard(page) {
     const topic = (page.topics || [])[0] || page.tag || "";
+    const summary = page.summary || page.description || "暂无摘要";
     return `
       <article class="document-card">
         <button class="card-main" type="button" data-open-path="${escapeHtml(page.path)}">
@@ -127,7 +134,7 @@
             ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
           </span>
           <h2>${escapeHtml(page.title)}</h2>
-          <p>${escapeHtml(page.description || "暂无摘要")}</p>
+          <p>${escapeHtml(summary)}</p>
         </button>
       </article>`;
   }

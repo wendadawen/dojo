@@ -26,7 +26,7 @@ index.html    GitHub Pages 首页应用
 ## 项目约束
 
 - 可浏览内容统一生成 HTML，放入 `wiki/<name>/`。不要手工登记首页；GitHub Pages 构建会扫描 `wiki/*/index.html` 自动生成目录与 Graph 数据。
-- 新页面的 `<head>` 必须包含 `description`、`dojo:type`、`dojo:topics`、`dojo:tag` 元数据；页面关系自动来自 HTML 内部链接。
+- 新页面的 `<head>` 必须包含 `description`、`dojo:summary`、`dojo:type`、`dojo:topics`、`dojo:tag` 元数据。`description` 使用纯文本，`dojo:summary` 用于首页展示，公式写成 `$...$`；页面关系自动来自 HTML 内部链接。
 - `index.html` 是稳定首页应用，不因新增文章而重写。
 - 页面用相对路径引用 `libs/`（`wiki/<name>/` 深两层，即 `../../libs/...`）。
 - 生成页面后运行 `.dojo/scripts/validate.py <页面路径>`。

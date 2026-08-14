@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 
@@ -30,11 +31,57 @@ IGNORE_PREFIXES = (
 )
 
 MARKERS = ("@content", "@component", "TODO", "TBD")
+REQUIRED_WIKI_META = (
+    "description",
+    "dojo:summary",
+    "dojo:type",
+    "dojo:topics",
+    "dojo:tag",
+)
+INLINE_MATH_RE = re.compile(
+    r"\$\$[\s\S]+?\$\$|"
+    r"(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$(?!\$)|"
+    r"\\\([\s\S]+?\\\)|"
+    r"\\\[[\s\S]+?\\\]"
+)
+
+
+class PageInspector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: dict[str, str] = {}
+        self.scripts: list[str] = []
+        self.stylesheets: list[str] = []
+        self.visible_parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple]) -> None:
+        values = dict(attrs)
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+        if tag == "meta":
+            name = values.get("name", "").strip().lower()
+            if name:
+                self.meta[name] = values.get("content", "").strip()
+        elif tag == "script" and values.get("src"):
+            self.scripts.append(values["src"])
+        elif tag == "link" and values.get("rel") == "stylesheet":
+            self.stylesheets.append(values.get("href", ""))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.visible_parts.append(data)
 
 
 def validate_page(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8", errors="ignore")
+    inspector = PageInspector()
+    inspector.feed(text)
 
     if not text.startswith("<!DOCTYPE html>"):
         errors.append("missing <!DOCTYPE html>")
@@ -71,6 +118,35 @@ def validate_page(path: Path) -> list[str]:
             target = target / "index.html"
         if not target.exists():
             errors.append(f"broken local reference {ref}")
+
+    is_wiki_page = "wiki" in path.parts
+    if is_wiki_page and path.name == "index.html":
+        for name in REQUIRED_WIKI_META:
+            if not inspector.meta.get(name):
+                errors.append(f"missing metadata: {name}")
+
+        description = inspector.meta.get("description", "")
+        summary = inspector.meta.get("dojo:summary", "")
+        if "$" in description:
+            errors.append("description must be plain text; put formulas in dojo:summary")
+        if "$$" in summary:
+            errors.append("dojo:summary supports inline $...$ formulas only")
+        if summary.count("$") % 2:
+            errors.append("dojo:summary has unmatched $ delimiter")
+
+    visible_text = " ".join(inspector.visible_parts)
+    summary = inspector.meta.get("dojo:summary", "")
+    if is_wiki_page and INLINE_MATH_RE.search(f"{summary} {visible_text}"):
+        has_katex_js = any("katex" in ref for ref in inspector.scripts)
+        has_katex_css = any("katex" in ref for ref in inspector.stylesheets)
+        has_auto_render = (
+            any("auto-render" in ref for ref in inspector.scripts)
+            and "renderMathInElement" in text
+        )
+        if not has_katex_js or not has_katex_css:
+            errors.append("math content requires local KaTeX JS and CSS")
+        if not has_auto_render:
+            errors.append("math content requires auto-render initialization")
 
     return errors
 

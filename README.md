@@ -25,7 +25,7 @@ index.html    GitHub Pages 首页应用
 
 ## 首页与知识地图
 
-GitHub Pages 发布时会扫描 `wiki/*/index.html`，自动生成文章目录和页面链接 Graph。新增文章只需提供页面元数据，不需要维护独立清单或重写 `index.html`。
+GitHub Pages 发布时会扫描 `wiki/*/index.html`，自动生成文章目录和页面链接 Graph。新增文章只需提供页面元数据，不需要维护独立清单或重写 `index.html`。其中 `description` 为纯文本，`dojo:summary` 用于首页摘要并支持 `$...$` 行内公式。
 
 ## 在线访问
 
