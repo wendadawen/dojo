@@ -664,7 +664,7 @@
 <p>给一个 Transformer 喂三个内容完全相同的 token "the the the"，每个位置的输出会一样吗？答案是：在没有任何位置信息时，三个位置的输出完全一样——注意力只看内容匹配，不看顺序。要让模型分清"第一个 the"和"第三个 the"，必须把位置信息注入到注意力里。<strong>RoPE</strong>（Rotary Position Embedding，旋转位置编码）的做法是：按 token 的绝对位置旋转它的 query 和 key 向量，使两个 token 之间的注意力内积自然只依赖它们的相对位置 $m-n$，且不引入任何可学习参数。RoPE 是当前自回归 LLM 的默认位置编码，被 LLaMA、Mistral、Qwen、Falcon、PaLM、Gemma、GPT-NeoX 等采用<sup>[C6]</sup>。本文回答：RoPE 的旋转矩阵长什么样？为什么内积只依赖 $m-n$？远程衰减从何而来？为什么只动 Q/K 不动 V？长度外推为何需要扩展方法？</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
+  <h2>核心问题</h2>
   <ul>
     <li>用一句话说清 RoPE 在做什么，并说明它和绝对位置编码、相对位置编码、NoPE 的本质区别；</li>
     <li>给定 2 维 q、k 和位置 m、n，手算 RoPE 旋转后的内积，并验证只依赖 $m-n$；</li>
@@ -704,12 +704,30 @@
 <p>RoPE 经常被叫做"相对位置编码"，但这个名字容易让人误以为它直接用 $m-n$ 构造旋转。准确的说法是<strong>"绝对构造、相对效果"</strong>：构造旋转用的是绝对位置 $m$ 和 $n$，但产生的内积 $(R_m q)\cdot(R_n k)$ 只依赖 $m-n$<sup>[C2]</sup>。论文摘要原文："encodes the absolute position with a rotation matrix and meanwhile incorporates the explicit relative position dependency"——同时编码绝对位置并引入相对位置依赖。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>APE、相对 PE、RoPE、NoPE 各把位置信息加在哪里？分别是否有可学习参数。</li>
-  <li>RoPE 论文摘要里"absolute position"与"relative position dependency"同时出现，这两件事是怎么统一的。</li>
-  <li>RoPE 修改了 value 吗？修改了输入嵌入吗。</li>
-</ul>
+<h3 id="why-position-encoding-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>APE、相对 PE、RoPE、NoPE 各把位置信息加在哪里？分别是否有可学习参数。</p>
+    <details>
+      <summary>解答：四类方案的注入位置与参数</summary>
+      <p>APE 把位置向量加在第一层之前的 token 嵌入上；learned 版本有可学习参数，sinusoidal 版本没有。相对位置编码（T5 相对偏置、ALiBi）把距离相关的偏置加在 softmax 之前的注意力分数上；T5 有约 32 个 bucket 每头的可学习参数，ALiBi 没有。RoPE 在每个注意力层内、softmax 之前把绝对位置编码成旋转矩阵左乘到 Q 和 K 上，没有可学习参数（$\theta_i$ 与 base 都是固定常数）。NoPE 不注入任何位置信息，也没有参数，依赖因果掩码隐式提供位置区分。</p>
+    </details>
+  </li>
+  <li>
+    <p>RoPE 论文摘要里“absolute position”与“relative position dependency”同时出现，这两件事是怎么统一的。</p>
+    <details>
+      <summary>解答：绝对构造与相对效果的统一</summary>
+      <p>两者描述的是同一机制的不同层面：构造阶段用的是绝对位置，位置 $m$ 决定旋转矩阵 $R_m$、位置 $n$ 决定 $R_n$，二者独立计算；效果阶段体现为相对位置，因为内积 $\langle R_m q, R_n k\rangle = q^T R_m^T R_n k = q^T R_{n-m} k$ 中绝对位置相互抵消，只留下 $n-m$。因此准确说法是“绝对构造、相对效果”，RoPE 并不直接用 $m-n$ 去构造旋转。</p>
+    </details>
+  </li>
+  <li>
+    <p>RoPE 修改了 value 吗？修改了输入嵌入吗。</p>
+    <details>
+      <summary>解答：RoPE 的作用范围</summary>
+      <p>都没有。RoPE 只把旋转矩阵左乘到 Q 和 K 上，不修改 V，也不修改输入嵌入。原因是注意力分数只来自 $QK^T$：旋转 Q 和 K 就足以让“看哪里”带上位置感知，而 V 决定“取什么信息”，旋转 V 不改变 softmax 的输入，不属于位置编码要解决的问题。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章把 RoPE 的"做什么"与已有方案的差异说清了：相对位置是<strong>效果</strong>不是<strong>构造</strong>，参数为零，作用点在每个注意力层内。但旋转矩阵长什么样、内积为何只剩 $m-n$ 尚未回答——下一章用最小 2 维例子讲旋转矩阵的形式。</p>
 
@@ -731,34 +749,47 @@ $$\tilde{q}_m = \begin{pmatrix} q_0 \cos m\theta - q_1 \sin m\theta \\ q_0 \sin 
 
 <p>关键问题：旋转后的内积 $\tilde{q}_m \cdot \tilde{k}_n$ 长什么样？把两个 2 维向量的内积展开（直接套用上面的逐元素公式，再用 $\cos(a-b)=\cos a\cos b + \sin a\sin b$ 与 $\sin(a-b)=\sin a\cos b - \cos a\sin b$），结果是</p>
 
-$$\langle R_m q, R_n k \rangle = (q_0 k_0 + q_1 k_1)\cos((n-m)\theta) + (q_0 k_1 - q_1 k_0)\sin((n-m)\theta).$$
+$$\langle R_m q, R_n k \rangle = (q_0 k_0 + q_1 k_1)\cos((n-m)\theta) - (q_0 k_1 - q_1 k_0)\sin((n-m)\theta).$$
 
 <p>这个结果只含 $(n-m)\theta$，不含单独的 $m\theta$ 或 $n\theta$——这就是 RoPE 的核心性质在 2 维情况下的体现<sup>[F2]</sup>。但要强调一点：内积不是只有 $\cos$ 项。当 $q=k$ 时 $q_0 k_1 - q_1 k_0 = 0$，$\sin$ 项消失，只剩 $\cos$；但一般情况下两项都在。论文给出的完整公式是上面这个形式（Eq.(4)）。</p>
 
-<pre class="diagram">q=(1,0) at position m=1, theta=pi/4
-
-        y
-        │
-   1 ───┼─── R_m q = (cos(pi/4), sin(pi/4)) ≈ (0.71, 0.71)
-        │   ╱
-        │  ╱  旋转 m·theta = pi/4 = 45°
-        │ ╱
-        │╱
-  ──────┼───── x        q=(1,0) 旋转前在 x 轴
-        │
-        0
-
-k=(1,0) at position n=2, theta=pi/4
-
-   1 ───┼─── R_n k = (cos(pi/2), sin(pi/2)) = (0, 1)
-        │   │
-        │   │  旋转 n·theta = pi/2 = 90°
-        │   │
-  ──────┼───┼─── x        k=(1,0) 旋转前在 x 轴
-        │
-        0
-
-内积 = (0.71)(0) + (0.71)(1) = 0.71 ≈ sqrt(2)/2</pre>
+<figure class="diagram">
+<svg viewBox="0 0 560 260" role="img" aria-label="q 与 k 同为 (1,0)，在位置 m=1 旋转 45 度、位置 n=2 旋转 90 度后的方向对比">
+  <g class="dg-line" stroke-width="1">
+    <line x1="30" y1="200" x2="250" y2="200"></line>
+    <line x1="60" y1="30" x2="60" y2="230"></line>
+    <line x1="300" y1="200" x2="520" y2="200"></line>
+    <line x1="330" y1="30" x2="330" y2="230"></line>
+  </g>
+  <g class="dg-line" stroke-width="1" stroke-dasharray="3 3">
+    <path d="M60 200 A 90 90 0 0 0 150 110"></path>
+    <path d="M330 200 A 90 90 0 0 0 420 110"></path>
+  </g>
+  <g class="dg-accent" stroke-width="2">
+    <line x1="60" y1="200" x2="150" y2="200"></line>
+    <line x1="60" y1="200" x2="124" y2="136"></line>
+    <line x1="330" y1="200" x2="420" y2="200"></line>
+    <line x1="330" y1="200" x2="330" y2="110"></line>
+  </g>
+  <g font-size="12">
+    <text x="255" y="204">x</text>
+    <text x="52" y="26">y</text>
+    <text x="525" y="204">x</text>
+    <text x="322" y="26">y</text>
+    <text x="108" y="216">q=(1,0)</text>
+    <text x="128" y="128">R_1 q</text>
+    <text x="378" y="216">k=(1,0)</text>
+    <text x="338" y="104">R_2 k</text>
+    <text x="72" y="176">45&#176;</text>
+    <text x="342" y="150">90&#176;</text>
+  </g>
+  <g font-size="13">
+    <text x="60" y="248">position m=1, rotate 1*theta</text>
+    <text x="330" y="248">position n=2, rotate 2*theta</text>
+  </g>
+</svg>
+<figcaption class="diagram-caption">同一向量 $(1,0)$ 在位置 $m=1$ 旋转到 $(0.71,\,0.71)$，在位置 $n=2$ 旋转到 $(0,\,1)$；两者夹角 $45^\circ$ 等于 $(n-m)\theta$，内积 $0.71\times0+0.71\times1=0.71=\cos((n-m)\theta)$。</figcaption>
+</figure>
 
 <p>上面这个例子是教学示例，便于手算验证。它的输入是 $q=(1,0)$、$k=(1,0)$、$\theta=\pi/4$、$m=1$、$n=2$。$\theta=\pi/4$ 是教学数字，不是真实模型的频率——真实模型 d=64/128 且 base=10000，下一章会看到具体数值。</p>
 
@@ -772,20 +803,38 @@ k=(1,0) at position n=2, theta=pi/4
 <p>第三步，内积：</p>
 <p>$$\tilde{q}_m \cdot \tilde{k}_n = (\sqrt{2}/2)\cdot 0 + (\sqrt{2}/2)\cdot 1 = \sqrt{2}/2 \approx 0.7071.$$</p>
 <p>第四步，用内积公式验证：$q_0 k_0 + q_1 k_1 = 1\cdot 1 + 0\cdot 0 = 1$，$q_0 k_1 - q_1 k_0 = 1\cdot 0 - 0\cdot 1 = 0$，$(n-m)\theta = (2-1)\pi/4 = \pi/4$，</p>
-<p>$$\langle R_m q, R_n k \rangle = 1\cdot \cos(\pi/4) + 0\cdot \sin(\pi/4) = \sqrt{2}/2 \approx 0.7071.$$</p>
+<p>$$\langle R_m q, R_n k \rangle = 1\cdot \cos(\pi/4) - 0\cdot \sin(\pi/4) = \sqrt{2}/2 \approx 0.7071.$$</p>
 <p>两种方法结果一致——这是 F2 公式正确性的证据。$\sin$ 项系数为零是因为 $q=k$，不是公式退化的结果。</p>
 </details>
 
 <div class="callout callout-yellow">
-<p><strong>常见误解</strong>：把"2 维旋转后内积"简化成 $\cos((m-n)\theta)$。这只在 $q=k$ 的特殊情况下成立（这时 $q_0 k_1 - q_1 k_0 = 0$，$\sin$ 项系数为零）。一般情况下内积还有 $\sin$ 项，正确形式是 $(q_0 k_0 + q_1 k_1)\cos((n-m)\theta) + (q_0 k_1 - q_1 k_0)\sin((n-m)\theta)$。"$\cos$ 形式"是 $q=k$ 的特例。</p>
+<p><strong>常见误解</strong>：把"2 维旋转后内积"简化成 $\cos((m-n)\theta)$。这只在 $q=k$ 的特殊情况下成立（这时 $q_0 k_1 - q_1 k_0 = 0$，$\sin$ 项系数为零）。一般情况下内积还有 $\sin$ 项，正确形式是 $(q_0 k_0 + q_1 k_1)\cos((n-m)\theta) - (q_0 k_1 - q_1 k_0)\sin((n-m)\theta)$。"$\cos$ 形式"是 $q=k$ 的特例。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 $m=0$ 时的 $R_m$，说明为什么位置 0 的旋转矩阵是单位矩阵。</li>
-  <li>给定 $q=(1,1)$、$k=(0,1)$、$\theta=\pi/6$、$m=0$、$n=1$，手算内积（提示：用 F2 公式）。</li>
-  <li>F2 内积公式里 $\sin$ 项什么时候为零？这对应什么几何条件。</li>
-</ul>
+<h3 id="rope-2d-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 $m=0$ 时的 $R_m$，说明为什么位置 0 的旋转矩阵是单位矩阵。</p>
+    <details>
+      <summary>解答：$R_0$ 为单位矩阵</summary>
+      <p>代入 $m=0$ 得 $0\cdot\theta=0$，而 $\cos 0=1$、$\sin 0=0$，因此</p>$$R_0=\begin{pmatrix}1 & 0\\ 0 & 1\end{pmatrix}.$$<p>几何含义是旋转角为零，向量保持原样。这与 RoPE 的定义一致：位置 0 是旋转的起点，不施加任何偏转，位置信息完全由后续位置相对它的旋转量体现。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 $q=(1,1)$、$k=(0,1)$、$\theta=\pi/6$、$m=0$、$n=1$，手算内积（提示：用 F2 公式）。</p>
+    <details>
+      <summary>解答：内积等于 $\sqrt{3}/2-1/2\approx0.3660$</summary>
+      <p>先算两个系数：对称项 $q_0k_0+q_1k_1=1\cdot0+1\cdot1=1$，反对称项 $q_0k_1-q_1k_0=1\cdot1-1\cdot0=1$。相对角 $(n-m)\theta=\pi/6$，其中 $\cos(\pi/6)=\sqrt{3}/2\approx0.8660$、$\sin(\pi/6)=1/2$。代入 F2：</p>$$\langle R_0 q, R_1 k\rangle = 1\cdot\frac{\sqrt{3}}{2} - 1\cdot\frac{1}{2} = \frac{\sqrt{3}-1}{2} \approx 0.3660.$$<p>直接旋转可以验证：$m=0$ 时 $\tilde q=(1,1)$ 不变；$k$ 旋转 $\pi/6$ 得 $(-1/2,\ \sqrt{3}/2)\approx(-0.5000,\ 0.8660)$，内积为 $1\cdot(-0.5)+1\cdot0.8660=0.3660$，两种算法一致。此例中 $q\neq k$，反对称项不为零，因此 $\sin$ 项必须计入。</p>
+    </details>
+  </li>
+  <li>
+    <p>F2 内积公式里 $\sin$ 项什么时候为零？这对应什么几何条件。</p>
+    <details>
+      <summary>解答：反对称项为零的条件</summary>
+      <p>$\sin$ 项的系数是 $q_0k_1-q_1k_0$，它为零当且仅当 $q_0k_1=q_1k_0$，即 $q$ 与 $k$ 共线（含 $q=k$、$q=ck$ 以及任一为零向量的情形）。几何上这个量是 $q$ 与 $k$ 张成的平行四边形的有向面积（二维叉积），共线时面积为零。此时内积退化为 $(q_0k_0+q_1k_1)\cos((n-m)\theta)$，也就是常见的“只剩 $\cos$”形式；一般情况下两项都存在。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章给出了 2 维旋转矩阵和内积公式，并用 $q=(1,0)$ 验证了内积只含 $(n-m)\theta$。但旋转矩阵用了绝对位置 $m$、$n$，内积为何只剩 $m-n$——下一章用三角恒等式证明这是旋转矩阵群的性质。</p>
 
@@ -816,18 +865,36 @@ $$\langle R_m q, R_n k \rangle = q^T R_m^T R_n k = q^T R_{n-m} k.$$
 
 <p>右侧只含 $R_{n-m}$，绝对位置 $m$、$n$ 完全抵消。这就是上一章手算例子中"$(n-m)\theta = \pi/4$ 出现、单独的 $m=1$ 或 $n=2$ 不出现"的代数来源。</p>
 
-<p>再用上一章的手算例子做一次验证：上一章里 $m=1$、$n=2$、$q=k=(1,0)$、$\theta=\pi/4$，内积是 $\sqrt{2}/2$。如果把 $m$ 改成 5、$n$ 改成 6（保持 $m-n=1$），手算结果应当一致。代入 F2：$(q_0 k_0 + q_1 k_1)\cos((6-5)\pi/4) + (q_0 k_1 - q_1 k_0)\sin((6-5)\pi/4) = 1\cdot\cos(\pi/4) + 0\cdot\sin(\pi/4) = \sqrt{2}/2$。结果确实一致——这是 $R_m^T R_n = R_{n-m}$ 在具体数字上的验证。</p>
+<p>再用上一章的手算例子做一次验证：上一章里 $m=1$、$n=2$、$q=k=(1,0)$、$\theta=\pi/4$，内积是 $\sqrt{2}/2$。如果把 $m$ 改成 5、$n$ 改成 6（保持 $m-n=1$），手算结果应当一致。代入 F2：$(q_0 k_0 + q_1 k_1)\cos((6-5)\pi/4) - (q_0 k_1 - q_1 k_0)\sin((6-5)\pi/4) = 1\cdot\cos(\pi/4) - 0\cdot\sin(\pi/4) = \sqrt{2}/2$。结果确实一致——这是 $R_m^T R_n = R_{n-m}$ 在具体数字上的验证。</p>
 
 <div class="callout callout-yellow">
 <p>注意 $R_{n-m}$ 与 $R_{m-n}$ 的区别：$R_{n-m}$ 角度是 $(n-m)\theta$，$R_{m-n}$ 角度是 $(m-n)\theta = -(n-m)\theta$。由于 $R_{-t} = R_t^T$，两者方向相反但内积结果相同（内积是标量，转置不改变）。论文统一用 $R_{n-m}$，本页沿用。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用三角恒等式展开 $R_m^T R_n$，证明等于 $R_{n-m}$。</li>
-  <li>上一章手算例子中，$m=1$、$n=2$ 与 $m=5$、$n=6$（同样 $m-n=1$）的内积是否相同？为什么。</li>
-  <li>$R_m^T R_n = R_{n-m}$ 是巧合还是必然？依赖哪个数学性质。</li>
-</ul>
+<h3 id="relative-position-proof-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用三角恒等式展开 $R_m^T R_n$，证明等于 $R_{n-m}$。</p>
+    <details>
+      <summary>解答：$R_m^T R_n = R_{n-m}$ 的推导</summary>
+      <p>转置把 $R_m$ 的 $\sin$ 项符号翻转，因此</p>$$R_m^T R_n=\begin{pmatrix}\cos m\theta & \sin m\theta\\ -\sin m\theta & \cos m\theta\end{pmatrix}\begin{pmatrix}\cos n\theta & -\sin n\theta\\ \sin n\theta & \cos n\theta\end{pmatrix}.$$<p>逐元素相乘后，对角元为 $\cos m\theta\cos n\theta+\sin m\theta\sin n\theta$，用 $\cos(a-b)=\cos a\cos b+\sin a\sin b$ 得 $\cos((n-m)\theta)$；右上元为 $-\cos m\theta\sin n\theta+\sin m\theta\cos n\theta$，用 $\sin(a-b)=\sin a\cos b-\cos a\sin b$ 得 $-\sin((n-m)\theta)$。整理即</p>$$R_m^T R_n=\begin{pmatrix}\cos((n-m)\theta) & -\sin((n-m)\theta)\\ \sin((n-m)\theta) & \cos((n-m)\theta)\end{pmatrix}=R_{n-m}.$$
+    </details>
+  </li>
+  <li>
+    <p>上一章手算例子中，$m=1$、$n=2$ 与 $m=5$、$n=6$（同样 $m-n=1$）的内积是否相同？为什么。</p>
+    <details>
+      <summary>解答：相同，因为只依赖位置差</summary>
+      <p>相同，两者都等于 $\sqrt{2}/2\approx0.7071$。因为内积化简后只含 $R_{n-m}$，而两组位置的差都是 $n-m=1$，相对角同为 $\pi/4$。代入 F2（$q=k=(1,0)$，对称项为 1、反对称项为 0）：$1\cdot\cos(\pi/4)-0\cdot\sin(\pi/4)=\sqrt{2}/2$，与 $m=1,n=2$ 的结果一致。这正是“绝对位置在内积中抵消”的具体体现。</p>
+    </details>
+  </li>
+  <li>
+    <p>$R_m^T R_n = R_{n-m}$ 是巧合还是必然？依赖哪个数学性质。</p>
+    <details>
+      <summary>解答：旋转矩阵群的性质</summary>
+      <p>是必然。二维旋转矩阵构成一个群（$SO(2)$）：乘积仍是旋转矩阵，且角度相加；转置等于逆，即 $R_m^T=R_m^{-1}=R_{-m}$。于是 $R_m^T R_n = R_{-m}R_n = R_{n-m}$，角度相减是群运算的直接结果，不依赖 $\theta$、$m$、$n$ 的具体取值。换成一般可逆矩阵则不成立——RoPE 选择旋转矩阵正是为了获得这个性质。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章证明了 2 维相对位置保持是旋转矩阵群的性质。但真实模型 $d$ 是 64 或 128 而非 2——下一章讲 d 维推广与 $\theta_i$ 几何级数。</p>
 
@@ -845,21 +912,17 @@ $$\langle R_m^d q, R_n^d k \rangle = q^T (R_m^d)^T R_n^d k = q^T R_{n-m}^d k.$$
 
 <p>相对位置保持性质在 d 维情况下依然成立。d 维 RoPE 的内积就是 $d/2$ 个 2 维内积之和，每个只依赖 $(n-m)\theta_i$。</p>
 
-<pre class="diagram">d=8 的分块对角旋转矩阵 R_m^d（每块独立旋转，频率不同）
+$$R_m^{d}=\begin{pmatrix}
+\cos m\theta_0 & -\sin m\theta_0 & 0 & 0 & \cdots & 0 & 0\\
+\sin m\theta_0 & \cos m\theta_0 & 0 & 0 & \cdots & 0 & 0\\
+0 & 0 & \cos m\theta_1 & -\sin m\theta_1 & \cdots & 0 & 0\\
+0 & 0 & \sin m\theta_1 & \cos m\theta_1 & \cdots & 0 & 0\\
+\vdots & \vdots & \vdots & \vdots & \ddots & \vdots & \vdots\\
+0 & 0 & 0 & 0 & \cdots & \cos m\theta_{d/2-1} & -\sin m\theta_{d/2-1}\\
+0 & 0 & 0 & 0 & \cdots & \sin m\theta_{d/2-1} & \cos m\theta_{d/2-1}
+\end{pmatrix}$$
 
-[ cos m·θ₀  -sin m·θ₀ │       0            0      │       0            0      │       0            0     ]
-[ sin m·θ₀   cos m·θ₀ │       0            0      │       0            0      │       0            0     ]
-[─────────────────────┼───────────────────────────┼───────────────────────────┼─────────────────────────]
-[       0            0      │ cos m·θ₁  -sin m·θ₁ │       0            0      │       0            0     ]
-[       0            0      │ sin m·θ₁   cos m·θ₁ │       0            0      │       0            0     ]
-[─────────────────────┼───────────────────────────┼───────────────────────────┼─────────────────────────]
-[       0            0      │       0            0      │ cos m·θ₂  -sin m·θ₂ │       0            0     ]
-[       0            0      │       0            0      │ sin m·θ₂   cos m·θ₂ │       0            0     ]
-[─────────────────────┼───────────────────────────┼───────────────────────────┼─────────────────────────]
-[       0            0      │       0            0      │       0            0      │ cos m·θ₃  -sin m·θ₃]
-[       0            0      │       0            0      │       0            0      │ sin m·θ₃   cos m·θ₃]
-
-第 0 对 (q₀,q₁) 用 θ₀；第 1 对 (q₂,q₃) 用 θ₁；第 2 对 (q₄,q₅) 用 θ₂；第 3 对 (q₆,q₇) 用 θ₃</pre>
+<p>矩阵是分块对角的：第 $i$ 个 $2\times2$ 块作用在第 $i$ 个坐标对上，块内旋转角为 $m\theta_i$，块外元素全为零。以 $d=8$ 为例，坐标对 $(q_0,q_1)$ 用 $\theta_0$，$(q_2,q_3)$ 用 $\theta_1$，$(q_4,q_5)$ 用 $\theta_2$，$(q_6,q_7)$ 用 $\theta_3$；各块互不干扰，因此整体内积等于 $d/2$ 个 2 维内积之和。</p>
 
 <p>现在看 $\theta_i$ 怎么选。论文给定的频率公式是</p>
 
@@ -899,12 +962,30 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 
 <p>实现层面有个等价性值得注意：原论文用"相邻对"形式 $(q_0,q_1), (q_2,q_3), \ldots$；但 GPT-NeoX、LLaMA 等实现把向量拆成"前半 $q_{0..d/2-1}$ 与后半 $q_{d/2..d-1}$"，对 $(q_i, q_{i+d/2})$ 做逐元素旋转。两种形式数学等价（只是配对方式不同），实现用前后两半是因为逐元素操作更高效。本文按论文原形式讲解。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定 $d=4$、$\mathrm{base}=10000$，计算 $\theta_0$、$\theta_1$。</li>
-  <li>$i$ 小 vs $i$ 大的频率对哪个负责短程依赖、哪个负责长程依赖？为什么。</li>
-  <li>给定 $d=4$、$\mathrm{base}=4$、$q=k=(1,0,1,0)$、$m=1$、$n=2$，手算总内积（提示：每对独立算，结果相加）。</li>
-</ul>
+<h3 id="d-dim-generalization-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 $d=4$、$\mathrm{base}=10000$，计算 $\theta_0$、$\theta_1$。</p>
+    <details>
+      <summary>解答：$\theta_0=1$，$\theta_1=0.01$</summary>
+      <p>频率公式为 $\theta_i=\mathrm{base}^{-2i/d}$，$d=4$ 时 $i$ 取 0 与 1。$\theta_0=10000^{0}=1$；$\theta_1=10000^{-2/4}=10000^{-1/2}=1/\sqrt{10000}=0.01$。两者相差 100 倍，体现了几何级数的多尺度特性：$i$ 每加 1，$\theta_i$ 乘上固定比例 $\mathrm{base}^{-2/d}$。</p>
+    </details>
+  </li>
+  <li>
+    <p>$i$ 小与 $i$ 大的频率分别对哪种依赖负责？为什么。</p>
+    <details>
+      <summary>解答：高频负责短程，低频负责长程</summary>
+      <p>$i$ 小对应 $\theta_i$ 大，位置每增加 1 就旋转较大角度，转一圈只需很少的位置，因此能分辨邻近 token 的细微位置差异，负责短程依赖。$i$ 大对应 $\theta_i$ 小，位置增加时角度几乎不变（$m\theta_i\approx0$、$\cos(m\theta_i)\approx1$），要跨越很多位置才转完一圈，因此在大跨度上仍保留可区分的相位差，负责长程依赖。以 $d=128$、$\mathrm{base}=10000$ 为例，$i=0$ 时约 6 个位置转一圈，$i=63$ 时约 54410 个位置才转一圈。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 $d=4$、$\mathrm{base}=4$、$q=k=(1,0,1,0)$、$m=1$、$n=2$，手算总内积。</p>
+    <details>
+      <summary>解答：总内积约 $1.4179$</summary>
+      <p>先算频率：$\theta_0=4^{0}=1$，$\theta_1=4^{-2/4}=4^{-1/2}=0.5$。位置差 $n-m=1$。两个坐标对都是 $(1,0)$，对称项 $1\cdot1+0\cdot0=1$，反对称项 $1\cdot0-0\cdot1=0$，因此每对只剩 $\cos$ 项。</p><ul><li>第 0 对：$\cos(1\cdot1)=\cos 1\approx0.5403$。</li><li>第 1 对：$\cos(1\cdot0.5)=\cos 0.5\approx0.8776$。</li></ul><p>各块互不干扰，总内积为两项之和 $0.5403+0.8776\approx1.4179$。这里的 $\mathrm{base}=4$ 是便于手算的教学取值，真实模型用 $\mathrm{base}=10000$。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章把 2 维机制推广到 d 维，解释了 $\theta_i$ 几何级数的多尺度编码。但 $|m-n|$ 增大时内积怎样变化、为何只动 Q/K 不动 V——下一章讲远程衰减与 QK-only 机制。</p>
 
@@ -914,7 +995,7 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 
 <p>先看内积的衰减。把 d 维内积按 $d/2$ 个对展开：</p>
 
-$$\langle R_m^d q, R_n^d k \rangle = \sum_{i=0}^{d/2-1} \left[(q_{2i} k_{2i} + q_{2i+1} k_{2i+1})\cos((n-m)\theta_i) + (q_{2i} k_{2i+1} - q_{2i+1} k_{2i})\sin((n-m)\theta_i)\right].$$
+$$\langle R_m^d q, R_n^d k \rangle = \sum_{i=0}^{d/2-1} \left[(q_{2i} k_{2i} + q_{2i+1} k_{2i+1})\cos((n-m)\theta_i) - (q_{2i} k_{2i+1} - q_{2i+1} k_{2i})\sin((n-m)\theta_i)\right].$$
 
 <p>远程衰减是<strong>确定性求和的相位抵消</strong>性质<sup>[C5]</sup><sup>[F7]</sup>，不需要概率假设。看一个便于手算的特定情形：取 $q=k$ 且每对分量恒定（$q_{2i}=q_{2i+1}=1$，即 $q=k=(1,1,\ldots,1)$）。此时反对称项 $q_{2i} k_{2i+1} - q_{2i+1} k_{2i}=1\cdot1-1\cdot1=0$，对称项 $q_{2i} k_{2i} + q_{2i+1} k_{2i+1}=1\cdot1+1\cdot1=2$。代入得</p>
 
@@ -928,7 +1009,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 
 <details>
 <summary>补充：从内积公式到归一化和的推导</summary>
-<p>起点：$\langle R_m^d q, R_n^d k \rangle = \sum_i \left[(q_{2i} k_{2i} + q_{2i+1} k_{2i+1})\cos((n-m)\theta_i) + (q_{2i} k_{2i+1} - q_{2i+1} k_{2i})\sin((n-m)\theta_i)\right]$。</p>
+<p>起点：$\langle R_m^d q, R_n^d k \rangle = \sum_i \left[(q_{2i} k_{2i} + q_{2i+1} k_{2i+1})\cos((n-m)\theta_i) - (q_{2i} k_{2i+1} - q_{2i+1} k_{2i})\sin((n-m)\theta_i)\right]$。</p>
 <p>特定情形：取 $q=k$ 且每对分量恒定，即 $q_{2i}=q_{2i+1}=k_{2i}=k_{2i+1}=1$（对所有 $i$）。</p>
 <p>第一步，反对称项：$q_{2i} k_{2i+1} - q_{2i+1} k_{2i}=1\cdot1-1\cdot1=0$，$\sin$ 项贡献为零。</p>
 <p>第二步，对称项：$q_{2i} k_{2i} + q_{2i+1} k_{2i+1}=1\cdot1+1\cdot1=2$。</p>
@@ -971,12 +1052,30 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p><strong>常见误解</strong>：把 RoPE 当成"给 Q/K/V 一起加旋转"。这是错的。原论文 §3.2.1 Eq.(13) 与 §3.2.2 Eq.(14) 给出的投影公式下标是 $\{q,k\}$、不含 $v$：$\tilde{q}_m = R_m^d W_q x_m$、$\tilde{k}_n = R_n^d W_k x_n$，而 $v_n = W_v x_n$ 不带旋转矩阵。如果旋转 V，注意力分数不变（softmax 的输入仍是 $\tilde{q}_m \cdot \tilde{k}_n$），但输出 $v$ 的方向被旋转，反而破坏了内容表示。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话说明为什么 RoPE 不动 V。</li>
-  <li>远程衰减的"相位抵消"直觉为什么成立？$|m-n|$ 大时各 $\cos((n-m)\theta_i)$ 为什么会相互抵消？真实模型中具体 token 对一定遵循衰减曲线吗。</li>
-  <li>归一化内积表里 $|m-n|=5000$ 时内积变成负数，这与"衰减"矛盾吗？为什么。</li>
-</ul>
+<h3 id="long-range-decay-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话说明为什么 RoPE 不动 V。</p>
+    <details>
+      <summary>解答：注意力分数只来自 $QK^T$</summary>
+      <p>因为注意力分数只由 $QK^T$ 决定，旋转 Q 和 K 就已经让“看哪里”带上位置感知；V 只决定“取到之后拿什么内容”，旋转 V 不改变 softmax 的输入，只会改变加权内容的方向，这不是位置编码要达成的目标。</p>
+    </details>
+  </li>
+  <li>
+    <p>远程衰减的“相位抵消”直觉为什么成立？真实模型中具体 token 对一定遵循衰减曲线吗。</p>
+    <details>
+      <summary>解答：相位抵消成立的范围</summary>
+      <p>d 维内积是 $d/2$ 个 $\cos((n-m)\theta_i)$ 的加权和，而 $\theta_i$ 按几何级数跨越多个数量级。$|m-n|$ 增大时各项相位分散到不同象限，正负贡献相互抵消，归一化和的幅度总体趋小（并非严格收敛到 0，而是接近几乎周期的振荡）。论文 §3.4.3 用 Abel 变换给出该和的上界。</p><p>不一定。页面给出的衰减曲线来自特定构造情形（$q=k$ 且每对分量恒定），真实模型中 $q$、$k$ 的分量分布有结构，具体 token 对的内积可能偏离该曲线；成立的是定性趋势，它解释了 RoPE 经验上的隐式局部性偏置，而非对每个 token 对的保证。</p>
+    </details>
+  </li>
+  <li>
+    <p>归一化内积表里 $|m-n|=5000$ 时内积变成负数，这与“衰减”矛盾吗？为什么。</p>
+    <details>
+      <summary>解答：衰减是趋势而非单调</summary>
+      <p>不矛盾。这里的“衰减”指幅度总体趋向 0，不是数值单调下降。归一化和是有限个余弦的叠加，本质是振荡函数：当 $|m-n|$ 增大到 5000 附近时它穿过 0 并进入小幅振荡（表中 $-0.0070$，$|m-n|=10000$ 时 $-0.0279$）。这些负值的绝对值远小于近距离时的 $0.97$ 或 $0.74$，符合“幅度趋小”的判断；若把衰减理解成严格单调递减，就会与该现象冲突。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章解释了远程衰减来源与"只在 QK 不在 V"的机制。但超出训练长度时 RoPE 会失效——下一章讲长度外推边界与 K3 MLA 的 NoPE 选择。</p>
 
@@ -1023,12 +1122,30 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p><strong>常见误解</strong>："K3 的 MLA 层用了 RoPE。"这是错的。DeepSeek-V2 的 MLA 用解耦 RoPE，读者可能假设 K3 也用；但 K3 通过 <code>mla_use_nope=true</code> 直接关闭了 MLA 层的位置编码。RoPE 与矩阵吸收的冲突在 K3 这里被 NoPE 路线绕过——这是 RoPE 边界（与某些推理优化不兼容）的实例，也是理解 K3 架构选择时 RoPE 作为前置概念的意义。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>RoPE 在长度外推时为什么失效？PI 与 YaRN 各自的解决思路是什么。</li>
-  <li>K3 的 MLA 层为什么用 NoPE 而不是 RoPE？这与矩阵吸收有什么关系。</li>
-  <li>RoPE 的适用条件有哪三条？举一个 RoPE 不适用的场景。</li>
-</ul>
+<h3 id="applicability-boundary-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>RoPE 在长度外推时为什么失效？PI 与 YaRN 各自的解决思路是什么。</p>
+    <details>
+      <summary>解答：外推失效原因与两种扩展思路</summary>
+      <p>训练时位置 $m$ 只在 $[0, L_{\text{train}})$ 内取值，模型只见过 $m\theta_i$ 落在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合。超出训练长度后 $m\theta_i$ 进入训练分布外的角度区间，尤其 $i$ 小的高频分量很快越界，性能下降。</p><p>PI（Position Interpolation）把位置整体缩放回训练范围，如 $m'=m\cdot L_{\text{train}}/L_{\text{target}}$，使 $m'\theta_i$ 仍落在已学区间。YaRN 按频率分组施加不同缩放：高频基本保持以保留局部分辨力，低频缩放以覆盖更长距离。此外 LongRoPE 按维度非均匀搜索缩放因子，支持百万级上下文。</p>
+    </details>
+  </li>
+  <li>
+    <p>K3 的 MLA 层为什么用 NoPE 而不是 RoPE？这与矩阵吸收有什么关系。</p>
+    <details>
+      <summary>解答：RoPE 与矩阵吸收的冲突</summary>
+      <p>MLA 的推理优化依赖矩阵吸收：把 $W^{UK}$ 从 key 侧搬到 query 侧，从而免于显式重建 K，前提是 $W^{UK}$ 与位置无关。若对压缩潜变量施加 RoPE，注意力项变成 $\tilde q^T(R_n W^{UK} c^{KV})$，位置相关的 $R_n$ 夹在 $\tilde q$ 与 $W^{UK}$ 之间且每个 token 各不相同，无法合并成固定矩阵，吸收前提被破坏。DeepSeek-V2 的应对是解耦 RoPE，用额外一组共享 key 承载位置信息。</p><p>Kimi K3 走另一条路：Gated MLA 在结构上保留 rot 分量接口，但 config.json 中 <code>mla_use_nope=true</code>，所有 MLA 层不施加位置编码；位置信息由 KDA 通过递归门控与衰减隐式提供。因此扩展上下文时无需调整位置编码参数，可直接外推到 1M token。</p>
+    </details>
+  </li>
+  <li>
+    <p>RoPE 的适用条件有哪三条？举一个 RoPE 不适用的场景。</p>
+    <details>
+      <summary>解答：三条适用条件与一个反例</summary>
+      <p>三条条件：一是使用 softmax 注意力，注意力分数来自 $QK^T$；二是 query/key 维度 $d$ 为偶数，能拆成 $d/2$ 个二维对；三是 token 位置可用整数 $m$ 表示。</p><p>不适用的场景：纯双向编码器中若需要显式的绝对位置信号（例如直接查询“这个 token 在第几位”），RoPE 只提供相对位置效果，APE 或可学习位置嵌入更直接。RoPE 也不替代 segment 之类的 token 类型嵌入，不表达分段文档或相对时间这类位置语义。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本文从"Transformer 为什么需要位置编码"出发，依次回答了开篇的五个问题：RoPE 用旋转矩阵编码绝对位置，使内积只依赖相对位置 $m-n$<sup>[C2]</sup>；2 维机制通过分块对角推广到 d 维，$\theta_i$ 几何级数实现多尺度编码<sup>[C4]</sup>；远程衰减来自相位抵消<sup>[C5]</sup>；RoPE 只动 Q/K 不动 V<sup>[C1]</sup>；超出训练长度需要 YaRN/PI 扩展<sup>[C7]</sup>，与 MLA 矩阵吸收冲突时用解耦或 NoPE 绕过<sup>[C8]</sup>。这些是理解任何 transformer 位置方案的前提——不是"加 RoPE 就行"，而是"RoPE 在什么条件下成立、不成立时怎么办"。</p>
 
