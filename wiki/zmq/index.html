@@ -1,0 +1,1821 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="ZeroMQ 是嵌入应用进程的消息库：send 不指定收件人，收件人由 socket 类型的出站策略决定；队列按对端划分，队列满后是丢弃还是阻塞同样由类型决定。页面用抓包字节说明 ZMTP 帧格式，并划清它不提供持久化、确认与重投递的边界。">
+  <meta name="dojo:summary" content="ZeroMQ 是链接进应用进程的消息库，没有 broker。`zmq_send` 不指定收件人：PUSH/DEALER 轮询、PUB 扇出、ROUTER 按路由标识定向。队列是每对端一条，HWM 默认 1000 条；满后 PUB 丢弃且不阻塞、PUSH 阻塞且不丢。页面含 ZMTP greeting 与帧头的实测字节。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="分布式通信,消息中间件,网络协议,进程间通信">
+  <meta name="dojo:tag" content="ZeroMQ">
+  <title>ZeroMQ（ZMQ）：用 socket 类型决定消息去哪、队列满时丢还是等</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .misconceptions ul { margin-bottom: 0; }
+    .diagram {
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.5;
+      margin: 1.5rem 0;
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">ZeroMQ</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">ZeroMQ（ZMQ）：用 socket 类型决定消息去哪、队列满时丢还是等</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：ZeroMQ RFC 23/ZMTP、28/REQREP、29/PUBSUB、30/PIPELINE（均为 stable 状态）；0MQ API 手册 <code>zmq_socket(3)</code>、<code>zmq_setsockopt(3)</code>、<code>zmq_send(3)</code>、<code>zmq_ctx_set(3)</code>、<code>zmq_inproc(7)</code>；libzmq v4.3.5 源码；本机实测环境 pyzmq 27.1.0 + libzmq 4.3.5。</p>
+</blockquote>
+
+<p>设想一个任务分发系统：一个进程产出编号 1 到 6 的任务，三个工作进程各自领取任务并处理，同时还要把状态变化广播给若干个监控端。如果直接用操作系统 socket 实现，第一堵墙来得很快——发送端连续调用两次 <code>send(b"job-1")</code> 和 <code>send(b"job-2")</code>，接收端一次 <code>recv</code> 可能拿到 <code>b"job-1job-2"</code>，也可能拿到 <code>b"job-1jo"</code>。TCP 交付的是一串没有分隔的字节，"一条任务从哪里开始、到哪里结束"这件事，传输层不负责。</p>
+
+<p>ZeroMQ 是一个链接进应用进程的消息库。它把"收发离散消息"这件事从字节流层面抽出来：应用按预设的消息模式收发完整消息，不必自己处理消息边界、多对端分发和断线重连。本文以上面这个任务分发系统作为贯穿例子，从它在裸 TCP 上撞到的墙开始，逐步展开 ZeroMQ 用什么机制补上这些缺口，以及它明确不负责什么。</p>
+
+<section class="learning-goals">
+  <h2>本文回答的问题</h2>
+  <ul>
+    <li>ZeroMQ 解决了裸 TCP 之上哪三个具体问题？</li>
+    <li>一条消息去往哪个对端，是由谁决定的？</li>
+    <li>队列满时消息会丢还是会阻塞，取决于什么？</li>
+    <li>一条 ZeroMQ 消息在 TCP 线上究竟长什么样？</li>
+    <li>ZeroMQ 不提供哪些保证，因此哪些事必须应用自己做？</li>
+  </ul>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>ZeroMQ 是消息队列中间件，用之前要先部署一个 ZeroMQ 服务——它没有任何常驻服务进程，所谓"队列"就在应用自己的进程内存里。</li>
+    <li>用了 ZeroMQ 消息就不会丢——是否丢消息由所选 socket 类型直接决定，PUB 在队列满时静默丢弃，PUSH 则宁可阻塞也不丢。</li>
+    <li><code>zmq_send</code> 返回成功说明对端收到了——它只表示消息已进入本地队列、库已接管，既不代表已上网络，更不代表已送达。</li>
+    <li>订阅前缀是在 SUB 端设置的，所以过滤在订阅端做、网络上仍然传全量——ZMTP 规定过滤在发布端执行，不匹配的消息根本不上线。</li>
+  </ul>
+</section>
+
+<h2 id="what-tcp-lacks">裸 TCP 到消息库之间缺了什么</h2>
+
+<p>把任务分发系统落到裸 TCP 上，需要自己补三件事。</p>
+
+<h3 id="no-message-boundary">字节流没有分隔</h3>
+
+<p>TCP 提供的是一条有序的字节流，它保证字节顺序，但不保证"一次 send 对应一次 recv"。发送端两次调用发出 <code>job-1</code> 和 <code>job-2</code> 共 10 个字节，接收端可能一次 <code>recv</code> 就拿到全部 10 字节，也可能先拿到 7 个、剩下 3 个下次再来。要还原出"任务 1"和"任务 2"这两条独立消息，应用必须自己设计边界规则——常见做法是每条消息前加一个固定长度的长度字段，收方先读长度、再按长度读体。</p>
+
+<p>这段代码本身不难写，但它必须处理"长度字段自己也可能被拆开"的情况，而且每个项目都要重写一遍。ZeroMQ 的做法是把边界规则固定进协议：传输的最小单位是<b>帧</b>（frame），每帧自带长度；一条<b>消息</b>由一到多个帧组成。应用调用一次发送，对端就收到一条完整消息。</p>
+
+<h3 id="no-peer-selection">一条连接只连一个对端</h3>
+
+<p>三个工作进程意味着三条 TCP 连接。每产出一个任务，应用都要回答"这条给谁"，于是要自己维护连接列表、实现分发顺序、还要处理某个工作进程处理不过来时怎么办——是等它，还是跳过它把任务给别人？</p>
+
+<p>ZeroMQ 把这个决策变成 socket 的属性。创建 socket 时选定类型，类型自带一套分发策略；之后应用只管发，不管发给谁。「send 不指定收件人，收件人由 socket 类型决定」一章展开这一点。</p>
+
+<h3 id="no-reconnect">连接会断</h3>
+
+<p>工作进程重启、网络抖动都会让连接断开。应用要自己检测断开、按某个退避策略重连、决定重连期间新产出的任务放在哪里、以及恢复后是否补发。ZeroMQ 为每个对端维护一条队列并在后台自动重连：连接断开期间应用照常调用发送，消息进入队列等待；连接恢复后继续发出。代价是这个队列有容量上限，满了以后的行为需要单独理解，这是「队列满了：谁丢消息，谁阻塞」一章的主题。</p>
+
+<pre class="diagram">裸 TCP 的三个障碍            ZeroMQ 对应的机制
+─────────────────────       ─────────────────────────────
+① 字节流无分隔        ──►   帧：每帧自带长度，消息由多帧组成
+② 一条连接一个对端    ──►   socket 类型：类型自带出入站分发策略
+③ 连接会断            ──►   每对端一条队列 + 自动重连
+</pre>
+
+<p>图中左列是应用在裸 TCP 上必须自己实现的三件事，右列是 ZeroMQ 提供的对应机制。后续每一章分别展开右列的一格。</p>
+
+<h3 id="name-clarification">名字里的 MQ 和 Zero 分别指什么</h3>
+
+<p>"MQ"容易让人以为它和 RabbitMQ、Kafka 是同一类东西——那些系统有独立的 broker 进程、消息落盘、消费者维护消费位点。ZeroMQ 没有这些：它是一个链接进应用进程的库，没有任何常驻服务，所谓"队列"是 socket 在自己进程内存中为每个对端维护的缓冲区。进程退出，队列随之消失。</p>
+
+<div class="callout callout-yellow">
+<p><b>辅助解释，注意边界</b>：官方把"Zero"解释为一系列"零"的设计取向——零 broker、零管理成本、零延迟这类目标表述。这个名字只反映设计倾向，不构成任何性能或可靠性承诺。特别是它不代表"零消息丢失"：「队列满了：谁丢消息，谁阻塞」一章会给出 ZeroMQ 主动丢弃消息的实测结果。正式判断应以各 socket 类型的文档语义为准，不以名字为准。</p>
+</div>
+
+<p>可用以下问题验证本节结论：</p>
+<ul>
+  <li>为什么 ZeroMQ 传输的最小单位不能是单个字节？</li>
+  <li>如果应用只需要在两个固定进程之间传固定长度的消息，上面三个障碍中哪些其实不构成问题？</li>
+</ul>
+
+<p>三个障碍里最容易被低估的是第二个。ZeroMQ 对"这条消息给谁"的回答相当反直觉：发送函数根本不接受收件人参数。</p>
+
+<h2 id="socket-types-decide-routing">send 不指定收件人，收件人由 socket 类型决定</h2>
+
+<p>ZeroMQ 的发送接口是 <code>zmq_send(socket, buf, len, flags)</code>：只有 socket 和数据，没有目标地址。目标由 socket 类型的<b>出站策略</b>决定。官方文档对此的表述是，ZeroMQ socket 呈现的是一层异步消息队列抽象，"具体的排队语义取决于所使用的 socket 类型"<sup>[C1]</sup>。</p>
+
+<h3 id="three-strategies">四种路由策略</h3>
+
+<p>本文涉及的稳定 socket 类型一共用到四种路由策略。三种用于出站（决定消息发给谁）：</p>
+
+<ul>
+  <li><b>轮询</b>（round-robin）：一条消息只发给<i>一个</i>对端，在可用对端间按顺序轮换。PUSH、DEALER、REQ 的出站用这种策略。</li>
+  <li><b>扇出</b>（fan out）：一条消息复制到<i>每一个</i>（订阅匹配的）对端队列。PUB、XPUB 用这种策略。</li>
+  <li><b>按标识定向</b>：从待发消息的第一帧取出目标标识，只发给对应的那一个队列。ROUTER 用这种策略，「广播与定向回话：扇出和路由标识」一章展开。</li>
+</ul>
+
+<p>一种用于入站（决定从谁那里读下一条消息）：</p>
+
+<ul>
+  <li><b>公平队列</b>（fair-queuing）：轮流从各个对端读取，不让一个高频对端把其他对端饿死。PULL、SUB、DEALER、ROUTER、REP 的入站用这种策略。</li>
+</ul>
+
+<p>第四种策略叫<b>上一个对端</b>（官方摘要写作 Last peer），它是 REQ 与 REP 严格交替语义的实现方式：REQ 发出请求后，只接受来自刚才那个对端的消息，其他对端发来的一律静默丢弃；REP 收到请求后，回复只发给发出该请求的那个对端<sup>[C22]</sup>。这种策略同时出现在出站与入站两侧——REQ 的入站用它，REP 的出站用它。正因为收发对象被锁定成同一个对端，这两种 socket 才必须一发一收严格交替。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>类型</th><th>方向</th><th>出站策略</th><th>入站策略</th><th>兼容对端</th><th>队列满时</th></tr></thead>
+<tbody>
+<tr><td>PUSH</td><td>只发</td><td>轮询</td><td>—</td><td>PULL</td><td>阻塞，不丢</td></tr>
+<tr><td>PULL</td><td>只收</td><td>—</td><td>公平队列</td><td>PUSH</td><td>入站队列满则停止读取，不丢</td></tr>
+<tr><td>PUB</td><td>只发</td><td>扇出</td><td>—</td><td>SUB、XSUB</td><td>丢弃，从不阻塞</td></tr>
+<tr><td>SUB</td><td>只收</td><td>—</td><td>公平队列</td><td>PUB、XPUB</td><td>入站队列满则静默丢弃<sup>[C21]</sup></td></tr>
+<tr><td>REQ</td><td>双向，发收严格交替</td><td>轮询</td><td>上一个对端</td><td>REP、ROUTER</td><td>阻塞，不丢</td></tr>
+<tr><td>REP</td><td>双向，收发严格交替</td><td>上一个对端</td><td>公平队列</td><td>REQ、DEALER</td><td>发送不阻塞；原请求方已断开则静默丢弃回复<sup>[C9]</sup></td></tr>
+<tr><td>DEALER</td><td>双向，无限制</td><td>轮询</td><td>公平队列</td><td>ROUTER、REP、DEALER</td><td>阻塞，不丢</td></tr>
+<tr><td>ROUTER</td><td>双向，无限制</td><td>按标识定向</td><td>公平队列</td><td>DEALER、REQ、ROUTER</td><td>丢弃（可配置为报错）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>表中前五列来自 <code>zmq_socket(3)</code> 的类型摘要<sup>[C1, C3]</sup>，最后一列在「队列满了：谁丢消息，谁阻塞」一章展开。SUB 与 PULL 两行需要单独说明，因为它们只收不发，<code>zmq_socket(3)</code> 的摘要表没有给它们列出发送侧动作。SUB 的入站队列满时按 RFC 29 静默丢弃<sup>[C21]</sup>；PULL 的"队列满"则表现为不再从连接读取，从而让上游 PUSH 把该对端视为不可用——这种"下游处理不过来时让压力回传到上游"的效果称为反压（back pressure），它不会让本端某个调用被挂住。</p>
+
+<h3 id="round-robin-in-practice">轮询实测：6 个任务落在 3 个工作进程上</h3>
+
+<p>把任务分发系统的分发端做成 PUSH、三个工作进程做成 PULL，依次发出编号 1 到 6 的任务，各工作进程收到的编号是：</p>
+
+<pre class="diagram">worker0 took [1, 4]
+worker1 took [2, 5]
+worker2 took [3, 6]
+</pre>
+
+<p>规范对 PUSH 的表述是"向一组匿名 PULL 对端按轮询算法发送消息"，对 PULL 的表述是"从所有已连接的 PUSH 对端按公平队列算法接收消息"<sup>[C3]</sup>。上面的结果正是轮询的直接表现：分发端不知道也不关心哪个工作进程更空闲，只是按顺序轮换。</p>
+
+<details class="code-details">
+<summary>代码：PUSH 与 PULL 的轮询分发</summary>
+<div class="code-block">
+<pre><code class="language-python">import time
+
+import zmq
+
+context = zmq.Context()
+
+dispatcher = context.socket(zmq.PUSH)
+dispatcher.bind("tcp://127.0.0.1:5701")
+
+workers = []
+for _ in range(3):
+    worker = context.socket(zmq.PULL)
+    worker.connect("tcp://127.0.0.1:5701")
+    workers.append(worker)
+
+time.sleep(0.5)                       # 等三条连接都完成握手
+
+for job in range(1, 7):
+    dispatcher.send(str(job).encode())
+time.sleep(0.5)
+
+for index, worker in enumerate(workers):
+    taken = []
+    while True:
+        try:
+            taken.append(int(worker.recv(flags=zmq.NOBLOCK)))
+        except zmq.Again:
+            break
+    print(f"worker{index} took {taken}")
+
+dispatcher.close(0)
+for worker in workers:
+    worker.close(0)
+context.term()</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">worker0 took [1, 4]
+worker1 took [2, 5]
+worker2 took [3, 6]</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>dispatcher.send()</code> 没有任何目标参数，编号 1、2、3 依次落到三个不同对端，编号 4 起回到第一个对端，这就是轮询<sup>[C3]</sup>。三个 <code>recv</code> 循环用非阻塞模式排空各自队列，对应 PULL 的公平队列入站。</p>
+<p><b>观察重点</b>：每个工作进程拿到的编号间隔恰好是 3（对端数量）。若把工作进程数改成 2，间隔会变成 2。</p>
+<p><b>简化条件</b>：<code>time.sleep(0.5)</code> 用来确保三条连接都已建立——若在连接完成前就开始发送，早期任务只会落到已连上的对端。三个工作进程都不做实际处理，因此没有快慢差异；真实系统中处理速度不同，分发结果会受下一节的机制影响。</p>
+</details>
+
+<h3 id="skip-full-peers">轮询只在可用对端间进行</h3>
+
+<p>纯粹的轮询有个明显问题：如果第二个工作进程卡住了，轮到它时是否要一直等？规范的回答是不等——PUSH"只在对端拥有未满的出站队列时才视其为可用"，并"只向可用对端按轮询分发"<sup>[C4]</sup>。卡住的对端会被跳过。</p>
+
+<p>让一个工作进程的队列容量极小（很快就满）、另一个保持宽裕，发出编号 0 到 9 十个任务，结果是：</p>
+
+<pre class="diagram">accepted by dispatcher: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+stuck worker took: [0, 2]
+idle  worker took: [1, 3, 4, 5, 6, 7, 8, 9]
+</pre>
+
+<p>前两轮还在正常交替（0 给卡住的、1 给空闲的、2 给卡住的、3 给空闲的），此后卡住的那个队列填满，被移出可用集合，余下 6 个任务全部走空闲对端。分发端自始至终没有阻塞，因为始终存在至少一个可用对端。</p>
+
+<details>
+<summary>补充：轮询跳过满队列在 libzmq 中的实现</summary>
+<p>libzmq v4.3.5 的 <code>src/lb.cpp</code> 实现了轮询出站。核心循环是：尝试向当前对端写入，成功则跳出；失败则把 <code>_active</code> 计数减一、把该对端与活跃区间末尾交换位置，然后<i>不推进</i>游标继续尝试——因为交换之后，原位置已经换成了另一个尚未尝试的对端。</p>
+<div class="code-block">
+<pre><code class="language-text">while (_active &gt; 0) {
+    if (_pipes[_current]-&gt;write (msg_)) { ... break; }
+    ...
+    _active--;
+    if (_current &lt; _active)
+        _pipes.swap (_current, _active);
+    else
+        _current = 0;
+}
+if (_active == 0) { errno = EAGAIN; return -1; }</code></pre>
+</div>
+<p>只有当全部对端都写不进去（<code>_active</code> 归零）时才返回 <code>EAGAIN</code>（POSIX 错误码，"暂时不可用，请稍后重试"），也就是「队列满了：谁丢消息，谁阻塞」一章要讲的 mute 状态。这段代码同时解释了一个容易误解的点：被跳过的对端并没有被断开，它只是暂时离开活跃集合，队列腾出空位后会重新加入。</p>
+</details>
+
+<p>回到主线：分发端把任务交给谁，是 socket 类型加上"对端是否可用"共同决定的，应用代码里没有任何一行参与这个决策。</p>
+
+<h3 id="bind-connect">bind 与 connect 不是服务端与客户端</h3>
+
+<p>上面的代码里分发端调用 <code>bind</code>、工作进程调用 <code>connect</code>，但这两个调用只决定谁提供端点地址，不决定消息流向，也不要求先后顺序。消息方向完全由 socket 类型决定：把分发端改成 <code>connect</code>、工作进程改成 <code>bind</code>，任务依旧从 PUSH 流向 PULL。</p>
+
+<p>顺序上也没有约束。tcp 传输本来就不要求 <code>zmq_bind()</code> 先于 <code>zmq_connect()</code>；<code>inproc</code> 传输在 libzmq 4.0 之前要求先 bind，自 4.0 起也放开了这一限制，与 tcp 一致<sup>[C14]</sup>。实测中让一个 PUSH 先连接到<i>无人监听</i>的端口并立即发送，随后才让 PULL 在该端口 bind：</p>
+
+<pre class="diagram">after late bind, PULL received: b'queued-before-bind'
+</pre>
+
+<p>消息在连接建立之前就被接受并排入队列，连接建立后自动发出。这解释了 ZeroMQ 程序为什么通常不需要"等服务端就绪"的启动顺序编排。</p>
+
+<p>可用以下问题验证本节结论：</p>
+<ul>
+  <li>一个 PUSH 连了两个 PULL，发出 5 条消息，各 PULL 分别拿到哪几条？依据是什么？</li>
+  <li>为什么 PULL 的入站策略必须是公平队列，而不能是"哪个对端先到就先读完"？</li>
+</ul>
+
+<p>路由策略解释了消息去哪，但还没解释"一条消息"到底是什么东西。工作进程收到的 <code>b"1"</code> 在 TCP 上并不是一个孤零零的字节。</p>
+
+<h2 id="wire-format">一条消息在 TCP 上的真实字节</h2>
+
+<p>要看清 ZeroMQ 的线格式，最直接的办法是写一个普通的 TCP 服务端假装 ZeroMQ 对端：完成最小的握手，然后把收到的字节原样打印出来。这样能看到库平时藏起来的部分。ZeroMQ 在面向连接传输上使用的线协议叫 <b>ZMTP</b>（ZeroMQ Message Transport Protocol）。</p>
+
+<h3 id="greeting">64 字节的 greeting</h3>
+
+<p>连接建立后，双方先各自发出一段固定 64 字节的 <b>greeting</b>，用于协商协议版本与安全机制。它的结构由 ZMTP 的 ABNF 语法定义<sup>[F1]</sup>：</p>
+
+<pre class="diagram">偏移  0                     10        12                    32        33                 64
+     ┌─────────────────────┬──────────┬─────────────────────┬──────────┬────────────────────┐
+     │ signature           │ version  │ mechanism           │ as-server│ filler             │
+     │ %xFF+padding(8)     │ 主版本号 │ 大写字母/数字       │ 服务方   │ 全零，补足         │
+     │ + %x7F              │ +次版本号│ 右侧补零            │ 标记     │ 到 64 字节         │
+     ├─────────────────────┼──────────┼─────────────────────┼──────────┼────────────────────┤
+     │ 10 字节             │ 2 字节   │ 20 字节             │ 1 字节   │ 31 字节            │
+     └─────────────────────┴──────────┴─────────────────────┴──────────┴────────────────────┘
+</pre>
+
+<ul>
+  <li><b>signature</b>：10 字节。首字节固定 <code>0xFF</code>，末字节固定 <code>0x7F</code>，中间 8 字节是 padding。规范明确 padding "无语义"，对端不得校验或解释它。</li>
+  <li><b>version</b>：2 字节，主版本号加次版本号。</li>
+  <li><b>mechanism</b>：20 字节，安全机制名称，取值限于大写字母、数字和少量符号，右侧补零。无加密时是 <code>NULL</code>。</li>
+  <li><b>as-server</b>：1 字节，取值 <code>0x00</code> 或 <code>0x01</code>，表明本端在安全握手中是否扮演服务方。</li>
+  <li><b>filler</b>：31 个零字节，把 greeting 补足到 64 字节。</li>
+</ul>
+
+<p>实测一个 DEALER socket 连出去时发的 greeting（十六进制）：</p>
+
+<pre class="diagram">ff00000000000000047f 0301 4e554c4c00000000000000000000000000000000 00 00…00
+└──── signature ───┘ └ver┘ └───────────── mechanism ──────────────┘ └as┘└filler┘
+      10 字节         2 字节            20 字节                    1 字节 31 字节
+</pre>
+
+<p>逐段核对：signature 首尾确实是 <code>ff</code> 和 <code>7f</code>；mechanism 段是 <code>4e554c4c</code>（即 <code>NULL</code>）加 16 个零，共 20 字节；as-server 为 <code>00</code>；其后是 31 个零字节的 filler。</p>
+
+<p>signature 中间那 8 字节 padding 出现了非零值 <code>04</code>，这一点需要单独解释，因为它同时涉及规范约束和实现取值两件事。规范侧：padding 被定义为"无语义"，接收方不得校验也不得解释它<sup>[F1]</sup>。实现侧：libzmq 并没有把它填成零，而是写入了"路由标识长度加一"——本例的路由标识是 <code>cli</code>（3 字节），所以这里是 4。这个用法本身也来自 RFC 23：向后兼容策略规定，为探测 ZMTP 1.0 与 2.0 对端，可以发一个 10 字节的伪签名，其中"size 是发送方标识的字节数（0 或更多）加 1，占据 padding 字段"<sup>[C19]</sup>。旧版本对端会把这几个字节当成标识帧的长度，新版本对端则按规范忽略它。</p>
+
+<details>
+<summary>补充：padding 取值与路由标识长度的对应关系</summary>
+<p>改变 DEALER 的 <code>ZMQ_ROUTING_ID</code> 并抓取它发出的前 10 字节，padding 段（第 2 至第 9 字节）的取值为：</p>
+<div class="code-block">
+<pre><code class="language-text">routing_id=b'cli'                  len=3   padding=0000000000000004  = 4
+routing_id=b'worker-7'             len=8   padding=0000000000000009  = 9
+routing_id=b''                     len=0   padding=0000000000000001  = 1
+routing_id=b'aaaaaaaaaaaaaaaaaaaa' len=20  padding=0000000000000015  = 21</code></pre>
+</div>
+<p>四组都满足"标识长度加一"。对应实现是 libzmq v4.3.5 <code>src/zmtp_engine.cpp</code> 的 <code>plug_internal()</code>：<code>_outpos[_outsize++] = UCHAR_MAX;</code>（即 <code>0xFF</code>）之后紧跟 <code>put_uint64 (&amp;_outpos[_outsize], _options.routing_id_size + 1);</code>，最后写入 <code>0x7f</code>。</p>
+<p>这不构成"可以拿 padding 判断对端标识长度"的许可——规范要求接收方忽略该字段，其他实现完全可以填零。这里只说明所观察到的字节从何而来。</p>
+</details>
+
+<div class="callout callout-yellow">
+<p><b>版本号的两个值需要区分</b>：RFC 23/ZMTP 规定 <code>version-major = %x03</code>、<code>version-minor = %x00</code>，即 ZMTP 3.0。而 libzmq 4.3.5 实测发出的是 <code>03 01</code>，即 ZMTP 3.1——这是一个更新的版本，由 RFC 37/ZMTP 定义，RFC 23 自己的相关规范列表中也明确指向了它。本文其余的 greeting 字段布局与帧格式在两个版本中一致，但引用版本号时必须分清"RFC 23 的规定值"与"当前实现的实测值"<sup>[F1]</sup>。</p>
+</div>
+
+<h3 id="handshake-command">握手命令：对端如何知道本端是什么类型</h3>
+
+<p>greeting 之后是握手命令。无加密时只需一个 READY 命令，携带本端的连接元数据。实测抓到的 READY 帧体：</p>
+
+<pre class="diagram">\x05READY  \x0b Socket-Type  \x00\x00\x00\x06 DEALER  \x08 Identity  \x00\x00\x00\x03 cli
+└命令名─┘  └名长┘└─ 名(11) ─┘ └─ 值长度(4B) ─┘ └值(6)┘  └名长┘└名(8)─┘ └─ 值长度(4B) ─┘ └值┘
+</pre>
+
+<p>属性名前有一个字节表示名字长度，属性值前有四个字节表示值长度（网络字节序）<sup>[C18]</sup>。这里可以看到 <code>Socket-Type: DEALER</code> 和 <code>Identity: cli</code>——「广播与定向回话：扇出和路由标识」一章要讲的路由标识，就是通过这个字段告知对端的。ZMTP 3.0 相对 2.0 的主要变化之一，正是把 socket 类型和标识从 greeting 里挪进了这个可扩展的元数据命令<sup>[C18]</sup>。</p>
+
+<h3 id="frame-header">帧头：1 字节 flags 加长度</h3>
+
+<p>握手完成后，双方才开始交换应用数据。每个帧的结构是 1 字节 flags、随后是长度字段、最后是帧体。规范原文写明"长度不包含 flags 字段，也不包含自身，所以空帧的长度为零"<sup>[F2]</sup>。</p>
+
+<p>flags 字节只有三个有效位，其余高位保留为零（bit 0 指最低有效位，即最右位）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>位</th><th>名称</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>bit 7–3</td><td>保留</td><td>必须为 0</td></tr>
+<tr><td>bit 2</td><td>COMMAND</td><td>1 = 命令帧（供实现使用），0 = 消息帧（承载应用数据）</td></tr>
+<tr><td>bit 1</td><td>LONG</td><td>0 = 长度用 1 字节（帧体 0–255 字节），1 = 长度用 8 字节网络字节序（帧体最大 $2^{63}-1$ 字节）</td></tr>
+<tr><td>bit 0</td><td>MORE</td><td>1 = 本条消息后面还有帧，0 = 本帧是最后一帧；命令帧此位必须为 0</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>于是"一条消息由多个帧组成且原子交付"这句抽象表述，在线上就是一串 MORE=1 的帧后面跟一个 MORE=0 的帧。规范对原子性的要求是：实现"必须始终原子地发送和交付消息，即一条消息的所有帧，或者一个都不发"<sup>[C2]</sup>。发送一条两帧消息 <code>[b"A", b"BC"]</code>，实测线上是：</p>
+
+<pre class="diagram">flags=0x04 COMMAND=True  LONG=False MORE=False size=44 body=b'\x05READY...cli'
+flags=0x01 COMMAND=False LONG=False MORE=True  size=1  body=b'A'
+flags=0x00 COMMAND=False LONG=False MORE=False size=2  body=b'BC'
+</pre>
+
+<p>第一帧的 flags 是 <code>0x04</code>，只有 COMMAND 位置一，这是握手命令。第二帧 <code>0x01</code>（MORE=1）和第三帧 <code>0x00</code>（MORE=0）合起来构成应用发出的那一条消息。</p>
+
+<p>用一个手算例子检查对帧头的理解。给定字节串：</p>
+
+<pre class="diagram">01 03 61 62 63 00 01 64
+</pre>
+
+<p>第一个字节 <code>0x01</code>：COMMAND=0（消息帧）、LONG=0（长度占 1 字节）、MORE=1（后面还有帧）。第二个字节 <code>0x03</code> 是长度，即帧体 3 字节，读出 <code>61 62 63</code> 也就是 <code>abc</code>。读完这 3 字节帧体后，下一个字节是 <code>0x00</code>：仍是消息帧、短长度、MORE=0，说明这是最后一帧；紧随其后的长度 <code>0x01</code> 表示帧体 1 字节 <code>64</code> 即 <code>d</code>。所以这 8 个字节是一条两帧消息 <code>[b"abc", b"d"]</code>。</p>
+
+<details class="code-details">
+<summary>代码：抓取 ZMTP 握手与帧的原始字节</summary>
+<div class="code-block">
+<pre><code class="language-python">import socket
+import threading
+import time
+
+import zmq
+
+HOST, PORT = "127.0.0.1", 5702
+captured = []
+
+
+def zmtp_greeting():
+    signature = b"\xff" + b"\x00" * 8 + b"\x7f"      # 10 字节
+    version = bytes([3, 1])                          # 2 字节
+    mechanism = b"NULL".ljust(20, b"\x00")           # 20 字节
+    as_server = b"\x00"                              # 1 字节，NULL 机制下必须为 0
+    filler = b"\x00" * 31                            # 31 字节
+    return signature + version + mechanism + as_server + filler
+
+
+def zmtp_ready(socket_type):
+    body = b"\x05READY" + bytes([11]) + b"Socket-Type"
+    body += len(socket_type).to_bytes(4, "big") + socket_type
+    return b"\x04" + bytes([len(body)]) + body       # 0x04 = 短命令帧
+
+
+def fake_router():
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((HOST, PORT))
+    listener.listen(1)
+    conn, _ = listener.accept()
+    conn.settimeout(2.0)
+    conn.sendall(zmtp_greeting())
+    conn.sendall(zmtp_ready(b"ROUTER"))
+    buffer = b""
+    try:
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+    except socket.timeout:
+        pass
+    captured.append(buffer)
+    conn.close()
+    listener.close()
+
+
+thread = threading.Thread(target=fake_router)
+thread.start()
+time.sleep(0.3)
+
+context = zmq.Context()
+dealer = context.socket(zmq.DEALER)
+dealer.setsockopt(zmq.ROUTING_ID, b"cli")
+dealer.connect(f"tcp://{HOST}:{PORT}")
+dealer.send_multipart([b"A", b"BC"])
+time.sleep(1.2)
+dealer.close(0)
+context.term()
+thread.join()
+
+data = captured[0]
+print("total bytes :", len(data))
+print("greeting    :", data[:64].hex())
+print("  signature :", data[:10].hex())
+print("  version   :", data[10:12].hex())
+print("  mechanism :", data[12:32])
+print("  as-server :", data[32:33].hex())
+
+payload = data[64:]
+offset = 0
+while offset &lt; len(payload):
+    flags = payload[offset]
+    if flags &amp; 0x02:
+        size = int.from_bytes(payload[offset + 1:offset + 9], "big")
+        header = 9
+    else:
+        size = payload[offset + 1]
+        header = 2
+    body = payload[offset + header:offset + header + size]
+    print(
+        f"frame flags=0x{flags:02x} "
+        f"COMMAND={bool(flags &amp; 0x04)} LONG={bool(flags &amp; 0x02)} MORE={bool(flags &amp; 0x01)} "
+        f"size={size} body={body!r}"
+    )
+    offset += header + size</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">total bytes : 117
+greeting    : ff00000000000000047f03014e554c4c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+  signature : ff00000000000000047f
+  version   : 0301
+  mechanism : b'NULL\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+  as-server : 00
+frame flags=0x04 COMMAND=True LONG=False MORE=False size=44 body=b'\x05READY\x0bSocket-Type\x00\x00\x00\x06DEALER\x08Identity\x00\x00\x00\x03cli'
+frame flags=0x01 COMMAND=False LONG=False MORE=True size=1 body=b'A'
+frame flags=0x00 COMMAND=False LONG=False MORE=False size=2 body=b'BC'</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>zmtp_greeting()</code> 逐段构造 10/2/20/1/31 的字段布局<sup>[F1]</sup>；解析循环按 flags 的 LONG 位选择 1 字节或 8 字节长度字段，按 MORE 位判断消息是否结束<sup>[F2]</sup>；<code>send_multipart([b"A", b"BC"])</code> 一次调用产生两个帧，对应多帧消息的原子交付<sup>[C2]</sup>。</p>
+<p><b>观察重点</b>：三处细节值得对照——signature 中间的 padding 是 <code>0000000000000004</code>，即路由标识 <code>cli</code> 的长度加一<sup>[C19]</sup>，而不是零；version 是 <code>0301</code> 而非 RFC 23 写的 <code>0300</code>；<code>greeting</code> 行共 128 个十六进制字符，正好 64 字节。</p>
+<p><b>简化条件</b>：假对端只实现了 greeting 与 READY，不解析对方的握手内容，也不做版本协商与错误处理，因此只能用于观察单向发出的字节。真实实现需要校验对端 greeting、按 RFC 23 的"Backwards Interoperability"策略处理旧版本对端，并处理帧跨 TCP 分段到达的情况（脚本里靠一次性读满缓冲区规避了这一点）。脚本的 <code>as_server</code> 取 <code>0x00</code>，因为 RFC 23 规定使用 NULL 安全机制时该字段必须为零<sup>[C20]</sup>。</p>
+</details>
+
+<p>可用以下问题验证本节结论：</p>
+<ul>
+  <li>flags 值为 <code>0x03</code> 的帧，同时代表哪两件事？</li>
+  <li>为什么空帧的长度字段是 0 而不是 1？</li>
+</ul>
+
+<p>帧解释了消息的形状，路由策略解释了消息的去向。但「send 不指定收件人，收件人由 socket 类型决定」一章只讲了轮询这一种去向，任务分发系统还需要另外两种：把状态广播给所有监控端，以及让工作进程回话时分发端知道是谁回的。</p>
+
+<h2 id="fanout-and-routing-id">广播与定向回话：扇出和路由标识</h2>
+
+<h3 id="pub-sub-filtering">扇出与"过滤发生在发布端"</h3>
+
+<p>广播状态用 PUB/SUB：PUB 的出站策略是扇出，一条消息复制到每个订阅者的队列。订阅者用 SUB，设置自己关心的<b>订阅前缀</b>——例如只订阅前缀 <code>A</code>，则所有以 <code>A</code> 开头的消息都匹配；空前缀匹配全部消息。</p>
+
+<p>订阅 API 写在 SUB 一侧，很容易让人以为过滤也在 SUB 一侧执行、网络上仍然传输全量数据。实际相反。ZMTP 明确规定"使用 ZMTP 时，消息过滤必须发生在发布端（PUB 或 XPUB socket）"，SUB 会把订阅前缀发给发布端，发布端"对订阅前缀与消息第一帧的起始处做二进制比较"后再决定是否发送<sup>[C5]</sup>。</p>
+
+<p>订阅前缀在线上的具体形式取决于协商出的 ZMTP 版本，有两种<sup>[C20]</sup>：ZMTP 3.0（RFC 23）用一个普通消息帧，帧体首字节 <code>0x01</code> 表示订阅、<code>0x00</code> 表示退订，其后是前缀；ZMTP 3.1（RFC 37）改用名为 <code>SUBSCRIBE</code> 的命令帧。实测同一个 SUB socket 面对宣告不同版本的对端时发出的字节：</p>
+
+<pre class="diagram">对端宣告 ZMTP 3.1  →  flags=0x04 COMMAND=True  size=11 body=b'\tSUBSCRIBEA'
+对端宣告 ZMTP 3.0  →  flags=0x00 COMMAND=False size=2  body=b'\x01A'
+</pre>
+
+<p>两种形式携带的信息相同（订阅前缀 <code>A</code>），区别只在帧类型。下面的验证脚本让假对端宣告 3.0，因此收到的是消息帧形式。</p>
+
+<p>验证方式是写一个假的 SUB 对端：完成握手，只声明订阅前缀 <code>A</code>，然后看真实 PUB 依次发出 <code>A-match-1</code>、<code>B-nomatch</code>、<code>A-match-2</code> 时，这条 TCP 连接上实际出现了什么。</p>
+
+<pre class="diagram">frames that actually crossed the TCP connection:
+  COMMAND size=25 body=b'\x05READY\x0bSocket-Type\x00\x00\x00\x03PUB'
+  MESSAGE size=9  body=b'A-match-1'
+  MESSAGE size=9  body=b'A-match-2'
+</pre>
+
+<p><code>B-nomatch</code> 从未出现在连接上——它在发布端就被拦下了，没有消耗任何网络带宽。这条结论有两个实际后果：订阅端设置精确的前缀能真正减少网络流量；同时，发布端需要为每个订阅者单独做匹配和发送，所以同一条消息在有 N 个订阅者时会在网络上传输多次（规范对 PUB 的描述里明确提到这一点）。</p>
+
+<p>订阅还有一个容易踩的性质：订阅是<b>加性且不幂等</b>的<sup>[C17]</sup>。同时订阅 <code>A</code> 和空前缀，等价于只订阅空前缀（空前缀已匹配全部）；订阅两次 <code>A</code> 会被计为两次订阅，需要两次退订才能真正撤销。</p>
+
+<details class="code-details">
+<summary>代码：用手写对端验证过滤发生在发布端</summary>
+<div class="code-block">
+<pre><code class="language-python">import socket
+import threading
+import time
+
+import zmq
+
+HOST, PORT = "127.0.0.1", 5704
+captured = []
+
+
+def zmtp_greeting():
+    # 宣告 ZMTP 3.0，与下面 3.0 形式的订阅报文保持一致
+    return (b"\xff" + b"\x00" * 8 + b"\x7f") + bytes([3, 0]) \
+        + b"NULL".ljust(20, b"\x00") + b"\x00" + b"\x00" * 31
+
+
+def zmtp_ready(socket_type):
+    body = b"\x05READY" + bytes([11]) + b"Socket-Type"
+    body += len(socket_type).to_bytes(4, "big") + socket_type
+    return b"\x04" + bytes([len(body)]) + body
+
+
+def zmtp_subscribe(prefix):
+    body = b"\x01" + prefix            # ZMTP 3.0 形式：0x01 表示订阅，其后是前缀
+    return b"\x00" + bytes([len(body)]) + body
+
+
+def fake_subscriber():
+    conn = socket.socket()
+    conn.connect((HOST, PORT))
+    conn.settimeout(2.0)
+    conn.sendall(zmtp_greeting())
+    time.sleep(0.2)
+    conn.sendall(zmtp_ready(b"SUB"))
+    time.sleep(0.2)
+    conn.sendall(zmtp_subscribe(b"A"))     # 只要前缀为 A 的消息
+    buffer = b""
+    try:
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+    except socket.timeout:
+        pass
+    captured.append(buffer)
+    conn.close()
+
+
+context = zmq.Context()
+publisher = context.socket(zmq.PUB)
+publisher.bind(f"tcp://{HOST}:{PORT}")
+
+thread = threading.Thread(target=fake_subscriber)
+thread.start()
+time.sleep(0.9)                            # 等订阅到达发布端
+
+publisher.send(b"A-match-1")
+publisher.send(b"B-nomatch")
+publisher.send(b"A-match-2")
+time.sleep(1.5)
+publisher.close(0)
+context.term()
+thread.join()
+
+payload = captured[0][64:]                 # 跳过 64 字节 greeting
+offset = 0
+print("frames that actually crossed the TCP connection:")
+while offset &lt; len(payload):
+    flags = payload[offset]
+    if flags &amp; 0x02:
+        size = int.from_bytes(payload[offset + 1:offset + 9], "big")
+        header = 9
+    else:
+        size = payload[offset + 1]
+        header = 2
+    body = payload[offset + header:offset + header + size]
+    kind = "COMMAND" if flags &amp; 0x04 else "MESSAGE"
+    print(f"  {kind} size={size} body={body!r}")
+    offset += header + size</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">frames that actually crossed the TCP connection:
+  COMMAND size=25 body=b'\x05READY\x0bSocket-Type\x00\x00\x00\x03PUB'
+  MESSAGE size=9 body=b'A-match-1'
+  MESSAGE size=9 body=b'A-match-2'</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>zmtp_greeting()</code> 宣告 ZMTP 3.0，因此 <code>zmtp_subscribe(b"A")</code> 按 RFC 23 的语法 <code>%x00 short-size %d1 subscription</code> 构造订阅报文——首字节 <code>0x00</code> 是普通消息帧的 flags，帧体首字节 <code>0x01</code> 表示"订阅"（<code>0x00</code> 为退订），其后是前缀<sup>[C5, C20]</sup>。发布端收到后建立过滤规则。</p>
+<p><b>观察重点</b>：输出里只有两条 MESSAGE，<code>B-nomatch</code> 完全缺席。若把 <code>zmtp_subscribe(b"A")</code> 改为 <code>zmtp_subscribe(b"")</code>，三条消息都会出现。</p>
+<p><b>简化条件</b>：假对端宣告 3.0 而非 libzmq 自己使用的 3.1，为的是让订阅报文用更易手写的消息帧形式；libzmq 的 PUB 对两种版本都能处理，过滤结论不受影响。脚本用固定 <code>sleep</code> 等待订阅在发布端生效，这是为了让结果可复现；真实程序不应依赖 sleep 判断订阅是否就绪（相关限制见「ZeroMQ 不做什么」一章的 slow joiner）。假对端不解析发布端的 greeting，也不处理帧跨 TCP 分段到达。</p>
+</details>
+
+<h3 id="router-envelope">路由标识信封</h3>
+
+<p>广播解决了状态分发，但任务分发系统还需要反向通路：工作进程处理完要回报结果，分发端得知道是哪个工作进程回的。轮询和扇出都做不到这件事——它们都不携带"是谁"的信息。这是 ROUTER 的职责。</p>
+
+<p>ROUTER 为每个对端维护一对队列（出站与入站各一条），并用一个唯一的二进制串标识它，这个串叫<b>路由标识</b>（routing id，规范中称 identity）。它的机制是两条对称的规则<sup>[C6]</sup>：</p>
+
+<ul>
+  <li><b>入站</b>：在收到的消息前面加一帧，内容是消息来源队列的路由标识，然后整条交给应用。</li>
+  <li><b>出站</b>：剥掉应用给出的消息的第一帧，把它当作目标路由标识，据此查找要写入哪条队列。</li>
+</ul>
+
+<p>这多出来的一帧就是<b>信封</b>。所以 ROUTER 的应用代码总是"收到的消息第一帧是发件人，回复时第一帧要填收件人"。</p>
+
+<p>让一个 ROUTER 同时接受两个对端——一个 DEALER（路由标识设为 <code>worker-7</code>）和一个 REQ（设为 <code>client-1</code>），各发一条消息，ROUTER 收到的是：</p>
+
+<pre class="diagram">ROUTER got: [b'worker-7', b'done: job 3']
+ROUTER got: [b'client-1', b'', b'status?']
+</pre>
+
+<p>第一条符合预期：一帧标识加一帧数据。第二条却多出一个空帧。这不是 ROUTER 加的，而是 REQ 自己加的：规范要求 REQ 发出的消息在线上格式为"一个空帧作为分隔符，由 REQ socket 添加"，随后才是应用可见的数据帧<sup>[C11]</sup>。这解释了为什么处理 REQ 客户端的 ROUTER 代码里经常出现"跳过一个空帧"的逻辑，而处理 DEALER 客户端时不需要——DEALER 不加这一帧。</p>
+
+<details>
+<summary>补充：路由标识从哪里来</summary>
+<p>规范要求 ROUTER"用一个唯一的 identity 二进制串标识每条双队列"，并"应当允许对端通过 Identity 元数据属性显式指定自己的标识"<sup>[C6]</sup>。对端若设置了 <code>ZMQ_ROUTING_ID</code>，这个值会在 ZMTP 握手的 READY 命令里发过来——在"握手命令"一节的实测字节里可以直接看到 <code>\x08Identity\x00\x00\x00\x03cli</code>。对端没有设置时，ROUTER 自行生成一个标识。</p>
+<p>由此可知路由标识不是网络地址，它只是一个由 ROUTER 维护的本地队列键。对端断开重连后如果没有显式指定标识，会拿到一个新的标识，原先记着旧标识的回复也就无处可去了。</p>
+</details>
+
+<h3 id="router-drop">ROUTER 找不到目标时不报错</h3>
+
+<p>ROUTER 出站有一个需要特别记住的默认行为：如果第一帧给出的路由标识对应的队列不存在（对端已断开或从未存在），消息被静默丢弃；发送调用照常返回成功，不阻塞、不报错<sup>[C6]</sup>。把 <code>ZMQ_ROUTER_MANDATORY</code> 设为 1 可以改变这一点，此时上述情况会以 <code>EHOSTUNREACH</code>（"目标主机不可达"错误码）失败。</p>
+
+<p>这是"消息明明发出去了、对端却没收到、日志里又什么都没有"这类问题的常见来源。任务分发系统里，一个工作进程崩溃后分发端仍按旧标识回复，那些回复就无声消失了。</p>
+
+<p>回到「四种路由策略」那张对照表：PUB 落在"扇出"一行，ROUTER 落在"按标识定向"一行。三种出站策略至此全部展开。</p>
+
+<p>可用以下问题验证本节结论：</p>
+<ul>
+  <li>ROUTER 要回复刚刚收到的那条消息，出站消息的第一帧必须填什么？</li>
+  <li>SUB 订阅空前缀与完全不设置订阅，收到的消息有什么区别？</li>
+</ul>
+
+<p>前三章都默认对端跟得上。现实里工作进程会卡住、监控端会掉线，此时消息去了哪里，取决于「四种路由策略」那张对照表的最后一列。</p>
+
+<h2 id="queue-full">队列满了：谁丢消息，谁阻塞</h2>
+
+<h3 id="per-peer-queue">队列的粒度是对端，不是 socket</h3>
+
+<p>理解队列行为的前提是搞清队列的粒度。ZeroMQ 不是"一个 socket 一个队列"，而是<b>每个对端一条队列</b>。规范对 PUSH 的要求是"为每个已连接对端维护一条出站消息队列"，对 PUB 是"为每个已连接订阅者维护一条出站消息队列"，对 SUB 是"为每个已连接的发布者维护一条入站消息队列"，ROUTER、DEALER、XPUB 则为每个对端维护出站与入站两条队列（<b>双队列</b>）<sup>[C4, C6, C10, C21]</sup>。</p>
+
+<p>队列在对端连接建立时创建；发起连出的一方在连接尚未建立时就已创建队列——这就是「bind 与 connect 不是服务端与客户端」一节中"connect 可以先于 bind"能成立的原因。反过来，对端断开时其队列被销毁，队列中尚未发出的消息一并丢弃<sup>[C15]</sup>。</p>
+
+<h3 id="hwm">高水位是单个对端的上限</h3>
+
+<p>队列容量由两个选项控制：<code>ZMQ_SNDHWM</code>（出站）与 <code>ZMQ_RCVHWM</code>（入站），合称<b>高水位</b>（high water mark，缩写 HWM）。文档的定义是"HWM 是一个硬上限，限制 0MQ 为该 socket 通信的<i>任意单个对端</i>在内存中排队的最大消息条数；取值为零表示无上限"<sup>[C7]</sup>。单位是消息条数（不是字节），默认值 1000。</p>
+
+<p>注意"任意单个对端"这几个字：连了 10 个对端就有 10 条队列，每条各自受 HWM 约束，因此总内存占用是 HWM 乘以对端数量的量级。</p>
+
+<div class="callout callout-yellow">
+<p><b>实际容量不保证等于设定值</b>：文档对两个选项都附了明确的告知。接收侧："0MQ 不保证 socket 能排队多达 ZMQ_RCVHWM 条消息，实际上限可能更低或更高，取决于传输。"发送侧："0MQ 不保证 socket 会接受多达 ZMQ_SNDHWM 条消息，实际上限可能比设定值低多达 90%（即可能低到设定值的约十分之一），取决于该 socket 上的消息流动情况；socket 甚至可能接受超过 ZMQ_SNDHWM 阈值的消息。"两处都点名 TCP 传输是典型例子<sup>[C8]</sup>。因此本节后面的实测条数只是该次运行的观察值，不能当作规格；HWM 应视为"大致的量级控制"，不是精确闸门。</p>
+</div>
+
+<h3 id="mute-state">mute 状态：丢弃还是阻塞</h3>
+
+<p>队列达到 HWM 后，socket 进入文档所称的 <b>mute 状态</b>。此时的行为按 socket 类型分成两类<sup>[C9]</sup>：</p>
+
+<ul>
+  <li><b>丢弃且从不阻塞</b>：PUB、XPUB、XSUB，以及默认配置的 ROUTER。PUB 的文档表述是，进入 mute 状态后"任何本应发给该订阅者的消息将被丢弃，直到 mute 状态结束"，并且"<code>zmq_send()</code> 函数对该 socket 类型永不阻塞"。</li>
+  <li><b>阻塞且不丢消息</b>：PUSH、PULL、REQ、DEALER、PAIR。PUSH 的文档表述是，发送操作"将阻塞直到 mute 状态结束或至少一个下游节点变为可发送；消息不被丢弃"。REQ 的表述是"REQ socket 不应丢弃消息"。</li>
+</ul>
+
+<p>这份分类描述的是<i>发送侧</i>行为，只收不发的类型需要单独说明。手册给 PULL 标注的 Block 并不意味着某个接收调用会挂住——PULL 没有发送操作，它的实际表现是不再从连接读取数据，从而让上游的 PUSH 把这个对端算作不可用（见「轮询只在可用对端间进行」一节）。</p>
+
+<p>接收侧队列满时也会丢消息：RFC 29 要求 SUB"若某个发布者的队列已满，则静默丢弃消息"<sup>[C21]</sup>。所以 PUB/SUB 通路上有两个可能丢消息的位置——发布端的出站队列和订阅端的入站队列。下一节的对照实验会说明在什么条件下丢弃发生在哪一侧。</p>
+
+<p>把任务分发系统的两条通路各做一次压力对照：HWM 设为 5，接收端不读取，连发 100 条。</p>
+
+<pre class="diagram">PUB  accepted 100/100, SUB received 5 -> dropped 95
+PUSH accepted 5/100,   PULL received 5 -> lost 0
+</pre>
+
+<p>两行代码结构几乎相同，只换了 socket 类型，结果性质完全不同：</p>
+
+<ul>
+  <li>PUB 把 100 条全部"发送成功"，订阅端只收到 5 条，95 条无声消失，应用侧没有任何错误信号。</li>
+  <li>PUSH 在第 5 条之后就用 <code>EAGAIN</code>（POSIX 错误码，含义是"暂时不可用，请稍后重试"）拒绝了后续发送——这是非阻塞模式下的表现，阻塞模式下调用会直接挂住。它只接受了 5 条，而这 5 条全部抵达，零丢失。</li>
+</ul>
+
+<p>这就是"用了 ZeroMQ 消息就不会丢"这个说法的准确修正：是否丢消息不是库的属性，而是所选 socket 类型的属性。广播状态用 PUB 是合适的——监控端跟不上时丢掉旧状态比阻塞住整个系统更好；但任务分发绝不能用 PUB，否则压力一上来任务就静静消失了。</p>
+
+<details class="code-details">
+<summary>代码：PUB 丢弃与 PUSH 阻塞的对照</summary>
+<div class="code-block">
+<pre><code class="language-python">import time
+
+import zmq
+
+context = zmq.Context()
+
+
+def try_send(sender, count):
+    """连发 count 条，返回被 socket 接受的条数。"""
+    accepted = 0
+    for _ in range(count):
+        try:
+            sender.send(b"payload", flags=zmq.NOBLOCK)
+            accepted += 1
+        except zmq.Again:                  # 队列满且该类型选择阻塞
+            break
+    return accepted
+
+
+def drain(receiver):
+    """反复排空，直到连续 5 轮没有新消息。"""
+    total, idle = 0, 0
+    while idle &lt; 5:
+        try:
+            receiver.recv(flags=zmq.NOBLOCK)
+            total += 1
+            idle = 0
+        except zmq.Again:
+            idle += 1
+            time.sleep(0.1)
+    return total
+
+
+# ---- PUB / SUB：发布端队列满则丢弃 ----
+publisher = context.socket(zmq.PUB)
+publisher.setsockopt(zmq.SNDHWM, 5)
+publisher.bind("tcp://127.0.0.1:5705")
+subscriber = context.socket(zmq.SUB)
+subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+subscriber.connect("tcp://127.0.0.1:5705")
+time.sleep(0.6)
+
+pub_accepted = try_send(publisher, 100)
+time.sleep(0.3)
+sub_got = drain(subscriber)
+print(f"PUB  accepted {pub_accepted}/100, SUB received {sub_got} -&gt; dropped {pub_accepted - sub_got}")
+publisher.close(0)
+subscriber.close(0)
+
+# ---- PUSH / PULL：队列满则拒绝，不丢消息 ----
+pusher = context.socket(zmq.PUSH)
+pusher.setsockopt(zmq.SNDHWM, 5)
+pusher.bind("tcp://127.0.0.1:5706")
+puller = context.socket(zmq.PULL)
+puller.setsockopt(zmq.RCVHWM, 5)
+puller.connect("tcp://127.0.0.1:5706")
+time.sleep(0.6)
+
+push_accepted = try_send(pusher, 100)
+time.sleep(0.3)
+pull_got = drain(puller)
+print(f"PUSH accepted {push_accepted}/100, PULL received {pull_got} -&gt; lost {push_accepted - pull_got}")
+pusher.close(0)
+puller.close(0)
+context.term()</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">PUB  accepted 100/100, SUB received 5 -&gt; dropped 95
+PUSH accepted 5/100, PULL received 5 -&gt; lost 0</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>try_send</code> 用 <code>zmq.NOBLOCK</code> 把"阻塞"转换成可观测的 <code>zmq.Again</code>（即 <code>EAGAIN</code>）异常，从而在同一段代码里区分两类 mute 行为<sup>[C9]</sup>；<code>drain</code> 反复排空是必要的——接收端队列容量有限，一次性排空可能读不完全部已在途消息。</p>
+<p><b>观察重点</b>：PUB 分支的 <code>accepted</code> 恒为 100（永不阻塞），差异体现在接收端条数；PUSH 分支的 <code>accepted</code> 停在容量上限，而 <code>lost</code> 恒为 0。</p>
+<p><b>简化条件</b>：HWM=5 是为便于观察而人为设小的构造参数，不是工程推荐值；实际接受条数受"实际容量不保证等于 HWM"约束，不同机器与不同运行可能不是 5。接收端完全不读取也是极端构造，真实系统中接收端会持续消费，只在瞬时峰值时短暂触及上限。</p>
+</details>
+
+<h3 id="which-side-drops">两侧都会丢，先满的那一侧丢</h3>
+
+<p>PUB/SUB 通路上有两个队列都可能丢消息：发布端为每个订阅者维护的出站队列，规范要求"若某个订阅者的队列已满，则静默丢弃该消息"<sup>[C10]</sup>；订阅端为每个发布者维护的入站队列，规范同样要求"若某个发布者的队列已满，则静默丢弃消息"<sup>[C21]</sup>。</p>
+
+<p>由此可以纠正一个常见做法："把订阅端的 <code>ZMQ_RCVHWM</code> 调大就能防丢"只在瓶颈确实在订阅端时才有效；若发布端 HWM 更小，消息在到达网络之前就被丢掉了，调订阅端参数没有任何作用。</p>
+
+<p>固定发送 200 条，改变两侧 HWM，反复排空后统计订阅端实际收到的条数：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>ZMQ_SNDHWM（发布端）</th><th>ZMQ_RCVHWM（订阅端）</th><th>订阅端收到</th></tr></thead>
+<tbody>
+<tr><td>5</td><td>1000</td><td>5 / 200</td></tr>
+<tr><td>1000</td><td>5</td><td>200 / 200</td></tr>
+<tr><td>5</td><td>5</td><td>5 / 200</td></tr>
+<tr><td>1000</td><td>1000</td><td>200 / 200</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>规律是：丢弃发生在先被填满的那一侧。发布端 HWM 为 5 时，消息在发布端就被丢掉（第 1、3 行）；发布端 HWM 为 1000 而订阅端只有 5 时却一条不丢（第 2 行）——因为本实验中订阅端在发送结束后才开始排空，而消息一次只在 TCP 与订阅端队列间流动少量几条，订阅端始终有空位，真正的积压落在发布端那条容量 1000 的队列里。</p>
+
+<p>需要强调的是，第 2 行的"200/200"不能推广成"订阅端 HWM 小不会丢消息"。若订阅端持续处理不过来而发布端仍在高速发布，订阅端入站队列同样会填满并开始丢弃<sup>[C21]</sup>。这组数据只说明一件事：在这个构造条件下瓶颈在发布端，因此该调的是发布端的 <code>ZMQ_SNDHWM</code>。定位真实系统的丢弃位置需要分别观察两侧队列，不能只看单侧参数。</p>
+
+<p>这组数字同时是"实际容量不保证等于 HWM"的一个例子：HWM 设为 5 时收到的恰好是 5，但这只是本次运行的结果，换传输方式或换消息大小都可能得到别的数字。</p>
+
+<div class="callout callout-purple">
+<p><b>ZeroMQ 的"可靠"到什么程度</b>：PIPELINE 规范给 PUSH/PULL 模式的定性是"大体可靠，只要节点不意外断开就不丢消息"。这句话的后半句正对应队列销毁规则：对端断开时其队列被销毁，队列中的消息一并丢弃<sup>[C15]</sup>。也就是说，即使用了阻塞不丢的 PUSH，"不丢"也只在连接持续存在的前提下成立。进程崩溃、网络中断、容器被杀，队列里的消息都会随内存消失。</p>
+</div>
+
+<p>可用以下问题验证本节结论：</p>
+<ul>
+  <li>一个 PUB 连了 3 个 SUB，其中 1 个卡住、另外 2 个正常消费。卡住的那个开始丢消息时，另外两个会受影响吗？依据是什么？</li>
+  <li>把任务分发的 PUSH 换成 PUB 之后，"任务不会丢"这个性质还成立吗？</li>
+</ul>
+
+<p>至此三个障碍都有了答案。但 ZeroMQ 补的是通信胶水，不是可靠投递系统，最后需要把它不做的事划清楚。</p>
+
+<h2 id="what-zeromq-does-not-do">ZeroMQ 不做什么</h2>
+
+<h3 id="send-semantics">send 成功的确切含义</h3>
+
+<p>文档对此有一条专门的注解："<code>zmq_send()</code> 调用成功并不表示消息已经发送到网络，只表示消息已在该 socket 上排队、且 0MQ 已承担该消息的责任。"<sup>[C12]</sup></p>
+
+<p>这解释了「mute 状态：丢弃还是阻塞」一节中 PUB 为什么能"成功发送"100 条却只有 5 条抵达——那 100 次成功返回描述的是入队环节，不是投递结果。任何基于"send 返回成功即已送达"的逻辑在 ZeroMQ 上都是错的。</p>
+
+<h3 id="io-threads">消息实际由谁发出</h3>
+
+<p>应用调用 send 只是入队，真正把字节写进操作系统 socket 的是别的线程。ZeroMQ 的 <b>context</b> 持有一个 I/O 线程池负责处理 I/O 操作，默认大小为 1 个线程<sup>[C13]</sup>。应用线程与 I/O 线程之间通过队列交接，这正是 send 语义只能停在"已入队"的原因。</p>
+
+<p>一个例外值得记住：<code>inproc</code>（进程内、线程间）传输不经过 I/O 线程——文档明确"使用 inproc 传输传递消息不涉及任何 I/O 线程"，因此纯 inproc 的程序可以把 I/O 线程数设为 0<sup>[C13]</sup>。「轮询只在可用对端间进行」一节的实验就用了 <code>zmq.Context(0)</code>。</p>
+
+<h3 id="slow-joiner">订阅生效需要时间</h3>
+
+<p>PUB/SUB 有一个必须知道的时序陷阱，社区称之为 <b>slow joiner</b>。SUB 完成连接后，订阅前缀要经过 ZMTP 握手与订阅消息传递才能在发布端生效；在这之前发布的消息，对该订阅者没有匹配的订阅，因而无处可去。</p>
+
+<p>实测：SUB 建立连接后立即发布 3 条 <code>early-*</code>，等待 0.5 秒后再发布 3 条 <code>late-*</code>，订阅端最终收到的是：</p>
+
+<pre class="diagram">subscriber received: ['late-0', 'late-1', 'late-2']
+</pre>
+
+<p>三条 <code>early-*</code> 全部消失。这个现象在本机测试中因为耗时极短容易被忽略，而在跨主机、进程启动顺序不定的真实部署里会更明显。需要"确保订阅者就绪后再发布"时，必须由应用自己建立同步机制（例如让订阅者通过另一条通路回报就绪状态），库不提供这个保证。</p>
+
+<details class="code-details">
+<summary>代码：slow joiner 与 connect 先于 bind</summary>
+<div class="code-block">
+<pre><code class="language-python">import time
+
+import zmq
+
+context = zmq.Context()
+
+# ---- slow joiner：订阅生效前发布的消息无处可去 ----
+publisher = context.socket(zmq.PUB)
+publisher.bind("tcp://127.0.0.1:5711")
+subscriber = context.socket(zmq.SUB)
+subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+subscriber.connect("tcp://127.0.0.1:5711")
+
+for index in range(3):                     # connect 之后立刻发布
+    publisher.send(f"early-{index}".encode())
+
+time.sleep(0.5)                            # 订阅在这段时间内生效
+for index in range(3):
+    publisher.send(f"late-{index}".encode())
+time.sleep(0.3)
+
+received = []
+while True:
+    try:
+        received.append(subscriber.recv(flags=zmq.NOBLOCK).decode())
+    except zmq.Again:
+        break
+print("subscriber received:", received)
+publisher.close(0)
+subscriber.close(0)
+
+# ---- connect 可以先于 bind ----
+sender = context.socket(zmq.PUSH)
+sender.connect("tcp://127.0.0.1:5712")     # 此刻还没有任何进程监听该端口
+sender.send(b"queued-before-bind")
+
+receiver = context.socket(zmq.PULL)
+receiver.bind("tcp://127.0.0.1:5712")      # 事后才 bind
+time.sleep(0.6)
+print("after late bind, PULL received:", receiver.recv(flags=zmq.NOBLOCK))
+
+sender.close(0)
+receiver.close(0)
+context.term()</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">subscriber received: ['late-0', 'late-1', 'late-2']
+after late bind, PULL received: b'queued-before-bind'</code></pre>
+</div>
+<p><b>验证的机制</b>：前半段的三条 <code>early-*</code> 消失，说明订阅在发布端生效前发布端没有匹配的订阅者，与"过滤发生在发布端"一致<sup>[C5]</sup>；后半段说明 <code>connect</code> 时立即创建了队列，消息在连接建立前就能入队，连接建立后自动发出<sup>[C14]</sup>。</p>
+<p><b>观察重点</b>：把 <code>time.sleep(0.5)</code> 改小（如 0.01），<code>late-*</code> 也可能一起丢失；改大则不影响结果。这个阈值依赖机器与网络，不存在可依赖的固定值——这正是不能用 sleep 当同步手段的原因。</p>
+<p><b>简化条件</b>：两段实验都在本机 loopback 上运行，订阅生效耗时远小于跨主机场景。真实部署中应改用显式的就绪握手，而不是靠延时。</p>
+</details>
+
+<h3 id="no-persistence">没有持久化、没有确认、没有重投递</h3>
+
+<p>把前面散落的限制集中起来：队列在进程内存里，进程退出即消失；对端断开时其队列被销毁、消息一并丢弃<sup>[C15]</sup>；库不记录消息是否被处理，没有投递确认，也没有重投递机制。ZeroMQ 传的是不透明的字节，它也不定义消息的序列化格式。</p>
+
+<h3 id="thread-safety">常用 socket 类型都不是线程安全的</h3>
+
+<p>文档的表述没有留余地："应用在任何情况下都不得从多个线程使用非线程安全的 socket。这样做会导致未定义行为。"<sup>[C16]</sup> 本文讨论的全部类型——REQ、REP、DEALER、ROUTER、PUB、SUB、XPUB、XSUB、PUSH、PULL、PAIR——都属于非线程安全。（少数标记为线程安全的类型目前仍是 draft 状态，接口可能变动，本文不涉及。）</p>
+
+<p>正确做法是每个线程持有自己的 socket，线程之间需要传递消息时用 <code>inproc</code> 传输——这也是 <code>inproc</code> 存在的主要理由之一。</p>
+
+<h3 id="application-responsibility">因此必须由应用实现的部分</h3>
+
+<p>综合上述边界，用 ZeroMQ 搭一个能在生产环境站得住的系统，至少还要自己做这些事：</p>
+
+<ul>
+  <li><b>投递确认与重试</b>：需要"任务一定被处理过"时，得让工作进程显式回报完成，分发端超时未收到回报则重投；这要求任务处理是幂等的，否则重投会导致重复执行。</li>
+  <li><b>超时判定</b>：库不会区分"对端还活着但很慢"和"对端已经没了"。<code>ZMQ_HEARTBEAT_IVL</code> 等选项可以让 ZMTP 层发心跳，但判定与处置策略仍由应用决定。</li>
+  <li><b>序列化格式</b>：帧体是不透明字节，编解码方式（JSON、Protobuf、自定义二进制等）完全由应用约定。</li>
+  <li><b>容量规划</b>：HWM 乘以对端数量决定内存量级，需要根据峰值流量和可接受的丢弃/阻塞行为来定。</li>
+</ul>
+
+<p>最后是选型边界。需要消息落盘、消费位点回放、跨重启不丢，应当用带 broker 的消息中间件；需要标准化的接口契约、代码生成与成熟生态，gRPC 或 HTTP 更合适。ZeroMQ 的位置很明确：它只负责把消息搬到对端，不管内容、不管持久化、不管送达确认。当通信双方都在自己掌控之下、且能接受"可靠性由应用层补齐"时，它省掉的正是「裸 TCP 到消息库之间缺了什么」一章列出的那三段人人都要重写一遍的胶水代码。</p>
+
+<p>可用以下问题验证本节结论：</p>
+<ul>
+  <li>一个 PUSH socket 在两个线程里被同时使用会发生什么？依据是什么？</li>
+  <li>要保证"每个任务一定被某个工作进程处理过"，需要在 ZeroMQ 之上补哪些机制？</li>
+</ul>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3 id="sources-claims">核心论断与来源</h3>
+
+<p>本页引用的官方 API 手册为 0MQ 手册 latest 版本（libzmq.readthedocs.io），RFC 为 rfc.zeromq.org 上 status 为 stable 的版本，源码为 libzmq tag v4.3.5。</p>
+
+<ul>
+<li><b>C1</b>（socket 是消息队列抽象，语义由类型决定）：<code>zmq_socket(3)</code>，DESCRIPTION 首段——"0MQ sockets present an abstraction of an asynchronous <i>message queue</i>, with the exact queueing semantics depending on the socket type in use."</li>
+<li><b>C2</b>（帧组成消息，原子交付）：<code>zmq_send(3)</code>，Multi-part messages 节——"0MQ ensures atomic delivery of messages: peers shall receive either all message parts of a message or none at all."；RFC 23/ZMTP，Framing 节——"an implementation SHALL always send and deliver messages atomically"。</li>
+<li><b>C3</b>（PUSH 轮询、PULL 公平队列）：RFC 30/PIPELINE，The PUSH Socket Type 与 The PULL Socket Type 两节；<code>zmq_socket(3)</code> 的 ZMQ_PUSH / ZMQ_PULL 摘要表（Outgoing routing strategy = Round-robin，Incoming routing strategy = Fair-queued）。</li>
+<li><b>C4</b>（轮询只在可用对端间进行，队列满的被跳过）：RFC 30/PIPELINE，PUSH 的 "For processing outgoing messages" 条目——"SHALL consider a peer as available only when it has a outgoing queue that is not full."；libzmq v4.3.5 <code>src/lb.cpp</code>，<code>lb_t::sendpipe</code> 的 <code>while (_active &gt; 0)</code> 循环。</li>
+<li><b>C5</b>（PUB 扇出，过滤在发布端）：RFC 29/PUBSUB，PUB 节——"SHALL perform a binary comparison of the subscription against the start of the first frame of the message."；RFC 23/ZMTP，The Publish-Subscribe Pattern 节——"When using ZMTP, message filtering SHALL happen at the publisher side (the PUB or XPUB socket)."，订阅报文的线格式见 C20。</li>
+<li><b>C6</b>（ROUTER 的路由标识信封与丢弃行为）：RFC 28/REQREP，ROUTER 节的入站/出站处理条目；<code>zmq_socket(3)</code> ZMQ_ROUTER 节——"If the peer does not exist anymore, or has never existed, the message shall be silently discarded. However, if 'ZMQ_ROUTER_MANDATORY' socket option is set to '1', the socket shall fail with EHOSTUNREACH in both cases."</li>
+<li><b>C7</b>（HWM 是每对端上限，默认 1000 条消息）：<code>zmq_setsockopt(3)</code>，ZMQ_SNDHWM 与 ZMQ_RCVHWM 两节的定义段与属性表（Option value unit = messages，Default value = 1000）。</li>
+<li><b>C8</b>（实际容量不保证等于 HWM）：<code>zmq_setsockopt(3)</code>，ZMQ_RCVHWM 与 ZMQ_SNDHWM 两节的 Note 段。</li>
+<li><b>C9</b>（mute 状态下丢弃或阻塞按类型区分）：<code>zmq_socket(3)</code> 各类型的 "Action in mute state" 摘要行与对应正文段（ZMQ_PUB、ZMQ_PUSH、ZMQ_DEALER、ZMQ_ROUTER、ZMQ_REQ）。该手册未给 ZMQ_SUB 与 ZMQ_REP 列出此行；REP 的发送侧行为另见 RFC 28/REQREP 的 REP 节——"SHALL not block on sending."、"SHALL silently discard the reply, or return an error, if the originating peer is no longer connected."。SUB 只收不发，丢弃动作发生在发布端（见 C10）。</li>
+<li><b>C10</b>（丢弃发生在发布端队列）：RFC 29/PUBSUB，PUB 节——"SHALL maintain a single outgoing message queue for each connected subscriber."、"SHALL silently drop the message if the queue for a subscriber is full."</li>
+<li><b>C11</b>（REQ 添加空分隔帧）：RFC 28/REQREP，REQ 节——"A delimiter, consisting of an empty frame, added by the REQ socket."、"SHALL prefix the outgoing message with an empty delimiter frame."</li>
+<li><b>C12</b>（send 成功只表示已入队）：<code>zmq_send(3)</code>，DESCRIPTION 的 Note 段。</li>
+<li><b>C13</b>（I/O 线程池默认 1，inproc 不用 I/O 线程）：<code>zmq_ctx_set(3)</code>，ZMQ_IO_THREADS 节及其 Default value = 1；<code>zmq_inproc(7)</code>，SYNOPSIS 的 Note 段。</li>
+<li><b>C14</b>（bind 与 connect 顺序无关）：<code>zmq_inproc(7)</code>，Connecting a socket 节——"Since version 4.0 the order of zmq_bind() and zmq_connect() does not matter just like for the tcp transport type."。该版本变更针对的是 <code>inproc</code> 传输；末句表明 tcp 传输本就不受顺序约束。</li>
+<li><b>C15</b>（对端断开则销毁其队列并丢弃其中消息）：RFC 30/PIPELINE，PUSH 节——"If this peer disconnects, the PUSH socket SHALL destroy its queue and SHALL discard any messages it contains."；RFC 28/REQREP 的 ROUTER 节与 RFC 29/PUBSUB 的 PUB 节有对应表述。PUSH/PULL 模式"大体可靠"的定性出自 RFC 30 的 Overall Goals of this Pattern 节。</li>
+<li><b>C16</b>（常用类型非线程安全）：<code>zmq_socket(3)</code>——"Applications MUST NOT use a <i>not</i> thread safe socket from multiple threads under any circumstances. Doing so results in undefined behaviour."，及各类型的 Thread safety 标注。</li>
+<li><b>C17</b>（订阅加性、不幂等）：RFC 23/ZMTP，The Publish-Subscribe Pattern 节——"Subscriptions SHALL be additive and SHALL NOT be idempotent."</li>
+<li><b>C18</b>（READY 元数据的属性编码，以及 socket 类型与标识从 greeting 移入元数据）：RFC 23/ZMTP，The NULL Security Mechanism 节的 ABNF——<code>property = name value</code>、<code>name = OCTET 1*255name-char</code>，以及"The value size field SHALL be four octets, in network byte order."；同文摘要段与 Changes from ZMTP 2.0 节——"the removal of hard-coded connection metadata (socket type and identity) from the greeting, the addition of connection metadata"。</li>
+<li><b>C19</b>（signature 的 padding 被 libzmq 写为路由标识长度加一）：RFC 23/ZMTP 两处。Version Negotiation 节规定接收方义务——"A peer SHALL NOT assign any significance to the padding field and MUST NOT validate this nor interpret it"；Detecting ZMTP 1.0 and 2.0 Peers 节规定该用法——"Send a 10-octet pseudo-signature consisting of '%xFF size %x7F' where 'size' is the number of octets in the sender's identity (0 or greater) plus 1. The size SHALL be 8 octets in network byte order and occupies the padding field."。实现依据为 libzmq v4.3.5 <code>src/zmtp_engine.cpp</code> 的 <code>plug_internal()</code>：<code>put_uint64 (&amp;_outpos[_outsize], _options.routing_id_size + 1)</code>。</li>
+<li><b>C20</b>（NULL 机制要求 as-server 为零；订阅报文有两种线格式）：RFC 23/ZMTP，The NULL Security Mechanism 节——"When a peer uses the NULL security mechanism, the as-server field MUST be zero."；同文 The Publish-Subscribe Pattern 节给出 ZMTP 3.0 的订阅语法 <code>subscribe = %x00 short-size %d1 subscription</code>，ZMTP 3.1 则改用 <code>SUBSCRIBE</code> 命令帧（RFC 37/ZMTP，由 RFC 23 的 Related Specifications 节指向）。两种形式均经本机实测确认。</li>
+<li><b>C21</b>（SUB 与 XSUB 的入站队列满时静默丢弃）：RFC 29/PUBSUB，The SUB Socket Type 的 For processing incoming messages 条目——"SHALL silently discard messages if the queue for a publisher is full."；同文 The XSUB Socket Type 有对应表述"SHALL silently discard messages if the incoming queue for a publisher is full."。SUB 同时"为每个已连接的发布者维护一条入站消息队列"。</li>
+<li><b>C22</b>（"上一个对端"策略与 REQ/REP 的严格交替）：<code>zmq_socket(3)</code>，ZMQ_REQ 摘要表的 Incoming routing strategy = Last peer 与 ZMQ_REP 摘要表的 Outgoing routing strategy = Last peer；RFC 28/REQREP，REQ 节——"SHALL send and then receive exactly one message at a time."、"SHALL accept an incoming message only from the last peer that it sent a request to."、"SHALL discard silently any messages received from other peers."；REP 节——"SHALL receive and then send exactly one message at a time."、"SHALL deliver this message back to the originating peer."</li>
+</ul>
+
+<h3 id="sources-formulas">核心公式与来源</h3>
+
+<ul>
+<li><b>F1</b>（greeting 的 64 字节布局）：RFC 23/ZMTP，Formal Grammar 节的 ABNF 定义 <code>greeting = signature version mechanism as-server filler</code> 及各项长度；"Following the greeting, which has a fixed size of 64 octets" 出自同文 Framing 节。RFC 23 规定 <code>version-major = %x03</code>、<code>version-minor = %x00</code>；正文中提到的实测值 <code>03 01</code> 对应 ZMTP 3.1，由 RFC 37/ZMTP 定义，RFC 23 的 Related Specifications 节列有该条目（"spec:37/ZMTP defines version 3.1 of this specification"）。本页对该差异按"规范值"与"实测值"分别标注，未将两者混同。</li>
+<li><b>F2</b>（帧头布局与 flags 位定义）：RFC 23/ZMTP，Framing 节的 flags 位说明（Bits 7-3 保留、Bit 2 COMMAND、Bit 1 LONG、Bit 0 MORE），以及 Formal Grammar 节的 <code>message-more</code>、<code>message-last</code>、<code>command</code> 产生式。"长度不含 flags 也不含自身"出自 Framing 节原文。</li>
+</ul>
+
+<h3 id="sources-numbers">外部数字与实验条件</h3>
+
+<p>规范值：greeting 固定 64 字节及其 10/2/20/1/31 的字段切分（RFC 23）；短帧帧体 0–255 字节、长帧帧体最大 $2^{63}-1$ 字节（RFC 23）；<code>ZMQ_SNDHWM</code>/<code>ZMQ_RCVHWM</code> 默认 1000 条消息（<code>zmq_setsockopt(3)</code>）；<code>ZMQ_IO_THREADS</code> 默认 1（<code>zmq_ctx_set(3)</code>）。</p>
+
+<p>本页所有实测输出均在同一环境下取得：macOS，pyzmq 27.1.0，libzmq 4.3.5，全部通过 loopback 地址 <code>127.0.0.1</code> 或 <code>inproc</code> 传输在单机完成，无网络延迟与丢包。各实验的具体条件：</p>
+
+<ul>
+<li><b>轮询分发</b>（worker0/1/2 各取 2 条）：1 个 PUSH bind、3 个 PULL connect，6 个任务，发送前等待 0.5 秒确保连接建立，工作进程不做实际处理。</li>
+<li><b>轮询跳过满队列</b>（慢对端取 0、2，空闲对端取余下 8 条）：<code>inproc</code> 传输，<code>zmq.Context(0)</code>，PUSH 的 <code>ZMQ_SNDHWM</code>=1，两个 PULL 的 <code>ZMQ_RCVHWM</code> 分别为 1 与 100，10 个任务。同一脚本连续运行两次结果一致。</li>
+<li><b>线上字节</b>（117 字节、三个帧）：手写 TCP 对端假装 ROUTER，真实 DEALER 设 <code>ZMQ_ROUTING_ID</code>=<code>cli</code>，发送 <code>[b"A", b"BC"]</code>。</li>
+<li><b>发布端过滤</b>（<code>B-nomatch</code> 未上线）：手写 TCP 对端假装 SUB 并只声明订阅前缀 <code>A</code>，真实 PUB 依次发出三条消息，发送前等待 0.9 秒确保订阅到达。</li>
+<li><b>ROUTER 信封</b>（<code>worker-7</code> 与 <code>client-1</code>）：1 个 ROUTER 同时接受 1 个 DEALER 与 1 个 REQ，两端均显式设置 <code>ZMQ_ROUTING_ID</code>。</li>
+<li><b>丢弃与阻塞对照</b>（PUB 收到 5/100、PUSH 接受 5/100）：<code>ZMQ_SNDHWM</code>=<code>ZMQ_RCVHWM</code>=5，接收端在发送期间完全不读取，发送使用 <code>zmq.NOBLOCK</code> 以便观察 <code>EAGAIN</code>。</li>
+<li><b>丢弃侧对照表</b>（5/200、200/200、5/200、200/200）：固定发送 200 条，四组 HWM 组合，接收端在发送结束后反复排空直到连续 5 轮无新消息。</li>
+<li><b>slow joiner</b>（只收到三条 <code>late-*</code>）：SUB connect 后立即发布 3 条，等待 0.5 秒后再发 3 条。</li>
+<li><b>connect 先于 bind</b>：PUSH 连接到无人监听的端口并立即发送，随后 PULL 才在该端口 bind。</li>
+</ul>
+
+<p>按 C8，上述所有与 HWM 相关的条数均为该次运行的观察值，不构成容量规格；更换传输方式、消息大小或运行环境都可能得到不同数字。</p>
+
+<h3 id="sources-constructed">构造示例</h3>
+
+<p>任务分发系统（一个分发端、三个工作进程、编号 1 到 6 的任务、若干监控端）是为本页构造的场景，不对应任何真实系统。其中的人为参数包括：任务编号 1–6、工作进程数 3、<code>ZMQ_SNDHWM</code>/<code>ZMQ_RCVHWM</code>=5、压力测试的 100 条与 200 条、端口号 5701–5712、路由标识 <code>worker-7</code> 与 <code>client-1</code>、订阅前缀 <code>A</code> 与消息内容 <code>A-match-1</code>/<code>B-nomatch</code>/<code>A-match-2</code>、以及帧头手算例子中的字节串 <code>01 03 61 62 63 00 01 64</code>。这些值的选取标准是便于手工追踪与复算，均非工程推荐配置——特别是 HWM=5 远小于默认值 1000，仅为在少量消息内触发队列满而设。</p>
+
+<h3 id="sources-analogy">辅助解释与类比边界</h3>
+
+<p>本页对"Zero"含义的说明（零 broker、零管理成本一类的设计取向）只用于解释名字的来源，不构成性能或可靠性结论。该说明不支持"ZeroMQ 延迟为零""ZeroMQ 不丢消息"一类推断——后者已被"队列满了"一章的实测直接否定。判断某个 socket 类型的实际行为时，依据应为 <code>zmq_socket(3)</code> 的类型语义与对应 RFC，而非名称。</p>
+
+<p>把 ZeroMQ 与带 broker 的消息中间件、gRPC/HTTP 对比的段落只用于说明选型边界，不构成对这些方案的完整评价，也未涉及它们各自的性能特征。</p>
+
+<h3 id="sources-simplifications">简化条件及其限制</h3>
+
+<ul>
+<li><b>只讨论 8 种稳定 socket 类型</b>：<code>zmq_socket(3)</code> 共记录 20 种类型（2026-08-17 核对 latest 版本）。本页覆盖 PUSH、PULL、PUB、SUB、REQ、REP、DEALER、ROUTER，可支持"出站三策略加入站公平队列"以及"丢弃与阻塞两类 mute 行为"的完整结论；不能推出关于 CLIENT/SERVER/RADIO/DISH 等 draft 类型的任何结论，那些类型的语义与线程安全性均不同。XPUB/XSUB 仅在对照表与 mute 行为处出现，其代理用法未展开。</li>
+<li><b>只讨论 NULL 安全机制</b>：本页的 greeting 与握手实测均在 mechanism = <code>NULL</code> 下取得。可支持关于字段布局与帧格式的结论；启用 PLAIN 或 CURVE 时握手命令序列与帧体加密情况都会变化，本页数据不适用。</li>
+<li><b>全部实测在单机 loopback 或 inproc 上完成</b>：可支持关于语义（谁丢、谁阻塞、字节如何排列）的结论；不能用于推断真实网络下的时序——特别是 slow joiner 的时间窗口、以及 TCP 传输下队列的实际容量，跨主机场景会明显不同。</li>
+<li><b>抓包脚本只实现最小 ZMTP 对端</b>：假对端不校验对方 greeting、不做版本协商、不处理帧跨 TCP 分段到达，仅够观察单向发出的字节。可支持"线上确实是这些字节"的结论；不能作为 ZMTP 实现参考。</li>
+<li><b>不涉及可靠性协议的具体设计</b>：本页说明了应用需要自己补哪些机制（确认、重试、幂等、超时判定），但未给出任何具体协议方案。基于 DEALER/ROUTER 构建的高层协议属于用 ZeroMQ 搭出来的东西，不在本页范围。</li>
+<li><b>不涉及性能数据</b>：本页所有数字都用于说明语义，没有任何吞吐、延迟或资源占用的测量。不能据此判断 ZeroMQ 与其他方案的性能优劣。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>

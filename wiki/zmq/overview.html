@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZeroMQ · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 分布式通信</span>
+      <h1>ZeroMQ（ZMQ）</h1>
+      <p class="lead">嵌入应用进程的消息库。它在字节流之上提供离散消息、多对端分发策略与断线自恢复，让应用不必自己写这三层胶水代码；消息发给谁、队列满时丢还是等，都由 socket 类型决定。</p>
+      <p class="meta">更新于 2026-08-17</p>
+    </header>
+
+    <h2>它是什么</h2>
+
+    <p>ZeroMQ 是一个链接进应用进程的消息传输库。它把"收发离散消息"这件事从字节流层面抽出来：应用按预设的消息模式收发完整消息，不必自己处理消息边界、多对端分发和断线重连。</p>
+
+    <p>它不是消息队列中间件。没有 broker，没有常驻服务进程，所谓"队列"是 socket 在应用自己的进程内存中为每个对端维护的缓冲区——进程退出，队列随之消失。</p>
+
+    <h2>问题背景</h2>
+
+    <p>直接在 TCP 上实现进程间通信，应用需要自己补三件事：</p>
+
+    <ul>
+      <li><b>消息边界</b>。TCP 交付的是一串没有分隔的字节，两次 <code>send</code> 的内容可能被合并或拆分读出，"一条消息从哪开始到哪结束"必须由应用自己约定。</li>
+      <li><b>多对端分发</b>。一条 TCP 连接只连一个对端。有多个对端时，"这条消息给谁""某个对端卡住了怎么办"的决策代码要自己写。</li>
+      <li><b>断线恢复</b>。连接会断。检测、重连、重连期间待发数据的暂存，都得自己实现。</li>
+    </ul>
+
+    <p>ZeroMQ 分别用帧、socket 类型的路由策略、每对端一条队列加自动重连来覆盖这三点。</p>
+
+    <h2>核心机制</h2>
+
+    <ul>
+      <li><b>socket 类型决定消息去哪</b>。发送函数不接受收件人参数，目标由 socket 类型的出站策略决定：PUSH/DEALER/REQ 用轮询（一条消息只去一个对端）；PUB/XPUB 用扇出（复制给所有匹配订阅的对端）；ROUTER 从消息第一帧取出路由标识定向投递。入站侧多数类型用公平队列，轮流从各对端读取；REQ 与 REP 例外，它们把收发对象锁定在"上一个对端"，因此必须一发一收严格交替。</li>
+      <li><b>轮询只在可用对端间进行</b>。队列已满的对端会被跳过，而不是拖慢全局。因此单个卡住的对端不会阻塞整条分发通路。</li>
+      <li><b>传输单位是帧，消息由多帧组成且原子交付</b>。每帧带 1 字节 flags 和长度字段，flags 的 MORE 位标记"后面还有帧"。对端要么收到一条消息的全部帧，要么一个都收不到。</li>
+      <li><b>队列按对端划分，容量由高水位（HWM）控制</b>。<code>ZMQ_SNDHWM</code>/<code>ZMQ_RCVHWM</code> 的单位是消息条数，默认 1000，限制的是"任意单个对端"的队列。官方同时说明实际容量不保证等于设定值。</li>
+      <li><b>队列满后的反应按类型分成两类</b>。发送侧：PUB、XPUB、XSUB 和默认配置的 ROUTER 丢弃消息且发送调用从不阻塞；PUSH、REQ、DEALER、PAIR 阻塞或返回 <code>EAGAIN</code>，明确不丢消息。接收侧：SUB 的入站队列满时静默丢弃；PULL 则停止读取，把压力回传给上游。</li>
+      <li><b>订阅过滤在发布端执行</b>。订阅 API 写在 SUB 一侧，但 SUB 会把订阅前缀发给发布端，由发布端做二进制前缀比较后再决定是否发送。不匹配的消息根本不上网络。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+
+    <ul>
+      <li><b>"用了 ZeroMQ 消息就不会丢"是错的</b>。是否丢消息不是库的属性，而是所选 socket 类型的属性。成立条件：查阅目标类型在队列满时的文档语义。广播状态用 PUB 合适（丢掉旧状态优于卡住系统），任务分发用 PUB 则会在压力下静默丢任务。PUB/SUB 通路上发布端出站队列与订阅端入站队列都可能丢弃，丢弃发生在先被填满的那一侧。</li>
+      <li><b>发送成功不等于送达</b>。官方明确：调用成功只表示消息已在该 socket 上排队、库已接管，既不代表已上网络，也不代表对端已收到。实际写 socket 的是 context 的 I/O 线程（默认 1 个；<code>inproc</code> 传输不经过 I/O 线程）。</li>
+      <li><b>"不丢消息"的前提是连接持续存在</b>。对端断开时其队列被销毁、其中消息一并丢弃。这是官方把 PUSH/PULL 定性为"只要节点不意外断开就不丢消息"的确切含义。</li>
+      <li><b>可靠投递必须由应用实现</b>。库不提供持久化、投递确认、重投递，也不定义消息格式。需要"任务一定被处理过"就得自己做回报、超时重投与幂等设计。此外常用 socket 类型全部非线程安全，跨线程共享是未定义行为。</li>
+    </ul>
+
+    <p>机制细节、ZMTP 线上字节的逐段解析，以及各结论对应的实测数据，见<a href="index.html">完整说明</a>。</p>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
