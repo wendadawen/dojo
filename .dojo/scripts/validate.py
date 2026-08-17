@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -58,10 +59,24 @@ BARE_MATH_CHARS = (
 )
 BARE_MATH_RE = re.compile(f"[{BARE_MATH_CHARS}]")
 
-# 以下上下文不参与公式检查：
-# button/option/nav/title 是交互控件；
-# text/tspan 位于 SVG 内部，KaTeX 不渲染 SVG 文本，数学表达应写在图注中。
-UI_CONTEXT_TAGS = {"button", "option", "title", "nav", "text", "tspan"}
+# 界面元素中的字符属于交互控件，不参与公式检查。
+UI_CONTEXT_TAGS = {"button", "option", "title", "nav"}
+
+# SVG 的 <text> 由浏览器直接绘制，KaTeX 不会处理其中的 $...$。
+# 图内需要公式时改用 <foreignObject> 承载 HTML，KaTeX 可正常渲染其内容。
+SVG_TEXT_RE = re.compile(r"<(text|tspan)\b[^>]*>(.*?)</\1>", re.S)
+
+# 用 ASCII 近似写数学符号同样属于未渲染公式：
+# 下标式标识（R_1、theta_i）、写成单词的希腊字母与角度单位、乘除号的字符替代。
+ASCII_MATH_PATTERNS = (
+    re.compile(r"\b[A-Za-z]\w*_\{?[A-Za-z0-9]"),
+    re.compile(
+        r"\b(?:alpha|beta|gamma|delta|theta|lambda|sigma|omega|phi|psi|mu|tau|epsilon|rho)\b",
+        re.I,
+    ),
+    re.compile(r"\b(?:deg|degrees?|pi)\b", re.I),
+    re.compile(r"[0-9A-Za-z]\s*\*\s*[0-9A-Za-z]"),
+)
 
 # 结构图使用 HTML 或内联 SVG，不使用等宽字符拼出的框线图。
 BOX_DRAWING_RE = re.compile(r"[\u2500-\u257f\u2580-\u259f\u25a0-\u25ff\u2b00-\u2bff]")
@@ -199,6 +214,7 @@ def validate_page(path: Path) -> list[str]:
 
     if is_wiki_page:
         errors.extend(check_bare_math(inspector))
+        errors.extend(check_svg_text_math(text))
         errors.extend(check_box_drawing(text))
 
     return errors
@@ -229,6 +245,37 @@ def check_bare_math(inspector: PageInspector) -> list[str]:
             f"unrendered math characters {''.join(hits)} in dojo:summary"
             " (wrap in $...$ so KaTeX renders it)"
         )
+    return errors
+
+
+def check_svg_text_math(text: str) -> list[str]:
+    """SVG 的 <text> 内不得出现公式或数学字符，改用 <foreignObject>。"""
+    errors: list[str] = []
+    for tag, content in SVG_TEXT_RE.findall(text):
+        inner = unescape(re.sub(r"<[^>]+>", "", content))
+        if INLINE_MATH_RE.search(inner):
+            snippet = " ".join(inner.split())[:60]
+            errors.append(
+                f"math delimiters inside <{tag}> are not rendered: {snippet}"
+                " (use <foreignObject> to hold the formula)"
+            )
+            continue
+        hits = sorted(set(BARE_MATH_RE.findall(inner)))
+        if hits:
+            snippet = " ".join(inner.split())[:60]
+            errors.append(
+                f"unrendered math characters {''.join(hits)} inside <{tag}>: {snippet}"
+                " (use <foreignObject> with $...$ instead)"
+            )
+            continue
+        for pattern in ASCII_MATH_PATTERNS:
+            if pattern.search(inner):
+                snippet = " ".join(inner.split())[:60]
+                errors.append(
+                    f"ascii approximation of math inside <{tag}>: {snippet}"
+                    " (use <foreignObject> with $...$ instead)"
+                )
+                break
     return errors
 
 
