@@ -45,6 +45,39 @@ INLINE_MATH_RE = re.compile(
     r"\\\[[\s\S]+?\\\]"
 )
 
+# 数学符号必须写成 LaTeX 交给 KaTeX 渲染，不能直接使用 Unicode 字符。
+# 只收录必须由 KaTeX 排版的字符：希腊字母、上下标、数学运算符与关系符。
+# × – → 等在中文技术散文中作为普通排版字符使用，不列入。
+BARE_MATH_CHARS = (
+    "\u0391-\u03a9\u03b1-\u03c9"  # 希腊字母大小写
+    "\u2202\u2207\u221a\u221d\u221e\u2211\u220f\u222b"  # 偏导 梯度 根号 正比 无穷 求和 求积 积分
+    "\u2248\u2260\u2261\u2264\u2265\u226a\u226b"  # 约等 不等 恒等 小于等于 大于等于 远小于 远大于
+    "\u2208\u2209\u2282\u2283\u2229\u222a\u2205"  # 属于 不属于 子集 超集 交 并 空集
+    "\u2295\u2297\u22c5"  # 直和 张量积 点乘
+    "\u2070-\u209f"  # 上标与下标数字字母
+)
+BARE_MATH_RE = re.compile(f"[{BARE_MATH_CHARS}]")
+
+# 以下上下文不参与公式检查：
+# button/option/nav/title 是交互控件；
+# text/tspan 位于 SVG 内部，KaTeX 不渲染 SVG 文本，数学表达应写在图注中。
+UI_CONTEXT_TAGS = {"button", "option", "title", "nav", "text", "tspan"}
+
+# 结构图使用 HTML 或内联 SVG，不使用等宽字符拼出的框线图。
+BOX_DRAWING_RE = re.compile(r"[\u2500-\u257f\u2580-\u259f\u25a0-\u25ff\u2b00-\u2bff]")
+PRE_BLOCK_RE = re.compile(r"<pre\b[^>]*>([\s\S]*?)</pre>", re.IGNORECASE)
+BOX_DRAWING_MIN_HITS = 4
+
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+
+
+def strip_math_segments(text: str) -> str:
+    """移除 $...$、$$...$$、\\(...\\)、\\[...\\] 包裹的公式内容。"""
+    return INLINE_MATH_RE.sub(" ", text)
+
 
 class PageInspector(HTMLParser):
     def __init__(self) -> None:
@@ -53,12 +86,19 @@ class PageInspector(HTMLParser):
         self.scripts: list[str] = []
         self.stylesheets: list[str] = []
         self.visible_parts: list[str] = []
+        self.prose_parts: list[tuple[str, str]] = []
         self._ignored_depth = 0
+        self._code_depth = 0
+        self._tag_stack: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple]) -> None:
         values = dict(attrs)
         if tag in {"script", "style"}:
             self._ignored_depth += 1
+        if tag in {"code", "pre", "samp", "kbd"}:
+            self._code_depth += 1
+        if tag not in VOID_TAGS:
+            self._tag_stack.append(tag)
         if tag == "meta":
             name = values.get("name", "").strip().lower()
             if name:
@@ -71,10 +111,19 @@ class PageInspector(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style"} and self._ignored_depth:
             self._ignored_depth -= 1
+        if tag in {"code", "pre", "samp", "kbd"} and self._code_depth:
+            self._code_depth -= 1
+        if tag in self._tag_stack:
+            while self._tag_stack and self._tag_stack.pop() != tag:
+                pass
 
     def handle_data(self, data: str) -> None:
-        if not self._ignored_depth:
-            self.visible_parts.append(data)
+        if self._ignored_depth:
+            return
+        self.visible_parts.append(data)
+        if not self._code_depth and data.strip():
+            context = self._tag_stack[-1] if self._tag_stack else "body"
+            self.prose_parts.append((context, data))
 
 
 def validate_page(path: Path) -> list[str]:
@@ -148,6 +197,51 @@ def validate_page(path: Path) -> list[str]:
         if not has_auto_render:
             errors.append("math content requires auto-render initialization")
 
+    if is_wiki_page:
+        errors.extend(check_bare_math(inspector))
+        errors.extend(check_box_drawing(text))
+
+    return errors
+
+
+def check_bare_math(inspector: PageInspector) -> list[str]:
+    """公式定界符之外出现数学 Unicode 字符即视为未渲染公式。
+
+    覆盖标题、summary、正文与列表；代码块内的字符不计入。
+    """
+    errors: list[str] = []
+    for context, chunk in inspector.prose_parts:
+        if context in UI_CONTEXT_TAGS:
+            continue
+        outside = strip_math_segments(chunk)
+        hits = sorted(set(BARE_MATH_RE.findall(outside)))
+        if hits:
+            snippet = " ".join(outside.split())[:70]
+            errors.append(
+                f"unrendered math characters {''.join(hits)} in <{context}>: {snippet}"
+                " (wrap in $...$ so KaTeX renders it)"
+            )
+
+    summary = inspector.meta.get("dojo:summary", "")
+    hits = sorted(set(BARE_MATH_RE.findall(strip_math_segments(summary))))
+    if hits:
+        errors.append(
+            f"unrendered math characters {''.join(hits)} in dojo:summary"
+            " (wrap in $...$ so KaTeX renders it)"
+        )
+    return errors
+
+
+def check_box_drawing(text: str) -> list[str]:
+    """结构图必须用 HTML 或内联 SVG，不使用等宽字符拼出的框线图。"""
+    errors: list[str] = []
+    for index, block in enumerate(PRE_BLOCK_RE.findall(text), start=1):
+        hits = BOX_DRAWING_RE.findall(block)
+        if len(hits) >= BOX_DRAWING_MIN_HITS:
+            errors.append(
+                f"ascii box-drawing diagram in <pre> block #{index}"
+                f" ({len(hits)} box characters); use HTML diagram or inline SVG"
+            )
     return errors
 
 
