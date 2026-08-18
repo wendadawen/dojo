@@ -580,6 +580,29 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    ol.chapter-questions { margin-bottom: 0; }
+    ol.chapter-questions li { margin-bottom: 1.25rem; }
+    ol.chapter-questions li:last-child { margin-bottom: 0; }
+    ol.chapter-questions details { margin: 0.6rem 0 0; }
+    ol.chapter-questions details p:first-child { margin-top: 0; }
+
+    /* ============ HTML 流程图 ============ */
+    .flow-steps {
+      margin: 2rem 0;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .flow-step {
+      border: 1px solid var(--border-light);
+      border-radius: 6px;
+      background: var(--bg-soft);
+      padding: 0.55rem 0.9rem;
+    }
+    .flow-arrow {
+      text-align: center;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -668,14 +691,44 @@
 <p>Quantile Balancing（QB）是 Kimi K3 的 MoE 负载均衡方法，从一次前向传播的路由分数分位数直接算出每个专家的 bias，替代 DeepSeek-V3 的固定步长 sign 更新。它不引入任何损失项，只改 bias 的更新规则：从"走固定小步"变成"一步跳到精确解"。<sup>[C17, N1]</sup></p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>QB 要解决什么问题？DeepSeek-V3 的固定步长 bias 更新为什么在 896 专家时失效？</li>
-    <li>QB 如何从一次前向传播推导出下一个 bias？公式 Eq.14 的每一步在做什么？</li>
-    <li>如何手算 m=8, n=4, k=1 的 QB 例子（从负载 (4,3,1,0) 变为 (2,2,2,2)）？</li>
-    <li>QB 与 DeepSeek-V3 sign 更新有什么本质区别？为什么 QB 不需要学习率类超参数？</li>
-    <li>QB 在训练时如何用直方图估计分位数？推理时如何处理？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>QB 要解决什么问题？DeepSeek-V3 的固定步长 bias 更新为什么在 896 专家时失效？</p>
+      <details>
+      <summary>解答：负载不均衡且不引入损失项；sign 更新只保留方向</summary>
+      <p>QB 解决 MoE 训练中的专家负载不均衡问题，且不引入任何损失项，只改 bias 的更新规则。DeepSeek-V3 的 sign 更新只保留负载误差的方向、丢弃幅度，唯一步长 $\gamma$ 同时承担"快速纠正"与"不震荡"两个矛盾要求；专家数扩大到 896 后，该缺陷被放大为收敛慢、均衡附近震荡和部分专家长期训练不足。完整论证见「1. auxiliary-loss-free 路由」与「2. DeepSeek-V3 的固定步长更新」。</p>
+      </details>
+    </li>
+    <li>
+      <p>QB 如何从一次前向传播推导出下一个 bias？公式 Eq.14 的每一步在做什么？</p>
+      <details>
+      <summary>解答：cutoff、margins、分位数、mean-centering 四步</summary>
+      <p>四步流水线：Top-$(k+1)$ 路由取 cutoff $\alpha_i$；对每对 token–专家计算 margin $s_{i,j} - \alpha_i$；对每个专家取 margins 的 $(1-k/n)$ 分位数并取负得 $\tilde{b}_j$；mean-centering 去掉公共偏移得 $b$。分位数保证恰好 $q = mk/n$ 个 margin 超过阈值，即目标负载。逐步推导与手算验证见「3. QB 的核心机制」。</p>
+      </details>
+    </li>
+    <li>
+      <p>如何手算 $m=8, n=4, k=1$ 的 QB 例子（负载从 $(4,3,1,0)$ 变为 $(2,2,2,2)$）？</p>
+      <details>
+      <summary>解答：一轮更新即达均衡</summary>
+      <p>按四步流程计算：过热的 E1、E2 得到负 bias，冷门的 E4 得到正 bias，mean-centering 后 $b = (-0.15, -0.05, 0.05, 0.15)$；3 个 token 改道后新负载为 $(2,2,2,2)$。该例一步收敛是构造数据的特殊性，一般情况需多轮。手算全过程见「3. QB 的核心机制」中的构造示例。</p>
+      </details>
+    </li>
+    <li>
+      <p>QB 与 DeepSeek-V3 sign 更新有什么本质区别？为什么 QB 不需要学习率类超参数？</p>
+      <details>
+      <summary>解答：SignSGD 与精确 coordinate minimizer 之别</summary>
+      <p>两者求解同一个对偶目标：sign 更新对该目标的（次）梯度做 SignSGD，只保留方向、步长固定为 $\gamma$；QB 直接计算使该坐标最优的精确值（margin 分布的分位数），因此不需要步长类超参数。对比见「4. QB 为什么好——从平衡分配到对偶的视角」。</p>
+      </details>
+    </li>
+    <li>
+      <p>QB 在训练时如何用直方图估计分位数？推理时如何处理？</p>
+      <details>
+      <summary>解答：counts 可加、一次 all-reduce；推理冻结 bias</summary>
+      <p>训练时对每个专家维护 $B$ 个 bin 的直方图，各 rank 本地 scatter-add counts，经一次整数 all-reduce 汇总后从 pooled counts 线性插值恢复分位数，通信量为 $nB$ 个整数且与 token 数无关；推理时 bias 冻结，路由退化为纯 Top-k 选择，无任何额外计算。见「5. 训练时的直方图估计与推理冻结」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
@@ -689,7 +742,7 @@
 
 <!-- auxiliary-loss-free 路由 -->
 
-<h2 id="aux-loss-free-routing">auxiliary-loss-free 路由——bias 做什么、不做什么</h2>
+<h2 id="aux-loss-free-routing">1. auxiliary-loss-free 路由——bias 做什么、不做什么</h2>
 
 <p>在讲 QB 之前，先理解它所处的路由框架。MoE（混合专家模型）的基本路由机制见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。这里只说 QB 直接依赖的部分。</p>
 
@@ -713,17 +766,29 @@ $$T_i = \text{argtopk}(s_i + b), \qquad p_{i,j} = \frac{s_{i,j}}{\sum_{r \in T_i
 
 <p>bias 能调节负载：给冷门专家加正 bias 会提高它进入 Top-k 的概率，给过热专家减 bias 会降低它被选中的概率。但 bias 本身怎么更新？下一章看 DeepSeek-V3 的做法和它的瓶颈。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>bias 加到分数上选 Top-k 后，如果两个 expert 的 bias 同时加 0.1，Top-k 选择会变吗。归一化权重 $p$ 会变吗。</li>
-  <li>$p_{i,j}$ 的公式中分母 $\sum_{r \in T_i} s_{i,r}$ 为什么不含 $b_r$。这保证了 bias 不影响什么。</li>
-</ul>
-
 <p>本章说明了 bias 在路由中的角色——只影响选谁，不进权重。但 bias 本身怎么更新、为什么固定步长更新在大规模时失效——下一章讲 DeepSeek-V3 的 sign 更新及其瓶颈。</p>
+
+<h3 id="ch1-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>bias 加到分数上参与 Top-k 选择后，如果两个专家的 bias 同时加 $0.1$，Top-k 选择会变吗？归一化权重 $p$ 会变吗？</p>
+    <details>
+    <summary>解答：两者都不变</summary>
+    <p>都不变。所有专家的 bias 同时加常数等价于全部 biased score 同时平移，相对排序不变，因此 Top-k 集合不变；归一化权重 $p_{i,j}$ 的分母只对原始分数 $s$ 求和，与 bias 无关，因此也不变。这正是 bias 只调节"选谁"、不干扰权重的体现。</p>
+    </details>
+  </li>
+  <li>
+    <p>$p_{i,j}$ 的公式中分母 $\sum_{r \in T_i} s_{i,r}$ 为什么不含 $b_r$？这保证了 bias 不影响什么？</p>
+    <details>
+    <summary>解答：权重只用原始分数计算</summary>
+    <p>bias 只叠加在 Top-k 选择的比较分数 $s_i + b$ 上，不进入归一化权重的计算。这保证 bias 不影响被选中专家的输出权重（mixture weight），也不进入梯度优化目标——bias 可以完全服务于负载调节，而不干扰模型正在学习的内容。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- DeepSeek-V3 sign 更新 -->
 
-<h2 id="deepseek-v3-sign-update">DeepSeek-V3 的固定步长更新——为什么 896 专家时失效</h2>
+<h2 id="deepseek-v3-sign-update">2. DeepSeek-V3 的固定步长更新——为什么 896 专家时失效</h2>
 
 <p>DeepSeek-V3 提出 auxiliary-loss-free 路由时，bias 的更新规则是固定步长的 sign 更新：<sup>[C2, F2]</sup></p>
 
@@ -741,53 +806,61 @@ $$b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \text{sign}(\bar{\ell}^{(t)} - \ell_j^{
 
 <p>这个更新有一个根本性的两难：$\gamma$ 只有一个值，既要够大才能快速纠正不均衡，又要够小才不会在均衡附近来回震荡。<strong>sign 只保留了负载误差的方向，丢掉了幅度</strong>。无论专家多了 100 个 token 还是多了 1 个 token，$\text{sign}(\bar{\ell} - \ell_j)$ 都返回 $-1$，bias 都只走 $\gamma$ 这一步。</p>
 
-<p>教学示例。 假设 $\gamma = 0.001$，某专家负载 $\ell_j = 100$，目标 $\bar{\ell} = 50$（多了 50 个）。$\text{sign}(50 - 100) = \text{sign}(-50) = -1$，每步 bias 减 $0.001$。另一个场景中负载 $\ell_j = 51$（只多了 1 个），$\text{sign}(50 - 51) = \text{sign}(-1) = -1$，每步 bias 也减 $0.001$。两种差距相差 50 倍，但 bias 的更新幅度完全相同——sign 丢失了"差多远"的信息。前者需要约 50000 步才能把 bias 调到合理水平。</p>
+<p>构造示例。假设 $\gamma = 0.001$，某专家负载 $\ell_j = 100$，目标 $\bar{\ell} = 50$（多了 50 个）。$\text{sign}(50 - 100) = \text{sign}(-50) = -1$，每步 bias 减 $0.001$。另一个场景中负载 $\ell_j = 51$（只多了 1 个），$\text{sign}(50 - 51) = \text{sign}(-1) = -1$，每步 bias 也减 $0.001$。两种差距相差 50 倍，但 bias 的更新幅度完全相同——sign 丢失了"差多远"的信息。前者需要约 50000 步才能把 bias 调到合理水平。</p>
 
 <p>K3 将 routed expert 池扩大到 <strong>896 per layer</strong>，每个 token 选 <strong>16 个</strong>（$k=16$）。这些数字来自 K3 官方 config.json（<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>topk_method: "noaux_tc"</code>）。<sup>[C17, N1]</sup> 专家数从前代 K2 的 384 扩大到 896（K3 报告 Table 1）后，sign 更新只保留方向的缺陷被放大：收敛慢、均衡附近震荡、部分专家长期训练不足，拖慢专家并行训练。</p>
 
 <p>sign 更新只走固定小步，QB 的思路是：能不能从当前分数分布直接算出"正确的 bias 应该是多少"——不是走一小步，而是一步跳到目标？</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>$\gamma = 0.001$ 时，负载从 100 降到目标 50，sign 更新需要多少步才能让 bias 减少合理量。这说明了 sign 更新的什么问题。</li>
-  <li>sign 函数在 $\bar{\ell} - \ell_j = -50$ 和 $\bar{\ell} - \ell_j = -1$ 时返回值相同，这丢失了什么信息。</li>
-</ul>
-
 <p>本章说明了 sign 更新在大规模专家时的瓶颈——只保留方向、步长固定。但能不能从当前分数分布直接算出"正确的 bias 应该是多少"——下一章讲 QB 的核心机制。</p>
+
+<h3 id="ch2-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>$\gamma = 0.001$ 时，负载从 100 降到目标 50，sign 更新需要约多少步才能把 bias 调到合理水平？这说明 sign 更新的什么问题？</p>
+    <details>
+    <summary>解答：约 50000 步；步长与误差幅度无关</summary>
+    <p>每步 bias 只变化 $0.001$，要在 $0.05$ 量级上产生实质影响需要约 $50000$ 步。问题在于步长 $\gamma$ 与负载误差的幅度无关：误差大时纠正太慢，误差小时又容易在均衡附近过冲震荡——sign 只保留方向，丢掉了"差多远"的信息。</p>
+    </details>
+  </li>
+  <li>
+    <p>sign 函数在 $\bar{\ell} - \ell_j = -50$ 和 $\bar{\ell} - \ell_j = -1$ 时返回值相同，这丢失了什么信息？</p>
+    <details>
+    <summary>解答：负载误差的幅度</summary>
+    <p>丢失了负载误差的幅度。两种情况相差 50 倍，但 bias 的更新量完全相同，更新幅度无法反映实际需要纠正的距离；这正是固定步长更新必须折中 $\gamma$ 的根源。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- QB 核心机制 -->
 
-<h2 id="qb-core-mechanism">QB 的核心机制——从一次前向推导下一个 bias</h2>
+<h2 id="qb-core-mechanism">3. QB 的核心机制——从一次前向推导下一个 bias</h2>
 
 <p>QB 从一次前向传播的分数推导出下一个 bias。整个过程可以画成一条流水线：</p>
 
-<pre class="diagram">前向传播
-  │
-  ▼
-Top-(k+1) 路由 ──► 前 k 个 = 实际路由 T_i
-                   第 (k+1) 个 = cutoff α_i
-  │
-  ▼
-margins = s_{i,j} − α_i        （raw score 减 cutoff）
-  │
-  ▼
-每专家取 (1−k/n) 分位数          （使恰好 q 个 margin 超过阈值）
-  │                              b̃_j = −quantile_{1−k/n}(margins_{:,j})
-  ▼
-mean-centering                  b = b̃ − mean(b̃)·1
-  │
-  ▼
-下一步生效（因果性）              batch 不用自己推导的 bias 路由</pre>
+<div class="flow-steps">
+  <div class="flow-step"><b>前向传播</b></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step"><b>Top-$(k+1)$ 路由</b>：前 $k$ 个为实际路由 $T_i$，第 $(k+1)$ 个为 cutoff $\alpha_i$</div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step"><b>计算 margins</b>：$\text{margin}_{i,j} = s_{i,j} - \alpha_i$（raw score 减 cutoff）</div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step"><b>每专家取 $(1-k/n)$ 分位数</b>：$\tilde{b}_j = -\text{quantile}_{1-k/n}(\text{margins}_{:,j})$，使恰好 $q$ 个 margin 超过阈值</div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step"><b>mean-centering</b>：$b = \tilde{b} - \text{mean}(\tilde{b}) \cdot \mathbf{1}$</div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step"><b>下一步生效（因果性）</b>：batch 不用自己推导的 bias 路由</div>
+</div>
 
 <p>下面逐步拆解。</p>
 
-<h3 id="step1-topk-plus-1">步骤 1：Top-(k+1) 路由得 cutoff α_i</h3>
+<h3 id="step1-topk-plus-1">3.1 步骤 1：Top-$(k+1)$ 路由得 cutoff $\alpha_i$</h3>
 
 <p>QB 不是做 Top-k，而是做 <strong>Top-(k+1)</strong>。对 token $i$，把 $s_{i,j} + b_j^{(t)}$ 从大到小排序，取前 $k+1$ 个。前 $k$ 个是实际路由 $T_i$（与普通 Top-k 相同），第 $(k+1)$ 个就是 cutoff $\alpha_i$——"要进 Top-k 必须超过的分数线"。</p>
 
 <p>从 Top-(k+1) 取 cutoff 的好处是：不需要额外做一次 token 侧的分位数计算来估计"门槛在哪"，cutoff 是路由的副产品。</p>
 
-<h3 id="step2-margins">步骤 2：计算 margins</h3>
+<h3 id="step2-margins">3.2 步骤 2：计算 margins</h3>
 
 <p>对每个 token $i$ 和每个专家 $j$，计算 margin：</p>
 
@@ -797,7 +870,7 @@ $$\text{margin}_{i,j} = s_{i,j} - \alpha_i$$
 
 <p>margin 的直觉含义：它衡量"专家 $j$ 对 token $i$ 的吸引力，减去进入 Top-k 的门槛"。margin 为正说明该专家的 raw 分数超过了 cutoff（在 biased 分数下它本可以进 Top-k），margin 为零说明恰好等于 cutoff，margin 为负说明不够格。</p>
 
-<h3 id="step3-quantile">步骤 3：取 (1−k/n) 分位数得 b̃</h3>
+<h3 id="step3-quantile">3.3 步骤 3：取 $(1-k/n)$ 分位数得 $\tilde{b}$</h3>
 
 <p>对每个专家 $j$，收集所有 $m$ 个 token 对它的 margin，取 $(1 - k/n)$ 分位数，取负就是 b̃：<sup>[C1, F3]</sup></p>
 
@@ -808,14 +881,14 @@ $$\tilde{b}_j^{(t+1)} \leftarrow -\text{quantile}_{1-k/n}\left(s_{:,j}^{(t)} - \
 <p>为什么是 $(1-k/n)$ 分位数？目标负载 $q = mk/n$，即每个专家应该收到 $q$ 个 token。设 $-\tilde{b}_j$ 为阈值，margin 超过 $-\tilde{b}_j$ 的 token 数就是会被路由到专家 $j$ 的 token 数。要使这个数恰好等于 $q$，阈值应设在第 $(q+1)$ 大的 margin 上——恰好 $q$ 个 margin 严格超过它。因为 $q/m = k/n$，第 $(q+1)$ 大的 margin 就是 $(1-k/n)$ 分位数。</p>
 
 <details>
-<summary>补充：为什么 (q+1)-th largest margin 等于 (1−k/n) 分位数</summary>
+<summary>补充：为什么 $(q+1)$ 大 margin 等于 $(1-k/n)$ 分位数</summary>
 <p>给定专家 $j$ 的 $m$ 个 margin，将它们从大到小排列：$v_1 \geq v_2 \geq \cdots \geq v_m$。设 $-\tilde{b}_j = v_{q+1}$（第 $(q+1)$ 大），则恰好 $q$ 个 margin 严格大于 $-\tilde{b}_j$（即 $v_1, \ldots, v_q$），其余 $m - q$ 个不超过它。</p>
 <p>"恰好 $q/m$ 比例的数超过阈值"就是 $(1 - q/m)$ 分位数的定义。代入 $q = mk/n$：</p>
 <p>$$1 - \frac{q}{m} = 1 - \frac{mk/n}{m} = 1 - \frac{k}{n}$$</p>
 <p>所以 $(q+1)$-th largest $= (1-k/n)$ 分位数。QB 取负号是因为 bias 越大越容易被选中，而 margin 越大说明该专家越"热门"，所以 bias 应与 margin 的分位数符号相反。</p>
 </details>
 
-<h3 id="step4-mean-centering">步骤 4：mean-centering</h3>
+<h3 id="step4-mean-centering">3.4 步骤 4：mean-centering</h3>
 
 <p>最后减去均值：</p>
 
@@ -831,13 +904,13 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 
 <!-- 手算例子嵌入本章正文 -->
 
-<p>教学示例。 以下分数为人为构造，数字便于手算，不代表真实模型输出。但 QB 的计算过程与真实机制完全一致。设 $m=8$（8 个 token）、$n=4$（4 个专家）、$k=1$（每个 token 选 1 个专家），目标负载 $q = mk/n = 8 \times 1 / 4 = 2$。初始 bias $b = (0, 0, 0, 0)$。</p>
+<p>构造示例。以下分数为人为构造，数字便于手算，不代表真实模型输出。但 QB 的计算过程与真实机制完全一致。设 $m=8$（8 个 token）、$n=4$（4 个专家）、$k=1$（每个 token 选 1 个专家），目标负载 $q = mk/n = 8 \times 1 / 4 = 2$。初始 bias $b = (0, 0, 0, 0)$。</p>
 
-<h3 id="example-scores">分数矩阵</h3>
+<h3 id="example-scores">3.5 分数矩阵</h3>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th></th><th>E1</th><th>E2</th><th>E3</th><th>E4</th><th>路由</th><th>α</th></tr></thead>
+<thead><tr><th></th><th>E1</th><th>E2</th><th>E3</th><th>E4</th><th>路由</th><th>$\alpha$</th></tr></thead>
 <tbody>
 <tr><td>T1</td><td>0.7</td><td>0.3</td><td>0.8</td><td>0.5</td><td>E3</td><td>0.7</td></tr>
 <tr><td>T2</td><td>0.7</td><td>0.5</td><td>0.4</td><td>0.2</td><td>E1</td><td>0.5</td></tr>
@@ -855,59 +928,59 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 
 <p>初始负载 $\ell = (4, 3, 1, 0)$——E1 过热（4 个 token），E4 完全没被选中（dying expert）。</p>
 
-<h3 id="example-margins">计算 margins</h3>
+<h3 id="example-margins">3.6 计算 margins</h3>
 
 <p>margin$_{i,j} = s_{i,j} - \alpha_i$。例如 T1 的 $\alpha_1 = 0.7$，margin$_{1,1} = 0.7 - 0.7 = 0.0$，margin$_{1,3} = 0.8 - 0.7 = 0.1$。</p>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th></th><th>α</th><th>E1</th><th>E2</th><th>E3</th><th>E4</th></tr></thead>
+<thead><tr><th></th><th>$\alpha$</th><th>E1</th><th>E2</th><th>E3</th><th>E4</th></tr></thead>
 <tbody>
-<tr><td>T1</td><td>0.7</td><td>+0.0</td><td>−0.4</td><td>+0.1</td><td>−0.2</td></tr>
-<tr><td>T2</td><td>0.5</td><td>+0.2</td><td>+0.0</td><td>−0.1</td><td>−0.3</td></tr>
-<tr><td>T3</td><td>0.6</td><td>+0.0</td><td>+0.2</td><td>−0.5</td><td>−0.4</td></tr>
-<tr><td>T4</td><td>0.8</td><td>+0.1</td><td>−0.6</td><td>+0.0</td><td>−0.7</td></tr>
-<tr><td>T5</td><td>0.6</td><td>+0.2</td><td>−0.2</td><td>+0.0</td><td>+0.0</td></tr>
-<tr><td>T6</td><td>0.7</td><td>+0.0</td><td>+0.1</td><td>−0.5</td><td>−0.4</td></tr>
-<tr><td>T7</td><td>0.5</td><td>+0.3</td><td>+0.0</td><td>−0.2</td><td>−0.1</td></tr>
-<tr><td>T8</td><td>0.7</td><td>−0.6</td><td>+0.1</td><td>+0.0</td><td>+0.0</td></tr>
+<tr><td>T1</td><td>0.7</td><td>$+0.0$</td><td>$-0.4$</td><td>$+0.1$</td><td>$-0.2$</td></tr>
+<tr><td>T2</td><td>0.5</td><td>$+0.2$</td><td>$+0.0$</td><td>$-0.1$</td><td>$-0.3$</td></tr>
+<tr><td>T3</td><td>0.6</td><td>$+0.0$</td><td>$+0.2$</td><td>$-0.5$</td><td>$-0.4$</td></tr>
+<tr><td>T4</td><td>0.8</td><td>$+0.1$</td><td>$-0.6$</td><td>$+0.0$</td><td>$-0.7$</td></tr>
+<tr><td>T5</td><td>0.6</td><td>$+0.2$</td><td>$-0.2$</td><td>$+0.0$</td><td>$+0.0$</td></tr>
+<tr><td>T6</td><td>0.7</td><td>$+0.0$</td><td>$+0.1$</td><td>$-0.5$</td><td>$-0.4$</td></tr>
+<tr><td>T7</td><td>0.5</td><td>$+0.3$</td><td>$+0.0$</td><td>$-0.2$</td><td>$-0.1$</td></tr>
+<tr><td>T8</td><td>0.7</td><td>$-0.6$</td><td>$+0.1$</td><td>$+0.0$</td><td>$+0.0$</td></tr>
 </tbody>
 </table>
 </div>
 
 <p>注意被选中的专家（路由列）的 margin 恰好为 $+0.0$，这是巧合还是规律？实际上，当 $k=1$ 且初始 bias 为 0 时，Top-2 的第二个值（cutoff）就是 Top-2 对应专家的 raw score，所以该专家的 margin 恰好为 0。Top-1 对应专家的 margin 为正（因为它分数更高）。</p>
 
-<h3 id="example-quantile">取分位数得 b̃</h3>
+<h3 id="example-quantile">3.7 取分位数得 $\tilde{b}$</h3>
 
-<p>对每个专家，将 8 个 margin 从大到小排列，取第 3 大（即 $(1-1/4) = 0.75$ 分位数），取负得 b̃。</p>
+<p>对每个专家，将 8 个 margin 从大到小排列，取第 3 大（即 $(1-1/4) = 0.75$ 分位数），取负得 $\tilde{b}$。</p>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>专家</th><th>margins 降序排列</th><th>3rd largest</th><th>b̃</th></tr></thead>
+<thead><tr><th>专家</th><th>margins 降序排列</th><th>第 3 大</th><th>$\tilde{b}$</th></tr></thead>
 <tbody>
-<tr><td>E1</td><td>+0.3, +0.2, <strong>+0.2</strong>, +0.1, +0.0, +0.0, +0.0, −0.6</td><td>+0.2</td><td>−0.2</td></tr>
-<tr><td>E2</td><td>+0.2, +0.1, <strong>+0.1</strong>, +0.0, +0.0, −0.2, −0.4, −0.6</td><td>+0.1</td><td>−0.1</td></tr>
-<tr><td>E3</td><td>+0.1, +0.0, <strong>+0.0</strong>, +0.0, −0.1, −0.2, −0.5, −0.5</td><td>+0.0</td><td>0.0</td></tr>
-<tr><td>E4</td><td>+0.0, +0.0, <strong>−0.1</strong>, −0.2, −0.3, −0.4, −0.4, −0.7</td><td>−0.1</td><td>+0.1</td></tr>
+<tr><td>E1</td><td>$+0.3$, $+0.2$, <strong>$+0.2$</strong>, $+0.1$, $+0.0$, $+0.0$, $+0.0$, $-0.6$</td><td>$+0.2$</td><td>$-0.2$</td></tr>
+<tr><td>E2</td><td>$+0.2$, $+0.1$, <strong>$+0.1$</strong>, $+0.0$, $+0.0$, $-0.2$, $-0.4$, $-0.6$</td><td>$+0.1$</td><td>$-0.1$</td></tr>
+<tr><td>E3</td><td>$+0.1$, $+0.0$, <strong>$+0.0$</strong>, $+0.0$, $-0.1$, $-0.2$, $-0.5$, $-0.5$</td><td>$+0.0$</td><td>$0.0$</td></tr>
+<tr><td>E4</td><td>$+0.0$, $+0.0$, <strong>$-0.1$</strong>, $-0.2$, $-0.3$, $-0.4$, $-0.4$, $-0.7$</td><td>$-0.1$</td><td>$+0.1$</td></tr>
 </tbody>
 </table>
 </div>
 
 <p>过热的 E1 和 E2 得到负 bias（压低），冷门的 E4 得到正 bias（抬高），E3 的 margin 分布恰好在边界。</p>
 
-<h3 id="example-centering">mean-centering</h3>
+<h3 id="example-centering">3.8 mean-centering</h3>
 
 <p>$\tilde{b} = (-0.2, -0.1, 0.0, 0.1)$，均值 $= (-0.2 - 0.1 + 0.0 + 0.1) / 4 = -0.05$。</p>
 
 <p>$$b = \tilde{b} - (-0.05) \cdot \mathbf{1} = (-0.15, -0.05, +0.05, +0.15)$$</p>
 
-<h3 id="example-verify">验证新路由</h3>
+<h3 id="example-verify">3.9 验证新路由</h3>
 
 <p>用新 bias $b = (-0.15, -0.05, 0.05, 0.15)$ 计算 biased score $s + b$，做 Top-1 选择：</p>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th></th><th>E1−0.15</th><th>E2−0.05</th><th>E3+0.05</th><th>E4+0.15</th><th>路由</th><th>变化</th></tr></thead>
+<thead><tr><th></th><th>E1 $-0.15$</th><th>E2 $-0.05$</th><th>E3 $+0.05$</th><th>E4 $+0.15$</th><th>路由</th><th>变化</th></tr></thead>
 <tbody>
 <tr><td>T1</td><td>0.55</td><td>0.25</td><td>0.85</td><td>0.65</td><td>E3</td><td>—</td></tr>
 <tr><td>T2</td><td>0.55</td><td>0.45</td><td>0.45</td><td>0.35</td><td>E1</td><td>—</td></tr>
@@ -916,7 +989,7 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 <tr class="highlight-row"><td>T5</td><td>0.65</td><td>0.35</td><td>0.65</td><td>0.75</td><td>E4</td><td>E1→E4</td></tr>
 <tr><td>T6</td><td>0.55</td><td>0.75</td><td>0.25</td><td>0.45</td><td>E2</td><td>—</td></tr>
 <tr><td>T7</td><td>0.65</td><td>0.45</td><td>0.35</td><td>0.55</td><td>E1</td><td>—</td></tr>
-<tr class="highlight-row"><td>T8</td><td>−0.05</td><td>0.75</td><td>0.75</td><td>0.85</td><td>E4</td><td>E2→E4</td></tr>
+<tr class="highlight-row"><td>T8</td><td>$-0.05$</td><td>0.75</td><td>0.75</td><td>0.85</td><td>E4</td><td>E2→E4</td></tr>
 </tbody>
 </table>
 </div>
@@ -930,10 +1003,10 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 <div class="code-block">
 <pre><code class="language-python">"""
 QB 手算例子验证：m=8, n=4, k=1（纯 Python，无第三方库）
-教学示例：分数为人为构造，QB 计算过程与真实机制一致。
+构造示例：分数为人为构造，QB 计算过程与真实机制一致。
 """
 
-# 教学示例分数矩阵 (8 tokens, 4 experts)
+# 构造示例分数矩阵 (8 tokens, 4 experts)
 scores = [
     [0.7, 0.3, 0.8, 0.5],  # T1
     [0.7, 0.5, 0.4, 0.2],  # T2
@@ -1053,22 +1126,40 @@ print(f"  改变的 token: {', '.join(changed)}")</code></pre>
 <p><b>教学简化</b>：代码使用纯 Python 列表，逐 token 排序，便于观察每一步；真实工程使用张量操作和直方图估计（见下一章），不逐 token 排序也不收集全部 margins。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>如果 T1 的 E3 分数从 0.8 改成 0.75，cutoff $\alpha_1$ 变不变。E3 的 margin 变不变。b̃₃ 变不变。</li>
-  <li>E1 的 3rd largest margin 是 $+0.2$，b̃₁ = $-0.2$。如果 b̃₁ 不取负而是取 $+0.2$，新路由会发生什么。</li>
-  <li>T5 的 biased score 中 E1 和 E3 都是 0.65，为什么 T5 选 E4 而不是 E1 或 E3。</li>
-</ul>
-
 <p>本章用公式和手算例子说明了 QB 的四步机制——从 Top-(k+1) 取 cutoff 到 mean-centering。但 QB 为什么比 sign 更新好、为什么不需要超参数——下一章从对偶理论的视角回答。</p>
+
+<h3 id="ch3-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>如果 T1 的 E3 分数从 $0.8$ 改成 $0.75$，cutoff $\alpha_1$ 变不变？E3 的 margin 变不变？$\tilde{b}_3$ 变不变？</p>
+    <details>
+    <summary>解答：cutoff 不变，margin 变，$\tilde{b}_3$ 不变</summary>
+    <p>T1 的分数变为 $(0.7, 0.3, 0.75, 0.5)$，Top-1 仍是 E3、Top-2 仍是 E1，cutoff $\alpha_1 = 0.7$ 不变。E3 在 T1 的 margin 从 $+0.1$ 变为 $+0.05$。但 E3 的 8 个 margin 降序排列为 $+0.05$, $0.0$, $0.0$, $0.0$, $-0.1$, $-0.2$, $-0.5$, $-0.5$，第 3 大仍是 $0.0$，与改动前相同，因此 $\tilde{b}_3 = 0$ 不变——分位数只依赖排序位置，单个 margin 的变化未跨过第 3 大的边界。</p>
+    </details>
+  </li>
+  <li>
+    <p>E1 的第 3 大 margin 是 $+0.2$，$\tilde{b}_1 = -0.2$。如果 $\tilde{b}_1$ 不取负而是取 $+0.2$，新路由会发生什么？</p>
+    <details>
+    <summary>解答：方向反了，负载更不均衡</summary>
+    <p>bias 方向反转：过热的 E1 被进一步抬高、冷门的 E4 被压低，E1 会吸走更多 token，E4 仍然得不到负载，不均衡加剧。取负的原因是 margin 越大说明该专家越热门，bias 应与 margin 分位数的符号相反。</p>
+    </details>
+  </li>
+  <li>
+    <p>T5 的 biased score 中 E1 和 E3 都是 $0.65$，为什么 T5 选 E4？</p>
+    <details>
+    <summary>解答：E4 的 biased score 更高</summary>
+    <p>E4 的 biased score 是 $0.6 + 0.15 = 0.75$，高于 E1 与 E3 的 $0.65$，Top-1 是 E4。E1 与 E3 并列只影响它们之间的次序，不影响最大值的选择。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- 对偶理论 -->
 
-<h2 id="dual-theory">QB 为什么好——从平衡分配到对偶的视角</h2>
+<h2 id="dual-theory">4. QB 为什么好——从平衡分配到对偶的视角</h2>
 
 <p>手算例子验证了 QB 的机制，但它为什么比 sign 更新好？为什么不需要 $\gamma$ 这类超参数？答案来自将负载均衡看作一个最优化问题。</p>
 
-<h3 id="balanced-assignment">平衡分配问题</h3>
+<h3 id="balanced-assignment">4.1 平衡分配问题</h3>
 
 <p>给定 $m$ 个 token 对 $n$ 个专家的分数 $s \in \mathbb{R}^{m \times n}$，每个 token 选 $k$ 个专家，每个专家服务 $mk/n$ 个 token。最大分数均衡分配是：</p>
 
@@ -1076,7 +1167,7 @@ $$\max_{x_{i,j} \in \{0,1\}} \sum_{i,j} x_{i,j} s_{i,j} \qquad \text{s.t.} \quad
 
 <p>这是整数规划，但线性松弛（$x_{i,j} \in [0,1]$）后由二部图 b-matching 多面体的整性保证最优解为整数，所以松弛是精确的。</p>
 
-<h3 id="dual-objective">对偶目标与交替求解</h3>
+<h3 id="dual-objective">4.2 对偶目标与交替求解</h3>
 
 <p>引入对偶乘子 $\alpha_i$（token 侧）和 $\beta_j$（专家侧），对偶目标为：<sup>[F4]</sup></p>
 
@@ -1095,7 +1186,7 @@ $$\min_{\alpha, \beta} L(\alpha, \beta) := \sum_{i,j} \max\left(0, s_{i,j} - \al
 <p>因为 $b_j = -\beta_j$（bias 是阈值的负数），所以 $b_j = -\text{quantile}_{1-k/n}(margins_{:,j})$，正是 Eq.14。</p>
 </details>
 
-<h3 id="sign-vs-qb">sign 更新是 SignSGD，QB 是 coordinate minimizer</h3>
+<h3 id="sign-vs-qb">4.3 sign 更新是 SignSGD，QB 是 coordinate minimizer</h3>
 
 <p>对偶目标对 $\beta_j$ 的（次）梯度恰好是：</p>
 
@@ -1118,23 +1209,35 @@ $$\frac{\partial L}{\partial \beta_j} = \frac{mk}{n} - \sum_{i=1}^{m} \mathbb{1}
 
 <p>这就是 QB 无需 $\gamma$ 的根本原因：它不是在走梯度步，而是在直接求精确解。代价是每步需要计算分位数（而非简单的 sign），但直方图估计（下一章）使这个代价可控。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>$\partial L / \partial \beta_j$ 在负载恰好均衡时等于 $0$，说明什么。sign 更新在均衡时 $\text{sign}(0) = 0$ 也不更新，两者在均衡点行为一致——区别在非均衡时怎么走。</li>
-  <li>SignSGD 只保留梯度方向不保留幅度，QB 保留了什么信息使得它能一步跳到精确解。</li>
-</ul>
-
 <p>本章从对偶理论说明了 QB 为什么比 sign 更新好——它直接求精确 coordinate minimizer 而非走梯度步。但训练时百万级 margin 无法全量收集——下一章讲直方图估计如何以固定成本恢复分位数。</p>
+
+<h3 id="ch4-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>$\partial L / \partial \beta_j$ 在负载恰好均衡时等于 $0$，说明什么？sign 更新在均衡点同样不更新——两者的区别在哪里？</p>
+    <details>
+    <summary>解答：均衡点是坐标最优点，区别在非均衡时的走法</summary>
+    <p>梯度为零说明负载恰好均衡时 $\beta_j$（即 bias）已处于对偶目标的坐标最优位置，无需更新；sign 更新在均衡点同样不更新（$\text{sign}(0) = 0$），两者在均衡点行为一致。区别在偏离均衡之后：sign 只按方向走固定 $\gamma$ 步，QB 通过分位数直接跳到使该坐标最优的值。</p>
+    </details>
+  </li>
+  <li>
+    <p>SignSGD 只保留梯度方向不保留幅度，QB 保留了什么信息使它能一步跳到精确解？</p>
+    <details>
+    <summary>解答：margin 的完整分布</summary>
+    <p>QB 通过分位数保留了 margin 分布的完整信息。分位数指出"阈值设在哪里恰好有 $q$ 个 margin 超过"，正是对偶目标作为分段线性函数的拐点位置，因此一步即达 coordinate minimizer，无需迭代走步。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- 直方图估计 -->
 
-<h2 id="histogram-estimation">训练时的直方图估计与推理冻结</h2>
+<h2 id="histogram-estimation">5. 训练时的直方图估计与推理冻结</h2>
 
 <p>QB 公式要求对每个专家的 $m$ 个 margin 取分位数。在 K3 训练中，$m$ 是百万级，分布在多张 GPU 和多个梯度累积步上。全量收集 $O(mn)$ 个 margin 来做精确分位数在训练循环内不可行。</p>
 
 <p>关键观察：QB 不需要 margin 本身，只需要每个专家的 margin <strong>分布</strong>。直方图以固定成本概括分布。</p>
 
-<h3 id="histogram-mechanism">直方图估计机制</h3>
+<h3 id="histogram-mechanism">5.1 直方图估计机制</h3>
 
 <p>对每个专家维护一个 $B$ 个 bin 的直方图。分箱范围为 $[b_{\min}-1, b_{\max}+1]$，其中 $b_{\min}$、$b_{\max}$ 是当前 bias 的极值。因为 router 分数 $s_{i,j} \in (0,1)$（sigmoid 输出），cutoff $\alpha_i$ 也是某个 biased score，落在 $(b_{\min}, 1+b_{\max})$ 内，所以所有 $r_{i,j} = \alpha_i - s_{i,j} = -\text{margin}_{i,j}$（与上文 margin 符号相反；来源称 $r$ 为 required bias）落在 $[b_{\min}-1, b_{\max}+1]$ 内。<sup>[C14, F7]</sup> 范围每步重算，bin width $w = (b_{\max} - b_{\min} + 2)/B$ 随 bias 扩散而自适应。</p>
 
@@ -1176,11 +1279,11 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 
 <p>其中 $\beta_j$ 是选中 bin 的索引，$c_j$ 是其前累计 count，$h_j$ 是 bin 内 count。</p>
 
-<h3 id="histogram-error">误差与成本</h3>
+<h3 id="histogram-error">5.2 误差与成本</h3>
 
 <p>分位数误差不超过 bin width $w$。$B = 1000$ 时误差最多几个 $10^{-3}$，观测不到残余负载不均衡。<sup>[N2]</sup> 通信成本是 $nB$ 个整数 per layer per step，在 K3 配置下低于 raw margins 交换成本的 1%。<sup>[N3]</sup></p>
 
-<h3 id="inference-freeze">推理冻结</h3>
+<h3 id="inference-freeze">5.3 推理冻结</h3>
 
 <p>训练结束后 bias 冻结。推理时路由是固定的 Top-k 选择加冻结 bias，不需要任何分位数计算、直方图或 all-reduce。这保证了训练-推理一致性：训练时学到的 bias 直接用于推理。</p>
 
@@ -1198,20 +1301,38 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 
 <p>作为进一步优化，维护估计分位数的 EMA（指数移动平均）可以减少批次间采样噪声，进一步改善负载均衡。<sup>[C16]</sup></p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>如果 $B = 10$ 而非 1000，分位数误差上限变大还是变小。为什么。</li>
-  <li>为什么 all-reduce 的是 counts 而不是 margins 本身。如果 all-reduce margins 本身会有什么问题。</li>
-  <li>推理时为什么不需要直方图。bias 冻结后路由变成什么操作。</li>
-</ul>
+<p>本章说明了训练时的直方图估计与推理冻结——通信量与 token 数无关，推理时零额外开销。本文的论断、公式与数字的来源出处及简化条件的边界，见下文「来源与范围说明」。</p>
 
-<p>本章说明了训练时的直方图估计与推理冻结——通信量与 token 数无关，推理时零额外开销。但本文的论断都有来源出处——下一章给出核心论断与公式的来源映射及教学简化的边界。</p>
+<h3 id="ch5-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>如果 $B = 10$ 而非 1000，分位数误差上限变大还是变小？为什么？</p>
+    <details>
+    <summary>解答：变大</summary>
+    <p>误差上限是 bin width $w = (b_{\max} - b_{\min} + 2)/B$。分箱范围不变时，$B$ 从 1000 缩小到 10 会使 $w$ 放大 100 倍，bin 内线性插值的粒度相应变粗，分位数误差上限变大。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 all-reduce 的是 counts 而不是 margins 本身？如果 all-reduce margins 本身会有什么问题？</p>
+    <details>
+    <summary>解答：counts 可加且通信量固定</summary>
+    <p>counts 是可加的整数，每层每步只需汇总 $nB$ 个值即可精确代表 pooled batch 的 margin 分布，通信量与 token 数 $m$ 无关。若直接 all-reduce margins，需要传输 $O(mn)$ 个浮点数，在百万级 token 的训练中通信不可行，也违背"以固定成本概括分布"的设计目标。</p>
+    </details>
+  </li>
+  <li>
+    <p>推理时为什么不需要直方图？bias 冻结后路由变成什么操作？</p>
+    <details>
+    <summary>解答：路由退化为纯 Top-k 选择</summary>
+    <p>分位数与直方图只服务于训练时的 bias 更新；训练结束后 bias 是固定常数，不再需要任何估计。推理路由退化为一次 Top-k 选择（$s + b_{\text{final}}$），无直方图、无 all-reduce、零额外开销。</p>
+    </details>
+  </li>
+</ol>
 
-<!-- 来源与教学说明 -->
+<!-- 来源与范围说明 -->
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-scope">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <p>
 - C1–C13：Kimi K3 Technical Report §2.3.3 (Eq.13–14) 及 Appendix C (Derivation of Quantile Balancing, Eq.20–27, Algorithm 1)。<br>
 - C14–C16：K3 报告 §2.3.3 histogram 段及 Appendix D (Histogram-Based Quantile Estimation)。<br>
@@ -1219,7 +1340,7 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 - C17（K3 config）：HuggingFace <code>moonshotai/Kimi-K3/config.json</code>，<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>moe_router_activation_func: "sigmoid"</code>, <code>topk_method: "noaux_tc"</code>。
 </p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p>
 - F1 (Eq.13 路由)：K3 报告 §2.3.3 Eq.13。<br>
 - F2 (DeepSeek-V3 sign 更新)：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report §3.3。<br>
@@ -1230,28 +1351,28 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 - F7 (直方图恢复)：K3 报告 Appendix D。
 </p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>
 - N1（896 专家、top-16）：config.json <code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>。条件：K3 LatentMoE 层。K2 的 384 专家来自 K3 报告 Table 1（K2→K3 对比）。<br>
-- N2（B=1000 误差几个 10⁻³）：K3 报告 Appendix D Properties。条件：sigmoid router scores ∈ (0,1)。<br>
-- N3（通信 <1%）：K3 报告 Appendix D。条件：K3 配置。
+- N2（$B=1000$ 误差几个 $10^{-3}$）：K3 报告 Appendix D Properties。条件：sigmoid router scores $\in (0,1)$。<br>
+- N3（通信 &lt;1%）：K3 报告 Appendix D。条件：K3 配置。
 </p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <p>
-- 8×4 分数矩阵（1 位小数）为人为构造，构造目的是使初始负载恰好为 (4,3,1,0) 且 QB 一步收敛到 (2,2,2,2)，便于手算验证。分数不代表真实模型输出。<br>
-- sign 更新的 γ=0.001、负载 100→50 的数字为教学示例，说明 sign 丢失幅度信息。<br>
+- $8 \times 4$ 分数矩阵（1 位小数）为人为构造，构造目的是使初始负载恰好为 (4,3,1,0) 且 QB 一步收敛到 (2,2,2,2)，便于手算验证。分数不代表真实模型输出。<br>
+- sign 更新的 $\gamma=0.001$、负载从 100 降到 50 的数字为构造数据，说明 sign 丢失幅度信息。<br>
 - 代码使用纯 Python 列表，逐 token 排序，便于观察每一步。
 </p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>
 - "要进 Top-k 必须超过的分数线"是对 cutoff $\alpha_i$ 的教学解释，只帮助理解其直觉含义。正式定义是 Top-(k+1) 路由中第 (k+1) 个 biased score 的值。<br>
 - margin 的直觉"专家对 token 的吸引力减去门槛"只帮助理解正负号含义。正式定义是 $s_{i,j} - \alpha_i$。<br>
 - "过热专家压低 bias、冷门专家抬高 bias"是方向直觉，正式依据是分位数公式。
 </p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>
 - 手算例子使用 $m=8, n=4, k=1$。可推出：QB 四步流程的计算逻辑。不可推出：真实规模（$m \approx 10^6, n=896, k=16$）下的性能与直方图估计的必要性。<br>
 - 代码逐 token 排序取分位数。可推出：分位数与 bias 的对应关系。不可推出：真实工程的张量操作与 all-reduce 通信模式。<br>
@@ -1260,7 +1381,7 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 - 直方图分位数恢复的 EMA 平滑作为扩展提及。可推出：EMA 可减少批次间采样噪声。不可推出：EMA 的具体公式与实现细节。
 </p>
 
-<p>本文从 auxiliary-loss-free 路由出发，说明了 QB 如何从一次前向传播的路由分数分位数直接推导出每个专家的 bias——替代 DeepSeek-V3 的固定步长 sign 更新，在 896 专家时仍能几步内收敛。核心是四步流程（Top-(k+1) 取 cutoff、计算 margins、取分位数、mean-centering），本质是对偶目标的精确 coordinate minimizer。训练时用直方图估计以固定通信成本恢复分位数，推理时 bias 冻结、零额外开销。读完本文，你应该能回答开篇的五个问题：QB 解决什么问题、如何推导 bias、怎么手算、与 sign 的本质区别、训练推理如何处理分位数。</p>
+<p>本文从 auxiliary-loss-free 路由出发，说明了 QB 如何从一次前向传播的路由分数分位数直接推导出每个专家的 bias——替代 DeepSeek-V3 的固定步长 sign 更新，在 896 专家时仍能几步内收敛。核心是四步流程（Top-(k+1) 取 cutoff、计算 margins、取分位数、mean-centering），本质是对偶目标的精确 coordinate minimizer。训练时用直方图估计以固定通信成本恢复分位数，推理时 bias 冻结、零额外开销。开篇「核心问题」列出的五个问题已在前述各章完整作答。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

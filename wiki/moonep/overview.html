@@ -44,7 +44,7 @@
       <p class="meta">更新于 2026-08-09 · 依据 K3 技术报告 §5.2.1 与 §E</p>
     </header>
 
-    <h2>为什么需要它</h2>
+    <h2>1. 为什么需要它</h2>
     <ul>
       <li><strong>传统 EP 负载随 router 偏好动态变化</strong>：每个 EP rank 收到多少 token 完全由 router 决定，而 router 偏好随每个 micro-batch、每一层都在变，导致有的 rank 过载、有的空转，训练吞吐被拖累。</li>
       <li><strong>激活形状动态变化导致显存碎片</strong>：routed-expert 每层收到的 token 数都不一样，张量形状无法静态确定，显存碎片严重。</li>
@@ -52,16 +52,16 @@
       <li><strong>最坏不均衡下 buffer 量级大</strong>：DeepEP 等传统方案在最坏不均衡下要支持零拷贝数据路径需要 S×K×R 的通信 buffer，任何 rank 都可能收到接近全网总量的 token。</li>
     </ul>
 
-    <h2>核心直觉</h2>
+    <h2>2. 核心直觉</h2>
     <ul>
       <li><strong>冗余专家 = 临时副本，不是常驻副本</strong>：把某个 home rank 上的专家临时复制到另一个 rank 上，让那个 rank 在本地处理原本要发出去的 token；forward 预取、backward 梯度暂存本地 reduce buffer 后 reduce 回 home rank，用完即弃。</li>
       <li><strong>完美均衡 = 每 rank 恰好收到 S×K token</strong>：总量守恒保证这总是可能——R 个 rank 各收 S×K，总和 S×K×R 恰好等于全网发出的 token-expert pair 总数。MoonEP 用冗余专家做载体把过载 rank 的 token 迁到空转 rank。</li>
-      <li><strong>E/R 是有证明的上界，不是经验值</strong>：构造性证明显示存在规划让每 rank 的远端 token 全来自同一 home rank，而一个 home rank 至多 E/R 个本地专家，故每 rank 至多 E/R 个冗余专家即保证可行解。该界基本紧——存在最坏构造需要 ⌈E(R−1)/R²⌉ ≈ E/R 个冗余专家。</li>
+      <li><strong>E/R 是有证明的上界，不是经验值</strong>：构造性证明显示存在规划让每 rank 的远端 token 全来自同一 home rank，而一个 home rank 至多 E/R 个本地专家，故每 rank 至多 E/R 个冗余专家即保证可行解。该界基本紧——存在最坏构造需要 $\lceil E(R-1)/R^2\rceil\approx E/R$ 个冗余专家。</li>
       <li><strong>完美均衡一次性解决三个问题</strong>：每 rank 恒收 S×K → 通信 buffer 固定 S×K（DeepEP 最坏要 S×K×R）→ 所有层计算形状静态已知 → 消除每层 host 同步。三个工程收益同源。</li>
       <li><strong>零拷贝 dispatch</strong>：planning kernel 预计算每个 token 的目的地，token 直接发到远端 expert-grouped 位置，返回 buffer view 免中间拷贝。</li>
     </ul>
 
-    <h2>关键结论与边界</h2>
+    <h2>3. 关键结论与边界</h2>
     <ul>
       <li><strong>MoonEP 不解决 per-expert 偏斜</strong>：完美均衡只保证 rank 间总量相等，rank 内部 per-expert token 数仍可能偏斜；由独立的 Expert-GEMM workload-aware scheduler 处理，shared expert 分到独立 stream 重叠。</li>
       <li><strong>MoonEP 不是 router 训练手段</strong>：router 的负载均衡训练由路由机制本身负责（K3 采用 auxiliary-loss-free routing 与 Quantile Balancing），MoonEP 只在 router 输出给定后做规划，不修改 router。把"router 均衡"和"EP 后 rank 均衡"混为一谈是常见误解。</li>

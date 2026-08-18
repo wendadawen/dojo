@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="用 sigmoid 门控调制线性分支：GLU(x)=(xW+b)⊗σ(xV+c)。门控激活函数家族基础，后续 SwiGLU、GeGLU、SiTU-GLU 都基于它。基于 Dauphin 2017 + Shazeer 2020 论文核对。">
+  <meta name="description" content="用 sigmoid 门逐元素缩放线性投影的门控单元：算两份线性投影，一份过 sigmoid 当门，再逐元素相乘。门控激活函数家族基础，后续 SwiGLU、GeGLU、SiTU-GLU 都基于它。基于 Dauphin 2017 + Shazeer 2020 论文核对。">
   <meta name="dojo:summary" content="用 sigmoid 门控调制线性分支：$\operatorname{GLU}(x)=(xW+b)\otimes\sigma(xV+c)$。它是门控激活函数家族的基础，SwiGLU、GeGLU 与 SiTU-GLU 都由此扩展。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="激活函数">
@@ -595,6 +595,22 @@
       .context-label { margin-top: 0.4rem; }
     }
 
+    /* ============ 结构图（SVG）与问题列表 ============ */
+    .dg-svg { display: block; margin: 1.5rem auto; max-width: 100%; height: auto; }
+    .dg-box { fill: var(--bg-code); stroke: var(--border); stroke-width: 1; }
+    .dg-circle { fill: var(--bg-code); stroke: var(--border); stroke-width: 1; }
+    .dg-arrow { stroke: var(--text-light); stroke-width: 1.2; fill: none; }
+    .dg-arrowhead { fill: var(--text-light); }
+    .dg-caption { font-family: var(--font-ui); font-size: 12px; fill: var(--text-muted); }
+    .dg-label {
+      font-family: var(--font-ui); font-size: 13px; color: var(--text);
+      display: flex; align-items: center; justify-content: center; height: 100%;
+    }
+    .chapter-questions { margin: 0 0 0.5rem; }
+    .chapter-questions li { margin-bottom: 1.2rem; }
+    .chapter-questions li > details { margin: 0.6rem 0 0; }
+    .learning-goals ol { margin-bottom: 0; }
+
     /* ============ 移动端 ============ */
     @media (max-width: 768px) {
       :root {
@@ -664,14 +680,44 @@
 <p>把一个向量送进神经网络的一层时，能不能让"每个维度自己决定放多少出去"——而不是用一个固定的激活函数对每个维度套同一条规则？GLU（Gated Linear Unit，门控线性单元）就是回答这个问题的一类单元：它算两份线性投影，一份过 sigmoid 压到 $(0,1)$ 当"门"，再与另一份逐元素相乘，让门控制每个维度放多少信息过去。本文说明 GLU 的定义、梯度通路、家族派生与经验边界。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>用一句话说清 GLU 在做什么，并说明它解决什么问题。</li>
-    <li>从公式解释为什么 GLU 既有非线性又给梯度留了线性通路（与 GTU 对比）。</li>
-    <li>给定小输入与权重，手算 GLU 的输出，并把数字翻译成"哪个维度被门放行/压低"。</li>
-    <li>说明 GLU 家族怎么派生（Bilinear、SwiGLU/GeGLU/ReGLU），并指出 Dauphin 与 Shazeer 的记号差异。</li>
-    <li>说明在 Transformer FFN 用 GLU 时为什么要缩 $2/3$ 维度，以及 GLU 不保证什么。</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>用一句话说清 GLU 在做什么，并说明它解决什么问题。</p>
+      <details>
+        <summary>解答：算两份线性投影，一份过 sigmoid 当门，与另一份逐元素相乘，实现按维度调节且不杀梯度</summary>
+        <p>GLU 用 sigmoid 门逐元素缩放线性投影：$h=(xW+b)\otimes\sigma(xV+c)$。它同时回应"线性+固定激活"的两个缺口——不能按输入内容逐维度调节放行量，以及用 sigmoid/tanh 当门会顺带压掉梯度。完整动机见「1. 为什么需要"门"」。</p>
+      </details>
+    </li>
+    <li>
+      <p>从公式解释为什么 GLU 既有非线性又给梯度留了线性通路（与 GTU 对比）。</p>
+      <details>
+        <summary>解答：非线性来自乘性门控；梯度第一项被门值而非门导数缩放，开门时近似直通</summary>
+        <p>GLU 梯度的第一项 $\nabla\mathbf{X}\otimes\sigma(\mathbf{X})$ 的缩放因子是门值本身，开门单元上近似为 $\nabla\mathbf{X}$，即"乘性跳连"；非线性来自值与门的乘性交互，而非把 sigmoid 套在输出上。GTU 的对应项带 $\tanh'$，随输入增大趋零。完整推导见「3. 为什么 GLU 给梯度留了一条线性通路」。</p>
+      </details>
+    </li>
+    <li>
+      <p>给定小输入与权重，手算 GLU 的输出，并把数字翻译成"哪个维度被门放行/压低"。</p>
+      <details>
+        <summary>解答：$h\approx[0.73, 0.19]$——第一维放行约 73%，第二维仅约 38%</summary>
+        <p>以 $x=[1.0,0.5]$、$W=I$、$V=\mathrm{diag}(1,-1)$、$b=c=0$ 为例：门 $\sigma(xV)\approx[0.73,0.38]$，输出 $h\approx[0.73,0.19]$。两维都有值，门给出不同放行比例，即"按维度调节"。手算全过程见「2. GLU 的公式与手算」。</p>
+      </details>
+    </li>
+    <li>
+      <p>说明 GLU 家族怎么派生（Bilinear、SwiGLU/GeGLU/ReGLU），并指出 Dauphin 与 Shazeer 的记号差异。</p>
+      <details>
+        <summary>解答：去激活得 Bilinear，换激活得 ReGLU/GEGLU/SwiGLU；两篇记法只是 $W\leftrightarrow V$ 互换</summary>
+        <p>把门分支的激活去掉得 Bilinear；换成 ReLU/GELU/Swish 得 ReGLU/GEGLU/SwiGLU（Shazeer 2020）。Dauphin 把 $\sigma$ 放在 $V$ 分支、Shazeer 放在 $W$ 分支，因 $\otimes$ 可交换而数学等价。见「4. GLU 家族」。</p>
+      </details>
+    </li>
+    <li>
+      <p>说明在 Transformer FFN 用 GLU 时为什么要缩 $2/3$ 维度，以及 GLU 不保证什么。</p>
+      <details>
+        <summary>解答：三矩阵比双矩阵多一份权重，缩 $d_{ff}$ 至 $2/3$ 保参数量相等；GLU 不保证普适更优</summary>
+        <p>GLU FFN 用三个权重矩阵，令 $3\cdot d\cdot d_{ff}'=2\cdot d\cdot d_{ff}$ 得 $d_{ff}'=\tfrac{2}{3}d_{ff}$。"变体更优"只是 T5 上的经验结论（原文明确无理论解释），GLU 也不替代归一化、不做跨位置聚合、门全关时输出为零。见「4. GLU 家族」与「5. 经验结论与边界」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
@@ -684,7 +730,7 @@
   </ul>
 </section>
 
-<h2 id="why-gate">为什么需要"门"——一层线性+激活缺了什么</h2>
+<h2 id="why-gate">1. 为什么需要"门"——一层线性+激活缺了什么</h2>
 
 <p>一个最常见的神经网络层长这样：先做线性变换 $xW+b$，再套一个固定的激活函数，例如 $\mathrm{ReLU}(xW+b)$ 或 $\tanh(xW+b)$。这里 $x$ 是输入向量，$W$ 是权重矩阵，$b$ 是偏置，$W$ 与 $b$ 在训练中学习；激活函数 $\mathrm{ReLU}(z)=\max(0,z)$、$\tanh(z)$ 之类是预先选定的、对所有维度套同一条规则的非线性。</p>
 
@@ -694,29 +740,76 @@
 
 <p>第二，缺一种<b>不杀梯度的非线性</b>。如果用 sigmoid 或 $\tanh$ 当门来获得"按维度调节"，会顺带把梯度也压下去：sigmoid 的导数 $\sigma'(z)=\sigma(z)(1-\sigma(z))$ 在输入绝对值大时趋于 0，$\tanh$ 的导数 $\tanh'(z)=1-\tanh^2(z)$ 同样如此。深层网络里这种"门控激活的导数"逐层相乘，梯度就消失了。这一现象在门控卷积里叫 GTU（Gated Tanh Unit，$\tanh(\mathbf{X})\otimes\sigma(\mathbf{X})$），梯度一章会展开它的梯度结构。<sup>[C4, F3]</sup></p>
 
-<p>门控的想法正是同时回应这两个缺口：<b>再算一份线性投影、过 sigmoid 压到 $(0,1)$ 当"门"，逐元素乘到"值"上</b>。sigmoid $\sigma(z)=1/(1+e^{-z})$ 把任意实数压到 $(0,1)$（基础记号，下同）；$\otimes$ 是逐元素乘积，两个同形向量逐位相乘。开门（门 $\approx 1$）≈ 放行原值，关门（门 $\approx 0$）≈ 屏蔽。这一步把"按维度调节"和"是否杀梯度"分了开来——后面会看到，GLU 的梯度里有一条不被导数压没的通路。</p>
+<p>门控的想法正是同时回应这两个缺口：<b>再算一份线性投影、过 sigmoid 压到 $(0,1)$ 当"门"，逐元素乘到"值"上</b>。sigmoid $\sigma(z)=1/(1+e^{-z})$ 把任意实数压到 $(0,1)$（基础记号，下同）；$\otimes$ 是逐元素乘积，两个同形向量逐位相乘。开门（门 $\approx 1$）即放行原值，关门（门 $\approx 0$）即屏蔽。这一步把"按维度调节"和"是否杀梯度"分了开来——后面会看到，GLU 的梯度里有一条不被导数压没的通路。</p>
 
-<pre class="diagram">常规层：     x ──► xW+b ──► act(·) ──► y          （激活固定，对所有维度同一规则）
-
-GLU：        x ──┬──► xW+b ──────────┐
-                 │                    ├─⊗─► y     （门 σ(xV+c) 逐维度缩放值）
-                 └──► xV+c ─► σ(·) ──┘
-                     值分支      门分支
-</pre>
+<svg class="dg-svg" viewBox="0 0 560 310" role="img" aria-label="常规层与 GLU 的结构对比图">
+  <defs>
+    <marker id="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="dg-arrowhead"/>
+    </marker>
+  </defs>
+  <!-- 常规层：单分支 -->
+  <text x="20" y="28" class="dg-caption">常规层</text>
+  <rect class="dg-box" x="20" y="42" width="44" height="36" rx="6"/>
+  <foreignObject x="20" y="42" width="44" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$x$</div></foreignObject>
+  <line class="dg-arrow" x1="64" y1="60" x2="94" y2="60" marker-end="url(#dg-arrow)"/>
+  <rect class="dg-box" x="100" y="42" width="80" height="36" rx="6"/>
+  <foreignObject x="100" y="42" width="80" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$xW+b$</div></foreignObject>
+  <line class="dg-arrow" x1="180" y1="60" x2="210" y2="60" marker-end="url(#dg-arrow)"/>
+  <rect class="dg-box" x="216" y="42" width="96" height="36" rx="6"/>
+  <foreignObject x="216" y="42" width="96" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$\mathrm{act}(\cdot)$</div></foreignObject>
+  <line class="dg-arrow" x1="312" y1="60" x2="342" y2="60" marker-end="url(#dg-arrow)"/>
+  <rect class="dg-box" x="348" y="42" width="44" height="36" rx="6"/>
+  <foreignObject x="348" y="42" width="44" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$y$</div></foreignObject>
+  <!-- GLU：值分支与门分支 -->
+  <text x="20" y="140" class="dg-caption">GLU</text>
+  <rect class="dg-box" x="20" y="200" width="44" height="36" rx="6"/>
+  <foreignObject x="20" y="200" width="44" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$x$</div></foreignObject>
+  <path class="dg-arrow" d="M64,218 H96 V160 H116" marker-end="url(#dg-arrow)"/>
+  <path class="dg-arrow" d="M64,218 H96 V276 H116" marker-end="url(#dg-arrow)"/>
+  <text x="126" y="136" class="dg-caption">值分支</text>
+  <rect class="dg-box" x="122" y="142" width="80" height="36" rx="6"/>
+  <foreignObject x="122" y="142" width="80" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$xW+b$</div></foreignObject>
+  <path class="dg-arrow" d="M202,160 H340 V196" marker-end="url(#dg-arrow)"/>
+  <text x="126" y="254" class="dg-caption">门分支</text>
+  <rect class="dg-box" x="122" y="258" width="80" height="36" rx="6"/>
+  <foreignObject x="122" y="258" width="80" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$xV+c$</div></foreignObject>
+  <line class="dg-arrow" x1="202" y1="276" x2="220" y2="276" marker-end="url(#dg-arrow)"/>
+  <rect class="dg-box" x="226" y="258" width="80" height="36" rx="6"/>
+  <foreignObject x="226" y="258" width="80" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$\sigma(\cdot)$</div></foreignObject>
+  <path class="dg-arrow" d="M306,276 H340 V240" marker-end="url(#dg-arrow)"/>
+  <circle class="dg-circle" cx="340" cy="218" r="18"/>
+  <foreignObject x="322" y="200" width="36" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$\otimes$</div></foreignObject>
+  <line class="dg-arrow" x1="358" y1="218" x2="498" y2="218" marker-end="url(#dg-arrow)"/>
+  <rect class="dg-box" x="504" y="200" width="44" height="36" rx="6"/>
+  <foreignObject x="504" y="200" width="44" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$y$</div></foreignObject>
+</svg>
 
 <p>图只展示结构：上面是常规"线性+激活"单分支；下面是 GLU 的两分支——值分支 $xW+b$ 与门分支 $\sigma(xV+c)$，在 $\otimes$ 处逐元素相乘。每个分支的具体公式由正文给出。</p>
 
 <p>一句话定位：<b>GLU 是一种用 sigmoid 门逐元素缩放线性投影的神经网络单元</b>。它在 2017 年由 Dauphin 等人为门控卷积语言模型提出，后被 Shazeer 2020 推广为整个"GLU 变体"家族，成为现代 Transformer 前馈层的事实标准结构。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>常规层与 GLU 层在"激活来自哪里"上的差别是什么。</li>
-  <li>为什么门用 sigmoid（压到 $(0,1)$）而不是直接用原始线性值当门。</li>
-</ul>
+<h3 id="ch1-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>常规层与 GLU 层在"激活来自哪里"上的差别是什么。</p>
+    <details>
+      <summary>解答：常规层的激活预先选定、对所有维度套同一条规则；GLU 的门由输入内容算出、逐维度调节</summary>
+      <p>常规层只有一份线性投影 $xW+b$，其激活函数（$\mathrm{ReLU}$、$\tanh$ 等）是预先选定的，对所有维度套同一条固定规则。GLU 额外再算一份线性投影 $xV+c$ 并过 sigmoid 得到门，逐元素乘到值分支上——"放多少"由输入内容经学习到的 $V,c$ 决定，不同维度可以有不同的放行量。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么门用 sigmoid（压到 $(0,1)$）而不是直接用原始线性值当门。</p>
+    <details>
+      <summary>解答：门需要的是 0 到 1 之间的放行比例，原始线性值无界且可负，起不到这个作用</summary>
+      <p>门的语义是"该维度放行多少"：$0$ 表示完全屏蔽、$1$ 表示完全放行。原始线性值 $xV+c$ 无界且可正可负，直接乘上去会任意放大或翻转符号，无法当作放行比例使用；sigmoid 把任意实数压到 $(0,1)$，门的取值范围与语义固定，且其导数性质已知，便于分析梯度通路。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章说明了门控的动机与 GLU 的结构定位。但结构图只画了分支、没给精确公式——下一章给出 GLU 的正式定义并手算一个例子。</p>
 
-<h2 id="formula-and-example">GLU 的公式与手算——定义、边界与逐维度缩放</h2>
+<h2 id="formula-and-example">2. GLU 的公式与手算——定义、边界与逐维度缩放</h2>
 
 <p>GLU 的正式定义由 Dauphin et al. 2017（§2, Eq.(1)）给出<sup>[C1, F1]</sup>：</p>
 
@@ -744,7 +837,7 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <p>所以 GLU 的非线性<b>来自乘性门控</b>，不是把 sigmoid 当激活套在整条输出上——这是它和"线性 + sigmoid 激活"的关键区别。</p>
 
-<p>教学示例。 取 $x=[1.0,\,0.5]$（一行二列向量），用最简单的 $2\times2$ 权重让两维的门能拉开差距。取 $W=I$（单位阵）让值分支近似直通，便于把注意力集中到门的作用上：</p>
+<p>构造示例。 取 $x=[1.0,\,0.5]$（一行二列向量），用最简单的 $2\times2$ 权重让两维的门能拉开差距。取 $W=I$（单位阵）让值分支近似直通，便于把注意力集中到门的作用上：</p>
 
 <p>$$W=\begin{pmatrix}1&0\\0&1\end{pmatrix}=I,\quad V=\begin{pmatrix}1&0\\0&-1\end{pmatrix},\quad b=c=[0,0].$$</p>
 
@@ -768,19 +861,37 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <details>
 <summary>展开：门 → 1 与门 → 0 的退化（同一输入，换一套 $V$）</summary>
-<p>教学示例。 把 $V$ 换成 $\mathrm{diag}(10,-10)$，其余不变。门分支内部线性部分变为 $xV=[10,\,-5]$，$\sigma([10,-5])\approx[\sigma(10),\sigma(-5)]\approx[0.99995,\,0.00669]$，近似为 $[1,0]$。于是 $h\approx[1.0,\,0.5]\otimes[1,0]=[1.0,\,0]$：第一维门近似全开 ⇒ 值分支直通；第二维门近似全关 ⇒ 输出归零。这验证了"开门直通、关门屏蔽"——GLU 在两个极端分别退化为"线性"和"零"。</p>
+<p>构造示例。 把 $V$ 换成 $\mathrm{diag}(10,-10)$，其余不变。门分支内部线性部分变为 $xV=[10,\,-5]$，$\sigma([10,-5])\approx[\sigma(10),\sigma(-5)]\approx[0.99995,\,0.00669]$，近似为 $[1,0]$。于是 $h\approx[1.0,\,0.5]\otimes[1,0]=[1.0,\,0]$：第一维门近似全开，值分支直通；第二维门近似全关，输出归零。这验证了"开门直通、关门屏蔽"——GLU 在两个极端分别退化为"线性"和"零"。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定 $x,W,V,b,c$，写出 GLU 运算的三个步骤（值分支、门分支、相乘）。</li>
-  <li>门为全 $1$ 与全 $0$ 时，GLU 输出分别退化为什么。</li>
-  <li>GLU 的非线性来自哪里？为什么不能把它等价于"线性 + sigmoid 激活"。</li>
-</ul>
+<h3 id="ch2-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 $x,W,V,b,c$，写出 GLU 运算的三个步骤（值分支、门分支、相乘）。</p>
+    <details>
+      <summary>解答：值分支 $xW+b$、门分支 $\sigma(xV+c)$、两者逐元素相乘</summary>
+      <p>第一步算值分支 $xW+b$，不经过任何激活；第二步算门分支，先做线性投影 $xV+c$ 再过 sigmoid 压到 $(0,1)$；第三步把两个同形向量逐元素相乘（$\otimes$），得输出 $h=(xW+b)\otimes\sigma(xV+c)$。</p>
+    </details>
+  </li>
+  <li>
+    <p>门为全 $1$ 与全 $0$ 时，GLU 输出分别退化为什么。</p>
+    <details>
+      <summary>解答：全 $1$ 退化为值分支本身（线性直通），全 $0$ 退化为零输出（完全屏蔽）</summary>
+      <p>门全为 $1$ 时 $h=xW+b$，输出就是值分支，等价于一层纯线性变换；门全为 $0$ 时 $h=\mathbf{0}$，输出被完全屏蔽。门在 $(0,1)$ 之间时，输出是值分支逐维度乘一个放行系数，即逐维度缩放。</p>
+    </details>
+  </li>
+  <li>
+    <p>GLU 的非线性来自哪里？为什么不能把它等价于"线性 + sigmoid 激活"。</p>
+    <details>
+      <summary>解答：非线性来自乘性门控，即两个输入相关的量逐元素相乘</summary>
+      <p>GLU 的非线性来自值分支与门分支的乘性交互：门本身是输入的非线性函数（含 sigmoid），再逐元素乘到值上，整体不再是单一线性变换的逐元素单变量函数。"线性 + sigmoid 激活"只是对一份线性投影逐元素套 sigmoid，输出仍是逐维度的单变量非线性，没有乘性交互，二者机制不同。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章给出了 GLU 的公式并手算验证了"门控缩放"。但公式只说明前向、没说梯度——下一章看 GLU 为什么给梯度留了一条不被导数压没的线性通路。</p>
 
-<h2 id="gradient-path">为什么 GLU 给梯度留了一条线性通路——门值缩放而非导数缩放</h2>
+<h2 id="gradient-path">3. 为什么 GLU 给梯度留了一条线性通路——门值缩放而非导数缩放</h2>
 
 <p>会算了，但 GLU 被提出的核心理由不是为了算输出，而是为了不杀梯度。这一章看梯度里发生了什么。</p>
 
@@ -820,20 +931,38 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <p>边界：GLU 不是"永不消失"。若门 $\sigma(\mathbf{X})$ 饱和到 0，第一项也趋于 0——通路被门主动关掉。区别在于这是<b>门控选择</b>而非<b>输入幅值副作用</b>。Dauphin 原文的限定语是"对激活的门单元不额外缩放"（for the activated gating units）。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>GLU 梯度的两项中，哪一项不含 $\sigma'$？它的缩放因子是什么。</li>
-  <li>GTU 梯度的第一项含什么导数？它为什么会让深层梯度消失。</li>
-  <li>门 $\sigma(\mathbf{X})$ 饱和到 0 时，GLU 的梯度通路会发生什么？这是"副作用"还是"门控选择"。</li>
-</ul>
+<h3 id="ch3-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>GLU 梯度的两项中，哪一项不含 $\sigma'$？它的缩放因子是什么。</p>
+    <details>
+      <summary>解答：第一项 $\nabla\mathbf{X}\otimes\sigma(\mathbf{X})$，缩放因子是门值 $\sigma(\mathbf{X})$ 本身</summary>
+      <p>第一项 $\nabla\mathbf{X}\otimes\sigma(\mathbf{X})$ 不含 $\sigma'$。它用门值缩放上游梯度：门开的单元上 $\sigma(\mathbf{X})\approx1$，梯度近似直通，Dauphin 称之为"乘性跳连"。门值由模型学习并可控，与输入幅值无直接关系。</p>
+    </details>
+  </li>
+  <li>
+    <p>GTU 梯度的第一项含什么导数？它为什么会让深层梯度消失。</p>
+    <details>
+      <summary>解答：含 $\tanh'(\mathbf{X})=1-\tanh^2(\mathbf{X})$，随 $|\mathbf{X}|$ 增大趋零且不可由门控制</summary>
+      <p>GTU 梯度第一项为 $\tanh'(\mathbf{X})\nabla\mathbf{X}\otimes\sigma(\mathbf{X})$，值路径也被 $\tanh$ 的导数缩放。$\tanh'(\mathbf{X})$ 随 $|\mathbf{X}|$ 增大趋于 $0$，深层网络里逐层相乘导致梯度消失，且这一压低取决于输入幅值，门无法干预。GLU 的对应项没有 $\tanh'$ 因子。</p>
+    </details>
+  </li>
+  <li>
+    <p>门 $\sigma(\mathbf{X})$ 饱和到 0 时，GLU 的梯度通路会发生什么？这是"副作用"还是"门控选择"。</p>
+    <details>
+      <summary>解答：通路被门主动关断，属于门控选择而非输入幅值副作用</summary>
+      <p>门饱和到 $0$ 时第一项 $\nabla\mathbf{X}\otimes\sigma(\mathbf{X})$ 也趋于 $0$，梯度通路被切断。但这与 GTU 的消失不同：GTU 的压低由输入幅值决定、不可控，而 GLU 的关断是门控本身的选择——模型学习到"该维度此刻不需要传信息"，是有意的屏蔽。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章从梯度结构解释了 GLU 为什么不杀梯度。但 GLU 的 sigmoid 不是唯一选择——下一章把激活替换或去掉，得到整个 GLU 家族，并看它怎么塞进 Transformer 前馈层。</p>
 
-<h2 id="family">GLU 家族——换激活、去门控、塞进 FFN</h2>
+<h2 id="family">4. GLU 家族——换激活、去门控、塞进 FFN</h2>
 
 <p>GLU 的 sigmoid 不是唯一选择。Shazeer 2020（§2, Eq.(4)(5)）把"门分支的激活"替换成其它函数，得到一族变体；Dauphin 原文本身也定义了一个去掉门控激活的退化形式。</p>
 
-<h3 id="derivatives">派生规则</h3>
+<h3 id="derivatives">4.1 派生规则</h3>
 
 <p><b>去激活（退化为 Bilinear）</b>：把 GLU 的 $\sigma$ 去掉，让门分支也是纯线性，得 Bilinear 层（Dauphin §5.3，归因 Mnih &amp; Hinton 2007）<sup>[C5, F5]</sup>：</p>
 
@@ -849,7 +978,7 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <p>其中 $\mathrm{Swish}_\beta(z)=z\cdot\sigma(\beta z)$（也写作 SiLU，$\beta=1$ 时为 $z\cdot\sigma(z)$），$\mathrm{GELU}$、$\mathrm{ReLU}=\max(0,z)$ 是激活名，这里只作为门控激活出现，不展开各自机制——它们各自的完整讲解属于独立概念页。</p>
 
-<h3 id="notation-diff">记号差异：Dauphin vs Shazeer</h3>
+<h3 id="notation-diff">4.2 记号差异：Dauphin vs Shazeer</h3>
 
 <p>这里必须停一下，否则读 SwiGLU 会乱。两篇论文把 $\sigma$/激活放在<b>不同分支</b>上：</p>
 
@@ -865,7 +994,7 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <p>因 $\otimes$ 可交换，$(xW+b)\otimes\sigma(xV+c)=\sigma(xV+c)\otimes(xW+b)$，两者只是 $W\leftrightarrow V$ 标签互换、数学等价，不是矛盾<sup>[C9]</sup>。<b>但读 SwiGLU、GeGLU 这类 Shazeer 系变体时，要按 Shazeer 记法——激活在 $W$ 分支</b>。<a href="../situ-glu/index.html">SiTU-GLU</a>、<a href="../swiglu/index.html">SwiGLU</a> 的概念页会沿用 Shazeer 记法。本文前面用 Dauphin 记法（与原始提出一致），到这一节起读变体时切到 Shazeer 记法。</p>
 
-<h3 id="ffn">塞进 Transformer FFN：三矩阵与 $2/3$ 缩放</h3>
+<h3 id="ffn">4.3 塞进 Transformer FFN：三矩阵与 $2/3$ 缩放</h3>
 
 <p>标准 Transformer FFN（Shazeer §1，无偏置版本）只用两个权重矩阵：</p>
 
@@ -887,19 +1016,37 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <details>
 <summary>展开：参数量等式的逐步推导与一个小数字验证</summary>
-<p>设模型维度 $d=768$、基线 $d_{ff}=3072$。双矩阵 FFN 参数量 $=2\times768\times3072=4{,}718{,}592$。三矩阵 GLU FFN 若不缩维度则为 $3\times768\times3072=7{,}077{,}888$，比基线多 $50\%$。缩为 $d_{ff}'=2048$ 后参数量 $=3\times768\times2048=4{,}718{,}592$，与基线相等。教学示例，数字为验算用。</p>
+<p>设模型维度 $d=768$、基线 $d_{ff}=3072$。双矩阵 FFN 参数量 $=2\times768\times3072=4{,}718{,}592$。三矩阵 GLU FFN 若不缩维度则为 $3\times768\times3072=7{,}077{,}888$，比基线多 $50\%$。缩为 $d_{ff}'=2048$ 后参数量 $=3\times768\times2048=4{,}718{,}592$，与基线相等。构造示例，数字为验算用。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>把 GLU 变成 SwiGLU，改的是哪一处？变成 Bilinear 又改了哪一处。</li>
-  <li>Dauphin 记法与 Shazeer 记法的 $\sigma$ 分别在哪个分支？为什么数学等价。</li>
-  <li>三矩阵 GLU FFN 要保持参数量与双矩阵 FFN 相等，$d_{ff}$ 应改为多少？写出等式。</li>
-</ul>
+<h3 id="ch4-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>把 GLU 变成 SwiGLU，改的是哪一处？变成 Bilinear 又改了哪一处。</p>
+    <details>
+      <summary>解答：SwiGLU 把激活换成 Swish，Bilinear 把激活去掉</summary>
+      <p>SwiGLU（Shazeer 记法）把作用在 $xW+b$ 上的激活由 sigmoid 换成 $\mathrm{Swish}_\beta(z)=z\cdot\sigma(\beta z)$，结构仍是"一支过激活、一支线性、逐元素相乘"。Bilinear 则把激活完全去掉，两分支都是纯线性投影，乘性交互仍在但没有饱和门。</p>
+    </details>
+  </li>
+  <li>
+    <p>Dauphin 记法与 Shazeer 记法的 $\sigma$ 分别在哪个分支？为什么数学等价。</p>
+    <details>
+      <summary>解答：Dauphin 在 $V$ 分支、Shazeer 在 $W$ 分支；$\otimes$ 可交换故等价</summary>
+      <p>Dauphin 写作 $(xW+b)\otimes\sigma(xV+c)$，$\sigma$ 在 $V$ 分支；Shazeer 写作 $\sigma(xW+b)\otimes(xV+c)$，激活在 $W$ 分支。由于逐元素乘积 $\otimes$ 满足交换律，两个式子只是 $W\leftrightarrow V$ 标签互换，数学上等价，不是矛盾。读 SwiGLU、GeGLU 等 Shazeer 系变体时按 Shazeer 记法理解。</p>
+    </details>
+  </li>
+  <li>
+    <p>三矩阵 GLU FFN 要保持参数量与双矩阵 FFN 相等，$d_{ff}$ 应改为多少？写出等式。</p>
+    <details>
+      <summary>解答：缩为原来的 $2/3$，由 $3\cdot d\cdot d_{ff}'=2\cdot d\cdot d_{ff}$ 解出</summary>
+      <p>双矩阵 FFN 参数量为 $2\cdot d\cdot d_{ff}$，三矩阵 GLU FFN 为 $3\cdot d\cdot d_{ff}'$。令二者相等得 $d_{ff}'=\tfrac{2}{3}d_{ff}$。例如基线 $d_{ff}=3072$ 时缩为 $2048$；若基线取 $d_{ff}=4d$，则变体取 $\tfrac{8}{3}d$。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章把 GLU 扩展为家族并塞进 Transformer FFN。但"家族变体更优"是经验结论还是理论保证——下一章看 Shazeer 的实验数据与原文自己给出的边界。</p>
 
-<h2 id="evidence-and-boundary">经验结论与边界——GLU 不保证什么</h2>
+<h2 id="evidence-and-boundary">5. 经验结论与边界——GLU 不保证什么</h2>
 
 <p>Shazeer 2020 在 T5 base（segment-filling 任务，参数与计算量匹配）上对比了各变体<sup>[C8]</sup>。结果是经验性的：</p>
 
@@ -929,7 +1076,7 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
 
 <p>翻译：作者没有解释这些架构为什么有效，把成功归于"神恩"。这句不是谦虚的修辞，而是<b>明确标注"无理论解释"</b>——经验结论不等于普适保证。</p>
 
-<h3 id="boundaries">GLU 不解决什么</h3>
+<h3 id="boundaries">5.1 GLU 不解决什么</h3>
 
 <ul>
   <li><b>不保证在所有任务/模态上更好</b>：Shazeer 的结论限定在 T5 语言建模。视觉、强化学习、小数据场景未必一致。</li>
@@ -939,18 +1086,36 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
   <li><b>门全关时退化为零输出</b>：若所有门饱和到 0，GLU 输出近似零、梯度也近零——"门控决定何时通"的另一面是"门关了就不通"。</li>
 </ul>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 Shazeer 实验的一个限定条件，并指出它不能推广到什么场景。</li>
-  <li>GLU 不解决的一类问题是什么。（举一个非注意力、非归一化的例子也可。）</li>
-  <li>"divine benevolence"这句在论文里标注的是什么。</li>
-</ul>
+<h3 id="ch5-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出 Shazeer 实验的一个限定条件，并指出它不能推广到什么场景。</p>
+    <details>
+      <summary>解答：限定在 T5 base 语言建模、参数与计算量匹配；不能推广到其它任务与模态</summary>
+      <p>例如限定条件"T5 base 架构、segment-filling 任务、参数量与计算量与基线匹配"。该结论不能推广到视觉、强化学习、小数据等场景——原文只在 T5 语言建模上做了对比，且明确未给理论解释。</p>
+    </details>
+  </li>
+  <li>
+    <p>GLU 不解决的一类问题是什么。（举一个非注意力、非归一化的例子也可。）</p>
+    <details>
+      <summary>解答：例如训练优化问题——收敛到全局最优、避开鞍点与大学习率失稳</summary>
+      <p>GLU 改善的是可训练性（梯度通路），不解决优化层面的困难：不保证收敛到全局最优，也不处理局部极小、鞍点或大学习率失稳。此外它不做跨位置信息聚合（那是注意力的职责）、不替代归一化（LayerNorm/RMSNorm 的职责）。</p>
+    </details>
+  </li>
+  <li>
+    <p>"divine benevolence"这句在论文里标注的是什么。</p>
+    <details>
+      <summary>解答：标注"无理论解释"——经验结论不构成普适保证</summary>
+      <p>这句自谦的结语明确表示作者不解释这些架构为何有效，把成功归于"神恩"。它的作用是标注该结论的经验性质：GLU 变体更优是 T5 上的实验观察，不是理论保证。</p>
+    </details>
+  </li>
+</ol>
 
-<p>本章给出了经验结论与 GLU 的边界——下一章汇总来源与教学说明，便于追溯。</p>
+<p>本章给出了经验结论与 GLU 的边界——下一章汇总来源与范围说明，便于追溯。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-scope">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <ul>
   <li>C1（GLU 定义 $h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\mathbf{V}+\mathbf{c})$，$\sigma$ 为 sigmoid，$\otimes$ 逐元素乘积）：Dauphin et al. 2017, §2, Eq.(1)。arXiv:1612.08083。</li>
   <li>C2（GLU 提供梯度线性通路、保留非线性、缓解梯度消失）：Dauphin §2 原文。</li>
@@ -963,7 +1128,7 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
   <li>C9（Dauphin $\sigma$ 在 $V$ 分支 vs Shazeer $\sigma$ 在 $W$ 分支，$W\leftrightarrow V$ 等价）：Dauphin §2 Eq.(1) 与 Shazeer §2 Eq.(4)。</li>
 </ul>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <ul>
   <li>F1 GLU 定义：Dauphin §2 Eq.(1)。</li>
   <li>F2 Sigmoid 与导数：标准定义（基础记号）。</li>
@@ -981,21 +1146,21 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
   <li>N2 Shazeer §3.1 实例：$d_{ff}:3072\to2048$。</li>
 </ul>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <ul>
-  <li>教学示例 $x=[1.0,0.5]$、$W=I$、$V=\mathrm{diag}(1,-1)$、$b=c=0$：构造目的是让两维的门值（$\sigma(1.0)\approx0.73$ 与 $\sigma(-0.5)\approx0.38$）拉开差距，便于看出"按维度调节"。数字为教学构造，不代表真实模型参数。</li>
+  <li>构造示例 $x=[1.0,0.5]$、$W=I$、$V=\mathrm{diag}(1,-1)$、$b=c=0$：构造目的是让两维的门值（$\sigma(1.0)\approx0.73$ 与 $\sigma(-0.5)\approx0.38$）拉开差距，便于看出"按维度调节"。数字为教学构造，不代表真实模型参数。</li>
   <li>极端对照 $V=\mathrm{diag}(10,-10)$：构造目的是验证门 → 1 / 门 → 0 的退化。</li>
   <li>参数量验算 $d=768,d_{ff}=3072\to d_{ff}'=2048$：构造目的是手算验证 $2/3$ 等式。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <ul>
   <li>"门控制每个维度放多少信息过去"——只解释 $\sigma(\cdot)\in(0,1)$ 作为逐维度系数的<b>乘性缩放</b>关系。失效边界：门 $\sigma$ 不是真正的物理阀门，没有离散开关；"放行"是连续乘法、不是选择。</li>
   <li>"乘性跳连"——Dauphin 原词，只解释 GLU 梯度第一项 $\nabla\mathbf{X}\otimes\sigma(\mathbf{X})$ 被门值缩放、不含导数这一局部关系。失效边界：门饱和到 0 时该通路也趋零；它不等同于 ResNet 的加性跳连（结构不同），只是借"跳连"一词描述"梯度不被激活导数压没"。</li>
   <li>"门控决定何时通 vs 输入幅值副作用"——只解释 GLU 与 GTU 的梯度差别来源。失效边界：不意味着 GLU 永不梯度消失（门全关仍消失），也不意味着 GTU 在浅层就一定坏。</li>
 </ul>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <ul>
   <li>把 Dauphin 的 $*$（卷积）在 Transformer 语境统一记为矩阵乘 $xW$。可推出：GLU 在卷积与前馈两种语境的机制结论一致；不可推出：卷积的具体维度/平移不变性质——那需要回到 $*$ 的卷积定义。</li>
   <li>梯度分析用简化形式 $Y=\mathbf{X}\otimes\sigma(\mathbf{X})$（两分支共享 $\mathbf{X}$）。可推出：GLU 梯度的通路结构与门值/导数的关系；不可推出：一般 GLU 两分支用不同 $W,V$ 时的精确系数——一般形式只是把两个 $\mathbf{X}$ 换成 $xW+b$ 与 $xV+c$，链式结构相同。</li>
@@ -1003,7 +1168,7 @@ $$h(\mathbf{X})=(\mathbf{X}*\mathbf{W}+\mathbf{b})\otimes\sigma(\mathbf{X}*\math
   <li>Sigmoid、$\otimes$、$xW+b$、链式法则作为基础记号内联一行定义，不建独立概念页。可推出：GLU 所需最小判断；不可推出：这些原语的完整理论——若未来建概念页可改为链接引用。</li>
 </ul>
 
-<p>全文总结：GLU 用 sigmoid 门逐元素缩放线性投影，把"按维度调节"与"是否杀梯度"拆开——值分支给梯度留了一条被门值（而非门导数）缩放的线性通路，这是它相对 GTU 的关键差别。手算验证了门控缩放的极端退化。把 sigmoid 替换或去掉得到 Bilinear、ReGLU/GEGLU/SwiGLU 家族，Dauphin 与 Shazeer 仅是 $W\leftrightarrow V$ 标签互换。塞进 Transformer FFN 要缩 $2/3$ 维度保参数量，而"变体更优"是 T5 上的经验结论、原文未给理论解释。以上对应开篇五条学习目标。</p>
+<p>全文总结：GLU 用 sigmoid 门逐元素缩放线性投影，把"按维度调节"与"是否杀梯度"拆开——值分支给梯度留了一条被门值（而非门导数）缩放的线性通路，这是它相对 GTU 的关键差别。手算验证了门控缩放的极端退化。把 sigmoid 替换或去掉得到 Bilinear、ReGLU/GEGLU/SwiGLU 家族，Dauphin 与 Shazeer 仅是 $W\leftrightarrow V$ 标签互换。塞进 Transformer FFN 要缩 $2/3$ 维度保参数量，而"变体更优"是 T5 上的经验结论、原文未给理论解释。以上对应开篇「核心问题」的五条。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

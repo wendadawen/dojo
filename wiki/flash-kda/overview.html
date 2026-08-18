@@ -46,10 +46,10 @@
 
     <!-- 快速阅读正文：是什么、为什么需要它、核心直觉、关键结论与边界。5 分钟内可扫读，不展开公式推导与手算例子。 -->
 
-    <h2>这个概念是什么</h2>
+    <h2>1. 这个概念是什么</h2>
     <p>KDA（Kimi Delta Attention）把 softmax 注意力随序列长度增长的 KV cache 压成了<strong>固定大小的递归状态</strong> $S_t$，省了显存，但状态必须一步一步串行更新（$S_t$ 依赖 $S_{t-1}$）。这和 GPU 偏好宽而均匀的并行相冲突——GPU 有上百块 SM 想同时干活，串行依赖却让它们排队等。本文讲解 K3 报告为这个冲突设计的四套方案，每个执行 regime 一套。KDA 的递归机制本身见 <a href="../../wiki/kda/index.html">KDA 概念页</a>，GPU 的 SM/CTA/warp 见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>。</p>
 
-    <h2>为什么需要它</h2>
+    <h2>2. 为什么需要它</h2>
     <ul>
       <li><strong>训练和 prefill 里 SM 空转</strong>：chunkwise 形式 chunk 内并行、chunk 间串行传状态，两阶段交替时多数 SM 闲着等少数 SM 推状态。</li>
       <li><strong>长 prefill 下纯 TP 填不满 SM</strong>：Tensor Parallelism 切 head 不缩短序列方向的递归，每个 rank 只持少量 head，132 块 SM 大部分空闲。</li>
@@ -57,7 +57,7 @@
       <li><strong>投机解码拒绝 draft token 时状态无法回滚</strong>：解码每步原地更新状态，MTP 投机解码若拒绝部分 draft token，状态已越过最后接受 token，无法平凡回到正确位置。</li>
     </ul>
 
-    <h2>核心直觉</h2>
+    <h2>3. 核心直觉</h2>
     <ul>
       <li><strong>FlashKDA 的重叠</strong>：把工作拆成 chunk 内 token 维度并行（token-parallel）和 head 维度递归（head-parallel）两部分，各自独立调度。算一个 chunk 的内部计算时，同时传另一些 head 的状态——两阶段不再交替等待，而是流水线重叠。不同 head 的状态递归互相独立，是重叠能成立的前提。</li>
       <li><strong>设备内 CP 的"段转移可独立计算"</strong>：KDA 的状态转移是线性的——一段 token 对状态的效果可以分解成"作用于入状态的部分"+"从零生成的部分"，<strong>不依赖入状态就能预先算好</strong>，之后精确合并。所以能把一条长序列切到单 rank 的多块 SM 上并行算段转移，再合并恢复每段入状态，且不需要跨设备通信。</li>
@@ -65,7 +65,7 @@
       <li><strong>解码缓存投影输入而非状态</strong>：任意接受前缀后的状态由 draft token 的投影输入（$q,k,v,\beta,\alpha$ 等几个向量）完全决定，而投影输入比状态（$d_k\times d_v$ 矩阵）小得多。只缓存投影输入，在片上重跑递归重建接受 token 的状态，就能回滚——既支持回滚又不让状态流量爆炸。</li>
     </ul>
 
-    <h2>关键结论与边界</h2>
+    <h2>4. 关键结论与边界</h2>
     <ul>
       <li><strong>KCP 通信量与序列长度无关</strong>：交换的是固定大小的状态（约 32KB，config.json），不是随序列长度增长的 KV block。这是 KCP 相对 softmax CP（如 Ring Attention）的核心优势。<em>成立条件</em>：KDA 递归成立、状态固定大小。</li>
       <li><strong>$M+\tilde S$ 分解依赖 KDA 递归的线性性</strong>：$M_t$ 和加性项可分离，段转移才可独立于入状态计算。若递归非线性使段转移不可分离，KCP 和设备内 CP 的分解都不成立。</li>

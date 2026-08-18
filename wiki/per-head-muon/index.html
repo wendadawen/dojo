@@ -579,17 +579,56 @@
       border: none;
     }
     .learning-goals ul,
+    .learning-goals ol,
     .misconceptions ul { margin-bottom: 0; }
-    .diagram {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      background: var(--bg-code);
-      padding: 1rem;
-      overflow-x: auto;
-      border-radius: 6px;
-      line-height: 1.5;
-      margin: 1.5rem 0;
+
+    /* ============ 问题块（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
     }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
       .context-label { margin-top: 0.4rem; }
@@ -666,19 +705,49 @@
 <p>多头注意力中，当各头动量尺度差异 10 倍时（如 $M_1=[3,4]$ 与 $M_2=[0.3,0.4]$），原版 Muon 对整块投影矩阵做正交化会让小尺度头行块范数被压到约 0.1<sup>[C1]</sup>。Per-Head Muon 把动量矩阵沿头维度切分、每头单独正交化，让各头更新幅度趋于一致<sup>[C2]</sup>。本文依赖 Muon 与 Newton-Schulz 正交化两个前置概念（完整讲解分别见 <a href="../muon-optimizer/index.html">Muon 优化器</a> 与 <a href="../newton-schulz/index.html">Newton-Schulz 正交化</a>），只使用结论不重复推导。本文回答：按头正交化在机制上做了什么、如何均衡各头更新尺度、为什么略降开销、分布式训练中如何避免全参数 all-gather。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>为什么 Muon 对完整 Q/K/V 投影矩阵做正交化会让大尺度头主导更新方向、小尺度头更新不足？</li>
-    <li>按头正交化在机制上做了什么改变？</li>
-    <li>按头正交化如何均衡各头更新尺度？带来什么实践效果？</li>
-    <li>为什么按头正交化会略降优化器开销？</li>
-    <li>分布式训练中如何避免 Muon 的全参数 all-gather？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>为什么 Muon 对完整 Q/K/V 投影矩阵做正交化会让大尺度头主导更新方向、小尺度头更新不足？</p>
+      <details>
+        <summary>解答：全矩阵正交化把所有头当作一个耦合块</summary>
+        <p>对整个动量矩阵做正交化时，奇异向量混合了所有头的贡献：大尺度头主导奇异方向，小尺度头在正交化结果中对应的行块得不到单位范数，更新幅度被压低（"未充分正交化"）。完整论证见「整块正交化——为什么对多头不够好」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>按头正交化在机制上做了什么改变？</p>
+      <details>
+        <summary>解答：沿头维度切分动量矩阵，逐头单独正交化</summary>
+        <p>把动量矩阵沿头维度切成 $H$ 个块，对每个头块单独做 Newton-Schulz 正交化，更新由各头结果纵向拼接组成。Newton-Schulz 算法本身没有改动，改的只是作用对象。见「按头正交化——切分动量矩阵并逐头正交化」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>按头正交化如何均衡各头更新尺度？带来什么实践效果？</p>
+      <details>
+        <summary>解答：每头块各自获得单位幅度，学习动力学更均衡</summary>
+        <p>"拉平"的作用域从整块缩小到每个头，每个头块各自获得单位范数的更新，各头更新幅度不再受原始动量尺度差异的耦合影响。K3 报告给出三个定性结论：学习动力学更均衡、大尺度训练稳定性提升、优化器开销略降。见「效果与开销」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>为什么按头正交化会略降优化器开销？</p>
+      <details>
+        <summary>解答：每头块的 Gram 矩阵更小，总量约为全矩阵的 $1/H$</summary>
+        <p>Newton-Schulz 每步的主要计算是 Gram 矩阵及其平方：按头切分后是 $H$ 个 $d_h\times d_h$ 小方阵，而不是一个 $Hd_h\times Hd_h$ 大方阵，总开销量级约为原来的 $1/H$。见「效果与开销」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>分布式训练中如何避免 Muon 的全参数 all-gather？</p>
+      <details>
+        <summary>解答：用 P2P 定点取回替代集体 all-gather</summary>
+        <p>每个 rank 只向持有自己所需分片的 owner rank 发起点对点通信，取回本地负责的那部分参数的完整矩阵，消除全参数缓冲区并降低通信量，再按 model-chunk 粒度把通信与计算流水化。P2P 降低而非消除通信。见「分布式实现——P2P 参数取回」一章。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <!-- 整块正交化——为什么对多头不够好 -->
 
-<h2 id="why-full-matrix-fails">整块正交化——为什么对多头不够好</h2>
+<h2 id="why-full-matrix-fails">1. 整块正交化——为什么对多头不够好</h2>
 
 <p>从 Muon 需要的结论说起。Muon 对二维矩阵参数的更新，是把累积的动量矩阵的正交化版本作为更新方向。所谓正交化，就是把矩阵 $X$ 做奇异值分解 $X = U S V^\top$ 后，把所有奇异值都设为 1，得到半正交矩阵 $U V^\top$<sup>[F2]</sup>：</p>
 
@@ -692,13 +761,47 @@
 
 <p>其中 $W_h$ 是第 $h$ 个头的投影权重行块。动量矩阵 $M$ 也是同样结构 $M = [M_1; M_2; \dots; M_H]$，每个 $M_h$ 对应一个头。这里只用"权重沿头维度堆叠"这一结构事实，不展开注意力机制本身。</p>
 
-<pre class="diagram">投影权重矩阵 M（行 = H 个头块，列 = 模型维度 d）
-
-      ┌─── 头 1 (M_1, d_h 行) ───┐
-  M = │  M_2 (d_h 行)             │   原版 Muon：对整个 M 做一次 NS
-      │  ...                      │   正交化，得到 Ortho(M)
-      └─── 头 H (M_H, d_h 行) ──┘
-</pre>
+<figure class="diagram">
+<svg viewBox="0 0 640 240" role="img" aria-label="动量矩阵 M 的行是 H 个头块沿行方向堆叠，原版 Muon 对整个 M 做一次 Newton-Schulz 正交化得到 Ortho(M)">
+  <foreignObject x="80" y="10" width="200" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">列 = 模型维度 $d$</div>
+  </foreignObject>
+  <foreignObject x="10" y="104" width="62" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-right">行 = $H$ 个头块</div>
+  </foreignObject>
+  <g class="dg-box" stroke-width="1">
+    <rect x="80" y="36" width="200" height="44"></rect>
+    <rect x="80" y="80" width="200" height="44"></rect>
+    <rect x="80" y="152" width="200" height="44"></rect>
+    <rect x="80" y="36" width="200" height="160" fill="none" stroke-width="1.5"></rect>
+  </g>
+  <g font-size="14">
+    <text x="180" y="138" text-anchor="middle">…</text>
+  </g>
+  <foreignObject x="86" y="48" width="60" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$M_1$</div>
+  </foreignObject>
+  <foreignObject x="86" y="92" width="60" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$M_2$</div>
+  </foreignObject>
+  <foreignObject x="86" y="164" width="60" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$M_H$</div>
+  </foreignObject>
+  <foreignObject x="152" y="92" width="124" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-right">每块 $d_h$ 行</div>
+  </foreignObject>
+  <g class="dg-line" stroke-width="1.5">
+    <line x1="288" y1="116" x2="352" y2="116"></line>
+    <polyline points="342,112 352,116 342,120"></polyline>
+  </g>
+  <foreignObject x="360" y="70" width="264" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">原版 Muon：对整个 $M$ 做一次 NS 正交化</div>
+  </foreignObject>
+  <foreignObject x="360" y="98" width="264" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">得到 $\mathrm{Ortho}(M)$，$U$ 混合所有头</div>
+  </foreignObject>
+</svg>
+</figure>
 
 <p>问题出在"对整个 $M$ 做一次正交化"。全矩阵正交化等价于对 $M = U S V^\top$ 取 $U V^\top$：所有奇异值拉平为 1，但奇异向量 $U$ 混合了所有头的贡献。$U$ 的每一行不再只属于某一个头，而是所有头共同决定的奇异方向。K3 报告把这个现象称为"把所有头当作一个耦合块"<sup>[C1]</sup>。</p>
 
@@ -706,7 +809,7 @@
 
 <p>用一个极小例子把这件事算清楚。</p>
 
-<p>教学示例（教学构造，不代表真实模型参数）。设头数 $H=2$、每头维度 $d_h=1$、模型维度 $d=2$。两头动量行向量平行同向、尺度差 10 倍：$M_1 = [3, 4]$（范数 5），$M_2 = [0.3, 0.4]$（范数 0.5）。完整动量矩阵</p>
+<p>构造示例（人为构造数据，不代表真实模型参数）。设头数 $H=2$、每头维度 $d_h=1$、模型维度 $d=2$。两头动量行向量平行同向、尺度差 10 倍：$M_1 = [3, 4]$（范数 5），$M_2 = [0.3, 0.4]$（范数 0.5）。完整动量矩阵</p>
 
 <p>$$M = \begin{bmatrix} 3 & 4 \\ 0.3 & 0.4 \end{bmatrix}.$$</p>
 
@@ -722,18 +825,36 @@
 
 <p>这个例子是极端情形（两头平行同向），用来展示"尺度被压低"的最简形态。实际训练中各头方向通常不完全平行，全矩阵 SVD 还会进一步混合方向信息；但"小尺度头行块范数远小于 1"这一核心现象在行空间有重叠的非平行情形下同样存在，只是数值不同；完全正交时各头不互相干扰、行块范数均为 1。本章不展开非平行情形的手算。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定 $M_1 = [1, 0]$、$M_2 = [0, 2]$（两行正交），判断全矩阵正交化后两头行块范数是否都接近 1，并说明原因。</li>
-  <li>给定 $M_1 = [4, 3]$（范数 5）、$M_2 = [0.4, 0.3]$（范数 0.5，与 $M_1$ 平行同向），判断小尺度头的行块范数会接近 1 还是远小于 1。</li>
-  <li>判断全矩阵正交化被压低的是小尺度头更新块的"方向"还是"幅度"。</li>
-</ul>
-
 <p>本章展示了全矩阵正交化压低小尺度头更新幅度的问题。但如何修复这个幅度不均——下一章讲按头正交化的切分与逐头正交化。</p>
+
+<h3 id="why-full-matrix-fails-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 $M_1 = [1, 0]$、$M_2 = [0, 2]$（两行正交），判断全矩阵正交化后两头行块范数是否都接近 1，并说明原因。</p>
+    <details>
+      <summary>解答：都接近 1，正交时两头互不干扰</summary>
+      <p>两行正交时 $M M^\top$ 是对角阵，两个奇异方向分别由两行各自决定，$U V^\top$ 的两行块各自获得单位范数。这对应"完全正交时各头不互相干扰、行块范数均为 1"的边界情形——压低效应只在行空间有重叠（如平行同向）时出现。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 $M_1 = [4, 3]$（范数 5）、$M_2 = [0.4, 0.3]$（范数 0.5，与 $M_1$ 平行同向），判断小尺度头的行块范数会接近 1 还是远小于 1。</p>
+    <details>
+      <summary>解答：远小于 1，约为 0.1</summary>
+      <p>与正文 $M_1=[3,4]$、$M_2=[0.3,0.4]$ 的情形同理：平行同向时唯一非零奇异方向的左奇异向量被大尺度头主导，小尺度头行块范数约等于两头范数之比 $0.5/5=0.1$，被压到远小于 1。</p>
+    </details>
+  </li>
+  <li>
+    <p>判断全矩阵正交化被压低的是小尺度头更新块的"方向"还是"幅度"。</p>
+    <details>
+      <summary>解答：压低的是幅度，不是方向</summary>
+      <p>方向仍由整体 SVD 共同决定；被压低的是小尺度头行块的范数（幅度）。Per-Head Muon 修复的正是幅度不均，不改变各头方向由各自动量决定的机制。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- 按头正交化——切分动量矩阵并逐头正交化 -->
 
-<h2 id="per-head-mechanism">按头正交化——切分动量矩阵并逐头正交化</h2>
+<h2 id="per-head-mechanism">2. 按头正交化——切分动量矩阵并逐头正交化</h2>
 
 <p>Per-Head Muon 的核心改动一句话说完：把动量矩阵沿头维度切分成 $H$ 个块，对每个头块单独做 Newton-Schulz 正交化，更新由各头正交化结果纵向拼接组成。</p>
 
@@ -747,7 +868,7 @@
 
 <p>回到上一章的极小例子，看按头正交化如何修复幅度不均。</p>
 
-<p>教学示例（续）。同样的 $M_1 = [3, 4]$、$M_2 = [0.3, 0.4]$，现在分别正交化。$\mathrm{Ortho}(M_1) = [3, 4] / 5 = [0.6, 0.8]$，范数 1。$\mathrm{Ortho}(M_2) = [0.3, 0.4] / 0.5 = [0.6, 0.8]$，范数 1。两头行块都获得了单位范数，且方向相同（因为输入本来就平行同向）。对照上一章全矩阵正交化下小头行块范数仅约 0.1，按头正交化把它拉回到了 1。</p>
+<p>构造示例（续）。同样的 $M_1 = [3, 4]$、$M_2 = [0.3, 0.4]$，现在分别正交化。$\mathrm{Ortho}(M_1) = [3, 4] / 5 = [0.6, 0.8]$，范数 1。$\mathrm{Ortho}(M_2) = [0.3, 0.4] / 0.5 = [0.6, 0.8]$，范数 1。两头行块都获得了单位范数，且方向相同（因为输入本来就平行同向）。对照上一章全矩阵正交化下小头行块范数仅约 0.1，按头正交化把它拉回到了 1。</p>
 
 <p>关键不在于两头方向是否相同，而在于两头行块的<b>幅度都被拉平到了 1</b>。全矩阵正交化只保证整块矩阵的奇异值拉平，不保证每个头块的行块范数都为 1；按头正交化把"拉平"的作用域从整块缩小到了每个头，每个头各自获得正交化本应给的单位幅度。</p>
 
@@ -779,22 +900,40 @@
 
 <p>机制澄清：Newton-Schulz 迭代算法本身没有被改动，改的只是它作用的对象——从整个 $M$ 变成每个 $M_h$。NS 多项式系数、迭代步数、归一化方式都与原版 Muon 一致。所以 Per-Head Muon 不是"新的正交化算法"，而是"同一个算法作用在更小的对象上"。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明切分发生在哪个维度，以及每个 $M_h$ 的形状。</li>
-  <li>说明为什么按头正交化后，每个头块的行块范数都接近 1。</li>
-  <li>判断 Newton-Schulz 迭代算法本身是否被改，以及改的只是什么。</li>
-</ul>
-
 <p>本章讲清了按头正交化的机制。但带来什么效果、开销怎样变化——下一章讲均衡更新尺度与开销变化。</p>
+
+<h3 id="per-head-mechanism-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说明切分发生在哪个维度，以及每个 $M_h$ 的形状。</p>
+    <details>
+      <summary>解答：沿头维度切分，每块是 $d_h \times d$ 矩阵</summary>
+      <p>切的是"头维度"：投影权重沿行方向按头分块，每块 $d_h$ 行。不是在 $d_h$ 内部切，也不是在模型维度 $d$ 上切。切完后每个 $M_h$ 是完整的 $d_h \times d$ 矩阵，可单独做 SVD 与 NS 正交化。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明为什么按头正交化后，每个头块的行块范数都接近 1。</p>
+    <details>
+      <summary>解答：拉平的作用域缩小到每个头</summary>
+      <p>每个 $\mathrm{Ortho}(M_h)$ 是对 $M_h$ 单独做 SVD 取 $U_h V_h^\top$，把该头块内部的奇异值拉平为 1，行块范数因此为单位值；各头的正交化互不耦合，头 1 的奇异向量只由 $M_1$ 决定，头 2 只由 $M_2$ 决定。构造示例中 $[3,4]/5$ 与 $[0.3,0.4]/0.5$ 都得到范数 1 的 $[0.6, 0.8]$。</p>
+    </details>
+  </li>
+  <li>
+    <p>判断 Newton-Schulz 迭代算法本身是否被改，以及改的只是什么。</p>
+    <details>
+      <summary>解答：算法没改，改的只是作用对象</summary>
+      <p>NS 多项式系数、迭代步数、归一化方式都与原版 Muon 一致。Per-Head Muon 不是新的正交化算法，而是同一个算法作用在更小的对象上——从整个 $M$ 变成每个 $M_h$。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- 效果与开销——均衡更新尺度与开销变化 -->
 
-<h2 id="balanced-scale-and-overhead">效果与开销——均衡更新尺度与开销变化</h2>
+<h2 id="balanced-scale-and-overhead">3. 效果与开销——均衡更新尺度与开销变化</h2>
 
 <p>先说"均衡"均衡的是什么。按头正交化使每个 $M_h$ 在各自内部获得单位奇异值——也就是每个头块的更新行块范数都接近 1。这与原版 Muon 的差别在于"作用域"：原版只保证整块矩阵的奇异值拉平，各头之间仍保留原始动量尺度的比例（大尺度头行块范数大、小尺度头行块范数小，当各行块行空间有重叠时；正交时不保留该比例、各头行块范数均为 1）；按头正交化把"拉平"的作用域缩小到每个头，各头更新幅度不再受原始动量尺度差异的耦合影响，趋于一致。K3 报告把这称为"均衡各头更新尺度"<sup>[C2, C3]</sup>。</p>
 
-<p>教学解释。 可以把全矩阵正交化类比成"把不同音量的乐器混进一条音轨再统一调音量"——音量大的乐器定调、音量小的乐器被压低，统一调音量后小音量乐器依然听不清。按头正交化像给每个乐器单独调音量，各自都调到标准音量。这个类比只解释"尺度耦合"这一局部关系：它帮助理解为什么全矩阵正交化不能保证每个头都被拉平。它不覆盖方向耦合（各头方向信息也会被 SVD 混合），也不保证收敛或最优。正式判断仍以 SVD 与正交化公式为准。</p>
+<p>辅助解释。可以把全矩阵正交化类比成"把不同音量的乐器混进一条音轨再统一调音量"——音量大的乐器定调、音量小的乐器被压低，统一调音量后小音量乐器依然听不清。按头正交化像给每个乐器单独调音量，各自都调到标准音量。这个类比只解释"尺度耦合"这一局部关系：它帮助理解为什么全矩阵正交化不能保证每个头都被拉平。它不覆盖方向耦合（各头方向信息也会被 SVD 混合），也不保证收敛或最优。正式判断仍以 SVD 与正交化公式为准。</p>
 
 <p>实践上，K3 报告给出三个定性结论<sup>[C3]</sup>：</p>
 
@@ -821,18 +960,36 @@
 
 <p>边界提醒：C3 的三个结论是 K3 在其大尺度训练配置下观察到的定性判断。报告没有给出"per-head Muon 单独贡献了多少稳定性或多少开销节省"的消融数字——这些是整体训练配方的综合结果。因此不应推广为"任何规模、任何头数配置下都更稳更省"，也不应给出来源未公开的具体百分比。"略降"是定性判断。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明"均衡"均衡的是什么，是各头的方向还是幅度。</li>
-  <li>说明为什么每头块的 Gram 矩阵比全矩阵的 Gram 矩阵小，以及量级比值约为多少。</li>
-  <li>判断 C3 的三个结论有没有给出 per-head 单独贡献的消融数字，以及"略降"是定性还是定量判断。</li>
-</ul>
-
 <p>本章讲清了按头正交化的效果与开销。但分布式训练里 NS 正交化需要完整参数矩阵而参数被分片了——下一章讲 P2P 参数取回如何避免全参数通信。</p>
+
+<h3 id="balanced-scale-and-overhead-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说明"均衡"均衡的是什么，是各头的方向还是幅度。</p>
+    <details>
+      <summary>解答：均衡的是各头的更新幅度</summary>
+      <p>按头正交化使每个头块的更新行块范数都接近 1，各头更新幅度不再受原始动量尺度差异的耦合影响；方向信息仍由各头动量经各自的 SVD 决定，不被拉平<sup>[C2, C3]</sup>。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明为什么每头块的 Gram 矩阵比全矩阵的 Gram 矩阵小，以及量级比值约为多少。</p>
+    <details>
+      <summary>解答：$d_h \times d_h$ 对 $H d_h \times H d_h$，比值约 $1/H$</summary>
+      <p>NS 每步主要计算 Gram 矩阵及其平方：每头块的是 $d_h \times d_h$，全矩阵的是 $H d_h \times H d_h$。$H$ 个小方阵的总开销量级约为大方的 $1/H$（当 $d_h \ll d$ 且 $H$ 适中时），实际节省还受工程因素影响。</p>
+    </details>
+  </li>
+  <li>
+    <p>判断 C3 的三个结论有没有给出 per-head 单独贡献的消融数字，以及"略降"是定性还是定量判断。</p>
+    <details>
+      <summary>解答：没有消融数字，"略降"是定性判断</summary>
+      <p>C3 的三个结论（动力学更均衡、大尺度稳定性提升、开销略降）是 K3 在其大尺度训练配置下的定性观察，报告没有给 per-head 单独贡献的消融数字，因此不应推广为任何规模、任何头数配置下都更稳更省，也不应给出来源未公开的具体百分比。</p>
+    </details>
+  </li>
+</ol>
 
 <!-- 分布式实现——P2P 参数取回 -->
 
-<h2 id="p2p-distributed">分布式实现——P2P 参数取回</h2>
+<h2 id="p2p-distributed">4. 分布式实现——P2P 参数取回</h2>
 
 <p>这一章讲 Per-Head Muon（以及 Muon 整体）在分布式训练里的工程落地。它不直接回答"按头怎么切"，而是回答"正交化需要完整矩阵、但参数被分片了怎么办"。</p>
 
@@ -840,20 +997,58 @@
 
 <p>朴素做法是 all-gather：每个 rank 把自己持有的参数分片发给所有其他 rank，每个 rank 都收到完整的全参数缓冲区，然后各自对完整矩阵做 NS。K3 报告指出这样做有两个问题<sup>[C4]</sup>：第一，每个 rank 都要持有全参数缓冲区，显存占用大；第二，全参数 all-gather 在大尺度下通信量极大，成为训练的主要瓶颈。</p>
 
-<pre class="diagram">朴素 all-gather（每 rank 收全参数）
-
-  rank 0 持有分片 A ──┐
-  rank 1 持有分片 B ──┼──► 每 rank 都得到 [A|B|C|D] 全参数
-  rank 2 持有分片 C ──┤    代价：每 rank 一份全参数缓冲区 + 大通信量
-  rank 3 持有分片 D ──┘
-
-P2P 取回（每 rank 只取所需分片）
-
-  rank 0 负责 Q 投影 ──► 只向持有 Q 各分片的 owner 取回 Q 的全部分片
-  rank 1 负责 K 投影 ──► 只向持有 K 各分片的 owner 取回 K 的全部分片
-  rank 2 负责 V 投影 ──► 只向持有 V 各分片的 owner 取回 V 的全部分片
-  （每 rank 只缓冲自己负责的参数，没有全参数缓冲区）
-</pre>
+<figure class="diagram">
+<svg viewBox="0 0 640 400" role="img" aria-label="朴素 all-gather 让每个 rank 都收到全参数并持有全参数缓冲区；P2P 取回让每个 rank 只向 owner 取回自己负责的参数分片">
+  <g font-size="13">
+    <text x="40" y="24">朴素 all-gather（每 rank 收全参数）</text>
+    <text x="40" y="228">P2P 取回（每 rank 只取所需分片）</text>
+  </g>
+  <g class="dg-box" stroke-width="1">
+    <rect x="40" y="40" width="150" height="30"></rect>
+    <rect x="40" y="80" width="150" height="30"></rect>
+    <rect x="40" y="120" width="150" height="30"></rect>
+    <rect x="40" y="160" width="150" height="30"></rect>
+    <rect x="390" y="85" width="210" height="60"></rect>
+    <rect x="40" y="244" width="170" height="30"></rect>
+    <rect x="40" y="282" width="170" height="30"></rect>
+    <rect x="40" y="320" width="170" height="30"></rect>
+    <rect x="40" y="358" width="170" height="30"></rect>
+    <rect x="390" y="292" width="210" height="68"></rect>
+  </g>
+  <g font-size="12">
+    <text x="115" y="59" text-anchor="middle">rank 0 持有分片 A</text>
+    <text x="115" y="99" text-anchor="middle">rank 1 持有分片 B</text>
+    <text x="115" y="139" text-anchor="middle">rank 2 持有分片 C</text>
+    <text x="115" y="179" text-anchor="middle">rank 3 持有分片 D</text>
+    <text x="495" y="110" text-anchor="middle">每 rank 都得到 [A|B|C|D] 全参数</text>
+    <text x="495" y="130" text-anchor="middle">（每 rank 一份全参数缓冲区）</text>
+    <text x="125" y="263" text-anchor="middle">rank 0 负责 Q 投影</text>
+    <text x="125" y="301" text-anchor="middle">rank 1 负责 K 投影</text>
+    <text x="125" y="339" text-anchor="middle">rank 2 负责 V 投影</text>
+    <text x="125" y="377" text-anchor="middle">…（每 rank 一个负责对象）</text>
+    <text x="495" y="316" text-anchor="middle">只向各 owner 取回自己负责参数的分片</text>
+    <text x="495" y="336" text-anchor="middle">拼成完整矩阵，无全参数缓冲区</text>
+  </g>
+  <g class="dg-line" stroke-width="1">
+    <line x1="190" y1="55" x2="382" y2="100"></line>
+    <polyline points="372,96 382,100 373,106"></polyline>
+    <line x1="190" y1="95" x2="382" y2="112"></line>
+    <polyline points="372,108 382,112 372,117"></polyline>
+    <line x1="190" y1="135" x2="382" y2="124"></line>
+    <polyline points="372,119 382,124 372,129"></polyline>
+    <line x1="190" y1="175" x2="382" y2="136"></line>
+    <polyline points="372,130 382,136 371,140"></polyline>
+    <line x1="210" y1="259" x2="382" y2="308"></line>
+    <polyline points="372,303 382,308 373,313"></polyline>
+    <line x1="210" y1="297" x2="382" y2="318"></line>
+    <polyline points="372,313 382,318 373,323"></polyline>
+    <line x1="210" y1="335" x2="382" y2="328"></line>
+    <polyline points="373,323 382,328 373,333"></polyline>
+    <line x1="210" y1="373" x2="382" y2="338"></line>
+    <polyline points="373,333 382,338 372,343"></polyline>
+  </g>
+</svg>
+</figure>
 
 <p>K3 的方案是 P2P 通信<sup>[C5]</sup>。每个 rank 不再做集体 all-gather，而是只向持有自己所需分片的 owner rank 发起点对点通信，取回本地负责的那部分参数的完整矩阵。例如，如果某个 rank 负责更新 Q 投影，它只取回 Q 投影在各 owner rank 上的分片，拼成完整的 Q 矩阵做 NS，不需要 K 和 V 的任何数据。</p>
 
@@ -861,41 +1056,59 @@ P2P 取回（每 rank 只取所需分片）
 
 <p>边界提醒：P2P 不是消除通信，而是用定点取回替代集体 all-gather。正交化仍需要完整矩阵，所以仍需通信取回分片——只是取的量少了、缓冲区小了。具体通信量节省取决于 DP 分片数量与参数布局，非 ZeRO 式分片或参数布局不同时需另行分析。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明 Newton-Schulz 正交化为什么需要完整参数矩阵，以及对不完整的矩阵做 NS 是否有意义。</li>
-  <li>说明朴素 all-gather 的两个问题是什么。</li>
-  <li>判断 P2P 方案取回的是"全参数"还是"本地所需分片"，以及通信是否被完全消除。</li>
-</ul>
+<h3 id="p2p-distributed-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说明 Newton-Schulz 正交化为什么需要完整参数矩阵，以及对不完整的矩阵做 NS 是否有意义。</p>
+    <details>
+      <summary>解答：正交化以完整矩阵的 SVD 为对象，分片上做没有意义</summary>
+      <p>Muon 的更新方向是完整动量矩阵的正交化版本，SVD 近似需要完整的参数矩阵才能定义各奇异方向；对一个不完整的分片做 NS，得到的不是整块正交化结果，没有意义。因此每步更新前必须有通信步骤把完整矩阵凑齐。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明朴素 all-gather 的两个问题是什么。</p>
+    <details>
+      <summary>解答：全参数缓冲区显存大，全参数通信成主要瓶颈</summary>
+      <p>第一，每个 rank 都要持有全参数缓冲区，显存占用大；第二，全参数 all-gather 在大尺度下通信量极大，成为训练的主要瓶颈<sup>[C4]</sup>。</p>
+    </details>
+  </li>
+  <li>
+    <p>判断 P2P 方案取回的是"全参数"还是"本地所需分片"，以及通信是否被完全消除。</p>
+    <details>
+      <summary>解答：只取本地所需分片；通信被降低而非消除</summary>
+      <p>每个 rank 只向持有自己所需分片的 owner rank 发起点对点通信，取回本地负责的那部分参数的完整矩阵，例如负责 Q 投影的 rank 不需要 K 和 V 的任何数据。正交化仍需要完整矩阵，通信仍然存在——P2P 是用定点取回替代集体 all-gather，取的量少了、缓冲区小了，并按 model-chunk 粒度流水化隐藏通信开销<sup>[C5]</sup>。</p>
+    </details>
+  </li>
+</ol>
 
 <p>回到全文：整块正交化在多头投影上耦合各头、压低小尺度头更新幅度；按头切分动量矩阵、每头单独正交化修复了幅度不均；这带来更均衡的学习动力学、提升大尺度稳定性、略降开销；分布式实现中用 P2P 取回替代全参数 all-gather，消除全参数缓冲区并流水化隐藏通信。开篇的五个问题至此都有了答案。</p>
 
-<!-- 文末：来源与教学说明 -->
+<!-- 文末：来源与范围说明 -->
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <p>C1（全矩阵正交化耦合各头、大尺度头主导、小尺度头未充分正交化）：Kimi K3 技术报告 §2.5 "Per-Head Muon"，原文 "full-matrix orthogonalization treats all heads as a single coupled block, so heads with larger gradient or momentum scales dominate the shared update direction, while smaller-scale heads receive insufficiently normalized updates"。</p>
 <p>C2（按头切分动量矩阵、每头块单独正交化、均衡各头更新尺度）：K3 技术报告 §2.5，原文 "we partition their momentum matrices along the head dimension and orthogonalize each head's block separately ... per-head orthogonalization equalizes the update scale across heads"。</p>
 <p>C3（更均衡学习动力学、提升大尺度稳定性、略降开销）：K3 技术报告 §2.5，原文 "this design yields more balanced learning dynamics across heads and improves training stability at larger scales. It also slightly reduces optimizer overhead, as Newton–Schulz iterations on tall per-head blocks are cheaper than on the full projection matrix"。</p>
 <p>C4（朴素 all-gather 的内存与通信问题）：K3 技术报告 §5.2.2 "P2P-based Muon orthogonalization"，原文 "The naive approach performs an all-gather over the entire parameter buffer on every rank, which incurs a substantial memory footprint on top of making communication the primary bottleneck at scale"。</p>
 <p>C5（P2P 取回本地所需分片、消除全参数缓冲区、流水化隐藏通信）：K3 技术报告 §5.2.2，原文 "each rank retrieves only the shards of its locally owned parameters via peer-to-peer (P2P) communication ... eliminating the full-parameter buffer and reducing both memory usage and communication volume. Communication and computation are further pipelined at the granularity of model-chunk buffers"。</p>
 
-<h3>核心公式与来源</h3>
-<p>F1（动量矩阵按头堆叠与逐头正交化的形式化表达）：切分方式由 C2 直接给出；记号 $M=[M_1;\dots;M_H]$、每块 $M_h\in\mathbb{R}^{d_h\times d}$ 为本页教学标注，用于表达"沿头维度切分"。</p>
+<h3>公式与来源（F）</h3>
+<p>F1（动量矩阵按头堆叠与逐头正交化的形式化表达）：切分方式由 C2 直接给出；记号 $M=[M_1;\dots;M_H]$、每块 $M_h\in\mathbb{R}^{d_h\times d}$ 为本页标注，用于表达"沿头维度切分"。</p>
 <p>F2（正交化等价于 SVD 后取 $UV^\top$、奇异值拉平为 1）：Muon 原始博客（Keller Jordan, "Muon" blog post, 2024-12）将正交化目标定义为 $\arg\min_O \|O-G\|_F$ s.t. $O$ 半正交，等价于 SVD 后取 $UV^\top$。K3 §2.5 默认沿用 Muon 的 NS 正交化定义。本页只使用其结论，NS 迭代的内部实现属于 Newton-Schulz 概念页。</p>
 
 <h3>外部数字与实验条件</h3>
 <p>本页无外部实验数字。K3 报告对 Per-Head Muon 只给定性结论（C3），未给 per-head 单独贡献的消融数值。Moonlight 技术报告（arXiv:2502.16982）给出的 Muon 相对 AdamW 的 ~2× 计算效率是整体 Muon 的结果，不归因于 per-head 改动，本页不引用以避免误导。</p>
 
-<h3>教学示例</h3>
-<p>本页教学示例是人为构造的：$H=2, d_h=1, d=2$，$M_1=[3,4]$（范数 5）、$M_2=[0.3,0.4]$（范数 0.5），两头平行同向、尺度差 10 倍。构造目的：用最小的可手算矩阵展示"全矩阵正交化把小尺度头行块压到远小于 1、按头正交化把它拉回 1"的尺度耦合效应。数字不代表真实训练数据，也不代表工程推荐值。极端情形（平行同向）展示的是"幅度被压低"的最简形态；非平行情形方向也会被耦合，本页不展开手算。</p>
-<p>效果与开销章完成检查中的对照例子 $M_1=[1,0], M_2=[0,2]$（两行正交）也是教学构造，用于让读者判断"两行正交时全矩阵正交化不会压低任一头"这一边界情形。</p>
+<h3>构造示例</h3>
+<p>本页构造示例是人为构造的：$H=2, d_h=1, d=2$，$M_1=[3,4]$（范数 5）、$M_2=[0.3,0.4]$（范数 0.5），两头平行同向、尺度差 10 倍。构造目的：用最小的可手算矩阵展示"全矩阵正交化把小尺度头行块压到远小于 1、按头正交化把它拉回 1"的尺度耦合效应。数字不代表真实训练数据，也不代表工程推荐值。极端情形（平行同向）展示的是"幅度被压低"的最简形态；非平行情形方向也会被耦合，本页不展开手算。</p>
+<p>「整块正交化」章本章问题中的对照例子 $M_1=[1,0], M_2=[0,2]$（两行正交）也是构造数据，用于说明"两行正交时全矩阵正交化不会压低任一头"这一边界情形。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>效果与开销章的"乐器混进一条音轨再统一调音量"类比只解释"尺度耦合"这一局部关系：帮助理解为什么全矩阵正交化不能保证每个头都被拉平。失效边界：它不覆盖方向耦合（各头方向信息也会被 SVD 混合），不保证收敛或最优，不说明各头学到的内容差异。正式判断以 SVD 与正交化公式为准。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>简化一：动量矩阵只用 $H=2, d_h=1, d=2$ 的极小矩阵，真实训练中 $H$ 通常为几十、$d_h$ 为 64–256、$d$ 为数千。可推出：全矩阵正交化不保证每头行块范数为 1、按头正交化保证。不可推出：真实尺度下的具体节省量。</p>
 <p>简化二：只展示"平行同向"极端情形的尺度耦合，不展开非平行情形的方向耦合手算。可推出：按头正交化均衡幅度的结论在非平行情形下同样成立。不可推出：非平行情形下方向耦合的具体数值。</p>
 <p>简化三：Newton-Schulz 迭代用 $\mathrm{Ortho}(\cdot)$ 符号表示，不展开其多项式系数 $(3.4445, -4.7750, 2.0315)$、5 步迭代与 bfloat16 归一化等实现细节。可推出：NS 把矩阵奇异值拉平为 1 这一结论。不可推出：NS 迭代的内部实现细节（属于 Newton-Schulz 概念页）。</p>

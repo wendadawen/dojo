@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="可训练的细粒度稀疏注意力：lightning indexer（64 头 × 128 维、ReLU、FP8）给每个历史位置打 index score，只对 top-k=2048 个位置做完整 MLA 注意力，主注意力从 O(L²) 降到 O(Lk)。indexer 仍是 O(L²) 只是单价低；KV cache 不减少反而多一份 indexer k_cache；L≤k 时无收益需回退稠密。含 dense warm-up + sparse training 两阶段续训（2.1B + 943.7B token）与 FP8 kernel、独立 cache、DCP top-k 合并等工程落地。基于 arXiv:2512.02556 LaTeX 源码 + 官方 inference 实现 + vLLM 实现三层核对。">
+  <meta name="description" content="可训练的细粒度稀疏注意力：lightning indexer（64 头、每头 128 维、ReLU、FP8）给每个历史位置打 index score，只对 top-k=2048 个位置做完整 MLA 注意力，主注意力主项从平方复杂度降为线性。indexer 自身仍是平方复杂度、只是单价低；KV cache 不减少反而多一份 indexer k_cache；序列长度不超过 k 时无收益需回退稠密。含 dense warm-up + sparse training 两阶段续训（2.1B + 943.7B token）与 FP8 kernel、独立 cache、DCP top-k 合并等工程落地。基于 arXiv:2512.02556 LaTeX 源码 + 官方 inference 实现 + vLLM 实现三层核对。">
   <meta name="dojo:summary" content="lightning indexer 给历史位置打分，只对 top-k=2048 个位置做完整 MLA 注意力，使主注意力从 $O(L^2)$ 降到 $O(Lk)$。indexer 本身仍是 $O(L^2)$；当 $L\le k$ 时需回退到稠密注意力。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制">
@@ -580,7 +580,8 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
-    .diagram {
+    /* ============ HTML 结构图 ============ */
+    .flow-diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
       background: var(--bg-code);
@@ -590,6 +591,20 @@
       line-height: 1.5;
       margin: 1.5rem 0;
     }
+    .flow-diagram .fd-caption { margin: 0 0 0.6rem; color: var(--text-light); }
+    .flow-diagram .fd-caption:last-child { margin-bottom: 0; }
+    .flow-diagram .fd-row { display: flex; gap: 0.75rem; align-items: stretch; justify-content: center; margin: 0.4rem 0; flex-wrap: wrap; }
+    .flow-diagram .fd-col { display: flex; flex-direction: column; align-items: center; gap: 0.2rem; }
+    .flow-diagram .fd-box { border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.6rem; text-align: center; color: var(--text); }
+    .flow-diagram .fd-arrow { text-align: center; color: var(--text-light); line-height: 1.2; }
+
+    /* ============ 问题块（chapter-questions） ============ */
+    .learning-goals ol.chapter-questions { margin-bottom: 0; }
+    .chapter-questions { margin-bottom: 0; }
+    .chapter-questions > li { margin-bottom: 1.25rem; }
+    .chapter-questions > li:last-child { margin-bottom: 0; }
+    .chapter-questions > li > p { margin-bottom: 0.5rem; }
+    .chapter-questions > li > details { margin: 0.5rem 0 0; }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
       .context-label { margin-top: 0.4rem; }
@@ -666,14 +681,44 @@
 <p>问题不在于这些计算做错了什么，而在于其中绝大部分位置对当前这一步几乎没有贡献。DeepSeek Sparse Attention（DSA）针对的正是这件事：先用一个成本极低的打分器给历史中每个位置评一个相关性分数，只让分数最高的 $k$ 个位置参与完整的注意力计算。主注意力的代价因此从"与序列长度平方成正比"变成"与序列长度成正比"。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>长上下文为什么必须动注意力，滑动窗口和线性注意力为什么不是同一条路？</li>
-    <li>lightning indexer 如何给一个历史位置打分，为什么它比主注意力便宜得多？</li>
-    <li>top-k 选择如何接回主注意力，为什么所有注意力头必须读同一批位置？</li>
-    <li>indexer 的打分能力从哪来，为什么需要两个阶段的续训？</li>
-    <li>DSA 省下了什么、没省下什么，什么情况下它完全不起作用？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>长上下文为什么必须动注意力，滑动窗口和线性注意力为什么不是同一条路？</p>
+      <details>
+      <summary>解答：代价结构决定，DSA 是第三条路</summary>
+      <p>稠密注意力要求每个查询与全部历史位置比对，配对数按 $O(L^2)$ 增长，生成阶段还要每步把整个 KV cache 搬一遍。滑动窗口按位置砍，窗口外的信息被彻底丢弃而非降权；线性注意力换掉注意力的数学形式，固定大小的状态无法无损保留任意长历史的细节；DSA 保留 softmax 注意力的完整形式，只按内容决定读哪些位置，因此是另一条路。完整论证见「1. 长上下文里，注意力的代价长在哪里」与「2. 两条减负路线，以及 DSA 选的那条」。</p>
+      </details>
+    </li>
+    <li>
+      <p>lightning indexer 如何给一个历史位置打分，为什么它比主注意力便宜得多？</p>
+      <details>
+      <summary>解答：多头点积、ReLU 截零、加权求和；便宜在单价</summary>
+      <p>每个 indexer 头拿自己的 query 与该位置共用的 key 做点积，负值 ReLU 截成 0，再按各头权重求和得到总分。便宜来自五处：头数少、每头维度低、ReLU 免跨序列归一化、可在 FP8 下计算、只输出标量排序分数——排序对数值误差的容忍度远高于加权求和。复杂度仍是 $O(L^2)$，降的是每对 token 的单价。完整论证见「3. lightning indexer 如何用极低成本给每个位置打分」。</p>
+      </details>
+    </li>
+    <li>
+      <p>top-k 选择如何接回主注意力，为什么所有注意力头必须读同一批位置？</p>
+      <details>
+      <summary>解答：掩码或稀疏 kernel；共享候选集是 kernel 约束</summary>
+      <p>取分数最高的 $k$ 个位置，只让这些位置的 key-value 条目参与注意力；参考实现用 $-\infty$ 掩码表达同一结果，真实收益依赖稀疏注意力 kernel。全部 query 头共享同一候选集，因为在 kernel 层面每个 key-value 条目必须被多个 query 共享才能保证访存效率，MLA 的 MQA 模式与之天然吻合。完整论证见「4. top-k 选择，以及候选集为什么必须跨头共享」。</p>
+      </details>
+    </li>
+    <li>
+      <p>indexer 的打分能力从哪来，为什么需要两个阶段的续训？</p>
+      <details>
+      <summary>解答：从主注意力蒸馏，两阶段分工不同</summary>
+      <p>dense warm-up 冻结除 indexer 外的全部参数，用 KL 散度让 indexer 拟合主注意力分数经跨头求和与 L1 归一化得到的分布（2.1B token）；sparse training 再引入 top-k 并放开全部参数，让模型适应稀疏模式（943.7B token）。随机初始化的 indexer 开启 top-k 等于随机丢掉历史位置，因此续训不可省略。完整论证见「5. indexer 的打分能力是训出来的」。</p>
+      </details>
+    </li>
+    <li>
+      <p>DSA 省下了什么、没省下什么，什么情况下它完全不起作用？</p>
+      <details>
+      <summary>解答：省计算不省显存，短序列需回退</summary>
+      <p>省的是主注意力的计算与访存，从 $O(L^2)$ 降到 $O(Lk)$；不省 KV cache 显存——每个查询选中的位置各不相同，全部历史条目必须保留，indexer 还额外多一份 key cache。当 $L \le k$ 时 top-k 不产生裁剪，indexer 的计算成为纯开销，实现会回退到稠密路径。完整论证见「7. 省了什么、没省什么、什么时候不该用」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <div class="callout callout-gray">
@@ -687,13 +732,13 @@
     <div class="context-label">序列长度</div><div class="context-value">8 个位置，第 8 个是当前 query（真实场景是 128K，这里缩小到能手算）</div>
     <div class="context-label">选取数量</div><div class="context-value">$k = 3$（真实模型中 $k = 2048$）</div>
     <div class="context-label">indexer 规模</div><div class="context-value">2 个头、每头 2 维（真实模型中 64 个头、每头 128 维）</div>
-    <div class="context-label">数字性质</div><div class="context-value">全部人为构造，为教学示例，不代表真实权重或推荐值</div>
+    <div class="context-label">数字性质</div><div class="context-value">全部人为构造，为构造示例，不代表真实权重或推荐值</div>
   </div>
 </div>
 
 <p>下面先把代价的结构说清楚——只有知道钱花在哪里，才能判断该砍哪一刀。</p>
 
-<h2 id="cost-structure">长上下文里，注意力的代价长在哪里</h2>
+<h2 id="cost-structure">1. 长上下文里，注意力的代价长在哪里</h2>
 
 <p>标准的<a href="../standard-attention/index.html">稠密注意力</a>规定：每个位置的查询要和它之前的每一个位置比对一次。序列里第 1 个位置只有 1 个对象可比，第 2 个有 2 个，第 8 个有 8 个。把 8 个位置的比对次数加起来是 $1+2+\cdots+8 = 36$ 次。</p>
 
@@ -705,14 +750,32 @@
 <p>这里要区分两种"让注意力更快"。FlashAttention 一类的工作改的是<b>怎么算</b>——通过分块和减少显存往返，让同一批计算跑得更快，算出的结果与朴素实现完全一致，读的仍是全部位置。本页讨论的是另一件事：<b>能不能少读</b>。两者互不冲突，可以叠加。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>序列从 8 个位置增长到 16 个位置，配对次数从多少变到多少？</li>
-  <li>生成一个新 token 时，为什么整个 KV cache 都要被读一遍？</li>
-  <li>如果一个方法让稠密注意力的 kernel 快了 3 倍，它减少了配对次数吗？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>序列从 8 个位置增长到 16 个位置，配对次数从多少变到多少？</p>
+    <details>
+    <summary>解答：从 36 次到 136 次</summary>
+    <p>8 个位置是 $1+2+\cdots+8 = 36$ 次，16 个位置是 $1+2+\cdots+16 = 136$ 次。长度翻倍，工作量涨到近 4 倍，这就是平方代价的含义：一般地，长度 $L$ 需要 $L(L+1)/2$ 次配对，量级 $O(L^2)$。</p>
+    </details>
+  </li>
+  <li>
+    <p>生成一个新 token 时，为什么整个 KV cache 都要被读一遍？</p>
+    <details>
+    <summary>解答：新查询要与全部历史位置比对</summary>
+    <p>生成阶段每次只产生一个新 token，它的查询要和此前所有位置逐一比对，而这些位置的 key/value 条目都存放在 KV cache 中，因此每生成一个 token 都要把整个 cache 从显存搬一遍。128K 上下文下瓶颈往往不在算力而在数据搬运。</p>
+    </details>
+  </li>
+  <li>
+    <p>如果一个方法让稠密注意力的 kernel 快了 3 倍，它减少了配对次数吗？</p>
+    <details>
+    <summary>解答：没有减少</summary>
+    <p>这类方法（如 FlashAttention）改的是怎么算——通过分块和减少显存往返让同一批计算跑得更快，结果与朴素实现一致，读的仍是全部位置。配对次数依旧是 $L(L+1)/2$；减少配对次数要靠少读位置，是另一件事，两者可以叠加。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="two-routes">两条减负路线，以及 DSA 选的那条</h2>
+<h2 id="two-routes">2. 两条减负路线，以及 DSA 选的那条</h2>
 
 <p>既然要少读，就得决定读哪些。这里有两条方向完全不同的路。</p>
 
@@ -741,14 +804,32 @@
 <p>"由内容决定"是 DSA 与固定模式稀疏的分界线，也是它的成本所在：必须先给每个位置算出一个分数，才知道该选谁。这个打分器本身若不够便宜，省下的计算就被它自己吃掉了。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>滑动窗口在什么场景下会失效，为什么 DSA 在同样场景下不会？</li>
-  <li>线性注意力和 DSA 在"KV cache 是否随长度增长"这一点上有什么不同？</li>
-  <li>为什么 DSA 必须额外付出一笔打分的成本，而滑动窗口不需要？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>滑动窗口在什么场景下会失效，为什么 DSA 在同样场景下不会？</p>
+    <details>
+    <summary>解答：关键信息在远处时，DSA 按内容选中远处</summary>
+    <p>关键信息位于窗口之外的远距离位置时（长文档问答里是常态），滑动窗口把它彻底丢掉——不是降权，是不可见。DSA 的选择由内容决定：只要该位置的 index score 足够高，再远也会被选进 top-k，照旧做完整注意力，因此同样场景下不失效。</p>
+    </details>
+  </li>
+  <li>
+    <p>线性注意力和 DSA 在"KV cache 是否随长度增长"这一点上有什么不同？</p>
+    <details>
+    <summary>解答：线性注意力不增长，DSA 不减反增</summary>
+    <p>线性注意力把历史压进一个固定大小的状态递推，KV cache 不随长度膨胀；DSA 每个查询选中的 $k$ 个位置各不相同，后续 token 可能选到任何历史位置，因此全部 KV 条目必须完整保留，indexer 还额外需要一份自己的 key cache。代价上的差别根源在于线性注意力改了数学形式，DSA 保留 softmax 形式只减少读取位置。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 DSA 必须额外付出一笔打分的成本，而滑动窗口不需要？</p>
+    <details>
+    <summary>解答：内容决定选择，选前必须先算分</summary>
+    <p>滑动窗口按位置截断，"读最近若干个位置"不需要任何计算就能确定。DSA 要让"读哪些"由内容决定，就必须先给每个历史位置算出一个相关性分数，才知道该选谁——这笔成本就是 lightning indexer 的全部开销，也决定了它必须做得极便宜，否则省下的计算会被打分器自己吃掉。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="lightning-indexer">lightning indexer 如何用极低成本给每个位置打分</h2>
+<h2 id="lightning-indexer">3. lightning indexer 如何用极低成本给每个位置打分</h2>
 
 <p>打分器的任务比主注意力轻得多。主注意力算出的分数要直接用作加权系数，参与最终输出的构造，因此精度要求高。打分器只需要给出一个<b>排序</b>：谁比谁更值得读。排序对数值误差的容忍度远高于加权求和，这就是它能被大幅简化的空间。</p>
 
@@ -768,9 +849,9 @@ $$I_{t, s} = \sum_{j=1}^{H^I} w_{t, j}^I \cdot \mathrm{ReLU}\left(\mathbf{q}^{I}
 
 <p>这个式子是定义式，不是推导结论，因此不展开推导。理解它的方式是代入算一遍：每个 indexer 头拿自己的 query 与该位置的 key 做点积，负值截成 0，再按各头的权重加权求和，得到这个位置的总分。</p>
 
-<h3 id="indexer-example">在贯穿例子上手算</h3>
+<h3 id="indexer-example">3.1 在贯穿例子上手算</h3>
 
-<p>教学示例。取 $H^I = 2$、$d^I = 2$，当前查询在位置 8。indexer 的两个 query 向量与两个头权重是</p>
+<p>构造示例。取 $H^I = 2$、$d^I = 2$，当前查询在位置 8。indexer 的两个 query 向量与两个头权重是</p>
 
 $$\mathbf{q}^I_{8,1} = (1, 0),\quad \mathbf{q}^I_{8,2} = (0, 1),\quad w^I_{8,1} = 1.0,\quad w^I_{8,2} = 0.5$$
 
@@ -797,8 +878,8 @@ $$\mathbf{q}^I_{8,1} = (1, 0),\quad \mathbf{q}^I_{8,2} = (0, 1),\quad w^I_{8,1} 
 <p>位置 3 和位置 4 展示了 ReLU 的作用。$s=3$ 在头 1 上点积为 $-1$，被截成 0，最终分数只由头 2 贡献；$s=4$ 反过来。ReLU 的效果是：某个头认为该位置"负相关"时，这个头不会把总分往下拉，只是不投赞成票。</p>
 
 <details>
-<summary>剩余六个位置的完整代入过程</summary>
-<p>教学示例，全部数字人为构造。</p>
+<summary>展开：剩余六个位置的完整代入过程</summary>
+<p>构造示例，全部数字人为构造。</p>
 <p>$s=1$：头 1 $(1,0)\cdot(2,0) = 2$，ReLU 后 2；头 2 $(0,1)\cdot(2,0) = 0$，ReLU 后 0。总分 $1.0\times 2 + 0.5\times 0 = 2.00$。</p>
 <p>$s=3$：头 1 $(1,0)\cdot(-1,0.5) = -1$，ReLU 截成 0；头 2 $(0,1)\cdot(-1,0.5) = 0.5$，ReLU 后 0.5。总分 $1.0\times 0 + 0.5\times 0.5 = 0.25$。</p>
 <p>$s=4$：头 1 $(1,0)\cdot(0.5,-2) = 0.5$，ReLU 后 0.5；头 2 $(0,1)\cdot(0.5,-2) = -2$，ReLU 截成 0。总分 $1.0\times 0.5 + 0.5\times 0 = 0.50$。</p>
@@ -808,7 +889,7 @@ $$\mathbf{q}^I_{8,1} = (1, 0),\quad \mathbf{q}^I_{8,2} = (0, 1),\quad w^I_{8,1} 
 <p>$s=8$：当前 token 对自身打分。头 1 得 1，头 2 得 4，总分 $1.0\times 1 + 0.5\times 4 = 3.00$。</p>
 </details>
 
-<h3 id="why-cheap">便宜来自五处</h3>
+<h3 id="why-cheap">3.2 便宜来自五处</h3>
 
 <p>论文明确指出，由于 lightning indexer 头数少且可以在 FP8 下实现，其计算效率非常突出（C6）。把便宜的来源拆开看，一共五处：</p>
 
@@ -828,18 +909,35 @@ $$\mathbf{q}^I_{8,1} = (1, 0),\quad \mathbf{q}^I_{8,2} = (0, 1),\quad w^I_{8,1} 
 <p>关于 ReLU，论文给出的理由是"出于吞吐考虑"（C5），没有进一步展开。教学解释：softmax 需要先在整行上求指数和才能得出任何一个归一化结果，是一个跨全序列的规约操作；ReLU 逐元素独立，不需要这类规约。这一解释只用于说明两种运算在实现结构上的差别，论文本身未给出这个论证。</p>
 
 <div class="callout callout-red">
-<p>便宜不等于复杂度降低。indexer 仍然要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$。它改变的是<b>每一对 token 的单价</b>，不是配对的数量。这一点在最后一章会重新算账。</p>
+<p>便宜不等于复杂度降低。indexer 仍然要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$。它改变的是<b>每一对 token 的单价</b>，不是配对的数量。这一点在「7. 省了什么、没省什么、什么时候不该用」一章会重新算账。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 index score 的公式，并说明 $w^I_{t,j}$ 与 $\mathbf{q}^I_{t,j}$ 各由哪个 token 导出。</li>
-  <li>为什么 $\mathbf{k}^I_s$ 没有头下标，这与主注意力的 key 有什么不同？</li>
-  <li>贯穿例子中位置 3 的分数为什么只有 0.25，哪一步把它压低了？</li>
-  <li>indexer 便宜的五个来源分别是什么，其中哪一个降低了复杂度？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 index score 的公式，并说明 $w^I_{t,j}$ 与 $\mathbf{q}^I_{t,j}$ 各由哪个 token 导出。</p>
+    <details>
+    <summary>解答：$I_{t,s}=\sum_j w^I_{t,j}\cdot\mathrm{ReLU}(\mathbf{q}^I_{t,j}\cdot\mathbf{k}^I_s)$，两者都由当前查询导出</summary>
+    <p>$w^I_{t,j}$ 与 $\mathbf{q}^I_{t,j}$ 都由当前查询 token $\mathbf{h}_t$ 导出（头 $j$ 的权重和 query 随查询变化），而 $\mathbf{k}^I_s$ 由历史位置 $\mathbf{h}_s$ 导出。代入即：各头用自己的 query 与该位置共用的 key 做点积，负值截成 0，再按各头权重求和。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 $\mathbf{k}^I_s$ 没有头下标，这与主注意力的 key 有什么不同？</p>
+    <details>
+    <summary>解答：全部 indexer 头共用同一个 key</summary>
+    <p>$\mathbf{k}^I_s$ 不带下标 $j$，说明 64 个 indexer 头共用同一份 128 维 key，而非各持一份。主注意力的 key 是每头各自的投影。共用使 indexer 的 key 存储量与头数无关，也使量化和 cache 只需按位置存一份，是单价低的一个直接来源。</p>
+    </details>
+  </li>
+  <li>
+    <p>indexer 便宜的五个来源分别是什么，其中哪一个降低了复杂度？</p>
+    <details>
+    <summary>解答：头数、维度、ReLU、FP8、标量输出；没有一个降低复杂度</summary>
+    <p>五处来源：头数少（64 对 128）、每头维度低（128 对 latent 512 + rope 64）、ReLU 逐元素免跨序列归一化、可在 FP8 下计算、每对 token 只产出一个标量分数而不必再加权聚合 value。五处都只压低每对 token 的单价；indexer 仍要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$，没有一处降低它。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="token-selection">top-k 选择，以及候选集为什么必须跨头共享</h2>
+<h2 id="token-selection">4. top-k 选择，以及候选集为什么必须跨头共享</h2>
 
 <p>有了每个位置的分数，选择这一步很直接：取分数最高的 $k$ 个位置，只让这些位置的 key-value 条目参与注意力。论文把这个组件称为 fine-grained token selection mechanism（细粒度 token 选择），本页在提到它时也会用"top-k 选择"这个更短的说法，两者指同一件事：</p>
 
@@ -852,27 +950,48 @@ $$\mathbf{u}_t = \mathrm{Attn}\left(\mathbf{h}_t, \left\{ \mathbf{c}_s \mid I_{t
   <li>$k$：选取的位置数。V3.2 中 $k = 2048$。注意区分：这个斜体 $k$ 表示数量，而 key 向量一律写作 $\mathbf{k}^I_s$。</li>
 </ul>
 
-<p>接回贯穿例子。上一章算出的 8 个分数按降序是 $s=7$（4.00）、$s=8$（3.00）、$s=2$（2.50）、$s=1$（2.00）、$s=6$（0.75）、$s=4$（0.50）、$s=3$（0.25）、$s=5$（0.00）。取 $k=3$ 得到选中集合 $\{2, 7, 8\}$——这正是第二章表格里 DSA 那一行的来源。</p>
+<p>接回贯穿例子。上一章算出的 8 个分数按降序是 $s=7$（4.00）、$s=8$（3.00）、$s=2$（2.50）、$s=1$（2.00）、$s=6$（0.75）、$s=4$（0.50）、$s=3$（0.25）、$s=5$（0.00）。取 $k=3$ 得到选中集合 $\{2, 7, 8\}$——这正是「2. 两条减负路线，以及 DSA 选的那条」一章表格里 DSA 那一行的来源。</p>
 
 <p>实现上，这个"只对选中位置做注意力"通常通过掩码达成：官方推理实现构造一个掩码张量，把未选中位置置为 $-\infty$，加到注意力分数上再做 softmax（$e^{-\infty} = 0$，这些位置的权重变成 0）。数学结果与"只对 $k$ 个位置计算"一致，但要注意这只是参考实现的表达方式——掩码版本仍然把全部位置算了一遍，真正的性能收益要靠专门的稀疏注意力 kernel 才能拿到。</p>
 
-<h3 id="shared-candidates">为什么所有头读同一批位置</h3>
+<h3 id="shared-candidates">4.1 为什么所有头读同一批位置</h3>
 
 <p>按"多头注意力各头关注不同模式"的直觉，似乎应该让每个头各选自己的 top-k。DSA 没有这么做：<b>该 token 的全部 query 头共享同一个候选集</b>。</p>
 
 <p>原因是 kernel 效率。论文引用 NSA 指出，在 kernel 层面每个 key-value 条目必须被多个 query 共享才能保证计算效率（C4）。如果每个头独立选择，一个 token 就会产生多套互不相同的不规则位置列表，显存访问模式随之碎片化——而稀疏计算的收益本来就依赖于把分散的读取整理成规整的批量访问。</p>
 
-<pre class="diagram">每头独立选择（DSA 没有采用）
-  头 1 ──► 读位置 {2, 7, 8}   ┐
-  头 2 ──► 读位置 {1, 3, 7}   ├─ 每头一套不同的访存模式
-  头 3 ──► 读位置 {2, 5, 6}   ┘   同一位置被反复零散读取
-
-共享候选集（DSA 的做法）
-  indexer ──► 一套位置 {2, 7, 8}
-                    │
-        ┌───────────┼───────────┐
-      头 1        头 2        头 3   ── 全部头读同一批条目
-                                        一次读取，多个 query 复用</pre>
+<div class="flow-diagram">
+  <p class="fd-caption">每头独立选择（DSA 没有采用）：</p>
+  <div class="fd-row">
+    <div class="fd-col">
+      <span class="fd-box">头 1</span>
+      <div class="fd-arrow">↓</div>
+      <span class="fd-box">读位置 $\{2, 7, 8\}$</span>
+    </div>
+    <div class="fd-col">
+      <span class="fd-box">头 2</span>
+      <div class="fd-arrow">↓</div>
+      <span class="fd-box">读位置 $\{1, 3, 7\}$</span>
+    </div>
+    <div class="fd-col">
+      <span class="fd-box">头 3</span>
+      <div class="fd-arrow">↓</div>
+      <span class="fd-box">读位置 $\{2, 5, 6\}$</span>
+    </div>
+  </div>
+  <p class="fd-caption">每头一套不同的访存模式，同一位置被反复零散读取。</p>
+  <p class="fd-caption">共享候选集（DSA 的做法）：</p>
+  <div class="fd-row">
+    <span class="fd-box">indexer 产出一套位置 $\{2, 7, 8\}$</span>
+  </div>
+  <div class="fd-arrow">↓ 全部头读同一批条目</div>
+  <div class="fd-row">
+    <span class="fd-box">头 1</span>
+    <span class="fd-box">头 2</span>
+    <span class="fd-box">头 3</span>
+  </div>
+  <p class="fd-caption">一次读取，多个 query 复用。</p>
+</div>
 
 <p>论文把这两件事分成两层来讲。选择 MLA 作为承载 DSA 的注意力，理由是续训——V3.2 是从 V3.1-Terminus 继续训练而来，沿用原有的 MLA 是前提。而在 MLA 内部选用 <a href="../mqa-gqa/index.html">MQA</a> 模式，理由才是上面说的 kernel 层约束：MQA 模式下一个 latent 向量本就被该 token 的全部 query 头共享，与"共享候选集"的要求天然吻合。</p>
 
@@ -880,21 +999,38 @@ $$\mathbf{u}_t = \mathrm{Attn}\left(\mathbf{h}_t, \left\{ \mathbf{c}_s \mid I_{t
 <p>这是一处算法设计被硬件约束反向决定的例子。"每头独立选择"在表达能力上不会更差，但它在 kernel 上跑不快，因此没有被采用。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>贯穿例子中 $k=3$ 选出了哪三个位置，它们的分数各是多少？</li>
-  <li>用掩码把未选中位置置为 $-\infty$，与真正的稀疏 kernel 在结果和性能上分别有什么区别？</li>
-  <li>如果让每个注意力头独立选 top-k，会在实现上带来什么问题？</li>
-  <li>MLA 的 MQA 模式为什么与共享候选集的要求吻合？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>贯穿例子中 $k=3$ 选出了哪三个位置，它们的分数各是多少？</p>
+    <details>
+    <summary>解答：位置 2、7、8，分数 2.50、4.00、3.00</summary>
+    <p>8 个分数按降序排前三位的是 $s=7$（4.00）、$s=8$（3.00）、$s=2$（2.50），因此选中集合是 $\{2, 7, 8\}$。注意它与"最近 3 个位置"（6、7、8）不同：远处高分的第 2 位被选中，近处低分的第 6 位被放弃，体现内容决定与位置决定的差别。</p>
+    </details>
+  </li>
+  <li>
+    <p>用掩码把未选中位置置为 $-\infty$，与真正的稀疏 kernel 在结果和性能上分别有什么区别？</p>
+    <details>
+    <summary>解答：结果一致，性能不同</summary>
+    <p>结果上两者一致：$-\infty$ 加到注意力分数上后经 softmax 权重变成 0（$e^{-\infty}=0$），数学上等价于只对 $k$ 个位置计算。性能上不同：掩码版本仍把全部位置算了一遍，拿不到节省；真实收益要靠专门的稀疏注意力 kernel 跳过未选中位置的计算与读取。</p>
+    </details>
+  </li>
+  <li>
+    <p>如果让每个注意力头独立选 top-k，会在实现上带来什么问题？</p>
+    <details>
+    <summary>解答：访存模式碎片化，kernel 跑不快</summary>
+    <p>每个头各选会产生多套互不相同的不规则位置列表，同一位置的 key-value 条目被反复零散读取，显存访问模式碎片化。稀疏计算的收益本就依赖把分散读取整理成规整的批量访问，kernel 层面要求每个条目被多个 query 共享；这也是 DSA 实例化在 MLA 的 MQA 模式上的原因——一个 latent 向量本就被该 token 的全部 query 头共享。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="training">indexer 的打分能力是训出来的</h2>
+<h2 id="training">5. indexer 的打分能力是训出来的</h2>
 
 <p>前面一直假设 indexer 能打出有意义的分数。但 indexer 是新增的参数模块——$\mathbf{q}^I$、$\mathbf{k}^I$、$w^I$ 的投影矩阵都是新权重。随机初始化时它打出的分数与相关性毫无关系，此时做 top-k 等于随机丢掉大部分历史位置。</p>
 
 <p>所以 DSA 不能直接加到一个训练好的稠密模型上。DeepSeek 的做法是从 V3.1-Terminus 的一个已扩展到 128K 上下文的 base checkpoint 出发，做两个阶段的续训。</p>
 
-<h3 id="dense-warmup">阶段一：dense warm-up，让 indexer 学会模仿主注意力</h3>
+<h3 id="dense-warmup">5.1 阶段一：dense warm-up，让 indexer 学会模仿主注意力</h3>
 
 <p>这一阶段的思路是：主注意力已经训练好了，它对每个位置的注意力分数本身就代表了"哪些位置重要"这一判断。让 indexer 去拟合这个已有的判断，就得到了一个有意义的初始打分器。</p>
 
@@ -905,8 +1041,8 @@ $$\mathcal{L}^{I} = \sum_t D_{\mathrm{KL}}\left(p_{t,:} \,\|\, \mathrm{Softmax}\
 <p>KL 散度衡量两个概率分布的差异，此处的作用是把 indexer 分数经 softmax 后的分布拉向目标分布 $p_{t,:}$。注意 indexer 在推理时用 ReLU 而不用 softmax；softmax 只出现在训练损失里，用于把分数转成可与 $p_{t,:}$ 比较的分布。</p>
 
 <details>
-<summary>目标分布 $p_{t,:}$ 的构造过程（教学示例数字）</summary>
-<p>教学示例，主注意力分数为人为构造。假设主注意力有 4 个头，对 8 个位置的注意力分数分别为：</p>
+<summary>补充：目标分布 $p_{t,:}$ 的构造过程（构造示例数字）</summary>
+<p>构造示例，主注意力分数为人为构造。假设主注意力有 4 个头，对 8 个位置的注意力分数分别为：</p>
 <p>头 1：$(0.30, 0.05, 0.02, 0.03, 0.05, 0.10, 0.25, 0.20)$<br>
 头 2：$(0.10, 0.30, 0.05, 0.02, 0.03, 0.05, 0.25, 0.20)$<br>
 头 3：$(0.05, 0.25, 0.05, 0.05, 0.05, 0.10, 0.25, 0.20)$<br>
@@ -918,7 +1054,7 @@ $$\mathcal{L}^{I} = \sum_t D_{\mathrm{KL}}\left(p_{t,:} \,\|\, \mathrm{Softmax}\
 <p>各项之和为 1.0，是一个合法的概率分布。位置 7 的目标概率最高（0.2625），位置 4 最低（0.0300）——KL 损失要让 indexer 的分布呈现同样的相对高低关系。</p>
 </details>
 
-<h3 id="sparse-training">阶段二：sparse training，让整个模型适应稀疏</h3>
+<h3 id="sparse-training">5.2 阶段二：sparse training，让整个模型适应稀疏</h3>
 
 <p>indexer 有了初始能力后，引入细粒度 token 选择，并放开全部模型参数一起优化，让模型适应 DSA 的稀疏模式。indexer 仍继续对齐主注意力分布，但这次只在被选中的集合上计算：</p>
 
@@ -945,65 +1081,93 @@ $$\mathcal{L}^{I} = \sum_t D_{\mathrm{KL}}\left(p_{t,\mathcal{S}_t} \,\|\, \math
 
 <p>两阶段的规模差异说明了它们的分工：warm-up 只是给 indexer 一个合理起点，2.1B token 足够；让整个模型适应稀疏模式则是一次 943.7B token 的续训，是前者的约 450 倍。这也回答了"能不能把 DSA 直接装到别的模型上"——不能，这 943.7B token 的续训不是可省略的步骤。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>warm-up 阶段冻结了哪些参数，为什么这一阶段必须保持稠密注意力？</li>
-  <li>目标分布 $p_{t,:}$ 经过哪两步从主注意力分数得到？</li>
-  <li>为什么 sparse training 阶段的 KL 只在 $\mathcal{S}_t$ 上计算？</li>
-  <li>"indexer 输入从计算图 detach"这一处理造成的结果是什么？</li>
-  <li>如果跳过两阶段续训，直接给一个稠密模型加上 indexer 并开启 top-k，会发生什么？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>warm-up 阶段冻结了哪些参数，为什么这一阶段必须保持稠密注意力？</p>
+    <details>
+    <summary>解答：冻结除 lightning indexer 外的全部参数</summary>
+    <p>冻结的范围是除 lightning indexer 外的全部模型参数。保持稠密有两个理由：其一，indexer 的训练目标是主注意力的分数分布，主注意力必须照常前向才有可拟合的目标；其二，此时 indexer 打出的分数毫无意义，若引入 top-k 等于随机丢弃历史位置，会破坏已训练好的模型。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 sparse training 阶段的 KL 只在 $\mathcal{S}_t$ 上计算？</p>
+    <details>
+    <summary>解答：未选中位置不参与注意力，排序不影响输出</summary>
+    <p>$\mathcal{S}_t$ 是位置 $t$ 经 top-k 选中的位置集合。未被选中的位置不参与注意力，它们之间的相对排序不再影响输出，因此分布对齐只需在被选中集合上进行；把 KL 的作用域从全部位置收窄到 $\mathcal{S}_t$，训练信号集中在真正参与计算的位置上。</p>
+    </details>
+  </li>
+  <li>
+    <p>如果跳过两阶段续训，直接给一个稠密模型加上 indexer 并开启 top-k，会发生什么？</p>
+    <details>
+    <summary>解答：等于随机丢历史，效果显著掉点</summary>
+    <p>indexer 的投影矩阵是新增权重，随机初始化时打出的分数与相关性毫无关系，top-k 选择等于随机丢掉大部分历史位置，模型效果会显著下降。因此 DSA 不能直接装到训练好的稠密模型上：warm-up 给 indexer 有意义的起点（2.1B token），其后的稀疏续训（943.7B token）让整个模型适应稀疏模式，两步都不可省略。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="engineering">工程落地：从 hidden state 到稀疏注意力的完整链路</h2>
+<h2 id="engineering">6. 工程落地：从 hidden state 到稀疏注意力的完整链路</h2>
 
 <p>前面讲的是机制。这一章看它在真实推理实现中由哪些部件构成。本章内容以 DeepSeek 官方开源推理实现与 vLLM 实现为依据，属于实现层事实，论文正文未涉及这些细节。</p>
 
-<h3 id="forward-path">前向链路</h3>
+<h3 id="forward-path">6.1 前向链路</h3>
 
 <p>从 hidden state 出发，先分出三条投影：</p>
 
-<pre class="diagram">hidden state h
-  │
-  ├─ wq_a + q_norm ──► qr（query 低秩 latent）
-  │                     │
-  │                     ├──► 主注意力自己的 q 投影 ──► q
-  │                     │
-  │                     └──► wq_b(qr) ──► q^I（64 头 × 128 维）
-  │
-  ├─ wk(h) + k_norm ──► k^I（不分头，128 维）
-  │
-  └─ wkv_a ──► KV latent ──► 主 KV cache</pre>
+<div class="flow-diagram">
+  <p class="fd-caption">hidden state $\mathbf{h}$ 的三条投影：</p>
+  <div class="fd-row">
+    <div class="fd-col">
+      <span class="fd-box"><code>wq_a</code> + <code>q_norm</code></span>
+      <div class="fd-arrow">↓</div>
+      <span class="fd-box">qr（query 低秩 latent）</span>
+      <div class="fd-arrow">↓ 各投影一层</div>
+      <span class="fd-box">主注意力自己的 q 投影 → q</span>
+      <span class="fd-box"><code>wq_b(qr)</code> → $\mathbf{q}^I$（64 头、每头 128 维）</span>
+    </div>
+    <div class="fd-col">
+      <span class="fd-box"><code>wk(h)</code> + <code>k_norm</code></span>
+      <div class="fd-arrow">↓</div>
+      <span class="fd-box">$\mathbf{k}^I$（不分头，128 维）</span>
+    </div>
+    <div class="fd-col">
+      <span class="fd-box"><code>wkv_a</code></span>
+      <div class="fd-arrow">↓</div>
+      <span class="fd-box">KV latent → 主 KV cache</span>
+    </div>
+  </div>
+  <p class="fd-caption">q 与主 KV cache 归主注意力；$\mathbf{q}^I$ 与 $\mathbf{k}^I$ 归 indexer。</p>
+</div>
 
-<p>其中 q 与主 KV cache 归主注意力，q^I 与 k^I 归 indexer。indexer 拿到这两样后的处理是一条直线：</p>
+<p>indexer 拿到 $\mathbf{q}^I$ 与 $\mathbf{k}^I$ 后的处理是一条直线：</p>
 
-<pre class="diagram">q^I, k^I
-  │
-  ▼
-RoPE（只对前 64 维施加，非 interleaved）
-  │
-  ▼
-Hadamard 变换（rotate_activation）
-  │
-  ▼
-量化到 FP8 ──► k^I 写入 indexer 自己的 k_cache（FP8 值 + scale）
-  │
-  ▼
-FP8 index kernel ──► index score I（每个位置一个标量）
-  │
-  ▼
-top-k 选择 ──► topk_indices（选中的位置）</pre>
+<div class="flow-diagram">
+  <div class="fd-col">
+    <span class="fd-box">RoPE（只对前 64 维施加，非 interleaved）</span>
+    <div class="fd-arrow">↓</div>
+    <span class="fd-box">Hadamard 变换（<code>rotate_activation</code>）</span>
+    <div class="fd-arrow">↓</div>
+    <span class="fd-box">量化到 FP8，$\mathbf{k}^I$ 写入 indexer 自己的 k_cache（FP8 值 + scale）</span>
+    <div class="fd-arrow">↓</div>
+    <span class="fd-box">FP8 index kernel → index score $I_{t,s}$（每个位置一个标量）</span>
+    <div class="fd-arrow">↓</div>
+    <span class="fd-box">top-k 选择 → <code>topk_indices</code>（选中的位置）</span>
+  </div>
+</div>
 
 <p>最后两路汇合，主注意力只按 indexer 给出的位置去读自己的 KV cache：</p>
 
-<pre class="diagram">q + 主 KV cache + topk_indices
-  │
-  ▼
-稀疏 MLA
-  │
-  ▼
-注意力输出 u</pre>
+<div class="flow-diagram">
+  <div class="fd-col">
+    <span class="fd-box">q + 主 KV cache + <code>topk_indices</code></span>
+    <div class="fd-arrow">↓</div>
+    <span class="fd-box">稀疏 MLA</span>
+    <div class="fd-arrow">↓</div>
+    <span class="fd-box">注意力输出 $\mathbf{u}$</span>
+  </div>
+</div>
 
-<p>图中各节点的含义：<code>wq_a</code> 与 <code>q_norm</code> 产出 query 的低秩 latent <code>qr</code>，主注意力和 indexer 都从它出发再各投影一层（前者用自己的 q 投影，后者用 <code>wq_b</code>）；<code>wk</code> 是 indexer 专有的 key 投影，<code>k_norm</code> 是作用在 indexer key 上的 LayerNorm；<code>wkv_a</code> 产出主注意力的 KV latent。竖线与箭头表示前向传播方向。要注意的是 indexer 一路最终只输出一件东西——选中的位置；它不参与输出的加权计算。</p>
+<p>图中各节点的含义：<code>wq_a</code> 与 <code>q_norm</code> 产出 query 的低秩 latent <code>qr</code>，主注意力和 indexer 都从它出发再各投影一层（前者用自己的 q 投影，后者用 <code>wq_b</code>）；<code>wk</code> 是 indexer 专有的 key 投影，<code>k_norm</code> 是作用在 indexer key 上的 LayerNorm；<code>wkv_a</code> 产出主注意力的 KV latent。箭头表示前向传播方向。要注意的是 indexer 一路最终只输出一件东西——选中的位置；它不参与输出的加权计算。</p>
 
 <p>链路中有三处值得单独说明。</p>
 
@@ -1013,12 +1177,12 @@ top-k 选择 ──► topk_indices（选中的位置）</pre>
 
 <p><b>indexer 有自己的一份 key cache。</b>官方实现为 indexer 注册了独立的 <code>k_cache</code>（FP8）与 <code>k_scale_cache</code>；vLLM 中对应一个独立的 <code>DeepseekV32IndexerCache</code>。它与主 KV cache 并存，两者互不复用。</p>
 
-<h3 id="fp8-kernel">FP8 index kernel 的四步</h3>
+<h3 id="fp8-kernel">6.2 FP8 index kernel 的四步</h3>
 
 <p>index score 的实际计算由一个专用 FP8 kernel 完成。官方实现的 docstring 把计算链写成四步（C6）：</p>
 
 <details class="code-details">
-<summary>index kernel 的四步计算链（伪代码）</summary>
+<summary>代码：index kernel 的四步计算链（伪代码）</summary>
 <div class="code-block">
 <pre><code class="language-text">以下是伪代码，不是 Python。对应官方 fp8_index 的计算链。
 
@@ -1050,7 +1214,7 @@ top-k 选择 ──► topk_indices（选中的位置）</pre>
 <p>四步与公式的对应关系是直接的：步骤 1 是点积，步骤 2 是 ReLU 与加权，步骤 3 是对头求和。步骤 4 没有出现在公式里——它属于 FP8 量化的还原，把量化时除掉的比例乘回来。另一处实现与公式的差别是：$w^I_{t,j}$ 在实现中被额外乘上了 $1/\sqrt{H^I}$ 与 softmax 缩放因子，然后合进 <code>q_s</code>，这属于实现层的缩放约定。</p>
 
 <details class="code-details">
-<summary>用 numpy 复现 index score 与 top-k（验证前面的手算）</summary>
+<summary>代码：用 numpy 复现 index score 与 top-k（验证前面的手算）</summary>
 <div class="code-block">
 <pre><code class="language-python">import numpy as np
 
@@ -1127,28 +1291,45 @@ k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</c
 <p><b>教学简化</b>：这段代码用 FP64 逐元素循环计算，真实实现是 FP8 矩阵乘 + 融合 kernel，且量化前还有 Hadamard 变换与 RoPE。代码只验证 index score 的算术定义与选择逻辑，不反映真实的数值精度与性能特征。</p>
 </details>
 
-<h3 id="dcp-merge">KV cache 被切分时，top-k 如何保持精确</h3>
+<h3 id="dcp-merge">6.3 KV cache 被切分时，top-k 如何保持精确</h3>
 
 <p>服务端常把 KV cache 按 rank 切分到多张卡上（vLLM 中称 decode context parallel，DCP）。此时每张卡只持有全部历史位置的一部分，各自只能算出自己那部分的局部 top-k。要得到全局 top-k，是否必须把整行分数都传一遍？</p>
 
 <p>不必。vLLM 的实现给出了论证：如果某个 token 属于全局 top-k，那么全局范围内至多有 $k-1$ 个 token 排在它前面；它所在的那张卡上排在它前面的 token 只会更少，因此它必然也在本卡的局部 top-k 内。于是只交换各卡的局部 top-k 候选就足够，结果与把整行分数全部聚合完全等价，而传输量从整行分数降到 $\text{卡数} \times k$ 个候选（C14，来源为 vLLM 实现，非论文内容）。</p>
 
 <details>
-<summary>这个论证为什么是精确的而非近似</summary>
+<summary>补充：这个论证为什么是精确的而非近似</summary>
 <p>反证。设 token $x$ 属于全局 top-k，但不属于它所在卡的局部 top-k。不属于局部 top-k 意味着该卡上至少有 $k$ 个 token 的分数排在 $x$ 之前。这 $k$ 个 token 也都在全局范围内，因此全局至少有 $k$ 个 token 排在 $x$ 之前，即 $x$ 的全局排名至少是第 $k+1$ 位，与 $x$ 属于全局 top-k 矛盾。</p>
 <p>因此"全局 top-k 的成员必定出现在其所属卡的局部 top-k 中"成立，收集全部卡的局部 top-k 候选不会漏掉任何全局 top-k 成员。这是精确算法，不是近似。</p>
 <p>需要注意的是，vLLM 中这条合并路径有实现约束：要求 CuteDSL，且 <code>index_topk</code> 取值为 512、1024 或 2048 之一。这些是实现层限制，与上面的正确性论证无关。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>画出从 hidden state 到 index score 的链路，说明中间经过哪几步变换。</li>
-  <li>indexer 的 key cache 与主 KV cache 是什么关系，两者能否复用？</li>
-  <li>index kernel 的四步中，哪一步不对应公式里的任何一项，它在做什么？</li>
-  <li>为什么只交换各卡的局部 top-k 候选就能得到精确的全局 top-k？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>indexer 的 key cache 与主 KV cache 是什么关系，两者能否复用？</p>
+    <details>
+    <summary>解答：各自独立注册，互不复用</summary>
+    <p>主 KV cache 按 MLA 的 latent 存放（官方实现注册 <code>kv_cache</code>/<code>pe_cache</code>，按最大序列长度分配，不随 $k$ 缩减）；indexer 的 <code>k_cache</code>（FP8）与 <code>k_scale_cache</code> 是单独一份，vLLM 中对应独立的 <code>DeepseekV32IndexerCache</code>。两者存放的内容、精度与生命周期都不同，互不复用，因此 DSA 在显存上略有增加。</p>
+    </details>
+  </li>
+  <li>
+    <p>index kernel 的四步中，哪一步不对应公式里的任何一项，它在做什么？</p>
+    <details>
+    <summary>解答：步骤 4，量化比例的还原</summary>
+    <p>步骤 1（FP8 矩阵乘）、步骤 2（ReLU 与逐头加权）、步骤 3（沿头求和）分别对应公式的点积、$\mathrm{ReLU}$ 加权与 $\sum_j$。步骤 4 把 key 侧量化 scale 乘回去，属于 FP8 量化的还原——把量化时除掉的比例恢复成真实数值，不属于 index score 的数学定义。另一处实现差异是 $w^I_{t,j}$ 被额外乘上 $1/\sqrt{H^I}$ 与 softmax 缩放后合进 <code>q_s</code>。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么只交换各卡的局部 top-k 候选就能得到精确的全局 top-k？</p>
+    <details>
+    <summary>解答：全局 top-k 成员必在其所在卡的局部 top-k 内</summary>
+    <p>若某 token 属于全局 top-k，则全局至多有 $k-1$ 个 token 排在它前面；它所在那张卡上排在它前面的只会更少，因此它必然也在该卡的局部 top-k 中。于是收集各卡的局部候选不会漏掉任何全局成员，结果与聚合整行分数完全等价，而传输量从整行分数降到卡数乘 $k$ 个候选。反证可知这是精确算法，不是近似（实现上另有 CuteDSL、<code>index_topk</code> 取值限制等约束，与正确性无关）。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="accounting">省了什么、没省什么、什么时候不该用</h2>
+<h2 id="accounting">7. 省了什么、没省什么、什么时候不该用</h2>
 
 <p>把账算清楚。</p>
 
@@ -1167,13 +1348,13 @@ k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</c
 </table>
 </div>
 
-<h3 id="not-linear">DSA 没有把注意力变成线性</h3>
+<h3 id="not-linear">7.1 DSA 没有把注意力变成线性</h3>
 
 <p>$O(Lk)$ 在 $k$ 固定时对 $L$ 是线性的，容易让人得出"DSA 把注意力复杂度降到线性"的结论。这个结论不成立：indexer 仍要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$。论文对此的处理是明确承认这一点，并给出论证——indexer 相比 V3.1-Terminus 中的 MLA 需要的计算量少得多。</p>
 
 <p>准确的说法是：DSA 把主项从平方变成线性，同时把残留的平方项的系数压得很低。整体不是线性。</p>
 
-<h3 id="no-memory-saving">DSA 不省 KV cache</h3>
+<h3 id="no-memory-saving">7.2 DSA 不省 KV cache</h3>
 
 <p>"只读 $k$ 个位置，那是不是只需要存这 $k$ 个位置"——不是。每个查询选出的 $k$ 个位置各不相同，后续 token 可能选到任何历史位置，因此全部历史位置的 KV 条目都必须完整保留。</p>
 
@@ -1183,13 +1364,13 @@ k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</c
 <p>容易与 MLA 的效果混淆。MLA 通过低秩压缩减少<b>每个位置存多少</b>，这确实省 KV cache；DSA 改变的是<b>每次读哪些位置</b>。V3.2 同时具备两者，但省显存的功劳属于 MLA，不属于 DSA。</p>
 </div>
 
-<h3 id="short-sequence">短序列下 DSA 不起作用</h3>
+<h3 id="short-sequence">7.3 短序列下 DSA 不起作用</h3>
 
 <p>当序列长度不超过 $k$ 时，top-k 会把全部位置都选进来——选择不产生任何裁剪，但 indexer 的计算照样发生，成为纯开销。贯穿例子的最后一行验证了这一点：8 个位置、$k=8$ 时，选中集合就是全部 8 个位置。</p>
 
 <p>真实模型中 $k = 2048$，因此这个失效区间是序列长度不足约 2048 的场景。两套实现对此都有专门处理：论文说明官方为短序列 prefill 特别实现了一个 masked MHA 模式来模拟 DSA，它在短上下文条件下效率更高；vLLM 的判据是当该批 <b>prefill</b> 请求的最大序列长度不超过 <code>index_topk</code>、且未强制走 MQA 时，置 <code>use_dense_mha=True</code> 走稠密路径（消费侧还有进一步的条件判断）。两者方向一致，但这个具体判据来自 vLLM 实现，不是论文给出的数字。</p>
 
-<h3 id="parity">效果上的代价</h3>
+<h3 id="parity">7.4 效果上的代价</h3>
 
 <p>论文报告，V3.2-Exp 在显著提升长序列计算效率的同时，与 V3.1-Terminus 相比在短上下文和长上下文任务上均未观察到明显的性能下降。这条结论的成立条件需要一并记住：标准 benchmark 的评测时间为 2025 年 9 月，对比对象是 V3.1-Terminus，且两者的训练设置被严格对齐——正是这种对齐才让"性能差异来自稀疏注意力"这一归因成立。</p>
 
@@ -1197,7 +1378,7 @@ k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</c
 
 <p>论文另给出 H800 集群上的推理成本曲线，按 2 USD/GPU 小时估算，展示 token 成本随序列位置的变化。本页只取其定性结论（长上下文下端到端显著加速），不复述曲线读数。</p>
 
-<h3 id="boundary">适用边界小结</h3>
+<h3 id="boundary">7.5 适用边界小结</h3>
 
 <ul>
   <li><b>解决</b>：长上下文下主注意力的计算量与访存量，使长序列训练与推理成本显著下降。</li>
@@ -1206,15 +1387,39 @@ k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</c
   <li><b>条件不满足时</b>：$L \le k$ 时 indexer 成为纯开销；未经续训直接开启 top-k 会显著掉点；缺少共享候选集时 kernel 无法高效实现。</li>
 </ul>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>为什么不能说"DSA 把注意力复杂度降到线性"？</li>
-  <li>DSA 对 KV cache 显存的净影响是增加、减少还是不变，为什么？</li>
-  <li>$k = 2048$ 时，什么长度的序列上 DSA 不产生收益，此时实现会怎么做？</li>
-  <li>"未观察到明显性能回退"这一结论的成立条件有哪些？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>为什么不能说"DSA 把注意力复杂度降到线性"？</p>
+    <details>
+    <summary>解答：主项线性，残留的平方项仍在</summary>
+    <p>$O(Lk)$ 在 $k$ 固定时对 $L$ 确实是线性的，但这只是主注意力；indexer 仍要给每个查询扫过全部历史位置，复杂度依旧是 $O(L^2)$。论文的处理是承认这一点并论证 indexer 的单价远低于 V3.1-Terminus 中的 MLA。准确的说法是：主项从平方变成线性，残留平方项的系数被压得很低，整体不是线性。</p>
+    </details>
+  </li>
+  <li>
+    <p>DSA 对 KV cache 显存的净影响是增加、减少还是不变，为什么？</p>
+    <details>
+    <summary>解答：略有增加</summary>
+    <p>每个查询选出的 $k$ 个位置各不相同，后续 token 可能选到任何历史位置，因此全部历史 KV 条目必须完整保留——主 KV cache 按最大序列长度分配，不随 $k$ 缩减；indexer 还额外需要自己的一份 key cache。所以净影响是略有增加。V3.2 省显存的功劳属于 MLA 的低秩压缩，不属于 DSA。</p>
+    </details>
+  </li>
+  <li>
+    <p>$k = 2048$ 时，什么长度的序列上 DSA 不产生收益，此时实现会怎么做？</p>
+    <details>
+    <summary>解答：长度不超过约 2048，回退稠密路径</summary>
+    <p>当 $L \le k$ 时 top-k 会把全部位置选进来，选择不产生任何裁剪，indexer 的计算照样发生、成为纯开销。官方为短序列 prefill 特别实现了 masked MHA 模式来模拟 DSA；vLLM 的判据是当该批 prefill 请求的最大序列长度不超过 <code>index_topk</code> 且未强制走 MQA 时置 <code>use_dense_mha=True</code> 走稠密路径。</p>
+    </details>
+  </li>
+  <li>
+    <p>"未观察到明显性能回退"这一结论的成立条件有哪些？</p>
+    <details>
+    <summary>解答：三组证据各有时间点与对照条件</summary>
+    <p>标准 benchmark 评测时间为 2025 年 9 月，对比对象是 V3.1-Terminus，且两者训练设置被严格对齐——正是这种对齐才让"性能差异来自稀疏注意力"的归因成立。另两组证据：ChatbotArena Elo（2025 年 11 月 10 日，两者后训练策略相同、分数相近）；发布后的独立长上下文评测（AA-LCR 上 reasoning 模式高 4 分、Fiction.liveBench 多项指标更优）。结论依赖这三组证据共同支撑，不能脱离条件外推。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="positioning">与相邻方法的定位</h2>
+<h2 id="positioning">8. 与相邻方法的定位</h2>
 
 <p>DSA 常与几类方法混在一起讨论。用前面几章建立的判据把它们分开。</p>
 
@@ -1237,34 +1442,52 @@ k=8 时选中的位置: [1, 2, 3, 4, 5, 6, 7, 8]（序列长 8，未裁剪）</c
 <p>名称歧义：DSA 在本页特指 DeepSeek Sparse Attention。它不是"动态稀疏注意力"（dynamic sparse attention）这一类方法的统称，也与计算机基础课程里的 Data Structures and Algorithms、密码学里的 Digital Signature Algorithm 无关。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>被问到"DSA 和 FlashAttention 有什么区别"时，用一句话如何回答？</li>
-  <li>DSA 与 MLA 在 V3.2 中同时存在，各自负责什么？</li>
-  <li>DSA 与 NSA 的关系是什么，能否说 DSA 是 NSA 的改进版？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>被问到"DSA 和 FlashAttention 有什么区别"时，用一句话如何回答？</p>
+    <details>
+    <summary>解答：一个改读哪些位置，一个改怎么算</summary>
+    <p>FlashAttention 改的是稠密注意力怎么算——分块与访存优化让同一批计算更快，结果与朴素实现等价、读的仍是全部位置；DSA 改的是每个查询读哪些位置——由内容决定的 top-k 稀疏。两者互不冲突，可以叠加。</p>
+    </details>
+  </li>
+  <li>
+    <p>DSA 与 MLA 在 V3.2 中同时存在，各自负责什么？</p>
+    <details>
+    <summary>解答：MLA 管存多少，DSA 管读哪些</summary>
+    <p>MLA 通过低秩压缩减少每个位置存多少，确实省 KV cache；DSA 改变每次读哪些位置，省的是计算与访存。V3.2 同时具备两者，DSA 实例化在 MLA 的 MQA 模式上，因为 MQA 下一个 latent 向量本就被该 token 的全部 query 头共享，与共享候选集的要求天然吻合。省显存的功劳属于 MLA，不属于 DSA。</p>
+    </details>
+  </li>
+  <li>
+    <p>DSA 与 NSA 的关系是什么，能否说 DSA 是 NSA 的改进版？</p>
+    <details>
+    <summary>解答：不能，只是引用了同一条约束</summary>
+    <p>NSA（Native Sparse Attention）是另一篇论文的另一套设计。DSA 论文引用 NSA 是为了支撑"kernel 层面每个 key-value 条目必须被多个 query 共享"这一约束，不涉及机制继承；DSA 不是 NSA 的重命名、简化版或改进版，两者同属可训练稀疏注意力但各自独立。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <p>S1 = arXiv:2512.02556《DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models》，DeepSeek-AI，2025，arXiv 源码 2025-12-02 提交版，<code>sections/01-method.tex</code>（§ DeepSeek-V3.2 Architecture 及其子节）。S2 = DeepSeek-V3.2-Exp 官方开源推理实现，<code>huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp</code>，commit <code>194c67e12b1b0d6df0ef373ddcf215bc84027409</code>，<code>inference/</code> 目录。S3 = 同仓库同 commit 的 <code>config.json</code>。S4 = vLLM，<code>github.com/vllm-project/vllm</code>，commit <code>5ac2684976ee22c04fe0d2f968c6cf6096b383f2</code>。</p>
 <p>C1 DSA 是 V3.2 相对 V3.1-Terminus 的唯一架构改动：S1 § DeepSeek Sparse Attention 首段。C2 V3.2 与 V3.2-Exp 架构完全相同：同上首句。C3 DSA 由 lightning indexer 与细粒度 token 选择两部分组成：S1 § DeepSeek Sparse Attention，Prototype of DSA 段。C4 论文把"从 V3.1-Terminus 续训"作为把 DSA 实例化在 MLA 之上的理由，把"kernel 层面每个 key-value 条目必须被多个 query 共享"作为在 MLA 中选用 MQA 模式的理由：S1 § Instantiate DSA Under MLA 段，其中 kernel 层约束引用 NSA（Yuan et al., 2025）。C5 选 ReLU 出于吞吐考虑：S1 § DeepSeek Sparse Attention。C6 indexer 头数少且可 FP8 实现故效率突出：同上；计算链见 S2 <code>inference/kernel.py</code> 中 <code>fp8_index</code> 的 docstring 与 <code>fp8_index_kernel</code>。C7 主注意力复杂度 $O(L^2) \to O(Lk)$、indexer 仍 $O(L^2)$：S1 § Inference Costs。C8 短序列 prefill 用 masked MHA 模式模拟 DSA：同上末段；vLLM 对应判据见 S4 <code>vllm/model_executor/layers/attention/sparse_mla_attention.py</code> 中 <code>use_dense_mha</code> 的赋值，消费方见 <code>vllm/model_executor/layers/attention/mla_attention.py</code>。C9 DSA 不减少 KV cache 且 indexer 需额外 key cache：从实现推出，依据 S2 <code>inference/model.py</code> 中 <code>Indexer</code> 注册的 <code>k_cache</code>/<code>k_scale_cache</code> 与 <code>MLA</code> 注册的 <code>kv_cache</code>/<code>pe_cache</code>，以及 S4 中独立的 <code>DeepseekV32IndexerCache</code>。C10 indexer 输入 detach、两条优化信号隔离：S1 § Sparse Training Stage。C11 未观察到明显性能回退：S1 § Parity Evaluation 全节三段——Standard Benchmark 段（2025 年 9 月，对比 V3.1-Terminus）、Human Preference 段（ChatbotArena Elo，2025 年 11 月 10 日）、Long Context Eval 段（AA-LCR 上 reasoning 模式高 4 分、Fiction.liveBench 多项指标更优）。C12 indexer 的 key 由 hidden state 独立投影、query 复用主注意力的低秩 latent、RoPE 通道独立且非 interleaved：S2 <code>inference/model.py</code> 中 <code>Indexer.forward</code> 的 <code>q = self.wq_b(qr)</code>、<code>k = self.k_norm(self.wk(x))</code>，其中 <code>qr</code> 由 <code>MLA.forward</code> 的 <code>q_norm(wq_a(x))</code> 传入；两处 "rope in indexer is not interleaved" 注释；S4 中 <code>indexer_rope_emb</code> 的构造与注释，以及 indexer 接收主注意力 <code>q_c</code> 的调用。C13 量化前施加 Hadamard 变换：S2 <code>inference/model.py</code> 中 <code>rotate_activation</code> 的定义与调用。C14 DCP 下局部 top-k 合并的精确性：S4 <code>vllm/model_executor/layers/sparse_attn_indexer.py</code> 中 <code>_merge_dcp_topk_global</code> 的 docstring。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p>F1 index score（正文 lightning indexer 一章）：S1 § DeepSeek Sparse Attention，Equation 1；符号说明同段。F2 稀疏注意力输出（正文 top-k 选择一章）：同节 Equation 2。F3 dense warm-up 的 indexer 损失（正文训练一章）：S1 § Dense Warm-up Stage，Equation 3；目标分布 $p_{t,:}$ 的构造见同段文字。F4 sparse training 的 indexer 损失：S1 § Sparse Training Stage，Equation 4。四条公式均为原文定义式，页面未做代数变形，不存在需要标注的推导链。正文提到的一处实现与公式差异（$w^I_{t,j}$ 在实现中额外乘 $1/\sqrt{H^I}$ 与 softmax 缩放并合入 <code>q_s</code>）依据 S2 <code>inference/model.py</code> 中 <code>Indexer.forward</code> 对 <code>weights</code> 的计算。</p>
 
 <h3>外部数字与实验条件</h3>
 <p>$H^I = 64$、$d^I = 128$：S3 的 <code>index_n_heads</code>、<code>index_head_dim</code>，与 S2 <code>inference/model.py</code> 中 <code>ModelArgs</code> 的默认值一致。$k = 2048$：S1 § Sparse Training Stage 文字（"select 2048 key-value tokens for each query token"）与 S3 的 <code>index_topk</code> 一致。主注意力 128 头、61 层、hidden 7168、kv_lora_rank 512、qk_rope_head_dim 64：S3 对应字段。warm-up 学习率 $10^{-3}$、1000 步、每步 16 条 128K 序列、合计 2.1B token：S1 § Dense Warm-up Stage。sparse training 学习率 $7.3\times 10^{-6}$、15000 步、每步 480 条 128K 序列、合计 943.7B token：S1 § Sparse Training Stage。续训起点上下文长度 128K：S1 § Continued Pre-Training 首段。推理成本图的估算口径（H800 集群、2 USD/GPU 小时）：S1 § Inference Costs。效果结论的实验条件：评测时间 2025 年 9 月，对比对象 V3.1-Terminus，两者训练设置严格对齐，见 S1 § Parity Evaluation。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <p>全文贯穿例子（8 个位置、$k=3$、$H^I=2$、$d^I=2$，以及 $\mathbf{q}^I_{8,j}$、$w^I_{8,j}$、$\mathbf{k}^I_s$ 的全部数值）为人为构造，不代表真实权重或推荐配置。构造目的是让 index score 可完全手算，同时满足三个条件：8 个分数两两不等使 top-k 无并列歧义；至少两个位置在某个头上点积为负以展示 ReLU 截断（$s=3$、$s=4$）；$k=3$ 的选中集合与"最近 3 个位置"不同，以便对比内容决定与位置决定的差别。训练一章中 warm-up 目标分布的 4 个头、8 个位置的主注意力分数同样为人为构造，用于展示"跨头求和 + L1 归一化"两步。可运行代码的输入与上述数值一致，输出为实际运行结果。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>"ReLU 逐元素独立、softmax 需要跨序列规约"是对 C5 的教学解释。论文只说选 ReLU 出于吞吐考虑，未给出这一论证；该解释仅用于说明两种运算在实现结构上的差别，不可当作论文结论，也不能据此推断二者在效果上的优劣。</p>
 <p>"Hadamard 变换把异常大值能量摊到各维度以减少低精度量化误差"是对 C13 的教学解释。S2 只给出了实现，未说明动机；这一动机属于推断。</p>
 <p>"打分器只需给出排序，因此对数值误差的容忍度高于加权求和"是教学解释，用于说明 indexer 可被简化的空间。它解释的是设计动机的方向，不是论文给出的论证，也不构成对具体精度可降到何种程度的判断。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>贯穿例子把 128K 序列缩到 8 个位置、64 头缩到 2 头、128 维缩到 2 维。这一简化保留了 index score 的算术定义、ReLU 的作用与 top-k 的选择逻辑，可支持"公式如何代入计算""ReLU 何时截断""$k \ge L$ 时不产生裁剪"这三类结论；不可用于推断真实模型的分数分布形态、稀疏模式的实际稠密度，或任何性能数字。</p>
 <p>正文用掩码（未选中位置置 $-\infty$）说明 top-k 如何接回注意力，这与官方参考实现的做法一致，但掩码版本仍把全部位置算了一遍。它在数学上等价于只对 $k$ 个位置计算，不等价于性能上的收益——真实收益依赖专门的稀疏注意力 kernel。这一点已在正文标明，不可据此认为掩码实现即可获得论文报告的加速。</p>
 <p>可运行代码用 FP64 逐元素循环实现，真实实现是 FP8 矩阵乘加融合 kernel，且量化前还有 RoPE 与 Hadamard 变换。代码只验证算术定义与选择逻辑，不反映真实的数值精度、访存行为与性能特征。</p>

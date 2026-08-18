@@ -580,6 +580,11 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    .chapter-questions { margin-bottom: 0; }
+    .chapter-questions li { margin-bottom: 1.2rem; }
+    .chapter-questions li:last-child { margin-bottom: 0; }
+    .chapter-questions li > p { margin-bottom: 0.5rem; }
+    .chapter-questions details { margin: 0.5rem 0 0; }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -661,17 +666,47 @@
 <p><b>主要依据</b>：Kimi K3 Technical Report §2.3.2 与附录 §B（Eq.12/18/19），通过本地存档 <code>/tmp/kimi-k3-research/k3-report.txt</code> 逐条核对。SwiGLU/GLU 家族相关结论引用 Shazeer 2020 / Dauphin 2017，已登记于 <a href="../../wiki/glu/research/evidence.md">GLU 概念页 evidence.md</a>，本文不重复。</p>
 </blockquote>
 
-<p>神经网络一层 FFN 的输出常常是两个数的乘积——如果两个数都没有上界，乘积会怎么涨？Kimi K3 在 2.8 万亿参数 + Stable LatentMoE 四连矩阵相乘的结构下恰好遇到这件事：单个坐标的 pre-activation 可以大到 100、1000，乘积就到 10000、1000000（教学示例数值，说明量级关系，非 K3 实测；源 §2.3.2 行 492-493 与 §B 仅泛述"coincident large coordinates can produce activation outliers and increase overflow risk in low-precision arithmetic"<sup>[C9]</sup>），直接撑爆低精度训练。给输出加个 clip 就够了吗？clip 的梯度在饱和后是 0——模型进了饱和区就死。SiTU-GLU 是 GLU 家族中 SwiGLU 的"有界化"版本（K3 §2.3.2 与附录 §B 提出<sup>[C1]</sup>），把门支线性因子和值支同时换成 softcap $\beta\tanh(x/\beta)$，乘积上界锁在 $\beta_1\beta_2=100$<sup>[C7, N1]</sup>。本文要回答：它怎么做到让两个乘性因子平滑饱和到固定上界，同时保留 SwiGLU 在原点附近的近线性响应。</p>
+<p>神经网络一层 FFN 的输出常常是两个数的乘积——如果两个数都没有上界，乘积会怎么涨？Kimi K3 在 2.8 万亿参数 + Stable LatentMoE 四连矩阵相乘的结构下恰好遇到这件事：单个坐标的 pre-activation 可以大到 100、1000，乘积就到 10000、1000000（构造示例数值，说明量级关系，非 K3 实测；源 §2.3.2 行 492-493 与 §B 仅泛述"coincident large coordinates can produce activation outliers and increase overflow risk in low-precision arithmetic"<sup>[C9]</sup>），直接撑爆低精度训练。给输出加个 clip 就够了吗？clip 的梯度在饱和后是 0——模型进了饱和区就死。SiTU-GLU 是 GLU 家族中 SwiGLU 的"有界化"版本（K3 §2.3.2 与附录 §B 提出<sup>[C1]</sup>），把门支线性因子和值支同时换成 softcap $\beta\tanh(x/\beta)$，乘积上界锁在 $\beta_1\beta_2=100$<sup>[C7, N1]</sup>。本文要回答：它怎么做到让两个乘性因子平滑饱和到固定上界，同时保留 SwiGLU 在原点附近的近线性响应。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>用一句话说清 SiTU-GLU 在做什么，并说明它解决什么问题（Q1）。</li>
-    <li>从公式说明为什么 SiTU-GLU 同时实现"近原点近似 SwiGLU"和"输出有界 100"（Q2）。</li>
-    <li>手算 $x=0$、$x=10$、$x=100$ 三个标量输入的 SiTU-GLU 输出，并对比同输入下 SwiGLU 的无界增长（Q3）。</li>
-    <li>说明 softcap 与 hard clamping 在饱和区梯度上的关键差别（Q4）。</li>
-    <li>说明 SiTU-GLU 在 K3 中的使用位置与不解决的问题（Q5）。</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>用一句话说清 SiTU-GLU 在做什么，并说明它解决什么问题。</p>
+      <details>
+      <summary>解答：SiTU-GLU 的定位与所解决的问题</summary>
+      <p>SiTU-GLU 是把 SwiGLU 的门支线性因子与值支同时换成 softcap $\beta\tanh(x/\beta)$ 的 GLU 变体，两个乘性因子都平滑饱和，乘积上界固定为 $\beta_1\beta_2=100$。它解决 K3 Stable LatentMoE 路由分支中四连矩阵相乘 + 2.8 万亿参数规模引发的激活爆炸——单个 pre-activation 坐标过大导致乘积在低精度算术下溢出。动机与公式见"为什么需要给 SwiGLU 加上界"与"SiTU-GLU 的公式与手算"两章。</p>
+      </details>
+    </li>
+    <li>
+      <p>从公式说明为什么 SiTU-GLU 同时实现"近原点近似 SwiGLU"和"输出有界 100"。</p>
+      <details>
+      <summary>解答：两个性质在不同区域各自成立的机制</summary>
+      <p>近原点：局部展开 $\beta\tanh(z/\beta)=z+O((z/\beta)^3)$（K3 §B Eq.(18)），当 $|W_g x|\ll\beta_1=4$、$|W_u x|\ll\beta_2=25$ 时 softcap 一阶退化为线性因子，SiTU-GLU 与 SwiGLU 一阶等价。远点：$|\tanh|<1$ 且 $0<\sigma<1$（K3 §B Eq.(19)），每个输出坐标满足 $|\mathrm{SiTU\text{-}GLU}(x)|\le\beta_1\beta_2=100$。两个性质分别在小输入区与饱和区生效，互不冲突。完整证明见"近原点像 SwiGLU、远点饱和"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>手算 $x=0$、$x=10$、$x=100$ 三个标量输入的 SiTU-GLU 输出，并对比同输入下 SwiGLU 的无界增长。</p>
+      <details>
+      <summary>解答：三个边界点的输出对照</summary>
+      <p>取 $\beta_1=4,\beta_2=25$：$y(0)=0$，与 SwiGLU 同值（softcap 未起作用）；$y(10)\approx 37.485$，同点 SwiGLU 为 $99.995$，门支线性因子已被 $\tanh(2.5)\approx 0.987$ 压近 $\beta_1=4$；$y(100)\approx 99.933$，逼近上界 100，同点 SwiGLU 为 $10000$——无界增长 100 倍。完整手算见"SiTU-GLU 的公式与手算"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>说明 softcap 与 hard clamping 在饱和区梯度上的关键差别。</p>
+      <details>
+      <summary>解答：饱和区导数的"严格为零"与"指数衰减非零"</summary>
+      <p>hard clamping 在 $|x|>c$ 时导数严格为 0，梯度反向传播到饱和坐标即被截断，该坐标无法自行恢复；softcap 导数 $1-\tanh^2(x/\beta)$ 在 $|x|\to\infty$ 时指数衰减趋于 0 但始终严格非零（$x=100,\beta=25$ 时约 $1.3\times 10^{-3}$），深饱和坐标仍能传梯度、被缓慢拉回。这是 K3 §B 选择 softcap 的核心依据。对比见"为什么是 softcap 而不是 clip"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>说明 SiTU-GLU 在 K3 中的使用位置与不解决的问题。</p>
+      <details>
+      <summary>解答：两处使用与不解决的边界</summary>
+      <p>使用位置：Stable LatentMoE 路由分支 FFN（核心场景，抑制激活爆炸）与 Dense FFN（K2→K3 对比表，SwiGLU 整体换为 SiTU-GLU）。不解决：Quantile Balancing 的负载均衡、MLA 注意力内部稳定性、训练损失是否下降（只承诺结构有界性）、低精度算术的其余问题（舍入误差、累加顺序、优化器状态精度）。见"在 K3 中的使用位置与不解决"一章。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
@@ -684,7 +719,7 @@
   </ul>
 </section>
 
-<h2 id="why-bound">为什么需要给 SwiGLU 加上界——激活爆炸从哪里来</h2>
+<h2 id="why-bound">1. 为什么需要给 SwiGLU 加上界——激活爆炸从哪里来</h2>
 
 <p>Transformer 一层 FFN 的核心运算可以拆成"两份线性投影、再逐元素相乘"的形式。SwiGLU 是当前最常用的版本，公式（Shazeer 2020 §2 Eq.(5)<sup>[F6]</sup>，家族派生与记号差异见 <a href="../../wiki/glu/index.html">GLU 概念页</a>）为</p>
 
@@ -699,7 +734,7 @@
   <li>值分支 $W_u x$：本来就是线性，没有上界。</li>
 </ul>
 
-<p>两支同时大时，乘积 $\approx (W_g x)\cdot(W_u x)$，量级是 $O(x^2)$。在常规规模下这点并不致命，但 K3 在 Stable LatentMoE 的路由分支里把 $W_\downarrow$、专家 FFN、$W_\upagger$ 接成<b>四连矩阵相乘</b>，加上 2.8 万亿参数规模，单个坐标的 pre-activation 就可能到 100、1000，乘积到 10000、1000000（教学示例数值，说明量级关系，非 K3 实测）——这种"激活爆炸"在低精度算术（FP8/INT8）下直接溢出（K3 §2.3 开头与 §2.3.2 第二段<sup>[C9]</sup>）。</p>
+<p>两支同时大时，乘积 $\approx (W_g x)\cdot(W_u x)$，量级是 $O(x^2)$。在常规规模下这点并不致命，但 K3 在 Stable LatentMoE 的路由分支里把 $W_\downarrow$、专家 FFN、$W_\upagger$ 接成<b>四连矩阵相乘</b>，加上 2.8 万亿参数规模，单个坐标的 pre-activation 就可能到 100、1000，乘积到 10000、1000000（构造示例数值，说明量级关系，非 K3 实测）——这种"激活爆炸"在低精度算术（FP8/INT8）下直接溢出（K3 §2.3 开头与 §2.3.2 第二段<sup>[C9]</sup>）。</p>
 
 <p>那为什么不直接换回原始 GLU（用 sigmoid 门而不是 Swish 门）？K3 §2.3.2 第二段给出两个理由<sup>[C3]</sup>：第一，GLU 的 sigmoid 门虽然有界，但值分支 $W_u x$ 仍然无界——乘积仍无界；第二，GLU 不保留 Swish 在原点附近"正侧近似线性、负侧压到 0"的响应形状（Swish 在 $x>0$ 时近似 $x$、在 $x<0$ 时压到 0）。SiTU-GLU 需要的是一个"同时控制两支、又保留 SwiGLU 局部响应"的方案。</p>
 
@@ -726,15 +761,27 @@
 
 <p>表中 $x$ 是 pre-activation 的占位记号；具体在 SiTU-GLU 里，门支的 $x$ 是 $W_g x$、值支的 $x$ 是 $W_u x$。可以看出：GLU 和 SwiGLU 的乘积都至少有一个无界因子，SiTU-GLU 把两个线性因子都换成有界的 softcap，乘积才有界。这正是 K3 §B 第二段"preventing either branch from dominating the product"的几何含义。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>指出 SwiGLU 的两个无界乘性因子分别是哪两个。</li>
-  <li>解释 GLU 的 sigmoid 门有界但 K3 仍不直接采用 GLU 的两个原因。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>指出 SwiGLU 的两个无界乘性因子分别是哪两个。</p>
+    <details>
+    <summary>解答：门支线性因子与值支</summary>
+    <p>一是门分支的线性因子 $W_g x$：sigmoid 只把门的取值压到 $(0,1)$，当 $W_g x\to+\infty$ 时 $\sigma(W_g x)\to 1$，门支退化为 $W_g x\cdot 1=W_g x$，线性无界。二是值分支 $W_u x$：本身就是纯线性投影，没有任何上界。两支同时大时乘积量级为 $O(x^2)$。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释 GLU 的 sigmoid 门有界但 K3 仍不直接采用 GLU 的两个原因。</p>
+    <details>
+    <summary>解答：值支无界与响应形状丢失</summary>
+    <p>第一，GLU 的 sigmoid 门虽然有界，但值分支 $W_u x$ 仍然线性无界，乘积依旧无界，爆炸问题没有解决。第二，GLU 不保留 Swish 近原点"正侧近似线性、负侧压到 0"的响应形状，直接换回 GLU 会丢失 SwiGLU 的局部响应特性。两点依据均为 K3 §2.3.2 第二段（C3）。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章说清了 SwiGLU 为什么会激活爆炸、以及 SiTU-GLU 用 softcap 给两个乘性因子加上界的动机。但公式还没展开、手算还没做——下一章给出 SiTU-GLU 的正式定义并手算三个边界点。</p>
 
-<h2 id="formula-and-example">SiTU-GLU 的公式与手算——定义、符号与三个边界点</h2>
+<h2 id="formula-and-example">2. SiTU-GLU 的公式与手算——定义、符号与三个边界点</h2>
 
 <p>SiTU-GLU 的正式定义由 K3 §2.3.2 Eq.(12) 给出<sup>[C1, F1]</sup>：</p>
 
@@ -762,7 +809,7 @@
 
 <p>所以 SiTU-GLU 的<b>正侧上界</b>是 $\beta_1\beta_2=100$，<b>负侧</b>因 sigmoid 杀尾实际接近 0——这正是 K3 §B 想要的"保留 Swish 负尾衰减"形状。</p>
 
-<p>教学示例。 取标量 $x$（设两支 pre-act 均为 $x$ 以隔离函数行为，这是为隔离函数本身性质做的教学简化，不代表真实 FFN 的两支会共享同一 $W$），用 $\beta_1=4,\beta_2=25$ 算三个点：</p>
+<p>构造示例：取标量 $x$（设两支 pre-act 均为 $x$ 以隔离函数行为，这是为隔离函数本身性质做的教学简化，不代表真实 FFN 的两支会共享同一 $W$），用 $\beta_1=4,\beta_2=25$ 算三个点：</p>
 
 <p>$$g(x)=4\tanh(x/4)\cdot\sigma(x),\quad u(x)=25\tanh(x/25),\quad y(x)=g(x)\cdot u(x).$$</p>
 
@@ -793,15 +840,27 @@
 <p>结论：从 $x=0$ 到 $x=100$，SiTU-GLU 的输出从 0 平滑过渡到 99.93，没有任何"台阶"或断点。softcap 的平滑性来自 $\tanh$ 的 $C^\infty$ 性质。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定标量 $x$ 与 $\beta_1,\beta_2$，写出 SiTU-GLU 的运算三步（门支、值支、相乘）。</li>
-  <li>解释 $x=0$、$x=10$、$x=100$ 三个点的输出差别，并指出上界 100 在哪个点逼近。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定标量 $x$ 与 $\beta_1,\beta_2$，写出 SiTU-GLU 的运算三步（门支、值支、相乘）。</p>
+    <details>
+    <summary>解答：门支、值支、乘积的运算顺序</summary>
+    <p>门支：$g(x)=\beta_1\tanh(x/\beta_1)\cdot\sigma(x)$，把 Swish 门的线性因子换成 softcap、保留 sigmoid 因子。值支：$u(x)=\beta_2\tanh(x/\beta_2)$，把线性值换成 softcap。输出：$y(x)=g(x)\cdot u(x)$（向量情形为逐元素乘积 $\odot$）。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释 $x=0$、$x=10$、$x=100$ 三个点的输出差别，并指出上界 100 在哪个点逼近。</p>
+    <details>
+    <summary>解答：三个点对应的饱和进程</summary>
+    <p>$x=0$：两支均在原点，输出 0，与 SwiGLU 同值。$x=10$：输出约 $37.485$，门支线性因子被 $\tanh(10/4)\approx 0.987$ 压到接近 $\beta_1=4$，值支 $\tanh(10/25)\approx 0.380$ 仍在近似线性区。$x=100$：输出约 $99.933$，两支接近完全饱和，上界 $\beta_1\beta_2=100$ 在该点逼近；同输入下 SwiGLU 输出 $10000$，无界增长。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章给出了公式并手算了三个边界点，验证了"两支都平滑饱和"。但"近原点像 SwiGLU"和"远点有界"这两件事为什么能同时成立，还没有严格证明——下一章用局部展开与上界证明把两个性质钉死。</p>
 
-<h2 id="local-and-bound">近原点像 SwiGLU、远点饱和——两个性质怎么同时成立</h2>
+<h2 id="local-and-bound">3. 近原点像 SwiGLU、远点饱和——两个性质怎么同时成立</h2>
 
 <p>读到这一章，读者可能会有疑问：一个函数怎么可能"近原点和 SwiGLU 一样、远点又被压到 100"？这两件事看上去矛盾——如果近原点和 SwiGLU 一样，那它就该和 SwiGLU 一起无界增长才对。答案的关键是 softcap 的<b>局部展开</b>与<b>远点饱和</b>两件事在不同区域生效，互不冲突。</p>
 
@@ -859,16 +918,34 @@
 
 <p>这个极限把 SiTU-GLU 与 SwiGLU 的关系说清楚了：<b>SiTU-GLU 是 SwiGLU 的"有界化"版本</b>，把"线性因子 $x$"换成"线性因子的有界化 $\beta\tanh(x/\beta)$"。$\beta$ 越大、有界化越弱、越接近 SwiGLU；$\beta$ 越小、有界化越强、上界越紧。K3 选 $\beta_1=4,\beta_2=25$ 是工程设定（C4），让门支上界 4、值支上界 25、乘积上界 100——报告未给选择依据与对照实验，不是普适最优。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 $\beta\tanh(z/\beta)$ 在 $|z|\ll\beta$ 时的局部展开式。</li>
-  <li>解释为什么 $\beta_1,\beta_2\to\infty$ 时 SiTU-GLU 收敛到 SwiGLU。</li>
-  <li>指出若只套门支、值支不套，上界 100 是否还成立。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 $\beta\tanh(z/\beta)$ 在 $|z|\ll\beta$ 时的局部展开式。</p>
+    <details>
+    <summary>解答：一阶展开与三次残差</summary>
+    <p>$\beta\tanh(z/\beta)=z+O((z/\beta)^3)$。由 $\tanh u=u-u^3/3+O(u^5)$ 代入 $u=z/\beta$、两边乘 $\beta$ 得到，即 $z-z^3/(3\beta^2)+O(z^5/\beta^4)$（K3 §B Eq.(18)，F3）。三次小量 $O((z/\beta)^3)$ 决定近原点处 SiTU-GLU 与 SwiGLU 的偏离程度。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释为什么 $\beta_1,\beta_2\to\infty$ 时 SiTU-GLU 收敛到 SwiGLU。</p>
+    <details>
+    <summary>解答：softcap 在 $\beta\to\infty$ 时退化为恒等</summary>
+    <p>$\beta\to\infty$ 时 $z/\beta\to 0$，$\tanh(z/\beta)\approx z/\beta$，于是 $\beta\tanh(z/\beta)\to z$：softcap 退化为线性因子本身。门支与值支分别还原为 SwiGLU 的 $W_g x\cdot\sigma(W_g x)$ 与 $W_u x$，因此 SiTU-GLU 逐点收敛到 SwiGLU（K3 §B Eq.(18) 后一句，C6/F5）。</p>
+    </details>
+  </li>
+  <li>
+    <p>指出若只套门支、值支不套，上界 100 是否还成立。</p>
+    <details>
+    <summary>解答：不成立，两支都套是必要条件</summary>
+    <p>不成立。值支仍为线性 $W_u x$ 时，$|W_u x|$ 无界，乘积随值支增大而无界，$\beta_1\beta_2$ 不再是上界。"两支都套 softcap"是上界成立的必要条件，K3 §B 第二段"preventing either branch from dominating the product"即指此设计。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章把"近原点一阶等价"和"输出有界 100"两件事都严格证明了。但 softcap 相对 hard clamping 的核心优势——饱和区梯度——还没有对比——下一章对比两者的导数，说清 K3 为什么选 softcap 不选 clip。</p>
 
-<h2 id="softcap-vs-clip">为什么是 softcap 而不是 clip——饱和区里梯度差别</h2>
+<h2 id="softcap-vs-clip">4. 为什么是 softcap 而不是 clip——饱和区里梯度差别</h2>
 
 <p>读者到这里可能又会问：既然只是想要"两支有界、乘积有界"，为什么不直接对 $W_g x$ 和 $W_u x$ 做 hard clamping $\mathrm{clip}(x,c)=\min(\max(x,-c),c)$？输出在远点也接近 $\pm c$，岂不是更简单？K3 §B 末段直接回答了这个问题，关键差别在<b>饱和区的梯度</b>。</p>
 
@@ -911,16 +988,34 @@
 
 <p>另外要注意：K3 §B 末段那句"better training behavior"是<b>经验陈述</b>，不是对照实验结论。报告没有给 SiTU-GLU vs (SwiGLU + clip) 的对照训练曲线，只是说"我们观察到"。读者不应据此把"softcap 比 clip 更好"扩大成普适结论。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 clip 与 softcap 在 $|x|>c$（或 $|x|>\beta$）时的导数。</li>
-  <li>解释为什么"饱和后梯度仍非零"对训练有利。</li>
-  <li>指出 K3 §B 末段"better training behavior"是经验陈述还是对照实验结论。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 clip 与 softcap 在 $|x|>c$（或 $|x|>\beta$）时的导数。</p>
+    <details>
+    <summary>解答：严格为零与指数衰减非零</summary>
+    <p>clip（hard clamping）在 $|x|>c$ 时导数严格为 0，且边界点不可导。softcap 导数为 $\frac{d}{dx}[\beta\tanh(x/\beta)]=1-\tanh^2(x/\beta)$，当 $x\gg\beta$ 时约 $4e^{-2x/\beta}$，指数衰减趋于 0 但对任意有限 $x$ 严格非零。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释为什么"饱和后梯度仍非零"对训练有利。</p>
+    <details>
+    <summary>解答：深饱和坐标仍可被拉回</summary>
+    <p>梯度反向传播到深饱和坐标时，softcap 的非零导数保证梯度信号不被截断，优化器仍能（哪怕缓慢）把该坐标拉回非饱和区；hard clamping 中该坐标梯度严格为 0，一旦进入饱和区就无法通过自身梯度恢复。K3 §B 末段据此称 softcap"preserves nonzero gradients away from saturation boundaries"并给出更好的训练行为（经验陈述）。</p>
+    </details>
+  </li>
+  <li>
+    <p>指出 K3 §B 末段"better training behavior"是经验陈述还是对照实验结论。</p>
+    <details>
+    <summary>解答：经验陈述</summary>
+    <p>经验陈述。原文措辞是"which we find to give better training behavior"，属观察性表述；报告未提供 SiTU-GLU 与（SwiGLU + clip）的对照训练曲线，不能据此推出"softcap 普适优于 clip"。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章说清了 softcap 与 hard clamping 在饱和区梯度上的关键差别。最后回到使用层面——下一章给出 SiTU-GLU 在 K3 中的两个使用位置与四条不解决的边界。</p>
 
-<h2 id="usage-and-boundary">在 K3 中的使用位置与不解决——两处使用与四条边界</h2>
+<h2 id="usage-and-boundary">5. 在 K3 中的使用位置与不解决——两处使用与四条边界</h2>
 
 <p>SiTU-GLU 在 K3 中有两个使用位置（K3 §2.3 + §4 对比表）：</p>
 
@@ -963,18 +1058,36 @@
   <li><b>"softcap 在饱和区等价于 hard clamping"</b>——不对（"为什么是 softcap 而不是 clip"章已展开）。两者输出在远点都接近 $\pm\beta$，但 softcap 导数指数衰减非零、hard clamping 导数严格为 0。</li>
 </ul>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 SiTU-GLU 在 K3 的两个使用位置。</li>
-  <li>指出 SiTU-GLU 在 Stable LatentMoE 三件套中只负责哪一项。</li>
-  <li>指出 SiTU-GLU 不解决的一类问题（举一个非 QB、非 MLA 的例子也可）。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出 SiTU-GLU 在 K3 的两个使用位置。</p>
+    <details>
+    <summary>解答：路由分支 FFN 与 Dense FFN</summary>
+    <p>一是 Stable LatentMoE 路由分支 FFN，抑制四连矩阵相乘 + 2.8 万亿参数规模下的激活爆炸，是核心使用场景；二是 Dense FFN，K2→K3 架构对比表（§4）显示激活函数从 SwiGLU 整体换为 SiTU-GLU（C10, N2）。</p>
+    </details>
+  </li>
+  <li>
+    <p>指出 SiTU-GLU 在 Stable LatentMoE 三件套中只负责哪一项。</p>
+    <details>
+    <summary>解答：抑制激活爆炸</summary>
+    <p>三件套为 RMSNorm（§2.3.1，减少 routed 表征对尺度变化的敏感性）、SiTU-GLU（§2.3.2，控制两支乘性因子有界、抑制激活爆炸）、Quantile Balancing（§2.3.3，896 专家池下的负载均衡）。SiTU-GLU 只负责抑制激活爆炸这一项，三者并列、各管一件事。</p>
+    </details>
+  </li>
+  <li>
+    <p>指出 SiTU-GLU 不解决的一类问题（举一个非 QB、非 MLA 的例子也可）。</p>
+    <details>
+    <summary>解答：不解决的边界举例</summary>
+    <p>例如低精度算术的其余问题：SiTU-GLU 只降低溢出风险，舍入误差、累加顺序、优化器状态精度等仍需专门方案。此外它也不保证训练损失一定下降——K3 §2.3.2 末段只承诺结构有界性，未给性能对照实验。</p>
+    </details>
+  </li>
+</ol>
 
-<p>本文从 SwiGLU 的激活爆炸动机出发，依次给出了 SiTU-GLU 的公式与手算、近原点一阶等价与输出上界 100 的证明、以及 softcap 相对 hard clamping 在饱和区梯度上的优势。回扣开头的学习目标：SiTU-GLU 是把 SwiGLU 的门支线性因子与值支同时换成 softcap $\beta\tanh(x/\beta)$ 的 GLU 变体<sup>[C1, F1]</sup>，在 K3 Stable LatentMoE 路由分支抑制四连矩阵相乘引发的激活爆炸<sup>[C9]</sup>；它通过 $\beta\tanh(z/\beta)=z+O((z/\beta)^3)$ 在近原点一阶等价 SwiGLU<sup>[C5, F3]</sup>、通过 $|\tanh|<1$ 把输出锁在 $\beta_1\beta_2=100$<sup>[C7, F4]</sup>，并以饱和区非零梯度区别于 hard clamping<sup>[C8]</sup>。报告未给 SiTU-GLU vs SwiGLU 的对照实验，$\beta_1=4,\beta_2=25$ 是 K3 工程设定而非普适最优——这些边界已在正文中逐条标出。</p>
+<p>本文从 SwiGLU 的激活爆炸动机出发，依次给出了 SiTU-GLU 的公式与手算、近原点一阶等价与输出上界 100 的证明、以及 softcap 相对 hard clamping 在饱和区梯度上的优势。回扣开头的核心问题：SiTU-GLU 是把 SwiGLU 的门支线性因子与值支同时换成 softcap $\beta\tanh(x/\beta)$ 的 GLU 变体<sup>[C1, F1]</sup>，在 K3 Stable LatentMoE 路由分支抑制四连矩阵相乘引发的激活爆炸<sup>[C9]</sup>；它通过 $\beta\tanh(z/\beta)=z+O((z/\beta)^3)$ 在近原点一阶等价 SwiGLU<sup>[C5, F3]</sup>、通过 $|\tanh|<1$ 把输出锁在 $\beta_1\beta_2=100$<sup>[C7, F4]</sup>，并以饱和区非零梯度区别于 hard clamping<sup>[C8]</sup>。报告未给 SiTU-GLU vs SwiGLU 的对照实验，$\beta_1=4,\beta_2=25$ 是 K3 工程设定而非普适最优——这些边界已在正文中逐条标出。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-scope">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <ul>
   <li>C1（SiTU-GLU 定义）：Kimi K3 Technical Report §2.3.2 Eq.(12)。本地存档 <code>/tmp/kimi-k3-research/k3-report.txt:498-502</code>。</li>
   <li>C2（softcap 套到门支线性因子与值支）：K3 §2.3.2 第二段与 §B 第二段。本地 <code>k3-report.txt:497-498, 2763-2766</code>。</li>
@@ -988,7 +1101,7 @@
   <li>C10（K2→K3 激活函数 SwiGLU→SiTU-GLU）：K3 §4 对比表。本地 <code>k3-report.txt:756</code>。</li>
 </ul>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <ul>
   <li>F1 SiTU-GLU 定义：K3 §2.3.2 Eq.(12)。</li>
   <li>F2 softcap $\beta\tanh(x/\beta)$：K3 §2.3.2 Eq.(12) 前定义式。</li>
@@ -1001,29 +1114,29 @@
   <li>F9 clip 导数：标准定义（基础记号）。</li>
 </ul>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <ul>
   <li>N1：K3 设定 $\beta_1=4,\beta_2=25$，输出上界 $\beta_1\beta_2=100$。来源：K3 §2.3.2 末段 + §B Eq.(19)。</li>
   <li>N2：K2→K3 激活函数对比表行 SwiGLU→SiTU-GLU。来源：K3 §4 对比表。无具体性能数字。</li>
 </ul>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <ul>
-  <li>教学示例：标量 $x\in\{0,10,100\}$，设两支 pre-act 均为 $x$（隔离函数行为）。构造目的：让读者看到原点附近与 SwiGLU 同值、远点逼近上界 100、负侧被 sigmoid 杀到 0 三个关键点。数字为教学构造，不代表真实 FFN 两支共享同一权重。</li>
+  <li>构造示例：标量 $x\in\{0,10,100\}$，设两支 pre-act 均为 $x$（隔离函数行为）。构造目的：让读者看到原点附近与 SwiGLU 同值、远点逼近上界 100、负侧被 sigmoid 杀到 0 三个关键点。数字为教学构造，不代表真实 FFN 两支共享同一权重。</li>
   <li>$x=2$、$x=50$ 中间点手算（折叠块）：验证从原点到饱和的过渡平滑。</li>
   <li>$z=0.5,\beta=4$ 验证局部展开（折叠块）：$4\tanh(0.125)\approx 0.49741$，理论 $-z^3/(3\beta^2)\approx -0.00260$，吻合。</li>
   <li>$x=100,\beta=4/25$ 的梯度数值（折叠块）：导数 $\approx 7.7\times 10^{-22}$（深饱和）与 $\approx 1.3\times 10^{-3}$（浅饱和），验证"非零但极小"。</li>
   <li>对照 SwiGLU 在 $x=0/10/100$ 的输出 $0/99.995/10000$：构造目的是直观展示"无界增长 100 倍"，对照 SiTU-GLU 的 99.93。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <ul>
   <li>"softcap 平滑饱和到 $\pm\beta$"——只解释 $\tanh$ 值域 $(-1,1)$ 乘 $\beta$ 后压到 $(-\beta,\beta)$ 的<b>数值范围</b>关系。失效边界：$\beta\tanh(x/\beta)$ 严格小于 $\pm\beta$（开区间），不是严格等于；只有在 $|x|\to\infty$ 极限时才趋于 $\pm\beta$。</li>
   <li>"SiTU-GLU 是 SwiGLU 的有界化版本"——只解释 $\beta\tanh(x/\beta)$ 替换 SwiGLU 中线性因子 $x$ 这一<b>结构关系</b>，依据 §B 极限行为 $\beta\to\infty$ 收敛到 SwiGLU。失效边界：$\beta_1,\beta_2$ 有限时 SiTU-GLU 与 SwiGLU 数值不同，不能在工程计算中互相替换。</li>
   <li>"饱和区仍能传梯度"——只解释 $1-\tanh^2(x/\beta)$ 严格非零这一<b>导数性质</b>。失效边界：深饱和时梯度指数衰减接近 0，"非零"是数学严格性、不是工程意义上的"有用梯度"。</li>
 </ul>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <ul>
   <li>设两支 pre-act 均为同一标量 $x$。可推出：原点近线性、正侧饱和到上界、负侧 sigmoid 杀尾三个性质。不可推出：真实 FFN 中两支 pre-act 分布不同时的精确输出——那需要 $W_g x$ 与 $W_u x$ 各自的分布。</li>
   <li>用标量代替向量。可推出：每个坐标独立满足上界。不可推出：不同坐标间的相关性或联合分布性质。</li>

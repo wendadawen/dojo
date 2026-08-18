@@ -580,6 +580,10 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    .chapter-questions { margin: 0.5rem 0 0; }
+    .chapter-questions li { margin-bottom: 1.2rem; }
+    .chapter-questions li:last-child { margin-bottom: 0; }
+    .chapter-questions li > p { margin-bottom: 0.5rem; }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -664,13 +668,37 @@
 <p>训练 transformer 时，某个隐藏层权重矩阵的动量更新经 SVD 分解后发现：最大的几个奇异值方向拿走了更新的绝大部分"能量"，而很多奇异值很小的方向几乎不被更新。Muon（MomentUm Orthogonalized by Newton-Schulz）由 Keller Jordan 等于 2024 年提出，专门针对隐藏层二维权重矩阵，对动量更新做 Newton-Schulz 正交化后再作为更新方向，让每一个奇异值方向获得均等的更新尺度；标量/向量参数、embedding 层、输出层仍用 AdamW。本文回答四个问题：正交化为什么能改善更新、Newton-Schulz 迭代如何只用矩阵乘法逼近正交化、Muon 与 SGD-momentum 和 AdamW 的几何区别、Muon 的适用边界在哪里。<sup>[C1]</sup></p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>Muon 每一步对动量更新矩阵做了什么，为什么这样能改善二维权重矩阵的更新？</li>
-    <li>Newton-Schulz 迭代如何把"正交化一个矩阵"变成只靠矩阵乘法就能逐步逼近的计算？</li>
-    <li>Muon 与 SGD-momentum、AdamW 在更新方向的几何结构上有什么关键区别？</li>
-    <li>Muon 适用哪些参数、不适用哪些参数，为什么 embedding 和输出层仍用 AdamW？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>Muon 每一步对动量更新矩阵做了什么，为什么这样能改善二维权重矩阵的更新？</p>
+      <details>
+        <summary>解答：正交化动量更新</summary>
+        <p>Muon 先按 Nesterov momentum 累积动量得到 $M_t$，再对 $M_t$ 做 Newton-Schulz 正交化，把所有奇异值拉平到接近 1，最后以正交化结果 $O_t \approx UV^\top$ 作为更新方向。改善的关键机制：SGD-momentum 产生的动量更新矩阵通常条件数很高，少数大奇异值方向拿走绝大部分更新能量，小奇异值方向几乎不被更新；正交化使每个奇异值方向获得均等的更新尺度。完整论证见「1. 动量更新矩阵为什么需要正交化」与「2. Newton-Schulz 迭代如何近似正交化」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Newton-Schulz 迭代如何把"正交化一个矩阵"变成只靠矩阵乘法就能逐步逼近的计算？</p>
+      <details>
+        <summary>解答：矩阵乘法逼近正交化</summary>
+        <p>Newton-Schulz 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$ 只含矩阵乘法与线性组合，没有 SVD、没有求逆。在 SVD 下，它等价于对每个奇异值施加五次多项式 $\phi(x)=ax+bx^3+cx^5$；迭代前先做谱范数归一化，使奇异值落入 $[0,1]$ 的收敛域，重复 5 步后所有非零奇异值被推向 1。由于只用矩阵乘法，它可在 GPU 的 bfloat16 张量核心上高效运行。完整论证见「2. Newton-Schulz 迭代如何近似正交化」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Muon 与 SGD-momentum、AdamW 在更新方向的几何结构上有什么关键区别？</p>
+      <details>
+        <summary>解答：三者几何结构对比</summary>
+        <p>SGD-momentum 直接用动量矩阵 $M_t$ 更新，各奇异值方向的步长正比于奇异值大小，大方向更新过猛、小方向不足；AdamW 逐坐标按二阶矩缩放，不考虑矩阵整体的方向结构；Muon 对整个矩阵正交化，把各奇异值拉平到接近 1，方向间相对尺度被重整、各方向步长均等。完整对比见「3. Muon 的完整更新流程与几何含义」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Muon 适用哪些参数、不适用哪些参数，为什么 embedding 和输出层仍用 AdamW？</p>
+      <details>
+        <summary>解答：适用边界</summary>
+        <p>Muon 仅适用于隐藏层二维权重矩阵（线性层权重、展平后的卷积核）。一维参数（bias、LayerNorm）无法定义奇异值方向，用 AdamW；embedding 层虽是二维矩阵，但 modular norm theory 表明其优化动力学应当不同；输出层用 AdamW 是纯经验结论。QKV 应分别应用于 Q、K、V 三个投影矩阵。完整论证见「4. Muon 的适用边界」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
@@ -682,7 +710,7 @@
   </ul>
 </section>
 
-<h2 id="why-orthogonalize">动量更新矩阵为什么需要正交化——条件数高与稀有方向被忽略</h2>
+<h2 id="why-orthogonalize">1. 动量更新矩阵为什么需要正交化——条件数高与稀有方向被忽略</h2>
 
 <p>先回顾带动的随机梯度下降（SGD-momentum）。它维护一个动量缓冲矩阵 $M_t$，每步把当前梯度 $G_t$ 累积进去：</p>
 
@@ -695,7 +723,7 @@
 <p>Keller Jordan 在主源博客中报告了一项经验观察：SGD-momentum 和 Adam 产生的二维参数更新矩阵<strong>通常条件数很高</strong>，近似低秩——所有神经元的更新被少数几个方向主导。<sup>[C4]</sup> 条件数定义为最大奇异值与最小奇异值之比；条件数高意味着各方向更新幅度悬殊。</p>
 
 <div class="callout callout-yellow">
-<p><b>教学示例</b>。 假设某个隐藏层权重矩阵的动量更新 $M_t$ 经 SVD 后奇异值为 $(0.9,\ 0.1)$，即 $M_t$ 在两个奇异值方向上的更新幅度相差 9 倍（条件数 $0.9/0.1 = 9$）。大奇异值方向拿走了绝大部分更新能量，小奇异值方向几乎不被更新。这里的数字是为便于手算构造的教学数字，不代表真实训练数据。</p>
+<p><b>构造示例</b>。 假设某个隐藏层权重矩阵的动量更新 $M_t$ 经 SVD 后奇异值为 $(0.9,\ 0.1)$，即 $M_t$ 在两个奇异值方向上的更新幅度相差 9 倍（条件数 $0.9/0.1 = 9$）。大奇异值方向拿走了绝大部分更新能量，小奇异值方向几乎不被更新。这里的数字是为便于手算构造的教学数字，不代表真实训练数据。</p>
 </div>
 
 <p>直接用这样的 $M_t$ 更新参数，等于只优化了少数方向。作者推测，正交化能有效放大那些在更新中幅度很小但对学习重要的"稀有方向"，抑制过度主导的少数方向。<sup>[C5]</sup></p>
@@ -708,16 +736,34 @@
 
 <p>但直接做 SVD 取 $UV^\top$ 太慢。下一章看 Newton-Schulz 迭代如何只用矩阵乘法逼近这个目标。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用自己的话说"动量更新矩阵条件数高"意味着什么。</li>
-  <li>说明正交化目标 $\operatorname{Ortho}(G)$ 为什么等价于把奇异值全置 1。</li>
-  <li>计算奇异值为 $(0.9,\ 0.1)$ 的矩阵的条件数。</li>
-</ul>
-
 <p>本章解释了动量更新矩阵条件数高、正交化把奇异值拉平的动机。但直接做 SVD 太慢——下一章讲 Newton-Schulz 迭代如何只用矩阵乘法逼近正交化。</p>
 
-<h2 id="newton-schulz-iteration">Newton-Schulz 迭代如何近似正交化——只用矩阵乘法把奇异值推向 1</h2>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>"动量更新矩阵条件数高"意味着什么？</p>
+    <details>
+      <summary>解答：条件数高的含义</summary>
+      <p>条件数是最大奇异值与最小奇异值之比。条件数高说明动量更新矩阵 $M_t = USV^\top$ 的各奇异值 $s_i$ 悬殊，更新近似低秩：少数大奇异值方向拿走绝大部分更新能量，很多小奇异值方向几乎不被更新。<sup>[C4]</sup> 例如奇异值为 $(0.9,\ 0.1)$ 时条件数为 $0.9/0.1 = 9$，两个方向的更新幅度相差 9 倍。这一观察的经验范围是 SGD-momentum 和 Adam 产生的二维参数更新矩阵。</p>
+    </details>
+  </li>
+  <li>
+    <p>正交化目标 $\operatorname{Ortho}(G)$ 为什么等价于把奇异值全置 1？</p>
+    <details>
+      <summary>解答：正交化目标与 $UV^\top$</summary>
+      <p>$\operatorname{Ortho}(G) = \arg\min_O \{\|O - G\|_F : O^\top O = I\}$ 的解是 $UV^\top$（设 $G = USV^\top$）。约束 $O^\top O = I$ 要求 $O$ 的奇异值全为 1；在所有满足约束的半正交矩阵中，与 $G$ 的 Frobenius 距离最小的是保留 $G$ 的奇异向量方向、把奇异值全置 1 的那个，即 $UV^\top$。该结论以 Frobenius 范数度量距离为前提。</p>
+    </details>
+  </li>
+  <li>
+    <p>计算奇异值为 $(0.9,\ 0.1)$ 的矩阵的条件数。</p>
+    <details>
+      <summary>解答：条件数计算</summary>
+      <p>条件数 = 最大奇异值 / 最小奇异值 = $0.9/0.1 = 9$。这个例子是人为构造的手算数字：条件数 9 已足以展示"少数方向主导更新"；真实训练中动量更新矩阵的条件数通常更高。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="newton-schulz-iteration">2. Newton-Schulz 迭代如何近似正交化——只用矩阵乘法把奇异值推向 1</h2>
 
 <p>Newton-Schulz（NS）迭代用矩阵乘法的多项式逼近正交化，单步公式为：<sup>[F1]</sup></p>
 
@@ -756,9 +802,9 @@
 
 <p>NS 迭代的另一个工程优势是<strong>可在 bfloat16 精度下稳定运行</strong>。<sup>[C8]</sup> 对比之下，SVD 太慢，Shampoo 使用的 coupled Newton iteration 需要至少 float32 精度才能避免数值不稳定。NS 迭代只用矩阵乘法，而现代 GPU 有 bfloat16 专用张量核心，这使得它在工程上可行。</p>
 
-<h3 id="handcalc-example">手算例子：把 diag(0.9, 0.1) 拉平</h3>
+<h3 id="handcalc-example">2.1 手算例子：把 $\operatorname{diag}(0.9,\ 0.1)$ 拉平</h3>
 
-<p>用教学示例 $G = \operatorname{diag}(0.9,\ 0.1)$ 展示 NS 迭代。先做谱范数归一化：$\|G\|_F = \sqrt{0.9^2 + 0.1^2} = \sqrt{0.82} \approx 0.9055$，所以归一化后奇异值为 $(0.9939,\ 0.1104)$。</p>
+<p>用构造示例 $G = \operatorname{diag}(0.9,\ 0.1)$ 展示 NS 迭代。先做谱范数归一化：$\|G\|_F = \sqrt{0.9^2 + 0.1^2} = \sqrt{0.82} \approx 0.9055$，所以归一化后奇异值为 $(0.9939,\ 0.1104)$。</p>
 
 <p>用基线系数 $\phi(x) = 2x - 1.5x^3 + 0.5x^5$ 做第一步。对大奇异值 $s_1 = 0.9939$：</p>
 
@@ -772,7 +818,7 @@
 
 <details>
 <summary>展开：完整 5 步手算过程（基线系数）</summary>
-<p>教学示例。 初始（谱归一化后）奇异值 $(0.9939,\ 0.1104)$，基线系数 $\phi(x)=2x-1.5x^3+0.5x^5$。</p>
+<p>构造示例。 初始（谱归一化后）奇异值 $(0.9939,\ 0.1104)$，基线系数 $\phi(x)=2x-1.5x^3+0.5x^5$。</p>
 <div class="table-scroll">
 <table>
 <thead><tr><th>步数</th><th>大奇异值 $s_1$</th><th>小奇异值 $s_2$</th></tr></thead>
@@ -786,12 +832,12 @@
 </tbody>
 </table>
 </div>
-<p>5 步后两个奇异值都逼近 1，正交化完成。注意每步小奇异值的提升：0.11 → 0.22 → 0.42 → 0.74 → 0.98 → 1.00，越接近 1 提升越快（多项式在 1 附近斜率较大）。</p>
+<p>5 步后两个奇异值都逼近 1，正交化完成。注意每步小奇异值的提升：$0.11 \to 0.22 \to 0.42 \to 0.74 \to 0.98 \to 1.00$，越接近 1 提升越快（多项式在 1 附近斜率较大）。</p>
 </details>
 
 <details>
 <summary>展开：调优系数 vs 基线系数——第 1 步小奇异值对照</summary>
-<p>教学示例。 对同一个初始小奇异值 $s_2 = 0.1104$：</p>
+<p>构造示例。 对同一个初始小奇异值 $s_2 = 0.1104$：</p>
 <div class="table-scroll">
 <table>
 <thead><tr><th>系数</th><th>$\phi(x)$</th><th>第 1 步 $\phi(0.1104)$</th></tr></thead>
@@ -805,7 +851,7 @@
 </details>
 
 <details class="code-details">
-<summary>代码：用 numpy 复现 diag(0.9, 0.1) 的 5 步 NS 迭代</summary>
+<summary>代码：用 numpy 复现 $\operatorname{diag}(0.9,\ 0.1)$ 的 5 步 NS 迭代</summary>
 <div class="code-block">
 <pre><code class="language-python">import math
 import numpy as np
@@ -823,7 +869,7 @@ def newtonschulz5(G, a, b, c, steps=5, eps=1e-7):
         X = X.T
     return X
 
-# 教学示例
+# 构造示例
 G = np.diag(np.array([0.9, 0.1]))
 fro = np.linalg.norm(G)
 print(f"||G||_F = {fro:.6f}")
@@ -860,16 +906,34 @@ print(f"基线 O^T O =\n{np.round(O_base.T @ O_base, 4)} (应接近 I)")
 <p><b>教学简化</b>：简化做法是用 numpy 的 float64 计算。可推出：NS 迭代的奇异值拉平机制与精度无关。不可推出：bfloat16 下的精确数值行为与 float64 完全一致。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 NS 单步迭代公式，说明它只用矩阵乘法。</li>
-  <li>说明谱范数归一化的作用，以及为什么 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$ 使缩放是良性的。</li>
-  <li>用基线系数计算 $\phi(0.1104)$ 的值，与正文对照。</li>
-</ul>
-
 <p>本章展示了 Newton-Schulz 迭代如何只用矩阵乘法把奇异值推向 1。但 NS 迭代只是 Muon 的一环——下一章讲动量、正交化与参数更新的完整组合流程。</p>
 
-<h2 id="full-algorithm">Muon 的完整更新流程与几何含义——动量、正交化与参数更新</h2>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 NS 单步迭代公式，并说明它为什么只用矩阵乘法。</p>
+    <details>
+      <summary>解答：单步公式</summary>
+      <p>$G' = (aI + b(GG^\top) + c(GG^\top)^2)G = aG + b(GG^\top)G + c(GG^\top)^2 G$，其中 $a,b,c$ 是给定系数。整个计算只涉及矩阵乘法（$GG^\top$、$(GG^\top)G$ 等）与线性组合，没有 SVD、没有求逆，因此能在 GPU 上高效运行，并可在 bfloat16 精度下稳定工作。<sup>[F1]</sup></p>
+    </details>
+  </li>
+  <li>
+    <p>谱范数归一化起什么作用？为什么 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$ 使缩放是良性的？</p>
+    <details>
+      <summary>解答：归一化的作用与良性缩放</summary>
+      <p>归一化 $X = G/(\|G\|_F + \varepsilon)$ 把所有奇异值压入 $[0,1]$（因为最大奇异值不超过 $\|G\|_F$），保证奇异值落在多项式 $\phi$ 的收敛域内，这是迭代收敛的前提。由于正交化满足 $\operatorname{Ortho}(cG) = \operatorname{Ortho}(G)$（对任意非零常数 $c$），缩放只整体改变奇异值大小、不改变正交化目标，因此缩放是良性的。<sup>[F5]</sup></p>
+    </details>
+  </li>
+  <li>
+    <p>用基线系数计算 $\phi(0.1104)$，并与正文对照。</p>
+    <details>
+      <summary>解答：一步手算</summary>
+      <p>基线系数 $(a,b,c) = (2,\ -1.5,\ 0.5)$，即 $\phi(x) = 2x - 1.5x^3 + 0.5x^5$。代入 $x = 0.1104$：$\phi(0.1104) = 2(0.1104) - 1.5(0.1104)^3 + 0.5(0.1104)^5 \approx 0.2189$，与正文表格第 1 步的小奇异值一致。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="full-algorithm">3. Muon 的完整更新流程与几何含义——动量、正交化与参数更新</h2>
 
 <p>把动量与正交化组合起来，Muon 一步更新的完整流程为：</p>
 
@@ -915,7 +979,7 @@ W_{t+1} ← W_t - η · O_t
 
 <p>关键在于第 2 步与第 4 步的组合：<strong>动量在正交化之前加入</strong>。这不是任意选择——作者报告使用动量对最佳经验性能是必要的，且 Nesterov 版本略优。前瞻动量 $\tilde{M}_t$ 是被正交化的对象，最终的更新方向是 $O_t \approx UV^\top$ 而非原始动量 $M_t$。</p>
 
-<h3 id="geometry-comparison">与 SGD-momentum、AdamW 的几何区别</h3>
+<h3 id="geometry-comparison">3.1 与 SGD-momentum、AdamW 的几何区别</h3>
 
 <p>三者改变的是更新方向的几何结构，而非简单的学习率缩放：</p>
 
@@ -932,7 +996,7 @@ W_{t+1} ← W_t - η · O_t
 
 <p>SGD-momentum 直接用 $M_t$ 更新，各奇异值方向步长正比于奇异值大小——大方向更新过猛、小方向更新不足（回到动量更新矩阵条件数高的问题）。AdamW 逐坐标归一化（按元素二阶矩缩放每个参数），它不看矩阵整体的方向结构。（AdamW 是逐坐标自适应学习率加权重衰减的优化器，本文只用其作为对照。）Muon 对整个矩阵做正交化，改变的是方向间的相对尺度：把各奇异值拉平到接近 1，使各方向步长均等。</p>
 
-<h3 id="shampoo-relation">与 Shampoo 的关系</h3>
+<h3 id="shampoo-relation">3.2 与 Shampoo 的关系</h3>
 
 <p>Muon 可视为"无累积 Shampoo"。Shampoo 是二阶预条件优化器，去除其 preconditioner accumulation 后，更新经 SVD 展开等价于正交化梯度：<sup>[C6]</sup></p>
 
@@ -950,22 +1014,40 @@ W_{t+1} ← W_t - η · O_t
 
 <p>所以 Muon 与无累积 Shampoo 的更新方向在数学上等价。<sup>[F6]</sup> 区别在于：Muon 在正交化<strong>之前</strong>加入 momentum（Shampoo 不加）；Muon 用 Newton-Schulz 迭代替代 Shampoo 的逆四次根 $(GG^\top)^{-1/4}$ 计算，从而更高效、可在 bfloat16 下运行。</p>
 
-<h3 id="engineering-cost">工程开销与外部证据</h3>
+<h3 id="engineering-cost">3.3 工程开销与外部证据</h3>
 
 <p>NS 迭代的 FLOP 开销很低。对 $n \times m$ 矩阵（$m \le n$），每步 NS 迭代约需 $2(2nm^2 + m^3)$ matmul FLOPs，总开销上界为 $T \cdot m / B$（$T=5$ 为迭代步数，$B$ 为 batch size）。在典型 LM 训练场景下 FLOP 开销低于 1%：<sup>[N8]</sup> NanoGPT speedrun（$m=768$，$B=524288$）约 0.7%，Llama 405B（$m=16384$，$B=16\text{M}$）约 0.5%。</p>
 
 <p>Muon 的主要外部证据来自竞争性训练任务 NanoGPT speedrun（以 FineWeb 数据集训练 NanoGPT 达到 val loss 3.28 为目标）：<sup>[N6, N7]</sup> 2024-10-15 从 AdamW 切换到 Muon 首次创造训练速度记录，提速 35%；此后产生的 12 个新记录由 7 位不同研究者创造，Muon 在所有记录中保持为优化器选择。扩展验证中，用 8 张 H100 训练 1.5B 参数 transformer 达到 GPT-2 XL 级 HellaSwag 性能，Muon 需 10 小时而 AdamW 需 13.3 小时；<sup>[N9]</sup> CIFAR-10 训练至 94% 准确率的速度记录从 3.3 A100-seconds 提升到 2.6 A100-seconds。<sup>[N10]</sup> 这些是外部事实数字，说明 Muon 在竞争性任务中的表现，不直接构成机制结论。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>按顺序说出 Muon 一步更新的五个步骤。</li>
-  <li>说明动量在正交化之前加入的原因。</li>
-  <li>对比 SGD-momentum 与 Muon 在大/小奇异值方向上步长的差异。</li>
-</ul>
-
 <p>本章把动量、正交化与参数更新组合成完整流程，并对比了 SGD-momentum、AdamW 与 Shampoo。但 Muon 并非万能——下一章讲它的适用边界，哪些参数用 Muon、哪些仍用 AdamW。</p>
 
-<h2 id="applicability">Muon 的适用边界——哪些参数用 Muon，哪些仍用 AdamW</h2>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>按顺序说出 Muon 一步更新的五个步骤。</p>
+    <details>
+      <summary>解答：一步更新的完整流程</summary>
+      <p>（1）计算当前梯度 $G_t = \nabla_W \mathcal{L}(W_t)$；（2）用 Nesterov momentum 累积动量，先构造前瞻动量 $\tilde{M}_t = G_t + \beta M_{t-1}$，再更新动量缓冲 $M_t = \beta M_{t-1} + G_t$；（3）对动量矩阵做谱范数归一化 $X = \tilde{M}_t / (\|\tilde{M}_t\|_F + \varepsilon)$；（4）做 5 步 NS 迭代正交化，得到 $O_t \approx UV^\top$；（5）参数更新 $W_{t+1} = W_t - \eta O_t$。</p>
+    </details>
+  </li>
+  <li>
+    <p>动量为什么在正交化之前加入？</p>
+    <details>
+      <summary>解答：动量加入的时机</summary>
+      <p>作者报告使用动量对最佳经验性能是必要的，且 Nesterov 版本在他们测试过的所有情况中都略优于普通 SGD-momentum，因此被正交化的对象是前瞻动量 $\tilde{M}_t$ 而非原始梯度。<sup>[C3]</sup> 这是经验结论：最终更新方向是 $O_t \approx UV^\top$，动量的作用体现在进入正交化之前先累积历史梯度信息。</p>
+    </details>
+  </li>
+  <li>
+    <p>SGD-momentum 与 Muon 在大/小奇异值方向上的步长有何差异？</p>
+    <details>
+      <summary>解答：步长几何对比</summary>
+      <p>SGD-momentum 各方向步长正比于奇异值大小：大奇异值方向更新过猛、小奇异值方向更新不足（条件数高的直接后果）。Muon 把奇异值拉平到接近 1，各方向步长趋于均等，更新方向的相对尺度被重整。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="applicability">4. Muon 的适用边界——哪些参数用 Muon，哪些仍用 AdamW</h2>
 
 <p>Muon 并非全量替换 AdamW 的"更好版本"。它改变的是更新方向的几何结构，仅适用于特定参数类型。<sup>[C2]</sup> 训练一个含 Muon 的网络时，参数按以下方式分组：</p>
 
@@ -984,11 +1066,11 @@ W_{t+1} ← W_t - η · O_t
 
 <p>embedding 层用 AdamW 有理论支持：modular norm theory（Large et al. 2024）表明 embedding 层的优化动力学应当与其他层不同。输出层用 AdamW 则是纯经验结论——作者明确指出这"似乎不遵循理论，而是由经验驱动"。<sup>[C2]</sup> 本文只引用 modular norm theory 的结论，不展开其推导。</p>
 
-<h3 id="qkv-separate">QKV 应分开应用</h3>
+<h3 id="qkv-separate">4.1 QKV 应分开应用</h3>
 
 <p>训练 transformer 时，Muon 应分别应用于 Q、K、V 三个投影矩阵，而非合并为单一 QKV 矩阵后统一应用。<sup>[C7]</sup> 这是 Vlado Boza 首先展示的经验结果：transformer 实现常把 QKV 参数化为一个输出再分割的单一线性层，但对其统一应用 Muon 效果不如分开应用。</p>
 
-<h3 id="rms-alignment">RMS 对齐缩放因子</h3>
+<h3 id="rms-alignment">4.2 RMS 对齐缩放因子</h3>
 
 <p>正交化后的更新 $O_t \approx UV^\top$ 的各奇异值接近 1，但不同形状矩阵的"每元素平均更新幅度"（update RMS）不同。为了让 Muon 的 update RMS 与 AdamW 一致（便于复用 AdamW 调好的学习率与权重衰减），Moonshot AI 提出了 RMS 对齐缩放因子：<sup>[F7]</sup></p>
 
@@ -999,12 +1081,12 @@ W_{t+1} ← W_t - η · O_t
 <p>$$\operatorname{RMS}(UV^\top) = \frac{\|UV^\top\|_F}{\sqrt{nm}} = \sqrt{\frac{r}{nm}} = \sqrt{\frac{1}{\max(m,n)}}.$$</p>
 
 <details>
-<summary>补充：RMS(UVᵀ) = √(1/max(m,n))</summary>
+<summary>补充：$\operatorname{RMS}(UV^\top) = \sqrt{1/\max(m,n)}$</summary>
 <p>设 $U \in \mathbb{R}^{n \times r}$，$V \in \mathbb{R}^{m \times r}$，$U^\top U = I$，$V^\top V = I$（列正交），$r = \min(m,n)$。则 $UV^\top \in \mathbb{R}^{n \times m}$，其 Frobenius 范数平方为：</p>
 <p>$$\|UV^\top\|_F^2 = \sum_{i=1}^{n}\sum_{j=1}^{m} (UV^\top)_{ij}^2 = \sum_{i,j} \left(\sum_{k=1}^{r} U_{ik} V_{jk}\right)^2.$$</p>
 <p>展开平方并交换求和顺序：</p>
 <p>$$= \sum_{k=1}^{r} \sum_{l=1}^{r} \left(\sum_{i=1}^{n} U_{ik} U_{il}\right) \left(\sum_{j=1}^{m} V_{jk} V_{jl}\right).$$</p>
-<p>由 $U^\top U = I$ 知 $\sum_i U_{ik} U_{il} = \delta_{kl}$（克罗内克 δ），同理 $\sum_j V_{jk} V_{jl} = \delta_{kl}$。所以：</p>
+<p>由 $U^\top U = I$ 知 $\sum_i U_{ik} U_{il} = \delta_{kl}$（克罗内克 $\delta$），同理 $\sum_j V_{jk} V_{jl} = \delta_{kl}$。所以：</p>
 <p>$$= \sum_{k=1}^{r} \delta_{kk} \cdot \delta_{kk} = \sum_{k=1}^{r} 1 = r.$$</p>
 <p>因此 $\|UV^\top\|_F = \sqrt{r}$，$\operatorname{RMS}(UV^\top) = \sqrt{r}/\sqrt{nm} = \sqrt{r/(nm)}$。满秩时 $r = \min(m,n)$，化简得 $\sqrt{1/\max(m,n)}$。</p>
 </details>
@@ -1026,26 +1108,51 @@ W_{t+1} ← W_t - η · O_t
 </table>
 </div>
 
-<p>最后回顾全文要点，回扣开篇的四个学习目标。第一，Muon 每一步对动量更新矩阵做 Newton-Schulz 正交化，把奇异值拉平到接近 1，使各奇异值方向获得均等更新尺度，改善二维权重矩阵的条件数过高问题。第二，Newton-Schulz 迭代用五次多项式 $\phi(x)=ax+bx^3+cx^5$ 对奇异值施加变换，在 SVD 下矩阵迭代退化为标量迭代，只用矩阵乘法、可在 bfloat16 下运行。第三，Muon 与 SGD-momentum、AdamW 的关键区别在更新方向的几何结构：SGD-momentum 步长正比于奇异值大小，AdamW 逐坐标归一化不看矩阵整体方向，Muon 对整个矩阵做正交化重整方向间相对尺度。第四，Muon 仅适用于隐藏层二维权重矩阵（线性层权重、卷积核展平），embedding 层用 AdamW 有 modular norm theory 理论支持，输出层用 AdamW 是纯经验结论；QKV 应分开应用；Moonshot 的 RMS 对齐缩放因子使 Muon 可复用 AdamW 调好的超参。</p>
+<p>最后回顾全文要点，回扣开篇的四个核心问题。第一，Muon 每一步对动量更新矩阵做 Newton-Schulz 正交化，把奇异值拉平到接近 1，使各奇异值方向获得均等更新尺度，改善二维权重矩阵的条件数过高问题。第二，Newton-Schulz 迭代用五次多项式 $\phi(x)=ax+bx^3+cx^5$ 对奇异值施加变换，在 SVD 下矩阵迭代退化为标量迭代，只用矩阵乘法、可在 bfloat16 下运行。第三，Muon 与 SGD-momentum、AdamW 的关键区别在更新方向的几何结构：SGD-momentum 步长正比于奇异值大小，AdamW 逐坐标归一化不看矩阵整体方向，Muon 对整个矩阵做正交化重整方向间相对尺度。第四，Muon 仅适用于隐藏层二维权重矩阵（线性层权重、卷积核展平），embedding 层用 AdamW 有 modular norm theory 理论支持，输出层用 AdamW 是纯经验结论；QKV 应分开应用；Moonshot 的 RMS 对齐缩放因子使 Muon 可复用 AdamW 调好的超参。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>Muon 适用于哪些参数？embedding 层和输出层为什么仍用 AdamW？</p>
+    <details>
+      <summary>解答：参数分组与理由</summary>
+      <p>Muon 适用于隐藏层二维权重矩阵：线性层权重与展平后的卷积核，正交化使其各方向均等更新。标量/向量参数（bias、LayerNorm scale/shift）无法定义奇异值方向，正交化无意义，用 AdamW。embedding 层用 AdamW 有 modular norm theory 的理论支持（其优化动力学应当与其他层不同）；输出层用 AdamW 是纯经验结论，作者明确指出不遵循理论、由经验驱动。<sup>[C2]</sup></p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 QKV 应分开应用 Muon？</p>
+    <details>
+      <summary>解答：QKV 分开应用</summary>
+      <p>transformer 实现常把 QKV 参数化为一个输出再分割的单一线性层，但对合并后的 QKV 矩阵统一应用 Muon 的效果不如分别应用于 Q、K、V 三个投影矩阵。这是 Vlado Boza 首先展示的经验结果，目前无理论解释。<sup>[C7]</sup></p>
+    </details>
+  </li>
+  <li>
+    <p>RMS 对齐缩放因子解决什么问题？$\gamma$ 的值是多少？</p>
+    <details>
+      <summary>解答：RMS 对齐缩放因子</summary>
+      <p>正交化后的更新 $O_t \approx UV^\top$ 各奇异值接近 1，但不同形状矩阵的每元素平均更新幅度（update RMS）不同。Moonshot AI 提出缩放因子 $\gamma = 0.2\sqrt{\max(m,n)}$，缩放后的 update RMS 恒为 0.2，与 AdamW 的典型 update RMS 对齐，从而复用 AdamW 调好的学习率与权重衰减。此缩放是 Moonshot 改进，非 Keller Jordan 原始博客内容；PyTorch <code>torch.optim.Muon</code> 提供该选项。<sup>[F7]</sup></p>
+    </details>
+  </li>
+</ol>
 
-<h3>核心论断与来源</h3>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
 <p>C1（Muon 定义）、C2（仅隐藏层 2D，embedding/输出层用 AdamW）、C3（动量在正交化前加入，Nesterov 默认）、C4（更新矩阵条件数高）、C5（正交化放大稀有方向）、C6（与 Shampoo 关系）、C7（QKV 分开）、C8（bfloat16 稳定）：均来自 Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客 https://kellerjordan.github.io/posts/muon/）。C2 中 embedding 用 AdamW 的理论依据为 modular norm theory（Large et al. 2024《Scalable Optimization in the Modular Norm》，arXiv:2405.14813），本文只引用结论。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p>F1（NS 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$）、F2（SVD 下 $U\phi(S)V^\top$）、F3（N 步复合 $U\phi^N(S)V^\top$）、F4（正交化目标 $\arg\min\|O-G\|_F$ 等价 $UV^\top$）、F5（谱范数归一化与 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$）、F6（Shampoo 无累积 = $UV^\top$）：均来自 Keller Jordan 2024 博客。F7（RMS 对齐缩放因子 $\gamma=0.2\sqrt{\max(m,n)}$ 与 $\operatorname{RMS}(UV^\top)=\sqrt{1/\max(m,n)}$）：来自 Moonshot AI《Muon is Scalable for LLM Training》（2025），推导参考苏剑林博客（kexue.fm）。F1–F5 由主源直接给出；F6 由主源给出 SVD 展开步骤，本页折叠块补全过程；F7 由 Moonshot 给出结论，本页折叠块补全 RMS 推导。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>N1（调优系数 $(3.4445, -4.7750, 2.0315)$）、N2（基线系数 $(2, -1.5, 0.5)$）、N3（迭代步数 5）、N4（$\varepsilon=10^{-7}$）、N5（允许 $\phi^N(x)\in[0.7,1.3]$）、N8（FLOP 开销 NanoGPT 0.7% / Llama 405B 0.5%）、N9（1.5B transformer 10 vs 13.3 H100-hours）、N10（CIFAR-10 3.3→2.6 A100-seconds）：来自 Keller Jordan 2024 博客。N6（2024-10-15 首次记录，提速 35%）、N7（12 个记录，7 位研究者）：来自同一博客。N11（PyTorch <code>torch.optim.Muon</code> 默认 lr=1e-3, weight_decay=0.1, momentum=0.95, nesterov=True, ns_steps=5, adjust_lr_fn 默认 'original'）：来自 PyTorch 官方文档 <code>torch.optim.Muon</code>（2.9 起内置，<code>adjust_lr_fn='match_rms_adamw'</code> 提供 Moonshot RMS 对齐选项）。N12（贡献者 Jordan、Jin、Boza、You、Cesista、Newhouse、Bernstein）：来自博客 Citation。</p>
 
-<h3>教学示例</h3>
-<p>教学示例 $G = \operatorname{diag}(0.9,\ 0.1)$ 为人为构造的教学数字，目的是让奇异值拉平过程可手算：条件数 9（少数方向主导），谱归一化后 $(0.9939,\ 0.1104)$，5 步基线系数 NS 后逼近 $(1,\ 1)$。不代表真实训练数据或工程推荐值。可运行代码用 numpy float64 复现，便于读者独立验证。</p>
+<h3>构造示例</h3>
+<p>构造示例 $G = \operatorname{diag}(0.9,\ 0.1)$ 为人为构造的教学数字，目的是让奇异值拉平过程可手算：条件数 9（少数方向主导），谱归一化后 $(0.9939,\ 0.1104)$，5 步基线系数 NS 后逼近 $(1,\ 1)$。不代表真实训练数据或工程推荐值。可运行代码用 numpy float64 复现，便于读者独立验证。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>"正交化把奇异值拉平到接近 1"只解释 SVD 下奇异值被多项式映射这一局部关系，不保证正交化对任意矩阵都收敛——收敛要求初始奇异值落在 $\phi$ 的收敛域（由谱范数归一化保证）。"放大稀有方向、抑制主导方向"是作者推测（speculate），不作为已证结论。"无累积 Shampoo"的定位只解释 Muon 与去除累积的 Shampoo 在更新方向上的等价性，不覆盖 Shampoo 的完整 preconditioner accumulation 机制。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>简化做法是用 numpy 的 float64 计算。可推出：NS 迭代的奇异值拉平机制与计算精度无关。不可推出：bfloat16 下的精确数值行为与 float64 完全一致（真实工程用 bfloat16 在 GPU 上运行，精度行为有差异但机制一致）。</p>
 <p>简化做法是只展示 2×2 对角矩阵。可推出：NS 迭代机制对任意大小矩阵相同。不可推出：大矩阵的收敛速度与 2×2 一致（真实训练中矩阵远大于此，如 $768 \times 768$ 或更大）。</p>
 <p>简化做法是伪代码与代码只展示单步更新与正交化。可推出：Muon 的核心更新机制。不可推出：完整训练流程（未展示学习率调度、权重衰减除 RMS 对齐外、梯度裁剪等工程细节，不能直接作为生产训练代码）。</p>

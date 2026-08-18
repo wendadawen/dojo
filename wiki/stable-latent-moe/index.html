@@ -578,18 +578,40 @@
       padding: 0;
       border: none;
     }
-    .learning-goals ul,
+    .learning-goals ul, .learning-goals ol,
     .misconceptions ul { margin-bottom: 0; }
-    .diagram {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      background: var(--bg-code);
-      padding: 1rem;
-      overflow-x: auto;
-      border-radius: 6px;
+    /* ============ SVG 结构图 ============ */
+    svg.dg { width: 100%; height: auto; display: block; margin: 2rem 0; }
+    .dg .dg-box { fill: var(--bg-soft); stroke: var(--border); stroke-width: 1; }
+    .dg .dg-box-hl { fill: var(--bg-soft); stroke: var(--yellow); stroke-width: 1.5; }
+    .dg .dg-line { stroke: var(--text-muted); stroke-width: 1.2; fill: none; }
+    .dg .dg-title { font-family: var(--font-ui); font-size: 13px; fill: var(--text-light); }
+    .dg .dg-step { font-family: var(--font-ui); font-size: 11px; fill: var(--text-muted); }
+    .dg-label {
+      font-family: var(--font-ui);
+      font-size: 13px;
       line-height: 1.5;
-      margin: 1.5rem 0;
+      color: var(--text);
+      text-align: center;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      height: 100%;
     }
+    .dg-note {
+      font-family: var(--font-ui);
+      font-size: 12px;
+      color: var(--text-light);
+      margin: 0;
+      line-height: 1.5;
+    }
+
+    /* ============ 章节问题列表 ============ */
+    ol.chapter-questions { padding-left: 1.5rem; }
+    ol.chapter-questions > li { margin-bottom: 1.25rem; }
+    ol.chapter-questions > li:last-child { margin-bottom: 0; }
+    ol.chapter-questions details { margin: 0.6rem 0 0; }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
       .context-label { margin-top: 0.4rem; }
@@ -661,20 +683,50 @@
 <p><b>主要依据</b>：Kimi K3 技术报告 §2.3-2.3.3（Eq. 11-14）与官方 <code>config.json</code>（Hugging Face <code>moonshotai/Kimi-K3</code>）；DeepSeekMoE 论文（arXiv:2401.06066）§3.2。</p>
 </blockquote>
 
-<p>如果你要把一个 MoE 层的专家池扩到 896、每 token 激活扩到 16，会发生什么？直觉上"专家多了、每个 token 走的路径多了"应该更好。但在 2.8 万亿参数规模下，K3 团队发现这条路上有两个具体的失败点——路由分支内部激活爆炸，以及近千专家的负载失衡——必须用三件稳定化才能让这个扩大后的稀疏层真正跑起来<sup>[C3, N4, N6]</sup>。本页只讲 Stable LatentMoE 的层结构与三件稳定化的插入位置；MoE 基础、SiTU-GLU、Quantile Balancing 等独立概念只引用结论，完整推导见对应概念页。本文要回答：这套结构怎么动，为什么这么动。</p>
+<p>若要把一个 MoE 层的专家池扩到 896、每 token 激活扩到 16，会发生什么？直觉上"专家多了、每个 token 走的路径多了"应该更好。但在 2.8 万亿参数规模下，K3 团队发现这条路上有两个具体的失败点——路由分支内部激活爆炸，以及近千专家的负载失衡——必须用三件稳定化才能让这个扩大后的稀疏层真正跑起来<sup>[C3, N4, N6]</sup>。本页只讲 Stable LatentMoE 的层结构与三件稳定化的插入位置；MoE 基础、SiTU-GLU、Quantile Balancing 等独立概念只引用结论，完整推导见对应概念页。本文说明这套结构如何构造、为何如此设计。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>为什么 LatentMoE 要把路由专家放进比全模型宽度更窄的隐空间？这解决了什么问题，代价是什么？</li>
-    <li>Stable LatentMoE 的层结构是什么？共享分支、路由分支、$W_\downarrow$、$W_\uparrow$、RMSNorm 各自的位置和职责是什么？</li>
-    <li>极端稀疏下的两个失败模式是什么？三件稳定化分别修复哪一个？</li>
-    <li>RMSNorm 插在路由聚合之后、上投影之前，为什么这个位置是必要的？</li>
-    <li>Stable LatentMoE 的适用边界是什么？它依赖哪些独立概念，不能单独推出什么结论？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>为什么 LatentMoE 要把路由专家放进比全模型宽度更窄的隐空间？这解决了什么问题，代价是什么？</p>
+      <details>
+      <summary>解答：分离两个宽度，收益与代价</summary>
+      <p>LatentMoE 分离全模型宽度 $d$ 与路由专家宽度 $\ell$：共享专家保留全宽 $d$ 的路径处理通用变换，路由专家经下投影 $W_\downarrow$ 在更窄的隐空间 $\ell$（$\ell &lt; d$）操作，再经上投影 $W_\uparrow$ 投回。解决的问题是扩大专家池时通信与权重流量随路由倍数线性增长；代价是路由分支多出两次投影，形成更长的矩阵乘法链，成为激活爆炸的根源之一。完整论证见「1. 扩大专家池的代价」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Stable LatentMoE 的层结构是什么？共享分支、路由分支、$W_\downarrow$、$W_\uparrow$、RMSNorm 各自的位置和职责是什么？</p>
+      <details>
+      <summary>解答：两支相加，Eq. 11 数据流</summary>
+      <p>层输出由两支相加得到：$y = \sum_{j=1}^{N_s} E_j^{\text{shared}}(x) + W_\uparrow\,\mathrm{RMSNorm}(u)$，其中 $u = \sum_{i \in T_k(x)} p_i E_i^{\text{routed}}(W_\downarrow x)$（Eq. 11）。共享分支全宽、无路由、不经 RMSNorm；路由分支先经 $W_\downarrow$ 压入隐空间，Top-k 个路由专家按 $p_i$ 加权聚合，聚合结果先 RMSNorm 归一再经 $W_\uparrow$ 投回。结构细节见「2. Stable LatentMoE 的层结构」。</p>
+      </details>
+    </li>
+    <li>
+      <p>极端稀疏下的两个失败模式是什么？三件稳定化分别修复哪一个？</p>
+      <details>
+      <summary>解答：激活爆炸与负载失衡，各管一段</summary>
+      <p>失败模式一是路由分支近四个连续矩阵乘法链上的激活爆炸；失败模式二是近千专家的负载失衡。Normalized LatentMoE 管 $u$ 的尺度、SiTU-GLU 管路由 FFN 内部的激活上界，二者协同修复激活爆炸；Quantile Balancing 修复负载失衡。见「3. 极端稀疏下的两个失败模式」与「4. 三件稳定化」。</p>
+      </details>
+    </li>
+    <li>
+      <p>RMSNorm 插在路由聚合之后、上投影之前，为什么这个位置是必要的？</p>
+      <details>
+      <summary>解答：只有此处能抹尺度、保信息</summary>
+      <p>$u$ 的尺度随选中专家集合 $T_k(x)$ 与路由权重 $p_i$ 逐 token 漂移，不归一化会把尺度抖动透传到 $W_\uparrow$ 的输出。放在 $W_\downarrow$ 之前、$W_\uparrow$ 之后或专家内部，会分别破坏共享分支的输入、抹掉路由权重传递的相对大小信息、或无法解决聚合后的尺度漂移。完整论证见「5. 为什么 RMSNorm 必须插在路由聚合之后」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Stable LatentMoE 的适用边界是什么？它依赖哪些独立概念，不能单独推出什么结论？</p>
+      <details>
+      <summary>解答：结论限于 K3 规模与配置</summary>
+      <p>结论在 K3 的规模与配置下成立（$N=896$、$k=16$、$\ell=3584$、$d=7168$、2.8 万亿参数、bfloat16 训练），依赖 MoE 基础、SiTU-GLU、Quantile Balancing、DeepSeekMoE、RMSNorm 等独立概念。不能推出任何 MoE 都该用 LatentMoE、SiTU-GLU 一定优于 SwiGLU、QB 一定优于辅助损失等结论。见「6. 适用边界与不能推出的结论」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
-<h2 id="why-latent-moe">扩大专家池的代价——为什么需要 LatentMoE</h2>
+<h2 id="why-latent-moe">1. 扩大专家池的代价——为什么需要 LatentMoE</h2>
 
 <p>普通 MoE 层里，每个被选中的路由专家都直接接收完整的 $d$ 维 token 表示 $x$，并在 $d$ 维空间里做 FFN 变换（详见<a href="../moe-serving/index.html">MoE 基础</a>）。这意味着扩大路由倍数——更多专家、更多每 token 激活——会让路由通信与专家权重流量随路由倍数线性增长：每多一个被选中的专家，就要把 $d$ 维向量送过去、把 $d$ 维变换后的向量取回来。<sup>[C1]</sup></p>
 
@@ -696,16 +748,34 @@ $$z = W_\downarrow x, \qquad W_\downarrow \in \mathbb{R}^{\ell \times d}, \quad 
 </table>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话说明 LatentMoE 分离了哪两个宽度。</li>
-  <li>指出 LatentMoE 路由分支多出哪两次投影，它们各自的方向（$d \to \ell$ 还是 $\ell \to d$）。</li>
-  <li>说明共享专家走全宽还是隐空间。</li>
-</ul>
-
 <p>本章说明了 LatentMoE 分离两个宽度的动机与代价。但层结构的完整数据流——$W_\downarrow$、$W_\uparrow$、共享专家、路由专家、RMSNorm 各在什么位置——尚未摆清，下一章讲 Stable LatentMoE 层的完整结构。</p>
 
-<h2 id="layer-structure">Stable LatentMoE 的层结构——共享分支、路由分支与 RMSNorm 的位置</h2>
+<h3 id="ch1-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话说明 LatentMoE 分离了哪两个宽度。</p>
+    <details>
+    <summary>解答：全模型宽度与路由专家宽度</summary>
+    <p>LatentMoE 分离全模型宽度 $d$ 与路由专家宽度 $\ell$：共享专家保留全宽 $d$ 的路径处理通用变换，路由专家经 $W_\downarrow$ 压入更窄的隐空间 $\ell$（$\ell &lt; d$）操作、经 $W_\uparrow$ 投回。扩大路由专家池因此不再让每个被选中的专家承担全宽流量。</p>
+    </details>
+  </li>
+  <li>
+    <p>LatentMoE 路由分支多出哪两次投影？各自的方向是什么（$d \to \ell$ 还是 $\ell \to d$）？</p>
+    <details>
+    <summary>解答：下投影与上投影</summary>
+    <p>下投影 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 把输入从 $d$ 维压到 $\ell$ 维（$d \to \ell$）；上投影 $W_\uparrow \in \mathbb{R}^{d \times \ell}$ 把路由结果投回 $d$ 维（$\ell \to d$）。代价是路由分支形成更长的矩阵乘法链，是极端稀疏下激活爆炸的根源之一。</p>
+    </details>
+  </li>
+  <li>
+    <p>共享专家走全宽还是隐空间？</p>
+    <details>
+    <summary>解答：共享专家走全宽</summary>
+    <p>共享专家走全宽：直接接收 $x \in \mathbb{R}^d$、输出 $\mathbb{R}^d$，不经过 $W_\downarrow$ 与 $W_\uparrow$；只有路由分支走隐空间。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="layer-structure">2. Stable LatentMoE 的层结构——共享分支、路由分支与 RMSNorm 的位置</h2>
 
 <p>K3 的 Stable LatentMoE 层沿用 DeepSeekMoE 提出的"共享专家 + 路由专家"组织：共享专家无路由、所有 token 必经，承担通用变换；路由专家参与 Top-k 选择，承担差异化变换（DeepSeekMoE 论文 §3.2；完整机制见<a href="../deepseek-moe/index.html">DeepSeekMoE</a>）<sup>[C7]</sup>。K3 每层固定 $N_s = 2$ 个全宽共享专家<sup>[C8]</sup>。</p>
 
@@ -748,40 +818,57 @@ $$u = \sum_{i \in T_k(x)} p_i \, E_i^{\text{routed}}(W_\downarrow x), \qquad y =
 
 <p>数据流如下图所示——共享支直接吃 $x$、路由支先 $W_\downarrow$ 再分发再聚合再 RMSNorm 再 $W_\uparrow$，最后两支相加：</p>
 
-<pre class="diagram">                    Stable LatentMoE 层数据流（K3 Eq.11）
+<svg class="dg" viewBox="0 0 880 660" role="img" aria-label="Stable LatentMoE 层数据流图">
+  <defs>
+    <marker id="dg-arrow1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="var(--text-muted)"/>
+    </marker>
+  </defs>
+  <text x="440" y="24" text-anchor="middle" class="dg-title">Stable LatentMoE 层数据流（K3 Eq. 11）</text>
 
-        输入 x ∈ R^d (d=7168)
-        │
-        ├─────────────────────── 共享支（全宽，不走隐空间）──────────────────┐
-        │                                                                    │
-        │   E_1^shared(x) ∈ R^d,  E_2^shared(x) ∈ R^d   (N_s=2, 无路由)     │
-        │        │                   │                                        │
-        │        └─────────┬─────────┘                                        │
-        │                  ▼                                                  │
-        │             Σ E_j^shared(x)                                         │
-        │                  │                                                  │
-        │                  ▼                                                  │
-        │             （等待路由支结果）────────────────────────────────────► (+) ──► y ∈ R^d
-        │                                                                      ▲
-        │   路由支（隐空间 ℓ=3584）                                              │
-        │   z = W_↓ x ∈ R^ℓ                                                    │
-        │   │                                                                   │
-        │   ├──► E_{i1}^routed(z) ─┐                                            │
-        │   ├──► E_{i2}^routed(z) ─┤   p_i 加权聚合                             │
-        │   ├──► ...              ─┤   （Top-k=16 个）                          │
-        │   ├──► E_{i16}^routed(z)─┘                                           │
-        │   │                  │                                                │
-        │   │                  ▼                                                │
-        │   │             u ∈ R^ℓ                                               │
-        │   │                  │                                                │
-        │   │                  ▼  &lt;── RMSNorm 插在这里（聚合后、W_↑ 前）        │
-        │   │       RMSNorm(u) ∈ R^ℓ                                            │
-        │   │                  │                                                │
-        │   │                  ▼                                                │
-        │   │       W_↑ RMSNorm(u) ∈ R^d ─────────────────────────────────────┘
-        │   │
-        （W_↓: d→ℓ 下投影；W_↑: ℓ→d 上投影）
-</pre>
+  <!-- 输入 -->
+  <rect x="330" y="40" width="220" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="330" y="40" width="220" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">输入 $x \in \mathbb{R}^d$（$d = 7168$）</div></foreignObject>
+
+  <path d="M440 80 V100 H200 V126" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <path d="M440 80 V100 H650 V126" class="dg-line" marker-end="url(#dg-arrow1)"/>
+
+  <!-- 共享支 -->
+  <foreignObject x="80" y="106" width="240" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-note" style="text-align:center;">共享支（全宽，不走隐空间）</div></foreignObject>
+  <rect x="80" y="130" width="240" height="52" class="dg-box" rx="6"/>
+  <foreignObject x="80" y="130" width="240" height="52"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$E_1^{\text{shared}}(x)$、$E_2^{\text{shared}}(x)$（$N_s = 2$，无路由）</div></foreignObject>
+  <path d="M200 182 V206" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <rect x="80" y="210" width="240" height="44" class="dg-box" rx="6"/>
+  <foreignObject x="80" y="210" width="240" height="44"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$\sum_j E_j^{\text{shared}}(x) \in \mathbb{R}^d$</div></foreignObject>
+  <path d="M200 254 V540 H420" class="dg-line" marker-end="url(#dg-arrow1)"/>
+
+  <!-- 路由支 -->
+  <foreignObject x="530" y="106" width="240" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-note" style="text-align:center;">路由支（隐空间 $\ell = 3584$）</div></foreignObject>
+  <rect x="530" y="130" width="240" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="530" y="130" width="240" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$z = W_\downarrow x \in \mathbb{R}^\ell$</div></foreignObject>
+  <path d="M650 170 V194" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <rect x="530" y="198" width="240" height="56" class="dg-box" rx="6"/>
+  <foreignObject x="530" y="198" width="240" height="56"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$E_{i_1}^{\text{routed}}(z),\ \ldots,\ E_{i_{16}}^{\text{routed}}(z)$（Top-$k$ = 16 个）</div></foreignObject>
+  <path d="M650 254 V278" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <rect x="530" y="282" width="240" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="530" y="282" width="240" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">按 $p_i$ 加权聚合：$u \in \mathbb{R}^\ell$</div></foreignObject>
+  <path d="M650 322 V346" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <rect x="530" y="350" width="240" height="52" class="dg-box-hl" rx="6"/>
+  <foreignObject x="530" y="350" width="240" height="52"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">RMSNorm 插在这里：$\mathrm{RMSNorm}(u) \in \mathbb{R}^\ell$（聚合后、$W_\uparrow$ 前）</div></foreignObject>
+  <path d="M650 402 V426" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <rect x="530" y="430" width="240" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="530" y="430" width="240" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$W_\uparrow\,\mathrm{RMSNorm}(u) \in \mathbb{R}^d$</div></foreignObject>
+  <path d="M650 470 V540 H460" class="dg-line" marker-end="url(#dg-arrow1)"/>
+
+  <!-- 两支相加 -->
+  <circle cx="440" cy="540" r="16" class="dg-box"/>
+  <text x="440" y="545" text-anchor="middle" class="dg-step">+</text>
+  <path d="M440 556 V580" class="dg-line" marker-end="url(#dg-arrow1)"/>
+  <rect x="330" y="584" width="220" height="36" class="dg-box" rx="6"/>
+  <foreignObject x="330" y="584" width="220" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$y \in \mathbb{R}^d$</div></foreignObject>
+
+  <foreignObject x="80" y="630" width="720" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-note">$W_\downarrow$：$d \to \ell$ 下投影；$W_\uparrow$：$\ell \to d$ 上投影；共享支不经这两次投影。</div></foreignObject>
+</svg>
 
 <p>注意几个容易看错的地方。第一，<strong>共享专家不走隐空间</strong>——它们直接吃 $x \in \mathbb{R}^d$、输出 $\mathbb{R}^d$，不经过 $W_\downarrow$/$W_\uparrow$；只有路由分支走隐空间。第二，<strong>$W_\uparrow$ 作用于 RMSNorm 的输出，不是 $u$ 本身</strong>——这正是 K3 相对原始 LatentMoE 的核心改造，为什么 RMSNorm 必须插在路由聚合之后一章会单独说清为什么必须在这里<sup>[C9]</sup>。第三，896 是路由专家总数，每 token 只激活其中 $k=16$ 个，再加 2 个共享专家；稀疏度 56 是 $N/k$，不是"每 token 走 56 个专家"<sup>[N4, N5]</sup>。</p>
 
@@ -801,33 +888,84 @@ $$u = \sum_{i \in T_k(x)} p_i \, E_i^{\text{routed}}(W_\downarrow x), \qquad y =
 </table>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>画出 Eq. 11 的数据流，标出 RMSNorm 的位置。</li>
-  <li>说明共享专家的输入空间是 $d$ 还是 $\ell$。</li>
-  <li>指出 $W_\uparrow$ 作用于 RMSNorm 的输出还是 $u$ 本身。</li>
-  <li>用 K3 的数字回答：每 token 实际经过几个专家（共享 + 路由）。</li>
-</ul>
-
 <p>本章摆清了层结构与数据流。但 $N=896, k=16$ 的极端稀疏会引发什么具体失败——激活爆炸发生在哪一段、负载失衡为什么恶化——尚未展开，下一章讲极端稀疏下的两个失败模式。</p>
 
-<h2 id="two-failure-modes">极端稀疏下的两个失败模式——激活爆炸与负载失衡</h2>
+<h3 id="ch2-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>画出 Eq. 11 的数据流，标出 RMSNorm 的位置。</p>
+    <details>
+    <summary>解答：共享支与路由支相加</summary>
+    <p>输入 $x$ 分两支。共享支：$E_1^{\text{shared}}(x) + E_2^{\text{shared}}(x)$，全宽、无路由。路由支：$x$ 经 $W_\downarrow$ 得 $z$，分发给 Top-k 选中的路由专家，按 $p_i$ 加权聚合得 $u$，先 RMSNorm 归一、再经 $W_\uparrow$ 投回。两支相加得 $y$。RMSNorm 插在路由聚合 $u$ 之后、上投影 $W_\uparrow$ 之前。</p>
+    </details>
+  </li>
+  <li>
+    <p>$W_\uparrow$ 作用于 RMSNorm 的输出还是 $u$ 本身？共享专家的输入空间是 $d$ 还是 $\ell$？</p>
+    <details>
+    <summary>解答：作用于归一化结果；共享专家输入为全宽</summary>
+    <p>$W_\uparrow$ 作用于 $\mathrm{RMSNorm}(u)$，不是 $u$ 本身——这是 K3 相对原始 LatentMoE 的核心改造（Normalized LatentMoE）。共享专家的输入空间是全宽 $d$：直接接收 $x \in \mathbb{R}^d$，不经隐空间。</p>
+    </details>
+  </li>
+  <li>
+    <p>用 K3 的数字回答：每 token 实际经过几个专家（共享 + 路由）？</p>
+    <details>
+    <summary>解答：16 个路由专家加 2 个共享专家</summary>
+    <p>每 token 经过 $k = 16$ 个路由专家加 $N_s = 2$ 个共享专家，共 18 个。896 是路由专家池的总数，每 token 只激活其中 16 个；稀疏度 56 是 $N/k$，不是每 token 走的专家数。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="two-failure-modes">3. 极端稀疏下的两个失败模式——激活爆炸与负载失衡</h2>
 
 <p>LatentMoE 让扩大专家池变得可负担，但 K3 在 $N=896, k=16$（稀疏度 56）、2.8 万亿参数规模下发现两个具体的失败点<sup>[C3, N4, N5, N6]</sup>。</p>
 
-<h3 id="failure-one">失败模式一——路由分支激活爆炸</h3>
+<h3 id="failure-one">3.1 失败模式一——路由分支激活爆炸</h3>
 
 <p>路由分支的结构是 $W_\downarrow \to$ 门控多分支路由 FFN $\to W_\uparrow$，这是近四个连续矩阵乘法的链——$W_\downarrow$ 一次、路由 FFN 内部门支与值支各一次、$W_\uparrow$ 一次。这条链的条件数本来就差（连续投影会放大数值扰动），再叠加 2.8 万亿参数的规模，路由分支内部就会出现激活异常增大，威胁训练稳定性<sup>[C3, N6]</sup>。</p>
 
-<pre class="diagram">路由分支的矩阵乘法链（激活爆炸的发生位置）
+<svg class="dg" viewBox="0 0 880 200" role="img" aria-label="路由分支矩阵乘法链示意图">
+  <defs>
+    <marker id="dg-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="var(--text-muted)"/>
+    </marker>
+  </defs>
+  <text x="440" y="24" text-anchor="middle" class="dg-title">路由分支的矩阵乘法链（激活爆炸的发生位置）</text>
 
-  x ∈ R^d ──► W_↓ ──► z ∈ R^ℓ ──► [路由 FFN：门支 × 值支] ──► u ∈ R^ℓ ──► W_↑ ──► R^d
-              (1)         (2)(3)                              (4)
-              └────────── 近四个连续矩阵乘法，条件数差 ──────────┘
-                                              2.8T 规模 → 激活爆炸
-</pre>
+  <rect x="10" y="60" width="100" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="10" y="60" width="100" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$x \in \mathbb{R}^d$</div></foreignObject>
+  <path d="M110 80 H130" class="dg-line" marker-end="url(#dg-arrow2)"/>
 
-<h3 id="failure-two">失败模式二——近千专家负载失衡</h3>
+  <rect x="134" y="60" width="76" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="134" y="60" width="76" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$W_\downarrow$</div></foreignObject>
+  <text x="172" y="116" text-anchor="middle" class="dg-step">(1)</text>
+  <path d="M210 80 H230" class="dg-line" marker-end="url(#dg-arrow2)"/>
+
+  <rect x="234" y="60" width="100" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="234" y="60" width="100" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$z \in \mathbb{R}^\ell$</div></foreignObject>
+  <path d="M334 80 H354" class="dg-line" marker-end="url(#dg-arrow2)"/>
+
+  <rect x="358" y="60" width="170" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="358" y="60" width="170" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">路由 FFN：门支 × 值支</div></foreignObject>
+  <text x="443" y="116" text-anchor="middle" class="dg-step">(2)(3)</text>
+  <path d="M528 80 H548" class="dg-line" marker-end="url(#dg-arrow2)"/>
+
+  <rect x="552" y="60" width="100" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="552" y="60" width="100" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$u \in \mathbb{R}^\ell$</div></foreignObject>
+  <path d="M652 80 H672" class="dg-line" marker-end="url(#dg-arrow2)"/>
+
+  <rect x="676" y="60" width="76" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="676" y="60" width="76" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$W_\uparrow$</div></foreignObject>
+  <text x="714" y="116" text-anchor="middle" class="dg-step">(4)</text>
+  <path d="M752 80 H772" class="dg-line" marker-end="url(#dg-arrow2)"/>
+
+  <rect x="776" y="60" width="94" height="40" class="dg-box" rx="6"/>
+  <foreignObject x="776" y="60" width="94" height="40"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$\mathbb{R}^d$</div></foreignObject>
+
+  <path d="M134 148 V138 H752 V148" class="dg-line"/>
+  <foreignObject x="134" y="156" width="620" height="36"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-note">近四个连续矩阵乘法，条件数差；叠加 2.8 万亿参数的规模，路由分支内部激活异常增大（激活爆炸）。</div></foreignObject>
+</svg>
+
+<h3 id="failure-two">3.2 失败模式二——近千专家负载失衡</h3>
 
 <p>K3 用的是无辅助损失路由（auxiliary-loss-free，DeepSeek-V3 引入<sup>[C12]</sup>）：在每个专家的路由分数上加一个 bias $b_j$ 用于 Top-k 选择，但 bias 不进入 mixture 权重。原方法用固定步长规则 $b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \mathrm{sign}(\bar{\ell} - \ell_j)$ 更新 bias——步长 $\gamma$ 太小则适应慢，太大则负载振荡。这套规则在专家数较少时够用，但平衡近 $10^3$ 个专家的负载已经超出它的适用范围：部分专家被过度使用、部分专家几乎不被使用（"dying expert"），拖慢专家并行训练并让部分专家训练不足<sup>[C12]</sup>。</p>
 
@@ -843,24 +981,35 @@ $$u = \sum_{i \in T_k(x)} p_i \, E_i^{\text{routed}}(W_\downarrow x), \qquad y =
 </table>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>指出激活爆炸发生在路由分支的哪一段（哪几次矩阵乘法）。</li>
-  <li>说明负载失衡问题为什么随专家数增大而恶化。</li>
-  <li>原 bias 更新规则的步长 $\gamma$ 面临什么两难。</li>
-</ul>
-
 <p>本章明确了两个失败模式的发生位置与原因。但三件稳定化分别修复哪个失败、怎么修复——Normalized LatentMoE 插在哪里、SiTU-GLU 如何限幅、QB 如何设 bias——尚未展开，下一章讲三件稳定化的机制。</p>
 
-<h2 id="three-stabilizers">三件稳定化——Normalized LatentMoE、SiTU-GLU、Quantile Balancing</h2>
+<h3 id="ch3-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>激活爆炸发生在路由分支的哪一段（哪几次矩阵乘法）？</p>
+    <details>
+    <summary>解答：近四个连续矩阵乘法的链</summary>
+    <p>发生在路由分支近四个连续矩阵乘法的链上：$W_\downarrow$ 一次、路由 FFN 内部门支与值支各一次、$W_\uparrow$ 一次。连续投影条件数差、会放大数值扰动，叠加 2.8 万亿参数的规模，路由分支内部出现激活异常增大，威胁训练稳定性。</p>
+    </details>
+  </li>
+  <li>
+    <p>负载失衡为什么随专家数增大而恶化？原 bias 更新规则的步长 $\gamma$ 面临什么两难？</p>
+    <details>
+    <summary>解答：固定步长规则在近千专家下失效</summary>
+    <p>原无辅助损失路由用固定步长规则 $b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \mathrm{sign}(\bar{\ell} - \ell_j)$ 更新 bias：步长 $\gamma$ 太小则适应慢，太大则负载振荡。专家数较少时够用；平衡近 $10^3$ 个专家的负载已超出该规则的适用范围，出现部分专家被过度使用、部分几乎不被使用（dying expert）。</p>
+    </details>
+  </li>
+</ol>
 
-<p>Stable LatentMoE 的"Stable"由三件稳定化承担，分别修复极端稀疏下的两个失败模式的两个失败模式。</p>
+<h2 id="three-stabilizers">4. 三件稳定化——Normalized LatentMoE、SiTU-GLU、Quantile Balancing</h2>
 
-<h3 id="normalized-latentmoe">Normalized LatentMoE——在路由聚合后插 RMSNorm</h3>
+<p>Stable LatentMoE 的"Stable"由三件稳定化承担，分别修复极端稀疏下的两个失败模式。</p>
+
+<h3 id="normalized-latentmoe">4.1 Normalized LatentMoE——在路由聚合后插 RMSNorm</h3>
 
 <p>原始 LatentMoE 直接把 $W_\uparrow$ 作用于聚合表示 $u$。但 $u$ 的尺度会随选中专家集合 $T_k(x)$ 与路由权重 $p_i$ 变化——不同 token 选不同专家、不同权重，$u$ 的尺度逐 token 漂移。K3 在 $u$ 与 $W_\uparrow$ 之间插入 RMSNorm，把 $u$ 归一化到稳定尺度后再交给 $W_\uparrow$，降低路由分支对尺度变化的敏感度<sup>[C9]</sup>。这是 Eq. 11 中 $W_\uparrow \, \mathrm{RMSNorm}(u)$ 这一项的来源，修复激活爆炸中"尺度放大"的部分。为什么 RMSNorm 必须插在路由聚合之后一章会单独论证这个位置的必要性。</p>
 
-<h3 id="situ-glu-stabilizer">SiTU-GLU——给路由专家 FFN 一个有界激活</h3>
+<h3 id="situ-glu-stabilizer">4.2 SiTU-GLU——给路由专家 FFN 一个有界激活</h3>
 
 <p>路由专家 FFN 内部用 SiTU-GLU 作为激活函数（K3 报告 Eq. 12；完整机制见<a href="../situ-glu/index.html">SiTU-GLU</a>）<sup>[F3, C11]</sup>：</p>
 
@@ -868,7 +1017,7 @@ $$\mathrm{SiTU\text{-}GLU}(x) = \beta_1 \tanh\!\left(\frac{W_g x}{\beta_1}\right
 
 <p>这里只需要知道一个结论：两个线性因子都被 $\tanh$ 的 softcap 限幅，乘积有上界 $\beta_1 \beta_2$。K3 取 $\beta_1 = 4$（gate 支）、$\beta_2 = 25$（up 支），上界为 $4 \times 25 = 100$<sup>[N7]</sup>。softcap 在原点附近近似线性（保留 SwiGLU 的局部响应），在大幅值处被 $\beta$ 限幅（抑制激活爆炸）。SiTU-GLU 修复激活爆炸中"激活无界"的部分。softcap 的极限情形、与硬截断的对比、近原点展开等推导不在此展开。</p>
 
-<h3 id="quantile-balancing-stabilizer">Quantile Balancing——从分位数设置专家 bias</h3>
+<h3 id="quantile-balancing-stabilizer">4.3 Quantile Balancing——从分位数设置专家 bias</h3>
 
 <p>K3 在 DeepSeek-V3 无辅助损失路由的基础上改进 bias 更新规则——Quantile Balancing（QB，K3 报告 Eq. 14；完整推导见<a href="../quantile-balancing/index.html">Quantile Balancing</a>）<sup>[F4, C12]</sup>。核心结论是：每一步从路由分数的 $(1 - k/n)$ 分位数设置每个专家的 bias，使每专家获得目标负载 $q = mk/n$（$m$ 是 batch 内 token 数、$n$ 是专家数）：</p>
 
@@ -876,13 +1025,13 @@ $$\tilde{b}_j^{(t+1)} \leftarrow -\mathrm{quantile}_{1-k/n}\!\left(s_{:,j}^{(t)}
 
 <p>这里 $s_{:,j}^{(t)}$ 是 batch 内所有 token 对专家 $j$ 的原始路由分数、$\alpha^{(t)}$ 是 Top-$(k+1)$ 路由的截断值。第二行减去均值是为了去掉一个不影响 Top-k 选择的公共偏移<sup>[C13]</sup>。QB 修复负载失衡。Top-$(k+1)$ 截断的推导、直方图估计的工程实现见<a href="../quantile-balancing/index.html">Quantile Balancing</a>。</p>
 
-<h3 id="stabilizer-failure-mapping">三件稳定化与两个失败的对应关系</h3>
+<h3 id="stabilizer-failure-mapping">4.4 三件稳定化与两个失败的对应关系</h3>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th>稳定化</th><th>修复哪个失败</th><th>机制（一句话）</th><th>引用</th></tr></thead>
 <tbody>
-<tr><td>Normalized LatentMoE</td><td>激活爆炸（尺度放大部分）</td><td>在 $u$ 与 $W_\uparrow$ 之间插 RMSNorm</td><td>本文对应章节<sup>[C9]</sup>；K3 §2.3.1</td></tr>
+<tr><td>Normalized LatentMoE</td><td>激活爆炸（尺度放大部分）</td><td>在 $u$ 与 $W_\uparrow$ 之间插 RMSNorm</td><td>「为什么 RMSNorm 必须插在路由聚合之后」一章<sup>[C9]</sup>；K3 §2.3.1</td></tr>
 <tr><td>SiTU-GLU</td><td>激活爆炸（激活无界部分）</td><td>两线性因子 softcap 限幅，上界 $\beta_1\beta_2=100$</td><td><a href="../situ-glu/index.html">wiki/situ-glu/</a><sup>[C11]</sup>；K3 §2.3.2</td></tr>
 <tr><td>Quantile Balancing</td><td>负载失衡</td><td>从路由分数 $(1-k/n)$ 分位数设专家 bias</td><td><a href="../quantile-balancing/index.html">wiki/quantile-balancing/</a><sup>[C12]</sup>；K3 §2.3.3</td></tr>
 </tbody>
@@ -891,33 +1040,43 @@ $$\tilde{b}_j^{(t+1)} \leftarrow -\mathrm{quantile}_{1-k/n}\!\left(s_{:,j}^{(t)}
 
 <p>注意三件稳定化是<strong>各管一段、不可互相替代</strong>：Normalized LatentMoE 只管 $u$ 的尺度，不管路由 FFN 内部激活是否无界；SiTU-GLU 只管路由 FFN 内部的激活上界，不管 $u$ 聚合后的尺度；QB 只管负载分布，不管激活数值。两个失败模式的修复各需两件稳定化协同（激活爆炸 = Normalized LatentMoE + SiTU-GLU），不是一件搞定一个。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>三件稳定化分别修复哪个失败。</li>
-  <li>SiTU-GLU 在 K3 配置下的激活上界是多少。</li>
-  <li>RMSNorm 插在什么位置（哪两个量之间）。</li>
-  <li>激活爆炸的修复为什么需要两件稳定化协同。</li>
-</ul>
+<p>本章给出了三件稳定化的机制与对应关系。但 RMSNorm 插在路由聚合后、上投影前这个位置为什么不可换——换位置会发生什么——尚未论证，下一章「为什么 RMSNorm 必须插在路由聚合之后」单独论证这个位置的必要性。</p>
 
-<p>本章给出了三件稳定化的机制与对应关系。但 RMSNorm 插在路由聚合后、上投影前这个位置为什么不可换——换位置会发生什么——尚未论证，下一章单独论证这个位置的必要性。</p>
+<h3 id="ch4-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>三件稳定化分别修复哪个失败？激活爆炸的修复为什么需要两件协同？</p>
+    <details>
+    <summary>解答：各管一段、不可互相替代</summary>
+    <p>Normalized LatentMoE 修复激活爆炸中尺度放大的部分（在 $u$ 与 $W_\uparrow$ 之间插 RMSNorm）；SiTU-GLU 修复激活无界的部分（softcap 限幅，上界 $\beta_1\beta_2 = 100$）；Quantile Balancing 修复负载失衡。前两者各管一段——一个管 $u$ 的尺度、一个管路由 FFN 内部的激活上界——不可互相替代，需协同才能完整修复激活爆炸。</p>
+    </details>
+  </li>
+  <li>
+    <p>RMSNorm 插在哪两个量之间？SiTU-GLU 在 K3 配置下的激活上界是多少？</p>
+    <details>
+    <summary>解答：聚合后、上投影前；上界 100</summary>
+    <p>RMSNorm 插在路由聚合 $u$ 之后、上投影 $W_\uparrow$ 之前。SiTU-GLU 的激活上界为 $\beta_1\beta_2 = 4 \times 25 = 100$（$\beta_1 = 4$，gate 支；$\beta_2 = 25$，up 支）。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="rmsnorm-position">为什么 RMSNorm 必须插在路由聚合之后——Normalized LatentMoE 的位置必要性</h2>
+<h2 id="rmsnorm-position">5. 为什么 RMSNorm 必须插在路由聚合之后——Normalized LatentMoE 的位置必要性</h2>
 
-<p>上一章已经给出结论：RMSNorm 插在路由聚合 $u$ 之后、上投影 $W_\uparrow$ 之前。这一章单独论证这个位置为什么是必要的——换位置会发生什么。</p>
+<p>三件稳定化一章已给出结论：RMSNorm 插在路由聚合 $u$ 之后、上投影 $W_\uparrow$ 之前。这一章单独论证这个位置为什么是必要的——换位置会发生什么。</p>
 
-<h3 id="u-scale-source">$u$ 的尺度由什么决定</h3>
+<h3 id="u-scale-source">5.1 $u$ 的尺度由什么决定</h3>
 
 <p>聚合表示 $u = \sum_{i \in T_k(x)} p_i \, E_i^{\text{routed}}(z)$ 的尺度由两个因素决定：选中的专家集合 $T_k(x)$（不同专家的 FFN 输出幅度不同），以及路由权重 $p_i$（同一组专家、不同权重组合，加权结果幅度不同）。不同 token 选不同专家、不同权重，$u$ 的尺度就会逐 token 漂移。</p>
 
-<h3 id="without-norm">不插 RMSNorm 会怎样</h3>
+<h3 id="without-norm">5.2 不插 RMSNorm 会怎样</h3>
 
 <p>原始 LatentMoE 直接 $W_\uparrow u$：$u$ 的尺度变化原样透传到 $W_\uparrow$ 的输出，再与共享分支 $\sum E_j^{\text{shared}}(x)$ 相加。共享分支处理的是稳定的 $x$，输出尺度相对稳定；路由分支却带来逐 token 抖动的尺度。两支相加时，共享分支要"消化"这种尺度抖动，训练稳定性受损——这就是极端稀疏下的两个失败模式一章中失败模式一的"尺度放大"的具体机制<sup>[C3]</sup>。</p>
 
-<h3 id="with-norm">插 RMSNorm 后怎样</h3>
+<h3 id="with-norm">5.3 插 RMSNorm 后怎样</h3>
 
 <p>插入 RMSNorm 后变成 $W_\uparrow \, \mathrm{RMSNorm}(u)$：$u$ 被按均方根归一化到稳定尺度，$W_\uparrow$ 的输入分布不再逐 token 大幅漂移。归一化只抹掉尺度，不抹掉方向——$u$ 的方向信息（哪些维度大、哪些维度小）被保留，因为 RMSNorm 是逐向量除以自身的 RMS，不跨维度混合。除稳定训练外，K3 报告还观察到这一改造持续改善验证损失与下游基准<sup>[C10]</sup>（该结论是 K3 自称，未提供独立复现）。</p>
 
-<h3 id="wrong-positions">换位置会怎样</h3>
+<h3 id="wrong-positions">5.4 换位置会怎样</h3>
 
 <p>这个位置不可换：</p>
 <ul>
@@ -942,28 +1101,45 @@ $$\tilde{b}_j^{(t+1)} \leftarrow -\mathrm{quantile}_{1-k/n}\!\left(s_{:,j}^{(t)}
 
 <details>
 <summary>展开：构造两个不同 $T_k$ 与 $p_i$ 的 $u$，对比归一化前后</summary>
-<p>教学示例。把隐空间维度缩小到 $\ell = 2$ 便于手算，构造两个 token 的聚合结果 $u$。</p>
+<p>构造示例。把隐空间维度缩小到 $\ell = 2$ 便于手算，构造两个 token 的聚合结果 $u$。</p>
 <p>Token A：选中专家 1、2，权重 $p_1 = p_2 = 0.5$，专家输出 $E_1(z) = (2, 0)$、$E_2(z) = (0, 2)$。则</p>
 $$u_A = 0.5 \times (2, 0) + 0.5 \times (0, 2) = (1, 1).$$
 <p>Token B：选中专家 3、4，权重 $p_3 = p_4 = 0.5$，专家输出 $E_3(z) = (20, 0)$、$E_4(z) = (0, 20)$。则</p>
 $$u_B = 0.5 \times (20, 0) + 0.5 \times (0, 20) = (10, 10).$$
-<p>RMS 的定义为 $\mathrm{RMS}(u) = \sqrt{\frac{1}{\ell}\sum_{i=1}^{\ell} u_i^2}$（教学简化：省略 RMSNorm 的可学习缩放参数 $\gamma$）。</p>
+<p>RMS 的定义为 $\mathrm{RMS}(u) = \sqrt{\frac{1}{\ell}\sum_{i=1}^{\ell} u_i^2}$（简化条件：省略 RMSNorm 的可学习缩放参数 $\gamma$）。</p>
 <p>$u_A$ 的 RMS $= \sqrt{(1^2 + 1^2)/2} = \sqrt{1} = 1$；$u_B$ 的 RMS $= \sqrt{(10^2 + 10^2)/2} = \sqrt{100} = 10$。归一化前 $u_B$ 的尺度是 $u_A$ 的 10 倍，$W_\uparrow u_B$ 的输出尺度也是 $W_\uparrow u_A$ 的 10 倍——这就是"尺度逐 token 漂移"。</p>
 <p>归一化后：$\mathrm{RMSNorm}(u_A) = (1, 1) / 1 = (1, 1)$；$\mathrm{RMSNorm}(u_B) = (10, 10) / 10 = (1, 1)$。两个 token 的归一化结果完全一致——尺度被抹平，方向（$(1,1)$ 与 $(10,10)$ 同向）被保留。$W_\uparrow$ 看到的输入分布不再因 token 不同而大幅漂移。</p>
 <p>这个例子是人为构造的（专家输出幅度相差 10 倍），目的是让尺度漂移可手算可见，不代表 K3 实际训练中的数值范围。实际 $\ell = 3584$、专家输出幅度由训练决定。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明 $u$ 的尺度由哪两个因素决定。</li>
-  <li>指出 RMSNorm 放在 $W_\uparrow$ 之后会丢失什么信息。</li>
-  <li>用教学示例的数字说明：归一化前 $u_A$ 与 $u_B$ 的 RMS 相差几倍。归一化后呢。</li>
-  <li>说明"K3 自称 RMSNorm 还改善验证损失"这一结论的置信状态。</li>
-</ul>
-
 <p>本章论证了 RMSNorm 位置的必要性。但 Stable LatentMoE 的结论在什么规模与配置下成立、依赖哪些独立概念、不能单独推出什么——尚未界定，下一章讲适用边界与不能推出的结论。</p>
 
-<h2 id="applicability-boundary">适用边界与不能推出的结论</h2>
+<h3 id="ch5-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>$u$ 的尺度由哪两个因素决定？RMSNorm 放在 $W_\uparrow$ 之后会丢失什么信息？</p>
+    <details>
+    <summary>解答：专家集合与路由权重；放后会抹掉权重信息</summary>
+    <p>$u$ 的尺度由选中的专家集合 $T_k(x)$（不同专家的 FFN 输出幅度不同）与路由权重 $p_i$（同一组专家、不同权重组合的加权结果幅度不同）决定，因此逐 token 漂移。放在 $W_\uparrow$ 之后会把路由分支的最终输出强行拉到固定尺度，抹掉 $p_i$ 传递的相对大小信息——路由贡献大的 token 与贡献小的 token 的差异被归一化抹平。</p>
+    </details>
+  </li>
+  <li>
+    <p>用构造示例的数字说明：归一化前 $u_A$ 与 $u_B$ 的 RMS 相差几倍？归一化后呢？</p>
+    <details>
+    <summary>解答：归一化前相差 10 倍，归一化后一致</summary>
+    <p>归一化前 $u_A = (1,1)$ 的 RMS 为 1、$u_B = (10,10)$ 的 RMS 为 10，相差 10 倍，$W_\uparrow$ 的输出尺度随之相差 10 倍——这就是尺度逐 token 漂移。归一化后两者都变为 $(1,1)$：尺度被抹平、方向保留，$W_\uparrow$ 的输入分布不再逐 token 大幅漂移。</p>
+    </details>
+  </li>
+  <li>
+    <p>"RMSNorm 改造还持续改善验证损失与下游基准"这一结论的置信状态如何？</p>
+    <details>
+    <summary>解答：K3 自称，未提供独立复现</summary>
+    <p>该结论来自 K3 报告的自述，未提供独立复现；引用时应注明这一来源状态。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="applicability-boundary">6. 适用边界与不能推出的结论</h2>
 
 <p>Stable LatentMoE 的结论在 K3 的规模与配置下成立：$N = 896$ 路由专家、$k = 16$ 每 token 激活、$\ell = 3584$ 隐空间宽度、$d = 7168$ 全宽、2.8 万亿参数、bfloat16 训练。它不解决"如何选择 $N$ 与 $k$"、"如何选择 $\ell$"、"如何在更小规模下判断是否需要 LatentMoE"——K3 报告未给出这些问题的判据，本文不补。</p>
 
@@ -986,33 +1162,44 @@ $$u_B = 0.5 \times (20, 0) + 0.5 \times (0, 20) = (10, 10).$$
   <li>不能推出"三件稳定化可以独立使用"——三件稳定化一章已说明激活爆炸的修复需要 Normalized LatentMoE 与 SiTU-GLU 协同。</li>
 </ul>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>列出三件稳定化各自依赖的独立概念。</li>
-  <li>举一个"不能从本文推出"的结论，说明为什么不能推出。</li>
-  <li>说明 K3 报告是否给出了"多大规模下必须用 LatentMoE"的判据。</li>
-</ul>
-
 <p>综上，Stable LatentMoE 用 LatentMoE 的两个宽度分离让 896 路由专家的扩大可负担，用 Normalized LatentMoE 与 SiTU-GLU 协同修复路由分支激活爆炸，用 Quantile Balancing 修复近千专家的负载失衡。三件稳定化各管一段、不可互相替代，其结论在 K3 的规模与配置下成立，不可外推到任意 MoE。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h3 id="ch6-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>三件稳定化各自依赖哪些独立概念？</p>
+    <details>
+    <summary>解答：机制细节来自各独立概念页</summary>
+    <p>Normalized LatentMoE 依赖 RMSNorm（本文只用"按均方根归一化"这一基本作用）；SiTU-GLU 的完整机制见其概念页；Quantile Balancing 的完整推导见其概念页；整体 shared+routed 组织来自 DeepSeekMoE，路由与 Top-k 来自 MoE 基础。</p>
+    </details>
+  </li>
+  <li>
+    <p>举一个"不能从本文推出"的结论，并说明为什么不能推出。</p>
+    <details>
+    <summary>解答：以外推结论为例</summary>
+    <p>例如不能推出"任何 MoE 都应该用 LatentMoE"：LatentMoE 的收益在扩大专家池时才显现，小规模 MoE 可能不需要；K3 报告未给出"多大规模下必须用 LatentMoE"的判据，本文不补。同类限制也适用于 SiTU-GLU 与 SwiGLU、QB 与辅助损失的优劣比较。</p>
+    </details>
+  </li>
+</ol>
 
-<h3>核心论断与来源</h3>
+<h2 id="sources-and-scope">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
 <p>C1-C2：K3 技术报告 §2.3（第 423-428 行）。C3-C5：K3 技术报告 §2.3（第 429-433 行）。C6-C10：K3 技术报告 §2.3-2.3.1（第 461-485 行）。C11：K3 技术报告 §2.3.2（Eq. 12，第 499-502 行）与第 541 行。C12-C13：K3 技术报告 §2.3.3（Eq. 13-14，第 547-596 行）。C7：K3 技术报告 §2.3 第 464 行；DeepSeekMoE 论文 §3.2（arXiv:2401.06066）。C8：K3 技术报告 §2.3 第 478 行；<code>config.json</code> 的 <code>num_shared_experts=2</code>。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p>F1（Eq. 11，Stable LatentMoE 层输出）：K3 报告 §2.3 第 467-474 行。F2（DeepSeekMoE 组织公式）：DeepSeekMoE 论文 §3.2（arXiv:2401.06066），本文只引用 shared+routed 组织结果。F3（SiTU-GLU，Eq. 12）：K3 报告 §2.3.2 第 499-502 行，本文只引用上界结论，完整推导见 <a href="../situ-glu/index.html">wiki/situ-glu/</a>。F4（QB 更新，Eq. 14）：K3 报告 §2.3.3 第 586-589 行，本文只引用分位数结论，完整推导见 <a href="../quantile-balancing/index.html">wiki/quantile-balancing/</a>。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>N1（$d=7168$）、N2（$\ell=3584$）、N3（<code>moe_intermediate_size=3072</code>）、N4（$N=896, k=16, N_s=2$）、N8（<code>latent_moe_use_norm=true</code> 等）：均来自 Hugging Face <code>moonshotai/Kimi-K3</code> 的 <code>config.json</code>。N5（稀疏度 56）、N6（2.8T 参数）：K3 报告 §2.3。N7（SiTU-GLU 上界 100）：K3 报告 §2.3.2 第 541 行与 <code>config.json</code> 的 <code>activation_situ_beta=4.0</code>、<code>activation_situ_linear_beta=25.0</code>。实验条件均为 K3 配置（bfloat16 训练）。</p>
 
-<h3>教学示例</h3>
-<p>为什么 RMSNorm 必须插在路由聚合之后一章的 RMSNorm 数字例子是人为构造的教学示例：隐空间维度缩小到 $\ell = 2$ 便于手算；专家输出 $E_1(z)=(2,0)$、$E_3(z)=(20,0)$ 等幅度相差 10 倍是为让尺度漂移可手算可见；省略了 RMSNorm 的可学习缩放参数 $\gamma$。构造目的是让"$u$ 的尺度逐 token 漂移"和"RMSNorm 抹尺度保方向"两个结论可手算验证，不代表 K3 实际训练中的数值范围（实际 $\ell=3584$、专家输出幅度由训练决定）。</p>
+<h3>构造示例</h3>
+<p>为什么 RMSNorm 必须插在路由聚合之后一章的 RMSNorm 数字例子是构造示例：隐空间维度缩小到 $\ell = 2$ 便于手算；专家输出 $E_1(z)=(2,0)$、$E_3(z)=(20,0)$ 等幅度相差 10 倍是为让尺度漂移可手算可见；省略了 RMSNorm 的可学习缩放参数 $\gamma$。构造目的是让"$u$ 的尺度逐 token 漂移"和"RMSNorm 抹尺度保方向"两个结论可手算验证，不代表 K3 实际训练中的数值范围（实际 $\ell=3584$、专家输出幅度由训练决定）。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>"尺度放大"用于解释极端稀疏下的两个失败模式一章中失败模式一的 $u$ 的尺度变化如何透传到 $W_\uparrow$ 输出；它只描述矩阵乘法链中尺度因子的传播，不涵盖条件数、梯度爆炸等数值分析的完整内容，正式判断以 Eq. 11 与 RMSNorm 的数学定义为准。"抹尺度保方向"用于解释 RMSNorm 的作用；它只描述 RMSNorm 按均方根归一化、不跨维度混合这一性质，不覆盖 RMSNorm 与 LayerNorm 的差异、可学习参数 $\gamma$ 的作用等内部细节。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>（1）DeepSeekMoE 组织公式只引用 shared+routed 结构，省略了 $g_{i,t}$ 的 softmax 与 Top-k 定义、细粒度专家切分策略。可推出：共享无路由、路由 Top-k。不可推出：DeepSeekMoE 的完整设计。（2）SiTU-GLU 只引用上界结论，省略了 softcap 推导、极限情形、与硬截断的对比。可推出：激活有界、上界 100。不可推出：SiTU-GLU 的完整机制。（3）QB 只引用分位数结论，省略了 Top-$(k+1)$ 截断推导、直方图估计实现。可推出：从分位数设 bias。不可推出：QB 的完整推导。（4）RMSNorm 只用"按均方根归一化"这一基本作用，省略了可学习缩放参数 $\gamma$、与 LayerNorm 的差异。可推出：归一化尺度、不跨维度混合。不可推出：RMSNorm 的完整定义。完整内容分别见对应独立概念页。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
