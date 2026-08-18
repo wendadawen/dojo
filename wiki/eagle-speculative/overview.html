@@ -44,20 +44,20 @@
       <p class="meta">更新于 2026-08-09</p>
     </header>
 
-    <h2>一句话定位</h2>
+    <h2>1. 一句话定位</h2>
     <p>EAGLE-3 是 EAGLE 系列（Li et al. 2024, ICML；2025, NeurIPS）的第三版 draft 模型架构，用于投机解码。它把 draft 减到单层 decoder，输入是 target 模型低/中/高三层 feature 的融合，输出直接是 token 分布（不再回归 feature），训练时用 training-time test 让 draft 见到自己多步输出的近似、模拟推理时「自替代」的噪声。K3 用预训练的 MTP 层 fine-tune 出 EAGLE-3 draft，与 target 共享同一 QAT 量化配置。</p>
 
-    <h2>为什么需要它</h2>
+    <h2>2. 为什么需要它</h2>
     <ul>
-      <li><strong>传统独立小模型 draft 有两难</strong>。太弱（如 TinyLLaMA）接受率低、α 趋近 0、加速消失；太强（如 7B 给 70B 打草稿）draft 自身成本 c 不可忽略、加速比退化。训练一个独立小语言模型成本又极高（TinyLLaMA 用 3000B tokens）。</li>
+      <li><strong>传统独立小模型 draft 有两难</strong>。太弱（如 TinyLLaMA）接受率低、$\alpha$ 趋近 0、加速消失；太强（如 7B 给 70B 打草稿）draft 自身成本 $c$ 不可忽略、加速比退化。训练一个独立小语言模型成本又极高（TinyLLaMA 用 3000B tokens）。</li>
       <li><strong>target feature 已经算出来了</strong>。target 模型每步前向传播都会算出丰富的内部隐藏状态，传统 draft 完全不利用这些状态、从 token 序列重新学一遍，浪费了已经算好的信息。</li>
       <li><strong>EAGLE-1 有容量瓶颈</strong>。EAGLE-1 让 draft 在 feature 空间做自回归、再过 target lm_head 得到 token。但 feature 回归任务占用了 draft 容量，扩大训练数据对 EAGLE-1 提升饱和。</li>
       <li><strong>深度预测会累积噪声</strong>。EAGLE-3 推理时后续步骤要用 draft 自己的输出 a 替代 target 真实 feature g，a 与 g 有偏差，深度越大噪声越显著；若不在训练时模拟这种噪声，draft 在深度预测中接受率会快速衰减。</li>
     </ul>
 
-    <h2>核心直觉</h2>
+    <h2>3. 核心直觉</h2>
     <ul>
-      <li><strong>复用而非重建</strong>。EAGLE 系列不训练独立小模型，让 draft 直接复用 target 已算出的隐藏状态作为输入。draft 自身参数量极少（EAGLE-3 单层 decoder），单步成本 c 接近 0；同时 draft 决策基于 target 内部表示、与 target 决策边界更贴近，α 更高。</li>
+      <li><strong>复用而非重建</strong>。EAGLE 系列不训练独立小模型，让 draft 直接复用 target 已算出的隐藏状态作为输入。draft 自身参数量极少（EAGLE-3 单层 decoder），单步成本 $c$ 接近 0；同时 draft 决策基于 target 内部表示、与 target 决策边界更贴近，$\alpha$ 更高。</li>
       <li><strong>feature 空间比 token 空间更规律</strong>。EAGLE-1 的关键观察：target 的 second-to-top-layer feature 是连续表示、相邻位置关系平滑；token 序列是离散变换、预测难度大。在 feature 空间做自回归更稳定。</li>
       <li><strong>time-shifted token 解决不确定性</strong>。仅用历史 feature 预测下一步 feature 时，draft 不知道「下一步采了哪个 token」。EAGLE-1 引入提前一个时间步的 token embedding 作为额外输入，给 draft 提供「上一步采了什么」的信息。</li>
       <li><strong>直接 token 预测释放容量</strong>。EAGLE-3 放弃 feature 回归、直接预测 token 分布，draft 容量全部用于贴近 target token 分布；扩大训练数据能直接转化为更准的 token 预测。</li>
@@ -66,12 +66,12 @@
       <li><strong>TTT 让 draft 训练时体验推理噪声</strong>。training-time test 在训练时让 draft 见到自己多步输出的近似 feature（用因果 mask 构造多轮展开），模拟推理时「自替代」的噪声环境。这样训练出的 draft 在深度预测中接受率不快速衰减。</li>
     </ul>
 
-    <h2>关键结论与边界</h2>
+    <h2>4. 关键结论与边界</h2>
     <ul>
       <li><strong>EAGLE-3 不改变投机解码框架</strong>。接受/拒绝规则、残差分布、bonus token 都来自通用投机解码，见 <a href="../../wiki/speculative-decoding/index.html">投机解码</a>。EAGLE-3 只替换 draft 角色，输出分布与纯 target 采样完全相同（lossless）。成立条件：target 与 draft 共享 tokenizer。</li>
       <li><strong>直接 token 预测与多层融合是 EAGLE-3 与 EAGLE-1 的本质区别</strong>。EAGLE-1 是 3-4 层 decoder + second-to-top-layer 单层 feature + 预测 feature；EAGLE-3 是单层 decoder + low/mid/high 三层融合 + 直接预测 token。成立条件：target 暴露多层 feature。</li>
       <li><strong>TTT 是 EAGLE-3 训练侧的关键创新</strong>。它让 draft 在训练时见到自己的输出作为输入、模拟推理噪声；不只是「多训练几步」。成立条件：训练时能做因果 mask 多轮展开。</li>
-      <li><strong>LK loss 直接优化接受率</strong>。K3 报告版损失 L_LK = -log Σ_x min(p(x), q(x)) 是接受率 α 的负对数。常规 KL 散度只是分布距离的代理、不直接等价于 α；capacity-limited draft 在 KL 下可能学到「平均接近」但「具体 token 接受率不高」的解。成立条件：p 与 q 在 temperature=1 评估、无 ground-truth cross-term。</li>
+      <li><strong>LK loss 直接优化接受率</strong>。K3 报告版损失 $L_{\text{LK}} = -\log \sum_x \min(p(x), q(x))$ 是接受率 $\alpha$ 的负对数。常规 KL 散度只是分布距离的代理、不直接等价于 $\alpha$；capacity-limited draft 在 KL 下可能学到「平均接近」但「具体 token 接受率不高」的解。成立条件：p 与 q 在 temperature=1 评估、无 ground-truth cross-term。</li>
       <li><strong>K3 把 MTP 层 fine-tune 成 EAGLE-3 draft</strong>。MTP 层结构镜像 backbone block、单层 decoder，与 EAGLE-3 架构天然匹配；W_E3 初始化为 [0 0 I] 让初始 fused feature 等于 high-level feature、与 MTP 预训练对齐；TTT unroll 长度 7 步；draft 与 target 共享 QAT 配置（MXFP4 权重 + MXFP8 激活，非专家高精度），消除 train-inference mismatch。成立条件：K3 部署。</li>
       <li><strong>EAGLE-3 不解决高并发批处理吞吐</strong>。与投机解码边界一致，高批处理下「空闲算力」消失、加速退化。EAGLE-3 在 SGLang batch=64 时吞吐 1.38x，更高批处理下加速退化。</li>
     </ul>

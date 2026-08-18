@@ -579,6 +579,7 @@
       border: none;
     }
     .learning-goals ul,
+    .learning-goals ol,
     .misconceptions ul { margin-bottom: 0; }
     .diagram {
       font-family: var(--font-mono);
@@ -590,6 +591,42 @@
       line-height: 1.5;
       margin: 1.5rem 0;
     }
+
+    /* ============ HTML 结构流程图 ============ */
+    .flow {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.6;
+      margin: 1.5rem 0;
+    }
+    .flow-title { font-weight: 600; color: var(--text); margin: 0 0 0.6rem; }
+    .flow-row {
+      display: flex; align-items: center; flex-wrap: wrap;
+      gap: 0.35rem 0.5rem; margin: 0.45rem 0;
+    }
+    .flow-node {
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 0.3rem 0.6rem; background: var(--bg);
+    }
+    .flow-node.soft { border-style: dashed; background: transparent; }
+    .flow-node .flow-sub {
+      display: block; font-size: 0.85em;
+      color: var(--text-light); font-weight: 400;
+    }
+    .flow-tag { font-weight: 600; color: var(--text-light); white-space: nowrap; }
+    .flow-arrow { color: var(--text-muted); white-space: nowrap; }
+    .flow-gap { display: inline-block; width: 6.5em; }
+    .flow-note { color: var(--text-light); margin: 0.35rem 0; }
+
+    /* ============ 章节问题列表 ============ */
+    ol.chapter-questions { margin-bottom: var(--space-paragraph); }
+    ol.chapter-questions > li { margin-bottom: 1rem; }
+    ol.chapter-questions > li > p { margin-bottom: 0.5rem; }
+    ol.chapter-questions > li > details { margin: 0.5rem 0 0; }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
       .context-label { margin-top: 0.4rem; }
@@ -671,21 +708,51 @@
 </div>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>为什么把 Transformer 层的 FFN 换成 MoE，能让模型存下多得多的参数而每个 token 的计算量几乎不涨？</li>
-    <li>MoE 模型的专家为什么要切到多张 GPU 上，all-to-all 的 dispatch/combine 在搬运什么，TBO/SBO 怎样掩盖这部分通信开销？</li>
-    <li>一次对话请求在 prefill 和 decode 两个阶段分别做什么，KV cache 消除了哪部分重复计算？</li>
-    <li>TTFT、TPOT、SLO、goodput 各自衡量什么，为什么"服务快"要拆成两个指标？</li>
-    <li>PD 合设与 PD 分离各自的动机和基本代价是什么？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>为什么把 Transformer 层的 FFN 换成 MoE，能让模型存下多得多的参数而每个 token 的计算量几乎不涨？</p>
+      <details>
+        <summary>解答：稀疏激活把存储与计算解耦</summary>
+        <p>MoE 把每层的一个 FFN 复制成 $N$ 个专家，再加一个 router；每个 token 只让得分最高的 $k$ 个专家计算，输出按门控权重加权求和。参数总量随 $N$ 增长，每个 token 的计算量只随 $k$ 增长，存储与计算由此解耦。DeepSeek-V3 以 256 选 8 加 1 个共享专家，实现总参数 671B、每 token 激活约 37B（约 5.5%）。完整论证见「2. 把一个 FFN 换成一排专家：MoE 与 top-k 稀疏激活」。</p>
+      </details>
+    </li>
+    <li>
+      <p>MoE 模型的专家为什么要切到多张 GPU 上，all-to-all 的 dispatch/combine 在搬运什么，TBO/SBO 怎样掩盖这部分通信开销？</p>
+      <details>
+        <summary>解答：EP 切分引出 all-to-all，重叠掩盖通信</summary>
+        <p>稀疏激活只省计算不省存储，全部权重必须驻留显存，单卡放不下，因此按专家分片到多卡（专家并行）。分片之后，token 的激活必须送到选中专家所在的卡（dispatch），专家输出要送回原卡加权求和（combine），两者通常用 all-to-all 通信实现。TBO 让一个微批的通信与另一个微批的计算同时进行；SBO 在同一批内让共享专家的计算与路由专家的通信同时进行。重叠是"藏"不是"消"，通信仍占带宽。完整论证见「3. 权重放不下了：专家并行与 all-to-all 搬运」与「4. 通信不能干等：TBO 与 SBO 的重叠」。</p>
+      </details>
+    </li>
+    <li>
+      <p>一次对话请求在 prefill 和 decode 两个阶段分别做什么，KV cache 消除了哪部分重复计算？</p>
+      <details>
+        <summary>解答：prefill 建缓存，decode 读缓存</summary>
+        <p>prefill 一次性并行处理全部输入 token，逐层写入 key/value 并建立 KV cache，产出第一个新 token，计算密集、追求吞吐；decode 每步只处理 1 个新 token，大量时间花在读 KV cache 上，对延迟敏感。KV cache 消除的是"每生成一步就把全部前缀重新过一遍模型"带来的 key/value 重复计算：前缀不变，其 key/value 只需计算一次。完整论证见「5. 一次请求的两个阶段：prefill、decode 与 KV cache」。</p>
+      </details>
+    </li>
+    <li>
+      <p>TTFT、TPOT、SLO、goodput 各自衡量什么，为什么"服务快"要拆成两个指标？</p>
+      <details>
+        <summary>解答：两个阶段贡献两段延迟</summary>
+        <p>TTFT 是首 token 延迟，约等于 prefill 时长；TPOT 是除首 token 外平均每个输出 token 的生成时间，反映 decode 速度；总延迟 = TTFT + TPOT × decode 阶段生成的 token 数。SLO 是服务方对这两个指标分别承诺的上限与达标比例，goodput 是在满足 SLO 达成率前提下系统能承接的最大请求率。拆成两个指标，是因为两阶段的资源脾气不同，且不同应用对首字等待与出字速度的要求不同。完整论证见「6. 服务好不好怎么量：TTFT、TPOT、SLO 与 goodput」。</p>
+      </details>
+    </li>
+    <li>
+      <p>PD 合设与 PD 分离各自的动机和基本代价是什么？</p>
+      <details>
+        <summary>解答：干扰与副本的权衡</summary>
+        <p>PD 合设让两阶段共享同一批 GPU 与一份权重，省显存、KV cache 就地可用，代价是长短步互相干扰，TTFT 与 TPOT 互相拖累。PD 分离给两阶段各自一组实例，消除干扰并允许独立定制资源，代价是每个实例都要存一份完整模型副本、KV cache 要跨实例传输、容量要按部署单元成组扩缩。完整论证见「7. 放一起还是分开：PD 合设与 PD 分离」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：DeepSeek-V3 Technical Report（arXiv:2412.19437）、DistServe（OSDI 2024，arXiv:2401.09670）、ExpertPlex 背景章（arXiv:2607.18002 v2 §2）、Shazeer et al. 2017（arXiv:1701.06538）；逐条定位见文末"来源与教学说明"。</p>
+<p><b>主要依据</b>：DeepSeek-V3 Technical Report（arXiv:2412.19437）、DistServe（OSDI 2024，arXiv:2401.09670）、ExpertPlex 背景章（arXiv:2607.18002 v2 §2）、Shazeer et al. 2017（arXiv:1701.06538）；逐条定位见文末"来源与范围说明"。</p>
 </blockquote>
 
-<h2 id="s1-transformer-layer">一个字是怎么蹦出来的：token、参数与 Transformer 层</h2>
+<h2 id="s1-transformer-layer">1. 一个字是怎么蹦出来的：token、参数与 Transformer 层</h2>
 
 <p>模型不直接读文字。你输入的一句话会先被切成若干小块，每块叫一个 <strong>token</strong>（大致是一个字或一个词片段）。模型看到和生成的，都是一串 token。</p>
 
@@ -698,10 +765,15 @@
   <li><strong>FFN（前馈网络）</strong>：对每个 token 独立做同一套变换的小计算器，token 之间在这一步互不打交道。它由两个矩阵（两张"把向量变成另一个向量的权重表"）构成。</li>
 </ul>
 
-<pre class="diagram">一个 token 穿过一层 Transformer：
-
-token 向量 ──► attention（token 之间交换信息）──► FFN（每个 token 独立变换）──► 送往下一层
-                  参数 ≈ 4d²                        参数 ≈ 8d²（约为前者的 2 倍）</pre>
+<div class="flow">
+  <div class="flow-title">一个 token 穿过一层 Transformer</div>
+  <div class="flow-row">
+    <span class="flow-node">token 向量</span><span class="flow-arrow">→</span>
+    <span class="flow-node">attention<span class="flow-sub">token 之间交换信息</span><span class="flow-sub">参数 $\approx 4d^2$</span></span><span class="flow-arrow">→</span>
+    <span class="flow-node">FFN<span class="flow-sub">每个 token 独立变换</span><span class="flow-sub">参数 $\approx 8d^2$（约为前者的 2 倍）</span></span><span class="flow-arrow">→</span>
+    <span class="flow-node soft">送往下一层</span>
+  </div>
+</div>
 
 <p>这两个模块谁存的参数多？在 Transformer 原始论文（Vaswani 等，2017）的标准配置里，隐层宽度 $d=512$，FFN 中间层宽度 $d_{ff}=2048$。可以手算（忽略偏置和归一化参数）：</p>
 
@@ -712,15 +784,27 @@ token 向量 ──► attention（token 之间交换信息）──► FFN（�
 
 <p>FFN 约占两者之和的 2/3（数字 N7）。也就是说，每一层里存"知识"的大头是 FFN。这个比例是下一章的出发点：想把模型"撑大"，首先动的是 FFN。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出一个 token 经过一层 Transformer 时，attention 和 FFN 各做什么。</li>
-  <li>复算 $d=512$、$d_{ff}=2048$ 时两个模块的参数量，并说明 FFN 占比。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出一个 token 经过一层 Transformer 时，attention 和 FFN 各做什么。</p>
+    <details>
+      <summary>解答：attention 跨 token 汇信息，FFN 逐 token 变换</summary>
+      <p>attention 让 token 之间交换信息：每个 token 从前面所有 token 汇聚信息，解决"它"指代谁、哪个词修饰哪个词这类依赖。FFN 对每个 token 独立做同一套变换，token 之间在这一步互不打交道。标准配置下 attention 参数约 $4d^2$、FFN 约 $8d^2$，FFN 是每层的参数大户。</p>
+    </details>
+  </li>
+  <li>
+    <p>复算 $d=512$、$d_{ff}=2048$ 时两个模块的参数量，并说明 FFN 占比。</p>
+    <details>
+      <summary>解答：105 万对 210 万，FFN 约占 2/3</summary>
+      <p>attention 有 4 个 $d\times d$ 投影矩阵，合计 $4\times 512^2 = 1{,}048{,}576\approx 105$ 万；FFN 的两个矩阵分别为 $d\times d_{ff}$ 与 $d_{ff}\times d$，合计 $2\times 512\times 2048 = 2{,}097{,}152\approx 210$ 万。FFN 占两者之和的 $210/(105+210)=2/3$。该结果在忽略偏置与归一化参数的条件下成立。</p>
+    </details>
+  </li>
+</ol>
 
 <p>既然 FFN 是参数大户，"让模型更大"在工程上就是"让 FFN 更大"。下一章的问题是：怎样让 FFN 部分存下几十倍的参数，却不让每个 token 的计算量跟着爆炸？</p>
 
-<h2 id="s2-moe-topk">把一个 FFN 换成一排专家：MoE 与 top-k 稀疏激活</h2>
+<h2 id="s2-moe-topk">2. 把一个 FFN 换成一排专家：MoE 与 top-k 稀疏激活</h2>
 
 <p>直觉上，模型存的参数越多，能记住和表达的东西越多。但稠密（dense）模型里参数翻倍意味着每个 token 的计算量也翻倍——每一层的每个模块对每个 token 都要算一遍。计算量直接就是服务成本：参数翻倍，每个回答都贵一倍。有没有办法让"存得多"和"算得少"分开？</p>
 
@@ -738,7 +822,7 @@ token 向量 ──► attention（token 之间交换信息）──► FFN（�
 
 <p>用一个边界检查这个公式：如果 $k=N$（全部选中）且权重相同，MoE 就退化成"所有专家都算一遍"，稀疏省算力的意义消失。所以 $k$ 必须远小于 $N$——下面会看到 DeepSeek-V3 是 256 选 8。</p>
 
-<p><strong>教学示例。</strong> 构造 8 个 routed expert（按路由激活的专家）、top-2 的情形。某个 token 的 router 打分如下（打分为便于手算构造的数字）：</p>
+<p><strong>构造示例。</strong> 构造 8 个 routed expert（按路由激活的专家）、top-2 的情形。某个 token 的 router 打分如下（打分为便于手算构造的数字）：</p>
 
 <div class="table-scroll">
 <table>
@@ -755,8 +839,8 @@ token 向量 ──► attention（token 之间交换信息）──► FFN（�
 
 <p>现在把开头那个数字落实。DeepSeek-V3 的每个 MoE 层含 1 个 shared expert 与 256 个 routed expert，每个 token 激活其中 8 个（top-8，数字 N2）；全部 61 层中，前 3 层保留稠密 FFN，其余 58 层是 MoE 层（N3）；模型总参数 671B，每个 token 只激活约 37B（N1）。手算验证：$37 \div 671 \approx 0.055$，即每个 token 只动用约 5.5% 的参数。这就是"存 671B、每 token 只算 37B"同时成立的原因：<strong>稀疏激活把总参数量和每 token 计算量解耦了</strong>（论断 C3）。</p>
 
-<div class="callout callout-red">
-<p><b>最容易误解：</b>MoE 不是"几个独立模型在投票"。专家是同一个网络内部的一排小 FFN，与 router 一起联合训练、作为一个模型统一部署——没有任何一个专家能单独回答问题。</p>
+<div class="callout callout-yellow">
+<p><b>注意：</b>MoE 不是"几个独立模型在投票"。专家是同一个网络内部的一排小 FFN，与 router 一起联合训练、作为一个模型统一部署——没有任何一个专家能单独回答问题。</p>
 </div>
 
 <p>还有一个隐患先记下来：router 可能总偏爱少数几个专家，被选中的累垮、没被选中的白训。训练时要靠额外的均衡机制（辅助损失或偏置调整）拉住，这属于训练侧问题，本页不展开；但请记住"负载可能不均"，下一章它会在服务侧以另一种形式出现。</p>
@@ -766,19 +850,37 @@ token 向量 ──► attention（token 之间交换信息）──► FFN（�
 <p>稀疏激活的专家混合层由 Shazeer 等人 2017 年提出（带噪声的 top-k 门控，最多 1370 亿参数）；GShard（2020）把它搬进 Transformer 并用 top-2；Switch Transformer（2021）简化为 top-1；DeepSeek-V3（2024）用细粒度专家加 top-8。k 取多少、专家分多细，至今没有统一答案，是各模型自己的权衡。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话解释"为什么 DeepSeek-V3 总参数 671B，但每个 token 只算约 37B"。</li>
-  <li>给定 8 个专家的打分表，复算 top-2 的选择与归一化权重。</li>
-  <li>说明 shared expert 与 routed expert 的区别。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话解释"为什么 DeepSeek-V3 总参数 671B，但每个 token 只算约 37B"。</p>
+    <details>
+      <summary>解答：稀疏激活解耦容量与计算</summary>
+      <p>全部 671B 权重都驻留在显存里，但每个 token 只经过 router 选中的 8 个路由专家加 1 个共享专家，因此每个 token 实际计算的参数只有约 37B，占总量的约 5.5%。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 8 个专家的打分表，复算 top-2 的选择与归一化权重。</p>
+    <details>
+      <summary>解答：选最高两名，按选中得分归一化</summary>
+      <p>取得分最高的两个专家（0.9 与 0.6），两者得分相加为 1.5，归一化权重为 $g_3=0.9/1.5=0.6$、$g_7=0.6/1.5=0.4$，该层输出为 $y=0.6\,E_3(x)+0.4\,E_7(x)$，其余 6 个专家对这个 token 不计算。归一化细节因实现而异，此处采用的是按选中得分归一化的简化写法。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明 shared expert 与 routed expert 的区别。</p>
+    <details>
+      <summary>解答：全量经过对按分选中</summary>
+      <p>shared expert 对所有 token 都计算，承载每个 token 都需要的通用变换；routed expert 只有被 router 打分选中的 token 才经过，承载按需激活的专门变换。两者并存于同一个 MoE 层，输出共同参与这一层的加权求和。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章解决了"算得少"。但注意一个容易滑过去的点：稀疏激活省的是<strong>计算</strong>，不是存储。那 671B 权重，一个数字都不能少地待在某个地方。下一章的问题是：一张 GPU 放不下时怎么办？</p>
 
-<h2 id="s3-ep-alltoall">权重放不下了：专家并行与 all-to-all 搬运</h2>
+<h2 id="s3-ep-alltoall">3. 权重放不下了：专家并行与 all-to-all 搬运</h2>
 
-<div class="callout callout-red">
-<p><b>最容易误解：</b>"每个 token 只激活 5.5% 的参数，所以模型只需要 37B 对应的显存。"错。稀疏激活省的是每 token 的计算量；全部 671B 权重都必须驻留——因为任何一个 token 都可能选中任何一个专家，哪个都不能缺。</p>
+<div class="callout callout-yellow">
+<p><b>注意：</b>"每个 token 只激活 5.5% 的参数，所以模型只需要 37B 对应的显存。"错。稀疏激活省的是每 token 的计算量；全部 671B 权重都必须驻留——因为任何一个 token 都可能选中任何一个专家，哪个都不能缺。</p>
 </div>
 
 <p>先补一个事实：GPU 是擅长并行做矩阵乘法的芯片，它的高速存储（<strong>显存</strong>）容量有限（单卡几十到上百 GB 量级），权重必须放进显存才能算。671B 参数远超单卡容量，必须把模型摊开。（GPU 内部如何执行计算由概念页《<a href="../gpu-execution-model/index.html">GPU 执行模型</a>》负责；本页只需要"显存有限"这一个事实。）</p>
@@ -787,17 +889,25 @@ token 向量 ──► attention（token 之间交换信息）──► FFN（�
 
 <p>切完之后问题来了：路由是按 token 决定的，而每张卡只持有部分专家。于是每个 token 的中间结果（<strong>激活</strong>，即它流过这一层时的向量）必须被送到选中专家所在的卡上——这一步叫 <strong>dispatch</strong>；专家算完，结果要送回来加权求和——这一步叫 <strong>combine</strong>。由于每张卡上的 token 都可能要去任何一张卡，dispatch 和 combine 通常用 <strong>all-to-all</strong> 通信实现：每张卡都同时与所有其他卡交换数据（论断 C7）。DeepSeek 为此开源了专门的通信库 DeepEP。</p>
 
-<pre class="diagram">一层 MoE 在 2 张卡上的数据流（EP=2，8 个专家每卡 4 个）：
+<div class="flow">
+  <div class="flow-title">一层 MoE 在 2 张卡上的数据流（EP=2，8 个专家每卡 4 个）</div>
+  <div class="flow-row">
+    <span class="flow-node">卡 0 上的 token</span><span class="flow-node">卡 1 上的 token</span>
+    <span class="flow-arrow">→</span>
+    <span class="flow-node">router 打分、选 top-k（每 token 决定去哪 $k$ 个专家）</span>
+  </div>
+  <div class="flow-arrow">dispatch（all-to-all）：把激活送到选中专家所在的卡 ↓</div>
+  <div class="flow-row">
+    <span class="flow-node">卡 0：专家 0,1,2,3</span><span class="flow-node">卡 1：专家 4,5,6,7</span>
+    <span class="flow-arrow">→ 各卡专家并行计算</span>
+  </div>
+  <div class="flow-arrow">combine（all-to-all）：把专家输出送回原卡、加权求和 ↓</div>
+  <div class="flow-row">
+    <span class="flow-node soft">下一层</span>
+  </div>
+</div>
 
-  卡0 上的 token ──┐                         ┌── 卡0：专家 0,1,2,3 ──┐
-  卡1 上的 token ──┴─► router 打分、选 top-k ─►│                        │─► 各卡专家并行计算
-                        （每 token 决定去     └── 卡1：专家 4,5,6,7 ──┘
-                         哪 k 个专家）                    ▲
-                              │                           │
-                              └── dispatch（all-to-all：把激活送到选中专家所在的卡）
-                                  combine（all-to-all：把专家输出送回原卡，加权求和）──► 下一层</pre>
-
-<p><strong>教学示例。</strong> 把上一章那 8 个 routed expert 放到 2 张卡上：卡 0 存专家 0–3，卡 1 存专家 4–7。4 个 token 的 top-2 路由结果如下（构造数字）：</p>
+<p><strong>构造示例。</strong> 把上一章那 8 个 routed expert 放到 2 张卡上：卡 0 存专家 0–3，卡 1 存专家 4–7。4 个 token 的 top-2 路由结果如下（构造数字）：</p>
 
 <div class="table-scroll">
 <table>
@@ -817,11 +927,11 @@ token 向量 ──► attention（token 之间交换信息）──► FFN（�
 <p>真实规模感受一下：DeepSeek 的在线推理系统里，prefill 的一个部署单元是 4 节点 32 张 GPU（EP32，每卡放 9 个路由专家加 1 个共享专家），decode 的一个部署单元是 18 节点 144 张 GPU（EP144，每卡只放 2 个路由专家加 1 个共享专家）（数字 N4）。256 个专家摊到上百张卡上，每张卡只剩个位数。</p>
 
 <details class="code-details">
-<summary>可运行代码：模拟 top-2 路由下的 dispatch 计数，验证上面的表格</summary>
+<summary>代码：模拟 top-2 路由下的 dispatch 计数，验证上表</summary>
 <div class="code-block">
 <pre><code class="language-python">import random
 
-# 教学示例：8 个路由专家、每 token 选 top-2，专家分片到 2 张卡
+# 构造示例：8 个路由专家、每 token 选 top-2，专家分片到 2 张卡
 NUM_EXPERTS = 8
 TOP_K = 2
 NUM_GPUS = 2  # 卡 0 放专家 0-3，卡 1 放专家 4-7
@@ -829,7 +939,7 @@ NUM_GPUS = 2  # 卡 0 放专家 0-3，卡 1 放专家 4-7
 def gpu_of(expert):
     return expert // (NUM_EXPERTS // NUM_GPUS)
 
-# 正文教学示例的固定路由表：4 个 token 各自选中的 2 个专家
+# 正文构造示例的固定路由表：4 个 token 各自选中的 2 个专家
 routes = [
     ("t1", [1, 2]),
     ("t2", [2, 5]),
@@ -873,23 +983,48 @@ combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
 <p><b>教学简化</b>：代码只做计数，不含真实的网络传输与专家计算；真实系统中 dispatch/combine 由 DeepEP 这类通信库在多卡间完成，combine 还要按门控权重加权求和。本例 8 专家、2 卡是缩小版，DeepSeek-V3 是 256 专家、上百张卡。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 dispatch 和 combine 各搬什么、沿什么方向搬。</li>
-  <li>复算上表卡 0 与卡 1 的计数，并解释"卡 1 空转"的原因。</li>
-  <li>解释为什么"每 token 只激活 8/256 个专家"并不能让模型少占显存。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出 dispatch 和 combine 各搬什么、沿什么方向搬。</p>
+    <details>
+      <summary>解答：激活去程，结果回程</summary>
+      <p>dispatch 把每个 token 的激活从它当前所在的卡搬到其选中专家所在的卡（去程）；combine 把专家算出的输出沿原路送回 token 原来的卡，在那里按门控权重加权求和（回程）。由于每张卡上的 token 都可能要去任何一张卡，两者通常用 all-to-all 通信实现。</p>
+    </details>
+  </li>
+  <li>
+    <p>复算上表卡 0 与卡 1 的计数，并解释"卡 1 空转"的原因。</p>
+    <details>
+      <summary>解答：6 对对 2 对，整层等最慢的卡</summary>
+      <p>4 个 token 各选 2 个专家，共 8 个 token–专家对：落在卡 0（专家 0–3）的 6 对，落在卡 1（专家 4–7）的 2 对。若每对计算时间相近，卡 0 要干的活约为卡 1 的 3 倍；而这一层必须等所有卡都算完才能继续，卡 1 在等待期间无活可干，算力空转。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释为什么"每 token 只激活 8/256 个专家"并不能让模型少占显存。</p>
+    <details>
+      <summary>解答：任何一个专家都可能被选中</summary>
+      <p>router 的选择按 token 逐个决定，任何一个 token 都可能选中任何一个专家，因此全部 256 个专家的权重都必须驻留在显存中，缺一个就无法服务可能到来的路由。稀疏激活省的是每 token 的计算量，不是存储量。</p>
+    </details>
+  </li>
+</ol>
 
 <p>dispatch 和 combine 是真实的网络传输，要花时间。通信在路上时，GPU 在干什么？什么也不干——除非刻意安排。下一章的问题是：怎样把这段通信时间"藏起来"？</p>
 
-<h2 id="s4-tbo-sbo">通信不能干等：TBO 与 SBO 的重叠</h2>
+<h2 id="s4-tbo-sbo">4. 通信不能干等：TBO 与 SBO 的重叠</h2>
 
 <p>把一层 MoE 的各步骤按时间排开，最朴素的执行是串行的：</p>
 
-<pre class="diagram">串行执行（一层 MoE）：
-
-[attention 等计算] ──► [dispatch] ──► [专家计算] ──► [combine] ──► 下一层
-                       └───────── 通信期间算力闲置（气泡）─────────┘</pre>
+<div class="flow">
+  <div class="flow-title">串行执行（一层 MoE）</div>
+  <div class="flow-row">
+    <span class="flow-node">attention 等计算</span><span class="flow-arrow">→</span>
+    <span class="flow-node">dispatch</span><span class="flow-arrow">→</span>
+    <span class="flow-node">专家计算</span><span class="flow-arrow">→</span>
+    <span class="flow-node">combine</span><span class="flow-arrow">→</span>
+    <span class="flow-node soft">下一层</span>
+  </div>
+  <div class="flow-note">dispatch 到 combine 之间：通信期间算力闲置（气泡）。</div>
+</div>
 
 <p>通信期间 GPU 的算力在空转，这段空白叫<strong>气泡</strong>。all-to-all 的规模越大（卡越多、token 越多），气泡越长。两种通行的"藏"法（论断 C8）：</p>
 
@@ -897,28 +1032,60 @@ combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
 
 <p><strong>SBO（single-batch overlap，单批次重叠）</strong>：在同一微批内部找可并行的工作。shared expert 的计算不依赖路由结果，不需要等 dispatch——让它与 routed expert 的 dispatch/combine 同时进行，同一批之内把通信盖住。</p>
 
-<pre class="diagram">TBO：微批 A 的通信与微批 B 的计算重叠
-微批A  [计算A] [──通信A──] [专家A] [计算A′]
-微批B         [计算B     ] [──通信B──] [专家B] ...
-                ▲ B 的计算盖住了 A 的通信
+<div class="flow">
+  <div class="flow-title">TBO：微批 A 的通信与微批 B 的计算重叠（时间向右）</div>
+  <div class="flow-row">
+    <span class="flow-tag">微批 A</span>
+    <span class="flow-node">计算 A</span><span class="flow-node">通信 A</span><span class="flow-node">专家 A</span><span class="flow-node">计算 A′</span>
+  </div>
+  <div class="flow-row">
+    <span class="flow-tag">微批 B</span>
+    <span class="flow-gap"></span>
+    <span class="flow-node">计算 B</span><span class="flow-node">通信 B</span><span class="flow-node">专家 B</span>
+    <span class="flow-note">…</span>
+  </div>
+  <div class="flow-note">B 的计算盖住了 A 的通信；轮到 B 通信时 A 在计算。</div>
+</div>
 
-SBO：同一微批内，共享专家计算与路由专家通信重叠
-同一批 [计算] [dispatch/combine（路由专家）] [路由专家计算] [合并]
-              [shared 专家计算（同时进行）]      ▲ 共享专家计算盖住了同批通信</pre>
+<div class="flow">
+  <div class="flow-title">SBO：同一微批内，共享专家计算与路由专家通信重叠（时间向右）</div>
+  <div class="flow-row">
+    <span class="flow-tag">路由专家</span>
+    <span class="flow-node">计算</span><span class="flow-node">dispatch/combine</span><span class="flow-node">路由专家计算</span><span class="flow-node">合并</span>
+  </div>
+  <div class="flow-row">
+    <span class="flow-tag">共享专家</span>
+    <span class="flow-gap"></span>
+    <span class="flow-node">shared 专家计算（与 dispatch/combine 同时进行）</span>
+  </div>
+  <div class="flow-note">共享专家计算盖住了同批通信。</div>
+</div>
 
 <div class="callout callout-yellow">
 <p><b>注意边界：</b>重叠是"藏"不是"消"。通信本身仍占用带宽与硬件资源；能否藏住取决于有没有足够的可并行计算——批太小、或 shared expert 的计算太短，气泡还是会露出来。TBO/SBO 也没有消除 all-to-all，只是让它与计算同时进行。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定串行时间线，指出 TBO 和 SBO 分别能盖住哪一段通信。</li>
-  <li>说出"重叠不能消除通信开销"的两个理由。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定串行时间线，指出 TBO 和 SBO 分别能盖住哪一段通信。</p>
+    <details>
+      <summary>解答：跨批掩盖与批内掩盖</summary>
+      <p>TBO 把一个大批拆成两个微批交替执行：微批 A 做 dispatch/combine 通信时微批 B 在计算，因此盖住的是"另一个微批的通信"。SBO 在同一微批内部，让不依赖路由结果的 shared expert 计算与 routed expert 的 dispatch/combine 同时进行，盖住的是"本批内的路由专家通信"。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出"重叠不能消除通信开销"的两个理由。</p>
+    <details>
+      <summary>解答：资源仍被占用，掩盖有条件</summary>
+      <p>其一，通信本身仍占用网络带宽与硬件资源，重叠只是让它与计算同时发生，并没有减少通信量，all-to-all 也依然存在。其二，能否盖住取决于有没有足够长的可并行计算：批太小或 shared expert 的计算太短时，气泡仍会暴露。</p>
+    </details>
+  </li>
+</ol>
 
 <p>模型会算了、权重铺开了、通信也藏住了。现在换到用户视角：你发出一句话到一个字一个字收到回答，中间到底发生了什么？</p>
 
-<h2 id="s5-prefill-decode-kvcache">一次请求的两个阶段：prefill、decode 与 KV cache</h2>
+<h2 id="s5-prefill-decode-kvcache">5. 一次请求的两个阶段：prefill、decode 与 KV cache</h2>
 
 <p>第 1 章说过，模型逐 token 生成。现在把它展开成一个循环：第 1 步，把你输入的全部 token 过一遍模型，产出第 1 个新 token；第 2 步，把"你的输入 + 刚生成的 token"再过一遍，产出第 2 个……直到模型说"完了"。每一步都要看到全部前缀。</p>
 
@@ -926,7 +1093,7 @@ SBO：同一微批内，共享专家计算与路由专家通信重叠
 
 <p>解法直白：把每层算过的 key/value 张量存下来，这就是 <strong>KV cache</strong>。下一步只需为那 1 个新 token 算 key/value，再拼到 cache 后面（论断 C10）。</p>
 
-<p><strong>教学示例。</strong> 你的输入是 4 个 token，模型再生成 3 个。只数 key/value 投影这一项的计算次数（教学简化：忽略 attention 打分与其余计算）：</p>
+<p><strong>构造示例。</strong> 你的输入是 4 个 token，模型再生成 3 个。只数 key/value 投影这一项的计算次数（教学简化：忽略 attention 打分与其余计算）：</p>
 
 <ul>
   <li>不存 cache：第 1 步要为 4 个前缀 token 算 key/value；第 2 步前缀变成 5 个，重算 5 个；第 3 步重算 6 个。合计 $4+5+6=15$ 个 token 次。</li>
@@ -942,27 +1109,53 @@ SBO：同一微批内，共享专家计算与路由专家通信重叠
   <li><strong>decode（解码）</strong>：之后每步只处理 1 个新 token，大量时间花在读 KV cache 上。每一步都很短，但每一步的长短直接决定你看到的"出字速度"，对<strong>延迟</strong>敏感。</li>
 </ul>
 
-<pre class="diagram">prefill：输入 [你][好][今][天] 一次性并行处理
-           ──► 各层 key/value 写入 KV cache ──► 产出首 token「吃」
-
-decode： 第1步：读 cache + 新 token「吃」──► 算 1 个 key/value 追加进 cache ──► 产出「饭」
-          第2步：读 cache + 新 token「饭」──► 算 1 个 key/value 追加进 cache ──► 产出「了」
-          ……每步只算 1 个新 token 的 key/value，前缀全靠读 cache</pre>
+<div class="flow">
+  <div class="flow-title">prefill：输入 [你][好][今][天] 一次性并行处理</div>
+  <div class="flow-row">
+    <span class="flow-node">输入 [你][好][今][天] 一次性并行处理</span><span class="flow-arrow">→</span>
+    <span class="flow-node">各层 key/value 写入 KV cache</span><span class="flow-arrow">→</span>
+    <span class="flow-node">产出首 token「吃」</span>
+  </div>
+  <div class="flow-title">decode：每步只算 1 个新 token 的 key/value</div>
+  <div class="flow-row">
+    <span class="flow-node">第 1 步：读 cache + 新 token「吃」</span><span class="flow-arrow">→</span>
+    <span class="flow-node">算 1 个 key/value 追加进 cache</span><span class="flow-arrow">→</span>
+    <span class="flow-node">产出「饭」</span>
+  </div>
+  <div class="flow-row">
+    <span class="flow-node">第 2 步：读 cache + 新 token「饭」</span><span class="flow-arrow">→</span>
+    <span class="flow-node">算 1 个 key/value 追加进 cache</span><span class="flow-arrow">→</span>
+    <span class="flow-node">产出「了」</span>
+  </div>
+  <div class="flow-note">每步只算 1 个新 token 的 key/value，前缀全靠读 cache。</div>
+</div>
 
 <details>
 <summary>补充：KV cache 本身会占掉大量显存</summary>
 <p>KV cache 随对话长度增长，长对话、多并发下它本身就是显存大户，怎么存放、换入换出、跨请求复用是推理引擎的核心难题之一（例如 vLLM 的 PagedAttention）。这属于引擎实现层，本页不展开。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>复算 4 token 输入 + 生成 3 个 token 时，有无 KV cache 的 key/value 计算次数。</li>
-  <li>说出 prefill 和 decode 各自对 KV cache 是"写"还是"读"，以及为什么 prefill 重吞吐、decode 重延迟。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>复算 4 token 输入 + 生成 3 个 token 时，有无 KV cache 的 key/value 计算次数。</p>
+    <details>
+      <summary>解答：15 次对 7 次</summary>
+      <p>不存 cache：三步分别要为 4、5、6 个前缀 token 计算 key/value，合计 $4+5+6=15$ 个 token 次。存 cache：第一步算 4 个并入库，之后每步只算新 token 的 1 个，合计 $4+1+1+1=7$ 个 token 次。该计数只含 key/value 投影一项，是浪费的下界而非全部。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出 prefill 和 decode 各自对 KV cache 是"写"还是"读"，以及为什么 prefill 重吞吐、decode 重延迟。</p>
+    <details>
+      <summary>解答：写缓存求吞吐，读缓存求延迟</summary>
+      <p>prefill 对 KV cache 以写为主：一次性并行处理全部输入 token，把各层 key/value 写入 cache，一次算很多 token，计算密集，因此追求吞吐。decode 以读为主：每步只处理 1 个新 token，为它追加 1 份 key/value，其余前缀全靠读 cache；每步都很短，但每步时长直接决定出字速度，因此对延迟敏感。</p>
+    </details>
+  </li>
+</ol>
 
 <p>两个阶段脾气完全不同：一个一次算一大片，一个一次算一丁点但要算很多步。那么"这个服务快不快"该怎么量？一个数字够吗？</p>
 
-<h2 id="s6-metrics">服务好不好怎么量：TTFT、TPOT、SLO 与 goodput</h2>
+<h2 id="s6-metrics">6. 服务好不好怎么量：TTFT、TPOT、SLO 与 goodput</h2>
 
 <p>上一章的两个阶段各贡献一段等待，于是 LLM 服务的延迟天然拆成两个指标（论断 C11，来自 DistServe 论文）：</p>
 
@@ -973,11 +1166,11 @@ decode： 第1步：读 cache + 新 token「吃」──► 算 1 个 key/value 
 
 <p>总延迟 = TTFT + TPOT × decode 阶段生成的 token 数（即不含首 token）。为什么要拆成两个？因为不同应用对两者的要求完全不同（论断 C12）：实时聊天重 TTFT——没人愿意对着转圈等半分钟，而 TPOT 只要快过人的阅读速度（约 250 词/分钟）就够用；批量生成长文档则相反——首 token 等 1 秒还是 2 秒无所谓，TPOT 决定整篇要等多久。</p>
 
-<p><strong>教学示例。</strong> 某请求 prefill 花了 0.3 s，之后生成 5 个 token，每步 0.05 s（构造数字）。那么 TTFT = 0.3 s；TPOT = $(0.05\times 5)/5 = 0.05$ s；总延迟 = $0.3 + 5\times 0.05 = 0.55$ s。</p>
+<p><strong>构造示例。</strong> 某请求 prefill 花了 0.3 s，之后生成 5 个 token，每步 0.05 s（构造数字）。那么 TTFT = 0.3 s；TPOT = $(0.05\times 5)/5 = 0.05$ s；总延迟 = $0.3 + 5\times 0.05 = 0.55$ s。</p>
 
 <p>服务方对这两个指标分别承诺上限，并要求一定比例的请求达标——这叫 <strong>SLO</strong>（服务级别目标），达标请求占比的下限叫<strong>达成率</strong>（比如 90% 的请求满足 TTFT 与 TPOT 上限）。</p>
 
-<p>最后是衡量系统容量的主指标：<strong>goodput</strong>（有效吞吐）= 在满足 SLO 达成率的前提下，系统每秒最多能承接多少请求（论断 C12）。注意它不是"尽量快"：请求越挤，排队越久，超 SLO 的请求越多。goodput 问的是"在不让达成率破防的前提下，还能再加多少请求"。<strong>教学示例。</strong> 若实测 4 req/s 时 95% 的请求达标、8 req/s 时只剩 80% 达标（构造数字），那么 goodput 落在 4 与 8 之间，需要找到仍满足 90% 达成率的最大速率。</p>
+<p>最后是衡量系统容量的主指标：<strong>goodput</strong>（有效吞吐）= 在满足 SLO 达成率的前提下，系统每秒最多能承接多少请求（论断 C12）。注意它不是"尽量快"：请求越挤，排队越久，超 SLO 的请求越多。goodput 问的是"在不让达成率破防的前提下，还能再加多少请求"。<strong>构造示例。</strong> 若实测 4 req/s 时 95% 的请求达标、8 req/s 时只剩 80% 达标（构造数字），那么 goodput 落在 4 与 8 之间，需要找到仍满足 90% 达成率的最大速率。</p>
 
 <div class="table-scroll">
 <table>
@@ -992,16 +1185,34 @@ decode： 第1步：读 cache + 新 token「吃」──► 算 1 个 key/value 
 
 <p>这组指标不是纸面定义，它直接驱动系统设计：以 goodput 为目标、把 prefill 和 decode 分开部署的 DistServe 系统，能比当时最优系统多服务最多 7.4 倍请求，或把 SLO 收紧 12.6 倍（>90% 请求达标，数字 N6）。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定 prefill 0.5 s、生成 4 个 token 各 0.1 s 的时间线，算出 TTFT、TPOT 与总延迟。</li>
-  <li>用一句话说清 goodput 与裸吞吐量的区别。</li>
-  <li>解释为什么实时聊天应用更在意 TTFT 而不是 TPOT。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 prefill 0.5 s、生成 4 个 token 各 0.1 s 的时间线，算出 TTFT、TPOT 与总延迟。</p>
+    <details>
+      <summary>解答：0.5 s、0.1 s、0.9 s</summary>
+      <p>TTFT 等于 prefill 时长 0.5 s；TPOT 为除首 token 外平均每个输出 token 的生成时间，即 0.1 s；总延迟 $=0.5+4\times 0.1=0.9$ s，其中 4 是 decode 阶段生成的不含首 token 的 token 数。</p>
+    </details>
+  </li>
+  <li>
+    <p>用一句话说清 goodput 与裸吞吐量的区别。</p>
+    <details>
+      <summary>解答：以 SLO 达成率为前提</summary>
+      <p>goodput 是在满足 SLO 达成率（如 90% 请求达标）的前提下系统每秒最多能承接的请求数；裸吞吐量不计延迟是否达标——不顾达标的请求数再高也不算 goodput。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释为什么实时聊天应用更在意 TTFT 而不是 TPOT。</p>
+    <details>
+      <summary>解答：首字决定等待感，出字快过阅读即可</summary>
+      <p>聊天的体验痛点是发出消息后对着转圈等待，这段等待由 TTFT 决定；而 TPOT 只要快过人的阅读速度（约 250 词/分钟）就基本无感。因此实时聊天对 TTFT 要求严格，对 TPOT 的容忍度相对高。</p>
+    </details>
+  </li>
+</ol>
 
 <p>两个指标由两个脾气不同的阶段贡献：TTFT 看 prefill，TPOT 看 decode。部署时，把这两个阶段放在同一批 GPU 上，还是分开？</p>
 
-<h2 id="s7-pdd-colocation">放一起还是分开：PD 合设与 PD 分离</h2>
+<h2 id="s7-pdd-colocation">7. 放一起还是分开：PD 合设与 PD 分离</h2>
 
 <p>两条主流路线（论断 C13、C14）：</p>
 
@@ -1023,31 +1234,49 @@ decode： 第1步：读 cache + 新 token「吃」──► 算 1 个 key/value 
 
 <p>两条路线各自的深层局限——分离的副本太贵、部署单元太粗，合设的干扰难消、GPU 内部切分太死——以及一种更细的混合架构，正是论文 ExpertPlex 要解决的问题；其解析页将从本页的概念出发，本页到此为止。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 PDD 用哪三样代价换来了"无干扰"和"各自定制"。</li>
-  <li>解释为什么 PDD 的 P:D 配比不是 1:1，并举出 DeepSeek-V3 的部署单元数字。</li>
-  <li>说明合设省下的两样东西是什么。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出 PDD 用哪三样代价换来了"无干扰"和"各自定制"。</p>
+    <details>
+      <summary>解答：副本、传输、成组供给</summary>
+      <p>其一，prefill 与 decode 的每个实例都要存一份完整模型副本，对 MoE 模型尤其贵（权重的大头是专家）；其二，prefill 产出的 KV cache 要跨实例传给 decode；其三，两阶段的容量要按配比成组供给，最小单位是一整个部署单元（DeepSeek-V3 技术报告的配比单元为 32 张 prefill GPU 加 320 张 decode GPU）。</p>
+    </details>
+  </li>
+  <li>
+    <p>解释为什么 PDD 的 P:D 配比不是 1:1，并举出 DeepSeek-V3 的部署单元数字。</p>
+    <details>
+      <summary>解答：负载不对称决定配比</summary>
+      <p>prefill 计算密集、decode 显存与带宽密集，两阶段负载天然不对称，所需资源量不同；对半分会造成一边闲置一边拥挤，因此配比由负载结构决定。DeepSeek-V3 技术报告的一个配比单元是 32 张 prefill GPU 加 320 张 decode GPU（1:10）。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明合设省下的两样东西是什么。</p>
+    <details>
+      <summary>解答：一份权重与零跨阶段传输</summary>
+      <p>PD 合设下两阶段共用同一批 GPU 与同一份模型权重，省下的是"每实例一份完整副本"的显存开销；且 prefill 建好的 KV cache 就地可供 decode 使用，省下跨实例传输。代价是两阶段在同一份资源上互相干扰。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
-<p>C1（Transformer 层 = attention + FFN；attention 跨 token、FFN 逐 token）：Vaswani et al., Attention Is All You Need, NeurIPS 2017, arXiv:1706.03762 §3.1；ExpertPlex arXiv:2607.18002 v2 §2.1。C2（FFN 参数 8d² 约为 attention 4d² 的 2 倍）：由 Vaswani 2017 §3.1 与 Table 1 配置（d=512，d_ff=2048）直接推导。C3（稀疏激活解耦容量与计算）：Shazeer et al., ICLR 2017, arXiv:1701.06538 摘要与 §2；ExpertPlex §2.1。C4（router + routed/shared expert、top-k 加权和）：Shazeer 2017 §2；DeepSeek-V3 Technical Report arXiv:2412.19437 §2.1.2 Eq.(14)–(16)；ExpertPlex §2.1。C5（负载不均及其训练/服务两侧表现）：Shazeer 2017 §2 及附录；DeepSeek-V3 §2.1.2（auxiliary-loss-free 偏置调整）；ExpertPlex §2.5。C6（EP 动机）：ExpertPlex §2.3。C7（dispatch/combine 与 all-to-all）：ExpertPlex §2.3；GShard arXiv:2006.16668 §3；通信库 github.com/deepseek-ai/DeepEP。C8（TBO/SBO 定义）：ExpertPlex §2.3 与延迟模型段；DeepSeek 官方《DeepSeek-V3/R1 推理系统概览》（2025-03-01，知乎/github.com/deepseek-ai）"双批次重叠"段。C9（prefill/decode 定义与导向）：DistServe, OSDI 2024, arXiv:2401.09670 §2.1；ExpertPlex §2.1。C10（KV cache 复用）：ExpertPlex §2.1。C11（TTFT/TPOT 定义与总延迟公式）：DistServe §1 及脚注 1。C12（SLO/goodput 定义、250 词/分钟例）：DistServe §1，§2.1 重申 goodput。C13（PDD 收益与代价）：DistServe §1/§2.1；Splitwise, ISCA 2024, arXiv:2311.18677；ExpertPlex §2.4。C14（colocation 定义与干扰）：DistServe §2.1；ExpertPlex §2.5。</p>
+<h3>论断与来源（C）</h3>
+<p>C1（Transformer 层 = attention + FFN；attention 跨 token、FFN 逐 token）：Vaswani et al., Attention Is All You Need, NeurIPS 2017, arXiv:1706.03762 §3.1；ExpertPlex arXiv:2607.18002 v2 §2.1。C2（FFN 参数 $8d^2$ 约为 attention $4d^2$ 的 2 倍）：由 Vaswani 2017 §3.1 与 Table 1 配置（$d=512$，$d_{ff}=2048$）直接推导。C3（稀疏激活解耦容量与计算）：Shazeer et al., ICLR 2017, arXiv:1701.06538 摘要与 §2；ExpertPlex §2.1。C4（router + routed/shared expert、top-k 加权和）：Shazeer 2017 §2；DeepSeek-V3 Technical Report arXiv:2412.19437 §2.1.2 Eq.(14)–(16)；ExpertPlex §2.1。C5（负载不均及其训练/服务两侧表现）：Shazeer 2017 §2 及附录；DeepSeek-V3 §2.1.2（auxiliary-loss-free 偏置调整）；ExpertPlex §2.5。C6（EP 动机）：ExpertPlex §2.3。C7（dispatch/combine 与 all-to-all）：ExpertPlex §2.3；GShard arXiv:2006.16668 §3；通信库 github.com/deepseek-ai/DeepEP。C8（TBO/SBO 定义）：ExpertPlex §2.3 与延迟模型段；DeepSeek 官方《DeepSeek-V3/R1 推理系统概览》（2025-03-01，知乎/github.com/deepseek-ai）"双批次重叠"段。C9（prefill/decode 定义与导向）：DistServe, OSDI 2024, arXiv:2401.09670 §2.1；ExpertPlex §2.1。C10（KV cache 复用）：ExpertPlex §2.1。C11（TTFT/TPOT 定义与总延迟公式）：DistServe §1 及脚注 1。C12（SLO/goodput 定义、250 词/分钟例）：DistServe §1，§2.1 重申 goodput。C13（PDD 收益与代价）：DistServe §1/§2.1；Splitwise, ISCA 2024, arXiv:2311.18677；ExpertPlex §2.4。C14（colocation 定义与干扰）：DistServe §2.1；ExpertPlex §2.5。</p>
 
-<h3>核心公式与来源</h3>
-<p>F1（MoE 层输出 y = Σ g_i·E_i，top-k 稀疏）：Shazeer 2017 §2（y = Σ G(x)_i E_i(x)，G 为稀疏门控）；DeepSeek-V3 §2.1.2 Eq.(14)–(16)（sigmoid 亲和度 + 偏置选 top-k）。页面中"把选中专家得分归一化为权重"的写法为教学简化，不绑定具体归一化实现。FFN/attention 参数计数（4d² 与 8d²）：由 Vaswani 2017 Table 1 配置直接推导，忽略偏置与 LayerNorm。</p>
+<h3>公式与来源（F）</h3>
+<p>F1（MoE 层输出 $y=\sum_{i\in S_k(x)} g_i(x)\cdot E_i(x)$，top-k 稀疏）：Shazeer 2017 §2（$y=\sum_i G(x)_i E_i(x)$，$G$ 为稀疏门控）；DeepSeek-V3 §2.1.2 Eq.(14)–(16)（sigmoid 亲和度 + 偏置选 top-k）。页面中"把选中专家得分归一化为权重"的写法为教学简化，不绑定具体归一化实现。FFN/attention 参数计数（$4d^2$ 与 $8d^2$）：由 Vaswani 2017 Table 1 配置直接推导，忽略偏置与 LayerNorm。</p>
 
-<h3>外部数字与实验条件</h3>
-<p>N1：DeepSeek-V3 总参数 671B、每 token 激活 37B——DeepSeek-V3 Technical Report 摘要。N2：每 MoE 层 1 shared + 256 routed、top-8——同报告 §2.1.2；在线系统概览"每层仅激活 256 个专家中的 8 个"。N3：61 层、前 3 层稠密——同报告 §2.1.2（"except for the first three layers"）与官方模型配置（num_hidden_layers=61，first_k_dense_replace=3）。N4：在线推理部署（prefill 4 节点 32 GPU / EP32、每卡 9 路由 + 1 共享；decode 18 节点 144 GPU / EP144、每卡 2 路由 + 1 共享；prefill 双批次重叠）——《DeepSeek-V3/R1 推理系统概览》2025-03-01。N5：技术报告版部署单元（prefill 4 节点 32 GPU / EP32；decode 40 节点 320 GPU / EP320）——DeepSeek-V3 Technical Report 部署章节；ExpertPlex §2.4 转述为"32 prefill and 320 decode GPUs"。N6：DistServe 最多 7.4× 请求 / 12.6× 更紧 SLO（>90% 达标）——DistServe 摘要。N7：4d²≈105 万、8d²≈210 万——由 Vaswani 2017 配置计算。</p>
+<h3>外部数字与实验条件（N）</h3>
+<p>N1：DeepSeek-V3 总参数 671B、每 token 激活 37B——DeepSeek-V3 Technical Report 摘要。N2：每 MoE 层 1 shared + 256 routed、top-8——同报告 §2.1.2；在线系统概览"每层仅激活 256 个专家中的 8 个"。N3：61 层、前 3 层稠密——同报告 §2.1.2（"except for the first three layers"）与官方模型配置（num_hidden_layers=61，first_k_dense_replace=3）。N4：在线推理部署（prefill 4 节点 32 GPU / EP32、每卡 9 路由 + 1 共享；decode 18 节点 144 GPU / EP144、每卡 2 路由 + 1 共享；prefill 双批次重叠）——《DeepSeek-V3/R1 推理系统概览》2025-03-01。N5：技术报告版部署单元（prefill 4 节点 32 GPU / EP32；decode 40 节点 320 GPU / EP320）——DeepSeek-V3 Technical Report 部署章节；ExpertPlex §2.4 转述为"32 prefill and 320 decode GPUs"。N6：DistServe 最多 7.4× 请求 / 12.6× 更紧 SLO（>90% 达标）——DistServe 摘要。N7：$4d^2\approx105$ 万、$8d^2\approx210$ 万——由 Vaswani 2017 配置计算。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <p>E1（第 2 章）：8 专家 top-2 打分表为构造数字，展示选择与归一化。E2（第 3 章）：4 token 的 top-2 路由表为构造数字，展示 dispatch 计数与负载倾斜；配套可运行代码已实际执行，输出与页面一致。E3（第 5 章）：4+3 token 的 key/value 计数，只数 K/V 投影一项。E4（第 6 章）：0.3 s + 5×0.05 s 时间线与 4/8 req/s 达成率为构造数字，展示指标计算与 goodput 含义。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>"FFN 是存知识的大头"仅以参数占比（2/3）为依据，不断言知识具体存在哪里。key/value 的"检索标签/信息内容"表述只解释为什么它们可以被缓存复用，不解释 attention 内部机制（超出本页范围）。"气泡"指通信期间算力闲置，不特指流水线并行中的 pipeline bubble。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>（1）attention 内部 Q/K/V 打分、多头结构未展开，只保留"跨 token 汇信息、产出 key/value"这一功能描述；KV cache 的 E3 只数 K/V 投影计算，实际朴素重算的浪费还包括 attention 打分与全部层计算，因此 15 对 7 是浪费的下界而非全部。（2）router 归一化写法（选中专家得分归一化）是多种实现之一；DeepSeek-V3 用 sigmoid + 偏置，Switch 用 softmax top-1，结构共性是"只算选中的 k 个、加权和输出"。（3）TBO/SBO 时间线为示意图，不反映真实 kernel 调度（由《<a href="../gpu-execution-model/index.html">GPU 执行模型</a>》概念页负责）。（4）本页所有数字以 DeepSeek-V3 系模型为准；其他 MoE 模型（如 Mixtral 8 专家 top-2）层数、专家数、k 值不同，机制描述仍成立。（5）GPU/显存只用"并行矩阵运算芯片、显存有限"的最小表述，SM、kernel、CUDA Graph 等执行细节不在本页范围。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

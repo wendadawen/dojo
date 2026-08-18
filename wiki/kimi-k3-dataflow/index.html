@@ -73,19 +73,19 @@
   <header>
     <span class="eyebrow">学习笔记 · 模型架构</span>
     <h1>Kimi K3 前向数据流</h1>
-    <p class="lead">Kimi K3 是一个 2.78T 参数的 MoE 模型：93 层主干中，第 0 层为 KDA + Dense FFN，第 1–90 层按 KDA×3 : Gated MLA×1 循环混合，末尾第 91、92 层连续 MLA；FFN 全部是 Stable Latent MoE（896 路由专家 top-16 + 2 共享专家），并用 Block AttnRes 做跨块加权残差、SiTU-GLU 有界激活保证稳定；全模型无位置编码（NoPE），上下文 1M，每 token 激活 104.2B 参数。</p>
+    <p class="lead">Kimi K3 是一个 2.78T 参数的 MoE 模型：93 层主干中，第 0 层为 KDA + Dense FFN，第 1–90 层按 KDA $\times$ 3 : Gated MLA $\times$ 1 循环混合，末尾第 91、92 层连续 MLA；FFN 全部是 Stable Latent MoE（896 路由专家 top-16 + 2 共享专家），并用 Block AttnRes 做跨块加权残差、SiTU-GLU 有界激活保证稳定；全模型无位置编码（NoPE），上下文 1M，每 token 激活 104.2B 参数。</p>
     <p class="meta">更新于 2026-08-05（2026-08-07 按官方源码修订 Block AttnRes 数据流）· 来源：官方 config.json 与官方实现代码 · 数值与公式逐项核对</p>
   </header>
 
-  <h2 id="specs">关键规格</h2>
+  <h2 id="specs">1. 关键规格</h2>
   <table>
     <tr><th>规模</th><td>总参数 2.78T；每 token 激活 104.2B；上下文 1,048,576</td></tr>
     <tr><th>主干</th><td>93 层 = 69 层 KDA + 24 层 Gated MLA；hidden=7168；96 头；KDA head_dim=128</td></tr>
-    <tr><th>层分布</th><td>第 0 层（KDA + Dense FFN，first_k_dense_replace=1）；第 1–90 层 KDA×3:MLA×1 循环（MLA 在 3,7,…,87）；第 91、92 层连续 MLA</td></tr>
-    <tr><th>MoE</th><td>896 路由专家，每 token 激活 16 个（稀疏度 56×）；另有 2 个共享专家</td></tr>
+    <tr><th>层分布</th><td>第 0 层（KDA + Dense FFN，first_k_dense_replace=1）；第 1–90 层 KDA $\times$ 3 : MLA $\times$ 1 循环（MLA 在 3,7,…,87）；第 91、92 层连续 MLA</td></tr>
+    <tr><th>MoE</th><td>896 路由专家，每 token 激活 16 个（稀疏度 $56\times$）；另有 2 个共享专家</td></tr>
     <tr><th>Latent MoE</th><td>routed_expert_hidden_size=3584（隐空间）；moe_intermediate_size=3072；latent_moe_use_norm=true</td></tr>
     <tr><th>MLA</th><td>q_lora_rank=1536；kv_lora_rank=512；qk_nope_head_dim=128；qk_rope_head_dim=64；v_head_dim=128；mla_use_output_gate=true</td></tr>
-    <tr><th>KDA</th><td>short_conv_kernel_size=4；gate_lower_bound=−5（safe_gate）；use_full_rank_gate=true</td></tr>
+    <tr><th>KDA</th><td>short_conv_kernel_size=4；gate_lower_bound=$-5$（safe_gate）；use_full_rank_gate=true</td></tr>
     <tr><th>AttnRes</th><td>attn_res_block_size=12；8 个历史块快照（第 1 个即 embedding）+ 当前残差流 = 9 个候选；每层 attention 前与 MLP 前各加权一次，模型末尾再加权一次</td></tr>
     <tr><th>激活</th><td>SiTU-GLU：activation_situ_beta=4.0，activation_situ_linear_beta=25.0，输出坐标上界 100</td></tr>
     <tr><th>词表</th><td>vocab_size=163840；tie_word_embeddings=false（lm_head 独立权重）</td></tr>
@@ -94,7 +94,7 @@
     <tr><th>其他</th><td>RMSNorm eps=1e-5；routed_scaling_factor=1.0；moe_renormalize=true；MXFP4 权重量化（QAT；范围=路由专家权重+embedding，attn/共享专家/lm_head/视觉塔豁免）</td></tr>
   </table>
 
-  <h2 id="viz">交互式数据流</h2>
+  <h2 id="viz">2. 交互式数据流</h2>
   <p>六个视图，从整体总览开始；黄色双线框节点可点击下钻。节点两行 = 算子名 / 输入维→输出维；边上标数据名与维度；悬停节点查看公式。机制解释见下方要点。</p>
   <div class="viz">
     <div class="viz-head">
@@ -106,9 +106,9 @@
   </div>
   <div id="tip"></div>
 
-  <h2 id="points">要点</h2>
+  <h2 id="points">3. 要点</h2>
 
-  <h3>整体结构：三条信息流</h3>
+  <h3>3.1 整体结构：三条信息流</h3>
   <ul>
     <li><b>沿序列</b>：69 层 KDA 做低成本、固定状态的长序列混合，每 3 层插入 1 层 Gated MLA 保留全局注意力，共 24 层 MLA；末两层（91、92）连续 MLA 收尾。</li>
     <li><b>沿深度</b>：Block AttnRes 在等权累加的残差流上叠加块级加权：每层在 attention 前、MLP 前各加权一次（两套独立可学习参数），模型末尾 final norm 前再加权一次，让每层可按内容选择此前块级快照的信息。</li>
@@ -116,45 +116,45 @@
     <li>KDA 与 MLA 均无显式位置编码（NoPE）：位置感由 KDA 的循环状态、衰减与短卷积隐式提供，扩展上下文无需 RoPE 插值。</li>
   </ul>
 
-  <h3>KDA（Kimi Delta Attention，69 层）</h3>
+  <h3>3.2 KDA（Kimi Delta Attention，69 层）</h3>
   <ul>
-    <li>q/k/v 各自投影到 12288（96 头 × 128 维）后过核长 4 的深度可分离因果短卷积 + silu；q/k 再 L2 归一。</li>
+    <li>q/k/v 各自投影到 12288（$96 \times 128$）后过核长 4 的深度可分离因果短卷积 + silu；q/k 再 L2 归一。</li>
     <li>衰减信号 g 由 f_a_proj（7168→128）与 f_b_proj（128→12288）低秩生成，每 token/头/维一个；dt_bias 每头每维偏置；A_log 每头一个尺度。</li>
-    <li>衰减率（K3 用 safe_gate）：$\log\alpha = -5\,\sigma\!\left(e^{A_{\log}}\cdot(g + \mathrm{dt\_bias})\right)$，即 lower-bound sigmoid，值域 (−5, 0)，每步衰减 $\exp(-5)\approx 0.0067$ 下限——不是非安全版本的 softplus 形式。</li>
+    <li>衰减率（K3 用 safe_gate）：$\log\alpha = -5\,\sigma\!\left(e^{A_{\log}}\cdot(g + \mathrm{dt\_bias})\right)$，即 lower-bound sigmoid，值域 $(-5, 0)$，每步衰减 $\exp(-5)\approx 0.0067$ 下限——不是非安全版本的 softplus 形式。</li>
     <li>delta 规则：$S_t = (I - \beta_w\hat k\hat k^\top)\,\mathrm{diag}(\alpha)\,S_{t-1} + \beta_w\,\hat k\,v^\top$，写强度 $\beta_w$ 由 b_proj（7168→96，每头一标量）sigmoid 得到；输出 $o = S^\top\hat q$。</li>
-    <li>输出门为<b>全秩</b>（use_full_rank_gate=true）：g_proj 7168→12288，FusedRMSNormGated 先 RMSNorm(o) 再与 σ(g) 逐元素相乘。</li>
+    <li>输出门为<b>全秩</b>（use_full_rank_gate=true）：g_proj 7168→12288，FusedRMSNormGated 先 RMSNorm(o) 再与 $\sigma(g)$ 逐元素相乘。</li>
   </ul>
 
-  <h3>Gated MLA（24 层）</h3>
+  <h3>3.3 Gated MLA（24 层）</h3>
   <ul>
-    <li>Q 路：q_a_proj 压缩到 1536 → RMSNorm → q_b_proj 升到 18432（96×192）；每头 192 拆为 nope 128 + rot 64。</li>
-    <li>KV 路：kv_a_proj_with_mqa 压缩到 576（512 + 64），拆出压缩潜向量 ckv 与共享的 rot 键；ckv 过 RMSNorm 后 kv_b_proj 展开 96 头 × 256，再拆 k_nope 128 与 v 128。</li>
+    <li>Q 路：q_a_proj 压缩到 1536 → RMSNorm → q_b_proj 升到 18432（$96\times192$）；每头 192 拆为 nope 128 + rot 64。</li>
+    <li>KV 路：kv_a_proj_with_mqa 压缩到 576（512 + 64），拆出压缩潜向量 ckv 与共享的 rot 键；ckv 过 RMSNorm 后 kv_b_proj 展开 96 头 $\times 256$，再拆 k_nope 128 与 v 128。</li>
     <li>rot 分量仅做结构拆分，<b>不施加旋转</b>（rotary_emb=None）；q/k 拼回 192 维做标准因果注意力，scaling = $192^{-1/2}$。</li>
     <li>输出经 g_proj（7168→12288）sigmoid 门控（mla_use_output_gate=true）后 o_proj 投影回 7168。</li>
   </ul>
 
-  <h3>Stable Latent MoE（除第 0 层外全部 FFN）</h3>
+  <h3>3.4 Stable Latent MoE（除第 0 层外全部 FFN）</h3>
   <ul>
     <li>门控（KimiMoEGate）：sigmoid 打分 → top-16(s + bias) 选专家；bias 只影响排序、不进权重；选中专家权重按原始分数 renormalize 后乘 routed_scaling_factor=1.0。</li>
-    <li>负载均衡：偏置在代码里沿用 DeepSeek-V3 的 <code>e_score_correction_bias</code>（结构相同、名字照搬）；训练时按技术报告用 <b>Quantile Balancing</b> 更新（取 margin 的 1−k/n 分位数一步到位，无 sign-update 学习率），推理时冻结。开源推理代码不含该更新逻辑（训练路径未开源），Quantile Balancing 细节以技术报告为准。</li>
+    <li>负载均衡：偏置在代码里沿用 DeepSeek-V3 的 <code>e_score_correction_bias</code>（结构相同、名字照搬）；训练时按技术报告用 <b>Quantile Balancing</b> 更新（取 margin 的 $1-k/n$ 分位数一步到位，无 sign-update 学习率），推理时冻结。开源推理代码不含该更新逻辑（训练路径未开源），Quantile Balancing 细节以技术报告为准。</li>
     <li>路由专家（KimiBlockSparseMLP）：w1=gate、w3=up、w2=down，在隐空间 3584→3072→3584，SiTU-GLU 有界激活。</li>
-    <li>聚合后先 RMSNorm（latent_moe_use_norm=true）再上投影回 7168；共享专家为全宽 KimiMLP（intermediate=3072×2=6144），对所有 token 恒激活。</li>
+    <li>聚合后先 RMSNorm（latent_moe_use_norm=true）再上投影回 7168；共享专家为全宽 KimiMLP（intermediate $=3072\times2=6144$），对所有 token 恒激活。</li>
   </ul>
 
-  <h3>Block AttnRes（跨块注意力式残差）</h3>
+  <h3>3.5 Block AttnRes（跨块注意力式残差）</h3>
   <ul>
     <li>93 层按 12 层分块；块边界（layer_idx % 12 == 0，即 0,12,…,84）在 attention 前把进入该层时的输入快照存入 block_residual，共 8 个块快照（第 1 个即 embedding），加上当前残差流共 9 个候选。</li>
-    <li>每层在 attention 前、MLP 前各做一次：把"当前残差流 + 全部历史块快照"做 RMSNorm，用层自带可学习打分权重（norm.weight × proj.weight）逐维相乘求和得标量分数，softmax 后加权求和作为送入 norm 的输入；模型末尾 final norm 前再做第三次（output_attn_res）。</li>
-    <li>效果：深层能自适应地多信任近期块或回溯早期块，缓解 93 层深度下的信息稀释；开销从逐层的 O(L·d) 降到逐块的 O(N·d)。</li>
+    <li>每层在 attention 前、MLP 前各做一次：把"当前残差流 + 全部历史块快照"做 RMSNorm，用层自带可学习打分权重（norm.weight $\times$ proj.weight）逐维相乘求和得标量分数，softmax 后加权求和作为送入 norm 的输入；模型末尾 final norm 前再做第三次（output_attn_res）。</li>
+    <li>效果：深层能自适应地多信任近期块或回溯早期块，缓解 93 层深度下的信息稀释；开销从逐层的 $O(L\cdot d)$ 降到逐块的 $O(N\cdot d)$。</li>
   </ul>
 
-  <h3>Dense FFN（仅第 0 层）</h3>
+  <h3>3.6 Dense FFN（仅第 0 层）</h3>
   <ul>
     <li>first_k_dense_replace=1：只有第 0 层用稠密 KimiMLP，gate_proj/up_proj 7168→33792，SiTU-GLU 后 down_proj 33792→7168。</li>
-    <li>SiTU-GLU：门支 $\mathrm{SiTU}(g)=\beta\tanh(g/\beta)\,\sigma(g)$（β=4），值支 $\tilde u=\beta_l\tanh(u/\beta_l)$（β_l=25），两因子均平滑饱和，输出坐标上界 $\beta\cdot\beta_l=100$，从根源抑制激活爆炸。</li>
+    <li>SiTU-GLU：门支 $\mathrm{SiTU}(g)=\beta\tanh(g/\beta)\,\sigma(g)$（$\beta=4$），值支 $\tilde u=\beta_l\tanh(u/\beta_l)$（$\beta_l=25$），两因子均平滑饱和，输出坐标上界 $\beta\cdot\beta_l=100$，从根源抑制激活爆炸。</li>
   </ul>
 
-  <h2 id="sources">来源与核对</h2>
+  <h2 id="sources">来源与范围说明</h2>
   <table>
     <tr><th>项目</th><th>依据</th></tr>
     <tr><td>全部 config 数值（层数、维度、专家数、beta 等）</td><td>官方 <code>config.json</code>：huggingface.co/moonshotai/Kimi-K3</td></tr>
@@ -162,7 +162,7 @@
     <tr><td>技术报告（2026-07-28，47 页）</td><td>Moonshot AI 官方 Kimi K3 Technical Report（架构动机、Quantile Balancing、SiTU、NoPE、Block AttnRes）</td></tr>
     <tr><td>总参数 2.78T / 激活 104.2B</td><td>技术报告 Table 1</td></tr>
   </table>
-  <p style="color:var(--muted);font-size:14px">核对说明：config 数值与公式均以官方 config.json、官方实现源码（含 fla chunk_kda 算子）为准逐项核实；2026-08-07 按源码修订 Block AttnRes 数据流（每层 attention 前与 MLP 前各一次加权、块快照取进入层时的输入、模型末尾 output AttnRes 第三次加权）。KDA 写门 W_β 与遗忘门低秩投影的具体维度官方未披露，页面标注按官方实现展示。</p>
+  <p style="color:var(--muted);font-size:14px">核对说明：config 数值与公式均以官方 config.json、官方实现源码（含 fla chunk_kda 算子）为准逐项核实；2026-08-07 按源码修订 Block AttnRes 数据流（每层 attention 前与 MLP 前各一次加权、块快照取进入层时的输入、模型末尾 output AttnRes 第三次加权）。KDA 写门 $W_\beta$ 与遗忘门低秩投影的具体维度官方未披露，页面标注按官方实现展示。</p>
 
   <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
 </main>

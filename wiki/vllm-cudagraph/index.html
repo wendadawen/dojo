@@ -58,14 +58,14 @@
       <p class="meta">更新于 2026-08-06 · 类型：代码机制</p>
     </header>
 
-    <h2 id="pipeline">torch.compile 的两阶段流程</h2>
+    <h2 id="pipeline">1. torch.compile 的两阶段流程</h2>
     <p>PyTorch 默认的 <code>forward()</code> 以逐行解释方式执行：每一条 Python 语句对应一次算子（kernel）提交，中间结果写入显存、再由后续算子读回，解释器与 kernel 启动存在固定开销。torch.compile 通过将计算整体化为可复用编译产物来消除这部分开销，分为两个阶段：</p>
     <ol>
       <li><strong>图捕获（graph capture）</strong>：由 <strong>TorchDynamo</strong> 在运行前向时，将 Python 层调用逐条转换为一张计算图（graph），图中节点对应算子。</li>
       <li><strong>图编译（graph compilation）</strong>：由后端将计算图翻译为可执行的 GPU kernel。torch.compile 的默认后端为 <strong>Inductor</strong>（PyTorch 官方内置），其通过代码生成以 <strong>Triton</strong> 语言产出 kernel，再编译为 CUDA 机器码。产物除 kernel 外，还包括调用它们的执行计划，整体封装为可复用的编译函数，此后推理直接执行该产物、不再逐行解释。</li>
     </ol>
 
-    <h2 id="dynamo-boundary">Dynamo 图捕获的处理边界</h2>
+    <h2 id="dynamo-boundary">2. Dynamo 图捕获的处理边界</h2>
     <p>图捕获要求计算中的每个可追踪节点都能映射为图算子，或可被安全地 graph break（跳出图、回落到 Python 执行）。Dynamo 对代码类型的处理方式如下：</p>
     <table>
       <tr><th>代码类型</th><th>Dynamo 处理方式</th><th>结果</th></tr>
@@ -76,7 +76,7 @@
     <p>graph break 是软性失效：图在该位置断开、控制流回落 Python，执行仍可继续；而 C 扩展被标记为 skipped 时是硬性失败，Dynamo 直接抛出 <code>Unsupported</code> 异常终止捕获。</p>
     <p><strong>C 扩展</strong>指通过 CPython C API 编译为共享库（<code>.so</code>）供 Python 调用的函数。这类函数对 Dynamo 而言是黑盒——既无法映射为图节点，也无 graph break 的兜底规则，因此捕获失败。典型报错信息为：<code>Dynamo does not know how to trace the builtin _hashlib.openssl_sha1.</code></p>
 
-    <h2 id="cuda-graph">CUDA Graph 的录制与重放</h2>
+    <h2 id="cuda-graph">3. CUDA Graph 的录制与重放</h2>
     <p>即便 kernel 已编译完成，每次推理仍由 CPU 逐个向 GPU 提交 kernel，每次提交存在固定延迟（CPU 到 GPU 的命令下发开销）。CUDA Graph 将<strong>完整的 GPU 执行序列</strong>——包括 kernel 顺序、各 kernel 参数、输入输出内存地址及数据搬运操作——一次性<strong>录制（capture）</strong>为一张图，此后 CPU 仅需一次命令即可整张<strong>重放（replay）</strong>，从而消除逐个下发的开销。</p>
     <ul>
       <li><strong>适用阶段</strong>：主要用于<strong>解码（decode）</strong>阶段。decode 每步仅生成一个 token，kernel 单次计算量小但数量多，CPU 逐个下发开销占比较高，且计算形状相对稳定，适合录制；而预填充（prefill）单次处理大量 token、计算形状动态变化，不适用于固定形状的图录制。</li>
@@ -85,11 +85,11 @@
       <li><strong>核心约束</strong>：录制时地址被固化，重放阶段输入输出内存地址不可改变，故数据须存放于预分配的固定内存池中（如 vLLM 的 KV cache 缓冲区即为此设计）。</li>
     </ul>
 
-    <h2 id="capture-size">捕获尺寸的确定</h2>
+    <h2 id="capture-size">4. 捕获尺寸的确定</h2>
     <p>CUDA Graph 捕获的尺寸以<strong>解码阶段的总 token 数</strong>为单位。decode 中每个请求每步仅产生一个 token，故总 token 数近似等于并发请求数（<code>num_seqs</code>，即 batch size）；seq_len 在 decode 中恒定，不参与尺寸组合。</p>
     <p>默认捕获尺寸按 <code>[1, 2, 4] + list(range(8, 256, 8)) + list(range(256, max, 16))</code> 生成，最大捕获尺寸默认取 <code>min(max_num_seqs * 2, 512)</code>。实际请求数不落在合法捕获尺寸上时，按邻近的合法尺寸向上补齐（padding）。</p>
 
-    <h2 id="ref">来源</h2>
+    <h2 id="ref">来源与范围说明</h2>
     <ul>
       <li>PyTorch torch.compile 官方文档：两阶段（图捕获 / 图编译）与 Inductor 后端说明。</li>
       <li>vLLM 源码（本机环境，行号已核对）：<code>vllm/config/compilation.py</code>（捕获尺寸默认生成规则）、<code>vllm/v1/cudagraph_dispatcher.py</code>（batch 到捕获尺寸的映射与 padding）。</li>

@@ -580,15 +580,56 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
-    .diagram {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
+    /* ============ 问题块（chapter-questions） ============ */
+    ol.chapter-questions { margin-bottom: 0; }
+    ol.chapter-questions > li { margin-bottom: 1.25rem; }
+    ol.chapter-questions > li:last-child { margin-bottom: 0; }
+    ol.chapter-questions > li > details { margin: 0.5rem 0 0; }
+    /* ============ HTML 结构图（flow-diagram） ============ */
+    .flow-diagram {
       background: var(--bg-code);
-      padding: 1rem;
-      overflow-x: auto;
+      padding: 1rem 1.25rem;
       border-radius: 6px;
-      line-height: 1.5;
       margin: 1.5rem 0;
+      overflow-x: auto;
+      font-size: 0.92em;
+    }
+    .flow-title { font-family: var(--font-ui); font-weight: 600; margin-bottom: 1rem; }
+    .flow-subtitle { font-family: var(--font-ui); font-weight: 600; margin: 1.5rem 0 0.9rem; }
+    .flow-grid {
+      display: inline-grid;
+      align-items: center;
+      column-gap: 0.45rem;
+      row-gap: 0.35rem;
+    }
+    .flow-node {
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 0.28rem 0.65rem; border: 1.5px solid var(--border);
+      border-radius: 6px; background: var(--bg);
+      white-space: nowrap; font-size: 0.95em;
+    }
+    .flow-node.io { border-color: var(--blue); color: var(--blue); font-weight: 600; }
+    .flow-node.cand {
+      border-style: dashed; color: var(--text-light);
+      font-size: 0.88em; padding: 0.22rem 0.55rem;
+    }
+    .flow-node.query { border-color: var(--green); color: var(--green); font-weight: 600; }
+    .flow-arrow { text-align: center; color: var(--text-light); }
+    .flow-bar {
+      border: 1.5px dashed var(--border); border-radius: 6px;
+      padding: 0.35rem 0.8rem; text-align: center; color: var(--text-light);
+      justify-self: stretch;
+    }
+    .flow-group {
+      border: 1.5px solid var(--border); border-radius: 8px;
+      padding: 0.6rem 0.8rem; text-align: center;
+      display: flex; flex-direction: column; align-items: center; gap: 0.35rem;
+      background: var(--bg);
+    }
+    .flow-group-title { font-family: var(--font-ui); font-weight: 600; font-size: 0.88em; }
+    .flow-note {
+      margin-top: 1rem; color: var(--text-light);
+      font-size: var(--fs-small); line-height: 1.6;
     }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
@@ -664,17 +705,47 @@
 <p>K3 主干 93 层，标准残差把所有前层输出以系数 1 累加进同一个流——第 1 层 embedding 在第 93 层只占 1/93，且无法被后续层按内容找回。Block AttnRes 把它当作深度方向的 RNN 瓶颈：每层用可学习 pseudo-query 对"embedding + 此前块级快照 + 当前块 partial sum"做 softmax 加权检索，把送入归一化的输入从"当前残差流"替换为"attention 检索结果"。它不取消标准残差（K3 仍逐层累加 attention 与 MLP 输出），而是在其上叠加块级加权选择，与 token 方向的 attention、channel 方向的 MoE 同级，构成 K3 的三维信息流。本文依赖前置概念<a href="../residual-connection/index.html">残差连接</a>，只使用其结论；softmax 与 RMSNorm 作为公式零件使用，不展开为独立概念页。本文要回答：Full AttnRes 的公式是什么、Block AttnRes 如何把内存从 $O(Ld)$ 降到 $O(Nd)$、K3 的 8 块×12 层配置与加权三次的具体位置、以及 softmax kernel 中 RMSNorm 的作用。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>标准残差在深度方向上为什么是瓶颈？AttnRes 用什么思路替代？</li>
-    <li>Full AttnRes 的公式是什么？pseudo-query、keys/values、softmax kernel 各代表什么？</li>
-    <li>Block AttnRes 如何分块、块内求和、块间 attention？内存从 $O(Ld)$ 降到 $O(Nd)$ 的来源是什么？</li>
-    <li>K3 的具体配置是什么——8 块×12 层、9 个候选来源、加权三次的位置在哪里？</li>
-    <li>softmax kernel 为什么用 $\exp(q^\top\mathrm{RMSNorm}(k))$？RMSNorm 防大值主导的具体含义和边界？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>标准残差在深度方向上为什么是瓶颈？AttnRes 用什么思路替代？</p>
+      <details>
+      <summary>解答：标准残差把所有前层输出以系数 1 累加进同一残差流，早期信息被层层稀释且无法按内容找回；AttnRes 用 softmax 加权检索替代等权累加。</summary>
+      <p>标准残差展开后 $h_L=h_1+\sum_{l=1}^{L-1}F_l(h_l)$，第 1 层 embedding 在第 $L$ 层只占 $1/L$ 份额，后续层只能被动接收累加好的结果，与 RNN 把历史压进单个 hidden state 是同一种瓶颈。AttnRes 让每层用可学习 pseudo-query 对前序表征做 attention，按内容分配权重。完整论证见「1. 标准残差在深度上的瓶颈——为什么需要 AttnRes」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Full AttnRes 的公式是什么？pseudo-query、keys/values、softmax kernel 各代表什么？</p>
+      <details>
+      <summary>解答：候选 $k_i=v_i$ 取 embedding 与此前各层输出，权重由 softmax kernel $\phi(q_l,k_i)=\exp(q_l^\top\mathrm{RMSNorm}(k_i))$ 归一化得到，输出为候选的加权求和。</summary>
+      <p>pseudo-query $q_l=w_l$ 是层自带、不依赖输入的可学习参数向量；keys 与 values 同源，被检索的对象就是被加权求和的对象；softmax kernel 输出正数供归一化，其中的 RMSNorm 防止大幅值 key 主导权重。公式对应 K3 报告 §2.2 Eq.(8)(9)。完整论证见「2. Full AttnRes 的公式——pseudo-query 如何检索前序层」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Block AttnRes 如何分块、块内求和、块间 attention？内存从 $O(Ld)$ 降到 $O(Nd)$ 的来源是什么？</p>
+      <details>
+      <summary>解答：把 $L$ 层分为 $N$ 块，块内输出求和成单表征，attention 只作用于块级表征；需保留的表征从 $L$ 个层输出降为 $N$ 个块表征，内存即从 $O(Ld)$ 降为 $O(Nd)$。</summary>
+      <p>候选集合为历史块快照加上当前块 partial sum（块的第一层除外）。跨 pipeline stage 的通信量随需保留的表征数同比例下降，这是 K3 采用块级形式的直接原因。完整论证见「3. Block AttnRes 的分块与块间 attention——把内存从 $O(Ld)$ 降到 $O(Nd)$」。</p>
+      </details>
+    </li>
+    <li>
+      <p>K3 的具体配置是什么——8 块×12 层、9 个候选来源、加权三次的位置在哪里？</p>
+      <details>
+      <summary>解答：K3 主干 93 层按 block size 12 分 8 块（最后一块 9 层），加 embedding 共 9 个块级表征；加权位置为每层 attention 前、MLP 前各一次，模型末尾 final norm 前一次。</summary>
+      <p>9 个候选是最后一个 block 内 $i\ge 2$ 层的最大候选数（8 个块快照加当前流），其他层的候选数更少。三次加权使用三套独立参数；具体位置与参数字段名来自源码核对，属间接证据。完整论证见「4. K3 的具体配置——8 块×12 层、9 个候选、加权三次」。</p>
+      </details>
+    </li>
+    <li>
+      <p>softmax kernel 为什么用 $\exp(q^\top\mathrm{RMSNorm}(k))$？RMSNorm 防大值主导的具体含义和边界？</p>
+      <details>
+      <summary>解答：不加 RMSNorm 时大幅值 key 的内积被幅值放大，softmax 权重几乎集中在该 key；RMSNorm 把 key 缩放到单位均方根，使权重只由方向决定。</summary>
+      <p>「防大值主导」的含义是消除幅值对权重的影响，让 pseudo-query 按方向选择来源。边界有两条：所有 key 方向接近时 softmax 仍接近均匀，RMSNorm 不能凭空创造选择性；RMSNorm 不防止 $\exp$ 溢出，需工程上的减最大值配合。完整论证见「5. softmax kernel 中的 RMSNorm——为什么不能直接用内积」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
-<h2 id="standard-residual-bottleneck">标准残差在深度上的瓶颈——为什么需要 AttnRes</h2>
+<h2 id="standard-residual-bottleneck">1. 标准残差在深度上的瓶颈——为什么需要 AttnRes</h2>
 
 <p>标准残差连接（<a href="../residual-connection/index.html">前置概念页</a>）的形式是 $h_{l+1}=h_l+F_l(h_l)$：把第 $l$ 层的输入 $h_l$ 直接加到该层变换 $F_l$ 的输出上。展开 $L$ 层后，第 $L$ 层的残差流是</p>
 
@@ -690,25 +761,53 @@ $$h_L = h_1 + \sum_{l=1}^{L-1} F_l(h_l).$$
 
 <p>RNN 把所有历史时间步压进一个 hidden state，深网络的标准残差在深度维度做同样的事。Transformer 用 attention 解决了 RNN 在时间维度的瓶颈——让每个位置选择性访问所有前序位置；AttnRes 把同样的思路用到深度维度：让每层选择性访问所有前序层的输出，而不是被动接收累加好的 $h_l$。</p>
 
-<pre class="diagram">标准残差（等权累加，RNN-over-depth 瓶颈）：
+<div class="flow-diagram">
+  <div class="flow-title">标准残差（等权累加，RNN-over-depth 瓶颈）</div>
+  <div class="flow-grid">
+    <span class="flow-node io" style="grid-column:1">$h_1$</span><span class="flow-arrow" style="grid-column:2">→</span>
+    <span class="flow-node" style="grid-column:3">$F_1$</span><span class="flow-arrow" style="grid-column:4">→</span>
+    <span class="flow-node" style="grid-column:5">$F_2$</span><span class="flow-arrow" style="grid-column:6">→</span>
+    <span class="flow-node" style="grid-column:7">$F_3$</span><span class="flow-arrow" style="grid-column:8">→</span>
+    <span class="flow-node" style="grid-column:9">…</span><span class="flow-arrow" style="grid-column:10">→</span>
+    <span class="flow-node" style="grid-column:11">$F_{L-1}$</span><span class="flow-arrow" style="grid-column:12">→</span>
+    <span class="flow-node" style="grid-column:13">$F_L$</span><span class="flow-arrow" style="grid-column:14">→</span>
+    <span class="flow-node io" style="grid-column:15">$h_L$</span>
+    <span class="flow-arrow" style="grid-column:1">↓</span>
+    <span class="flow-arrow" style="grid-column:3">↓</span>
+    <span class="flow-arrow" style="grid-column:5">↓</span>
+    <span class="flow-arrow" style="grid-column:7">↓</span>
+    <span class="flow-arrow" style="grid-column:9">↓</span>
+    <span class="flow-arrow" style="grid-column:11">↓</span>
+    <span class="flow-arrow" style="grid-column:13">↓</span>
+    <span class="flow-bar" style="grid-column:1/-1">等权累加：$h_1$ 与所有 $F_l$ 的输出以系数 1 压进同一个 $h_L$——所有历史挤在单个残差流里</span>
+  </div>
+  <div class="flow-note">问题：第 $L$ 层只能看到「累加好的过去」，无法按内容回看某一层。</div>
 
-  h_1 ─┬─► F_1 ─┬─► F_2 ─┬─► F_3 ─┬─► ... ─┬─► F_L ─► h_L
-        │        │        │                │
-        └────────┴────────┴────────────────┴── 所有历史压进 h_L
-
-  问题：第 L 层只能看到"累加好的过去"，无法按内容回看某一层
-
-AttnRes（沿深度做 attention）：
-
-  h_1 ─┬─► F_1 ─┬─► F_2 ─┬─► F_3 ─┬─► ... ─┬─► F_L
-        │        │        │                │
-        ▼        ▼        ▼                ▼
-      候选 0   候选 1   候选 2    ...     候选 L-1
-        ▲        ▲        ▲                ▲
-        └────────┴────────┴────────────────┴── q_L 用 attention 检索
-
-  第 L 层用 pseudo-query q_L 主动检索此前所有层输出，按内容分配权重</p>
-</pre>
+  <div class="flow-subtitle">AttnRes（沿深度做 attention）</div>
+  <div class="flow-grid">
+    <span class="flow-node io" style="grid-column:1">$h_1$</span><span class="flow-arrow" style="grid-column:2">→</span>
+    <span class="flow-node" style="grid-column:3">$F_1$</span><span class="flow-arrow" style="grid-column:4">→</span>
+    <span class="flow-node" style="grid-column:5">$F_2$</span><span class="flow-arrow" style="grid-column:6">→</span>
+    <span class="flow-node" style="grid-column:7">$F_3$</span><span class="flow-arrow" style="grid-column:8">→</span>
+    <span class="flow-node" style="grid-column:9">…</span><span class="flow-arrow" style="grid-column:10">→</span>
+    <span class="flow-node" style="grid-column:11">$F_{L-1}$</span><span class="flow-arrow" style="grid-column:12">→</span>
+    <span class="flow-node query" style="grid-column:13">$F_L$（当前层）</span>
+    <span class="flow-arrow" style="grid-column:1">↓</span>
+    <span class="flow-arrow" style="grid-column:3">↓</span>
+    <span class="flow-arrow" style="grid-column:5">↓</span>
+    <span class="flow-arrow" style="grid-column:7">↓</span>
+    <span class="flow-arrow" style="grid-column:9">↓</span>
+    <span class="flow-arrow" style="grid-column:11">↓</span>
+    <span class="flow-node cand" style="grid-column:1">候选 0（$h_1$）</span>
+    <span class="flow-node cand" style="grid-column:3">候选 1（$f_1$）</span>
+    <span class="flow-node cand" style="grid-column:5">候选 2（$f_2$）</span>
+    <span class="flow-node cand" style="grid-column:7">候选 3（$f_3$）</span>
+    <span class="flow-node cand" style="grid-column:9">…</span>
+    <span class="flow-node cand" style="grid-column:11">候选 $L{-}1$（$f_{L-1}$）</span>
+    <span class="flow-bar" style="grid-column:1/-1">pseudo-query $q_L$ 用 attention 检索全部候选，按内容分配权重 $\alpha_{i\to L}$</span>
+  </div>
+  <div class="flow-note">第 $L$ 层用 pseudo-query $q_L$ 主动检索此前所有层输出，按内容分配权重。</div>
+</div>
 
 <p>这里的关键转换是：把"沿深度做累加"替换为"沿深度做 attention"。机制细节由下一章的公式给出。先用一个对照表固定两者的区别：</p>
 
@@ -726,17 +825,29 @@ AttnRes（沿深度做 attention）：
 
 <p>需要强调的是：AttnRes <b>替代的是"等权累加"这个聚合方式"</b>，不是取消标准残差本身。K3 仍逐层累加 attention 与 MLP 的输出（保留标准残差的梯度流动性质，见前置概念页）；AttnRes 是叠加在等权累加之上的"块级加权选择"，把送入归一化的输入从"当前残差流"替换为"用 attention 检索块级历史表征得到的结果"。这个区分是本文最常见的误解之一，后面 K3 具体配置一章会再用 K3 的实际配置印证。<sup>[C1]</sup></p>
 
-<p>为了后续手算，先固定教学示例的小网络：$L=6$ 层、$d=2$、embedding $h_1=[1,0]$，各层输出 $f_1=[0,1]$、$f_2=[1,1]$、$f_3=[0.5,0.5]$、$f_4=[1,0.5]$、$f_5=[0.5,1]$、$f_6=[1,1]$（教学构造，不代表真实模型参数）。Full AttnRes 公式一章用它算第 6 层，Block AttnRes 分块一章升级为分 3 块。</p>
-
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话说明标准残差在深度上的瓶颈与 RNN 瓶颈的类比关系。</li>
-  <li>说出 AttnRes 用什么思路替代等权累加，并指出它替代的是"等权累加方式"还是"标准残差本身"。</li>
-</ul>
+<p>为了后续手算，先固定构造示例的小网络：$L=6$ 层、$d=2$、embedding $h_1=[1,0]$，各层输出 $f_1=[0,1]$、$f_2=[1,1]$、$f_3=[0.5,0.5]$、$f_4=[1,0.5]$、$f_5=[0.5,1]$、$f_6=[1,1]$（教学构造，不代表真实模型参数）。Full AttnRes 公式一章用它算第 6 层，Block AttnRes 分块一章升级为分 3 块。</p>
 
 <p>本章说明了 AttnRes 替代等权累加的思路。但还没有公式与 pseudo-query 的具体定义——下一章讲 Full AttnRes 的公式。</p>
 
-<h2 id="full-attnres-formula">Full AttnRes 的公式——pseudo-query 如何检索前序层</h2>
+<h3 id="chapter-1-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话说明标准残差在深度上的瓶颈与 RNN 瓶颈的类比关系。</p>
+    <details>
+    <summary>解答：标准残差把所有前层输出以系数 1 累加进单个残差流，早期信息被层层稀释且无法按内容找回，这与 RNN 把所有历史时间步压进单个 hidden state 是同一种瓶颈，只是维度从时间换成了深度。</summary>
+    <p>类比的边界：RNN 的 hidden state 是按时间步更新的动态状态，残差流 $h_l$ 是按层累加的静态求和，两者数学性质不同。正式判断以 $h_L=h_1+\sum_{l=1}^{L-1}F_l(h_l)$ 为准。</p>
+    </details>
+  </li>
+  <li>
+    <p>AttnRes 用什么思路替代等权累加？它替代的是"等权累加方式"还是"标准残差本身"？</p>
+    <details>
+    <summary>解答：AttnRes 用 softmax 加权检索替代等权累加——每层用可学习 pseudo-query 对前序表征做 attention、按内容分配权重，而非固定系数 1。</summary>
+    <p>它替代的只是"等权累加"这一聚合方式，即把送入归一化的输入从当前残差流换成 attention 检索结果，不取消标准残差本身：K3 仍逐层累加 attention 与 MLP 的输出，保留残差的梯度流动性质。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="full-attnres-formula">2. Full AttnRes 的公式——pseudo-query 如何检索前序层</h2>
 
 <p>Full AttnRes 对每层 $l$ 定义一个层自带的可学习 pseudo-query $q_l=w_l\in\mathbb{R}^d$。它叫"pseudo"是因为它不依赖该层输入（与标准 attention 中 $Q=W_Q x$ 不同），就是一个层参数向量。keys 与 values 取自此前的层输出（K3 报告 §2.2 Eq.(8)）<sup>[C2, F1]</sup>：</p>
 
@@ -767,13 +878,13 @@ $$\mathrm{RMSNorm}(x) = \frac{x}{\sqrt{\tfrac{1}{d}\sum_{j=1}^d x_j^2 + \epsilon
 
 <p>用两个快速检查验证公式。第一，若所有 key 方向相同（如 $k_i=c_i\cdot u$ 对某个单位向量 $u$），则 $\mathrm{RMSNorm}(k_i)=\sqrt d\cdot u$ 对所有 $i$ 相同，$\alpha_{i\to l}=1/l$——权重均匀，pseudo-query 失去选择性。第二，若 pseudo-query $q_l$ 与某个 key $k_j$ 方向高度一致而与其他 key 正交，则 $\alpha_{j\to l}\to 1$——权重集中在该 key。这两个边界说明：AttnRes 的"选择性"来自 key 之间的方向差异，与幅值无关（因为 RMSNorm 已去掉幅值）。</p>
 
-<p>现在用教学示例手算第 6 层。为了先把 attention 检索的本质讲清，本节暂时<b>不加 RMSNorm</b>（即用 $\phi(q,k)=\exp(q^\top k)$），softmax kernel 中的 RMSNorm 一章再加 RMSNorm 重算并对比。</p>
+<p>现在用构造示例手算第 6 层。为了先把 attention 检索的本质讲清，本节暂时<b>不加 RMSNorm</b>（即用 $\phi(q,k)=\exp(q^\top k)$），softmax kernel 中的 RMSNorm 一章再加 RMSNorm 重算并对比。</p>
 
-<p>教学示例。 $L=6$、$d=2$。对第 6 层，候选 = $[h_1, f_1, f_2, f_3, f_4, f_5]$ = 6 个。设 $q_6=[0.5, 0.5]$。内积 $q_6^\top k_i$ 分别为 $0.5, 0.5, 1.0, 0.5, 0.75, 0.75$；softmax 后权重约为 $0.139, 0.139, 0.228, 0.139, 0.178, 0.178$；加权求和得 $h_6\approx[0.703, 0.703]$。权重最大的是 $f_2$（0.228），因为 $f_2=[1,1]$ 与 $q_6=[0.5,0.5]$ 方向最一致。完整计算过程见下方折叠块。</p>
+<p>构造示例。 $L=6$、$d=2$。对第 6 层，候选 = $[h_1, f_1, f_2, f_3, f_4, f_5]$ = 6 个。设 $q_6=[0.5, 0.5]$。内积 $q_6^\top k_i$ 分别为 $0.5, 0.5, 1.0, 0.5, 0.75, 0.75$；softmax 后权重约为 $0.139, 0.139, 0.228, 0.139, 0.178, 0.178$；加权求和得 $h_6\approx[0.703, 0.703]$。权重最大的是 $f_2$（0.228），因为 $f_2=[1,1]$ 与 $q_6=[0.5,0.5]$ 方向最一致。完整计算过程见下方折叠块。</p>
 
 <details>
 <summary>展开：Full AttnRes 第 6 层的完整手算（6 个候选，不加 RMSNorm）</summary>
-<p>教学示例。 输入：$q_6=[0.5, 0.5]$，6 个候选 $k_i=v_i$ 为</p>
+<p>构造示例。 输入：$q_6=[0.5, 0.5]$，6 个候选 $k_i=v_i$ 为</p>
 <ul>
 <li>$k_0=h_1=[1, 0]$</li>
 <li>$k_1=f_1=[0, 1]$</li>
@@ -833,16 +944,34 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot u^\top (c-1)u\bigr) = \exp\
 
 <p>Full AttnRes 公式成立<sup>[C3]</sup>，但它的开销是 $O(Ld)$ 内存——需要保留所有 $L$ 个层输出供后续层检索。K3 主干 93 层、$d=7168$，这个内存（含跨 pipeline stage 通信）是实际瓶颈。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 Full AttnRes 的权重公式 $\alpha_{i\to l}$，说出 $q_l$、$k_i$、$v_i$、$\alpha_{i\to l}$ 各代表什么。</li>
-  <li>说出 pseudo-query $q_l=w_l$ 与标准 attention 中 $Q=W_Q x$ 的关键区别（提示：是否依赖输入）。</li>
-  <li>在 $d=2$、3 个候选 $k_0=[1,0]$、$k_1=[0,1]$、$k_2=[1,1]$、$q=[0.5,0.5]$ 的小例子里手算 softmax 权重（先不算 RMSNorm）。</li>
-</ul>
-
 <p>本章给出了 Full AttnRes 的公式与 pseudo-query 检索机制。但 $O(Ld)$ 内存是实际瓶颈——下一章讲 Block AttnRes 如何分块把内存降到 $O(Nd)$。</p>
 
-<h2 id="block-attnres-mechanism">Block AttnRes 的分块与块间 attention——把内存从 O(Ld) 降到 O(Nd)</h2>
+<h3 id="chapter-2-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 Full AttnRes 的权重公式 $\alpha_{i\to l}$，并说明 $q_l$、$k_i$、$v_i$、$\alpha_{i\to l}$ 各代表什么。</p>
+    <details>
+    <summary>解答：$\alpha_{i\to l}=\phi(q_l,k_i)\big/\sum_{j=0}^{l-1}\phi(q_l,k_j)$，其中 $\phi(q_l,k_i)=\exp(q_l^\top\mathrm{RMSNorm}(k_i))$。</summary>
+    <p>$q_l=w_l\in\mathbb{R}^d$ 是层 $l$ 自带的可学习 pseudo-query，不依赖该层输入；$k_i=v_i$ 是第 $i$ 个来源的 key 与 value，$i=0$ 时为 embedding $h_1$，$i\ge 1$ 时为第 $i$ 层输出 $f_i(h_i)$，key 与 value 同源；$\alpha_{i\to l}$ 是层 $l$ 对来源 $i$ 的 attention 权重，全部权重之和为 1。公式来自 K3 报告 §2.2 Eq.(8)(9)。</p>
+    </details>
+  </li>
+  <li>
+    <p>pseudo-query $q_l=w_l$ 与标准 attention 中 $Q=W_Q x$ 的关键区别是什么？</p>
+    <details>
+    <summary>解答：关键区别是是否依赖输入——pseudo-query 是层自带的参数向量，对该层任何输入都相同；$Q=W_Q x$ 由当前输入线性变换得到，随输入变化。</summary>
+    <p>因此 AttnRes 每层的检索方向是训练学出的固定偏好，而标准 attention 的查询内容随输入动态变化。这也让 pseudo-query 无需随输入重新计算，是该机制开销较低的原因之一。</p>
+    </details>
+  </li>
+  <li>
+    <p>在 $d=2$、3 个候选 $k_0=[1,0]$、$k_1=[0,1]$、$k_2=[1,1]$、$q=[0.5,0.5]$ 的小例子里手算 softmax 权重（暂不加 RMSNorm）。</p>
+    <details>
+    <summary>解答：内积为 $0.5$、$0.5$、$1.0$，softmax 权重约为 $0.274$、$0.274$、$0.452$，$k_2$ 权重最大。</summary>
+    <p>取 exp 得 $1.6487$、$1.6487$、$2.7183$，和为 $6.0157$；归一化得 $\alpha_0\approx 0.274$、$\alpha_1\approx 0.274$、$\alpha_2\approx 0.452$。$k_2=[1,1]$ 与 $q=[0.5,0.5]$ 方向最一致，因此权重最大。注意本例未加 RMSNorm，K3 实际 kernel 始终含 RMSNorm（Eq.(9)）。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="block-attnres-mechanism">3. Block AttnRes 的分块与块间 attention——把内存从 $O(Ld)$ 降到 $O(Nd)$</h2>
 
 <p>Full AttnRes 的开销有两部分：$O(L^2 d)$ 算力（每层对所有前序层做 attention，共 $L$ 层）与 $O(Ld)$ 内存（保留所有 $L$ 个层输出）。K3 报告 §2.2 指出网络深度 $L<100$ 时算力可承受，实际瓶颈是内存与跨 pipeline stage 通信：</p>
 
@@ -868,37 +997,66 @@ $$V = \begin{cases} [b_0, b_1, \dots, b_{n-1}]^\top & i = 1\ (\text{block } n\te
 
 <p>两种情况的差别是：block 的第一层（$i=1$）还没有"当前流"（block 内尚未累加任何输出），候选只有 $n$ 个历史 block 表征；后续层（$i\ge 2$）多一个当前 block 的 partial sum $b_n^{i-1}$，候选共 $n+1$ 个。attention 仍按 Eq.(8)(9) 计算，但作用在 block 级表征上。</p>
 
-<pre class="diagram">Full AttnRes（每层对此前所有层输出做 attention）：
+<div class="flow-diagram">
+  <div class="flow-title">Full AttnRes（每层对此前所有层输出做 attention）</div>
+  <div class="flow-grid">
+    <span class="flow-node" style="grid-column:1">层 1</span><span class="flow-arrow" style="grid-column:2">→</span>
+    <span class="flow-node" style="grid-column:3">层 2</span><span class="flow-arrow" style="grid-column:4">→</span>
+    <span class="flow-node" style="grid-column:5">层 3</span><span class="flow-arrow" style="grid-column:6">→</span>
+    <span class="flow-node" style="grid-column:7">层 4</span><span class="flow-arrow" style="grid-column:8">→</span>
+    <span class="flow-node" style="grid-column:9">层 5</span><span class="flow-arrow" style="grid-column:10">→</span>
+    <span class="flow-node query" style="grid-column:11">层 6</span><span class="flow-arrow" style="grid-column:12">→</span>
+    <span class="flow-node" style="grid-column:13">…</span>
+    <span class="flow-arrow" style="grid-column:1">↓</span>
+    <span class="flow-arrow" style="grid-column:3">↓</span>
+    <span class="flow-arrow" style="grid-column:5">↓</span>
+    <span class="flow-arrow" style="grid-column:7">↓</span>
+    <span class="flow-arrow" style="grid-column:9">↓</span>
+    <span class="flow-arrow" style="grid-column:11">↓</span>
+    <span class="flow-node cand" style="grid-column:1">候选 0</span>
+    <span class="flow-node cand" style="grid-column:3">候选 1</span>
+    <span class="flow-node cand" style="grid-column:5">候选 2</span>
+    <span class="flow-node cand" style="grid-column:7">候选 3</span>
+    <span class="flow-node cand" style="grid-column:9">候选 4</span>
+    <span class="flow-node cand" style="grid-column:11">候选 5</span>
+  </div>
+  <div class="flow-note">层 6 的候选 = 6 个层输出（含 embedding）。内存 $O(Ld)$：需保留全部 $L$ 个层输出。</div>
 
-  层 1 ─► 层 2 ─► 层 3 ─► 层 4 ─► 层 5 ─► 层 6 ─► ...
-   │      │       │       │       │       │
-   ▼      ▼       ▼       ▼       ▼       ▼
-  候选 0  候选 1   候选 2   候选 3   候选 4   候选 5   ...
-                  │
-                  └── 层 6 的候选 = 6 个层输出（含 embedding）
-                      内存：O(Ld)，需保留全部 L 个层输出
-
-Block AttnRes（块内求和，块间 attention）：
-
-  block 1 (层 1-2)    block 2 (层 3-4)    block 3 (层 5-6)
-   f_1 + f_2            f_3 + f_4            f_5 + f_6
-      │                    │                    │
-      ▼                    ▼                    ▼
-     b_1                   b_2                  b_3^i (partial sum)
-
-  对 block 3 第 2 层（i=2），候选 = [b_0, b_1, b_2, b_3^1] = 4 个
-  内存：O(Nd)，只保留 N 个 block 级表征 + 当前 partial sum</p>
-</pre>
+  <div class="flow-subtitle">Block AttnRes（块内求和，块间 attention）</div>
+  <div class="flow-grid">
+    <div class="flow-group" style="grid-column:1">
+      <span class="flow-group-title">block 1（层 1-2）</span>
+      <span>$f_1+f_2$</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_1$</span>
+    </div>
+    <span class="flow-arrow" style="grid-column:2">→</span>
+    <div class="flow-group" style="grid-column:3">
+      <span class="flow-group-title">block 2（层 3-4）</span>
+      <span>$f_3+f_4$</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_2$</span>
+    </div>
+    <span class="flow-arrow" style="grid-column:4">→</span>
+    <div class="flow-group" style="grid-column:5">
+      <span class="flow-group-title">block 3（层 5-6）</span>
+      <span>$f_5+f_6$</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_3^i$（partial sum）</span>
+    </div>
+  </div>
+  <div class="flow-note">对 block 3 第 2 层（$i=2$）：候选 = $[\,b_0,\ b_1,\ b_2,\ b_3^1\,]$，共 4 个。内存 $O(Nd)$：只保留 $N$ 个 block 级表征 + 当前 partial sum。</div>
+</div>
 
 <p><b>内存对比</b><sup>[C5]</sup>。Full AttnRes 需要保留 $L$ 个层输出（$O(Ld)$ 内存），且在 pipeline parallelism 下要在 stage 之间传递这些层输出。Block AttnRes 只需保留 $N$ 个 block 级表征（$O(Nd)$ 内存），跨 stage 通信量同比例下降。K3 报告 §2.2 原文："Under Block AttnRes, memory and communication overhead drop from $O(Ld)$ to $O(Nd)$."</p>
 
 <p>需要强调的一个细节：候选数随 block index 增长。对 block $n$ 的第 $i\ge 2$ 层，候选数为 $n+1$（$n$ 个历史 block 表征 + 当前 partial sum）。最大候选数出现在最后一个 block 的 $i\ge 2$ 层，为 $N+1$。这个细节在 K3 具体配置一章看 K3 的实际参数时会变得关键——K3 的"9 个候选来源"正是最后一个 block 内 $i\ge 2$ 层的最大候选数。</p>
 
-<p>现在用教学示例手算 Block AttnRes 版本。把 $L=6$ 层分 3 块、每块 2 层：block 1 = layer 1-2、block 2 = layer 3-4、block 3 = layer 5-6。块内求和：$b_0=h_1=[1,0]$、$b_1=f_1+f_2=[0,1]+[1,1]=[1,2]$、$b_2=f_3+f_4=[0.5,0.5]+[1,0.5]=[1.5,1]$。对 block 3 第 2 层（即 layer 6），候选 = $[b_0, b_1, b_2, b_3^1]$，其中 $b_3^1=f_5=[0.5,1]$，共 4 个候选。用 $q_6=[0.5,0.5]$（暂时不加 RMSNorm），权重约为 $[0.14, 0.38, 0.30, 0.18]$，加权求和得 $h_6\approx[1.059, 1.241]$。完整计算见下方折叠块。</p>
+<p>现在用构造示例手算 Block AttnRes 版本。把 $L=6$ 层分 3 块、每块 2 层：block 1 = layer 1-2、block 2 = layer 3-4、block 3 = layer 5-6。块内求和：$b_0=h_1=[1,0]$、$b_1=f_1+f_2=[0,1]+[1,1]=[1,2]$、$b_2=f_3+f_4=[0.5,0.5]+[1,0.5]=[1.5,1]$。对 block 3 第 2 层（即 layer 6），候选 = $[b_0, b_1, b_2, b_3^1]$，其中 $b_3^1=f_5=[0.5,1]$，共 4 个候选。用 $q_6=[0.5,0.5]$（暂时不加 RMSNorm），权重约为 $[0.14, 0.38, 0.30, 0.18]$，加权求和得 $h_6\approx[1.059, 1.241]$。完整计算见下方折叠块。</p>
 
 <details>
 <summary>展开：Block AttnRes 对 block 3 第 2 层的完整手算（4 个候选，不加 RMSNorm）</summary>
-<p>教学示例。 输入：$q_6=[0.5, 0.5]$，4 个候选 $k_i=v_i$ 为</p>
+<p>构造示例。 输入：$q_6=[0.5, 0.5]$，4 个候选 $k_i=v_i$ 为</p>
 <ul>
 <li>$k_0=b_0=h_1=[1, 0]$</li>
 <li>$k_1=b_1=f_1+f_2=[1, 2]$</li>
@@ -978,19 +1136,34 @@ final_hidden ← RMSNorm(output)
 <p>伪代码展示三个关键点：(1) 候选集合随 block index 增长，block $n$ 的第 $i\ge 2$ 层有 $n+1$ 个候选；(2) AttnRes 替代的是"送入归一化的输入"，标准残差累加 $h\leftarrow h+\text{attn\_out}$ 仍保留；(3) 每层 attention 前、MLP 前各加权一次（两套独立参数），模型末尾 final norm 前第三次。注意伪代码省略了 K3 的实际工程细节（如 online softmax、TP/SP 通信），只展示机制本身。</p>
 </details>
 
-<p>Block AttnRes 的机制清楚后，下一章看 K3 具体怎么用——8 块、12 层、9 个候选来源、加权三次。</p>
-
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 Block AttnRes 的分块方式与块内求和 $b_n$ 的定义，指出 $b_0$ 的特殊之处。</li>
-  <li>对 block $n$ 的第 $i$ 层，写出候选集合的两种情况（$i=1$ 与 $i\ge 2$），并说出最大候选数是多少。</li>
-  <li>解释内存从 $O(Ld)$ 降到 $O(Nd)$ 的来源。</li>
-  <li>在 $N=3$、$S=2$、$d=2$ 的小例子里手算 block 3 第 2 层的候选集合（4 个候选）与权重。</li>
-</ul>
-
 <p>本章给出了 Block AttnRes 的分块机制与内存来源。但还没落到 K3 的具体配置——下一章讲 K3 的 8 块×12 层、9 个候选与加权三次。</p>
 
-<h2 id="k3-instantiation">K3 的具体配置——8 块×12 层、9 个候选、加权三次</h2>
+<h3 id="chapter-3-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>Block AttnRes 的分块方式与块内求和 $b_n$ 的定义是什么？$b_0$ 有什么特殊之处？</p>
+    <details>
+    <summary>解答：把 $L$ 层划分为 $N$ 个 block、每 block $S=L/N$ 层；块内求和 $b_n=\sum_{j\in B_n}f_j(h_j)$，即 block $n$ 内所有层输出之和。</summary>
+    <p>$b_0=h_1$ 是 token embedding，特殊之处在于它不是任何 block 的求和结果，但始终作为候选来源占据 $i=0$ 的位置。块内还维护 partial sum $b_n^i$（block $n$ 内前 $i$ 层之和），作为当前流参与候选。</p>
+    </details>
+  </li>
+  <li>
+    <p>对 block $n$ 的第 $i$ 层，候选集合有哪两种情况？最大候选数是多少？</p>
+    <details>
+    <summary>解答：$i=1$（block 第一层）时候选为 $[b_0,b_1,\dots,b_{n-1}]$ 共 $n$ 个；$i\ge 2$ 时候选为 $[b_0,b_1,\dots,b_{n-1},b_n^{i-1}]$ 共 $n+1$ 个，多出的 $b_n^{i-1}$ 是当前块的 partial sum。</summary>
+    <p>最大候选数出现在最后一个 block 的 $i\ge 2$ 层，为 $N+1$。候选数随 block index 增长，K3 的"9 个候选来源"正是 $N=8$ 时的最大值。</p>
+    </details>
+  </li>
+  <li>
+    <p>内存从 $O(Ld)$ 降到 $O(Nd)$ 的来源是什么？</p>
+    <details>
+    <summary>解答：来源是块内求和把"需保留供检索的表征"从 $L$ 个层输出压缩为 $N$ 个 block 级表征。</summary>
+    <p>Full AttnRes 需保留全部 $L$ 个层输出（$O(Ld)$ 内存），且在 pipeline 并行下要在 stage 之间传递这些输出；Block AttnRes 只需保留 $N$ 个 block 表征加当前 partial sum（$O(Nd)$ 内存），跨 stage 通信量同比例下降。算力 $O(L^2 d)$ 在 $L<100$ 时本就可承受，内存才是实际瓶颈。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="k3-instantiation">4. K3 的具体配置——8 块×12 层、9 个候选、加权三次</h2>
 
 <p>K3 主干 93 层（69 KDA + 24 MLA，K3 报告 Table 1），按 HuggingFace 官方 <code>config.json</code> 中 <code>attn_res_block_size=12</code> 划分为 8 个 block：前 7 个各 12 层、第 8 个 9 层（$93 = 7\times 12 + 9$，最后一个为 partial block）。加上 embedding 共 9 个 block 级表征<sup>[C6, C9, N1]</sup>。K3 报告 §2.2 原文：</p>
 
@@ -1009,25 +1182,47 @@ final_hidden ← RMSNorm(output)
 
 <p>"9 个候选来源（8 块快照 + 当前流）"这个说法对应的就是这个视角：8 个块快照（$b_0$ 即 embedding + $b_1\dots b_7$）+ 当前流（$b_8^{i-1}$）。注意这是最后一个 block 内 $i\ge 2$ 层的视角——其他 block 的层候选数更少（如 block 1 的 $i\ge 2$ 层只有 $[b_0, b_1^{i-1}]$ 共 2 个候选）。K3 报告 §2.2 以最大候选数 9 描述该配置；具体槽位分配的实现细节（预分配与屏蔽策略）属于工程实现，K3 报告未展开，本文不推测。</p>
 
-<pre class="diagram">K3 的 Block AttnRes 候选来源（最后一个 block 内 i≥2 层的视角）：
-
-  embedding         block 1         block 2         ... block 7         block 8 (partial)
-   h_1            layer 1-12      layer 13-24     ... layer 73-84     layer 85-93 (9 层)
-    │                │                │                  │                │
-    ▼                ▼                ▼                  ▼                ▼
-   b_0              b_1              b_2     ...        b_7              b_8^{i-1}
-  (snapshot)      (snapshot)       (snapshot)         (snapshot)       (current stream)
-    │                │                │                  │                │
-    └────────────────┴────────────────┴──────────────────┴────────────────┘
-                              9 个候选来源
-                              (8 块快照 + 当前流)
-                                │
-                                ▼
-                         q_l 用 attention 检索
-                                │
-                                ▼
-                         h_l = Σ α_i · v_i</p>
-</pre>
+<div class="flow-diagram">
+  <div class="flow-title">K3 的 Block AttnRes 候选来源（最后一个 block 内 $i\ge 2$ 层的视角）</div>
+  <div class="flow-grid">
+    <div class="flow-group" style="grid-column:1">
+      <span class="flow-group-title">embedding</span>
+      <span>$h_1$</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_0$（快照）</span>
+    </div>
+    <div class="flow-group" style="grid-column:2">
+      <span class="flow-group-title">block 1</span>
+      <span>层 1-12</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_1$（快照）</span>
+    </div>
+    <div class="flow-group" style="grid-column:3">
+      <span class="flow-group-title">block 2</span>
+      <span>层 13-24</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_2$（快照）</span>
+    </div>
+    <span class="flow-node" style="grid-column:4">…</span>
+    <div class="flow-group" style="grid-column:5">
+      <span class="flow-group-title">block 7</span>
+      <span>层 73-84</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_7$（快照）</span>
+    </div>
+    <div class="flow-group" style="grid-column:6">
+      <span class="flow-group-title">block 8（partial）</span>
+      <span>层 85-93（9 层）</span>
+      <span class="flow-arrow">↓</span>
+      <span class="flow-node cand">$b_8^{i-1}$（当前流）</span>
+    </div>
+    <span class="flow-bar" style="grid-column:1/-1">9 个候选来源（8 块快照 + 当前流）</span>
+    <span class="flow-arrow" style="grid-column:1/-1">↓</span>
+    <span class="flow-node query" style="grid-column:1/-1;justify-self:center">$q_l$ 用 attention 检索</span>
+    <span class="flow-arrow" style="grid-column:1/-1">↓</span>
+    <span class="flow-node" style="grid-column:1/-1;justify-self:center">$h_l=\sum_i \alpha_{i\to l}\,v_i$</span>
+  </div>
+</div>
 
 <p><b>加权三次的位置</b>。K3 在每个 attention 子层前与每个 MLP（Stable LatentMoE）子层前各做一次 AttnRes 加权，模型末尾 final norm 前再做第三次。三次使用三套独立的可学习参数：</p>
 <ul>
@@ -1074,16 +1269,34 @@ final_hidden ← RMSNorm(output)
 </table>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 K3 主干层数、block 数、block size、最后一个 block 的层数，并指出 9 个候选来源的构成。</li>
-  <li>说出 K3 加权三次的具体位置，并标注哪些来自 K3 报告原文、哪些来自源码核对。</li>
-  <li>解释"9 个候选来源"对应哪个 block 的哪一层，为什么不是所有层都有 9 个候选。</li>
-</ul>
-
 <p>本章把抽象公式落到 K3 的具体配置<sup>[N3]</sup>。但还有一个容易被忽略的设计选择——下一章讲 softmax kernel 中的 RMSNorm。</p>
 
-<h2 id="rmsnorm-in-kernel">softmax kernel 中的 RMSNorm——为什么不能直接用内积</h2>
+<h3 id="chapter-4-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>K3 主干层数、block 数、block size、最后一个 block 的层数各是多少？9 个候选来源由什么构成？</p>
+    <details>
+    <summary>解答：主干 93 层（69 KDA + 24 MLA），block size 12，分为 8 个 block：前 7 个各 12 层、最后一个 9 层（$93=7\times 12+9$，partial block）。</summary>
+    <p>9 个候选来源 = embedding $b_0$ + 前 7 个完整 block 的块内求和 $b_1\dots b_7$ + 当前 partial block 的 partial sum $b_8^{i-1}$，即"8 块快照 + 当前流"，对应最后一个 block 内 $i\ge 2$ 层的候选集合。来源为 K3 报告 §2.2 与 HuggingFace 官方 <code>config.json</code>。</p>
+    </details>
+  </li>
+  <li>
+    <p>K3 加权三次的具体位置在哪里？哪些位置来自 K3 报告原文确认，哪些来自源码核对？</p>
+    <details>
+    <summary>解答：三次位置为每个 attention 子层前一次、每个 MLP 子层前一次（两套独立参数）、模型末尾 final norm 前一次（output AttnRes 聚合所有 block 表征）。</summary>
+    <p>证据层级：K3 报告原文只确认"each module 各加权一次 + 末尾聚合"；具体三次位置与参数字段名（<code>self_attention_res_norm</code> 等）来自 K3 前向数据流 note 对官方源码 <code>modeling_kimi_linear.py</code> 的核对，本页未直接复核源码，标注为间接证据。</p>
+    </details>
+  </li>
+  <li>
+    <p>"9 个候选来源"对应哪个 block 的哪一层？为什么不是所有层都有 9 个候选？</p>
+    <details>
+    <summary>解答：对应最后一个 block（block 8）内 $i\ge 2$ 的层——此时历史快照最多（$b_0$ 到 $b_7$ 共 8 个）且已存在当前 partial sum $b_8^{i-1}$，合计 9 个。</summary>
+    <p>候选数随 block index 增长：block 1 的 $i\ge 2$ 层只有 $[b_0, b_1^{i-1}]$ 共 2 个候选；每个 block 的第一层（$i=1$）还没有当前流，比同 block 的后续层少一个候选。9 是最大候选数而非固定值。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="rmsnorm-in-kernel">5. softmax kernel 中的 RMSNorm——为什么不能直接用内积</h2>
 
 <p>Full AttnRes 公式一章暂时跳过了 RMSNorm，用 $\phi(q,k)=\exp(q^\top k)$ 手算了 Full AttnRes 与 Block AttnRes 的权重。本章解释为什么 kernel 里要加 RMSNorm——也就是 $\phi(q,k)=\exp(q^\top\mathrm{RMSNorm}(k))$ 中 RMSNorm 的作用<sup>[C3]</sup>。</p>
 
@@ -1103,7 +1316,7 @@ $$\phi(q_l, k_i) = \exp\!\bigl(q_l^\top \mathrm{RMSNorm}(k_i)\bigr),\qquad \math
 
 <details>
 <summary>展开：同一例子在"不加 RMSNorm"与"加 RMSNorm"两种情况下的权重对比</summary>
-<p>教学示例。 沿用 Block AttnRes 分块一章的例子：4 个候选 $b_0=[1,0]$、$b_1=[1,2]$、$b_2=[1.5,1]$、$b_3^1=[0.5,1]$，$q_6=[0.5,0.5]$，$d=2$，$\sqrt d=\sqrt 2\approx 1.4142$。</p>
+<p>构造示例。 沿用 Block AttnRes 分块一章的例子：4 个候选 $b_0=[1,0]$、$b_1=[1,2]$、$b_2=[1.5,1]$、$b_3^1=[0.5,1]$，$q_6=[0.5,0.5]$，$d=2$，$\sqrt d=\sqrt 2\approx 1.4142$。</p>
 
 <p><b>情况 A：不加 RMSNorm</b>（Block AttnRes 分块一章已算）。内积 $q_6^\top k_i = [0.5, 1.5, 1.25, 0.75]$，softmax 权重 $\approx [0.1405, 0.3818, 0.2974, 0.1804]$，加权求和得 $h_6\approx [1.059, 1.241]$。</p>
 
@@ -1164,19 +1377,36 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
 <p>边界：若 $q$ 与 $u$ 不完全一致（$q^\top u < \|q\|$），RMSNorm 后权重比仍由方向决定，但不会归零。若所有 key 方向相同，RMSNorm 后所有 key 相同，softmax 完全均匀——RMSNorm 不能凭空创造选择性。</p>
 </details>
 
-<p>本章是最后一个学习目标。完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出不加 RMSNorm 时大 key 为什么会主导 softmax（用内积与 exp 的关系解释）。</li>
-  <li>说出 RMSNorm 改变了 key 的什么、不改变什么，并指出 value 是否被 RMSNorm 影响。</li>
-  <li>说出 RMSNorm 的两个失效边界。</li>
-  <li>在 4 候选的小例子里对比"不加 RMSNorm"与"加 RMSNorm"的权重，指出哪个候选的权重变化最大、为什么。</li>
-</ul>
+<p>至此本文五个核心问题全部作答：标准残差的深度瓶颈与 AttnRes 思路、Full AttnRes 公式、Block AttnRes 分块机制、K3 具体配置、RMSNorm 设计选择。RMSNorm 的作用是"按方向而非幅值选择来源"，两个失效边界是：所有 key 方向接近时 softmax 仍接近均匀；RMSNorm 不防 exp 溢出（工程上需配合减最大值）。</p>
 
-<p>至此本文五个学习目标全部完成：标准残差的深度瓶颈与 AttnRes 思路、Full AttnRes 公式、Block AttnRes 分块机制、K3 具体配置、RMSNorm 设计选择。RMSNorm 的作用是"按方向而非幅值选择来源"，两个失效边界是：所有 key 方向接近时 softmax 仍接近均匀；RMSNorm 不防 exp 溢出（工程上需配合减最大值）。</p>
+<h3 id="chapter-5-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>不加 RMSNorm 时，大 key 为什么会主导 softmax？</p>
+    <details>
+    <summary>解答：softmax 权重比 $\alpha_1/\alpha_2=\exp(q^\top(k_1-k_2))$，指数函数把 key 之间的内积差异放大为权重差异，幅值大的 key 内积也大，权重几乎全部分配给它。</summary>
+    <p>量化地看：内积差 2 时权重比约 7.4 倍，差 5 时约 148 倍；若 $k_1=c\cdot u$（$c=5$）且方向与 $q$ 一致，权重比达 $\exp((c-1)\|q\|)\approx 54.6$。此时 softmax 失去按内容选择的能力，等于屏蔽了其他来源。</p>
+    </details>
+  </li>
+  <li>
+    <p>RMSNorm 改变了 key 的什么、不改变什么？value 是否受 RMSNorm 影响？</p>
+    <details>
+    <summary>解答：RMSNorm 把 key 缩放到单位均方根，改变的是进入内积的幅值，不改变方向；value 不受影响——加权求和仍使用原始候选。</summary>
+    <p>因此权重的分配从"按幅值与方向"变为"只按方向"，但输出 $h_l$ 的幅值仍受大候选 value 的影响：RMSNorm 改变的是权重分配方式，不是 value 的尺度。</p>
+    </details>
+  </li>
+  <li>
+    <p>RMSNorm 的两个失效边界是什么？</p>
+    <details>
+    <summary>解答：其一，若所有 key 方向接近，RMSNorm 后方向仍接近，softmax 仍接近均匀——RMSNorm 不能凭空创造选择性；其二，RMSNorm 不保证 $\exp$ 不溢出。</summary>
+    <p>第二条边界的细节：若 pseudo-query 本身幅值很大且与归一化后的 key 方向一致，指数仍可能溢出；工程实现通常在 softmax 前减去最大值，这是 softmax 的标准数值稳定技术，不属于 RMSNorm 的职责。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <ul>
   <li><b>C1</b>（标准残差的深度瓶颈与 AttnRes 思路）：K3 报告 §2.2 第 379-383 行。</li>
   <li><b>C2</b>（Full AttnRes 公式 Eq.8-9）：K3 报告 §2.2 第 385-396 行。</li>
@@ -1189,7 +1419,7 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
   <li><b>C9</b>（K3 主干 93 层、$d=7168$、$N=8$、$S=12$）：HuggingFace 官方 <code>config.json</code>（<code>num_hidden_layers=93</code>、<code>attn_res_block_size=12</code>、<code>hidden_size=7168</code>）+ K3 报告 Table 1。</li>
 </ul>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <ul>
   <li><b>F1</b>（Full AttnRes 的 keys/values）：K3 报告 §2.2 Eq.(8)，第 385-389 行。</li>
   <li><b>F2</b>（softmax kernel 与权重）：K3 报告 §2.2 Eq.(9)，第 393-396 行。</li>
@@ -1198,30 +1428,30 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
   <li><b>F5</b>（RMSNorm 定义）：Zhang & Sennrich 2019（K3 报告引用 [146]）；本页只用定义，不展开推导。</li>
 </ul>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <ul>
   <li><b>N1</b>：K3 主干 93 层（69 KDA + 24 MLA）、8 个 block、每个 12 层、最后一个 9 层（partial block）、9 个 block 级表征。来源：K3 报告 §2.2 第 423-424 行 + Table 1 + HuggingFace <code>config.json</code>。实验条件：K3 Instruct 模型版本。</li>
   <li><b>N2</b>：$N\approx 8$ 在多数模型尺度下恢复 Full AttnRes 的大部分收益。来源：K3 报告 §2.2 第 423 行转述 [58]。实验条件：原 preprint [58] 的实验设置。置信状态：K3 报告转述已确认；原 preprint 实验数据未独立核对，标注为间接证据。</li>
   <li><b>N3</b>：K3 主干 hidden_size=7168、num_attention_heads=96、block size=12 层。来源：HuggingFace <code>config.json</code>。实验条件：K3 Instruct 模型版本。</li>
 </ul>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <ul>
   <li><b>教学小例子</b>（$N=3$、$S=2$、$d=2$、$L=6$）：人为构造的教学数字，便于手算 softmax 与 RMSNorm。embedding $h_1=[1,0]$、各层输出 $f_1=[0,1]$、$f_2=[1,1]$、$f_3=[0.5,0.5]$、$f_4=[1,0.5]$、$f_5=[0.5,1]$、$f_6=[1,1]$；pseudo-query $q_6=[0.5,0.5]$。这些数字不代表真实模型参数，构造目的是让 4-6 个候选的 softmax 与 RMSNorm 都能逐位手算。</li>
-  <li><b>Full AttnRes 6 候选手算</b>（不加 RMSNorm）：教学示例，展示 softmax 加权检索的本质。结果 $h_6\approx[0.703, 0.703]$，权重最大 0.228（$f_2$）。</li>
-  <li><b>Block AttnRes 4 候选手算</b>（不加 RMSNorm）：教学示例，展示块内求和与块间 attention。结果 $h_6\approx[1.059, 1.241]$，权重最大 0.382（$b_1$，部分由幅值放大带来）。</li>
-  <li><b>加 RMSNorm 对比</b>：教学示例，展示 RMSNorm 把"按幅值选择"换成"按方向选择"。加 RMSNorm 后权重从 $[0.14, 0.38, 0.30, 0.18]$ 变为 $[0.21, 0.26, 0.27, 0.26]$，$b_1$ 权重从 0.38 降到 0.26。</li>
+  <li><b>Full AttnRes 6 候选手算</b>（不加 RMSNorm）：构造示例，展示 softmax 加权检索的本质。结果 $h_6\approx[0.703, 0.703]$，权重最大 0.228（$f_2$）。</li>
+  <li><b>Block AttnRes 4 候选手算</b>（不加 RMSNorm）：构造示例，展示块内求和与块间 attention。结果 $h_6\approx[1.059, 1.241]$，权重最大 0.382（$b_1$，部分由幅值放大带来）。</li>
+  <li><b>加 RMSNorm 对比</b>：构造示例，展示 RMSNorm 把"按幅值选择"换成"按方向选择"。加 RMSNorm 后权重从 $[0.14, 0.38, 0.30, 0.18]$ 变为 $[0.21, 0.26, 0.27, 0.26]$，$b_1$ 权重从 0.38 降到 0.26。</li>
   <li><b>softmax 大值敏感性推导</b>（Full AttnRes 公式一章末尾与 RMSNorm 一章折叠块）：教学推导，用 $k_1=c\cdot u$、$k_2=u$ 的简化模型说明大 key 主导 softmax 的数学机制。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <ul>
   <li><b>"深度方向的 RNN 瓶颈"类比</b>（标准残差瓶颈一章）：把标准残差的等权累加类比为 RNN 把所有历史压进 hidden state。这个类比只解释"所有历史被压成单一流"的结构相似性，不覆盖 RNN 的梯度问题、不覆盖 Transformer attention 的完整机制。失效边界：RNN 的 hidden state 是按时间步更新的动态状态，标准残差的 $h_l$ 是按层累加的静态求和，两者数学性质不同。正式判断以 $h_L=h_1+\sum_l F_l(h_l)$ 为准。</li>
   <li><b>"沿深度做 attention"类比</b>（标准残差瓶颈一章）：把 AttnRes 类比为序列方向的 self-attention 用到深度维度。这个类比只解释"用 softmax 加权替代等权累加"的思路，不覆盖 self-attention 的位置编码、causal mask、多头等机制。失效边界：序列 attention 的 key/value 来自同一层不同位置，AttnRes 的 key/value 来自不同层同一位置；序列 attention 的 $Q$ 依赖输入，AttnRes 的 $q_l=w_l$ 不依赖输入。正式判断以 Eq.(8)(9) 为准。</li>
   <li><b>"按方向而非幅值选择"解释</b>（RMSNorm 一章）：把 RMSNorm 的作用解释为"让 pseudo-query 按方向选择来源"。这个解释只适用于 key 之间幅值差异大的情况；若 key 幅值接近，RMSNorm 几乎不改变结果。失效边界：RMSNorm 不创造方向差异，只去掉幅值差异；若所有 key 方向相同，RMSNorm 后 softmax 仍均匀。正式判断以 $\phi(q,k)=\exp(q^\top\mathrm{RMSNorm}(k))$ 为准。</li>
 </ul>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <ul>
   <li><b>Full AttnRes 与 Block AttnRes 手算暂时不加 RMSNorm</b>。简化做法：先用 $\phi(q,k)=\exp(q^\top k)$ 手算，RMSNorm 一章再加 RMSNorm 重算对比。可推出：attention 检索的本质是 softmax 加权。不可推出：真实 K3 的权重分布——K3 实际 kernel 始终含 RMSNorm（Eq.9），不存在"不加 RMSNorm"的版本。</li>
   <li><b>小例子用 $d=2$</b>。简化做法：用 $d=2$ 让 4-6 个候选的 softmax 与 RMSNorm 都能逐位手算。可推出：RMSNorm 的"按方向选择"性质。不可推出：$d=7168$ 时的具体数字——真实 K3 的 $\sqrt{7168}\approx 84.7$，机制相同但数字不直观，RMSNorm 的性质与 $d$ 无关。</li>

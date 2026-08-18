@@ -46,17 +46,17 @@
 
     <!-- 快速阅读正文：是什么、为什么需要它、核心直觉、关键结论与边界。5 分钟内可扫读，不展开公式推导与手算例子。 -->
 
-    <h2>是什么</h2>
+    <h2>1. 是什么</h2>
     <p>KDA 是 Kimi K3 在 93 层 backbone 中用于<strong>长序列混合</strong>的注意力机制，占了其中 69 层（其余 24 层是 <a href="index.html">深度教学</a>里详述的 Gated MLA，负责全局内容交互）。它的核心是把 delta rule 的递归——"先擦除旧 key 方向、再写入新值"——叠加一个<strong>每通道独立衰减</strong>的遗忘门，并专门改了一处衰减率参数化让它在 BF16 上不溢出。它的前置概念是 <a href="../../wiki/delta-rule/index.html">delta rule</a>（擦写机制）和 <a href="../../wiki/linear-attention/index.html">线性注意力</a>（固定大小递归状态）。</p>
 
-    <h2>为什么需要它</h2>
+    <h2>2. 为什么需要它</h2>
     <ul>
       <li><strong>softmax 的 KV cache 在 1M token 下装不下。</strong>标准注意力把每个历史 token 的 K、V 都存进 cache，单层单份就接近几十 GB 量级；K3 的 <code>max_position_embeddings = 1,048,576</code>，全 softmax 不可行。KDA 用固定大小的递归状态 $S \in \mathbb{R}^{128 \times 128}$（约 32 KB），与序列长度无关。</li>
       <li><strong>vanilla 线性注意力会"记不清"。</strong>纯加性累加 $S_t = S_{t-1} + \phi(k_t)v_t^\top$ 在序列长度超过状态维度时发生 key 碰撞，旧 token 被新写入覆盖。delta rule 的"先擦后写"解决了擦除，但没有显式的时间衰减——旧 token 只在被覆盖时才消失。</li>
       <li><strong>Kimi Linear 的 decay 参数化让 chunkwise 形式里 $1/\Gamma$ 无界。</strong>Kimi Linear 用 negative-softplus 把 log-decay 映射到 $(-\infty, 0)$，$\alpha$ 可任意接近 0，累积衰减 $\Gamma$ 可任意接近 0，倒数 $1/\Gamma$ 无界，BF16 会溢出。于是 chunkwise 形式的对角 tile 不得不走逐位置对计算，不能用 Tensor Core。</li>
     </ul>
 
-    <h2>核心直觉</h2>
+    <h2>3. 核心直觉</h2>
     <ul>
       <li><strong>三步更新：先衰减、再擦除、再写入。</strong>每步先把旧状态 $S_{t-1}$ 按通道乘 $\alpha_t$ 衰减，再用 $I - \beta_t k_t k_t^\top$ 在 $k_t$ 方向擦除，最后加 $\beta_t k_t v_t^\top$ 写入新值。$\alpha_t$ 是<strong>每通道一个独立衰减率</strong>，$\beta_t$ 是<strong>标量写入强度</strong>，职责不同。</li>
       <li><strong>K3 的关键改动：scaled sigmoid 限定 log-decay 下界。</strong>把 decay logit $z$ 经 $g = g_{\min}\mathrm{Sigmoid}(e^A z)$ 映射到 $(g_{\min}, 0) = (-5, 0)$，于是 $\alpha = e^g \in (e^{-5}, 1) \approx (0.0067, 1)$。每个通道的最小留存率被钳在 $e^{-5}$，不会任意接近 0。代价是 KDA 无法"彻底遗忘"——最多遗忘到 $e^{-5}$。</li>
@@ -65,9 +65,9 @@
       <li><strong>K3 不全部用 KDA。</strong>93 层 = 69 KDA + 24 Gated MLA，3:1 交替，最后两层均为 Gated MLA。KDA 负责位置敏感 + 近因混合，MLA 负责全局内容交互。</li>
     </ul>
 
-    <h2>关键结论与边界</h2>
+    <h2>4. 关键结论与边界</h2>
     <ul>
-      <li><strong>KDA ≠ DeltaNet。</strong>KDA 在 DeltaNet 基础上多了 channel-wise forget gate、lower-bounded decay、full-rank gate 三项。forget gate 在 delta 更新之前先衰减（由 Eq.1 的乘法顺序决定）。</li>
+      <li><strong>KDA $\neq$ DeltaNet。</strong>KDA 在 DeltaNet 基础上多了 channel-wise forget gate、lower-bounded decay、full-rank gate 三项。forget gate 在 delta 更新之前先衰减（由 Eq.1 的乘法顺序决定）。</li>
       <li><strong>K3 的 lower-bound 与 Kimi Linear 的 negative-softplus 不等价。</strong>前者 $g \in (-5, 0)$ 有下界、对角 tile 用 Tensor Core；后者 $g \in (-\infty, 0)$ 无下界、对角 tile 走 position-pair。这是 K3 相对 Kimi Linear 的关键改动。</li>
       <li><strong>KDA 不解决全局内容交互。</strong>任意两个远距离 token 的直接交互由 Gated MLA 负责（每 4 层一次）。KDA 也不负责跨设备状态同步（KCP）和 kernel 调度（FlashKDA），这些是 §5.1 的工程实现。</li>
       <li><strong>lower-bound 收益的前提是 $g_{\min}=-5$、tile=16、BF16 同时满足。</strong>三者同时满足时 $1/\Gamma < e^{80}$ 落在 BF16 范围内。若 $g_{\min}$ 更小或 tile 更大，$1/\Gamma$ 可能溢出，退回 Kimi Linear 的 position-pair 路径；若用 FP32 训练，negative-softplus 也能用但成本更高。</li>

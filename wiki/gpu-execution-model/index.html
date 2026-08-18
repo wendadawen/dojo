@@ -579,6 +579,7 @@
       border: none;
     }
     .learning-goals ul,
+    .learning-goals ol,
     .misconceptions ul { margin-bottom: 0; }
     .diagram {
       font-family: var(--font-mono);
@@ -590,6 +591,42 @@
       line-height: 1.5;
       margin: 1.5rem 0;
     }
+
+    /* ============ HTML 结构流程图 ============ */
+    .flow {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      background: var(--bg-code);
+      padding: 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      line-height: 1.6;
+      margin: 1.5rem 0;
+    }
+    .flow-title { font-weight: 600; color: var(--text); margin: 0 0 0.6rem; }
+    .flow-row {
+      display: flex; align-items: center; flex-wrap: wrap;
+      gap: 0.35rem 0.5rem; margin: 0.45rem 0;
+    }
+    .flow-node {
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 0.3rem 0.6rem; background: var(--bg);
+    }
+    .flow-node.soft { border-style: dashed; background: transparent; }
+    .flow-node .flow-sub {
+      display: block; font-size: 0.85em;
+      color: var(--text-light); font-weight: 400;
+    }
+    .flow-tag { font-weight: 600; color: var(--text-light); white-space: nowrap; }
+    .flow-arrow { color: var(--text-muted); white-space: nowrap; }
+    .flow-gap { display: inline-block; width: 6.5em; }
+    .flow-note { color: var(--text-light); margin: 0.35rem 0; }
+
+    /* ============ 章节问题列表 ============ */
+    ol.chapter-questions { margin-bottom: var(--space-paragraph); }
+    ol.chapter-questions > li { margin-bottom: 1rem; }
+    ol.chapter-questions > li > p { margin-bottom: 0.5rem; }
+    ol.chapter-questions > li > details { margin: 0.5rem 0 0; }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
       .context-label { margin-top: 0.4rem; }
@@ -664,14 +701,44 @@
 <p>本页约定：<em>kernel</em> 指「在 GPU 上由大量线程并行执行的一段函数」，这是 CUDA 的用法，和操作系统内核（OS kernel）只是同名，没有任何关系。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>一个 kernel 从启动到跑完经过哪些层级？为什么说正在运行的 kernel 不会被打断？</li>
-    <li>为什么矩阵乘（GEMM）要切成 tile 来算？为什么输入变长只是 tile 变多、单个 tile 不会变大？</li>
-    <li>启动一个 kernel 有哪些开销？persistent kernel 和 CUDA Graph 各消除哪一部分？</li>
-    <li>CTA cluster、DSMEM、TMA、warp specialization 各自解决了什么瓶颈？</li>
-    <li>两个任务共享一张 GPU 时，stream 优先级、MPS、MIG、Green Context 各自能做什么、不能做什么？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>一个 kernel 从启动到跑完经过哪些层级？为什么说正在运行的 kernel 不会被打断？</p>
+      <details>
+        <summary>解答：提交、分发、驻留、跑完释放</summary>
+        <p>CPU 把 kernel 提交到一个 stream（命令队列），硬件分发器把 grid 拆成一个个 CTA 放到有空位的 SM 上，SM 内以 warp 为单位发射指令，grid 里全部 CTA 跑完后 kernel 结束、SM 空出。CTA 一旦被放到 SM 上就运行到完成才释放，CUDA 不提供用户可控的中途打断；stream 优先级也只是调度提示，不抢占已运行的工作。完整论证见「2. kernel 是怎么跑起来的：线程、warp、CTA 与 stream」。</p>
+      </details>
+    </li>
+    <li>
+      <p>为什么矩阵乘（GEMM）要切成 tile 来算？为什么输入变长只是 tile 变多、单个 tile 不会变大？</p>
+      <details>
+        <summary>解答：容量定尺寸，长度定数量</summary>
+        <p>切 tile 让搬进 SM 高速存储的数据被反复复用，显著减少从远处内存的读取次数；tile 越大搬运越省，但 tile 必须连同缓冲整个放进 shared memory，其容量（H100 单 CTA 上限 227KB）加上数据类型与缓冲策略共同决定了 tile 尺寸是固定值，与输入总规模无关。因此输入变长只增加 tile 的数量，单个 tile 的搬运量与计算量不变。完整论证见「3. 为什么矩阵乘要切成 tile：一次能搬多少数据说了算」。</p>
+      </details>
+    </li>
+    <li>
+      <p>启动一个 kernel 有哪些开销？persistent kernel 和 CUDA Graph 各消除哪一部分？</p>
+      <details>
+        <summary>解答：一个摊启动，一个砍提交</summary>
+        <p>启动开销分两侧：CPU 侧逐次"准备参数、提交到 stream"的微秒级流程，GPU 侧 grid 的分发与收尾。persistent kernel 只启动一次、在内部循环领任务，把启动开销从每任务一次摊成全程一次；CUDA Graph 把一串 kernel 录制成图、整体重放，消除逐个 kernel 的 CPU 提交开销。代价分别是常驻占 SM 与形状必须固定。完整论证见「5. 反复启动太贵：persistent kernel 与 CUDA Graph」。</p>
+      </details>
+    </li>
+    <li>
+      <p>CTA cluster、DSMEM、TMA、warp specialization 各自解决了什么瓶颈？</p>
+      <details>
+        <summary>解答：搬运占线程、搬算不重叠、跨车间绕远路</summary>
+        <p>TMA 是异步拷贝引擎，让整块搬运不再占用计算线程；warp specialization 让 producer warp 与 consumer warp 分工，组成搬运与计算的流水线；CTA cluster 把最多 8 个 CTA 共同调度到同一组相邻 SM，DSMEM 让它们直接读写彼此的 shared memory，免去绕行全局内存。完整论证见「4. Hopper 的协作工具箱：TMA、warp 分工与 CTA cluster」。</p>
+      </details>
+    </li>
+    <li>
+      <p>两个任务共享一张 GPU 时，stream 优先级、MPS、MIG、Green Context 各自能做什么、不能做什么？</p>
+      <details>
+        <summary>解答：四种机制都缺运行期细粒度重分配</summary>
+        <p>stream 优先级只是"下一个空位给谁"的提示，不抢占已运行的 kernel；MPS 让多进程 kernel 真并发，但不为客户端预留资源；MIG 提供硬件级隔离，但只有固定档位、改配置要停负载；Green Context 在进程内按 SM 圈地，但分区创建后固定。四种机制没有一种能在 kernel 运行期间以微秒级粒度重新分配 SM。完整论证见「6. 分一张卡的四种机制：能力边界对照」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
@@ -683,10 +750,10 @@
 </section>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：NVIDIA 官方文档与白皮书——CUDA C++ Programming Guide、Hopper Tuning Guide、H100 架构白皮书、CUDA Driver API（stream 优先级 / Green Context）、MPS 与 MIG 官方文档。正文中的 [C1]–[C16]、[N1]–[N8] 编号在文末「来源与教学说明」逐条对应。</p>
+<p><b>主要依据</b>：NVIDIA 官方文档与白皮书——CUDA C++ Programming Guide、Hopper Tuning Guide、H100 架构白皮书、CUDA Driver API（stream 优先级 / Green Context）、MPS 与 MIG 官方文档。正文中的 [C1]–[C16]、[N1]–[N8] 编号在文末「来源与范围说明」逐条对应。</p>
 </blockquote>
 
-<h2 id="hardware">先认识硬件：一块 GPU 里有什么</h2>
+<h2 id="hardware">1. 先认识硬件：一块 GPU 里有什么</h2>
 
 <p>要知道「小活要等多久」，先得知道大活跑在什么东西上面。一块 GPU 拆开看，真正需要记住的只有两类部件：<strong>计算单元</strong>和<strong>内存</strong>。</p>
 
@@ -701,28 +768,46 @@
   <li><strong>HBM 全局内存</strong>：GPU 板载主存（H100 用的是 HBM3，第三代高带宽显存），H100 为 80GB，带宽 3.35 TB/s [C5][N1]。所有输入数据一开始都躺在这里。</li>
 </ul>
 
-<pre class="diagram">数据住在哪里、离计算多远（H100，数字为官方规格 [N1][N2]）：
-
-  HBM3 全局内存   80 GB · 3.35 TB/s —— 输入数据的家
-       │（经 L2 中转）
-  L2 缓存         50 MB —— 全卡 132 块 SM 共享
-       │
-  SM 0 · SM 1 · …… · SM 131 —— 每块 SM 内部：
-     228 KB shared memory + 寄存器 + 4 个 Tensor Core + 通用计算单元
-
-  规则：数据必须搬进 SM 内部（shared memory / 寄存器）才能参与计算</pre>
+<div class="flow">
+  <div class="flow-title">数据住在哪里、离计算多远（H100，数字为官方规格 [N1][N2]）</div>
+  <div class="flow-row">
+    <span class="flow-node">HBM3 全局内存：80 GB · 3.35 TB/s（输入数据的家）</span>
+  </div>
+  <div class="flow-arrow">↓ 经 L2 中转</div>
+  <div class="flow-row">
+    <span class="flow-node">L2 缓存：50 MB（全卡 132 块 SM 共享）</span>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-row">
+    <span class="flow-node">SM 0</span><span class="flow-node">SM 1</span><span class="flow-note">……</span><span class="flow-node">SM 131</span>
+  </div>
+  <div class="flow-note">每块 SM 内部：228 KB shared memory + 寄存器 + 4 个 Tensor Core + 通用计算单元。</div>
+  <div class="flow-note">规则：数据必须搬进 SM 内部（shared memory / 寄存器）才能参与计算。</div>
+</div>
 
 <p>为什么分层？因为「搬数据」比「算数据」贵。HBM 有 80GB 但隔着整个芯片；shared memory 就在车间里，却只有 228KB。一个计算想跑快，就要尽量少从远处搬东西、搬来一次用多次。<strong>这条规则会在第 3 章直接决定 tile 的尺寸</strong>。</p>
 
 <p>回到贯穿例子：大活和小活的输入矩阵，此刻都躺在 80GB 的 HBM 里。它们要变成结果，都得先被搬到某块 SM 的 228KB 小柜子里。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>不看正文，说出 SM、Tensor Core、shared memory、L2、HBM 各是什么、谁共享谁独占。</li>
-  <li>为什么 80GB 的输入不能「全搬上来慢慢算」？用 228KB 与 80GB 两个数字说明。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>不看正文，说出 SM、Tensor Core、shared memory、L2、HBM 各是什么、谁共享谁独占。</p>
+    <details>
+      <summary>解答：两级独占，两级共享</summary>
+      <p>SM（流式多处理器）是 GPU 的计算单元，一块 H100 SXM5 上有 132 块；Tensor Core 是 SM 内专做矩阵乘加的单元，每块 SM 4 个。shared memory 是 SM 内部、同车间线程共享的高速存储（H100 每块 SM 228KB），寄存器则是线程私有；L2 缓存由全卡 132 块 SM 共享（50MB）；HBM 是全卡共享的板载主存（80GB，3.35 TB/s）。越靠近 SM 越快越小。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 80GB 的输入不能"全搬上来慢慢算"？用 228KB 与 80GB 两个数字说明。</p>
+    <details>
+      <summary>解答：容量差约五个数量级</summary>
+      <p>数据必须搬进 SM 内部的 shared memory 或寄存器才能参与计算，而每块 SM 的高速存储只有 228KB（单个 CTA 上限 227KB），与 HBM 的 80GB 相差约五个数量级，一次全搬物理上不可能。计算只能分批进行：每次搬一小块进 SM 并反复使用，这也是"搬一次、用多次"成为优化主线的根源。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="launch">kernel 是怎么跑起来的：线程、warp、CTA 与 stream</h2>
+<h2 id="launch">2. kernel 是怎么跑起来的：线程、warp、CTA 与 stream</h2>
 
 <p>上一章是静态的硬件。这一章回答动态的问题：CPU 上一句「启动」，怎么变成 132 块 SM 上的千军万马？</p>
 
@@ -735,20 +820,24 @@
 
 <p>CTA 内部，SM 不是逐个线程调度，而是每 <strong>32 个线程组成一个 warp</strong>，以 warp 为单位发射指令 [C2][N3]——同一 warp 的 32 个线程齐步走，执行同一条指令、处理各自的数据。一块 SM 上可以同时常驻最多 64 个 warp [C2]，它们轮流占用计算单元：一个 warp 在等数据时，另一个 warp 立即补上。这就是 GPU 隐藏搬运延迟的基本手段，叫「用并行换等待」。</p>
 
-<pre class="diagram">一次 kernel 启动的旅程：
-
-  CPU                                    GPU
-  程序调用 kernel
-     │  ① 提交到一个 stream（命令队列，同一队列内严格按提交顺序执行 [C4]）
-     ▼
-  stream ─────────────►  ② 硬件分发器把 grid 拆成一个个 CTA，
-                            哪块 SM 有空位就放哪块
-                            ┌──────┬──────┬──────────┐
-                            │ SM 0 │ SM 1 │ …… SM 131│
-                            └──────┴──────┴──────────┘
-                            ③ 每块 SM 内，warp 调度器每周期
-                               挑选一个就绪的 warp 发射指令
-  ④ grid 里所有 CTA 全部跑完，kernel 结束，SM 空出</pre>
+<div class="flow">
+  <div class="flow-title">一次 kernel 启动的旅程</div>
+  <div class="flow-row">
+    <span class="flow-tag">CPU</span>
+    <span class="flow-node">程序调用 kernel</span>
+    <span class="flow-arrow">→ ① 提交到一个 stream（命令队列，同一队列内严格按提交顺序执行 [C4]）</span>
+  </div>
+  <div class="flow-row">
+    <span class="flow-tag">GPU</span>
+    <span class="flow-node">stream</span>
+    <span class="flow-arrow">→ ② 硬件分发器把 grid 拆成一个个 CTA，哪块 SM 有空位就放哪块</span>
+  </div>
+  <div class="flow-row">
+    <span class="flow-node">SM 0</span><span class="flow-node">SM 1</span><span class="flow-note">……</span><span class="flow-node">SM 131</span>
+  </div>
+  <div class="flow-note">③ 每块 SM 内，warp 调度器每周期挑选一个就绪的 warp 发射指令。</div>
+  <div class="flow-note">④ grid 里所有 CTA 全部跑完，kernel 结束，SM 空出。</div>
+</div>
 
 <p>现在说出本章最重要的事实：<strong>一个 CTA 被放到 SM 上之后，会运行到完成才释放这块 SM；CUDA 不提供任何让用户打断运行中 kernel 的接口</strong> [C3]。官方文档在讲 stream 优先级时把这一点写得很直白：优先级只是「尽量先调度高优先级工作」的提示，「不会抢占已经在运行的工作，也不对执行顺序提供任何功能性保证」（CUDA Driver API，cuStreamCreateWithPriority，原文引用见第 6 章）[C11]。</p>
 
@@ -756,22 +845,40 @@
 
 <p>贯穿例子推进：大活的 grid 有几百个 CTA，一波波铺满了 132 块 SM；小活的 CTA 此刻提交到另一个 stream，只能排队等空位。<strong>小活要等多久，取决于大活的 CTA 什么时候跑完</strong>——这就是开头问题的第一层答案，也是「队头阻塞」（head-of-line blocking，即队列前面的长任务挡住后面的短任务，使短任务即使已就绪也无法开始）的来源。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>按顺序说出一个 kernel 从 CPU 提交到执行完成经过的四个环节。</li>
-  <li>判断并解释：把小活的 stream 优先级调到最高，能不能打断正在运行的大活？</li>
-  <li>warp 和 CTA 的区别是什么？谁是 SM 内调度指令的单位，谁是驻留 SM 的单位？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>按顺序说出一个 kernel 从 CPU 提交到执行完成经过的四个环节。</p>
+    <details>
+      <summary>解答：提交、分发、发射、收尾</summary>
+      <p>① 程序把 kernel 提交到一个 stream，同一队列内严格按提交顺序执行；② 硬件分发器把 grid 拆成一个个 CTA，放到有空位的 SM 上；③ 每块 SM 内的 warp 调度器每周期挑选就绪的 warp 发射指令；④ grid 里所有 CTA 全部跑完，kernel 结束、SM 空出。</p>
+    </details>
+  </li>
+  <li>
+    <p>判断并解释：把小活的 stream 优先级调到最高，能不能打断正在运行的大活？</p>
+    <details>
+      <summary>解答：不能，优先级只是调度提示</summary>
+      <p>不能。官方文档明确 stream 优先级只是"让高优先级工作在可能时被优先调度"的提示，不会抢占已经在运行的工作，也不对执行顺序提供任何功能性保证。大活的 CTA 已经铺在 SM 上并会运行到完成，小活优先级再高也只能等空位。</p>
+    </details>
+  </li>
+  <li>
+    <p>warp 和 CTA 的区别是什么？谁是 SM 内调度指令的单位，谁是驻留 SM 的单位？</p>
+    <details>
+      <summary>解答：发射单位对驻留单位</summary>
+      <p>warp 是 32 个线程的编组，是 SM 内 warp 调度器每周期发射指令的单位；CTA（线程块）是最多 1024 个线程的集合，整体驻留在同一块 SM 上并独占分给它的那份 shared memory，是驻留 SM 的单位。一个 CTA 内含多个 warp，一块 SM 可同时常驻多个 warp 并让它们轮流占用计算单元。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="tile">为什么矩阵乘要切成 tile：一次能搬多少数据说了算</h2>
+<h2 id="tile">3. 为什么矩阵乘要切成 tile：一次能搬多少数据说了算</h2>
 
 <p>上一章说计算被切成 CTA。但一个 CTA 负责的那块矩阵乘，内部还要再切一层，切成 <strong>tile</strong>。为什么？这一章用一个可以手算的例子给出答案，并得出全页最关键的结构性结论：<strong>tile 的尺寸由硬件容量决定，输入变长只是 tile 变多</strong>。</p>
 
 <p>先复习矩阵乘的形式。$C = A \times B$，其中 $A$ 是 $M \times K$、$B$ 是 $K \times N$、$C$ 是 $M \times N$，每个输出元素是 $C[i][j] = \sum_{k=1}^{K} A[i][k] \cdot B[k][j]$——$A$ 的第 $i$ 行与 $B$ 的第 $j$ 列逐元素相乘再求和，共 $K$ 次乘加。</p>
 
-<h3 id="tile-why">不切 tile 的代价：手算一遍</h3>
+<h3 id="tile-why">3.1 不切 tile 的代价：手算一遍</h3>
 
-<p>教学示例。取最小的可算规模：$M = N = K = 4$，两个 $4 \times 4$ 矩阵相乘。数一数「从内存读数据」的次数（这是第 1 章说的贵操作）。</p>
+<p>构造示例。取最小的可算规模：$M = N = K = 4$，两个 $4 \times 4$ 矩阵相乘。数一数「从内存读数据」的次数（这是第 1 章说的贵操作）。</p>
 
 <p>不切 tile 的算法：算每个 $C[i][j]$ 时，读 $A$ 的第 $i$ 行（4 个数）和 $B$ 的第 $j$ 列（4 个数）。于是 $A$ 的每个元素被它所在行的 4 个输出各读一次，共被读 $4$ 次；$A$ 有 16 个元素，总读取 $16 \times 4 = 64$ 次。$B$ 同理也是 64 次。合计 <strong>128 次读取</strong>。</p>
 
@@ -779,7 +886,7 @@
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>算法（$4\times4$ 矩阵，教学示例）</th><th>每个 $A$ 元素被读次数</th><th>$A$ 总读取</th><th>$B$ 总读取</th><th>合计读取</th></tr></thead>
+<thead><tr><th>算法（$4\times4$ 矩阵，构造示例）</th><th>每个 $A$ 元素被读次数</th><th>$A$ 总读取</th><th>$B$ 总读取</th><th>合计读取</th></tr></thead>
 <tbody>
 <tr><td>不切 tile</td><td>$N = 4$</td><td>$16 \times 4 = 64$</td><td>64</td><td>128</td></tr>
 <tr class="highlight-row"><td>切 $2\times2$ tile</td><td>$N / T = 4 / 2 = 2$</td><td>$16 \times 2 = 32$</td><td>32</td><td>64</td></tr>
@@ -790,17 +897,17 @@
 <p>读取次数从 128 降到 64，省了一半。一般规律是：tile 边长为 $T$ 时，每个 $A$ 元素被读 $N/T$ 次——<strong>tile 越大，搬运越省</strong> [F1]。</p>
 
 <details>
-<summary>补充：4×4 例子逐 tile 的读取清单</summary>
+<summary>补充：$4\times4$ 例子逐 tile 的读取清单</summary>
 <p>切 $2\times2$ tile 后，$C$ 有 4 个输出 tile：$C_{11}, C_{12}, C_{21}, C_{22}$。每个输出 tile 沿 $K$ 方向要 2 步：$C_{11}$ 用 $(A_{11},B_{11})$ 再 $(A_{12},B_{21})$；$C_{12}$ 用 $(A_{11},B_{12})$ 再 $(A_{12},B_{22})$；$C_{21}$、$C_{22}$ 类似。$A_{11}$ 出现在 $C_{11}$ 和 $C_{12}$ 的计算中，共 2 次，且每次是整块搬入后块内 4 个元素都被复用——所以每个元素的「从内存读取」只有 2 次，而不是 4 次或 8 次。四个 $A$ 小块各被读 2 次，每次 4 个元素：$4 \times 2 \times 4 = 32$ 次，与正文一致。</p>
 </details>
 
-<h3 id="tile-size">tile 能做多大：228KB 说了算</h3>
+<h3 id="tile-size">3.2 tile 能做多大：228KB 说了算</h3>
 
-<p>既然 tile 越大越省，为什么不把 tile 做成 1000×1000？因为复用的前提是 tile 能整个搬进 SM 内的高速存储，而它的容量是硬件固定的。教学示例：用 fp16（每个数 2 字节）算，一个 $128 \times 128$ 的 $A$ tile 占 $128 \times 128 \times 2 = 32768$ 字节 $= 32$KB；$B$ tile 同样 32KB；为了不等待，通常要双缓冲（搬下一块的同时算这一块），搬运缓冲翻倍约 128KB；再加输出累加等开销，总量在百 KB 量级——已经逼近单 CTA 227KB 的上限 [C6][N2]。tile 再大就放不进车间了。</p>
+<p>既然 tile 越大越省，为什么不把 tile 做成 1000×1000？因为复用的前提是 tile 能整个搬进 SM 内的高速存储，而它的容量是硬件固定的。构造示例：用 fp16（每个数 2 字节）算，一个 $128 \times 128$ 的 $A$ tile 占 $128 \times 128 \times 2 = 32768$ 字节 $= 32$KB；$B$ tile 同样 32KB；为了不等待，通常要双缓冲（搬下一块的同时算这一块），搬运缓冲翻倍约 128KB；再加输出累加等开销，总量在百 KB 量级——已经逼近单 CTA 227KB 的上限 [C6][N2]。tile 再大就放不进车间了。</p>
 
 <p>所以 tile 的尺寸（实际高性能 GEMM 常用 $128 \times 128$ 这类档位）是<strong>由 shared memory 容量、数据类型和缓冲策略共同决定的固定值</strong>，跟你要算的矩阵总共有多大毫无关系。</p>
 
-<h3 id="tile-more">输入变长时，什么变、什么不变</h3>
+<h3 id="tile-more">3.3 输入变长时，什么变、什么不变</h3>
 
 <p>把例子的 $M$ 从 8192 加倍到 16384（教学构造数字），tile 边长仍是 128。行方向的 tile 数从 $8192 / 128 = 64$ 变成 $16384 / 128 = 128$——<strong>tile 数量翻倍，每个 tile 的搬运量和计算量完全不变</strong>。整活的耗时近似翻倍，但那是「同样的活干了两遍」，不是「每个活变大了」。</p>
 
@@ -808,35 +915,60 @@
 
 <p>贯穿例子推进：大活不是一个「2 毫秒的实心疙瘩」，而是几千个 tile 排成的长队；小活只有几个 tile。两者共用同一种刻度。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>复算：$4 \times 4$ 矩阵乘，切 $2 \times 2$ tile 后 $A$ 的总读取次数为什么是 32 而不是 64？</li>
-  <li>为什么 tile 不能做到 $512 \times 512$？用 shared memory 容量回答。</li>
-  <li>输入长度变成 4 倍，tile 数量怎么变？单个 tile 的时间怎么变？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>复算：$4 \times 4$ 矩阵乘，切 $2 \times 2$ tile 后 $A$ 的总读取次数为什么是 32 而不是 64？</p>
+    <details>
+      <summary>解答：每个元素只被读 $N/T=2$ 次</summary>
+      <p>切 $2\times2$ tile 后，$A$ 的每个小块被 $N/T=4/2=2$ 个输出 tile 使用，且每次整块搬入 SM 后块内 4 个元素都被复用，所以每个元素从内存读取 2 次；$A$ 共 16 个元素，总读取 $16\times 2=32$ 次。不切 tile 时每个元素被所在行的 4 个输出各读一次，共 64 次。差别来自"搬进 SM 的数据被反复使用"。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 tile 不能做到 $512 \times 512$？用 shared memory 容量回答。</p>
+    <details>
+      <summary>解答：一块就超容量上限</summary>
+      <p>fp16 下一个 $512\times512$ 的 $A$ tile 占 $512\times512\times2=512$KB，仅 $A$ 一块就远超单 CTA 可用的 227KB shared memory 上限，还未计 $B$ tile、双缓冲与输出累加。tile 必须连同这些开销一起放进 SM 高速存储，因此尺寸由容量封顶；$128\times128$ 一档正是逼近上限的常用值。</p>
+    </details>
+  </li>
+  <li>
+    <p>输入长度变成 4 倍，tile 数量怎么变？单个 tile 的时间怎么变？</p>
+    <details>
+      <summary>解答：数量变 4 倍，时间不变</summary>
+      <p>tile 边长固定（如 128），行方向的 tile 数随输入长度线性增长：长度变 4 倍，tile 数量变 4 倍。单个 tile 的搬运量与计算量只由 tile 尺寸决定，与输入总长度无关，因此单个 tile 的耗时不变——变长的是队伍，不是每个队员。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="hopper-tools">Hopper 的协作工具箱：TMA、warp 分工与 CTA cluster</h2>
+<h2 id="hopper-tools">4. Hopper 的协作工具箱：TMA、warp 分工与 CTA cluster</h2>
 
 <p>第 3 章留下一个工程问题：一个 tile 的生命周期是「搬进车间 → 算 → 搬下一块」。如果搬的时候算闲着、算的时候搬闲着，一半时间就浪费了。要让搬和算重叠起来，还需要三件工具。这一章讲的都是 Hopper 架构（H100 这一代）引入的机制 [C7][C8][C9]。</p>
 
-<h3 id="tma">TMA：把搬运从计算线程手里解放出来</h3>
+<h3 id="tma">4.1 TMA：把搬运从计算线程手里解放出来</h3>
 
 <p>在更早的 GPU 上，搬一个 tile 要靠计算线程自己一条一条指令地搬，搬运期间这些线程干不了别的。<strong>TMA</strong>（Tensor Memory Accelerator）是一个专门的异步拷贝引擎：只需要<strong>一个线程</strong>向它发出一条「把这整块张量从全局内存搬到 shared memory」的指令，引擎就在后台完成全部搬运，其他线程继续做计算，等数据到了再取 [C7]。它支持 1 到 5 维的张量块，也能在相邻 SM 的 shared memory 之间直接传输。</p>
 
-<h3 id="warp-spec">warp specialization：搬运工与计算工的分工流水线</h3>
+<h3 id="warp-spec">4.2 warp specialization：搬运工与计算工的分工流水线</h3>
 
 <p>有了异步搬运，就可以让一个 CTA 内的 warp 分工种：少数 warp 专职当 <strong>producer</strong>（发起 TMA 搬运、等数据到、通知大家），其余 warp 专职当 <strong>consumer</strong>（只负责算）。这就是 <strong>warp specialization</strong> [C9]。它的效果是一条流水线：</p>
 
-<pre class="diagram">tile 流水线（教学示意，时间向右）：
-
-  producer warp：  搬 tile 1 ─┬─ 搬 tile 2 ─┬─ 搬 tile 3 ─┬─ 搬 tile 4
-  consumer warp：             └─ 算 tile 1 ─┴─ 算 tile 2 ─┴─ 算 tile 3
-                              ▲
-                  算 tile t 的同时，tile t+1 已经在路上</pre>
+<div class="flow">
+  <div class="flow-title">tile 流水线（教学示意，时间向右）</div>
+  <div class="flow-row">
+    <span class="flow-tag">producer warp</span>
+    <span class="flow-node">搬 tile 1</span><span class="flow-node">搬 tile 2</span><span class="flow-node">搬 tile 3</span><span class="flow-node">搬 tile 4</span>
+  </div>
+  <div class="flow-row">
+    <span class="flow-tag">consumer warp</span>
+    <span class="flow-gap"></span>
+    <span class="flow-node">算 tile 1</span><span class="flow-node">算 tile 2</span><span class="flow-node">算 tile 3</span>
+  </div>
+  <div class="flow-note">算 tile $t$ 的同时，tile $t+1$ 已经在路上。</div>
+</div>
 
 <p>教学解释。这条流水线只说明「搬与算在时间上重叠」这一层关系。真实的实现还要处理同步（谁通知谁数据到了）、多级缓冲等细节，本页省略；正式机制以官方文档的 TMA 与 pipeline 章节为准 [C7]。</p>
 
-<h3 id="cluster">CTA cluster 与 DSMEM：相邻车间直接递东西</h3>
+<h3 id="cluster">4.3 CTA cluster 与 DSMEM：相邻车间直接递东西</h3>
 
 <p>第 2 章说过，CTA 是协作的天花板：不同 CTA 在编程模型里互相看不见对方的车间内部。Hopper 打破了这堵墙——可以把最多 8 个 CTA 声明为一个 <strong>CTA cluster</strong>（H100 上通过显式 opt-in 可以到 16 个，但这是不可移植的特例）[C8][N4]。cluster 内的 CTA 被硬件<strong>共同调度</strong>到同一组相邻的 SM（同一个 GPC——Graphics Processing Cluster，图形处理集群，是 GPU 硬件层级中一组物理相邻的 SM，H100 有 8 个 GPC）上 [C15]，并且可以直接读写彼此 SM 里的 shared memory——这个机制叫 <strong>DSMEM</strong>（Distributed Shared Memory，分布式共享内存）[C8]。</p>
 
@@ -848,25 +980,43 @@
 
 <p>贯穿例子推进：大活内部，tile 一个接一个在流水线上走；小活的 tile 太少（只有几个），流水线刚预热就结束了——小 kernel 天然吃不满硬件，这是它「单位效率低」的另一层原因。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>分别用一句话说出 TMA、warp specialization、DSMEM 各自解决什么瓶颈。</li>
-  <li>cluster 内两个 CTA 交换数据，需要经过 HBM 全局内存吗？</li>
-  <li>cluster 的上限是多少？把上限设大有什么代价？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>分别用一句话说出 TMA、warp specialization、DSMEM 各自解决什么瓶颈。</p>
+    <details>
+      <summary>解答：占线程、闲一半、绕远路</summary>
+      <p>TMA 把整块张量搬运交给专门的异步引擎，解决"搬运占用计算线程"的瓶颈；warp specialization 让搬运 warp 与计算 warp 分工、组成流水线，解决"搬的时候算闲着"的瓶颈；DSMEM 让同一 cluster 内的 CTA 直接读写彼此 SM 的 shared memory，解决"跨 CTA 交换数据要绕行全局内存"的瓶颈。</p>
+    </details>
+  </li>
+  <li>
+    <p>cluster 内两个 CTA 交换数据，需要经过 HBM 全局内存吗？</p>
+    <details>
+      <summary>解答：不需要</summary>
+      <p>cluster 内的 CTA 被硬件共同调度到同一组相邻 SM，通过 DSMEM 直接读写彼此 SM 里的 shared memory，不必写回 HBM 再让对方读。配合 TMA 的组播能力，同一份数据还可以一次发给 cluster 内多个 CTA。</p>
+    </details>
+  </li>
+  <li>
+    <p>cluster 的上限是多少？把上限设大有什么代价？</p>
+    <details>
+      <summary>解答：可移植上限 8，越大同时活跃的独立 block 越少</summary>
+      <p>可移植的 cluster 上限是 8 个 CTA（H100 上显式 opt-in 可以到 16，但属于不可移植的特例）。cluster 越大，GPU 上能同时活跃的独立 block 数可能越少：共同调度要求一组相邻 SM 同时有空位，比找单个空位更苛刻。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="persistent">反复启动太贵：persistent kernel 与 CUDA Graph</h2>
+<h2 id="persistent">5. 反复启动太贵：persistent kernel 与 CUDA Graph</h2>
 
 <p>前几章都在讲一个 kernel 内部怎么跑。这一章换一个角度：如果一个 kernel 本身很小、一天要跑成千上万次，那么「启动」这个动作本身就值得审视。</p>
 
 <p>启动一次 kernel 有两部分开销。CPU 侧：每次启动都要走一遍「准备参数、提交到 stream」的流程，量级是微秒级（<strong>量级说明</strong>：官方文档没有给出单一数字，CUDA Graphs 章节定性指出「当 kernel 又多又小时，逐次启动的开销占比会变得显著」[C10][N8]）。GPU 侧：grid 的 CTA 要被逐波分发到 SM、跑完要收尾。大活跑 2 毫秒，这点开销无所谓；小活本身只要 30 微秒，逐次启动的占比就刺眼了。有两种主流手段把它压掉。</p>
 
-<h3 id="persistent-kernel">persistent kernel：不退出，循环领活</h3>
+<h3 id="persistent-kernel">5.1 persistent kernel：不退出，循环领活</h3>
 
 <p><strong>persistent kernel</strong>（常驻内核）不是一种 CUDA API，而是一种<strong>编程模式</strong>（这一点常被误解）：kernel 只启动一次，启动后不退出，在 kernel 内部写一个循环，不断从全局内存的任务队列里领取下一个任务、执行、再领，直到收到退出信号。启动开销从「每任务一次」摊成「全程一次」。</p>
 
 <details class="code-details">
-<summary>伪代码：persistent kernel 的主循环（不是 Python，不可运行）</summary>
+<summary>代码：persistent kernel 的主循环（伪代码，不可运行）</summary>
 <div class="code-block">
 <pre><code class="language-text">输入：全局内存中的任务队列 Q（每个任务描述一组 tile 的输入位置与输出位置）
 状态：本 CTA 长期驻留 SM，不退出
@@ -882,7 +1032,7 @@
 
 <p>代价同样直接，而且是第 2 章事实的推论：<strong>常驻期间，它的 CTA 一直占着 SM，别的 kernel 用不了这些 SM</strong>。常驻 kernel 省下了启动，却把「什么时候让出资源」这个问题从硬件手里拿回到了软件自己手里——这正是它既强大又危险的原因。</p>
 
-<h3 id="cuda-graph">CUDA Graph：录制一次，整体重放</h3>
+<h3 id="cuda-graph">5.2 CUDA Graph：录制一次，整体重放</h3>
 
 <p>另一种手段解决的是 CPU 侧。深度学习的一步推理往往是几十上百个小 kernel 的固定序列。CUDA Graph 允许把这串操作<strong>录制（capture）</strong>成一张图，之后每次执行只需把整张图<strong>重放（replay）</strong>一次提交，消除了逐个 kernel 的 CPU 提交开销 [C10]。</p>
 
@@ -892,26 +1042,44 @@
 
 <p>贯穿例子推进：小活每 30 微秒来一次。若每次单独启动，开销占比高；若把它录进 CUDA Graph 或交给常驻 kernel 执行，启动开销被压掉——但前提是大活愿意让出 SM。绕了一圈，问题又回到了资源分配。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>persistent kernel 和 CUDA Graph 各消除哪一部分启动开销？各付什么代价？</li>
-  <li>判断：一个「每一步输入长度都不同」的循环，能不能整体录进一张 CUDA Graph？为什么？</li>
-  <li>为什么说 persistent kernel 把资源让出的责任从硬件拿回了软件？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>persistent kernel 和 CUDA Graph 各消除哪一部分启动开销？各付什么代价？</p>
+    <details>
+      <summary>解答：一个摊 GPU 侧启动，一个砍 CPU 侧提交</summary>
+      <p>persistent kernel 只启动一次、在内部循环领任务，把逐任务的启动开销摊成全程一次，代价是常驻期间它的 CTA 一直占着 SM，别的 kernel 用不了这些 SM。CUDA Graph 把一串 kernel 录制成图、整体重放，消除逐个 kernel 的 CPU 提交开销，代价是图内 kernel 的数量、形状、内存地址在捕获时固定，形状一变就得换图或重录。</p>
+    </details>
+  </li>
+  <li>
+    <p>判断：一个"每一步输入长度都不同"的循环，能不能整体录进一张 CUDA Graph？为什么？</p>
+    <details>
+      <summary>解答：不能，形状捕获即固定</summary>
+      <p>不能。CUDA Graph 在捕获时就固定了图内 kernel 的数量、形状与内存地址，输入长度每步都不同意味着形状每步都变，一张图无法覆盖；只能逐步重新捕获，失去整体重放的意义。CUDA Graph 天然适合形状固定的循环体，例如固定 batch 的逐字解码。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么说 persistent kernel 把资源让出的责任从硬件拿回了软件？</p>
+    <details>
+      <summary>解答：常驻不退出，让出靠软件安排</summary>
+      <p>普通 kernel 由硬件决定 CTA 何时跑完并释放 SM，调度权在硬件；persistent kernel 启动后不退出，其 CTA 长期占着 SM，"什么时候让出、让出多少"不再有硬件机制强制，而取决于 kernel 内部循环何时结束或是否检查让出条件。安排不当就会长时间挤占其他 kernel，因此它既强大又危险。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="sharing">分一张卡的四种机制：能力边界对照</h2>
+<h2 id="sharing">6. 分一张卡的四种机制：能力边界对照</h2>
 
 <p>最后一章回答开头问题的完整版：大活小活要共享一张 GPU，系统层面到底有哪些分法？NVIDIA 官方提供四种机制，力度各不相同。逐个看它们<strong>能做什么、不能做什么</strong>——「不能」比「能」更重要。</p>
 
-<h3 id="sharing-stream">stream 优先级：只是提示，不是抢占</h3>
+<h3 id="sharing-stream">6.1 stream 优先级：只是提示，不是抢占</h3>
 
 <p>给不同 stream 设不同优先级（如小活高优先级、大活低优先级）。官方文档的原文语义是：优先级「提供一个提示，让高优先级的工作在可能时被优先调度，但<strong>不会抢占已经在运行的工作，也不对执行顺序提供任何功能性保证</strong>」（CUDA Driver API，cuStreamCreateWithPriority）[C11]。翻译过来：它能决定「下一个空位给谁」，不能决定「现在让谁停下」。大活的 CTA 已经铺在 SM 上，小活优先级再高也得等空位。</p>
 
-<h3 id="sharing-mps">MPS：多进程真并发，但不预留资源</h3>
+<h3 id="sharing-mps">6.2 MPS：多进程真并发，但不预留资源</h3>
 
 <p><strong>MPS</strong>（Multi-Process Service）让多个操作系统进程（各自独立的程序）的 kernel 在同一张卡上真正并发执行 [C12]。它可以给每个客户端设资源限额，但官方文档明确：限额「<strong>不为任何客户端预留专用资源</strong>，只是限制它最多能用多少」，而且「不同客户端的 kernel 可能执行在同一块 SM 上，取决于负载均衡」[C12]。所以 MPS 提供的是「可以挤在一起」，不是「各自圈地」；干扰（缓存竞争、SM 争抢）依旧存在。</p>
 
-<h3 id="sharing-mig">MIG：硬件级隔离，但档位固定、改配置要停负载</h3>
+<h3 id="sharing-mig">6.3 MIG：硬件级隔离，但档位固定、改配置要停负载</h3>
 
 <p><strong>MIG</strong>（Multi-Instance GPU）是最硬的分法：把 GPU 在硬件层切成互相隔离的实例，各自独占 SM、显存和缓存切片。隔离最强，代价是<strong>只有固定档位</strong>。H100 有 7 个可用的 GPU 计算切片（对应 7 个 GPC，另留 1 个 GPC 给管理用）；profile 名称里的数字 <code>g</code> 表示该实例占用的计算切片数，数字后的 GB 表示它独占的显存量，7 个切片用满即整卡 [C13][N5]。H100（80GB）的全部 profile 如下：</p>
 
@@ -931,11 +1099,11 @@
 
 <p>两个任务分一张卡，只能从这张表里挑组合（例如 3g + 4g 正好用满）。负载比例变化时想改配置，需要 GPU 上没有运行中的负载才能重配——它没有时间复用，也没有运行中调整 [C13]。</p>
 
-<h3 id="sharing-green">Green Context：进程内按 SM 圈地，但创建后固定</h3>
+<h3 id="sharing-green">6.4 Green Context：进程内按 SM 圈地，但创建后固定</h3>
 
 <p><strong>Green Context</strong>（CUDA 12.4 引入）在同一个进程内把 SM 集合切成空间分区：往某个 Green Context 的 stream 提交的 kernel，只会落在该分区的 SM 上 [C14]。它比 MIG 细：不需要切显存，粒度是 SM 个数——但 Hopper 上分区必须是 <strong>8 的倍数、最少 8 个 SM</strong> [C14][N6]。两条边界由 API 设计决定：其一，SM 分区在创建 Green Context 时通过 split API 指定，Green Context API 不提供运行期重分区接口，要改变分区需销毁并重建 Green Context，所以运行中的 kernel 期间不能重新划分；其二，「即使两个 Green Context 的 SM 分区互不相交，也<strong>不保证</strong>两者的 kernel 会并发执行或有前进保证」（CUDA Driver API，Green Contexts 章节）[C14]。</p>
 
-<h3 id="sharing-table">对照与归纳</h3>
+<h3 id="sharing-table">6.5 对照与归纳</h3>
 
 <div class="table-scroll">
 <table>
@@ -955,31 +1123,49 @@
 
 <p>本章数字以 H100（Hopper）与 CUDA 12.x 文档为准；跨代际数字（SM 数、分区粒度、MIG 档位）会变，但「无运行期细粒度重分配」这一结构性结论在现有代际上均成立。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>不看对照表，复述四种机制各自「不能做什么」。</li>
-  <li>给定需求「小活必须在 50 微秒内拿到 SM」，判断四种机制谁能给出这个保证，并说明理由。</li>
-  <li>为什么 MIG 的 3g + 4g 组合能「用满整卡」却仍可能浪费？（提示：负载比例随时间变化。）</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>不看对照表，复述四种机制各自"不能做什么"。</p>
+    <details>
+      <summary>解答：不抢占、不预留、不能改、不能重分</summary>
+      <p>stream 优先级不能抢占已经在运行的 kernel，也不对执行顺序提供功能性保证；MPS 不为任何客户端预留专用资源，不同客户端的 kernel 可能落在同一 SM；MIG 只有固定档位，改配置需要 GPU 上没有运行中的负载；Green Context 的 SM 分区创建后固定，kernel 运行期间不能重分区，且不保证两个分区的 kernel 并发执行或有前进保证。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定需求"小活必须在 50 微秒内拿到 SM"，判断四种机制谁能给出这个保证，并说明理由。</p>
+    <details>
+      <summary>解答：四种都给不出</summary>
+      <p>四种机制都给不出这个保证。stream 优先级与 MPS 都依赖"有空位"：挡在大活的 CTA 之后仍要等它运行到完成；MIG 与 Green Context 可以事先圈出互不相干的 SM，但必须在负载到来前配置好——一旦大活已在运行，改 MIG 配置或重建 Green Context 都要求停掉现有负载，做不到运行中的微秒级响应。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 MIG 的 3g + 4g 组合能"用满整卡"却仍可能浪费？（提示：负载比例随时间变化。）</p>
+    <details>
+      <summary>解答：空间切死，比例会漂移</summary>
+      <p>3g + 4g 用满 7 个计算切片，但这是空间上的静态划分：3g 侧拿 3 个切片、4g 侧拿 4 个，运行期不能调整。两阶段负载的比例随时间变化，某段时间一侧排队、另一侧空闲也无法借用，切片被"切死"。这正是空间固定分区"闲时浪费"的来源。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
-<p>[C1] CUDA C++ Programming Guide，Programming Model / Thread Hierarchy（CTA ≤1024 线程、CTA 驻留单 SM）。 [C2] 同指南 Hardware Multithreading / SIMT（warp=32）；Hopper 每 SM 最多 64 warp 见 Hopper Tuning Guide §4.1.1 Occupancy。 [C3] 编程模型语义（CTA 运行至完成）；用户不可抢占由 [C11] 官方语义反推。 [C4] CUDA C++ Programming Guide，Asynchronous Concurrent Execution / Streams。 [C5] NVIDIA H100 Tensor Core GPU Architecture White Paper 及 NVIDIA Hopper Architecture In-Depth（developer.nvidia.com）：132 SM、每 SM 4 个第四代 Tensor Core、50MB L2、80GB HBM3 @ 3.35 TB/s。 [C6][C7][C8][C9] NVIDIA Hopper Tuning Guide §4.1.1–§4.1.3（228KB/227KB shared memory；TMA 异步拷贝与组播；cluster 上限 8、H100 opt-in 16、占用率代价；warp specialization）。 [C10] CUDA C++ Programming Guide，CUDA Graphs。 [C11] CUDA Driver API，cuStreamCreateWithPriority 描述原文。 [C12] NVIDIA MPS 官方文档，Execution Resource Provisioning（「不预留专用资源」「不同客户端 kernel 可落同一 SM」）。 [C13] NVIDIA MIG User Guide 及 NVIDIA vGPU 参考文档 H100 SXM5 表（六档 profile 与实例数；改配置需 GPU 空闲）。 [C14] CUDA Driver API，§Green Contexts（CUDA 12.4+；CC 9.0+ 最小 8、8 的倍数；不保证并发与前进；创建时固定）。 [C15] H100 白皮书（8 GPC 结构）+ Programming Guide（cluster 共同调度）。 [C16] 本文归纳：由 [C11][C12][C13][C14] 合取，正文已标注为推断。</p>
+<h3>论断与来源（C）</h3>
+<p>[C1] CUDA C++ Programming Guide，Programming Model / Thread Hierarchy（CTA $\le 1024$ 线程、CTA 驻留单 SM）。 [C2] 同指南 Hardware Multithreading / SIMT（warp=32）；Hopper 每 SM 最多 64 warp 见 Hopper Tuning Guide §4.1.1 Occupancy。 [C3] 编程模型语义（CTA 运行至完成）；用户不可抢占由 [C11] 官方语义反推。 [C4] CUDA C++ Programming Guide，Asynchronous Concurrent Execution / Streams。 [C5] NVIDIA H100 Tensor Core GPU Architecture White Paper 及 NVIDIA Hopper Architecture In-Depth（developer.nvidia.com）：132 SM、每 SM 4 个第四代 Tensor Core、50MB L2、80GB HBM3 @ 3.35 TB/s。 [C6][C7][C8][C9] NVIDIA Hopper Tuning Guide §4.1.1–§4.1.3（228KB/227KB shared memory；TMA 异步拷贝与组播；cluster 上限 8、H100 opt-in 16、占用率代价；warp specialization）。 [C10] CUDA C++ Programming Guide，CUDA Graphs。 [C11] CUDA Driver API，cuStreamCreateWithPriority 描述原文。 [C12] NVIDIA MPS 官方文档，Execution Resource Provisioning（「不预留专用资源」「不同客户端 kernel 可落同一 SM」）。 [C13] NVIDIA MIG User Guide 及 NVIDIA vGPU 参考文档 H100 SXM5 表（六档 profile 与实例数；改配置需 GPU 空闲）。 [C14] CUDA Driver API，§Green Contexts（CUDA 12.4+；CC 9.0+ 最小 8、8 的倍数；不保证并发与前进；创建时固定）。 [C15] H100 白皮书（8 GPC 结构）+ Programming Guide（cluster 共同调度）。 [C16] 本文归纳：由 [C11][C12][C13][C14] 合取，正文已标注为推断。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p>[F1] tile 化 GEMM 的读取计数（每元素被读 $N/T$ 次）：标准教材推导（如 Kirk &amp; Hwu《Programming Massively Parallel Processors》tiled GEMM 章的同款推导）；本页按教学推导处理，$4\times4$ 例子在正文与折叠块中可完整复算。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>[N1][N2][N3][N4][N5][N6] 与 [C5][C6][C2][C8][C13][C14] 同源，均为 H100 SXM5 / Hopper / CUDA 12.x 条件下的规格数字，跨代际会变。 [N8]「kernel 启动 CPU 侧开销为微秒量级」为工程经验的量级说明，无单一官方数字，页面未给精确值。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <p>开头的「大活约 2 毫秒 / 小活约 30 微秒」为教学构造的整数量级，与 ExpertPlex §4.1 的场景同构但不引用其测量值。$4\times4$ 矩阵乘、$M$ 从 8192 到 16384、fp16 下 $128\times128$ tile 的容量估算，均为便于手算的教学构造，不代表推荐工程参数。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p>「车间」类比只帮助理解 SM 独享 shared memory、数据须搬入才能算这一局部关系；它无法表达 warp 级指令调度、缓存一致性等细节，正式判断以编程模型文档为准。「流水线」示意只说明搬算重叠，不含同步原语细节。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p>本页省略：硬件 CTA 分发器（GigaThread engine）的内部算法（官方未公开，不影响「CTA 跑完才释放」的结论）；TMA descriptor 与 mbarrier 同步细节；cache 命中、带宽竞争与功耗对时间的影响；驱动级时间片（compute preemption，粒度粗且不可编程控制）。这些省略不改变「tile 尺寸由容量决定」「kernel 运行期无用户可控抢占」「四种共享机制无运行期细粒度重分配」三个核心结论；但本页给出的时间量级（tile 时间近似恒定等）是结构性的，不构成任何具体 kernel 的性能预测。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

@@ -580,6 +580,10 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    .learning-goals ol.chapter-questions { margin-bottom: 0; }
+    .chapter-questions li { margin-bottom: 1.2rem; }
+    .chapter-questions li:last-child { margin-bottom: 0; }
+    .chapter-questions details { margin: 0.75rem 0 0; }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -664,27 +668,57 @@
 <p>当一个语言模型在阅读一段长文档时，前面写了一段与当前问题无关的背景——模型需要"忘掉整段"重新聚焦。<a href="../delta-rule/index.html">DeltaNet 的 delta 规则</a>能精准覆写单个 key，但要逐 key 串行擦除整段过时记忆；<a href="../linear-attention/index.html">线性注意力</a>家族中的 Mamba2 标量衰减门能一步衰减整张状态，但无差别衰减所有 key-value 关联。能不能两者都要——既精准覆写单点、又快速遗忘全局？Gated DeltaNet（论文标题 "Gated Delta Networks"，缩写 GDN）的回答是：把两个机制塞进同一个递归公式。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>DeltaNet 的 delta 规则在"快速遗忘整段记忆"上有什么缺陷？Gated DeltaNet 为什么要加 α_t？</li>
-    <li>给定 $S_{t-1}$、$k_t$、$v_t$、$\alpha_t$、$\beta_t$，用 Gated DeltaNet 公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 手算一步更新，并说明 α_t、β_t 的职责分工。</li>
-    <li>Gated DeltaNet 在 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 两种极端下分别退化为哪个模型？为什么？</li>
-    <li>Gated DeltaNet 的并行训练算法解决什么问题？为什么不能直接串行递归？</li>
-    <li>Gated DeltaNet 与 KDA 在 α_t 的设计上有什么关键区别？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>DeltaNet 的 delta 规则在「快速遗忘整段记忆」上有什么缺陷？Gated DeltaNet 为什么要加 $\alpha_t$？</p>
+      <details>
+        <summary>解答：方向擦除需逐 key 串行，$\alpha_t$ 提供一步全局衰减</summary>
+        <p>delta 规则的擦除项 $I - \beta_t k_t k_t^\top$ 每步只作用于一个 key 方向，清空整段过时记忆需逐 key 串行更新。$\alpha_t$ 是作用于整张状态的全局衰减门，一步即可完成上下文切换式的遗忘，弥补这一缺陷。见「1. DeltaNet 与 Mamba2 各自缺什么」。</p>
+      </details>
+    </li>
+    <li>
+      <p>给定 $S_{t-1}$、$k_t$、$v_t$、$\alpha_t$、$\beta_t$，用 Gated DeltaNet 公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 手算一步更新，并说明 $\alpha_t$、$\beta_t$ 的职责分工。</p>
+      <details>
+        <summary>解答：衰减项乘擦除项加写入项；$\alpha_t$ 管全局、$\beta_t$ 管单点</summary>
+        <p>分别算出 $I - \beta_t k_t k_t^\top$ 与 $v_t k_t^\top$，按公式把 $S_{t-1}$ 乘 $\alpha_t(I - \beta_t k_t k_t^\top)$ 再加 $\beta_t v_t k_t^\top$。$\alpha_t$ 是标量衰减门，整张状态按比例缩小；$\beta_t$ 是写入强度，控制当前 key 方向新旧值的混合比例。手算全例见「3. 手算 Gated DeltaNet 一步更新」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Gated DeltaNet 在 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 两种极端下分别退化为哪个模型？为什么？</p>
+      <details>
+        <summary>解答：DeltaNet 与 Mamba2 的无写入特殊情形</summary>
+        <p>$\alpha_t \to 1$ 时衰减因子消失，公式退化为 DeltaNet 更新；$\beta_t \to 0$ 时擦除与写入同时关闭，退化为 $S_t = \alpha_t S_{t-1}$，即 Mamba2 在 $v_t = 0$ 时的特殊情形。代入过程见「4. 退化关系与并行训练算法」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Gated DeltaNet 的并行训练算法解决什么问题？为什么不能直接串行递归？</p>
+      <details>
+        <summary>解答：递归依赖链无法利用 GPU 并行，chunkwise 化为矩阵乘法</summary>
+        <p>$S_t$ 依赖 $S_{t-1}$，训练要算整段序列的状态，串行 $L$ 步无法利用 GPU 并行能力。chunkwise 算法用扩展 WY 表示把 chunk 内递归化为矩阵乘法并行计算，chunk 间递归传递状态。见「4. 退化关系与并行训练算法」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Gated DeltaNet 与 KDA 在 $\alpha_t$ 的设计上有什么关键区别？</p>
+      <details>
+        <summary>解答：标量 vs channel-wise 向量加下界约束</summary>
+        <p>Gated DeltaNet 的 $\alpha_t$ 是标量，整张状态同速率衰减；KDA 把它改为 channel-wise 向量（每个 key 通道独立衰减率）并用 lower-bounded scaled sigmoid 限定下界，以支持按通道差异化遗忘和 BF16 数值稳定。见「5. 与 KDA 的关系及实验效果」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
   <h2>最容易误解</h2>
   <ul>
-    <li>"Gated DeltaNet 的 α_t 和 KDA 的 α_t 是同一个东西"——Gated DeltaNet 的 α_t 是标量（每步一个衰减率作用于整张 S），KDA 的 α_t 是 channel-wise 向量（每 key 通道独立）且有 lower-bounded decay。</li>
-    <li>"α_t 和 β_t 都是遗忘门，职责重叠"——α_t 控全局衰减（整张 S 按比例缩小），β_t 控单点覆写强度（当前 k_t 方向新旧值混合比例），职责不重叠。</li>
-    <li>"Gated DeltaNet 只是 DeltaNet 加了个 α_t 系数，没本质区别"——α_t 使 Gated DeltaNet 能一步衰减整段记忆（上下文切换），DeltaNet 要逐 key 擦除；S-NIAH-2 数字针检索上 Gated DeltaNet 显著优于 DeltaNet。</li>
-    <li>"α_t 是固定常数衰减率"——α_t 是数据相关的（α_t = σ(W_α x_t)），模型根据当前输入决定本步衰减多少，这是它相对早期 data-independent decay（如 RetNet 的固定 γ）的区别。</li>
+    <li>"Gated DeltaNet 的 $\alpha_t$ 和 KDA 的 $\alpha_t$ 是同一个东西"——Gated DeltaNet 的 $\alpha_t$ 是标量（每步一个衰减率作用于整张 $S$），KDA 的 $\alpha_t$ 是 channel-wise 向量（每 key 通道独立）且有 lower-bounded decay。</li>
+    <li>"$\alpha_t$ 和 $\beta_t$ 都是遗忘门，职责重叠"——$\alpha_t$ 控全局衰减（整张 $S$ 按比例缩小），$\beta_t$ 控单点覆写强度（当前 $k_t$ 方向新旧值混合比例），职责不重叠。</li>
+    <li>"Gated DeltaNet 只是 DeltaNet 加了个 $\alpha_t$ 系数，没本质区别"——$\alpha_t$ 使 Gated DeltaNet 能一步衰减整段记忆（上下文切换），DeltaNet 要逐 key 擦除；S-NIAH-2 数字针检索上 Gated DeltaNet 显著优于 DeltaNet。</li>
+    <li>"$\alpha_t$ 是固定常数衰减率"——$\alpha_t$ 是数据相关的（$\alpha_t = \sigma(W_\alpha x_t)$），模型根据当前输入决定本步衰减多少，这是它相对早期 data-independent decay（如 RetNet 的固定 $\gamma$）的区别。</li>
   </ul>
 </section>
 
-<h2 id="why-gate-and-delta">DeltaNet 与 Mamba2 各自缺什么——gating 与 delta 规则的互补性</h2>
+<h2 id="why-gate-and-delta">1. DeltaNet 与 Mamba2 各自缺什么——gating 与 delta 规则的互补性</h2>
 
 <p>Gated DeltaNet 不是凭空设计的，它来自一个观察：DeltaNet 与 Mamba2 各自解决线性注意力"记不清"问题的一半，但都不完整。要理解 Gated DeltaNet，先看这两个"半成品"各缺什么。</p>
 
@@ -692,13 +726,13 @@
 
 $$S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top\qquad\text{（DeltaNet，F4）}$$
 
-<p>它的核心机制是<strong>方向擦除</strong>——矩阵 $I - \beta_t k_t k_t^\top$ 只擦除当前 $k_t$ 一个方向的旧值，保留与 $k_t$ 正交的其他方向。这让 DeltaNet 能精准覆写单个 key-value 关联（比如"把 key=k_2 对应的 value 从 v_old 改成 v_new"）。但精准也意味着局限：如果要清空整段过时记忆（比如模型从一段背景介绍切换到新话题），需要逐个 key 串行擦除，无法一步完成。Yang 2025 ICLR §2.3 原文说 DeltaNet "lacks the ability to rapidly clear outdated information, particularly during context switches"<sup>[C1]</sup>。delta 规则与 DeltaNet 的完整讲解见 <a href="../delta-rule/index.html">Delta 规则与 DeltaNet</a>。</p>
+<p>它的核心机制是<strong>方向擦除</strong>——矩阵 $I - \beta_t k_t k_t^\top$ 只擦除当前 $k_t$ 一个方向的旧值，保留与 $k_t$ 正交的其他方向。这让 DeltaNet 能精准覆写单个 key-value 关联（比如把 key $k_2$ 对应的 value 从 $v^{\text{old}}$ 改成 $v^{\text{new}}$）。但精准也意味着局限：如果要清空整段过时记忆（比如模型从一段背景介绍切换到新话题），需要逐个 key 串行擦除，无法一步完成。Yang 2025 ICLR §2.3 原文说 DeltaNet "lacks the ability to rapidly clear outdated information, particularly during context switches"<sup>[C1]</sup>。delta 规则与 DeltaNet 的完整讲解见 <a href="../delta-rule/index.html">Delta 规则与 DeltaNet</a>。</p>
 
-<p>Mamba2 走另一条路——用标量衰减门 α_t 全局衰减整张状态：</p>
+<p>Mamba2 走另一条路——用标量衰减门 $\alpha_t$ 全局衰减整张状态：</p>
 
 $$S_t = \alpha_t S_{t-1} + v_t k_t^\top\qquad\text{（Mamba2，F3）}$$
 
-<p>α_t 是一个标量，整张 $S_{t-1}$ 被乘以同一个 α_t。当 α_t 接近 0 时，一步就能清空整段记忆（"上下文切换"）。但 Mamba2 的衰减是<strong>无差别的</strong>——所有 key-value 关联按同一比例缩小，不区分哪个 key 更重要。Yang 2025 ICLR §2.2 原文说 "this approach does not account for the varying importance of different key-value associations"<sup>[C2]</sup>。Mamba2 无独立概念页，本页只引用此公式作对比，不展开状态空间模型理论。</p>
+<p>$\alpha_t$ 是一个标量，整张 $S_{t-1}$ 被乘以同一个 $\alpha_t$。当 $\alpha_t$ 接近 0 时，一步就能清空整段记忆（"上下文切换"）。但 Mamba2 的衰减是<strong>无差别的</strong>——所有 key-value 关联按同一比例缩小，不区分哪个 key 更重要。Yang 2025 ICLR §2.2 原文说 "this approach does not account for the varying importance of different key-value associations"<sup>[C2]</sup>。Mamba2 无独立概念页，本页只引用此公式作对比，不展开状态空间模型理论。</p>
 
 <div class="table-scroll">
 <table>
@@ -711,24 +745,42 @@ $$S_t = \alpha_t S_{t-1} + v_t k_t^\top\qquad\text{（Mamba2，F3）}$$
 </table>
 </div>
 
-<p>两者<strong>互补</strong>：gating（α_t）擅长快速遗忘全局，delta 规则（$I - \beta_t k_t k_t^\top$）擅长精准覆写单点。Yang 2025 ICLR §1 原文 "we observe that these mechanisms are complementary—gating enables rapid memory erasure while the delta rule facilitates targeted updates"<sup>[C7]</sup>。Gated DeltaNet 的工作就是把两者塞进同一个递归公式。</p>
+<p>两者<strong>互补</strong>：gating（$\alpha_t$）擅长快速遗忘全局，delta 规则（$I - \beta_t k_t k_t^\top$）擅长精准覆写单点。Yang 2025 ICLR §1 原文 "we observe that these mechanisms are complementary—gating enables rapid memory erasure while the delta rule facilitates targeted updates"<sup>[C7]</sup>。Gated DeltaNet 的工作就是把两者塞进同一个递归公式。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话说明 DeltaNet 为什么不能快速清空整段记忆（提示：方向擦除 vs 全局）。</li>
-  <li>用一句话说明 Mamba2 为什么不能选择性擦除单点（提示：α_t 是标量还是向量）。</li>
-  <li>说明 "gating 与 delta 规则互补" 指的是哪两种能力互补。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话说明 DeltaNet 为什么不能快速清空整段记忆（提示：方向擦除 vs 全局）。</p>
+    <details>
+      <summary>解答：擦除每次只作用于一个方向</summary>
+      <p>DeltaNet 的擦除由 $I - \beta_t k_t k_t^\top$ 完成，每次更新只清除当前 $k_t$ 一个方向的旧值；要清空含 $L$ 个方向的整段记忆需 $L$ 次串行更新，无法一步完成。</p>
+    </details>
+  </li>
+  <li>
+    <p>用一句话说明 Mamba2 为什么不能选择性擦除单点（提示：$\alpha_t$ 是标量还是向量）。</p>
+    <details>
+      <summary>解答：标量门对所有方向一视同仁</summary>
+      <p>$\alpha_t$ 是标量，乘到整张 $S_{t-1}$ 上，所有 key-value 关联按同一比例缩小，无法区分要擦的方向与要保留的方向。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明「gating 与 delta 规则互补」指的是哪两种能力互补。</p>
+    <details>
+      <summary>解答：快速全局遗忘与定向精准覆写</summary>
+      <p>gating 提供一步作用整张状态的全局衰减（上下文切换式遗忘），delta 规则提供只作用于当前 key 方向的精准覆写；两者作用范围与粒度不同，恰好互相补足。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章说明了 DeltaNet 与 Mamba2 各自缺什么。但两者如何统一还不清楚——下一章给出 Gated DeltaNet 的公式。</p>
 
-<h2 id="gated-deltanet-formula">Gated DeltaNet 的公式与符号——α_t 衰减与 β_t 擦写如何协同</h2>
+<h2 id="gated-deltanet-formula">2. Gated DeltaNet 的公式与符号——$\alpha_t$ 衰减与 $\beta_t$ 擦写如何协同</h2>
 
 <p>Gated DeltaNet 的递归更新公式（Yang 2025 ICLR §3.1 Eq.8<sup>[C3]</sup>）：</p>
 
 $$\boxed{\,S_t = S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) + \beta_t v_t k_t^\top\,}\qquad\text{（Gated DeltaNet，F1）}$$
 
-<p>公式出现前先说清它解决的问题：上一章看到 DeltaNet 缺全局遗忘、Mamba2 缺方向擦除。Gated DeltaNet 把 Mamba2 的标量 α_t 嵌进 DeltaNet 的 $I - \beta_t k_t k_t^\top$ 擦除项前面，得到 $\alpha_t(I - \beta_t k_t k_t^\top)$——先衰减整张状态、再做 delta 擦写。</p>
+<p>公式出现前先说清它解决的问题：上一章看到 DeltaNet 缺全局遗忘、Mamba2 缺方向擦除。Gated DeltaNet 把 Mamba2 的标量 $\alpha_t$ 嵌进 DeltaNet 的 $I - \beta_t k_t k_t^\top$ 擦除项前面，得到 $\alpha_t(I - \beta_t k_t k_t^\top)$——先衰减整张状态、再做 delta 擦写。</p>
 
 <p>每个符号：</p>
 
@@ -739,26 +791,26 @@ $$\boxed{\,S_t = S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) + \beta_t
   <li>$k_t \in \mathbb{R}^{d_k}$：第 $t$ 步的 key 向量，由输入 $x_t$ 经投影 $k_t = W_K x_t$ 得到。</li>
   <li>$v_t \in \mathbb{R}^{d_v}$：第 $t$ 步的 value 向量，由 $v_t = W_V x_t$ 得到。</li>
   <li>$q_t \in \mathbb{R}^{d_k}$：第 $t$ 步的 query 向量，由 $q_t = W_Q x_t$ 得到；输出 $o_t = S_t q_t$。</li>
-  <li>$\alpha_t = \sigma(W_\alpha x_t) \in (0, 1)$：<strong>数据相关标量衰减门</strong>，由 sigmoid 输出。α_t 控制整张 $S_{t-1}$ 的全局衰减——模型根据当前输入 $x_t$ 决定本步衰减多少<sup>[C4]</sup>。</li>
-  <li>$\beta_t = \sigma(W_\beta x_t) \in (0, 1)$：<strong>数据相关标量写入强度</strong>，由 sigmoid 输出。β_t 控制当前 $k_t$ 方向新旧值的混合比例。</li>
+  <li>$\alpha_t = \sigma(W_\alpha x_t) \in (0, 1)$：<strong>数据相关标量衰减门</strong>，由 sigmoid 输出。$\alpha_t$ 控制整张 $S_{t-1}$ 的全局衰减——模型根据当前输入 $x_t$ 决定本步衰减多少<sup>[C4]</sup>。</li>
+  <li>$\beta_t = \sigma(W_\beta x_t) \in (0, 1)$：<strong>数据相关标量写入强度</strong>，由 sigmoid 输出。$\beta_t$ 控制当前 $k_t$ 方向新旧值的混合比例。</li>
   <li>$\sigma(z) = 1/(1 + e^{-z})$：sigmoid 函数。</li>
   <li>$W_Q, W_K, W_V, W_\alpha, W_\beta$：可学习参数。</li>
 </ul>
 
 <p>形状检查（验证维度自洽）：$k_t k_t^\top$ 是 $(d_k, 1) \times (1, d_k) = (d_k, d_k)$；$I - \beta_t k_t k_t^\top$ 是 $(d_k, d_k)$；$\alpha_t$ 是标量，$\alpha_t(I - \beta_t k_t k_t^\top)$ 仍是 $(d_k, d_k)$；$S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top))$ 是 $(d_v, d_k) \cdot (d_k, d_k) = (d_v, d_k)$；$\beta_t v_t k_t^\top$ 是标量 $\times (d_v, 1) \times (1, d_k) = (d_v, d_k)$；两项相加形状一致，结果 $(d_v, d_k)$。检查通过。</p>
 
-<h3 id="alpha-beta-roles">α_t 与 β_t 的职责分工</h3>
+<h3 id="alpha-beta-roles">2.1 $\alpha_t$ 与 $\beta_t$ 的职责分工</h3>
 
-<p>α_t 与 β_t <strong>不是同一个东西</strong>，职责不重叠<sup>[C4]</sup>：</p>
+<p>$\alpha_t$ 与 $\beta_t$ <strong>不是同一个东西</strong>，职责不重叠<sup>[C4]</sup>：</p>
 
 <ul>
-  <li><strong>α_t 控全局衰减</strong>：$\alpha_t$ 是标量，作用于整张 $S_{t-1}$。无论 $S_{t-1}$ 里存了多少 key-value 关联，全部按 α_t 比例缩小。α_t → 0 时一步清空整段记忆（上下文切换），α_t → 1 时几乎不衰减。</li>
-  <li><strong>β_t 控单点覆写</strong>：$\beta_t$ 只影响当前 $k_t$ 一个方向。$I - \beta_t k_t k_t^\top$ 只擦 $k_t$ 方向的旧值，$\beta_t v_t k_t^\top$ 写入新值。β_t → 1 时完全覆写 $k_t$ 方向，β_t → 0 时几乎不擦不写。这与 DeltaNet 的 β_t 完全一致（见 <a href="../delta-rule/index.html">Delta 规则</a>关于 β_t 职责的讲解）。</li>
+  <li><strong>$\alpha_t$ 控全局衰减</strong>：$\alpha_t$ 是标量，作用于整张 $S_{t-1}$。无论 $S_{t-1}$ 里存了多少 key-value 关联，全部按 $\alpha_t$ 比例缩小。$\alpha_t \to 0$ 时一步清空整段记忆（上下文切换），$\alpha_t \to 1$ 时几乎不衰减。</li>
+  <li><strong>$\beta_t$ 控单点覆写</strong>：$\beta_t$ 只影响当前 $k_t$ 一个方向。$I - \beta_t k_t k_t^\top$ 只擦 $k_t$ 方向的旧值，$\beta_t v_t k_t^\top$ 写入新值。$\beta_t \to 1$ 时完全覆写 $k_t$ 方向，$\beta_t \to 0$ 时几乎不擦不写。这与 DeltaNet 的 $\beta_t$ 完全一致（见 <a href="../delta-rule/index.html">Delta 规则</a>关于 $\beta_t$ 职责的讲解）。</li>
 </ul>
 
 <p>论文 §3.1 原文："the data-dependent gating term $\alpha_t \in (0,1)$ controls state decay"；§1 原文："gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
 
-<h3 id="decay-then-rewrite">"先衰减后擦写"的等价解读</h3>
+<h3 id="decay-then-rewrite">2.2 "先衰减后擦写"的等价解读</h3>
 
 <p>Gated DeltaNet 公式的乘法顺序 $\alpha_t(I - \beta_t k_t k_t^\top)$ 有明确的语义。因为 $\alpha_t$ 是标量，它可以与矩阵交换：</p>
 
@@ -767,40 +819,59 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 <p>所以 Gated DeltaNet 的一步更新可以读作<strong>"先衰减、再擦写"</strong><sup>[C5]</sup>：</p>
 
 <ol>
-  <li><strong>衰减</strong>：$\alpha_t \cdot S_{t-1}$——整张状态乘 α_t，所有 key-value 关联按比例缩小。</li>
+  <li><strong>衰减</strong>：$\alpha_t \cdot S_{t-1}$——整张状态乘 $\alpha_t$，所有 key-value 关联按比例缩小。</li>
   <li><strong>擦除</strong>：$(\alpha_t S_{t-1})(I - \beta_t k_t k_t^\top)$——在已衰减的状态上，擦除 $k_t$ 方向的旧值。</li>
   <li><strong>写入</strong>：$+ \beta_t v_t k_t^\top$——写入新值。</li>
 </ol>
 
 <pre class="diagram">Gated DeltaNet 一步更新的三步语义（α_t 标量可交换）：
 
-  S_{t-1} ──[① 衰减]──► α_t · S_{t-1} ──[② 擦除 k_t 方向]──►
-                             (整张按 α_t 缩小)        (I - β_t k_t k_t^T)
-                                                          │
-                                                          ▼
-                                          ──[③ 写入]──► S_t
-                                              + β_t v_t k_t^T
+  S_{t-1}
+    ↓ ① 衰减：整张按 α_t 缩小
+  α_t · S_{t-1}
+    ↓ ② 擦除 k_t 方向：(I - β_t k_t k_t^T)
+  (α_t S_{t-1})(I - β_t k_t k_t^T)
+    ↓ ③ 写入：+ β_t v_t k_t^T
+  S_t
 
   DeltaNet 只有 ②③（无 ① 全局衰减）
   Mamba2 只有 ① + 加性写入（无 ② 方向擦除）
 </pre>
 
-<p><strong>前提条件</strong>：α_t 是标量（可与矩阵交换）。若 α_t 是 channel-wise 向量（如 KDA 的情形），则不能这样交换——这是 Gated DeltaNet 与 KDA 的关键区别，与 KDA 的关系一章详述。</p>
+<p><strong>前提条件</strong>：$\alpha_t$ 是标量（可与矩阵交换）。若 $\alpha_t$ 是 channel-wise 向量（如 KDA 的情形），则不能这样交换——这是 Gated DeltaNet 与 KDA 的关键区别，与 KDA 的关系一章详述。</p>
 
 <p>两个快速边界检查。第一，若 $\alpha_t = 1$，则 $S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$——退化为 DeltaNet（无全局衰减）。第二，若 $\beta_t = 0$，则 $S_t = S_{t-1}(\alpha_t \cdot I) + 0 = \alpha_t S_{t-1}$——退化为 Mamba2 在 $v_t = 0$ 时的特殊情形（只衰减不写入）。退化关系在下一章详细讨论。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明 α_t 与 β_t 的职责差异（全局 vs 单点），并指出论文原文怎么描述这个分工。</li>
-  <li>用代数规则说明为什么 $\alpha_t(I - \beta_t k_t k_t^\top)$ 可以读作"先衰减后擦写"，以及这个等价需要什么前提。</li>
-  <li>$\alpha_t = 1$ 与 $\beta_t = 0$ 时 Gated DeltaNet 分别退化为哪种更新。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说明 $\alpha_t$ 与 $\beta_t$ 的职责差异（全局 vs 单点），并指出论文原文怎么描述这个分工。</p>
+    <details>
+      <summary>解答：$\alpha_t$ 控状态衰减，$\beta_t$ 控定向更新强度</summary>
+      <p>$\alpha_t$ 是标量，作用于整张 $S_{t-1}$ 的全局衰减；$\beta_t$ 只作用于当前 $k_t$ 方向，控制新旧值混合比例。论文 §3.1："the data-dependent gating term $\alpha_t \in (0,1)$ controls state decay"；§1："gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
+    </details>
+  </li>
+  <li>
+    <p>用代数规则说明为什么 $\alpha_t(I - \beta_t k_t k_t^\top)$ 可以读作「先衰减后擦写」，以及这个等价需要什么前提。</p>
+    <details>
+      <summary>解答：标量与矩阵可交换；前提是 $\alpha_t$ 为标量</summary>
+      <p>$\alpha_t$ 是标量，满足交换律，$S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) = \alpha_t \cdot S_{t-1}(I - \beta_t k_t k_t^\top)$，故可读作先乘 $\alpha_t$ 衰减、再做 delta 擦写。前提是 $\alpha_t$ 为标量；KDA 的 channel-wise 向量不满足交换律，乘法顺序由 $\mathrm{Diag}(\alpha_t)$ 的位置决定。</p>
+    </details>
+  </li>
+  <li>
+    <p>$\alpha_t = 1$ 与 $\beta_t = 0$ 时 Gated DeltaNet 分别退化为哪种更新。</p>
+    <details>
+      <summary>解答：DeltaNet 与「只衰减不写入」</summary>
+      <p>$\alpha_t = 1$：$S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$，即 DeltaNet 更新；$\beta_t = 0$：$S_t = S_{t-1}(\alpha_t \cdot I) + 0 = \alpha_t S_{t-1}$，只衰减不写入，是 Mamba2 在 $v_t = 0$ 时的特殊情形。</p>
+    </details>
+  </li>
+</ol>
 
-<p>本章给出了 Gated DeltaNet 的公式与 α_t、β_t 的职责分工。但公式能否同时做到精准覆写与全局衰减——下一章用手算验证。</p>
+<p>本章给出了 Gated DeltaNet 的公式与 $\alpha_t$、$\beta_t$ 的职责分工。但公式能否同时做到精准覆写与全局衰减——下一章用手算验证。</p>
 
-<h2 id="hand-compute">手算 Gated DeltaNet 一步更新——三模型在同一序列上并排对比</h2>
+<h2 id="hand-compute">3. 手算 Gated DeltaNet 一步更新——三模型在同一序列上并排对比</h2>
 
-<p>教学示例。 取 $d = 2$ 维，3 步序列。前两步在两个正交方向各写一个关联，第 3 步覆写 $k_1$ 方向并加 $\alpha < 1$ 全局衰减——这样能同时看到 α_t 衰减非 $k_t$ 方向、β_t 覆写 $k_t$ 方向。key 已归一化（$\|k_1\| = \|k_2\| = 1$）。</p>
+<p>构造示例。 取 $d = 2$ 维，3 步序列。前两步在两个正交方向各写一个关联，第 3 步覆写 $k_1$ 方向并加 $\alpha < 1$ 全局衰减——这样能同时看到 $\alpha_t$ 衰减非 $k_t$ 方向、$\beta_t$ 覆写 $k_t$ 方向。key 已归一化（$\|k_1\| = \|k_2\| = 1$）。</p>
 
 <div class="table-scroll">
 <table>
@@ -808,7 +879,7 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 <tbody>
 <tr><td>1</td><td>$(1, 0)^\top$</td><td>$(1, 0)^\top$</td><td>$1$</td><td>$1$</td><td>在 $k_1$ 方向写 $v_1$</td></tr>
 <tr><td>2</td><td>$(0, 1)^\top$</td><td>$(0, 1)^\top$</td><td>$1$</td><td>$1$</td><td>在正交方向 $k_2$ 写 $v_2$</td></tr>
-<tr><td>3</td><td>$(1, 0)^\top = k_1$</td><td>$(0, 1)^\top$</td><td>$0.5$</td><td>$1$</td><td>覆写 $k_1$ 方向（β=1），同时全局衰减（α=0.5）</td></tr>
+<tr><td>3</td><td>$(1, 0)^\top = k_1$</td><td>$(0, 1)^\top$</td><td>$0.5$</td><td>$1$</td><td>覆写 $k_1$ 方向（$\beta=1$），同时全局衰减（$\alpha=0.5$）</td></tr>
 </tbody>
 </table>
 </div>
@@ -831,7 +902,7 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 
 <p>注意 $S_2$ 在两个正交方向各存了一个关联——查询 $k_1$ 返回 $v_1 = (1, 0)^\top$，查询 $k_2$ 返回 $v_2 = (0, 1)^\top$。这一步与 DeltaNet 完全一致（因为 $\alpha_2 = 1$）。</p>
 
-<p>第 3 步（关键步）：$k_3 = (1, 0)^\top = k_1$，$v_3 = (0, 1)^\top$，$\alpha_3 = 0.5$，$\beta_3 = 1$。这一步同时做两件事——用 β=1 覆写 $k_1$ 方向（delta 规则），用 α=0.5 衰减整张 $S_2$（全局门）。</p>
+<p>第 3 步（关键步）：$k_3 = (1, 0)^\top = k_1$，$v_3 = (0, 1)^\top$，$\alpha_3 = 0.5$，$\beta_3 = 1$。这一步同时做两件事——用 $\beta = 1$ 覆写 $k_1$ 方向（delta 规则），用 $\alpha = 0.5$ 衰减整张 $S_2$（全局门）。</p>
 
 <p>$$I - \beta_3 k_3 k_3^\top = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix},\qquad \alpha_3(I - \beta_3 k_3 k_3^\top) = 0.5 \cdot \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix}.$$</p>
 
@@ -841,7 +912,7 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 
 <p>$$S_3 = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix} + \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}.$$</p>
 
-<h3 id="compare-three-models">三模型在同一序列上的结果对比</h3>
+<h3 id="compare-three-models">3.1 三模型在同一序列上的结果对比</h3>
 
 <p>现在把 Gated DeltaNet 与 DeltaNet（$\alpha = 1$）、Mamba2（$\beta = 0$，只衰减不写入）在第 3 步的结果并排对比：</p>
 
@@ -851,7 +922,7 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 <tbody>
 <tr><td>DeltaNet<sup>[F4]</sup></td><td>$S_2(I - k_3 k_3^\top) + v_3 k_3^\top$</td><td>$\begin{pmatrix}0 & 0 \\ 1 & 1\end{pmatrix}$</td><td>$(0, 1)^\top = v_3$</td><td>$(0, 1)^\top = v_2$（未衰减）</td></tr>
 <tr class="highlight-row"><td>Gated DeltaNet<sup>[F1]</sup></td><td>$S_2(0.5(I - k_3 k_3^\top)) + v_3 k_3^\top$</td><td>$\begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}$</td><td>$(0, 1)^\top = v_3$</td><td>$(0, 0.5)^\top$（衰减到一半）</td></tr>
-<tr><td>Mamba2（β=0 特殊）<sup>[F3]</sup></td><td>$0.5 \cdot S_2$（$\beta = 0$，无写入）</td><td>$\begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}$</td><td>$(0.5, 0)^\top$（衰减，未覆写）</td><td>$(0, 0.5)^\top$（衰减）</td></tr>
+<tr><td>Mamba2（$\beta=0$ 特殊）<sup>[F3]</sup></td><td>$0.5 \cdot S_2$（$\beta = 0$，无写入）</td><td>$\begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}$</td><td>$(0.5, 0)^\top$（衰减，未覆写）</td><td>$(0, 0.5)^\top$（衰减）</td></tr>
 </tbody>
 </table>
 </div>
@@ -859,8 +930,8 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 <p>三个关键观察：</p>
 
 <ul>
-  <li><strong>Gated DeltaNet 与 DeltaNet 查 $k_3$ 都返回 $v_3$</strong>：因为 $\beta_3 = 1$ 完全覆写了 $k_3$ 方向，α_t 的衰减不影响"刚写入的新值"（$\beta_t v_t k_t^\top$ 这一项不被 α_t 衰减）。这是 delta 规则精准覆写的体现。</li>
-  <li><strong>Gated DeltaNet 查 $k_2$ 返回 $(0, 0.5)^\top$ 而 DeltaNet 返回 $(0, 1)^\top$</strong>：$k_2$ 方向与 $k_3$ 正交，delta 规则不擦它，但 α_t = 0.5 把它衰减了一半。这正是 α_t 的作用——衰减非 $k_t$ 方向的旧关联。</li>
+  <li><strong>Gated DeltaNet 与 DeltaNet 查 $k_3$ 都返回 $v_3$</strong>：因为 $\beta_3 = 1$ 完全覆写了 $k_3$ 方向，$\alpha_t$ 的衰减不影响「刚写入的新值」（$\beta_t v_t k_t^\top$ 这一项不被 $\alpha_t$ 衰减）。这是 delta 规则精准覆写的体现。</li>
+  <li><strong>Gated DeltaNet 查 $k_2$ 返回 $(0, 0.5)^\top$ 而 DeltaNet 返回 $(0, 1)^\top$</strong>：$k_2$ 方向与 $k_3$ 正交，delta 规则不擦它，但 $\alpha_t = 0.5$ 把它衰减了一半。这正是 $\alpha_t$ 的作用——衰减非 $k_t$ 方向的旧关联。</li>
   <li><strong>Mamba2 查 $k_3$ 返回 $(0.5, 0)^\top \neq v_3$</strong>：Mamba2 没有 delta 规则，无法覆写 $k_3$ 方向，只能把旧的 $v_1 = (1, 0)^\top$ 衰减到 $(0.5, 0)^\top$。这是 Mamba2 缺方向擦除的体现。</li>
 </ul>
 
@@ -872,21 +943,39 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 <p><strong>① 衰减</strong>：$\alpha_3 \cdot S_2 = 0.5 \cdot \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}$。整张 $S_2$ 被乘 0.5。</p>
 <p><strong>② 擦除</strong>：$(\alpha_3 S_2)(I - \beta_3 k_3 k_3^\top) = \begin{pmatrix}0.5 & 0 \\ 0 & 0.5\end{pmatrix}\begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix}$。擦掉 $k_3$ 方向（第一列），保留 $k_2$ 方向（衰减后的 0.5）。</p>
 <p><strong>③ 写入</strong>：$+ \beta_3 v_3 k_3^\top = \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix}$。写入新值 $v_3$ 到 $k_3$ 方向。</p>
-<p>合起来 $S_3 = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix} + \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}$，与紧凑公式一致。这一步展示"先衰减后擦写"的语义：α_t 先把整张状态缩小，delta 规则再在缩小的状态上擦写 $k_3$ 方向。</p>
+<p>合起来 $S_3 = \begin{pmatrix}0 & 0 \\ 0 & 0.5\end{pmatrix} + \begin{pmatrix}0 & 0 \\ 1 & 0\end{pmatrix} = \begin{pmatrix}0 & 0 \\ 1 & 0.5\end{pmatrix}$，与紧凑公式一致。这一步展示「先衰减后擦写」的语义：$\alpha_t$ 先把整张状态缩小，delta 规则再在缩小的状态上擦写 $k_3$ 方向。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定 $S_{t-1} = \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}$、$k_t = (0, 1)^\top$、$v_t = (1, 0)^\top$、$\alpha_t = 0.5$、$\beta_t = 1$，手算 $S_t$，并说明查询 $k_t$ 与查询 $(1, 0)^\top$ 各返回什么。</li>
-  <li>说明为什么 Gated DeltaNet 查 $k_3$ 返回 $v_3$ 而 Mamba2 查 $k_3$ 不返回 $v_3$（提示：delta 规则的覆写 vs 加性累加）。</li>
-  <li>说明为什么 Gated DeltaNet 查 $k_2$ 返回衰减后的 $(0, 0.5)^\top$ 而 DeltaNet 查 $k_2$ 返回未衰减的 $(0, 1)^\top$（提示：α_t 作用于哪些方向）。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 $S_{t-1} = \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}$、$k_t = (0, 1)^\top$、$v_t = (1, 0)^\top$、$\alpha_t = 0.5$、$\beta_t = 1$，手算 $S_t$，并说明查询 $k_t$ 与查询 $(1, 0)^\top$ 各返回什么。</p>
+    <details>
+      <summary>解答：$S_t = \begin{pmatrix}0.5 & 1 \\ 0 & 0\end{pmatrix}$</summary>
+      <p>$I - k_tk_t^\top = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}$，$\alpha_t(I - k_tk_t^\top) = \begin{pmatrix}0.5 & 0 \\ 0 & 0\end{pmatrix}$，$S_{t-1}$ 乘之得 $\begin{pmatrix}0.5 & 0 \\ 0 & 0\end{pmatrix}$；加 $v_tk_t^\top = \begin{pmatrix}0 & 1 \\ 0 & 0\end{pmatrix}$ 得 $S_t = \begin{pmatrix}0.5 & 1 \\ 0 & 0\end{pmatrix}$。查询 $k_t$ 返回 $(1, 0)^\top = v_t$（被完全覆写）；查询 $(1, 0)^\top$ 返回 $(0.5, 0)^\top$（旧值被 $\alpha_t$ 衰减一半）。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明为什么 Gated DeltaNet 查 $k_3$ 返回 $v_3$ 而 Mamba2 查 $k_3$ 不返回 $v_3$（提示：delta 规则的覆写 vs 加性累加）。</p>
+    <details>
+      <summary>解答：覆写项不受衰减，加性无法替换</summary>
+      <p>$\beta_3 = 1$ 使 delta 项完全覆写 $k_3$ 方向，且写入项 $\beta_t v_t k_t^\top$ 不被 $\alpha_t$ 衰减，故返回新值 $v_3$；Mamba2 没有方向擦除，只能把旧值按 $\alpha_t$ 比例缩小，得到的是衰减后的旧值而非 $v_3$。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明为什么 Gated DeltaNet 查 $k_2$ 返回衰减后的 $(0, 0.5)^\top$ 而 DeltaNet 查 $k_2$ 返回未衰减的 $(0, 1)^\top$（提示：$\alpha_t$ 作用于哪些方向）。</p>
+    <details>
+      <summary>解答：$k_2$ 与 $k_3$ 正交，只受全局门影响</summary>
+      <p>$k_2$ 方向与当前 key $k_3$ 正交，delta 擦除不作用于它；但 $\alpha_t$ 是作用于整张状态的全局标量，包括与 $k_t$ 正交的旧关联在内都被乘以 0.5，而 DeltaNet 没有 $\alpha_t$，旧关联保持原值。</p>
+    </details>
+  </li>
+</ol>
 
-<p>本章手算验证了公式与 α_t、β_t 的协同。但公式在极端下退化为哪个模型、训练时如何并行——下一章看退化关系与并行训练算法。</p>
+<p>本章手算验证了公式与 $\alpha_t$、$\beta_t$ 的协同。但公式在极端下退化为哪个模型、训练时如何并行——下一章看退化关系与并行训练算法。</p>
 
-<h2 id="degradation-and-parallel">退化关系与并行训练算法——为什么训练不能直接串行递归</h2>
+<h2 id="degradation-and-parallel">4. 退化关系与并行训练算法——为什么训练不能直接串行递归</h2>
 
-<h3 id="degradation">Gated DeltaNet 的退化</h3>
+<h3 id="degradation">4.1 Gated DeltaNet 的退化</h3>
 
 <p>把 $\alpha_t$ 和 $\beta_t$ 推到极端，看 Gated DeltaNet 分别退化为哪个模型<sup>[F2]</sup>。这是验证理解的最简方式。</p>
 
@@ -898,7 +987,7 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 
 <p>退化关系揭示 Gated DeltaNet 是 DeltaNet 与 Mamba2 的<strong>统一</strong>：DeltaNet 是 $\alpha_t = 1$ 的特例，Mamba2（无写入时）是 $\beta_t = 0$ 的特例，Gated DeltaNet 把两者统一进一个公式。</p>
 
-<h3 id="parallel-training">并行训练算法——为什么不能直接串行递归</h3>
+<h3 id="parallel-training">4.2 并行训练算法——为什么不能直接串行递归</h3>
 
 <p>Gated DeltaNet 的递归形式 $S_t$ 依赖 $S_{t-1}$，训练时要算整段序列的 $S_1, S_2, \ldots, S_L$，串行计算 $L$ 步无法利用 GPU 的并行能力。这在长序列上不可接受。</p>
 
@@ -907,14 +996,14 @@ $$S_{t-1}\bigl(\alpha_t(I - \beta_t k_t k_t^\top)\bigr) = \alpha_t \cdot S_{t-1}
 <ul>
   <li><strong>chunk 内</strong>：用扩展的 WY 表示（Bischof & Van Loan 1985）把递归展开为矩阵乘法，可并行计算。</li>
   <li><strong>chunk 间</strong>：递归传递 chunk 末尾的状态 $S_{[t]}$ 作为下一个 chunk 的初始状态。</li>
-  <li><strong>门控兼容性</strong>：α_t 只做逐元素乘法（标量乘矩阵），不破坏矩阵乘法结构，因此整个 chunkwise 形式仍兼容 Tensor Core GPU 优化。</li>
+  <li><strong>门控兼容性</strong>：$\alpha_t$ 只做逐元素乘法（标量乘矩阵），不破坏矩阵乘法结构，因此整个 chunkwise 形式仍兼容 Tensor Core GPU 优化。</li>
 </ul>
 
 <p>论文 §3.2 原文："the gating term only performs element-wise multiplication and does not affect the matrix multiplication structure, thus compatible with tensor core GPU optimization"。</p>
 
 <details>
 <summary>补充：WY 表示与 chunkwise 形式的作用（不展开推导）</summary>
-<p>WY 表示（Bischof & Van Loan 1985）把 Householder 矩阵乘积 $\prod_i (I - \beta_i k_i k_i^\top)$ 写成紧凑形式 $I - \sum_i w_i k_i^\top$，使 chunk 内的累积擦除可表示为一次矩阵乘法。Yang 2025 ICLR §3.2 Eq.9-10 把 WY 表示扩展以纳入 α_t 衰减项，得到 $\mathbf{P}_{[t]}^r = \gamma_{[t]}^r(I - \sum_i w_i k_i^\top)$，其中 $\gamma_{[t]}^j = \prod_i \alpha_i$ 是局部累积衰减。这让 chunk 内计算全部归约为矩阵乘法，可用 Tensor Core 加速。本页不展开 UT 变换、前向替换等数值线性代数细节——它们属于独立的数值线性代数概念，Yang 2025 ICLR §3.2 与 DeltaNet 论文 §3（见 <a href="../delta-rule/index.html">Delta 规则</a>）已有完整论证。</p>
+<p>WY 表示（Bischof & Van Loan 1985）把 Householder 矩阵乘积 $\prod_i (I - \beta_i k_i k_i^\top)$ 写成紧凑形式 $I - \sum_i w_i k_i^\top$，使 chunk 内的累积擦除可表示为一次矩阵乘法。Yang 2025 ICLR §3.2 Eq.9-10 把 WY 表示扩展以纳入 $\alpha_t$ 衰减项，得到 $\mathbf{P}_{[t]}^r = \gamma_{[t]}^r(I - \sum_i w_i k_i^\top)$，其中 $\gamma_{[t]}^j = \prod_i \alpha_i$ 是局部累积衰减。这让 chunk 内计算全部归约为矩阵乘法，可用 Tensor Core 加速。本页不展开 UT 变换、前向替换等数值线性代数细节——它们属于独立的数值线性代数概念，Yang 2025 ICLR §3.2 与 DeltaNet 论文 §3（见 <a href="../delta-rule/index.html">Delta 规则</a>）已有完整论证。</p>
 </details>
 
 <p>这个算法解决的核心问题是：让 Gated DeltaNet 在保持递归形式（推理时固定大小状态）的同时，训练时能像注意力一样并行计算。没有它，Gated DeltaNet 只能在短序列上用，无法扩展到 100B tokens 训练。</p>
@@ -1026,44 +1115,62 @@ Degradation alpha=1: Gated DeltaNet == DeltaNet: True
 Degradation beta=0: Gated DeltaNet == alpha * S_2: True
 </code></pre>
 </div>
-<p><b>验证的机制</b>：代码实现 F1（Gated DeltaNet 紧凑公式）、F4（DeltaNet）、F3（Mamba2），逐行对应正文 §2 公式与 §3 手算。第 3 步 $\alpha_3 = 0.5, \beta_3 = 1$：Gated DeltaNet 查 $k_3$ 返回 $v_3$（delta 规则覆写），查 $k_2$ 返回 $(0, 0.5)^\top$（α 门衰减非 $k_t$ 方向）；DeltaNet 查 $k_2$ 返回 $(0, 1)^\top$（无衰减）；Mamba2 查 $k_3$ 返回 $(0.5, 0)^\top$（无覆写）。退化验证确认 $\alpha=1$ 时 Gated DeltaNet == DeltaNet，$\beta=0$ 时 == $\alpha \cdot S_{t-1}$。</p>
-<p><b>观察重点</b>：Gated DeltaNet 的 $S_3$ 第二行第二列是 0.5（$k_2$ 方向被 α 衰减），而 DeltaNet 是 1（未衰减）；Gated DeltaNet 的 $S_3$ 第二行第一列是 1（$k_3$ 方向被 β 覆写为新值 $v_3$），而 Mamba2 是 0（无写入）。这正是"先衰减后擦写"的数值体现。</p>
+<p><b>验证的机制</b>：代码实现 F1（Gated DeltaNet 紧凑公式）、F4（DeltaNet）、F3（Mamba2），逐行对应正文 §2 公式与 §3 手算。第 3 步 $\alpha_3 = 0.5, \beta_3 = 1$：Gated DeltaNet 查 $k_3$ 返回 $v_3$（delta 规则覆写），查 $k_2$ 返回 $(0, 0.5)^\top$（$\alpha$ 门衰减非 $k_t$ 方向）；DeltaNet 查 $k_2$ 返回 $(0, 1)^\top$（无衰减）；Mamba2 查 $k_3$ 返回 $(0.5, 0)^\top$（无覆写）。退化验证确认 $\alpha=1$ 时 Gated DeltaNet == DeltaNet，$\beta=0$ 时 == $\alpha \cdot S_{t-1}$。</p>
+<p><b>观察重点</b>：Gated DeltaNet 的 $S_3$ 第二行第二列是 0.5（$k_2$ 方向被 $\alpha$ 衰减），而 DeltaNet 是 1（未衰减）；Gated DeltaNet 的 $S_3$ 第二行第一列是 1（$k_3$ 方向被 $\beta$ 覆写为新值 $v_3$），而 Mamba2 是 0（无写入）。这正是"先衰减后擦写"的数值体现。</p>
 <p><b>教学简化</b>：教学实现使用 numpy 标量循环逐手算 step；真实工程用 Triton chunkwise kernel（Yang 2025 ICLR §3.2）批量并行计算，chunk size 通常为 64，且融合 L2 归一化与 kernel。本代码不实现 batch、不处理多头、不归一化 key、不实现 chunkwise 并行。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 时 Gated DeltaNet 各退化为哪个模型，并从公式代入说明。</li>
-  <li>用一句话说明为什么 Gated DeltaNet 训练时不能直接串行递归。</li>
-  <li>说明 chunkwise 算法的两个层次（chunk 内并行、chunk 间递归）各做什么，以及 α_t 为什么不破坏 Tensor Core 兼容性。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说明 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 时 Gated DeltaNet 各退化为哪个模型，并从公式代入说明。</p>
+    <details>
+      <summary>解答：代入即可消去衰减项或写入项</summary>
+      <p>$\alpha_t \to 1$：$S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$，即 DeltaNet；$\beta_t \to 0$：$S_t = S_{t-1}(\alpha_t \cdot I) + 0 = \alpha_t S_{t-1}$，即 Mamba2 在 $v_t = 0$ 时的特殊情形（注意完整 Mamba2 还有加性写入项）。</p>
+    </details>
+  </li>
+  <li>
+    <p>用一句话说明为什么 Gated DeltaNet 训练时不能直接串行递归。</p>
+    <details>
+      <summary>解答：递归依赖链长为 $L$</summary>
+      <p>训练需算整段序列的状态 $S_1, \ldots, S_L$，而每个 $S_t$ 依赖 $S_{t-1}$，串行 $L$ 步的依赖链无法利用 GPU 的并行计算能力，长序列上不可接受。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明 chunkwise 算法的两个层次（chunk 内并行、chunk 间递归）各做什么，以及 $\alpha_t$ 为什么不破坏 Tensor Core 兼容性。</p>
+    <details>
+      <summary>解答：WY 表示化递归为矩阵乘法，状态逐 chunk 传递</summary>
+      <p>chunk 内用扩展 WY 表示把递归展开为矩阵乘法并行计算；chunk 间递归传递 chunk 末尾的状态作为下一段初始状态。$\alpha_t$ 只做逐元素（标量）乘法，不改变矩阵乘法结构，因此保持 Tensor Core 兼容。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章讲了退化关系与并行训练算法。但 Gated DeltaNet 在真实任务上表现如何、与 KDA 有何区别——下一章看与 KDA 的关系及实验效果。</p>
 
-<h2 id="kda-and-experiments">与 KDA 的关系及实验效果——α_t 从标量到 channel-wise</h2>
+<h2 id="kda-and-experiments">5. 与 KDA 的关系及实验效果——$\alpha_t$ 从标量到 channel-wise</h2>
 
-<h3 id="gated-deltanet-vs-kda">Gated DeltaNet 与 KDA 的 α_t 区别</h3>
+<h3 id="gated-deltanet-vs-kda">5.1 Gated DeltaNet 与 KDA 的 $\alpha_t$ 区别</h3>
 
-<p>Gated DeltaNet 是 Kimi K3 的 <a href="../kda/index.html">KDA（Kimi Delta Attention）</a> 的直接前身。KDA 基于 Gated DeltaNet 但做了三项改动<sup>[C8]</sup>，其中最关键的是 α_t 的设计（下表 KDA 列的 $g$ 为 log-decay，$\alpha_t = e^g$）：</p>
+<p>Gated DeltaNet 是 Kimi K3 的 <a href="../kda/index.html">KDA（Kimi Delta Attention）</a> 的直接前身。KDA 基于 Gated DeltaNet 但做了三项改动<sup>[C8]</sup>，其中最关键的是 $\alpha_t$ 的设计（下表 KDA 列的 $g$ 为 log-decay，$\alpha_t = e^g$）：</p>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th>设计项</th><th>Gated DeltaNet</th><th>KDA</th></tr></thead>
 <tbody>
-<tr><td>α_t 形状</td><td>标量（每步一个衰减率作用于整张 S）</td><td>channel-wise 向量（每 key 通道一个独立衰减率）</td></tr>
-<tr><td>decay 参数化</td><td>sigmoid（α_t ∈ (0,1)，无下界约束）</td><td>scaled sigmoid（$g \in (g_{\min}, 0)$，lower-bounded）</td></tr>
+<tr><td>$\alpha_t$ 形状</td><td>标量（每步一个衰减率作用于整张 S）</td><td>channel-wise 向量（每 key 通道一个独立衰减率）</td></tr>
+<tr><td>decay 参数化</td><td>sigmoid（$\alpha_t \in (0,1)$，无下界约束）</td><td>scaled sigmoid（$g \in (g_{\min}, 0)$，lower-bounded）</td></tr>
 <tr><td>output gate</td><td>（论文未特别强调 full-rank）</td><td>full-rank output gate</td></tr>
 </tbody>
 </table>
 </div>
 
-<p><strong>α_t 标量 vs channel-wise 的区别影响什么</strong>：Gated DeltaNet 的 α_t 是标量，整张 $S_{t-1}$ 按同一速率衰减——所有 key-value 关联同比例缩小，无法按通道差异化遗忘。KDA 的 α_t 是向量 $\alpha_t \in (0,1)^{d_k}$，每个 key 通道一个独立衰减率——$S_{t-1}$ 的不同行可以按不同速率衰减，模型能按通道差异化遗忘。这是 KDA 相对 Gated DeltaNet 的表达力提升。</p>
+<p><strong>$\alpha_t$ 标量 vs channel-wise 的区别影响什么</strong>：Gated DeltaNet 的 $\alpha_t$ 是标量，整张 $S_{t-1}$ 按同一速率衰减——所有 key-value 关联同比例缩小，无法按通道差异化遗忘。KDA 的 $\alpha_t$ 是向量 $\alpha_t \in (0,1)^{d_k}$，每个 key 通道一个独立衰减率——$S_{t-1}$ 的不同行可以按不同速率衰减，模型能按通道差异化遗忘。这是 KDA 相对 Gated DeltaNet 的表达力提升。</p>
 
-<p><strong>lower-bounded decay 的动机</strong>：Gated DeltaNet 的 α_t = σ(W_α x_t) ∈ (0,1) 可任意接近 0，累积衰减倒数可能溢出 BF16。KDA 把 decay 参数化改为 scaled sigmoid（限定 $g \in (g_{\min}, 0)$，K3 取 $g_{\min} = -5$），让 α_t 有下界 $e^{-5} \approx 0.0067$，使 chunkwise 形式的对角 tile 也能用 Tensor Core。这是工程稳定性改动，不影响递归形式本身。详见 <a href="../kda/index.html">KDA</a>。</p>
+<p><strong>lower-bounded decay 的动机</strong>：Gated DeltaNet 的 $\alpha_t = \sigma(W_\alpha x_t) \in (0,1)$ 可任意接近 0，累积衰减倒数可能溢出 BF16。KDA 把 decay 参数化改为 scaled sigmoid（限定 $g \in (g_{\min}, 0)$，K3 取 $g_{\min} = -5$），让 $\alpha_t$ 有下界 $e^{-5} \approx 0.0067$，使 chunkwise 形式的对角 tile 也能用 Tensor Core。这是工程稳定性改动，不影响递归形式本身。详见 <a href="../kda/index.html">KDA</a>。</p>
 
-<p><strong>公式差异</strong>：Gated DeltaNet 是 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$（α_t 标量可交换）；KDA 是 $S_t = (I - \beta_t k_t k_t^\top)\mathrm{Diag}(\alpha_t) S_{t-1} + \beta_t k_t v_t^\top$（α_t 向量不能与 $I - \beta_t k_t k_t^\top$ 交换，乘法顺序由 $\mathrm{Diag}(\alpha_t)$ 在左侧决定）。两者形式同源但 α_t 形状与参数化不同。</p>
+<p><strong>公式差异</strong>：Gated DeltaNet 是 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$（$\alpha_t$ 标量可交换）；KDA 是 $S_t = (I - \beta_t k_t k_t^\top)\mathrm{Diag}(\alpha_t) S_{t-1} + \beta_t k_t v_t^\top$（$\alpha_t$ 向量不能与 $I - \beta_t k_t k_t^\top$ 交换，乘法顺序由 $\mathrm{Diag}(\alpha_t)$ 在左侧决定）。两者形式同源但 $\alpha_t$ 形状与参数化不同。</p>
 
-<h3 id="experiments">实验效果：Gated DeltaNet 在哪些任务上占优</h3>
+<h3 id="experiments">5.2 实验效果：Gated DeltaNet 在哪些任务上占优</h3>
 
 <p>Yang 2025 ICLR §4 在 1.3B 参数 / 100B tokens（FineWeb-Edu）设置下对比 Gated DeltaNet、DeltaNet、Mamba2、Transformer++<sup>[N1]</sup>：</p>
 
@@ -1090,55 +1197,73 @@ Degradation beta=0: Gated DeltaNet == alpha * S_2: True
 <tbody>
 <tr><td>DeltaNet</td><td>18.6</td><td>数字针检索上显著退化</td></tr>
 <tr><td>Mamba2</td><td>56.2</td><td>—</td></tr>
-<tr class="highlight-row"><td>Gated DeltaNet</td><td>92.2</td><td>α_t 全局衰减让模型能"忘掉旧话题聚焦新问题"</td></tr>
+<tr class="highlight-row"><td>Gated DeltaNet</td><td>92.2</td><td>$\alpha_t$ 全局衰减让模型能"忘掉旧话题聚焦新问题"</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>DeltaNet 在简单 S-NIAH-1 上接近完美，但在干扰更强的 S-NIAH-2/3（number/uuid 针，非真实文本）上性能显著下降——这正对应 §1 说的"DeltaNet 缺乏快速清空整段记忆"。Gated DeltaNet 的 α_t 让模型能在上下文切换时快速衰减过时段落，检索能力大幅提升<sup>[N2]</sup>。这是 Gated DeltaNet 相对 DeltaNet 的核心实证收益。</p>
+<p>DeltaNet 在简单 S-NIAH-1 上接近完美，但在干扰更强的 S-NIAH-2/3（number/uuid 针，非真实文本）上性能显著下降——这正对应 §1 说的"DeltaNet 缺乏快速清空整段记忆"。Gated DeltaNet 的 $\alpha_t$ 让模型能在上下文切换时快速衰减过时段落，检索能力大幅提升<sup>[N2]</sup>。这是 Gated DeltaNet 相对 DeltaNet 的核心实证收益。</p>
 
-<h3 id="real-world-apps">现实应用</h3>
+<h3 id="real-world-apps">5.3 现实应用</h3>
 
 <p>Gated DeltaNet 已被多个实际模型采用：</p>
 
 <ul>
   <li><strong>Qwen3-Next</strong> 采用混合架构，75% 层用 Gated DeltaNet 作线性层、25% 层用 Gated Attention，以极小的全注意力预算补回精确检索能力<sup>[N4]</sup>。</li>
-  <li><strong>Kimi K3</strong> 的 <a href="../kda/index.html">KDA</a> 基于 Gated DeltaNet，把 α_t 改为 channel-wise + lower-bounded decay 以适配 BF16 训练。K3 的 93 层 backbone 中 69 层用 KDA。</li>
+  <li><strong>Kimi K3</strong> 的 <a href="../kda/index.html">KDA</a> 基于 Gated DeltaNet，把 $\alpha_t$ 改为 channel-wise + lower-bounded decay 以适配 BF16 训练。K3 的 93 层 backbone 中 69 层用 KDA。</li>
   <li>论文还探索了<strong>混合架构</strong> Gated DeltaNet-H1（GDN + 滑动窗口注意力 SWA）与 Gated DeltaNet-H2（GDN + Mamba2 + SWA），在长程状态建模与局部精细对齐之间折中。本页不展开混合架构设计。</li>
 </ul>
 
 <p>开源实现在 NVlabs/GatedDeltaNet 与 flash-linear-attention 库（Triton kernel）<sup>[N5]</sup>。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说明 Gated DeltaNet 与 KDA 在 α_t 形状上的区别，以及这个区别影响什么（提示：标量 vs channel-wise）。</li>
-  <li>说明 KDA 为什么要把 decay 参数化改为 lower-bounded scaled sigmoid（提示：BF16 数值稳定性）。</li>
-  <li>用 S-NIAH-2 的数字说明 Gated DeltaNet 相对 DeltaNet 的核心收益在哪类任务上。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说明 Gated DeltaNet 与 KDA 在 $\alpha_t$ 形状上的区别，以及这个区别影响什么（提示：标量 vs channel-wise）。</p>
+    <details>
+      <summary>解答：标量同速率衰减，向量按通道差异化</summary>
+      <p>Gated DeltaNet 的 $\alpha_t$ 是标量，整张 $S$ 按同一速率衰减；KDA 的 $\alpha_t$ 是 channel-wise 向量，每个 key 通道有独立衰减率。区别影响遗忘的粒度：KDA 能按通道差异化遗忘，表达力更强。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明 KDA 为什么要把 decay 参数化改为 lower-bounded scaled sigmoid（提示：BF16 数值稳定性）。</p>
+    <details>
+      <summary>解答：避免累积衰减倒数溢出</summary>
+      <p>无下界的 $\alpha_t$ 可任意接近 0，chunkwise 形式中累积衰减的倒数在 BF16 下可能溢出。限定 $g \in (g_{\min}, 0)$（K3 取 $g_{\min} = -5$）使 $\alpha_t \geq e^{-5} \approx 0.0067$，对角 tile 保持 Tensor Core 兼容。</p>
+    </details>
+  </li>
+  <li>
+    <p>用 S-NIAH-2 的数字说明 Gated DeltaNet 相对 DeltaNet 的核心收益在哪类任务上。</p>
+    <details>
+      <summary>解答：需要上下文切换的检索任务</summary>
+      <p>S-NIAH-2 4K 数字针检索上 Gated DeltaNet 92.2 vs DeltaNet 18.6——全局衰减让模型在话题切换后快速清空过时段落、聚焦当前问题，恢复精确检索能力；这正是 DeltaNet「缺乏快速清空整段记忆」的短板。</p>
+    </details>
+  </li>
+</ol>
 
-<p>五问已答完：DeltaNet 缺全局遗忘、Mamba2 缺方向擦除，Gated DeltaNet 把两者统一；公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 中 α_t 控全局衰减、β_t 控单点覆写，"先衰减后擦写"；$\alpha_t \to 1$ 退化为 DeltaNet、$\beta_t \to 0$ 退化为 Mamba2 特殊情形，chunkwise 算法让训练可并行；KDA 把 α_t 改 channel-wise + lower-bounded decay。这正是 K3 中 KDA 选择 Gated DeltaNet 作基础、再工程化改造的前提。</p>
+<p>五问已答完：DeltaNet 缺全局遗忘、Mamba2 缺方向擦除，Gated DeltaNet 把两者统一；公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 中 $\alpha_t$ 控全局衰减、$\beta_t$ 控单点覆写，"先衰减后擦写"；$\alpha_t \to 1$ 退化为 DeltaNet、$\beta_t \to 0$ 退化为 Mamba2 特殊情形，chunkwise 算法让训练可并行；KDA 把 $\alpha_t$ 改 channel-wise + lower-bounded decay。这正是 K3 中 KDA 选择 Gated DeltaNet 作基础、再工程化改造的前提。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 
 <p><b>C1（DeltaNet 缺乏全局遗忘）</b>：Yang, Kautz & Hatamizadeh. "Gated Delta Networks: Improving Mamba2 with Delta Rule." ICLR 2025, arXiv:2412.06464 §2.3 与 §1。§2.3 原文 "it lacks the ability to rapidly clear outdated information, particularly during context switches"。</p>
 
-<p><b>C2（Mamba2 标量衰减门机制）</b>：Yang 2025 ICLR arXiv:2412.06464 §2.2。原文 "Mamba2 decays all key-value associations uniformly by a dynamic ratio α_t" 与 "this approach does not account for the varying importance of different key-value associations"。</p>
+<p><b>C2（Mamba2 标量衰减门机制）</b>：Yang 2025 ICLR arXiv:2412.06464 §2.2。原文 "Mamba2 decays all key-value associations uniformly by a dynamic ratio $\alpha_t$" 与 "this approach does not account for the varying importance of different key-value associations"。</p>
 
 <p><b>C3（Gated DeltaNet 公式）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1 Eq.8。原文公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$。</p>
 
-<p><b>C4（α_t 与 β_t 职责分工）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1。原文 "the data-dependent gating term α_t ∈ (0,1) controls state decay" 与 §1 "gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
+<p><b>C4（$\alpha_t$ 与 $\beta_t$ 职责分工）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1。原文 "the data-dependent gating term $\alpha_t \in (0,1)$ controls state decay" 与 §1 "gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
 
-<p><b>C5（"先衰减后擦写"等价解读）</b>：由 C3 公式结合矩阵乘法结合律与标量交换律直接得到：$S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) = \alpha_t \cdot S_{t-1}(I - \beta_t k_t k_t^\top)$（α_t 标量可交换）。适用条件：α_t 是标量。</p>
+<p><b>C5（"先衰减后擦写"等价解读）</b>：由 C3 公式结合矩阵乘法结合律与标量交换律直接得到：$S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) = \alpha_t \cdot S_{t-1}(I - \beta_t k_t k_t^\top)$（$\alpha_t$ 标量可交换）。适用条件：$\alpha_t$ 是标量。</p>
 
 <p><b>C6（chunkwise 并行算法）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.2 Eq.9-12。原文 "the gating term only performs element-wise multiplication and does not affect the matrix multiplication structure, thus compatible with tensor core GPU optimization"。WY 表示引自 Bischof & Van Loan 1985（论文引用 [Bischof & Loan, 1985]）。</p>
 
 <p><b>C7（与 Mamba2、DeltaNet 互补）</b>：Yang 2025 ICLR arXiv:2412.06464 §1 与 §3.1。§1 原文 "we observe that these mechanisms are complementary—gating enables rapid memory erasure while the delta rule facilitates targeted updates"。</p>
 
-<p><b>C8（与 KDA 的 α_t 区别）</b>：Kimi K3 Technical Report §2.1.1 Eq.1、Eq.5（KDA 公式与 scaled sigmoid）；Gated DeltaNet 公式见 C3。KDA 完整讲解见 <a href="../kda/index.html">wiki/kda/</a>。</p>
+<p><b>C8（与 KDA 的 $\alpha_t$ 区别）</b>：Kimi K3 Technical Report §2.1.1 Eq.1、Eq.5（KDA 公式与 scaled sigmoid）；Gated DeltaNet 公式见 C3。KDA 完整讲解见 <a href="../kda/index.html">wiki/kda/</a>。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 
 <p><b>F1（Gated DeltaNet 递归公式）</b>：Yang 2025 ICLR arXiv:2412.06464 §3.1 Eq.8。</p>
 
@@ -1160,26 +1285,26 @@ Degradation beta=0: Gated DeltaNet == alpha * S_2: True
 
 <p><b>N5</b>（开源实现）：NVlabs/GatedDeltaNet（论文官方实现，NVIDIA）；flash-linear-attention 库（Songlin Yang 维护，含 Triton kernel）。两者均为 Gated DeltaNet 的开源实现。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 
 <p>本页构造了一组教学数字，均非真实模型数据：</p>
 
 <ul>
-  <li><b>手算主例子</b>：$d = 2$ 维、$L = 3$ 步、key 归一化（$k_1 = (1,0)^\top, k_2 = (0,1)^\top$ 正交，$k_3 = k_1$）。$v_1 = (1,0)^\top, v_2 = (0,1)^\top, v_3 = (0,1)^\top$；$\beta_1 = \beta_2 = \beta_3 = 1$；$\alpha_1 = \alpha_2 = 1$，$\alpha_3 = 0.5$。构造目的：第 1-2 步在两个正交方向各写一个关联，第 3 步覆写 $k_1$ 方向（β=1）同时全局衰减（α=0.5），让 α_t 衰减非 $k_t$ 方向（$k_2$）的效果可见。沿用 <a href="../delta-rule/index.html">Delta 规则</a>概念页的 key/value 设定，便于读者复用已有手算经验。</li>
-  <li><b>对照设定</b>：DeltaNet 取 $\alpha = 1$（无衰减），Mamba2 取 $\beta = 0$（无写入，只衰减）。两者均非完整模型在真实序列上的行为，只为对照 Gated DeltaNet 的 α_t 与 β_t 各自贡献。</li>
+  <li><b>手算主例子</b>：$d = 2$ 维、$L = 3$ 步、key 归一化（$k_1 = (1,0)^\top, k_2 = (0,1)^\top$ 正交，$k_3 = k_1$）。$v_1 = (1,0)^\top, v_2 = (0,1)^\top, v_3 = (0,1)^\top$；$\beta_1 = \beta_2 = \beta_3 = 1$；$\alpha_1 = \alpha_2 = 1$，$\alpha_3 = 0.5$。构造目的：第 1-2 步在两个正交方向各写一个关联，第 3 步覆写 $k_1$ 方向（$\beta=1$）同时全局衰减（$\alpha=0.5$），让 $\alpha_t$ 衰减非 $k_t$ 方向（$k_2$）的效果可见。沿用 <a href="../delta-rule/index.html">Delta 规则</a>概念页的 key/value 设定，便于读者复用已有手算经验。</li>
+  <li><b>对照设定</b>：DeltaNet 取 $\alpha = 1$（无衰减），Mamba2 取 $\beta = 0$（无写入，只衰减）。两者均非完整模型在真实序列上的行为，只为对照 Gated DeltaNet 的 $\alpha_t$ 与 $\beta_t$ 各自贡献。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 
-<p><b>"先衰减后擦写"类比</b>：把 $\alpha_t(I - \beta_t k_t k_t^\top)$ 解释为"先衰减整张、再擦写 $k_t$ 方向"是教学解释，服务于理解 C5 的等价关系。失效边界：(1) 仅当 α_t 是标量时可交换；KDA 的 channel-wise α_t 不能这样交换；(2) "先衰减"指 α_t 作用于 $S_{t-1}$，不包括 $\beta_t v_t k_t^\top$ 写入项（写入项不被 α_t 衰减）；(3) "擦写"仍受 $\beta_t$ 控制，$\beta_t < 1$ 时是部分擦除。正式判断以 F1 公式为准。</p>
+<p><b>"先衰减后擦写"类比</b>：把 $\alpha_t(I - \beta_t k_t k_t^\top)$ 解释为"先衰减整张、再擦写 $k_t$ 方向"是辅助解释，服务于理解 C5 的等价关系。失效边界：(1) 仅当 $\alpha_t$ 是标量时可交换；KDA 的 channel-wise $\alpha_t$ 不能这样交换；(2) "先衰减"指 $\alpha_t$ 作用于 $S_{t-1}$，不包括 $\beta_t v_t k_t^\top$ 写入项（写入项不被 $\alpha_t$ 衰减）；(3) "擦写"仍受 $\beta_t$ 控制，$\beta_t < 1$ 时是部分擦除。正式判断以 F1 公式为准。</p>
 
-<p><b>"Gated DeltaNet = DeltaNet + Mamba2"类比</b>：把 Gated DeltaNet 说成"DeltaNet 与 Mamba2 的统一"是教学解释，服务于理解退化关系 F2。失效边界：(1) Gated DeltaNet 不是两个模型的简单拼接，而是把 α_t 嵌进 delta 规则的擦除项前；(2) $\beta_t \to 0$ 退化为 Mamba2 在 $v_t = 0$ 的特殊情形，完整 Mamba2 还有 $+ v_t k_t^\top$ 写入项；(3) Gated DeltaNet 的训练算法与 Mamba2/DeltaNet 都不同（扩展 WY 表示）。</p>
+<p><b>"Gated DeltaNet = DeltaNet + Mamba2"类比</b>：把 Gated DeltaNet 说成"DeltaNet 与 Mamba2 的统一"是辅助解释，服务于理解退化关系 F2。失效边界：(1) Gated DeltaNet 不是两个模型的简单拼接，而是把 $\alpha_t$ 嵌进 delta 规则的擦除项前；(2) $\beta_t \to 0$ 退化为 Mamba2 在 $v_t = 0$ 的特殊情形，完整 Mamba2 还有 $+ v_t k_t^\top$ 写入项；(3) Gated DeltaNet 的训练算法与 Mamba2/DeltaNet 都不同（扩展 WY 表示）。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 
 <ul>
   <li><b>手算取 $d_v = d_k = 2$</b>。可推出：公式正确性与维度无关。不可推出：真实模型 $d = 64$ 或 $128$ 时的行为。</li>
-  <li><b>手算取 $\alpha_t = 0.5$</b>。可推出：α_t 衰减非 $k_t$ 方向的效果可见。不可推出：真实 $\alpha_t = \sigma(W_\alpha x_t)$ 的取值分布。</li>
+  <li><b>手算取 $\alpha_t = 0.5$</b>。可推出：$\alpha_t$ 衰减非 $k_t$ 方向的效果可见。不可推出：真实 $\alpha_t = \sigma(W_\alpha x_t)$ 的取值分布。</li>
   <li><b>不展开 WY 表示与 chunkwise 推导</b>。可推出：chunkwise 算法存在且兼容 Tensor Core。不可推出：UT 变换、前向替换等数值线性代数细节。</li>
   <li><b>代码用 numpy 标量循环，只讲单头</b>。可推出：公式正确性与单头更新规则。不可推出：训练效率与多头工程实现。</li>
   <li><b>不展开混合架构 H1/H2 与在线学习视角</b>。可推出：GDN + SWA 的组成与在线学习目标存在。不可推出：混合架构设计与目标函数推导。</li>

@@ -580,6 +580,12 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    /* ============ 问题块 ============ */
+    .learning-goals ol,
+    .misconceptions ol { margin-bottom: 0; }
+    ol.chapter-questions > li { margin-bottom: 1.25rem; }
+    ol.chapter-questions > li:last-child { margin-bottom: 0; }
+    ol.chapter-questions details { margin: 0.6rem 0 0; }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -589,6 +595,17 @@
       border-radius: 6px;
       line-height: 1.5;
       margin: 1.5rem 0;
+    }
+    /* ============ 流程图（SVG + foreignObject）============ */
+    .flow-svg { display: block; width: 100%; max-width: 660px; height: auto; margin: 2rem auto; }
+    .flow-svg .node { fill: var(--bg-soft); stroke: var(--border); stroke-width: 1; }
+    .flow-svg .edge { fill: none; stroke: var(--text-muted); stroke-width: 1.2; }
+    .flow-svg .arrow { fill: var(--text-muted); }
+    .flow-svg foreignObject div {
+      box-sizing: border-box; width: 100%; height: 100%;
+      display: flex; align-items: center; justify-content: center;
+      text-align: center; font-family: var(--font-ui);
+      font-size: 14px; line-height: 1.35; color: var(--text); padding: 2px 6px;
     }
     @media (max-width: 600px) {
       .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
@@ -664,17 +681,47 @@
 <p>让一个 70B 模型生成 100 个 token，为什么必须串行调用 100 次大模型？每次调用要把全部约 140GB 权重从显存读一遍，却只用它算 1 个 token 的概率——剩下的算力白白空转。能不能把这些空转的算力用来「猜」未来几个 token、再让大模型一次核对？投机解码（Speculative Decoding）就是回答这个问题的方法：用一个小而快的 draft 模型自回归地猜若干个候选 token，大 target 模型一次性并行验证，按修改版拒绝采样规则接受匹配的、修正不匹配的，从而在不改变输出分布的前提下减少大模型的串行调用次数。Chen et al. 2023 把同一机制称为 Speculative Sampling<sup>[C1]</sup>。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>自回归解码慢在哪里，为什么「并行验证多个 token」几乎不增加成本？</li>
-    <li>Draft-then-Verify 一轮做了什么，每个 token 在什么条件下被接受或拒绝？</li>
-    <li>为什么这个接受/拒绝规则能保证输出分布与纯 target 采样完全相同？</li>
-    <li>接受率 $\alpha$ 和草稿长度 $\gamma$ 如何决定加速比，什么时候反而更慢？</li>
-    <li>贪心解码下规则如何退化，与采样情形的关系是什么？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>自回归解码慢在哪里，为什么「并行验证多个 token」几乎不增加成本？</p>
+      <details>
+        <summary>解答：单步解码受内存带宽限制，多算几个位置几乎免费</summary>
+        <p>每生成一个 token 都要把模型全部权重从显存读一遍（70B 模型约 140GB），墙钟时间由内存带宽决定，所需算术量相对极低，计算单元大量空闲。因果注意力让同一次前向传播同时对序列每个位置输出分布，多算 $\gamma$ 个位置落在空闲计算单元上，几乎不增加时间。机制见「1. 为什么串行解码慢」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Draft-then-Verify 一轮做了什么，每个 token 在什么条件下被接受或拒绝？</p>
+      <details>
+        <summary>解答：draft 猜 $\gamma$ 个候选，target 一次前向按比值逐位判定</summary>
+        <p>draft 模型自回归采样 $\gamma$ 个候选并记录每步分布 $q_i$；target 对拼接后的序列做一次前向，得到 $\gamma+1$ 个位置分布 $p_i$。对每个候选 $x_i$ 以 $a_i = \min(1, p_i(x_i)/q_i(x_i))$ 的概率接受：$p_i \geq q_i$ 必接受，$p_i < q_i$ 按比值概率接受，$p_i = 0$ 必拒绝。首个拒绝处从残差分布重采样一个 token 并停止；全部接受时从 $p_{\gamma+1}$ 免费多采一个。流程见「2. Draft-then-Verify」。</p>
+      </details>
+    </li>
+    <li>
+      <p>为什么这个接受/拒绝规则能保证输出分布与纯 target 采样完全相同？</p>
+      <details>
+        <summary>解答：接受步骤的偏置被残差重采样恰好补回</summary>
+        <p>单位置上 token $x$ 被采出的概率分两条互斥路径：draft 采到且接受贡献 $\min(q(x), p(x))$，发生拒绝且残差重采样到 $x$ 贡献 $\max(0, p(x)-q(x))$；由恒等式 $\min(a,b) + \max(0, b-a) = b$，两者相加恰为 $p(x)$。逐位置成立即整条序列的输出分布与纯 target 采样相同。证明见「3. 为什么这条规则能保分布」。</p>
+      </details>
+    </li>
+    <li>
+      <p>接受率 $\alpha$ 和草稿长度 $\gamma$ 如何决定加速比，什么时候反而更慢？</p>
+      <details>
+        <summary>解答：$S = (1-\alpha^{\gamma+1})/[(1-\alpha)(1+\gamma c)]$，低接受率或高负载会退化</summary>
+        <p>每轮期望产出 $\mathbb{E}[L] = (1-\alpha^{\gamma+1})/(1-\alpha)$ 个 token，成本为 $1 + \gamma c$（$c$ 为 draft 与 target 单步时间比），加速比 $S = \mathbb{E}[L]/(1+\gamma c)$。$\alpha$ 低或 $c$ 大时 $S$ 趋向 1 甚至小于 1；高负载批处理下「空闲算力」消失，实测出现 1.4×-1.8× 减速。量化分析见「4. 能快多少」。</p>
+      </details>
+    </li>
+    <li>
+      <p>贪心解码下规则如何退化，与采样情形的关系是什么？</p>
+      <details>
+        <summary>解答：退化为逐位 argmax 匹配，是采样情形的特例</summary>
+        <p>贪心对应 $p$、$q$ 退化为点质量分布：draft 与 target 的 argmax 相同时比值为 1、必接受；不同时 $p(x) = 0$、必拒绝，残差重采样直接取 target 的 argmax。因此规则变为「逐位检查 draft 的 argmax 是否等于 target 的 argmax，遇到不等处取 target 的 argmax 并停止」，输出与纯 target 贪心解码一致。讨论见「3. 为什么这条规则能保分布」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
-<h2 id="why-sequential-slow">为什么串行解码慢——内存带宽留下的「免费午餐」</h2>
+<h2 id="why-sequential-slow">1. 为什么串行解码慢——内存带宽留下的「免费午餐」</h2>
 
 <p>自回归解码的工作方式是：每次把已生成的 token 序列喂给模型，模型做一次前向传播，得到下一个位置上的概率分布，从中采样一个 token，再把它拼回序列、重复下一步。每一步都依赖上一步的输出，因此必须串行。这里的「一次前向传播」会用到一个叫 KV cache 的机制——把历史 token 的注意力键值缓存下来，避免重复计算——但每一步仍然要把模型的全部权重从显存读一遍。</p>
 
@@ -682,61 +729,81 @@
 
 <p>这一点带来一个反直觉的机会。Transformer 的因果注意力让一次前向传播可以同时对序列每个位置输出分布（见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>）。如果把输入序列延长 $\gamma$ 个位置，同一次前向传播就额外给出了 $\gamma$ 个位置上的分布，而墙钟时间几乎不变——因为瓶颈是「把权重读一遍」这件事，读一遍权重之后，多用它算几个位置的乘积几乎不增加时间，多余的算术落在原本空闲的计算单元上。这就是投机解码的硬件前提：</p>
 
-<pre class="diagram">单 token 解码（标准）        γ+1 token 验证（投机）
-┌──────────────────┐         ┌──────────────────────────────┐
-│ 读权重 140GB     │ 42ms    │ 读权重 140GB                 │ 42ms
-│ 算 1 个位置      │ ≈0      │ 算 γ+1 个位置                │ ≈0+ε
-│ 总计             │ ≈42ms   │ 总计                         │ ≈42ms
-└──────────────────┘         └──────────────────────────────┘
-        ↓                              ↓
-   产出 1 token                  产出 1~γ+1 token
-</pre>
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>单 token 解码（标准）</th><th>$\gamma+1$ token 验证（投机）</th></tr></thead>
+<tbody>
+<tr><td>读权重（约 140GB）</td><td>约 42ms</td><td>约 42ms</td></tr>
+<tr><td>计算位置数</td><td>1 个，耗时 $\approx 0$</td><td>$\gamma+1$ 个，耗时 $\approx 0 + \varepsilon$</td></tr>
+<tr><td>单步总计</td><td>$\approx 42$ms</td><td>$\approx 42$ms</td></tr>
+<tr><td>单步产出</td><td>1 个 token</td><td>$1 \sim \gamma+1$ 个 token</td></tr>
+</tbody>
+</table>
+</div>
 
-<p>教学解释。 把「读权重」理解为「开车去仓库取货」：取一次货的开车时间是固定的，不管取一件还是取 $\gamma+1$ 件，开车时间都一样；只要这 $\gamma+1$ 件货值得取，跑一趟就更划算。这个类比只帮助理解「读权重」与「算位置」的时间量级差异。它不覆盖批量推理下的吞吐竞争（高并发时多个请求要抢同一份带宽），也不覆盖流水线并行下的气泡问题；正式判断仍以单流低负载下的带宽分析与第 4 章的加速比公式为准。</p>
+<p>教学解释。 把「读权重」理解为「开车去仓库取货」：取一次货的开车时间是固定的，不管取一件还是取 $\gamma+1$ 件，开车时间都一样；只要这 $\gamma+1$ 件货值得取，跑一趟就更划算。这个类比只帮助理解「读权重」与「算位置」的时间量级差异。它不覆盖批量推理下的吞吐竞争（高并发时多个请求要抢同一份带宽），也不覆盖流水线并行下的气泡问题；正式判断仍以单流低负载下的带宽分析与「能快多少」一章的加速比公式为准。</p>
 
-<p>这条「免费午餐」有一个硬条件：单流低负载。当批处理规模变大、多个请求已经把计算单元占满时，「空闲算力」就不存在了，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力，反而降低总吞吐。这个边界在第 4 章和第 6 章再展开。</p>
+<p>这条「免费午餐」有一个硬条件：单流低负载。当批处理规模变大、多个请求已经把计算单元占满时，「空闲算力」就不存在了，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力，反而降低总吞吐。这个边界在「能快多少」与「工程实例与边界」两章再展开。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话说出为什么单 token 解码是带宽受限而非计算受限。</li>
-  <li>「验证 $\gamma$ 个 token」与「生成 1 个 token」墙钟时间为何相近？说出硬件原因。</li>
-  <li>这条「验证几乎免费」的结论在什么负载条件下不成立。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话说出为什么单 token 解码是带宽受限而非计算受限。</p>
+    <details>
+      <summary>解答：单步墙钟时间由读权重决定，算术量极低</summary>
+      <p>每步要把全部权重从显存读一遍（70B 模型约 140GB，理论下限约 42ms），而算出一个 token 概率所需的乘加运算量相对极低，计算单元大部分时间在等权重到达。</p>
+    </details>
+  </li>
+  <li>
+    <p>「验证 $\gamma$ 个 token」与「生成 1 个 token」墙钟时间为何相近？说出硬件原因。</p>
+    <details>
+      <summary>解答：瓶颈是读权重，多算位置落在空闲计算单元上</summary>
+      <p>瓶颈是把权重读一遍这件事，与算几个位置无关。读完一遍权重后，因果注意力允许同一次前向对 $\gamma+1$ 个位置同时输出分布，额外乘加落在原本空闲的计算单元上，几乎不增加时间。</p>
+    </details>
+  </li>
+  <li>
+    <p>这条「验证几乎免费」的结论在什么负载条件下不成立？</p>
+    <details>
+      <summary>解答：高并发批处理下不成立</summary>
+      <p>多个请求把计算单元占满后，「空闲算力」不再存在，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力，总吞吐反而下降（vLLM 实测高查询率下出现 1.4×-1.8× 减速）。</p>
+    </details>
+  </li>
+</ol>
 
 <p>硬件允许「免费」核对 $\gamma$ 个 token——但核对什么？这 $\gamma$ 个候选 token 从哪里来？下一章讲 draft 模型如何提供候选、target 模型如何核对。</p>
 
-<h2 id="draft-then-verify">Draft-then-Verify——一轮做了什么</h2>
+<h2 id="draft-then-verify">2. Draft-then-Verify——一轮做了什么</h2>
 
 <p>投机解码用两个模型协同：一个小的 draft 模型 $q$（快但可能不准），一个大的 target 模型 $p$（慢但准，其分布 $p$ 是希望最终采样的目标分布）。每轮（一个 "superstep"）做五件事<sup>[C3-C6]</sup>：</p>
 
-<pre class="diagram">输入：当前前缀 prefix、draft 模型 q、target 模型 p、草稿长度 γ
-
-步骤 1 (Draft)     q 自回归采样 γ 个 token：x₁,x₂,…,x_γ
-                   保留每步分布 q₁,…,q_γ
-                            │
-步骤 2 (Verify)    p 对 [prefix + x₁,…,x_γ] 做单次前向 ──┐
-                   得 γ+1 个位置分布 p₁,…,p_γ, p_{γ+1}     │ 一次调用
-                            │                              │
-步骤 3 (Accept/   对 i=1..γ 逐位计算 a_i = min(1, p_i(x_i)/q_i(x_i))
-       Reject)    以概率 a_i 接受 x_i                       │
-                            │                              │
-              ┌─────────────┴─────────────┐                │
-        首个拒绝 i*                 全部接受                │
-              │                          │                  │
-步骤 4 (Resample)  从残差            步骤 5 (Bonus)        │
-                  p'_{i*} =         从 p_{γ+1} 免费       │
-                  norm(max(0,       采样一个 token         │
-                  p_{i*}-q_{i*}))                          │
-                  重采样 1 个,     产出 γ+1 个 token       │
-                  丢弃 i* 之后                              │
-                  的 draft,                                 │
-                  产出 i* 个 token                          │
-                            │                              │
-                            └──────────────────────────────┘
-                            ↓
-                  本轮产出 1 ~ γ+1 个 token
-                  （最差：首轮即拒，仍产出 1 个重采样 token）
-</pre>
+<svg class="flow-svg" viewBox="0 0 680 660" role="img" aria-label="Draft-then-Verify 一轮流程：draft 采样、target 一次前向验证、逐位接受或拒绝，分支为残差重采样或 bonus token">
+  <defs>
+    <marker id="sd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="arrow" d="M0,0 L10,5 L0,10 z"></path>
+    </marker>
+  </defs>
+  <rect class="node" x="140" y="16" width="400" height="52" rx="6"></rect>
+  <foreignObject x="140" y="16" width="400" height="52"><div xmlns="http://www.w3.org/1999/xhtml">输入：当前前缀 prefix、draft 模型 $q$、target 模型 $p$、草稿长度 $\gamma$</div></foreignObject>
+  <rect class="node" x="140" y="104" width="400" height="60" rx="6"></rect>
+  <foreignObject x="140" y="104" width="400" height="60"><div xmlns="http://www.w3.org/1999/xhtml">步骤 1 Draft：$q$ 自回归采样 $\gamma$ 个 token $x_1,\dots,x_\gamma$，保留每步分布 $q_1,\dots,q_\gamma$</div></foreignObject>
+  <rect class="node" x="140" y="196" width="400" height="64" rx="6"></rect>
+  <foreignObject x="140" y="196" width="400" height="64"><div xmlns="http://www.w3.org/1999/xhtml">步骤 2 Verify：$p$ 对 $\text{prefix} + (x_1,\dots,x_\gamma)$ 做一次前向，得 $\gamma+1$ 个位置分布 $p_1,\dots,p_{\gamma+1}$</div></foreignObject>
+  <rect class="node" x="140" y="292" width="400" height="64" rx="6"></rect>
+  <foreignObject x="140" y="292" width="400" height="64"><div xmlns="http://www.w3.org/1999/xhtml">步骤 3 接受/拒绝：对 $i = 1,\dots,\gamma$ 计算 $a_i = \min(1,\, p_i(x_i)/q_i(x_i))$，以概率 $a_i$ 接受 $x_i$</div></foreignObject>
+  <rect class="node" x="40" y="420" width="290" height="116" rx="6"></rect>
+  <foreignObject x="40" y="420" width="290" height="116"><div xmlns="http://www.w3.org/1999/xhtml">步骤 4 重采样（首个拒绝 $i^\*$）：从残差 $p'_{i^\*} = \mathrm{norm}(\max(0,\, p_{i^\*} - q_{i^\*}))$ 重采样 1 个 token，丢弃其后 draft，产出 $i^\*$ 个</div></foreignObject>
+  <rect class="node" x="350" y="420" width="290" height="116" rx="6"></rect>
+  <foreignObject x="350" y="420" width="290" height="116"><div xmlns="http://www.w3.org/1999/xhtml">步骤 5 Bonus（全部接受）：从 $p_{\gamma+1}$ 免费采样 1 个 token（复用已做的前向），产出 $\gamma+1$ 个</div></foreignObject>
+  <rect class="node" x="140" y="584" width="400" height="56" rx="6"></rect>
+  <foreignObject x="140" y="584" width="400" height="56"><div xmlns="http://www.w3.org/1999/xhtml">本轮产出 $1 \sim \gamma+1$ 个 token（最差：首轮即拒，仍产出 1 个重采样 token）</div></foreignObject>
+  <polyline class="edge" points="340,68 340,104" marker-end="url(#sd-arrow)"></polyline>
+  <polyline class="edge" points="340,164 340,196" marker-end="url(#sd-arrow)"></polyline>
+  <polyline class="edge" points="340,260 340,292" marker-end="url(#sd-arrow)"></polyline>
+  <polyline class="edge" points="240,356 240,388 185,388 185,420" marker-end="url(#sd-arrow)"></polyline>
+  <polyline class="edge" points="440,356 440,388 495,388 495,420" marker-end="url(#sd-arrow)"></polyline>
+  <polyline class="edge" points="185,536 185,560 280,560 280,584" marker-end="url(#sd-arrow)"></polyline>
+  <polyline class="edge" points="495,536 495,560 400,560 400,584" marker-end="url(#sd-arrow)"></polyline>
+</svg>
 
 <p>逐步说明。 步骤 1：draft 模型用普通自回归方式采样 $\gamma$ 个 token $x_1,\dots,x_\gamma$，每步都记下分布 $q_i$（即 draft 在第 $i$ 步给各 token 的概率）。步骤 2：把前缀和 $\gamma$ 个 draft token 拼成一条序列，target 模型做<strong>一次</strong>前向传播，因为因果注意力，同时得到 $\gamma+1$ 个位置上的分布 $p_1,\dots,p_{\gamma+1}$（最后一个 $p_{\gamma+1}$ 是 bonus 位置，见步骤 5）。步骤 3：从左到右逐位判断。对第 $i$ 个 draft token $x_i$，计算接受概率</p>
 
@@ -755,17 +822,17 @@ $$a_i = \min\!\left(1, \frac{p_i(x_i)}{q_i(x_i)}\right).$$
 </table>
 </div>
 
-<p>直觉是：如果 target 觉得这个 token 至少和 draft 一样可能（$p \geq q$），就放心接受；如果 target 觉得 draft 高估了它（$p < q$），就以两者比值概率接受，比值越低越倾向于拒绝。这听起来像调参，但第 3 章会证明这个比值恰好让输出分布回到 $p$，不是任意选择。</p>
+<p>直觉是：如果 target 觉得这个 token 至少和 draft 一样可能（$p \geq q$），就放心接受；如果 target 觉得 draft 高估了它（$p < q$），就以两者比值概率接受，比值越低越倾向于拒绝。这听起来像调参，但「为什么这条规则能保分布」一章会证明这个比值恰好让输出分布回到 $p$，不是任意选择。</p>
 
 <p>步骤 4：在<strong>首个</strong>被拒绝的位置 $i^\*$，丢弃 $x_{i^\*}$ 及其后的全部 draft token，从残差分布<sup>[F2]</sup></p>
 
 $$p'_{i^\*}(x) = \frac{\max\!\big(0,\ p_{i^\*}(x) - q_{i^\*}(x)\big)}{\sum_{x'} \max\!\big(0,\ p_{i^\*}(x') - q_{i^\*}(x')\big)}$$
 
-<p>重采样一个 token 作为该位置最终输出，并结束本轮（不再验证后续 draft token）。残差分布把 target 比 draft「多给」的概率拿出来重新分配——直观上是在修正 draft 高估某些 token 造成的偏差。为什么不能直接从 $p$ 重采样？因为接受步骤已经偏向 $q$ 高的 token，必须用残差把被低估的部分补回去；第 3 章会严格证明这一点。注意：若 $p_i \leq q_i$ 处处成立（$p$ 被 $q$ 支配），则 $\max(0, p_i - q_i)$ 全为零、残差归一化无定义，但此时 $\min(1, p_i/q_i) = 1$ 处处成立、永不拒绝，残差分支根本不会被触发。</p>
+<p>重采样一个 token 作为该位置最终输出，并结束本轮（不再验证后续 draft token）。残差分布把 target 比 draft「多给」的概率拿出来重新分配——直观上是在修正 draft 高估某些 token 造成的偏差。为什么不能直接从 $p$ 重采样？因为接受步骤已经偏向 $q$ 高的 token，必须用残差把被低估的部分补回去；「为什么这条规则能保分布」一章会严格证明这一点。注意：若 $p_i \leq q_i$ 处处成立（$p$ 被 $q$ 支配），则 $\max(0, p_i - q_i)$ 全为零、残差归一化无定义，但此时 $\min(1, p_i/q_i) = 1$ 处处成立、永不拒绝，残差分支根本不会被触发。</p>
 
 <p>步骤 5：若 $\gamma$ 个 draft token 全部被接受，target 同一次前向传播已经给出了第 $\gamma+1$ 个位置的分布 $p_{\gamma+1}$，可以免费从中采样一个 bonus token——「免费」是因为它复用了已经做过的那一次前向传播，不需要额外调用 target。本轮最多产出 $\gamma+1$ 个 token。</p>
 
-<p>一轮的最差情况是首个 draft token 就被拒绝：此时仍从残差重采样出 1 个 token，产出与纯 target 解码相同（1 个 token，1 次 target 调用），只是浪费了 draft 的工作。因此投机解码从不比纯解码产出更少——它只可能更快，不可能更慢（单流下；高并发的退化见第 4 章）。</p>
+<p>一轮的最差情况是首个 draft token 就被拒绝：此时仍从残差重采样出 1 个 token，产出与纯 target 解码相同（1 个 token，1 次 target 调用），只是浪费了 draft 的工作。因此投机解码从不比纯解码产出更少——它只可能更快，不可能更慢（单流下；高并发的退化见「能快多少」一章）。</p>
 
 <details>
 <summary>代码：Draft-then-Verify 一轮的伪代码（把五步形式化）</summary>
@@ -812,17 +879,34 @@ $$p'_{i^\*}(x) = \frac{\max\!\big(0,\ p_{i^\*}(x) - q_{i^\*}(x)\big)}{\sum_{x'} 
 <p>注意 $p_i, q_i$ 都是给定前缀与之前 token 的条件分布，伪代码中省略条件记号以突出主线。每轮的 target 调用次数始终为 1，draft 调用次数始终为 $\gamma$，与接受多少无关。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 $\gamma$ 个 draft token 是怎么来的、为什么 target 只需要一次前向传播。</li>
-  <li>给定 $p(x)=0.4$、$q(x)=0.5$，算出 $a(x)$ 并说出是必接受还是概率接受。</li>
-  <li>说出残差分布在什么条件下才会被触发、什么条件下永远不会被触发。</li>
-  <li>说出 bonus token 在什么条件下产生、为什么叫「免费」。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出 $\gamma$ 个 draft token 是怎么来的、为什么 target 只需要一次前向传播。</p>
+    <details>
+      <summary>解答：draft 自回归采样，因果注意力让一次前向出全部位置分布</summary>
+      <p>draft 模型用普通自回归方式逐个采样 $\gamma$ 个候选，并记录每步分布 $q_i$。把前缀与 $\gamma$ 个候选拼成一条序列后，因果注意力使 target 的一次前向同时给出 $\gamma+1$ 个位置的条件分布（最后一个为 bonus 位置，全部接受时可免费多采一个 token）。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 $p(x)=0.4$、$q(x)=0.5$，算出 $a(x)$ 并说出是必接受还是概率接受。</p>
+    <details>
+      <summary>解答：$a(x) = 0.8$，概率接受</summary>
+      <p>$a(x) = \min(1, 0.4/0.5) = 0.8$。因 $p(x) < q(x)$（target 认为 draft 高估了这个 token），以 0.8 的概率接受、0.2 的概率拒绝。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出残差分布在什么条件下才会被触发、什么条件下永远不会被触发。</p>
+    <details>
+      <summary>解答：首个拒绝处触发；$p \leq q$ 处处成立时永不触发</summary>
+      <p>残差分布仅在某个位置出现首个拒绝后才被使用，用于重采样该位置的输出并结束本轮。若 $p_i \leq q_i$ 处处成立，则 $\min(1, p_i/q_i) = 1$ 处处成立、永不拒绝，残差分支根本不会被触发。</p>
+    </details>
+  </li>
+</ol>
 
 <p>机制讲完了——但为什么接受概率要写成 $\min(1, p/q)$？为什么拒绝后要从 $\max(0, p-q)$ 重采样而不是直接从 $p$？这些选择不是任意调参，下一章证明它们组合起来恰好让输出分布回到 $p$。</p>
 
-<h2 id="why-distribution-preserved">为什么这条规则能保分布——单位置证明</h2>
+<h2 id="why-distribution-preserved">3. 为什么这条规则能保分布——单位置证明</h2>
 
 <p>这一章回答投机解码最核心的问题：为什么这条接受/拒绝规则能保证输出分布与纯 target 采样<strong>完全相同</strong>（lossless）？答案浓缩成一句话：因为接受步骤偏置了分布，残差重采样恰好把偏置的部分补回去。下面把这句话展开成可手算的证明。</p>
 
@@ -867,7 +951,7 @@ $$\Pr[\text{emit } x] = \min\!\big(q(x), p(x)\big) + \max\!\big(0,\ p(x) - q(x)\
 <p>最后一步再用一次 $\min(a,b) + \max(0, b-a) = b$（取 $a = q(x), b = p(x)$）。证毕。</p>
 </details>
 
-<p>这个证明还顺手给出接受率的一个有用形式。第 3 章的 $\beta$ 是「拒绝概率」，那么「平均接受概率」$\alpha = 1 - \beta = \sum_x \min(p(x), q(x))$。用恒等式 $\min(a, b) = (a + b - |a - b|)/2$ 代入：</p>
+<p>这个证明还顺手给出接受率的一个有用形式。「为什么这条规则能保分布」一章的 $\beta$ 是「拒绝概率」，那么「平均接受概率」$\alpha = 1 - \beta = \sum_x \min(p(x), q(x))$。用恒等式 $\min(a, b) = (a + b - |a - b|)/2$ 代入：</p>
 
 $$\alpha = \sum_x \min(p(x), q(x)) = \sum_x \frac{p(x) + q(x) - |p(x) - q(x)|}{2} = 1 - \frac{1}{2}\sum_x |p(x) - q(x)| = 1 - \mathrm{TV}(p, q),$$
 
@@ -875,19 +959,36 @@ $$\alpha = \sum_x \min(p(x), q(x)) = \sum_x \frac{p(x) + q(x) - |p(x) - q(x)|}{2
 
 <p>最后看贪心解码的退化情形。贪心解码（greedy decoding）是每步取 argmax 的解码方式，对应 $p$ 与 $q$ 都退化为点质量分布——即 $p$ 把全部概率放在 target 的 argmax 上、$q$ 把全部概率放在 draft 的 argmax 上。此时 $p(x)/q(x)$ 只可能取两个值：若 draft 的 argmax 与 target 的 argmax 相同，则 $p(x) = q(x) = 1$、比值为 1、$\min(1, 1) = 1$，接受；若不同，则 $p(x) = 0$、比值为 0、$\min(1, 0) = 0$，拒绝。残差分布 $\mathrm{norm}(\max(0, p - q))$ 退化为 target 的 argmax 处概率 1，即直接取 target 的 argmax。因此贪心情形下规则退化为「逐位检查 draft 的 argmax 是否等于 target 的 argmax，遇到不等处取 target 的 argmax 并停止」——输出与纯 target 贪心解码逐 token 一致<sup>[C7]</sup>。这是投机解码最易懂的入口，工程中也常用；但它只是采样情形（$p, q$ 为一般分布）的特例，不是另一套机制。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出单位置 $\Pr[\text{emit } x]$ 的两条路径分解。</li>
-  <li>说出残差分布的归一化常数为什么恰好等于拒绝概率 $\beta$（指出用了哪条恒等式）。</li>
-  <li>说出 $\alpha$ 与 $\mathrm{TV}(p, q)$ 的关系，并据此判断「draft 越像 target」时 $\alpha$ 如何变化。</li>
-  <li>说出贪心情形下规则如何退化为 argmax 匹配。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出单位置 $\Pr[\text{emit } x]$ 的两条路径分解。</p>
+    <details>
+      <summary>解答：路径 A 给 $\min(q, p)$，路径 B 给 $\max(0, p-q)$</summary>
+      <p>路径 A「draft 采到 $x$ 且被接受」贡献 $q(x)\min(1, p(x)/q(x)) = \min(q(x), p(x))$；路径 B「发生拒绝且从残差重采样到 $x$」贡献 $\beta \cdot p'(x) = \max(0, p(x)-q(x))$，其中 $\beta$ 为拒绝概率。两条路径互斥，相加恰为 $p(x)$。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出残差分布的归一化常数为什么恰好等于拒绝概率 $\beta$（指出用了哪条恒等式）。</p>
+    <details>
+      <summary>解答：用 $\min(a,b) + \max(0, b-a) = b$ 对全部 token 求和</summary>
+      <p>取 $a = q(x')$、$b = p(x')$ 并对所有 $x'$ 求和：$\sum_{x'} \max(0, p - q) = 1 - \sum_{x'} \min(p, q) = \beta$。残差的归一化常数与拒绝概率是同一个量，这是恒等式的直接推论，不是巧合。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出 $\alpha$ 与 $\mathrm{TV}(p, q)$ 的关系，并据此判断「draft 越像 target」时 $\alpha$ 如何变化。</p>
+    <details>
+      <summary>解答：$\alpha = 1 - \mathrm{TV}(p, q)$，越相似越高</summary>
+      <p>$\alpha = \sum_x \min(p(x), q(x)) = 1 - \mathrm{TV}(p, q)$。draft 越像 target、总变差越小、$\alpha$ 越接近 1；$p = q$ 时 $\alpha = 1$ 必接受，支撑集不相交时 $\alpha = 0$ 必拒。</p>
+    </details>
+  </li>
+</ol>
 
 <p>现在规则保分布已证明——那么实际跑起来能快多少？这取决于接受率和草稿长度，下一章用期望 token 数和加速比公式量化。</p>
 
-<h2 id="how-much-faster">能快多少——期望 token 数与加速比</h2>
+<h2 id="how-much-faster">4. 能快多少——期望 token 数与加速比</h2>
 
-<p>第 3 章给出 $\alpha = \sum_x \min(p(x), q(x))$ 作为单位置平均接受概率。这一章把 $\alpha$ 代入两个公式：期望 token 数和加速比。</p>
+<p>「为什么这条规则能保分布」一章给出 $\alpha = \sum_x \min(p(x), q(x))$ 作为单位置平均接受概率。这一章把 $\alpha$ 代入两个公式：期望 token 数和加速比。</p>
 
 <p><strong>期望 token 数</strong>。假设各位置接受率近似独立同分布（i.i.d.）、均为 $\alpha$。每个 draft token 被接受的概率独立为 $\alpha$，因此「连续接受 $k$ 个后首次失败」服从截断几何分布。一轮最多产出 $\gamma + 1$ 个 token（全接受加 bonus）、最少产出 1 个（首轮即拒仍重采样 1 个）。Leviathan et al. 2023 Theorem 3.8 给出期望产出<sup>[F5]</sup>：</p>
 
@@ -909,8 +1010,8 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 <p>代入 Leviathan et al. 2023 报告的 T5-XXL 实验参数<sup>[N3, F6]</sup>（draft 是 T5-base，约 250M，比 target 11B 小得多，单步成本比 $c = 0.04$；平均接受率 $\alpha \approx 0.8$；草稿长度 $\gamma = 5$）：</p>
 
 <details>
-<summary>展开：α=0.8, γ=5, c=0.04 的 E[L] 与 S（复算 Leviathan 数字）</summary>
-<p>教学示例，数字来自 Leviathan et al. 2023 §4 实验部分 Table 4（T5-base draft、T5-XXL target、EnDe 任务）。$\alpha=0.80$ 取自 temp=0 配置、$\gamma=5$ 取自 temp=1 配置，二者为教学复算的组合，不对应单一实验行。</p>
+<summary>展开：$\alpha=0.8$, $\gamma=5$, $c=0.04$ 的 $\mathbb{E}[L]$ 与 $S$（复算 Leviathan 数字）</summary>
+<p>构造示例，数字来自 Leviathan et al. 2023 §4 实验部分 Table 4（T5-base draft、T5-XXL target、EnDe 任务）。$\alpha=0.80$ 取自 temp=0 配置、$\gamma=5$ 取自 temp=1 配置，二者为教学复算的组合，不对应单一实验行。</p>
 <p>期望 token 数：</p>
 <p>$$\mathbb{E}[L] = \frac{1 - 0.8^{6}}{1 - 0.8} = \frac{1 - 0.262144}{0.2} = \frac{0.737856}{0.2} = 3.689 \text{ 个 token / 轮}.$$</p>
 <p>每轮成本：$1 + \gamma c = 1 + 5 \times 0.04 = 1.2$ 个 target 单位。</p>
@@ -920,8 +1021,8 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 </details>
 
 <details>
-<summary>展开：α=0.2, γ=5, c=0.04 时几乎不加速</summary>
-<p>教学示例，用于展示 $\alpha$ 低时加速消失。固定 $c = 0.04$、$\gamma = 5$，把 $\alpha$ 从 0.8 降到 0.2。</p>
+<summary>展开：$\alpha=0.2$, $\gamma=5$, $c=0.04$ 时几乎不加速</summary>
+<p>构造示例，用于展示 $\alpha$ 低时加速消失。固定 $c = 0.04$、$\gamma = 5$，把 $\alpha$ 从 0.8 降到 0.2。</p>
 <p>期望 token 数：</p>
 <p>$$\mathbb{E}[L] = \frac{1 - 0.2^{6}}{1 - 0.2} = \frac{1 - 0.000064}{0.8} = \frac{0.999936}{0.8} \approx 1.25 \text{ 个 token / 轮}.$$</p>
 <p>每轮成本仍是 $1 + 5 \times 0.04 = 1.2$ 个 target 单位。</p>
@@ -947,19 +1048,36 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 
 <p>草稿长度 $\gamma$ 也不是越大越好。增大 $\gamma$ 在分子上多加一项 $\alpha^{\gamma+1}$ 的衰减（边际收益递减），在分母上线性增加 $\gamma c$（成本线性增长）。$\alpha$ 越低、$c$ 越大，最优 $\gamma$ 越小。例如 $\alpha = 0.8, c = 0.04$ 时，把 $S = (1 - \alpha^{\gamma+1}) / [(1-\alpha)(1 + \gamma c)]$ 代入枚举 $\gamma = 5,6,7,8,9,10$ 可得 $S \approx 3.07, 3.19, 3.25, 3.28, 3.28, 3.27$，最优 $\gamma \approx 8$；$\alpha = 0.5$ 时最优 $\gamma$ 显著更小。「猜得更远」不等于「猜得更好」。（最优 $\gamma$ 的选择见 Leviathan et al. 2023 §3.5。）</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出 $\mathbb{E}[L]$ 与 $S$ 的公式，并解释每个符号（$\alpha, \gamma, c$）。</li>
-  <li>给定 $\alpha=0.7, \gamma=4, c=0.1$，手算 $S$。</li>
-  <li>说出三种使 $S < 1$ 或减速的条件，并指出哪种与单流公式无关。</li>
-  <li>说出 $\gamma$ 是否越大越好、为什么。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出 $\mathbb{E}[L]$ 与 $S$ 的公式，并解释每个符号（$\alpha, \gamma, c$）。</p>
+    <details>
+      <summary>解答：$\mathbb{E}[L] = (1-\alpha^{\gamma+1})/(1-\alpha)$，$S = \mathbb{E}[L]/(1+\gamma c)$</summary>
+      <p>$\mathbb{E}[L]$ 是每轮期望产出 token 数，$S$ 是相对纯 target 解码的加速比。$\alpha$ 为单位置平均接受率，$\gamma$ 为草稿长度，$c$ 为单步 draft 与单步 target 的墙钟时间比。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 $\alpha=0.7, \gamma=4, c=0.1$，手算 $S$。</p>
+    <details>
+      <summary>解答：$S \approx 1.98\times$</summary>
+      <p>$\mathbb{E}[L] = (1 - 0.7^5)/(1 - 0.7) = (1 - 0.168)/0.3 \approx 2.77$；每轮成本 $1 + 4 \times 0.1 = 1.4$；$S \approx 2.77 / 1.4 \approx 1.98\times$。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出三种使 $S < 1$ 或减速的条件，并指出哪种与单流公式无关。</p>
+    <details>
+      <summary>解答：$\alpha$ 低、$c$ 大、高负载批处理；第三种与单流公式无关</summary>
+      <p>其一 $\alpha$ 过低，几乎每轮首轮即拒，draft 工作白做；其二 $c$ 过大，draft 接近 target 规模，自身串行成本抵消节省；其三高负载批处理下「空闲算力」消失——这一种与单流公式 $S$ 无关，是吞吐层面的退化（vLLM 实测 1.4×-1.8× 减速）。</p>
+    </details>
+  </li>
+</ol>
 
 <p>现在何时加速、何时不加速已清楚——但所有这些数字都假设「接受率 $\alpha$ 是个已知量」。下一章把整条机制跑一遍，让抽象的 $\alpha$、$p$、$q$ 落到具体数字上。</p>
 
-<h2 id="worked-example">把机制跑一遍——3 个 token 的手算例子</h2>
+<h2 id="worked-example">5. 把机制跑一遍——3 个 token 的手算例子</h2>
 
-<p>教学示例。 这是一个为了手算构造的最小例子，不代表真实模型或工程推荐值。词表缩到 3 个 token $V = \{A, B, C\}$，草稿长度 $\gamma = 3$，前缀固定（省略条件记号）。</p>
+<p>构造示例。 这是一个为了手算构造的最小例子，不代表真实模型或工程推荐值。词表缩到 3 个 token $V = \{A, B, C\}$，草稿长度 $\gamma = 3$，前缀固定（省略条件记号）。</p>
 
 <p><strong>设定</strong>。draft 模型自回归采样 3 个 token，每步分布与采样结果如下：</p>
 
@@ -1003,7 +1121,7 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 
 <p>从 $p'_3$ 采样——假设采到 $A$（概率 $2/3$）。本轮产出 $[A, B, A]$ 共 3 个 token。无 bonus，因为 pos 3 被拒后停止验证。</p>
 
-<p><strong>对照单位置证明（第 3 章）</strong>。在 pos 1 上验证 $\Pr[\text{emit } A] = p_1(A) = 0.4$：</p>
+<p><strong>对照单位置证明（「为什么这条规则能保分布」一章）</strong>。在 pos 1 上验证 $\Pr[\text{emit } A] = p_1(A) = 0.4$：</p>
 
 <p>路径 A：$\min(q_1(A), p_1(A)) = \min(0.5, 0.4) = 0.4$。</p>
 
@@ -1012,8 +1130,8 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 <p>总和：$0.4 + 0 = 0.4 = p_1(A)$ ✓。pos 1 上 $p_1 < q_1$，残差项为 0，全部概率走路径 A——这恰好因为 $p_1(A) < q_1(A)$ 时接受概率 $a = 0.8 < 1$，被「扣下」的部分由残差在别处补回，对 $A$ 本身而言是 0。</p>
 
 <details>
-<summary>展开：教学示例三个位置的全部接受/拒绝/残差计算</summary>
-<p>教学示例。 上面正文只展示了主路径（pos 1 接受、pos 2 必接受、pos 3 拒绝重采样到 $A$）。这里把三个位置的全部计算展开，便于逐行复算。</p>
+<summary>展开：构造示例三个位置的全部接受/拒绝/残差计算</summary>
+<p>构造示例。 上面正文只展示了主路径（pos 1 接受、pos 2 必接受、pos 3 拒绝重采样到 $A$）。这里把三个位置的全部计算展开，便于逐行复算。</p>
 <p><strong>pos 1（draft $A$，本路径接受）</strong>：</p>
 <ul>
 <li>$q_1 = (0.5, 0.3, 0.2)$，$p_1 = (0.4, 0.4, 0.2)$</li>
@@ -1046,20 +1164,37 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 <li>同理 $\Pr[\text{emit } B] = \min(0.3, 0.4) + \max(0, 0.4-0.3) = 0.3 + 0.1 = 0.4 = p_3(B)$ ✓</li>
 <li>pos 3 单位置接受率：$\alpha_3 = 0.2 + 0.3 + 0.2 = 0.7$</li>
 </ul>
-<p><strong>对照期望产出（第 4 章）</strong>。三个位置的接受率 $(0.9, 0.9, 0.7)$，平均 $\bar{\alpha} = (0.9 + 0.9 + 0.7) / 3 = 2.5 / 3 \approx 0.833$。代入 $\mathbb{E}[L] = (1 - 0.833^4) / (1 - 0.833) \approx (1 - 0.481) / 0.167 \approx 3.11$ 个 token / 轮。本路径产出 3 个 token，与期望 $\approx 3.11$ 一致（具体路径可高于或低于期望）。若假设 pos 3 也接受，本轮会产出 4 个 token（含 bonus），高于期望——这与「期望」是平均值、单次可偏离一致。</p>
+<p><strong>对照期望产出（「能快多少」一章）</strong>。三个位置的接受率 $(0.9, 0.9, 0.7)$，平均 $\bar{\alpha} = (0.9 + 0.9 + 0.7) / 3 = 2.5 / 3 \approx 0.833$。代入 $\mathbb{E}[L] = (1 - 0.833^4) / (1 - 0.833) \approx (1 - 0.481) / 0.167 \approx 3.11$ 个 token / 轮。本路径产出 3 个 token，与期望 $\approx 3.11$ 一致（具体路径可高于或低于期望）。若假设 pos 3 也接受，本轮会产出 4 个 token（含 bonus），高于期望——这与「期望」是平均值、单次可偏离一致。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定上面 3 个 $p_i$ 与 $q_i$，逐位算出 $a_i$。</li>
-  <li>在 pos 3 上手算残差分布的归一化。</li>
-  <li>在 pos 1 上验证单位置输出分布等于 $p_1$。</li>
-  <li>说出本例若 pos 3 也接受、产出会是几个 token（答案：4 个，含 bonus）。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 3 个位置上的 $p_i$ 与 $q_i$，逐位算出 $a_i$。</p>
+    <details>
+      <summary>解答：$a_1 = 0.8$，$a_2 = 1$，$a_3 = 0.4$</summary>
+      <p>pos 1：$a_1 = \min(1, 0.4/0.5) = 0.8$（概率接受）；pos 2：$a_2 = \min(1, 0.5/0.4) = 1$（必接受）；pos 3：$a_3 = \min(1, 0.2/0.5) = 0.4$（概率接受）。</p>
+    </details>
+  </li>
+  <li>
+    <p>在 pos 3 上手算残差分布的归一化。</p>
+    <details>
+      <summary>解答：残差 $(0.2, 0.1, 0)$，$Z = 0.3$，$p'_3 = (2/3, 1/3, 0)$</summary>
+      <p>$\max(0, p_3 - q_3) = (\max(0, 0.4-0.2), \max(0, 0.4-0.3), \max(0, 0.2-0.5)) = (0.2, 0.1, 0)$，归一化常数 $Z = 0.3$。$C$ 因 $p_3(C) < q_3(C)$ 残差为 0，不可能被重采样到。</p>
+    </details>
+  </li>
+  <li>
+    <p>在 pos 1 上验证单位置输出分布等于 $p_1$。</p>
+    <details>
+      <summary>解答：三个 token 的采出概率都与 $p_1$ 一致</summary>
+      <p>$\Pr[\text{emit } A] = \min(0.5, 0.4) + \max(0, 0.4-0.5) = 0.4 + 0 = 0.4 = p_1(A)$；同理 $B$：$0.3 + 0.1 = 0.4 = p_1(B)$；$C$：$0.2 + 0 = 0.2 = p_1(C)$。逐 token 都与 $p_1$ 相等。</p>
+    </details>
+  </li>
+</ol>
 
-<p>教学示例把机制、证明、加速比公式串通——最后一章把工程实例（K3 与 EAGLE-3）和论文实测做个交代，并说明本页的边界。</p>
+<p>构造示例把机制、证明、加速比公式串通——最后一章把工程实例（K3 与 EAGLE-3）和论文实测做个交代，并说明本页的边界。</p>
 
-<h2 id="engineering-and-boundaries">工程实例与边界</h2>
+<h2 id="engineering-and-boundaries">6. 工程实例与边界</h2>
 
 <p>K3 用 EAGLE-3 作为 draft 模型加速推理——EAGLE-3 是一种具体的 draft 架构，本页只引用其作为工程实例，不展开它的内部机制。EAGLE-3 的完整概念页见 <a href="../../wiki/eagle-speculative/index.html">EAGLE-3 投机解码 draft 模型</a>。</p>
 
@@ -1086,16 +1221,34 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
   <li><strong>不展开</strong>：draft 模型的训练/蒸馏方法；EAGLE/Medusa/Lookahead 等具体 draft 架构；分布式部署拓扑；vLLM/TGI 等框架的 API；与量化、剪枝的叠加效果（这些是正交技术，可叠加但不属于本页主题）。</li>
 </ul>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出两篇论文的实测对象与加速比。</li>
-  <li>说出 K3 用哪个 draft 模型、对应概念页路径。</li>
-  <li>说出至少两条「本页不展开」的内容，并各给一个不展开的理由。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出两篇论文的实测对象与加速比。</p>
+    <details>
+      <summary>解答：T5-XXL 上 2×-3×，Chinchilla 70B 上 2-2.5×</summary>
+      <p>Leviathan et al. 2023 在 T5-XXL (11B) 单机部署上实测 2×-3× 加速，输出与标准实现完全相同；Chen et al. 2023 在 Chinchilla 70B 分布式部署上实测 2-2.5× 加速，不修改模型、不降采样质量。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出 K3 用哪个 draft 模型、对应概念页路径。</p>
+    <details>
+      <summary>解答：EAGLE-3，见 EAGLE-3 概念页</summary>
+      <p>K3 用 EAGLE-3 作为 draft 模型加速推理；EAGLE-3 是一种具体的 draft 架构，其完整概念页为本站 wiki 的「EAGLE-3 投机解码 draft 模型」（eagle-speculative 目录）。</p>
+    </details>
+  </li>
+  <li>
+    <p>说出至少两条「本页不展开」的内容，并各给一个不展开的理由。</p>
+    <details>
+      <summary>解答：draft 训练方法、具体 draft 架构、框架 API、与量化剪枝的叠加等</summary>
+      <p>例如：draft 模型的训练/蒸馏方法（训练侧主题，与解码机制正交）；EAGLE/Medusa/Lookahead 等具体 draft 架构（内部机制各自成页，本页只作工程实例引用）；vLLM/TGI 框架 API（使用细节，不影响机制理解）；与量化、剪枝的叠加效果（正交技术，可叠加但属不同主题）。</p>
+    </details>
+  </li>
+</ol>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 
 <p>[C1] 两篇论文独立提出：Leviathan, Kalman, Matias. arXiv:2211.17192, 提交 2022-11-30，ICML 2023 Oral，命名 "Speculative Decoding"；Chen, Borgeaud, Irving, Lespiau, Sifre, Jumper. arXiv:2302.01318, 提交 2023-02-02，命名 "Speculative Sampling"。两者机制本质相同。来源：两篇 arXiv 摘要与提交历史。</p>
 
@@ -1105,7 +1258,7 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 
 <p>[C7] 贪心退化为 argmax 匹配：Leviathan et al. 2023 §3 末尾对 greedy 的讨论；社区综述（howaiworks.ai）一致复述。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 
 <p>[F1] 接受概率 $a(x) = \min(1, p(x)/q(x))$：Leviathan et al. 2023 §2.3 Eq.(1)；Chen et al. 2023 §2.1。边界 $p \geq q \Rightarrow a=1$、$p < q \Rightarrow a=p/q$、$p=0 \Rightarrow a=0$。</p>
 
@@ -1119,7 +1272,7 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 
 <p>[F6] $S = (1 - \alpha^{\gamma+1}) / [(1-\alpha)(1 + \gamma c)]$：Leviathan et al. 2023 §3.3 速度分析；社区综述（howaiworks.ai、aistackinsights.ai）明确给出此式。推导：每轮成本 $\gamma c + 1$、产出 $\mathbb{E}[L]$，$S = \mathbb{E}[L] / (1 + \gamma c)$。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 
 <p>[N1] Leviathan et al. 2023 摘要：T5-XXL (11B) target，2×-3× 加速，输出与标准 T5X 实现完全相同（identical outputs）。来源：arXiv:2211.17192 摘要原文。</p>
 
@@ -1129,31 +1282,31 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 
 <p>[N4] vLLM 官方博客 2024-10（社区综述 howaiworks.ai 引用）：高查询率批处理下，Llama 3 70B on 4×H100，speculative decoding 出现 1.4×-1.8× 减速。用于支撑工程实例与边界章节的退化讨论。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 
 <p>本页的教学数字均为人为构造，目的是便于手算：</p>
 
 <ul>
-  <li>S1 的「70B 权重 140GB / HBM 3.35 TB/s / 42ms 理论下限」：教学计算，数字来自 [gpu-execution-model] 页面的 H100 规格（80GB HBM3 @ 3.35 TB/s）与 70B 模型 FP16 权重约 140GB（2 字节/参数 × 70B）的常规换算。42ms 是带宽下限，不是实测单步延迟。</li>
-  <li>S4 的 $\alpha=0.8, \gamma=5, c=0.05$ 手算：数字来自 [N3]（Leviathan 原文实验参数），用于复算 [N1] 的 2-3× 加速。</li>
-  <li>S4 的 $\alpha=0.2$ 反例：纯粹构造，用于展示 $\alpha$ 低时加速消失。固定 $\gamma=5, c=0.05$ 以与正例对照。</li>
-  <li>S5 的贯穿例子（3 token 词表、$q_i, p_i$ 取一位小数）：纯粹构造，目的是覆盖接受、必接受、拒绝、残差重采样四种情形且残差和为 0.3 易归一化。不代表真实模型分布。</li>
+  <li>「为什么串行解码慢」一章的「70B 权重 140GB / HBM 3.35 TB/s / 42ms 理论下限」：教学计算，数字来自 [gpu-execution-model] 页面的 H100 规格（80GB HBM3 @ 3.35 TB/s）与 70B 模型 FP16 权重约 140GB（2 字节/参数 × 70B）的常规换算。42ms 是带宽下限，不是实测单步延迟。</li>
+  <li>「能快多少」一章的 $\alpha=0.8, \gamma=5, c=0.05$ 手算：数字来自 [N3]（Leviathan 原文实验参数），用于复算 [N1] 的 2-3× 加速。</li>
+  <li>「能快多少」一章的 $\alpha=0.2$ 反例：纯粹构造，用于展示 $\alpha$ 低时加速消失。固定 $\gamma=5, c=0.05$ 以与正例对照。</li>
+  <li>「把机制跑一遍」一章的贯穿例子（3 token 词表、$q_i, p_i$ 取一位小数）：纯粹构造，目的是覆盖接受、必接受、拒绝、残差重采样四种情形且残差和为 0.3 易归一化。不代表真实模型分布。</li>
   <li>词表 $V = \{A, B, C\}$ 与 $p_i, q_i$ 的具体数字：构造为使单位置证明可在每个 $x \in V$ 上手算验证。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 
-<p>S1 的「开车去仓库取货」类比：只解释「读权重」与「算位置」的时间量级差异——开车时间固定、取一件和取 $\gamma+1$ 件开车时间相同。失效边界：不覆盖批量推理下的吞吐竞争（高并发时多个请求抢同一份带宽）；不覆盖流水线并行下的气泡问题；不覆盖 KV cache 读写开销。正式判断以单流带宽分析与第 4 章加速比公式为准。</p>
+<p>「为什么串行解码慢」一章的「开车去仓库取货」类比：只解释「读权重」与「算位置」的时间量级差异——开车时间固定、取一件和取 $\gamma+1$ 件开车时间相同。失效边界：不覆盖批量推理下的吞吐竞争（高并发时多个请求抢同一份带宽）；不覆盖流水线并行下的气泡问题；不覆盖 KV cache 读写开销。正式判断以单流带宽分析与「能快多少」一章加速比公式为准。</p>
 
-<p>S2 的「target 觉得 draft 高估了就倾向于拒绝」直觉：只帮助理解接受概率 $\min(1, p/q)$ 的方向性。失效边界：不构成保分布的证明（证明在 S3）；不覆盖 $p < q$ 但仍被接受的随机性（概率接受不等于必拒绝）。</p>
+<p>「Draft-then-Verify」一章的「target 觉得 draft 高估了就倾向于拒绝」直觉：只帮助理解接受概率 $\min(1, p/q)$ 的方向性。失效边界：不构成保分布的证明（证明在「为什么这条规则能保分布」一章）；不覆盖 $p < q$ 但仍被接受的随机性（概率接受不等于必拒绝）。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 
 <ul>
   <li>i.i.d. 接受率假设（[F5]、[F6]）：实际各位置接受率取决于具体前缀，并非独立同分布。Leviathan et al. 2023 明确这是近似；不影响公式作为期望的近似刻画。可推出：期望 token 数与加速比的近似值。不可推出：单次采样的确切 token 数。</li>
-  <li>词表缩小到 3 个 token（S5）：真实模型词表 3-30 万 token，无法手算；本简化是为了展示机制，不改变接受/拒绝规则的数学形式。可推出：规则在 3-token 词表上的行为。不可推出：真实大词表下的接受率（$\alpha$ 需要在真实分布上测量）。</li>
-  <li>概率取一位小数（S5）：为了手算方便；真实模型输出多位有效数字。不影响残差归一化的数学过程。</li>
-  <li>「单次前向传播给 $\gamma+1$ 个位置打分墙钟时间几乎相同」（S1）：在 batch size 1、低负载下成立；高负载批处理下不成立（[N4]）。本简化帮助理解硬件前提，但不构成所有场景的加速保证。</li>
+  <li>词表缩小到 3 个 token（「把机制跑一遍」一章）：真实模型词表 3-30 万 token，无法手算；本简化是为了展示机制，不改变接受/拒绝规则的数学形式。可推出：规则在 3-token 词表上的行为。不可推出：真实大词表下的接受率（$\alpha$ 需要在真实分布上测量）。</li>
+  <li>概率取一位小数（「把机制跑一遍」一章）：为了手算方便；真实模型输出多位有效数字。不影响残差归一化的数学过程。</li>
+  <li>「单次前向传播给 $\gamma+1$ 个位置打分墙钟时间几乎相同」（「为什么串行解码慢」一章）：在 batch size 1、低负载下成立；高负载批处理下不成立（[N4]）。本简化帮助理解硬件前提，但不构成所有场景的加速保证。</li>
   <li>未展开 KV cache 的实现细节：假设其已存在。KV cache 是自回归解码的标准优化，与投机解码正交；不展开不影响对投机解码机制的理解。</li>
 </ul>
 

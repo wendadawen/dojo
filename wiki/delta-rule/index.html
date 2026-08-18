@@ -580,6 +580,10 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    .learning-goals ol.chapter-questions { margin-bottom: 0; }
+    .chapter-questions li { margin-bottom: 1.2rem; }
+    .chapter-questions li:last-child { margin-bottom: 0; }
+    .chapter-questions details { margin: 0.75rem 0 0; }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -664,14 +668,44 @@
 <p>当一个语言模型需要在 10 万 token 的对话里“记住”前面写过的某个人名，标准 Transformer 把所有历史塞进 KV cache（显存随长度线性增长），线性注意力把它们压成一个固定大小的矩阵状态（省显存但记不清）。后者为什么会“记不清”？能不能既保留固定大小状态、又记得清？Delta 规则就是回答后一半问题的递归更新规则。本文讲解 Delta 规则与 DeltaNet——属于线性注意力 / 线性 RNN 家族，前置概念为 <a href="../../wiki/linear-attention/index.html">线性注意力</a>，现实应用如 Kimi K3 的 KDA（Kimi Delta Attention）；本文只讲规则本身，不展开 KDA 架构。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>为什么线性注意力的“加性累加”在长序列上会出现“key 碰撞”，Delta 规则如何解决这个问题。</li>
-    <li>给定 $S_{t-1}$、$k_t$、$v_t$、$\beta_t$，用 delta 规则公式 $S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$ 手算一步更新，并说明每个符号含义与 $\beta_t \in (0,1)$ 的作用。</li>
-    <li>把 delta 规则改写为“先擦除后写入”等价形式 $S_t = S_{t-1} - v_t^{\text{old}} k_t^\top + v_t^{\text{new}} k_t^\top$，并说明两种形式为什么等价。</li>
-    <li>说明 $\beta_t \to 1$ 和 $\beta_t \to 0$ 时 delta 规则分别退化为哪种更新规则，以及各自的前提条件。</li>
-    <li>DeltaNet 与线性注意力、Mamba2、Gated DeltaNet 在记忆更新机制上的关键差异是什么，为什么 Gated DeltaNet 要在 delta 规则上再加一个 $\alpha_t$ 门。</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>为什么线性注意力的「加性累加」在长序列上会出现「key 碰撞」，Delta 规则如何解决这个问题。</p>
+      <details>
+        <summary>解答：$L > d$ 时 key 无法两两正交，Delta 规则写入前先擦除</summary>
+        <p>$d$ 维空间最多容纳 $d$ 个两两正交的 key，$L > d$ 时必有 $k_i^\top k_j \neq 0$，检索时其他 value 被误检（retrieval error）。Delta 规则在写入新 key-value 前，先用 $I - \beta_t k_t k_t^\top$ 沿当前 key 方向擦除旧值再写入，从机制上移除碰撞来源。见「1. 为什么线性注意力会"记不清"」与「2. Delta 规则的紧凑公式与手算」。</p>
+      </details>
+    </li>
+    <li>
+      <p>给定 $S_{t-1}$、$k_t$、$v_t$、$\beta_t$，用 delta 规则公式 $S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$ 手算一步更新，并说明每个符号含义与 $\beta_t \in (0,1)$ 的作用。</p>
+      <details>
+        <summary>解答：先算外积，再按「擦除项 + 写入项」组合</summary>
+        <p>分别算出 $k_t k_t^\top$ 与 $v_t k_t^\top$，把 $S_{t-1}(I - \beta_t k_t k_t^\top)$ 与 $\beta_t v_t k_t^\top$ 相加。$S$ 是 $d_v \times d_k$ 记忆矩阵，$k_t, v_t$ 是当前 key/value，$\beta_t$ 由 sigmoid 输出，控制本步擦除与写入的强度——居中取值时新旧值为凸插值。完整手算见「2.2 手算一步」。</p>
+      </details>
+    </li>
+    <li>
+      <p>把 delta 规则改写为「先擦除后写入」等价形式 $S_t = S_{t-1} - v_t^{\text{old}} k_t^\top + v_t^{\text{new}} k_t^\top$，并说明两种形式为什么等价。</p>
+      <details>
+        <summary>解答：定义 $v_t^{\text{old}}$ 与凸插值 $v_t^{\text{new}}$ 后代数合并</summary>
+        <p>取 $v_t^{\text{old}} = S_{t-1}k_t$、$v_t^{\text{new}} = \beta_t v_t + (1-\beta_t)v_t^{\text{old}}$，把 $v_t^{\text{new}}$ 代入展开、合并 $v_t^{\text{old}}k_t^\top$ 的系数（$-1 + (1-\beta_t) = -\beta_t$），再用分配律即回到紧凑公式。推导见「3. 等价改写」。</p>
+      </details>
+    </li>
+    <li>
+      <p>说明 $\beta_t \to 1$ 和 $\beta_t \to 0$ 时 delta 规则分别退化为哪种更新规则，以及各自的前提条件。</p>
+      <details>
+        <summary>解答：完全覆盖（需归一化 key）与记忆不变</summary>
+        <p>$\beta_t \to 0$：$S_t = S_{t-1}$，不擦不写。$\beta_t \to 1$：$S_t = S_{t-1}(I - k_tk_t^\top) + v_tk_t^\top$，当 $\|k_t\| = 1$ 时擦除项是正交投影，实现完全覆盖；key 未归一化时只是擦除强度由 $\|k_t\|^2$ 决定的秩-1 扰动。见「4. 边界情况与 $\beta_t$ 的退化」。</p>
+      </details>
+    </li>
+    <li>
+      <p>DeltaNet 与线性注意力、Mamba2、Gated DeltaNet 在记忆更新机制上的关键差异是什么，为什么 Gated DeltaNet 要在 delta 规则上再加一个 $\alpha_t$ 门。</p>
+      <details>
+        <summary>解答：擦除机制从无到方向性到全局加方向双重</summary>
+        <p>线性注意力只加不擦；DeltaNet 沿当前 key 方向选择性擦除；Mamba2 用标量 $\alpha_t$ 全局衰减；Gated DeltaNet 把 $\alpha_t$ 嵌进擦除项前，兼得方向擦除与全局衰减——因为 DeltaNet 清空整段记忆需逐 key 串行，$\alpha_t$ 提供一步全局衰减。对比见「5. DeltaNet 与相邻模型对比」。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <section class="misconceptions">
@@ -683,7 +717,7 @@
   </ul>
 </section>
 
-<h2 id="why-linear-attention-collides">为什么线性注意力会"记不清"——key 碰撞与 retrieval error</h2>
+<h2 id="why-linear-attention-collides">1. 为什么线性注意力会"记不清"——key 碰撞与 retrieval error</h2>
 
 <p>线性注意力家族的模型把整段历史压缩成一个<strong>固定大小的矩阵状态</strong> $S \in \mathbb{R}^{d_v \times d_k}$，而不是像标准 Transformer 那样把所有过去的 key、value 向量都缓存下来。这是它能做到"显存与序列长度无关"的根本原因。但压缩有代价——下面要看这个代价是怎么产生的。</p>
 
@@ -697,7 +731,7 @@ $$o_t = S_t q_t.$$
 
 <p>本文引用线性注意力的完整讲解见 <a href="../../wiki/linear-attention/index.html">线性注意力</a>；本页只给出 delta 规则所需的最小事实——加性递归与 retrieval。下面直接用这两个公式推导“记不清”的来源。</p>
 
-<h3 id="retrieval-error-derivation">retrieval 时到底发生了什么</h3>
+<h3 id="retrieval-error-derivation">1.1 retrieval 时到底发生了什么</h3>
 
 <p>把递归展开，$S_t = \sum_{i=1}^{t} v_i k_i^\top$。当 query 恰好等于某个历史 key（设 $q = k_j$）时，理想输出是 $v_j$。实际计算：</p>
 
@@ -714,9 +748,9 @@ $$S_t k_j = \sum_{i=1}^{t} v_i (k_i^\top k_j) = v_j \cdot (k_j^\top k_j) + \sum_
 <p>当 $\|k_j\| = 1$（即 $k_j^\top k_j = 1$）时，第一项就是 $v_j$；第二项即 retrieval error。若 $k_j$ 未归一化，第一项是 $\|k_j\|^2 v_j$，量级偏移但仍包含 $v_j$ 方向。</p>
 </details>
 
-<h3 id="collision-numeric-example">手算例子：d=2 维、3 个非正交 key</h3>
+<h3 id="collision-numeric-example">1.2 手算例子：$d=2$ 维、3 个非正交 key</h3>
 
-<p>教学示例。 取 $d_k = d_v = 2$，3 步序列。为便于手算，key 不做归一化：</p>
+<p>构造示例。 取 $d_k = d_v = 2$，3 步序列。为便于手算，key 不做归一化：</p>
 
 <div class="table-scroll">
 <table>
@@ -749,16 +783,34 @@ $$S k_2 = \begin{pmatrix}1 & 1 \\ 1 & 2\end{pmatrix}\begin{pmatrix}1 \\ 1\end{pm
 
 <p>这段数字是想说清一件事：线性注意力的"加性累加"不会主动擦除任何东西，所有外积都堆在 $S$ 里，互相干扰。要让模型"记清"，需要在写入新 key-value 时<strong>先擦掉旧 key 方向已存的内容</strong>。这正是 delta 规则做的事。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用 $d = 2$ 维、$L = 2$ 个正交 key（如 $k_1 = (1, 0)^\top, k_2 = (0, 1)^\top$）手算 $S k_1$ 与 $v_1$ 的关系——说明 retrieval error 为 0。</li>
-  <li>说明为什么 $L > d$ 时 key 碰撞"不可避免"，而不是"碰巧发生"。</li>
-  <li>用一句话回答：加性累加为什么不能解决这个问题。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用 $d = 2$ 维、$L = 2$ 个正交 key（如 $k_1 = (1, 0)^\top, k_2 = (0, 1)^\top$）手算 $S k_1$ 与 $v_1$ 的关系——说明 retrieval error 为 0。</p>
+    <details>
+      <summary>解答：$Sk_1 = v_1$，无误检项</summary>
+      <p>$S = v_1k_1^\top + v_2k_2^\top$，右乘 $k_1$ 得 $Sk_1 = v_1(k_1^\top k_1) + v_2(k_2^\top k_1) = v_1 \cdot 1 + v_2 \cdot 0 = v_1$。正交使交叉项为零，retrieval error 为 0。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明为什么 $L > d$ 时 key 碰撞「不可避免」，而不是「碰巧发生」。</p>
+    <details>
+      <summary>解答：正交向量数量受维度限制</summary>
+      <p>$\mathbb{R}^d$ 中两两正交的向量最多 $d$ 个；$L > d$ 时由维度计数必有至少一对 $k_i^\top k_j \neq 0$，这是线性代数的必然结论，与 key 的具体取值无关。</p>
+    </details>
+  </li>
+  <li>
+    <p>用一句话回答：加性累加为什么不能解决这个问题。</p>
+    <details>
+      <summary>解答：只增不减，旧关联无法移除</summary>
+      <p>加性更新 $S_t = S_{t-1} + v_tk_t^\top$ 从不在任何方向上减少内容，旧 key-value 关联只能不断叠加，干扰单调累积，没有任何机制将其清除。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章看到线性注意力的 retrieval error 来自“只写不删”。但仅知道问题还不够——下一章给出 delta 规则的形式定义，把“擦除”显式放进递归里。</p>
 
-<h2 id="delta-rule-formula">Delta 规则的紧凑公式与手算</h2>
+<h2 id="delta-rule-formula">2. Delta 规则的紧凑公式与手算</h2>
 
 <p>Delta 规则把线性注意力的"纯加性累加"替换为"先擦除后写入"的递归。它的<strong>紧凑形式</strong>是：</p>
 
@@ -783,7 +835,7 @@ $$\boxed{\,S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top\,}\qqu
 
 <p>两个快速边界检查。第一，若 $\beta_t = 0$，则 $S_t = S_{t-1}(I) + 0 = S_{t-1}$，记忆完全不变——这一步不写也不擦。第二，若 $\beta_t = 1$，则 $S_t = S_{t-1}(I - k_t k_t^\top) + v_t k_t^\top$，新值完全覆盖；当 $\|k_t\| = 1$ 时 $I - k_t k_t^\top$ 是沿 $k_t$ 方向的正交投影（详见第 3 章），意味着先擦除 $k_t$ 方向的旧分量、再写入新值。$\beta_t$ 介于 0 和 1 之间时是<strong>部分擦除</strong>——新旧值按 $\beta_t$ 加权插值，第 3 章给出显式形式。</p>
 
-<h3 id="source-trace">来源与命名</h3>
+<h3 id="source-trace">2.1 来源与命名</h3>
 
 <p>Delta 规则的命名与形式<strong>类比</strong>于经典 Widrow-Hoff 1960 delta rule：</p>
 
@@ -794,19 +846,19 @@ $$\text{经典：}\;w \leftarrow w + \eta (y - \hat y) x,\qquad \text{DeltaNet�
 <p>DeltaNet 这个名字在三篇论文中的演化：</p>
 
 <pre class="diagram">Schlag, Irie & Schmidhuber  ICML 2021 (arXiv:2102.11174, 2021-02)
-  └─ 首次把 delta rule 引入线性 Transformer，原文称 "Delta Network"
+  · 首次把 delta rule 引入线性 Transformer，原文称 "Delta Network"
       ↓
 Yang, Wang, Zhang, Shen & Kim  NeurIPS 2024 (arXiv:2406.06484, 2024-06)
-  └─ 沿用 “DeltaNet” 命名，给出 chunkwise 并行训练算法，扩展到 1.3B / 100B tokens
+  · 沿用 “DeltaNet” 命名，给出 chunkwise 并行训练算法，扩展到 1.3B / 100B tokens
       ↓
 Yang, Kautz & Hatamizadeh  ICLR 2025 (arXiv:2412.06464, 2024-12)
-  └─ "Gated DeltaNet"：在 delta rule 上引入标量遗忘门 α_t</pre>
+  · "Gated DeltaNet"：在 delta rule 上引入标量遗忘门 α_t</pre>
 
 <p>本页以 Yang 2024 NeurIPS 的公式为正式定义，Schlag 2021 作为 delta rule 的提出者溯源，Gated DeltaNet 在第 5 章对比。</p>
 
-<h3 id="step1-numeric">手算一步：$\beta_t = 1$ 的最简更新</h3>
+<h3 id="step1-numeric">2.2 手算一步：$\beta_t = 1$ 的最简更新</h3>
 
-<p>教学示例。 取 $d = 2$ 维，初始 $S_0 = \begin{pmatrix}0 & 0 \\ 0 & 0\end{pmatrix}$，第 1 步 $k_1 = (1, 0)^\top$（已归一化，$\|k_1\| = 1$），$v_1 = (1, 0)^\top$，$\beta_1 = 1$。</p>
+<p>构造示例。 取 $d = 2$ 维，初始 $S_0 = \begin{pmatrix}0 & 0 \\ 0 & 0\end{pmatrix}$，第 1 步 $k_1 = (1, 0)^\top$（已归一化，$\|k_1\| = 1$），$v_1 = (1, 0)^\top$，$\beta_1 = 1$。</p>
 
 <p>先算 $k_1 k_1^\top$：</p>
 
@@ -842,16 +894,34 @@ $$S_2^{\text{linear}} k_2 = \begin{pmatrix}1 & 0 \\ 1 & 0\end{pmatrix}\begin{pma
 
 <p>加性累加不擦除，旧的 $v_1 = (1, 0)^\top$ 还留在 $S$ 的第一行，查询 $k_2$ 时把 $v_1$ 也拽了出来。Delta 规则因为先擦除 $k_2$ 方向的旧值，所以查询干净。这就是 delta 规则解决 key 碰撞的方式。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>给定 $S_{t-1} = \begin{pmatrix}0 & 0 \\ 0 & 0\end{pmatrix}$、$k_t = (0, 1)^\top$、$v_t = (2, 0)^\top$、$\beta_t = 1$，手算 $S_t$。</li>
-  <li>说明 $\beta_t = 0$ 与 $\beta_t = 1$ 两种极端下 delta 规则各做什么（不需要几何性质，几何留到下一章）。</li>
-  <li>用一句话回答：DeltaNet 的 delta rule 与经典 Widrow-Hoff delta rule 在“作用对象”上的关键差异是什么。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>给定 $S_{t-1} = \begin{pmatrix}0 & 0 \\ 0 & 0\end{pmatrix}$、$k_t = (0, 1)^\top$、$v_t = (2, 0)^\top$、$\beta_t = 1$，手算 $S_t$。</p>
+    <details>
+      <summary>解答：$S_t = \begin{pmatrix}0 & 0 \\ 2 & 0\end{pmatrix}$</summary>
+      <p>$k_tk_t^\top = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix}$，$S_{t-1}(I - k_tk_t^\top) = 0$（因 $S_{t-1} = 0$），$v_tk_t^\top = \begin{pmatrix}0 & 0 \\ 2 & 0\end{pmatrix}$，故 $S_t = \begin{pmatrix}0 & 0 \\ 2 & 0\end{pmatrix}$。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明 $\beta_t = 0$ 与 $\beta_t = 1$ 两种极端下 delta 规则各做什么（不需要几何性质，几何留到下一章）。</p>
+    <details>
+      <summary>解答：记忆不变与擦除后写入</summary>
+      <p>$\beta_t = 0$：$S_t = S_{t-1} \cdot I + 0 = S_{t-1}$，本步不擦不写；$\beta_t = 1$：$S_t = S_{t-1}(I - k_tk_t^\top) + v_tk_t^\top$，先移除 $k_t$ 方向的旧分量再写入新值。</p>
+    </details>
+  </li>
+  <li>
+    <p>用一句话回答：DeltaNet 的 delta rule 与经典 Widrow-Hoff delta rule 在「作用对象」上的关键差异是什么。</p>
+    <details>
+      <summary>解答：一个改前向状态，一个改训练参数</summary>
+      <p>经典 delta rule 修改训练阶段的参数权重 $w$（固定网络参数）；DeltaNet 的 delta rule 修改前向推理阶段的记忆矩阵 $S$（随输入变化的短期状态），两者形式同构但对象不同。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章给出 delta 规则的紧凑公式，揭示了“擦除 + 写入”的两项结构。但“被擦的旧值是谁”还不直观——下一章把它改写为显式带 $v^{\text{old}}$ 的等价形式。</p>
 
-<h2 id="equivalent-form">等价改写——"先擦除后写入"与几何直觉</h2>
+<h2 id="equivalent-form">3. 等价改写——"先擦除后写入"与几何直觉</h2>
 
 <p>紧凑公式 $S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top$ 把"擦除"藏在矩阵乘法里，看不清"擦的是什么"。把它展开成等价的"先擦除后写入"形式就清楚了。</p>
 
@@ -882,9 +952,9 @@ $$\boxed{\,S_t = S_{t-1} - v_t^{\text{old}} k_t^\top + v_t^{\text{new}} k_t^\top
 <p>最后一步用了矩阵分配律：$S_{t-1} - \beta_t S_{t-1} k_t k_t^\top = S_{t-1}(I - \beta_t k_t k_t^\top)$。这与 C3 完全一致。证毕。</p>
 </details>
 
-<h3 id="equivalent-numeric">回到手算例子</h3>
+<h3 id="equivalent-numeric">3.1 回到手算例子</h3>
 
-<p>教学示例。 用第 2 章末尾的第 2 步：$S_1 = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}$，$k_2 = (1, 0)^\top$，$v_2 = (0, 1)^\top$，$\beta_2 = 1$。</p>
+<p>构造示例。 用第 2 章末尾的第 2 步：$S_1 = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}$，$k_2 = (1, 0)^\top$，$v_2 = (0, 1)^\top$，$\beta_2 = 1$。</p>
 
 <p>先算旧值：$v_2^{\text{old}} = S_1 k_2 = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}\begin{pmatrix}1 \\ 0\end{pmatrix} = \begin{pmatrix}1 \\ 0\end{pmatrix} = v_1$。这正是上一步写入的旧值——记忆里 $k_2$ 方向当前存的就是 $v_1$。</p>
 
@@ -898,7 +968,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>与第 2 章紧凑公式的结果一致——两种形式确实等价。这次我们看清楚了"擦的是什么"：擦的是 $v_2^{\text{old}} k_2^\top = v_1 k_2^\top$，即上一步写入的旧关联。</p>
 
-<h3 id="geometry-projection">几何直觉：$I - k k^\top$ 是投影矩阵</h3>
+<h3 id="geometry-projection">3.2 几何直觉：$I - k k^\top$ 是投影矩阵</h3>
 
 <p>当 $\|k_t\| = 1$ 且 $\beta_t = 1$ 时，矩阵 $I - k_t k_t^\top$ 有特殊几何含义——它是<strong>沿 $k_t$ 方向的正交投影</strong>。设 $P = I - k k^\top$，验证两条性质：</p>
 
@@ -913,45 +983,57 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <pre class="diagram">2 维投影示意（k = (1,0)ᵀ, β = 1, P = I - k kᵀ）
 
-       y
-       ↑
-       │
-   b   ●     ← (a, b) 投影前
-       │
-       │   P 把 x 分量擦掉（k 方向）
-       │   保留 y 分量（k⊥方向）
-       ↓
-       ●     ← (0, b) 投影后 = P·(a,b)ᵀ
-       │
-       └───────────────→ x
-               a</pre>
+      y ↑
+        |    (a, b) *   投影前
+        |        ↓   P 把 x 分量擦掉（k 方向），保留 y 分量（k⊥ 方向）
+        |    (0, b) *   投影后 = P·(a,b)ᵀ
+        +----------------→ x
+                a</pre>
 
 <p>当 $\beta_t < 1$ 或 $\|k_t\| \neq 1$ 时，$I - \beta_t k_t k_t^\top$ 退化为<strong>秩-1 扰动</strong>（不再是正交投影），不保范数也不幂等。这是常见误解——投影性质需要两个前提同时满足，下一章详细讨论边界。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>把 $v_t^{\text{new}} = \beta_t v_t + (1-\beta_t) v_t^{\text{old}}$ 代入 C4 展开到 C3，每一步说明用了什么代数规则。</li>
-  <li>$v_t^{\text{old}} = S_{t-1} k_t$ 的语义是什么，为什么说它就是“如果现在查询 $k_t$ 会返回什么”。</li>
-  <li>$\|k\| = 1, \beta = 1$ 时 $I - k k^\top$ 为什么是正交投影，幂等性和对称性各验证一次。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>把 $v_t^{\text{new}} = \beta_t v_t + (1-\beta_t) v_t^{\text{old}}$ 代入 C4 展开到 C3，每一步说明用了什么代数规则。</p>
+    <details>
+      <summary>解答：分配律展开、合并同类项、右分配律</summary>
+      <p>代入后按分配律展开为四项；合并 $v_t^{\text{old}}k_t^\top$ 的系数 $-1 + (1-\beta_t) = -\beta_t$；把 $v_t^{\text{old}} = S_{t-1}k_t$ 代回，用右分配律 $S_{t-1} - \beta_t S_{t-1}k_tk_t^\top = S_{t-1}(I - \beta_tk_tk_t^\top)$，即得 C3。</p>
+    </details>
+  </li>
+  <li>
+    <p>$v_t^{\text{old}} = S_{t-1} k_t$ 的语义是什么，为什么说它就是「如果现在查询 $k_t$ 会返回什么」。</p>
+    <details>
+      <summary>解答：以当前 key 检索记忆的返回值</summary>
+      <p>检索定义为 $o = Sq$；取 $q = k_t$ 时 $o = S_{t-1}k_t = v_t^{\text{old}}$，正是更新前记忆对当前 key 的响应，即不写入直接查询会得到的值。</p>
+    </details>
+  </li>
+  <li>
+    <p>$\|k\| = 1, \beta = 1$ 时 $I - k k^\top$ 为什么是正交投影，幂等性和对称性各验证一次。</p>
+    <details>
+      <summary>解答：幂等且对称</summary>
+      <p>幂等性：$P^2 = (I - kk^\top)^2 = I - 2kk^\top + k(k^\top k)k^\top = I - kk^\top = P$（用 $\|k\| = 1$）。对称性：$P^\top = (I - kk^\top)^\top = I - kk^\top = P$。幂等加对称即正交投影。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章讲完 delta 规则本身——紧凑公式、等价形式、几何直觉都有了。但 $\beta_t$ 取极端值时规则如何退化还需澄清——下一章专门讨论边界情况与常见误解。</p>
 
-<h2 id="beta-boundaries">边界情况与 $\beta_t$ 的退化</h2>
+<h2 id="beta-boundaries">4. 边界情况与 $\beta_t$ 的退化</h2>
 
 <p>把 $\beta_t$ 推到两个极端，看 delta 规则分别退化为哪种更新规则。这是验证理解的最简方式，也是误解多发点。</p>
 
-<h3 id="beta-zero">$\beta_t = 0$：记忆完全不变</h3>
+<h3 id="beta-zero">4.1 $\beta_t = 0$：记忆完全不变</h3>
 
 <p>代入 $S_t = S_{t-1}(I - 0 \cdot k_t k_t^\top) + 0 \cdot v_t k_t^\top = S_{t-1} \cdot I + 0 = S_{t-1}$。这一步既不擦也不写，记忆保持上一步状态。语义上——模型根据当前输入 $x_t$ 判定"本步不需要更新"，把 $\beta_t$ 推到 0 即可。</p>
 
-<h3 id="beta-one">$\beta_t = 1$：完全覆盖（当 $\|k\| = 1$ 时）</h3>
+<h3 id="beta-one">4.2 $\beta_t = 1$：完全覆盖（当 $\|k\| = 1$ 时）</h3>
 
 <p>代入 $S_t = S_{t-1}(I - k_t k_t^\top) + v_t k_t^\top$。当 $\|k_t\| = 1$ 时，$I - k_t k_t^\top$ 是沿 $k_t$ 方向的正交投影（C6），意味着把 $S_{t-1}$ 中所有"沿 $k_t$ 方向"的分量擦干净，再写入新值 $v_t k_t^\top$。旧 key-value 关联被完全替换。</p>
 
 <p><strong>前提条件</strong>：$\|k_t\| = 1$。如果 $k_t$ 未归一化，$\beta_t = 1$ 时 $I - k_t k_t^\top$ 不是投影——它仍是秩-1 扰动，但擦除强度由 $\|k_t\|^2$ 决定：把任意 $x$ 投影为 $x - k_t(k_t^\top x)$，$k_t$ 越长擦得越狠，可能"擦过头"。Yang 2024 NeurIPS §3.3 说工程实现中对 key 做 L2 归一化以避免这个问题。</p>
 
-<h3 id="beta-middle">中间值 $\beta_t \in (0, 1)$：部分擦除</h3>
+<h3 id="beta-middle">4.3 中间值 $\beta_t \in (0, 1)$：部分擦除</h3>
 
 <p>这是最常见的情形。用 C4 形式看最清楚：</p>
 
@@ -959,7 +1041,7 @@ $$S_t = S_{t-1} - v_t^{\text{old}} k_t^\top + \underbrace{(\beta_t v_t + (1-\bet
 
 <p>$v_t^{\text{new}}$ 是新旧值的凸插值——$\beta_t$ 越大新值占比越大。把 $v_t^{\text{new}} k_t^\top$ 写回时，新关联不是"完全替换"而是"按 $\beta_t$ 加权混合"。</p>
 
-<p>教学示例。 把第 2 章末尾的例子改 $\beta_2 = 0.5$，其他不变：$S_1 = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}$，$k_2 = (1, 0)^\top$，$v_2 = (0, 1)^\top$。先算 $v_2^{\text{old}} = S_1 k_2 = (1, 0)^\top$，再算 $v_2^{\text{new}} = 0.5 \cdot (0, 1)^\top + 0.5 \cdot (1, 0)^\top = (0.5, 0.5)^\top$。</p>
+<p>构造示例。 把第 2 章末尾的例子改 $\beta_2 = 0.5$，其他不变：$S_1 = \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix}$，$k_2 = (1, 0)^\top$，$v_2 = (0, 1)^\top$。先算 $v_2^{\text{old}} = S_1 k_2 = (1, 0)^\top$，再算 $v_2^{\text{new}} = 0.5 \cdot (0, 1)^\top + 0.5 \cdot (1, 0)^\top = (0.5, 0.5)^\top$。</p>
 
 <p>代入 C4：</p>
 
@@ -969,7 +1051,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>检索 $k_2$：$S_2 k_2 = (0.5, 0.5)^\top = v_2^{\text{new}}$。返回的是新旧值各半的插值——既不是旧的 $v_1 = (1, 0)^\top$，也不是新的 $v_2 = (0, 1)^\top$，而是 $(0.5, 0.5)^\top$。这就是"部分擦除"的语义：记忆里的旧关联被部分替换为新关联。</p>
 
-<h3 id="projection-misconception">误解排查：$I - \beta k k^\top$ 不是"总是投影"</h3>
+<h3 id="projection-misconception">4.4 误解排查：$I - \beta k k^\top$ 不是"总是投影"</h3>
 
 <p>把投影性质的<strong>前提条件</strong>列清楚：</p>
 
@@ -987,18 +1069,36 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>把 "$I - \beta k k^\top$ 是投影矩阵" 当成无前提结论是常见误解——它只在 $\beta = 1$ 且 $\|k\| = 1$ 时成立。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>$\beta_t = 0$ 时 delta 规则退化为什么，$\beta_t = 1$ 且 $\|k_t\| = 1$ 时退化为什么。</li>
-  <li>用一句话说明 $\beta_t \in (0, 1)$ 时为什么是"部分擦除"而非"完全擦除"。</li>
-  <li>指出错误："$I - \beta k k^\top$ 在任何 $\beta$ 下都是投影矩阵"。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>$\beta_t = 0$ 时 delta 规则退化为什么，$\beta_t = 1$ 且 $\|k_t\| = 1$ 时退化为什么。</p>
+    <details>
+      <summary>解答：记忆不变与完全覆盖</summary>
+      <p>$\beta_t = 0$：$S_t = S_{t-1}$，记忆完全不变。$\beta_t = 1$ 且 $\|k_t\| = 1$：$I - k_tk_t^\top$ 是正交投影，把 $k_t$ 方向旧分量擦干净后写入 $v_tk_t^\top$，旧关联被完全替换。</p>
+    </details>
+  </li>
+  <li>
+    <p>用一句话说明 $\beta_t \in (0, 1)$ 时为什么是「部分擦除」而非「完全擦除」。</p>
+    <details>
+      <summary>解答：写回的是凸插值</summary>
+      <p>写回项是 $v_t^{\text{new}} = \beta_t v_t + (1-\beta_t)v_t^{\text{old}}$，旧值按 $1-\beta_t$ 的比例保留在结果中，旧关联没有被完全移除。</p>
+    </details>
+  </li>
+  <li>
+    <p>指出错误：「$I - \beta k k^\top$ 在任何 $\beta$ 下都是投影矩阵」。</p>
+    <details>
+      <summary>解答：投影性质需要两个前提</summary>
+      <p>仅当 $\beta = 1$ 且 $\|k\| = 1$ 时它幂等且对称，是正交投影；$\beta \in (0,1)$ 或 $\|k\| \neq 1$ 时它是秩-1 扰动——不幂等（或不保范数），擦除强度由 $\beta$ 与 $\|k\|^2$ 共同决定。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章讲完 delta 规则的边界与退化。但 delta 规则只是 DeltaNet 的核心组件——下一章把它放进模型，并对比线性注意力、Mamba2、Gated DeltaNet。</p>
 
-<h2 id="deltanet-and-comparison">DeltaNet 与相邻模型对比</h2>
+<h2 id="deltanet-and-comparison">5. DeltaNet 与相邻模型对比</h2>
 
-<h3 id="deltanet-definition">DeltaNet 是什么</h3>
+<h3 id="deltanet-definition">5.1 DeltaNet 是什么</h3>
 
 <p>DeltaNet 就是把线性注意力的加性累加替换为 delta 规则的模型。Yang et al. 2024 NeurIPS §2.2 的原话——"DeltaNet: Linear Transformers with the Delta Update Rule"。一句话定义：</p>
 
@@ -1008,7 +1108,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>本页讲的是"递归骨架 + delta 规则"这两部分。L2 归一化与并行训练算法属于工程实现，本页不展开（详见 Yang 2024 NeurIPS §3）。</p>
 
-<h3 id="comparison-table">4 种记忆更新规则对比</h3>
+<h3 id="comparison-table">5.2 4 种记忆更新规则对比</h3>
 
 <p>把 DeltaNet 放进"矩阵状态 + 结构化递归"家族，与线性注意力、Mamba2、Gated DeltaNet 并排对比：</p>
 
@@ -1032,7 +1132,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
   <li><strong>Gated DeltaNet = Mamba2 + DeltaNet</strong>：把 $\alpha_t$ 的标量衰减嵌进 delta 规则的 $I - \beta k k^\top$ 前面，得到 $\alpha_t(I - \beta_t k_t k_t^\top)$。这是 Gated DeltaNet 的核心设计——同时具备方向擦除（delta 规则）与全局衰减（Mamba2 风格遗忘门）<sup>[C7]</sup>。</li>
 </ul>
 
-<h3 id="gated-deltanet-degradation">Gated DeltaNet 的退化</h3>
+<h3 id="gated-deltanet-degradation">5.3 Gated DeltaNet 的退化</h3>
 
 <p>Gated DeltaNet 公式 $S_t = S_{t-1}(\alpha_t(I - \beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top$ 在两个极端下退化为已知模型<sup>[F3]</sup>：</p>
 
@@ -1044,7 +1144,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>这是 Yang, Kautz & Hatamizadeh ICLR 2025 §3.1 设计动机的代数体现——“gating enables rapid memory erasure while the delta rule facilitates targeted updates”，$\alpha_t$ 与 $\beta_t$ 各管一摊。</p>
 
-<h3 id="experimental-evidence">实际效果：DeltaNet 在哪些任务上占优</h3>
+<h3 id="experimental-evidence">5.4 实际效果：DeltaNet 在哪些任务上占优</h3>
 
 <p>Yang et al. 2024 NeurIPS §4 在 MAD benchmark（Poli et al. 2024）和 1.3B 语言建模上报告：</p>
 
@@ -1066,7 +1166,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>1.3B / 100B tokens 语言建模上<sup>[N1]</sup>：DeltaNet (w. conv) Wiki PPL = 16.87, LMB PPL = 12.21；Mamba (w. conv) = 17.06 / 13.89；GLA = 17.25 / 14.92；Transformer++ = 16.85 / 13.44。DeltaNet 略优于 Mamba 和 GLA，与 Transformer++ 接近。</p>
 
-<h3 id="engineering-and-applications">工程实现与现实应用</h3>
+<h3 id="engineering-and-applications">5.5 工程实现与现实应用</h3>
 
 <p>Yang 2024 NeurIPS §3 给出 delta 规则的 chunkwise 并行训练算法，基于 Bischof & Van Loan 1985 的 WY 表示（Householder 矩阵乘积的紧凑形式），使得训练时不需逐步串行递归。这部分属于数值线性代数与工程，本页不展开。开源实现在 flash-linear-attention 库（<code>fla-org/flash-linear-attention</code>，Triton kernel）。</p>
 
@@ -1150,18 +1250,36 @@ Matches compact form: True
 <p><b>教学简化</b>：教学实现使用 numpy 标量循环逐手算 step；真实工程用 Triton chunkwise kernel（Yang 2024 NeurIPS §3）批量并行计算，并融合 L2 归一化与 kernel。本代码不实现 batch、不处理多头、不归一化 key。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话对比 DeltaNet 与 Mamba2 的擦除机制差异（方向 vs. 标量）。</li>
-  <li>说明 Gated DeltaNet 在 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 两种极端下分别退化为哪个模型。</li>
-  <li>用 MAD benchmark 的数字说明 delta 规则在哪类任务上占优、在哪类任务上反而弱。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一句话对比 DeltaNet 与 Mamba2 的擦除机制差异（方向 vs. 标量）。</p>
+    <details>
+      <summary>解答：方向性擦除 vs 均匀衰减</summary>
+      <p>DeltaNet 用 $I - \beta_tk_tk_t^\top$ 只擦当前 key 方向、保留正交补；Mamba2 用标量 $\alpha_t$ 乘整张 $S_{t-1}$，所有方向按同一比例衰减，无选择性。</p>
+    </details>
+  </li>
+  <li>
+    <p>说明 Gated DeltaNet 在 $\alpha_t \to 1$ 与 $\beta_t \to 0$ 两种极端下分别退化为哪个模型。</p>
+    <details>
+      <summary>解答：DeltaNet 与 Mamba2 的无写入特殊情形</summary>
+      <p>$\alpha_t \to 1$ 时衰减因子消失，退化为 DeltaNet；$\beta_t \to 0$ 时 $S_t = \alpha_t S_{t-1}$，退化为 Mamba2 在 $v_t = 0$ 时的特殊情形（只衰减、无写入）。</p>
+    </details>
+  </li>
+  <li>
+    <p>用 MAD benchmark 的数字说明 delta 规则在哪类任务上占优、在哪类任务上反而弱。</p>
+    <details>
+      <summary>解答：精确覆写类占优，全部保留类弱</summary>
+      <p>In-Context Recall、Noisy Recall、Selective Copy 上 DeltaNet 得 100，优于 Mamba（90.4 / 90.1 / 86.3）——需要精确覆写 key-value 关联的任务占优；Memorize 上 52.8 vs Mamba 89.5 反而最弱——方向擦除不利于「全部保留」，标量衰减更擅长渐进记住全部历史。</p>
+    </details>
+  </li>
+</ol>
 
 <p>全文总结：Delta 规则把线性注意力的纯加性累加替换为“先擦除后写入”——用 $I - \beta_t k_t k_t^\top$ 沿当前 key 方向擦除旧值，再写入新旧值的凸插值。$\beta_t = 1$ 且 $\|k\| = 1$ 时退化为正交投影式的完全覆盖，$\beta_t = 0$ 时记忆不变，中间值为部分擦除。DeltaNet 用这一规则解决了线性注意力在 $L > d$ 时的 key 碰撞问题，在 recall / copy 类任务上占优；Gated DeltaNet 进一步加入标量遗忘门 $\alpha_t$ 兼顾方向擦除与全局衰减。回到开篇的问题——既保留固定大小状态、又记得清，delta 规则给出的答案是“写入前先擦除”。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 
 <p><b>C1（线性注意力加性递归）</b>：Yang, Wang, Zhang, Shen & Kim. "Parallelizing Linear Transformers with the Delta Rule over Sequence Length." NeurIPS 2024, arXiv:2406.06484 §2.1 与 Table 4 第一行（Linear Attention [40] = Katharopoulos et al. 2020）。</p>
 
@@ -1179,7 +1297,7 @@ Matches compact form: True
 
 <p><b>C8（实验对比）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §4.1 Table 2（MAD benchmark）与 §4.2 Table 3（1.3B LM PPL）。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 
 <p><b>F1（retrieval 展开 $S k_j = v_j + \sum_{i \neq j} (k_i^\top k_j) v_i$）</b>：代数恒等式，由 C1 $S = \sum_i v_i k_i^\top$ 直接展开得到。Yang 2024 NeurIPS §2.1 引用为 retrieval error 的来源。</p>
 
@@ -1193,7 +1311,7 @@ Matches compact form: True
 
 <p><b>N2</b>：Yang 2024 NeurIPS arXiv:2406.06484 §4.1 Table 2（MAD benchmark, Poli et al. 2024）。340M 模型 / 15B tokens 设置。DeltaNet：In-Context Recall = 100, Fuzzy Recall = 35.7, Noisy Recall = 100, Selective Copy = 100, Memorize = 52.8, Compress = 42.2, Average = 71.8；Mamba：90.4, 6.7, 90.1, 86.3, 89.5, 52.7, 69.3。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 
 <p>本页构造了两组教学数字，均非真实模型数据：</p>
 
@@ -1202,13 +1320,13 @@ Matches compact form: True
   <li><b>第 2-4 章主例子</b>：$d = 2$ 维、$L = 2$ 步、key 归一化（$k_1 = k_2 = (1,0)^\top$，$v_1 = (1,0)^\top, v_2 = (0,1)^\top$，$\beta \in \{0.5, 1\}$）。构造目的：用最小维度手算展示 delta 规则的紧凑公式、等价形式、边界退化，并对比加性累加。第 2 步故意让 $k_2 = k_1$，模拟"模型改变主意、覆写同一 key 的关联"。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 
 <p><b>"先擦除后写入"类比</b>：把 $I - k k^\top$ 解释为"沿 $k$ 方向的投影"、把 $- v^{\text{old}} k^\top + v^{\text{new}} k^\top$ 解释为"擦旧值写新值"是教学解释，服务于理解 C3 与 C4 的等价关系。失效边界：(1) 当 $\beta \neq 1$ 时是部分擦除（凸插值），不是完全替换；(2) 当 $\|k\| \neq 1$ 时 $I - \beta k k^\top$ 不是投影，是秩-1 扰动；(3) 投影只擦一个方向，不擦整个矩阵——Mamba2 的标量衰减才擦整个矩阵。正式判断仍以 C3 公式为准。</p>
 
 <p><b>"DeltaNet vs. Mamba2 方向擦除 vs. 标量衰减"类比</b>：把 DeltaNet 比作"用橡皮擦掉一个字"、把 Mamba2 比作"把整页纸都晒褪色"是教学解释，服务于理解方向擦除与标量衰减的差异。失效边界：(1) DeltaNet 的擦除强度由 $\beta_t$ 控制，不一定是完全擦除；(2) Mamba2 的 $\alpha_t$ 也可以接近 1（几乎不擦），与"晒褪色"的强语义不完全对应；(3) 两者都能配合 $v_t k_t^\top$ 写入，不是纯擦除操作。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 
 <ul>
   <li><b>key 未归一化（第 1 章碰撞例子）</b>：第 1 章手算使用未归一化的 $k$（如 $k_2 = (1,1)^\top$），真实 DeltaNet 工程实现中 key 经 L2 归一化（Yang 2024 NeurIPS §3.3）。可推出：retrieval error 的代数来源。不可推出：正交投影性质（需 $\|k\| = 1$），第 2-4 章主例子已改用归一化 $k$。</li>

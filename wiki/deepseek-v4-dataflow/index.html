@@ -77,7 +77,7 @@
     <p class="meta">生成于 2026-08-12 · 依据官方 inference 源码 + config.json + 真实 checkpoint 张量头 + 本机实测</p>
   </header>
 
-  <h2 id="specs">关键规格</h2>
+  <h2 id="specs">1. 关键规格</h2>
   <table>
     <tr><th>项目</th><th>数值</th><th>出处</th></tr>
     <tr><td>总参数 / 每 token 激活</td><td>1.599T / 48.85B</td><td>由 64 个 safetensors 文件头逐张量实算（见下）</td></tr>
@@ -87,7 +87,7 @@
     <tr><td>注意力头维度</td><td>512（后 64 维走 RoPE）</td><td><code>head_dim</code> / <code>qk_rope_head_dim</code></td></tr>
     <tr><td>压缩率逐层配置</td><td>奇数层 128、偶数层 4，共 31 + 30 层</td><td><code>compress_ratios</code>（62 项，末项对应 MTP）</td></tr>
     <tr><td>滑动窗口</td><td>128</td><td><code>sliding_window</code></td></tr>
-    <tr><td>Indexer 选中条目数</td><td>1024（64 头 × 128 维）</td><td><code>index_topk</code> / <code>index_n_heads</code> / <code>index_head_dim</code></td></tr>
+    <tr><td>Indexer 选中条目数</td><td>1024（$64 \times 128$）</td><td><code>index_topk</code> / <code>index_n_heads</code> / <code>index_head_dim</code></td></tr>
     <tr><td>MoE</td><td>384 路由专家 top-6 + 1 共享专家，中间维 3072</td><td><code>n_routed_experts</code> / <code>num_experts_per_tok</code> / <code>moe_intermediate_size</code></td></tr>
     <tr><td>路由评分函数</td><td>sqrt(softplus)，缩放 2.5</td><td><code>scoring_func</code> / <code>routed_scaling_factor</code></td></tr>
     <tr><td>Hash 路由层</td><td>前 3 层（第 0、1、2 层）</td><td><code>num_hash_layers</code>，并由 checkpoint 中仅 3 层含 <code>gate.tid2eid</code> 佐证</td></tr>
@@ -96,7 +96,7 @@
     <tr><td>权重精度</td><td>路由专家 FP4、其余多为 FP8、norm/embed BF16</td><td><code>expert_dtype</code> / <code>quantization_config</code>，并由张量头 dtype 佐证</td></tr>
   </table>
 
-  <h2 id="flow">交互式数据流</h2>
+  <h2 id="flow">2. 交互式数据流</h2>
   <p>下图为实际前向路径。黄框节点可点击下钻；悬停查看该级的张量形状与公式。图中形状取自本机对官方 <code>model.py</code> 打 forward hook 的实测记录（缩小配置），维度数字标注为官方 config 的真实值。</p>
 
   <div class="viz">
@@ -109,9 +109,9 @@
   </div>
   <div id="tip"></div>
 
-  <h2 id="points">要点</h2>
+  <h2 id="points">3. 要点</h2>
 
-  <h3>整体结构：两种注意力逐层交替 + 四份残差流</h3>
+  <h3>3.1 整体结构：两种注意力逐层交替 + 四份残差流</h3>
   <ul>
     <li><b>沿序列</b>：61 层里 HCA（<code>compress_ratio=128</code>）与 CSA（<code>compress_ratio=4</code>）交替。<code>compress_ratios</code> 前 12 项为 <code>[128,128,4,128,4,128,4,128,4,128,4,128]</code>——第 0、1 层连续两层 HCA，此后严格奇偶交替，最终 HCA 31 层、CSA 30 层。只有 CSA 层带 Indexer，checkpoint 中恰好 30 层含 <code>attn.indexer.*</code>。</li>
     <li><b>压缩不是池化</b>：每个压缩条目是 <code>wgate</code> 从隐藏状态算出的 softmax 权重对 <code>wkv</code> 结果的加权和，再加可学习位置偏置 <code>ape</code>。实测将其与均值池化对比，相对差异 0.76，确认权重是数据相关的。</li>
@@ -119,39 +119,39 @@
     <li><b>沿宽度</b>：每层 384 个路由专家取 top-6，另有 1 个共享专家恒激活。路由专家占总参数 96.8%（1.547T / 1.599T），但每 token 只激活 6/384。</li>
   </ul>
 
-  <h3>CSA（Compressed Sparse Attention，30 层）</h3>
+  <h3>3.2 CSA（Compressed Sparse Attention，30 层）</h3>
   <ul>
     <li>压缩率 4 且启用重叠：<code>Compressor</code> 中 <code>self.overlap = compress_ratio == 4</code>，使 <code>wkv</code>/<code>wgate</code> 输出宽度翻倍（真实权重 <code>layers.2.attn.compressor.wkv.weight</code> 形状 [1024, 7168]，正好是 HCA 层 [512, 7168] 的两倍）。</li>
-    <li>重叠的含义：每个压缩条目由 2m=8 个原始条目产生，softmax 在 8 个元素上归一化（实测归一化宽度=8）；但相邻条目复用彼此的一半来源，因此序列长度仍只压到 1/4，而非 1/8。</li>
+    <li>重叠的含义：每个压缩条目由 $2m=8$ 个原始条目产生，softmax 在 8 个元素上归一化（实测归一化宽度=8）；但相邻条目复用彼此的一半来源，因此序列长度仍只压到 1/4，而非 1/8。</li>
     <li>Lightning Indexer 自带一套独立的压缩器（<code>index_head_dim=128</code>，带 Hadamard 旋转 + FP4 量化模拟）。索引分数为 $I_{t,s}=\sum_h w_{t,h}\,\mathrm{ReLU}(q^I_{t,h}\cdot K^{\mathrm{IComp}}_s)$——注意是先 ReLU 再按头加权求和，不是 softmax。</li>
     <li>Indexer 的 query 与主注意力的 query 共享同一个低秩潜向量 <code>qr</code>（<code>q_norm(wq_a(x))</code>），只是各自用不同的 <code>wq_b</code> 上投影。</li>
   </ul>
 
-  <h3>HCA（Heavily Compressed Attention，31 层）</h3>
+  <h3>3.3 HCA（Heavily Compressed Attention，31 层）</h3>
   <ul>
     <li>压缩率 128、不重叠，softmax 在 128 个元素上归一化（实测归一化宽度=128）。无 Indexer，也无稀疏选择——所有压缩条目全部参与注意力。</li>
     <li>正是因为压得足够狠，才可以不做稀疏化：1M 上下文下每层只有 8192 个压缩条目，与滑窗 128 合计 8320，规模已经可控。</li>
     <li>YaRN 只在带压缩的层生效。<code>model.py</code> 中若 <code>compress_ratio</code> 为 0 则用 <code>rope_theta=10000</code> 且关闭 YaRN；带压缩的层用 <code>compress_rope_theta=160000</code>。压缩条目的位置索引是压缩后的块号，跨度被压掉，因此需要单独的 theta。</li>
   </ul>
 
-  <h3>两种层共有的四个细节</h3>
+  <h3>3.4 两种层共有的四个细节</h3>
   <ul>
     <li><b>滑窗与压缩条目同处一个 softmax</b>：<code>model.py</code> 把窗口索引与压缩索引 <code>cat</code> 成一个 <code>topk_idxs</code> 再调用一次 <code>sparse_attn</code>。即两条分支不是各算一次注意力再融合，而是共享同一个归一化分母。实测把压缩索引拼进去后输出变化 1.57，确认其参与同一归一化。</li>
     <li><b>Attention sink</b>：每头一个可学习标量，$\mathrm{Exp}(z'_h)$ 直接加进 softmax 分母。实测 sink 取 5 时注意力权重之和降到 0.26，即该头可以选择几乎不看任何 KV。</li>
     <li><b>输出侧反向 RoPE</b>：KV 条目同时充当 key 和 value，输出因此携带绝对位置相位；<code>apply_rotary_emb(o, freqs, inverse=True)</code> 用共轭旋转把它转回相对位置。实测正向再反向的误差为 2.4e-7，是精确逆变换。</li>
-    <li><b>分组输出投影</b>：128 头 × 512 维 = 65536 维直接投回 7168 代价过高，故按 <code>o_groups=16</code> 分组，每组先降到 <code>o_lora_rank=1024</code>（<code>wo_a</code> [16384, 4096]）再合并投回（<code>wo_b</code> [7168, 16384]）。</li>
+    <li><b>分组输出投影</b>：$128 \times 512 = 65536$ 维直接投回 7168 代价过高，故按 <code>o_groups=16</code> 分组，每组先降到 <code>o_lora_rank=1024</code>（<code>wo_a</code> [16384, 4096]）再合并投回（<code>wo_b</code> [7168, 16384]）。</li>
   </ul>
 
-  <h3>mHC（Manifold-Constrained Hyper-Connections）</h3>
+  <h3>3.5 mHC（Manifold-Constrained Hyper-Connections）</h3>
   <ul>
     <li>每层的混合参数由当前残差流算出，不是静态权重：把 4 份残差拼成 28672 维，经 <code>hc_attn_fn</code>（真实形状 [24, 28672]）投到 24 维，再切成 pre(4) / post(4) / comb(16) 三段。</li>
-    <li>pre 为 $\sigma(\cdot)+\varepsilon$，post 为 $2\sigma(\cdot)$，comb 经 Sinkhorn 迭代投影后作为 4×4 残差混合矩阵。</li>
-    <li><b>实测发现</b>：官方 kernel 的迭代顺序是「softmax(-1) → 列归一化 → 19 轮（行归一化 → 列归一化）」，最后一步是列归一化，因此列和精确为 1、行和只是近似。收敛速度强烈依赖 comb logits 的尺度：尺度 ≤0.1 时 20 轮远超所需、行列和都精确为 1；尺度为 3 时 20 轮后行和最大仍偏离 3.5e-2，需约 231 轮才降到 1e-3。<code>hc_sinkhorn_iters=20</code> 是与「门控参数初始化较小、矩阵接近均匀」相匹配的取值，而非在任意输入下都严格双随机。</li>
+    <li>pre 为 $\sigma(\cdot)+\varepsilon$，post 为 $2\sigma(\cdot)$，comb 经 Sinkhorn 迭代投影后作为 $4\times4$ 残差混合矩阵。</li>
+    <li><b>实测发现</b>：官方 kernel 的迭代顺序是「softmax(-1) → 列归一化 → 19 轮（行归一化 → 列归一化）」，最后一步是列归一化，因此列和精确为 1、行和只是近似。收敛速度强烈依赖 comb logits 的尺度：尺度 $\le 0.1$ 时 20 轮远超所需、行列和都精确为 1；尺度为 3 时 20 轮后行和最大仍偏离 3.5e-2，需约 231 轮才降到 1e-3。<code>hc_sinkhorn_iters=20</code> 是与「门控参数初始化较小、矩阵接近均匀」相匹配的取值，而非在任意输入下都严格双随机。</li>
     <li>双随机约束的作用是让残差混合成为压缩映射：实测双随机 comb 混合后 L2 范数比值 0.83；若只做行归一化，列和会散到 [0, 2.62]，某些残差通道被反复放大。</li>
     <li>代价很小：每层 mHC 参数约 1.38M，61 层合计 0.084B，占总参数 0.005%。</li>
   </ul>
 
-  <h3>MoE 路由</h3>
+  <h3>3.6 MoE 路由</h3>
   <ul>
     <li><b>评分函数从 V3 的 sigmoid 换成 sqrt(softplus)</b>。实测差异集中在高分区：logit=12 时 sigmoid 已饱和到 0.999994，sqrt(softplus) 仍在按 $\sqrt{z}$ 增长到 3.46。含义是高置信路由之间的亲和度差异不会被压平。</li>
     <li><b>bias 只参与选择、不进权重</b>：<code>scores + bias</code> 用于 topk，而权重从未加 bias 的 <code>original_scores</code> 里 gather。实测把专家 0 的 bias 抬到 5 后它被挤进 top-6，但拿到的权重仍基于原始分数 0.73。这是 auxiliary-loss-free 均衡的关键——调节被选频率而不扭曲输出系数。</li>
@@ -159,7 +159,7 @@
     <li>专家精度分层：路由专家为 FP4（张量头显示 I8 [3072, 3584]，即沿 K 维两值打包，配 <code>scale</code> F8_E8M0 [3072, 224]），而共享专家是 FP8 [3072, 7168] 未降到 FP4。</li>
   </ul>
 
-  <h3>长上下文效率的来源</h3>
+  <h3>3.7 长上下文效率的来源</h3>
   <p>注意力开销由每 token 的候选集规模决定。按官方配置实算：</p>
   <table>
     <tr><th>上下文</th><th>CSA 层候选集</th><th>HCA 层候选集</th></tr>
@@ -167,10 +167,10 @@
     <tr><td>64K</td><td>128 + 1024 = 1152</td><td>128 + 512 = 640</td></tr>
     <tr><td>1M</td><td>128 + 1024 = 1152</td><td>128 + 8192 = 8320</td></tr>
   </table>
-  <p>CSA 层在上下文超过 4096（= <code>index_topk</code> × 4）后候选集被 topk 钉死在 1152，完全与长度脱钩；HCA 层随长度线性增长但斜率只有 1/128。两者叠加即报告所称 1M 下单 token 推理 FLOPs 仅为 V3.2 的 27%。</p>
-  <p>KV cache 侧：每条目 64 维 BF16（RoPE）+ 448 维 FP8 = 576 字节，为纯 BF16 的 56.2%（报告称「近一半」）。1M 上下文下主注意力 KV cache 合计 4.36 GiB，相对报告基线 BF16 GQA8（head_dim=128，244 GiB）为 <b>1.79%</b>，独立复现了报告「约 2%」的结论。Indexer 另需 1.88 GiB（30 个 CSA 层各 262144 条目 × 128 维），未计入该口径。</p>
+  <p>CSA 层在上下文超过 4096（即 <code>index_topk</code> $\times$ 4）后候选集被 topk 钉死在 1152，完全与长度脱钩；HCA 层随长度线性增长但斜率只有 1/128。两者叠加即报告所称 1M 下单 token 推理 FLOPs 仅为 V3.2 的 27%。</p>
+  <p>KV cache 侧：每条目 64 维 BF16（RoPE）+ 448 维 FP8 = 576 字节，为纯 BF16 的 56.2%（报告称「近一半」）。1M 上下文下主注意力 KV cache 合计 4.36 GiB，相对报告基线 BF16 GQA8（head_dim=128，244 GiB）为 <b>1.79%</b>，独立复现了报告「约 2%」的结论。Indexer 另需 1.88 GiB（30 个 CSA 层各 $262144 \times 128$），未计入该口径。</p>
 
-  <h2 id="verify">本机实测与核对</h2>
+  <h2 id="verify">4. 本机实测与核对</h2>
   <p>官方 <code>inference/kernel.py</code> 用 tilelang 编写，只能在 NVIDIA GPU 上编译。为在本机验证，按其逐行语义用纯 PyTorch 等价复现了 <code>act_quant</code>、<code>fp4_act_quant</code>、<code>sparse_attn</code>、<code>hc_split_sinkhorn</code>，随后直接 import 官方 <code>inference/model.py</code>——架构代码一行未改，仅替换这几个算子，因此跑出的路径就是官方实现的路径。</p>
   <p>缩小配置（4~6 层、dim 256、结构与官方同构：HCA/CSA 交替、含 Hash 层、含重叠压缩、含 Indexer、hc_mult=4）下 prefill 与逐 token decode 均跑通，logits 无 NaN/Inf。forward hook 抓到的候选集与手算完全一致：</p>
   <pre>层  compress_ratio  kv形状              topk_idxs        最大有效候选
@@ -191,7 +191,7 @@ mHC(61层)            0.08 B    0.0%
 每 token 激活 = 61 层 × 6 专家 (24.18 B) + 非专家部分 (24.68 B) = 48.85 B    官方宣称 49B</pre>
   <div class="note">实测脚本与完整输出存于本页 <code>research/</code> 目录：<code>kernel_ref.py</code> 为算子等价实现，<code>t1</code>~<code>t11</code> 为各项验证，<code>all_results.txt</code> 为一次性跑完全部脚本的原始输出。</div>
 
-  <h2 id="sources">来源与核对</h2>
+  <h2 id="sources">来源与范围说明</h2>
   <table>
     <tr><th>项目</th><th>依据</th></tr>
     <tr><td>全部 config 数值</td><td>官方 <code>config.json</code> 与 <code>inference/config.json</code>：huggingface.co/deepseek-ai/DeepSeek-V4-Pro</td></tr>

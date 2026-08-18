@@ -664,21 +664,51 @@
 <p>把"我打你"和"你打我"这两句话喂给一个完全没有位置编码的 Transformer——模型能分清谁打谁吗？答案是：不能。两句话的 token 完全相同，只是顺序不同；而自注意力只看内容匹配、不看顺序，交换 token 顺序后每个位置的输出值不变。要让模型分清"谁在前谁在后"，必须把位置信息注入进去。<strong>位置编码</strong>就是干这件事的一类方法：给本身排列等变、不含位置感知的自注意力补充位置信号。按位置信号加在哪里可分成四类——加在输入嵌入上的绝对方案（正弦或可学习）、加在注意力分数上的相对偏置（T5）、乘在 query/key 上的旋转（RoPE），以及完全不施加的 NoPE。本页要回答：这四类方案各自怎么注入位置信号、有什么权衡，以及 Kimi K3 的 MLA 层为什么选 NoPE。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>为什么 Transformer 需要位置编码？注意力本身的什么性质导致位置信息缺失？</li>
-    <li>写出绝对正弦位置编码公式，解释每个符号，并手算 d=4、pos=1、2 的 PE 向量；说明为什么用不同频率的 sin/cos。</li>
-    <li>可学习绝对位置编码与正弦位置编码的区别与权衡是什么？</li>
-    <li>相对位置编码（T5 bias）的机制是什么，与绝对位置编码的本质区别是什么？</li>
-    <li>用一张表对比四类方案与 NoPE 的核心权衡，并说明 K3 为什么选 NoPE。</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>为什么 Transformer 需要位置编码？注意力本身的什么性质导致位置信息缺失？</p>
+      <details>
+        <summary>解答：自注意力排列等变，对顺序无区分能力</summary>
+        <p>双向自注意力只按内容匹配：交换输入 token 顺序后，每个位置看到的 token 集合与匹配权重不变，仅输出随位置重排——即排列等变。因此"我打你"与"你打我"在无位置信息时不可区分。RNN 靠逐步处理天然带顺序、CNN 靠局部窗口隐含相对位置，自注意力是唯一必须外接位置信号的架构。完整论证见"为什么 Transformer 需要位置编码"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>写出绝对正弦位置编码公式，解释每个符号，并手算 d=4、pos=1、2 的 PE 向量；说明为什么用不同频率的 sin/cos。</p>
+      <details>
+        <summary>解答：多频率 sin/cos 同时编码局部与全局位置</summary>
+        <p>$PE_{(pos,2i)}=\sin(pos/10000^{2i/d_{model}})$、$PE_{(pos,2i+1)}=\cos(pos/10000^{2i/d_{model}})$；$d_{model}=4$ 时频率 $\omega_0=1$、$\omega_1=0.01$，手算得 $PE_1\approx(0.8415, 0.5403, 0.0100, 1.0000)$、$PE_2\approx(0.9093, -0.4161, 0.0200, 0.9998)$。不同频率让高频维度编码局部/精细位置、低频维度编码全局/粗略位置，同一向量携带多尺度位置信息。完整论证与手算过程见"绝对正弦位置编码"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>可学习绝对位置编码与正弦位置编码的区别与权衡是什么？</p>
+      <details>
+        <summary>解答：参数表换固定公式，外推能力是核心权衡</summary>
+        <p>可学习方案用 $L\times d_{model}$ 参数表代替固定 sin/cos 公式，注入方式仍为加到嵌入上。训练长度内两者表现相近（Vaswani 2017 Table 3 row (e)：25.8 对 25.7 BLEU，"nearly identical"）；可学习超出 $L$ 即无参数、外推失败并增加参数量，正弦公式对任意 $pos$ 成立但经验外推同样退化。完整论证见"可学习绝对位置编码"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>相对位置编码（T5 bias）的机制是什么，与绝对位置编码的本质区别是什么？</p>
+      <details>
+        <summary>解答：偏置加在分数上，编码"相差几位"</summary>
+        <p>T5 在 softmax 之前给注意力分数加一个与相对距离 $i-j$ 分桶绑定的可学习标量偏置 $b_{\text{bucket}(i-j)}$（约 32 个桶，每头独立、各层共享，超界 clamp 到最大桶）。与绝对方案的本质区别有两点：编码对象（"相差几位"对"第几位"）与作用点（注意力分数对输入嵌入，每层每头直接注入）。完整论证见"相对位置编码"一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>用一张表对比四类方案与 NoPE 的核心权衡，并说明 K3 为什么选 NoPE。</p>
+      <details>
+        <summary>解答：按"加在哪里"区分，K3 因矩阵吸收冲突与 KDA 而选 NoPE</summary>
+        <p>四类方案按位置信号注入点区分：绝对正弦/可学习加在输入嵌入上、T5 bias 加在注意力分数上（与 FlashAttention 不兼容）、RoPE 乘在 query/key 上（与 MLA 矩阵吸收冲突）、NoPE 不施加（依赖 decoder-only 因果掩码隐式提供位置，可直接外推）。Kimi K3 的 MLA 层选 NoPE 的原因：其一 RoPE 的逐 token 旋转破坏矩阵吸收的前提；其二位置信息已由 KDA 的递归门控与衰减承载。完整论证见"四类方案对比与 NoPE 选择"一章。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
 <p>本文依赖几个已有概念页，正文只引用结论不内联展开：<strong>自注意力</strong>的完整机制见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>，排列等变性的形式化讨论见 <a href="../../wiki/nope/index.html">NoPE</a>。<strong>RoPE</strong>（旋转位置编码，见 <a href="../../wiki/rope/index.html">RoPE</a>）与 <strong>NoPE</strong>（无位置编码，见 <a href="../../wiki/nope/index.html">NoPE</a>）各有独立概念页，本页只在对比章节引用。<strong>Kimi K3</strong> 的 MLA 与 NoPE 选择见 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a>，MLA 的矩阵吸收见 <a href="../../wiki/mla/index.html">MLA</a>。</p>
 
-<p>先看一个教学示例钩子：用一个 $d_{model}=4$ 的最小正弦位置编码，pos=1 和 pos=2 的位置向量长什么样？这个问题会在下一章手算回答，并在后续章节作为对比基准。</p>
+<p>先看一个构造示例钩子：用一个 $d_{model}=4$ 的最小正弦位置编码，pos=1 和 pos=2 的位置向量长什么样？这个问题会在下一章手算回答，并在后续章节作为对比基准。</p>
 
-<h2 id="why-positional-encoding">为什么 Transformer 需要位置编码——注意力的排列等变性</h2>
+<h2 id="why-positional-encoding">1. 为什么 Transformer 需要位置编码——注意力的排列等变性</h2>
 
 <p>标准自注意力做的事情是"用 query 和 key 做匹配，按匹配程度对 value 加权求和"（见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>）。它只关心两个 token 的内容像不像，不关心它们各自在第几位。这引出一个问题：如果模型不知道 token 的位置，它还能区分"我打你"和"你打我"吗？</p>
 
@@ -701,16 +731,34 @@
 
 <p>位置编码不是单一方法，而是一类方法。按"位置信号加在哪里、怎么加"可以分成四类：加在输入嵌入上的绝对位置编码（正弦或可学习）、加在注意力分数上的相对位置编码、乘在 query/key 上的旋转位置编码（RoPE），以及完全不施加的 NoPE。下面四章依次讲清前三类的机制与权衡，最后一章总收束对比并解释 NoPE 的选择。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一句话说出注意力为什么不含位置信息（排列等变——交换顺序后每个位置输出值不变）。</li>
-  <li>说出 RNN、CNN、自注意力三者哪个需要外接位置信号及原因。</li>
-  <li>"我打你"和"你打我"在无位置信息时为什么不可区分？</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>注意力为什么不含位置信息？</p>
+    <details>
+      <summary>解答：排列等变——交换顺序后每个位置输出值不变</summary>
+      <p>双向注意力只按内容匹配，不给位置信息时，交换输入顺序后每个位置仍看到同样一组 token、按同样内容匹配得到同样权重，只是输出跟着挪了位置。这叫排列等变：模型对"谁先谁后"没有真正的区分能力。</p>
+    </details>
+  </li>
+  <li>
+    <p>RNN、CNN、自注意力三者哪个需要外接位置信号？为什么？</p>
+    <details>
+      <summary>解答：自注意力，因为所有位置同时交互</summary>
+      <p>自注意力。RNN 按时间步逐步处理，隐状态天然带顺序；CNN 的卷积核局部窗口隐含相对位置（远距离仍需补充）；自注意力把所有位置同时拉到一起、对行重排不变，顺序信息完全丢失，是三者中唯一必须外接位置信号的架构。</p>
+    </details>
+  </li>
+  <li>
+    <p>"我打你"和"你打我"在无位置信息时为什么不可区分？</p>
+    <details>
+      <summary>解答：token 集合相同，仅顺序不同</summary>
+      <p>两句的 token 完全相同、只是顺序不同；注意力只按内容匹配，交换顺序后每个位置看到的内容集合不变、输出值也不变，而两句语义完全相反。这说明位置信息对语义至关重要，必须显式注入。</p>
+    </details>
+  </li>
+</ol>
 
 <p>知道了"为什么需要"，下一章看 Vaswani 2017 给出的第一种注入方式——绝对正弦位置编码。</p>
 
-<h2 id="sinusoidal-pe">绝对正弦位置编码——Vaswani 2017 的 sin/cos 公式与手算</h2>
+<h2 id="sinusoidal-pe">2. 绝对正弦位置编码——Vaswani 2017 的 sin/cos 公式与手算</h2>
 
 <p>位置编码最直接的做法是：给每个位置 $pos$ 生成一个与位置绑定的向量 $PE_{pos}$，加到那个位置的 token 嵌入上。注入方式是</p>
 
@@ -743,10 +791,10 @@
 <p><strong>教学解释</strong>。 可以把多频率 sin/cos 暂时理解成一个"连续版二进制计数器"：二进制里最低位每步翻转（高频）、最高位很少翻转（低频），组合起来唯一标识每个整数；正弦位置编码里 $i$ 小的维度振荡快（像低位）、$i$ 大的维度振荡慢（像高位），组合起来给每个位置一个唯一的"指纹"。这个类比只帮助理解"为什么多频率能唯一编码位置"。它失效的边界：二进制各位是离散 0/1 跳变，sin/cos 是连续平滑函数；二进制位数固定，这里维度对数由 $d_{model}$ 决定且波长连续分布；二进制有唯一性证明，sin/cos 的唯一性依赖频率不可约。正式判断仍以正弦位置编码公式为准。</p>
 </div>
 
-<p>下面用教学示例把公式落到可复算程度。</p>
+<p>下面用构造示例把公式落到可复算程度。</p>
 
 <div class="callout callout-yellow">
-<p><strong>教学示例</strong>。 取 $d_{model}=4$（让计算可手算；真实模型 $d_{model}=512$）。由 $\omega_i = 1/10000^{2i/4}$：</p>
+<p><strong>构造示例</strong>。 取 $d_{model}=4$（让计算可手算；真实模型 $d_{model}=512$）。由 $\omega_i = 1/10000^{2i/4}$：</p>
 <p>$$\omega_0 = 1/10000^{0} = 1,\qquad \omega_1 = 1/10000^{2/4} = 1/10000^{0.5} = 1/100.$$</p>
 <p>所以维度 0,1 用频率 $\omega_0=1$（$pos$ 直接作自变量），维度 2,3 用频率 $\omega_1=0.01$（$pos/100$ 作自变量）。数字为便于手算构造，不代表真实模型配置。</p>
 </div>
@@ -806,17 +854,34 @@
 <p><strong>常见误解</strong>：把正弦位置编码叫做"相对位置编码"。这是错的。正弦方案是<strong>绝对</strong>位置编码——位置向量与绝对位置 $pos$ 绑定、加在输入嵌入上。它具有"PE(pos+k) 是 PE(pos) 的线性函数"这一性质，使模型<strong>有可能</strong>学到相对位置，但这不改变它属于绝对方案的事实。真正的相对位置编码加在注意力分数上、与相对距离绑定，下一章会讲。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出正弦位置编码公式并解释 $pos$、$i$、$d_{model}$、$10000$ 每个符号。</li>
-  <li>手算 $d_{model}=4$、$pos=1$ 的 PE 向量（应为 $\approx (0.8415, 0.5403, 0.0100, 1.0000)$）。</li>
-  <li>说明 $i$ 小与 $i$ 大的维度对分别编码局部还是全局位置及原因。</li>
-  <li>说明线性性质的含义及其作为 RoPE 思想伏笔的原因。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出正弦位置编码公式并解释 $pos$、$i$、$d_{model}$、$10000$ 每个符号。</p>
+    <details>
+      <summary>解答：公式与符号</summary>
+      <p>$PE_{(pos,2i)}=\sin(pos/10000^{2i/d_{model}})$、$PE_{(pos,2i+1)}=\cos(pos/10000^{2i/d_{model}})$。$pos$ 是 token 的位置索引（从 0 起）；$i$ 是维度对索引（$0$ 到 $d_{model}/2-1$），第 $i$ 对覆盖维度 $2i$（sin）与 $2i+1$（cos）；$d_{model}$ 是嵌入维度也是位置向量维度；$10000$ 是 base 常数，控制频率几何递减的速率，使同一对维度共用频率 $\omega_i=1/10000^{2i/d_{model}}$。</p>
+    </details>
+  </li>
+  <li>
+    <p>$i$ 小与 $i$ 大的维度对分别编码什么？为什么？</p>
+    <details>
+      <summary>解答：高频编码局部，低频编码全局</summary>
+      <p>$i$ 小时频率大、波长短（$i=0$ 波长 $2\pi$，约 6 个位置转一圈），sin/cos 随 $pos$ 变化快，编码局部/精细位置；$i$ 大时频率小、波长长（$d_{model}=512$ 时最大波长约 $10000\cdot 2\pi$），几乎不随 $pos$ 变化，编码全局/粗略位置。波长跨越四个数量级，同一个位置向量因此同时携带多尺度位置信息，模型能同时处理短程和长程的位置关系。</p>
+    </details>
+  </li>
+  <li>
+    <p>线性性质的含义是什么？为什么说它是 RoPE 的思想伏笔？</p>
+    <details>
+      <summary>解答：固定偏移对应固定旋转，相对位置可线性读出</summary>
+      <p>对任意固定偏移 $k$，$PE_{pos+k}$ 可由 $PE_{pos}$ 经角度 $k\omega_i$ 的旋转得到（和角公式直接推出）：这意味着位置向量虽与绝对位置绑定，模型却有可能从绝对编码中线性读出相对位置 $k$——正是 Vaswani 选择 sin/cos 的理由。RoPE 后来把"旋转"直接做成机制：按位置旋转 query/key，使内积只依赖相对位置。注意该性质只在一对维度内成立，且不改变正弦方案属于绝对位置编码的事实。</p>
+    </details>
+  </li>
+</ol>
 
 <p>正弦方案用固定公式生成位置向量。如果把固定公式换成可学习参数会怎样？下一章看可学习绝对方案。</p>
 
-<h2 id="learned-pe">可学习绝对位置编码——把固定向量换成可学习参数</h2>
+<h2 id="learned-pe">3. 可学习绝对位置编码——把固定向量换成可学习参数</h2>
 
 <p>正弦方案的频率与公式都是人工设定的。一个自然的改进是：让模型自己学每个位置该用什么向量。这就是<strong>可学习绝对位置编码</strong><sup>[F5]</sup>：用一个 $L\times d_{model}$ 的可学习参数表 $PE$ 代替固定 sin/cos，$L$ 是预设的最大序列长度，每个位置一个可学习向量。</p>
 
@@ -862,16 +927,34 @@
 
 <p>可学习方案换来了"数据驱动"（模型能学到任务特定的位置模式），但失去了外推能力（超出 $L$ 即失败），并增加 $L\cdot d_{model}$ 参数。这是绝对位置编码（无论正弦还是可学习）的共同局限：它们都加在输入嵌入上、编码"第几位"，而语言理解往往更依赖"相差几位"。下一章看相对位置编码如何换一个作用点。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>写出可学习方案的参数表形式并说明 $L$ 的含义。</li>
-  <li>Vaswani 2017 报告 learned 与 sinusoidal 的关系是什么？（相近，正弦略优，base/big 都用正弦）</li>
-  <li>解释可学习方案外推失败的原因，并判断正弦方案外推是否一定好。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>写出可学习方案的参数表形式，并说明 $L$ 的含义。</p>
+    <details>
+      <summary>解答：$L\times d_{model}$ 参数表，$L$ 为最大长度</summary>
+      <p>用一个 $PE\in\mathbb{R}^{L\times d_{model}}$ 的可学习参数表代替固定 sin/cos 公式，注入方式不变：$x'_m=x_m+PE_m$。$L$ 是预设的最大序列长度，每个位置对应一个可学习向量；位置超出 $L$ 时没有对应参数，模型无法处理。</p>
+    </details>
+  </li>
+  <li>
+    <p>Vaswani 2017 报告的 learned 与 sinusoidal 的关系是什么？</p>
+    <details>
+      <summary>解答：nearly identical，base/big 都用正弦</summary>
+      <p>Table 3 row (e)：正弦 25.8、可学习 25.7 BLEU（base 模型，dev 集），差距小于 1 BLEU，论文描述为 "nearly identical"。base 与 big 最终都采用正弦位置编码，可学习只是实验对比项；最终选正弦的理由是可能允许外推到更长序列，不是性能。</p>
+    </details>
+  </li>
+  <li>
+    <p>可学习方案为什么外推失败？正弦方案的外推一定好吗？</p>
+    <details>
+      <summary>解答：超 $L$ 无参数；正弦理论可外推但经验也退化</summary>
+      <p>可学习方案的参数表只有 $L$ 个位置，超出 $L$ 即无参数可用，外推直接失败。正弦公式对任意 $pos$ 数学上成立，理论可外推；但经验上在训练时未见过的长度同样退化，外推能力并非保证——这正是论文措辞"may allow"的含义。</p>
+    </details>
+  </li>
+</ol>
 
 <p>绝对方案（正弦与可学习）都加在输入嵌入上、编码"第几位"。但语言理解常更依赖"相差几位"——下一章看相对方案。</p>
 
-<h2 id="relative-pe">相对位置编码——T5 的 bias 机制与"加在分数上"的本质区别</h2>
+<h2 id="relative-pe">4. 相对位置编码——T5 的 bias 机制与"加在分数上"的本质区别</h2>
 
 <p>绝对位置编码给每个位置一个独立向量，编码的是"这是第几位"。但语言学里更重要的是相对距离：理解"The cat sat on the mat"中"sat"与"cat"的关系，需要知道"cat 在 sat 前面 1 位"（主谓关系），而不是"cat 是第 2 位、sat 是第 3 位"。<strong>相对位置编码</strong>直接编码"两个位置相差几位"。</p>
 
@@ -887,14 +970,16 @@
 </ul>
 
 <pre class="diagram">绝对位置编码（正弦/可学习）：位置信号加在输入嵌入上
-  x_m ──► +PE_m ──► W^Q ──► q_m ┐
-  x_n ──► +PE_n ──► W^K ──► k_n ┼──► q_m · k_n ──► softmax ──► 加权 V
-  x_n ──► +PE_n ──► W^V ──► v_n ┘   （位置只通过嵌入进入一次，之后被投影扭曲）
+  x_m → +PE_m → W^Q → q_m
+  x_n → +PE_n → W^K → k_n     →  q_m · k_n → softmax → 加权 V
+  x_n → +PE_n → W^V → v_n
+  （位置只通过嵌入进入一次，之后被投影扭曲）
 
 相对位置编码（T5 bias）：位置信号加在注意力分数上
-  x_m ──► W^Q ──► q_m ┐
-  x_n ──► W^K ──► k_n ┼──► q_m · k_n + b_{bucket(m-n)} ──► softmax ──► 加权 V
-  x_n ──► W^V ──► v_n ┘   （位置在每个注意力层、每个头都直接进入分数）</pre>
+  x_m → W^Q → q_m
+  x_n → W^K → k_n     →  q_m · k_n + b_{bucket(m-n)} → softmax → 加权 V
+  x_n → W^V → v_n
+  （位置在每个注意力层、每个头都直接进入分数）</pre>
 
 <p>本质区别在两点<sup>[C8]</sup>：</p>
 <ul>
@@ -906,7 +991,7 @@
 <table>
 <thead><tr><th>维度</th><th>绝对方案（正弦/可学习）</th><th>相对方案（T5 bias）</th></tr></thead>
 <tbody>
-<tr><td>编码对象</td><td>绝对位置 pos</td><td>相对距离 i−j</td></tr>
+<tr><td>编码对象</td><td>绝对位置 $pos$</td><td>相对距离 $i-j$</td></tr>
 <tr><td>作用点</td><td>输入嵌入（第一层之前）</td><td>注意力分数（softmax 之前，每层每头）</td></tr>
 <tr><td>可学习参数量</td><td>0（正弦）或 $L\cdot d$（可学习）</td><td>约 $32 \times h$（桶数×头数，各层共享）</td></tr>
 <tr><td>长度外推</td><td>正弦理论可外推、可学习失败</td><td>clamp 到最大桶，可一定程度外推</td></tr>
@@ -923,16 +1008,34 @@
 
 <p>相对方案换来了"直接编码相对距离"和"每层每头注入位置"，但也带来代价：与 FlashAttention 不兼容（需物化 $n\times n$ 偏置矩阵），限制了高效推理。这正是后来 RoPE 被广泛采用的原因之一——RoPE 用乘旋转实现相对效果，但不需要物化偏置矩阵（详见 <a href="../../wiki/rope/index.html">RoPE</a>）。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 T5 bias 加在哪里（注意力分数 softmax 之前）、与相对距离怎么绑定（分桶后每桶一个标量）。</li>
-  <li>说出绝对方案与相对方案的两个本质区别（编码对象：第几位 vs 相差几位；作用点：嵌入 vs 分数）。</li>
-  <li>说明 T5 bias 与 FlashAttention 不兼容的原因（需物化 $n\times n$ 偏置矩阵）。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>T5 bias 加在哪里？与相对距离怎么绑定？</p>
+    <details>
+      <summary>解答：softmax 之前的分数上，分桶绑定</summary>
+      <p>加在注意力分数 softmax 之前：$\text{score}(i,j)=q_i\cdot k_j+b_{\text{bucket}(i-j)}$。相对距离 $i-j$ 经分桶函数映射到约 32 个桶——邻近距离每距离一桶、远距离按对数合并粗桶、超出训练最大距离 clamp 到最大桶——每桶一个可学习标量，每头独立一套、各注意力层共享。</p>
+    </details>
+  </li>
+  <li>
+    <p>绝对方案与相对方案的两个本质区别是什么？</p>
+    <details>
+      <summary>解答：编码对象与作用点不同</summary>
+      <p>其一，编码对象：绝对方案编码"第几位"（向量与绝对位置 $pos$ 绑定），相对方案编码"相差几位"（偏置与相对距离 $i-j$ 绑定）。其二，作用点：绝对方案加在输入嵌入上，位置信号只在第一层之前进入一次、之后被 $W^Q,W^K,W^V$ 投影扭曲；相对方案加在注意力分数上，每个注意力层、每个头都直接注入位置信号，模型对位置更敏感。</p>
+    </details>
+  </li>
+  <li>
+    <p>T5 bias 与 FlashAttention 不兼容的原因是什么？</p>
+    <details>
+      <summary>解答：需物化 $n\times n$ 偏置矩阵</summary>
+      <p>bias 依赖于每一对 (i, j) 的相对距离，计算分数时需要物化 $n\times n$ 的偏置矩阵；FlashAttention 的效率来自分块 IO、避免显式物化该规模中间矩阵，两者冲突，分块优化失效。这也是后来 RoPE 被广泛采用的原因之一——用乘旋转实现相对效果而不需要偏置矩阵。</p>
+    </details>
+  </li>
+</ol>
 
 <p>四类方案（绝对正弦、可学习绝对、相对 bias、RoPE）各自的机制已清楚。最后一章把它们放一张表对比，并看 K3 为什么选 NoPE。</p>
 
-<h2 id="comparison-and-nope">四类方案对比与 NoPE 选择——为什么 K3 选 NoPE</h2>
+<h2 id="comparison-and-nope">5. 四类方案对比与 NoPE 选择——为什么 K3 选 NoPE</h2>
 
 <p>把四类方案与 NoPE 放一张表，从四个维度对比核心权衡：</p>
 
@@ -955,7 +1058,7 @@
 <p><strong>常见误解</strong>："NoPE 完全没有位置信息。"这是错的。NoPE 不施加<strong>显式</strong>位置编码，但 decoder-only 的因果掩码让每个位置只能看到它之前的 token——这种"可见位置集合随当前位置变化"的不对称性隐式提供了位置信号。NoPE 不适用于双向编码器（那里每个位置看到同样的 token 集合，真没有位置信息）。详见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
 </div>
 
-<h3 id="k3-nope-choice">K3 为什么选 NoPE</h3>
+<h3 id="k3-nope-choice">5.1 K3 为什么选 NoPE</h3>
 
 <p>Kimi K3 的 Gated MLA 层在结构上保留了 RoPE 接口（拆出 rot 分量），但配置中 <code>mla_use_nope=true</code>，所有 MLA 层不施加位置编码。这个选择有两个原因：</p>
 
@@ -967,21 +1070,38 @@
 
 <p>选择位置方案的判断框架：看模型架构（decoder-only 适用 NoPE/RoPE；双向编码器需显式位置信号）、推理优化约束（FlashAttention 与相对 bias 不兼容；MLA 矩阵吸收与 RoPE 冲突）、外推需求（NoPE 直接外推；RoPE 需扩展；可学习无法外推）。没有银弹，只有权衡。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>用一张表对比四类方案与 NoPE 在"加在哪里、是否有参数、长度外推、与推理优化兼容性"四维上的差异。</li>
-  <li>说明 RoPE 叫"绝对构造、相对效果"的原因，以及 NoPE 的位置信息来源。</li>
-  <li>说明 K3 的 MLA 层选 NoPE 的原因（RoPE 与矩阵吸收冲突；位置信息由 KDA 提供）。</li>
-  <li>举一个 RoPE 不适用的场景（如 MLA 压缩潜变量），一个 NoPE 不适用的场景（如双向编码器）。</li>
-</ul>
+<h3>本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>用一张表对比四类方案与 NoPE 在"加在哪里、是否有参数、长度外推、与推理优化兼容性"四维上的差异。</p>
+    <details>
+      <summary>解答：注入点决定参数、外推与兼容性</summary>
+      <p>绝对正弦加在输入嵌入上，无参数，理论可外推（经验也退化），兼容推理优化；可学习绝对加在嵌入上，参数 $L\times d_{model}$，超出 $L$ 即失败，兼容；相对 bias（T5）加在注意力分数上，参数为桶数乘头数（各层共享），clamp 后有限外推，与 FlashAttention 不兼容（需物化 $n\times n$ 偏置矩阵）；RoPE 乘在 Q/K 上，无参数，需 YaRN/PI 等扩展，与 MLA 矩阵吸收冲突；NoPE 什么都不做，无参数，decoder-only 直接外推，依赖因果掩码。</p>
+    </details>
+  </li>
+  <li>
+    <p>RoPE 为什么叫"绝对构造、相对效果"？NoPE 的位置信息来源是什么？</p>
+    <details>
+      <summary>解答：按绝对位置旋转、内积只依赖相对距离；因果掩码隐式提供位置</summary>
+      <p>RoPE 按绝对位置 $m$ 旋转 query 和 key（构造是绝对的），但旋转后的内积只依赖相对位置 $m-n$（效果是相对的），无可学习参数。NoPE 不施加显式位置编码，但 decoder-only 的因果掩码让每个位置只能看到它之前的 token——"可见位置集合随当前位置变化"的不对称性隐式提供了位置信号；双向编码器没有这种不对称性，不适用 NoPE。</p>
+    </details>
+  </li>
+  <li>
+    <p>K3 的 MLA 层为什么选 NoPE？</p>
+    <details>
+      <summary>解答：RoPE 与矩阵吸收冲突，位置信息由 KDA 提供</summary>
+      <p>原因有二。其一，RoPE 与 MLA 的矩阵吸收冲突：吸收要求投影矩阵 $W^{UK}$ 与位置无关，而对压缩潜变量施加 RoPE 会引入逐 token 不同的旋转矩阵，无法合并成固定矩阵，破坏吸收前提。其二，K3 的位置信息由 KDA 的递归门控与衰减机制承载，MLA 不需要额外位置编码；扩展上下文长度时无需修改位置编码参数，可直接外推到 1M token。MLA 压缩潜变量是 RoPE 不适用的典型场景，双向编码器是 NoPE 不适用的典型场景。</p>
+    </details>
+  </li>
+</ol>
 
 <p>本章把四类方案与 NoPE 放一张表对比，并解释了 K3 选 NoPE 的原因。但对比表里的每个论断都需要溯源——下一章给出全部核心论断、公式与数字的来源。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <p>全文总结。回到开篇的问题：没有位置编码的 Transformer 分不清"我打你"和"你打我"，因为自注意力排列等变。位置编码通过四类方式注入位置信号：绝对正弦用多频率 sin/cos 加在嵌入上<sup>[C2]</sup>，可学习绝对把固定公式换成参数表<sup>[C6]</sup>，相对偏置加在注意力分数上编码"相差几位"<sup>[C7]</sup>，RoPE 用乘旋转实现"绝对构造、相对效果"<sup>[C9]</sup>。NoPE 不施加显式编码，靠因果掩码隐式提供位置<sup>[C9]</sup>。选择取决于架构与推理优化约束：K3 的 MLA 层因 RoPE 与矩阵吸收冲突、位置信息由 KDA 提供，选 NoPE 直接外推到更长上下文<sup>[C10]</sup>。没有银弹，只有权衡。</p>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <p><strong>C1（自注意力排列等变、不含位置信息）</strong>：Vaswani et al. 2017, arXiv:1706.03762, §3.5 第 1 段；排列等变论证见已有页面 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a> §复杂度与边界。</p>
 <p><strong>C2（绝对正弦位置编码公式）</strong>：Vaswani et al. 2017, §3.5, Eq.(3) 与 Eq.(4)。</p>
 <p><strong>C3（多频率多尺度）</strong>：Vaswani et al. 2017, §3.5 第 3 段（波长从 $2\pi$ 到 $10000\cdot 2\pi$）。</p>
@@ -993,27 +1113,27 @@
 <p><strong>C9（RoPE 绝对构造相对效果；NoPE 依赖因果掩码）</strong>：Su et al. 2021, arXiv:2104.09864 §3.1；已有页面 <a href="../../wiki/rope/index.html">RoPE</a>、<a href="../../wiki/nope/index.html">NoPE</a>。</p>
 <p><strong>C10（K3 MLA 选 NoPE）</strong>：已有页面 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a> §2.1.2、§3.4；<a href="../../wiki/mla/index.html">MLA</a> §3；<a href="../../wiki/nope/index.html">NoPE</a>。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p><strong>F1（正弦 PE 公式）</strong>：Vaswani et al. 2017, §3.5, Eq.(3) 与 Eq.(4)。</p>
 <p><strong>F2（注入方式 $x'=x+PE$）</strong>：Vaswani et al. 2017, §3.5（"we add the positional encodings to the input embeddings"）。</p>
 <p><strong>F3（线性性质）</strong>：Vaswani et al. 2017, §3.5 第 4 段陈述形式；由 sin/cos 和角公式直接推出。</p>
 <p><strong>F4（T5 bias 加在分数）</strong>：Raffel et al. 2019, §3.2。</p>
 <p><strong>F5（可学习参数表）</strong>：Vaswani 2017 §3.5 引用 [9] Gehring et al. 2017。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p><strong>N1（Table 3 row (e) BLEU 对比）</strong>：Vaswani et al. 2017 Table 3 row (e)；sinusoidal base 25.8、learned base 25.7（dev 集 newstest2013；Table 3 row (e) 仅对 base 做了 learned 消融；big 28.4 出自 Table 2 最终结果 test 集 newstest2014，big 未做 learned 消融）。</p>
 <p><strong>N2（波长范围）</strong>：Vaswani et al. 2017 §3.5 第 3 段；$i=0$ 波长 $2\pi$，$i=d_{model}/2-1$（$d_{model}=512$ 时 $i=255$）波长 $10000\cdot 2\pi$。</p>
 <p><strong>N3（$d_{model}=512$）</strong>：Vaswani et al. 2017 §3.2.2 / Table 3 base 模型。</p>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <p><strong>d=4 正弦 PE 手算</strong>：$d_{model}=4$、base $=10000$，计算 $pos=0,1,2,3$ 的 PE 向量。构造目的：用最小手算例子展示多频率在同一位置的不同变化速率（高频维 dim 0,1 振荡快、低频维 dim 2,3 几乎不动）。数字便于手算，不代表真实模型配置（真实 $d_{model}=512$）。</p>
 <p><strong>"我打你"vs"你打我"钩子</strong>：教学构造，说明排列等变带来的语义丢失——相同 token 不同顺序在无位置信息时不可区分。</p>
 <p><strong>"The cat sat on the mat"相对距离</strong>：教学构造，说明语言学中相对距离比绝对位置更重要。</p>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <p><strong>二进制计数器类比</strong>：服务"多频率为何能唯一编码位置"这一局部关系——$i$ 小的维度振荡快像二进制低位、$i$ 大的维度振荡慢像高位、组合起来给每个位置唯一指纹。<strong>失效边界</strong>：（1）二进制各位是离散 0/1 跳变，sin/cos 是连续平滑函数；（2）二进制位数固定，这里维度对数由 $d_{model}$ 决定且波长连续分布；（3）二进制有严格唯一性证明，sin/cos 的唯一性依赖频率不可约，非完全等价。正式判断仍以正弦位置编码公式为准。</p>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <p><strong>简化 1：用 $d_{model}=4$ 手算</strong>。可推出：多频率机制在最小例子里如何工作。不可推出：真实模型也只用 2 个频率对。</p>
 <p><strong>简化 2：T5 分桶只说方向不展开完整公式</strong>。可推出：分桶让参数量与桶数（32）而非序列长度成正比。不可推出：本页已给出分桶函数的完整定义。</p>
 <p><strong>简化 3：ALiBi 只列方向</strong>。可推出：ALiBi 是与 T5 不同的相对方案。不可推出：本页已展开 ALiBi 的斜率设计与外推性质。</p>

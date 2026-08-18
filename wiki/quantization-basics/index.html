@@ -580,6 +580,45 @@
     }
     .learning-goals ul,
     .misconceptions ul { margin-bottom: 0; }
+    .learning-goals .chapter-questions { margin-bottom: 0; }
+
+    /* ============ 问题块（chapter-questions） ============ */
+    .chapter-questions { margin-bottom: var(--space-paragraph); }
+    .chapter-questions > li { margin-bottom: 1.25rem; }
+    .chapter-questions > li:last-child { margin-bottom: 0; }
+    .chapter-questions > li > p { margin-bottom: 0.5rem; }
+    .chapter-questions details { margin: 0.5rem 0 0; }
+
+    /* ============ HTML 结构图 ============ */
+    .flow-diagram {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      background: var(--bg-code);
+      padding: 1rem;
+      border-radius: 6px;
+      margin: 1.5rem 0;
+      line-height: 1.5;
+      text-align: center;
+      overflow-x: auto;
+    }
+    .flow-diagram .flow-box {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      padding: 0.4rem 0.8rem;
+      margin: 0.25rem 0.4rem;
+    }
+    .flow-diagram .flow-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      align-items: stretch;
+      margin: 0.25rem 0;
+    }
+    .flow-diagram .flow-arrow { color: var(--text-muted); margin: 0.25rem 0; }
+    .flow-diagram .flow-note { font-size: var(--fs-caption); color: var(--text-muted); margin: 0.6rem 0 0; }
+    .flow-diagram .katex { font-size: 1em; }
     .diagram {
       font-family: var(--font-mono);
       font-size: 0.86em;
@@ -664,17 +703,47 @@
 <p>训练一个 7B 模型用 FP16 要 14 GB 显存放权重；部署到消费级显卡（24 GB 还要装 KV cache 与激活）几乎装不下。能不能在精度损失可控的前提下把每个参数从 16 bit 压到 4 bit？这正是量化要解决的问题——用一组 scale（和可选 zero-point）把高精度浮点映射到低精度整数或浮点网格上，让显存和计算按位宽比例下降，代价是网格变粗引入的舍入误差。本文回答：均匀量化如何编码浮点、误差从何而来、对称性与粒度如何适配分布，以及 PTQ、QAT、MXFP4 三条路径各自的机制与边界。</p>
 
 <section class="learning-goals">
-  <h2>读完你能回答</h2>
-  <ul>
-    <li>量化要解决什么问题、为什么它会引入精度损失？</li>
-    <li>给定一组浮点权重和位宽，如何用对称均匀量化把它编码成整数并反量化回来？</li>
-    <li>对称与非对称、per-tensor 与 per-channel 与 per-block 在精度和开销上的差别是什么？</li>
-    <li>量化误差的三个来源是什么，离群值为什么会让误差爆炸？</li>
-    <li>PTQ 与 QAT 的关键差别在哪？MXFP4 这类 block-wise 浮点量化相对定点量化的优势是什么？</li>
-  </ul>
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>量化要解决什么问题、为什么它会引入精度损失？</p>
+      <details>
+      <summary>解答：用位宽换显存与算力，代价是网格变粗的舍入误差</summary>
+      <p>量化用一组 scale（和可选 zero-point）把高精度浮点映射到低精度整数或浮点网格，使显存与算力按位宽比例下降。低精度网格的离散等级远少于浮点，连续值必须舍到最近的网格等级，误差由此产生；位宽越低等级越少、误差上界越大。机制见「1. 量化要解决什么问题」与「2. 均匀量化怎么把浮点变成整数」两章。</p>
+      </details>
+    </li>
+    <li>
+      <p>给定一组浮点权重和位宽，如何用对称均匀量化把它编码成整数并反量化回来？</p>
+      <details>
+      <summary>解答：除以 scale、舍入、裁剪，反量化乘回 scale</summary>
+      <p>对称均匀量化取 $s=\max(|x|)/(2^{b-1}-1)$，量化 $x_q=\mathrm{clip}(\mathrm{round}(x/s),\, -2^{b-1}+1,\, 2^{b-1}-1)$，反量化 $\hat{x}=s\,x_q$。落在网格点上的值零误差，网格点之间的值误差不超过 $s/2$。完整公式与手算见「2. 均匀量化怎么把浮点变成整数」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>对称与非对称、per-tensor 与 per-channel 与 per-block 在精度和开销上的差别是什么？</p>
+      <details>
+      <summary>解答：对称性适配分布形状，粒度决定离群值隔离范围</summary>
+      <p>对称量化（$z=0$）适合零中心分布（典型为权重），反量化只需一次乘法；非对称量化适合偏斜分布（典型为 ReLU 后激活），不浪费整数等级。粒度从 per-tensor 到 per-channel 到 per-block 逐步变细：离群值的影响被限制在更小范围内、精度上升，代价是元数据开销与 kernel 复杂度增大。对照表见「4. 对称/非对称 与 量化粒度」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>量化误差的三个来源是什么，离群值为什么会让误差爆炸？</p>
+      <details>
+      <summary>解答：离散级粗、舍入、裁剪；离群值毒化共享 scale</summary>
+      <p>三来源是离散级粗（等级数 $2^b$ 有限）、舍入（误差上界 $s/2$）与裁剪（超出范围的值被截断）。per-tensor 量化用全张量的 $\max(|x|)$ 算一个 scale，显著离群值会把它主导、放大 $s$，使所有正常值被压到网格低端的少数等级、几乎全被舍到 0。拆解与手算见「3. 量化误差从哪来」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>PTQ 与 QAT 的关键差别在哪？MXFP4 这类 block-wise 浮点量化相对定点量化的优势是什么？</p>
+      <details>
+      <summary>解答：训练时是否见过量化误差；浮点元素自带指数且块隔离离群值</summary>
+      <p>PTQ 训练全程高精度、训练后用校准数据确定 $(s,z)$，无需重训，低位宽下精度下降显著；QAT 前向插入伪量化、反向用直通估计器传梯度，让训练时即"看见"量化误差，是低位宽主流。MXFP4 每 32 个元素共享一个 8-bit E8M0 scale、元素为 4-bit E2M1 浮点：元素自带指数位使块内动态范围更宽，块共享 scale 把离群值隔离在块内。对照见「5. PTQ vs QAT 与 浮点 block-wise 量化」一章。</p>
+      </details>
+    </li>
+  </ol>
 </section>
 
-<h2 id="why-quantize">量化要解决什么问题——压缩比与精度损失的权衡</h2>
+<h2 id="why-quantize">1. 量化要解决什么问题——压缩比与精度损失的权衡</h2>
 
 <p>大模型的权重通常以 FP16 或 BF16 存储，每个参数占 2 字节。一个 7B 参数的模型光是权重就要 $7\times10^9 \times 2 = 14$ GB 显存；推理时还要装下 KV cache 与中间激活，部署到 24 GB 的消费级显卡已几乎装不下。把权重压到更低精度是直接减小显存占用的手段。<sup>[N1]</sup></p>
 
@@ -686,15 +755,33 @@
 <p><b>核心权衡一句话</b>：量化用位宽换显存与算力，代价是网格变粗带来的舍入误差；所有量化方法都是在固定压缩比下尽量压低这个误差。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 FP16 → INT8 与 FP16 → INT4 的理论压缩比。</li>
-  <li>解释为什么"位宽越低精度损失越大"是一个必然趋势，而不是某个特定方法的缺陷。</li>
-  <li>说出量化在显存与计算两个维度上分别带来什么收益。</li>
-</ul>
+<h3 id="ch1-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>FP16 → INT8 与 FP16 → INT4 的理论压缩比各是多少？</p>
+    <details>
+    <summary>解答：2 倍与 4 倍</summary>
+    <p>压缩比由位宽决定：FP16 每参数 2 字节，INT8 每参数 1 字节，压缩 $2\times$；INT4 每参数 0.5 字节，压缩 $4\times$。以 7B 模型为例，权重从 FP16 的约 14 GB 降到 INT8 的约 7 GB、INT4 的约 3.5 GB。该比例只由位宽决定，与数值分布无关。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么"位宽越低精度损失越大"是必然趋势，而不是某个特定方法的缺陷？</p>
+    <details>
+    <summary>解答：等级数随位宽指数减少，网格间距必然变大</summary>
+    <p>位宽 $b$ 决定整数等级数 $2^b$。在固定数据范围下，等级越少、相邻可表示值的间距（scale $s$）越大，落在网格点之间的值舍入误差上界 $s/2$ 随之增大。这是均匀量化机制固有的几何事实，与 scale 怎么选、用什么粒度无关；后续所有方法（粒度选择、QAT、浮点格式）都是在固定压缩比下压低这个误差，不能消除它。</p>
+    </details>
+  </li>
+  <li>
+    <p>量化在显存与计算两个维度上分别带来什么收益？</p>
+    <details>
+    <summary>解答：显存按位宽比例下降，低位宽算术吞吐更高能耗更低</summary>
+    <p>显存上，存储字节数按位宽比例下降（如 16 bit 到 4 bit 为四分之一）。计算上，INT8/INT4 在专用硬件（如 GPU 的 INT8 Tensor Core）上吞吐量更高、能耗更低，推理延迟与成本随之下降。计算收益的前提是硬件提供对应低位宽的算术单元。</p>
+    </details>
+  </li>
+</ol>
 <p>本章明确了量化值得做的动机与压缩比/精度损失的权衡。但还没说怎么把一个浮点数变成低精度整数——下一章给出均匀仿射量化公式并手算。</p>
 
-<h2 id="uniform-quantization">均匀量化怎么把浮点变成整数——仿射变换与对称特例</h2>
+<h2 id="uniform-quantization">2. 均匀量化怎么把浮点变成整数——仿射变换与对称特例</h2>
 
 <p>最基础且工程上最通用的量化是<strong>均匀仿射量化</strong>：用一组 scale $s$ 与 zero-point $z$ 把实数 $x$ 仿射变换到一个等间距整数网格上。前向量化的公式是<sup>[C1, F1]</sup></p>
 
@@ -716,7 +803,7 @@ $$\hat{x} = s\,(x_q - z).$$
 
 <p>用两个快速检查验证公式。第一，若 $x=0$，则 $\mathrm{round}(0/s)+z = z$，所以 $x_q=z$，反量化 $\hat{x}=s(z-z)=0$——实数 0 总能精确重建。第二，若 $x$ 恰好等于某个网格点 $k\cdot s$（$k$ 为整数），则 $\mathrm{round}(x/s)=k$，反量化 $\hat{x}=s(k+0)=ks=x$——网格点上的值零误差。误差只来自落在网格点之间的值。</p>
 
-<h3 id="symmetric-special-case">对称量化特例</h3>
+<h3 id="symmetric-special-case">2.1 对称量化特例</h3>
 
 <p>当数据分布近似关于 0 对称时（典型为训练好的权重，正负值幅度相近），取 $z=0$ 与对称整数范围 $[-2^{b-1}+1,\; 2^{b-1}-1]$ 即可。<sup>[C2, F2]</sup> INT8 取 $\{-127,127\}$（牺牲 $-128$ 这一端换算术对称），INT4 取 $\{-7,7\}$。scale 由张量内最大幅度决定：</p>
 
@@ -726,28 +813,25 @@ $$s = \frac{\max(|x|)}{2^{b-1}-1}, \qquad x_q = \mathrm{clip}\!\big(\mathrm{roun
 
 <p>验证边界：若 $x=\max(|x|)$，则 $x/s = 2^{b-1}-1$，$x_q$ 取最大正等级 $2^{b-1}-1$，$\hat{x}=s\,(2^{b-1}-1)=\max(|x|)$，零误差；若 $x=0$，则 $x_q=0$，$\hat{x}=0$。</p>
 
-<pre class="diagram">浮点数轴          量化网格（INT4 对称，s=0.8）
-   │                       │
-   │   1.2 ┐               │   1.6 ── ●(x_q=2)
-   │       │ round(1.2/0.8)│       │   误差 +0.4
-   │       └──────────────►│       │
-   │                       │   0.8 ●(x_q=1)
-   │   0.0 ●──────────────►│   0.0 ●(x_q=0)
-   │                       │
-   │   3.4 ┐               │   3.2 ── ●(x_q=4)
-   │       │ round(3.4/0.8)│       │   误差 -0.2
-   │       └──────────────►│       │
-   │                       │   4.0 ●(x_q=5)
-   │                       │
-   │   5.6 ┐               │   5.6 ── ●(x_q=7, q_max)
-   │       │ round(5.6/0.8)│       │   误差 0
-   │       └──────────────►│       │
-   └───────────────────────┴──────────────────────────
-       实数 x            s=0.8 决定网格步长，clip 限定 [-7,7]</p>
+<p>以 $s=0.8$ 的 INT4 对称网格为例，几个实数到量化网格的映射过程如下：</p>
 
-<h3 id="handcalc-e1">手算：[1.2, 3.4, 5.6] 的 INT4 对称量化</h3>
+<div class="table-scroll">
+<table>
+<thead><tr><th>实数 $x$</th><th>$x/s$</th><th>量化 $x_q=\mathrm{round}(x/s)$</th><th>重建 $\hat{x}=s\,x_q$</th><th>误差 $\hat{x}-x$</th></tr></thead>
+<tbody>
+<tr><td>0.0</td><td>0.0</td><td>0</td><td>0.0</td><td>$0$</td></tr>
+<tr><td>1.2</td><td>1.5</td><td>2</td><td>1.6</td><td>$+0.4$</td></tr>
+<tr><td>3.4</td><td>4.25</td><td>4</td><td>3.2</td><td>$-0.2$</td></tr>
+<tr><td>5.6</td><td>7.0</td><td>7（$q_{\max}$）</td><td>5.6</td><td>$0$</td></tr>
+</tbody>
+</table>
+</div>
 
-<p>教学示例。取一个 3 元素权重向量 $x=[1.2, 3.4, 5.6]$，做 INT4 对称量化。</p>
+<p>网格点 $\{0, \pm0.8, \pm1.6, \pm2.4, \ldots\}$ 上的值（如 5.6）零误差；网格点之间的值（如 1.2、3.4）舍到最近等级，误差不超过 $s/2=0.4$。$s=0.8$ 决定网格步长，clip 限定整数范围 $[-7,7]$。</p>
+
+<h3 id="handcalc-e1">2.2 手算：$[1.2, 3.4, 5.6]$ 的 INT4 对称量化</h3>
+
+<p>构造示例。取一个 3 元素权重向量 $x=[1.2, 3.4, 5.6]$，做 INT4 对称量化。</p>
 
 <p>第一步算 scale：$\max(|x|)=5.6$，$s=5.6/(2^3-1)=5.6/7=0.8$。第二步把每个值除以 $s$ 并四舍五入：$1.2/0.8=1.5\to2$、$3.4/0.8=4.25\to4$、$5.6/0.8=7.0\to7$，得 $x_q=[2,4,7]$（都在 $[-7,7]$ 内，无需 clip）。第三步反量化：$\hat{x}=s\cdot x_q=[1.6, 3.2, 5.6]$。误差 $\hat{x}-x=[+0.4, -0.2, 0]$，每个值的误差绝对值都不超过 $s/2=0.4$。</p>
 
@@ -758,16 +842,33 @@ $$s = \frac{\max(|x|)}{2^{b-1}-1}, \qquad x_q = \mathrm{clip}\!\big(\mathrm{roun
 
 <p>把数字结果翻译成机制结论：每个真实值被舍到最近的 4-bit 等级，单值最大舍入误差不超过 $s/2$；处于网格点上的值（如 5.6）零误差。这正是量化"可接受精度损失"的微观来源——只要 $s$ 足够小，误差就够小；而 $s$ 由位宽 $b$ 与数据范围共同决定，位宽越低 $s$ 越大。</p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出对称量化为何取整数范围 $[-127,127]$ 而非 $[-128,127]$。</li>
-  <li>手算 $[2.0, 4.0, 6.0]$ 的 INT4 对称量化（应得 $s=6/7\approx0.857$，$x_q=[2,5,7]$，$\hat{x}\approx[1.71,4.29,6.0]$）。</li>
-  <li>说出对称量化下单值最大舍入误差的上界（用 $s$ 表示）。</li>
-  <li>说明 zero-point 在反量化公式 $\hat{x}=s(x_q-z)$ 中的几何含义（实数 0 对应哪个整数）。</li>
-</ul>
+<h3 id="ch2-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>对称量化为何取整数范围 $[-127,127]$ 而非 $[-128,127]$？</p>
+    <details>
+    <summary>解答：牺牲一个等级换取网格关于 0 对称</summary>
+    <p>8-bit 有符号整数的完整范围是 $[-128,127]$，两端关于 0 不对称。对称量化要求零点为 0 且正负等级数相等，于是牺牲 $-128$ 这一个等级，取 $[-127,127]$（INT4 同理取 $[-7,7]$）。对称使反量化简化为一次乘法 $\hat{x}=s\,x_q$，并保证 $x=0$ 精确映射到 $x_q=0$。</p>
+    </details>
+  </li>
+  <li>
+    <p>手算 $[2.0, 4.0, 6.0]$ 的 INT4 对称量化。</p>
+    <details>
+    <summary>解答：$s=6/7\approx0.857$，$x_q=[2,5,7]$，$\hat{x}\approx[1.71,4.29,6.0]$</summary>
+    <p>$\max(|x|)=6$，$s=6/7\approx0.857$。逐个除以 $s$ 并四舍五入：$2.0/0.857\approx2.33\to2$、$4.0/0.857\approx4.67\to5$、$6.0/0.857=7.0\to7$，得 $x_q=[2,5,7]$（都在 $[-7,7]$ 内，无需 clip）。反量化 $\hat{x}=s\cdot x_q\approx[1.71,4.29,6.0]$，误差 $\approx[-0.29,+0.29,0]$，均不超过 $s/2\approx0.43$。</p>
+    </details>
+  </li>
+  <li>
+    <p>对称量化下单值最大舍入误差的上界是多少（用 $s$ 表示）？</p>
+    <details>
+    <summary>解答：$s/2$</summary>
+    <p>$\mathrm{round}(x/s)$ 把连续值舍到最近整数，连续值与最近整数的距离不超过 $0.5$，因此反量化后的误差不超过 $0.5\,s=s/2$。恰好在网格点 $k\cdot s$ 上的值误差为 0；误差只出现在落在网格点之间的值上。</p>
+    </details>
+  </li>
+</ol>
 <p>本章给出了均匀仿射量化公式与对称特例的手算。但手算产生的误差从何而来还没拆解——下一章给出误差的三个来源。</p>
 
-<h2 id="quantization-error">量化误差从哪来——离散级粗、舍入与裁剪</h2>
+<h2 id="quantization-error">3. 量化误差从哪来——离散级粗、舍入与裁剪</h2>
 
 <p>上一章的手算里 $[1.2,3.4,5.6]$ 产生了误差 $[+0.4,-0.2,0]$。误差不是某个 bug，而是均匀量化机制固有的三个来源的叠加。<sup>[C5]</sup></p>
 
@@ -795,20 +896,37 @@ $$s = \frac{\max(|x|)}{2^{b-1}-1}, \qquad x_q = \mathrm{clip}\!\big(\mathrm{roun
 <p>对比上一章无离群值时 $[1.2,3.4,5.6]$ 的误差 $[+0.4,-0.2,0]$——离群值让正常值的误差从不到 0.4 放大到 1 以上，量级跳了一级。</p>
 </details>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出三来源各自的名字与一句话定义。</li>
-  <li>解释为什么 $[1.2, 3.4, 5.6, 50.0]$ 的 1.2 被舍到 0（写出 $1.2/s$ 的近似值与 round 结果）。</li>
-  <li>说出单值最大舍入误差上界与离群值如何影响 $s$。</li>
-  <li>说出三来源中哪一个会随位宽降低而恶化得最快（提示：等级数 $2^b$ 指数下降）。</li>
-</ul>
+<h3 id="ch3-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>说出误差三个来源各自的名字与一句话定义。</p>
+    <details>
+    <summary>解答：离散级粗、舍入、裁剪</summary>
+    <p>离散级粗（grid coarseness）：位宽 $b$ 只提供 $2^b$ 个等级，等级之间的差异无法表达。舍入（rounding）：$\mathrm{round}(x/s)$ 把连续值映射到最近整数，单值误差上界 $s/2$。裁剪（clipping）：超出观测范围 $[\alpha,\beta]$ 的值被截断到网格端点，误差等于超出量。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 $[1.2, 3.4, 5.6, 50.0]$ 中的 1.2 会被舍到 0？</p>
+    <details>
+    <summary>解答：离群值主导 scale，1.2 归一化后不足 0.5</summary>
+    <p>per-tensor 量化用 $\max(|x|)=50$ 算 scale，$s=50/7\approx7.143$。归一化 $1.2/s\approx0.168$，四舍五入到最近的整数 0，反量化得 $\hat{x}=0$，误差 $-1.2$。根因是离群值把 $s$ 放大到正常值只占网格最低一两个等级的程度，3.4 同理被舍到 0。</p>
+    </details>
+  </li>
+  <li>
+    <p>三来源中哪一个会随位宽降低而恶化得最快？</p>
+    <details>
+    <summary>解答：离散级粗，等级数随位宽指数下降</summary>
+    <p>等级数 $2^b$ 随位宽 $b$ 指数减少，网格间距 $s$ 相应变大，可区分的值急剧减少——这是三来源中的根源项。舍入误差上界 $s/2$ 与裁剪误差也随之增大，但它们放大的机制都来自等级数减少导致的网格变粗。</p>
+    </details>
+  </li>
+</ol>
 <p>本章拆解了误差三来源与离群值的毒化效应。但还没说如何选择对称性与粒度来适配分布、隔离离群值——下一章对照对称/非对称与三种粒度。</p>
 
-<h2 id="symmetry-and-granularity">对称/非对称 与 量化粒度——分布适配与离群值隔离</h2>
+<h2 id="symmetry-and-granularity">4. 对称/非对称 与 量化粒度——分布适配与离群值隔离</h2>
 
 <p>上一章看到 per-tensor 在离群值面前的失败。本章给出两个改进方向：选择对称还是非对称、选择多细的粒度。这两者共同决定 $(s,z)$ 如何适配数据分布。</p>
 
-<h3 id="symmetric-vs-asymmetric">对称 vs 非对称</h3>
+<h3 id="symmetric-vs-asymmetric">4.1 对称 vs 非对称</h3>
 
 <p>对称量化（$z=0$，对称整数范围）的反量化只需乘法 $\hat{x}=s\,x_q$，硬件实现最简。它适合分布近似关于 0 对称的数据——训练好的权重通常如此，正负值幅度相近。</p>
 
@@ -824,7 +942,7 @@ $$s = \frac{\beta-\alpha}{q_{\max}-q_{\min}}, \qquad z = \mathrm{round}\!\big(q_
 
 <p>非对称的反量化多一次减法 $\hat{x}=s(x_q-z)$，硬件开销略大但通常可忽略。选择规则：<strong>权重常取对称，激活常取非对称</strong>——这是工业部署的事实约定。</p>
 
-<h3 id="granularity">量化粒度：per-tensor / per-channel / per-block</h3>
+<h3 id="granularity">4.2 量化粒度：per-tensor / per-channel / per-block</h3>
 
 <p>粒度决定一组 $(s,z)$ 覆盖多少元素。<sup>[C4]</sup> 三者由粗到细：</p>
 
@@ -860,26 +978,43 @@ $$s = \frac{\beta-\alpha}{q_{\max}-q_{\min}}, \qquad z = \mathrm{round}\!\big(q_
 <p><b>粒度必须与位宽一起声明</b>。"4-bit 量化"本身不说明精度——per-tensor(4-bit) 与 per-block(4-bit, 块 32) 的精度可能差几个数量级。判断一个量化方案要看 (位宽, 对称性, 粒度) 三元组，缺一不可。</p>
 </div>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出对称量化的反量化只需乘法、非对称多一次减法。</li>
-  <li>说出 per-tensor 在哪种数据分布下精度最差。</li>
-  <li>说出 INT4 + per-block(32) + 8-bit scale 的有效位宽。</li>
-  <li>说出权重和激活通常各选哪种对称性，并说明原因。</li>
-</ul>
+<h3 id="ch4-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>对称与非对称量化的反量化计算差别是什么？各自适合什么分布？</p>
+    <details>
+    <summary>解答：对称一次乘法、非对称多一次减法；选择看分布形状</summary>
+    <p>对称量化（$z=0$）反量化为 $\hat{x}=s\,x_q$，只需一次乘法，适合近似零中心的分布（训练好的权重）；非对称量化反量化为 $\hat{x}=s(x_q-z)$，多一次减法，适合偏向一侧的分布（典型为 ReLU 后的非负激活，取 $[0,\max]$），能不浪费整数等级。工业部署的事实约定是权重取对称、激活常取非对称。</p>
+    </details>
+  </li>
+  <li>
+    <p>per-tensor 在哪种数据分布下精度最差？</p>
+    <details>
+    <summary>解答：含显著离群值的分布</summary>
+    <p>per-tensor 用全张量的 $\max(|x|)$ 算一个共享 scale，单个显著离群值会主导它，使 $s$ 被放大、正常值被压到网格低端的少数等级（上一章 $[1.2, 3.4, 5.6, 50.0]$ 即实例）。无离群值时 per-tensor 元数据最少、kernel 最简，仍是合理选择。</p>
+    </details>
+  </li>
+  <li>
+    <p>INT4 + per-block（块 32）+ 8-bit scale 的有效位宽是多少？</p>
+    <details>
+    <summary>解答：4.25 bit/元素</summary>
+    <p>每块存储 $32\times4+8=136$ bit，摊到 32 个元素为 $136/32=4.25$ bit/元素，元数据开销仅 $0.25$ bit/元素（约 6.25%）。块越小精度越好但开销越大（块 128 时为 4.0625 bit），块大小是"精度 vs 元数据开销"的旋钮。粒度必须与位宽、对称性一起声明，单说"4-bit 量化"不说明精度。</p>
+    </details>
+  </li>
+</ol>
 <p>本章对照了对称/非对称与三种粒度。但前面都在讲推理时如何压低精度，没说训练时模型是否见过量化误差——下一章讲 PTQ 与 QAT 两条路径及 MXFP4 浮点量化。</p>
 
-<h2 id="ptq-vs-qat">PTQ vs QAT 与 浮点 block-wise 量化——训练时是否见过量化误差</h2>
+<h2 id="ptq-vs-qat">5. PTQ vs QAT 与 浮点 block-wise 量化——训练时是否见过量化误差</h2>
 
 <p>前面四章讲的 scale、对称性、粒度都是在"推理时怎么把数值压到低精度"。但还有一个独立维度：训练时模型有没有见过量化误差。这决定了 PTQ 与 QAT 两条路径。</p>
 
-<h3 id="ptq">训练后量化（PTQ）</h3>
+<h3 id="ptq">5.1 训练后量化（PTQ）</h3>
 
 <p>PTQ 的流程是：训练全程用高精度权重（FP32/FP16/BF16）正常训练；训练结束后，用少量校准数据（典型 128–512 样本）跑前向、统计每层激活的范围、据此确定 $(s,z)$；把权重量化后部署。整个过程无需重训，时间从分钟到小时级。<sup>[C7, N3]</sup> PTQ 的优势是工程成本低、适用于任何已训练模型。</p>
 
 <p>PTQ 的劣势是：训练时模型从未见过量化引入的离散误差，推理时量化把权重替换为低精度近似，相当于把模型暴露在一个训练时没见过的分布上。位宽高（INT8 及以上）时这个 mismatch 通常可接受；位宽降到 INT4 及以下时精度下降显著——离群值、粗网格、激活分布偏移的效应叠加，模型质量可能崩坏。</p>
 
-<h3 id="qat">量化感知训练（QAT）</h3>
+<h3 id="qat">5.2 量化感知训练（QAT）</h3>
 
 <p>QAT（Jacob et al. 2018）的核心是让训练时模型就"看见"量化误差。前向插入<strong>伪量化</strong>（fake quantization）：先把高精度权重 $w$ 按目标量化规则（如 INT4 对称）量化再反量化，得到近似权重 $\hat{w}$；用 $\hat{w}$（不是 $w$）算前向与损失。于是模型每个前向都见到量化引入的离散偏差，损失函数据此产生梯度。</p>
 
@@ -1012,20 +1147,20 @@ error   = [-1.2, -3.4, 1.5429, 0.0]
 <tr><td>反向机制</td><td>无反向（不训练）</td><td>STE 令 $\partial\hat{w}/\partial w\equiv 1$，梯度直传</td></tr>
 <tr><td>精度（INT8）</td><td>通常可接受</td><td>略好于 PTQ，但提升空间小</td></tr>
 <tr><td>精度（INT4 及以下）</td><td>下降显著，可能崩坏</td><td>显著好于 PTQ，是低位宽主流</td></tr>
-<tr><td>适用场景</td><td>已训练模型的快速部署</td><td>目标位宽低（≤4-bit）、对精度要求高</td></tr>
+<tr><td>适用场景</td><td>已训练模型的快速部署</td><td>目标位宽低（4-bit 及以下）、对精度要求高</td></tr>
 </tbody>
 </table>
 </div>
 
 <div class="callout callout-purple">
-<p><b>教学解释</b>。 可以把 STE 暂时理解为"透明的窗户"：前向时量化把权重替换为低精度近似 $\hat{w}$（窗户把它"看"成低精度），反向时 STE 令导数为 1 让梯度原样穿过（窗户对梯度透明）。这个类比只帮助理解 STE 在反向做的事——让梯度绕过不可导的 round/clip。它不保证训练收敛、不覆盖 STE 的其它变体（如 LSQ 让 scale 也参与梯度），也不意味着 STE 是唯一或最优的反向处理；正式判断仍以 $\partial\hat{w}/\partial w\equiv 1$ 这一约定与训练稳定性为准。</p>
+<p><b>辅助解释</b>。 可以把 STE 暂时理解为"透明的窗户"：前向时量化把权重替换为低精度近似 $\hat{w}$（窗户把它"看"成低精度），反向时 STE 令导数为 1 让梯度原样穿过（窗户对梯度透明）。这个类比只帮助理解 STE 在反向做的事——让梯度绕过不可导的 round/clip。它不保证训练收敛、不覆盖 STE 的其它变体（如 LSQ 让 scale 也参与梯度），也不意味着 STE 是唯一或最优的反向处理；正式判断仍以 $\partial\hat{w}/\partial w\equiv 1$ 这一约定与训练稳定性为准。</p>
 </div>
 
 <div class="callout callout-yellow">
 <p><b>QAT 不恢复精度，只补偿</b>。权重仍以低精度部署；QAT 让模型权重在训练中朝"在低精度下仍能减小损失"的方向调整，补偿（部分）精度损失带来的质量下降。补偿程度取决于训练数据、QAT 配置与模型本身——不保证任何模型都能无损量化到 INT4。</p>
 </div>
 
-<h3 id="mxfp4">延伸：MXFP4 这类 block-wise 浮点量化</h3>
+<h3 id="mxfp4">5.3 延伸：MXFP4 这类 block-wise 浮点量化</h3>
 
 <p>前面所有例子中元素都是<strong>定点整数</strong>（INT8/INT4）。还有一类量化把元素存为<strong>低精度浮点</strong>（FP8/FP4），典型代表是 OCP Microscaling v1.0 规范的 MXFP4（Rouhani et al. 2023）。</p>
 
@@ -1043,19 +1178,35 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
 
 <p>MXFP4 在大模型部署中已成为事实低位宽方案（如 OpenAI gpt-oss 采用 MXFP4 存储混合专家权重）。完整的 MXFP4 QAT 机制（块结构图、反量化公式、QAT 配置、部署案例）见 <a href="../mxfp4-qat/index.html">MXFP4 量化感知训练</a>。<sup>[C9, N2]</sup></p>
 
-<p>完成本章后，用下面几个问题检查自己是否跟上：</p>
-<ul>
-  <li>说出 PTQ 与 QAT 各自的训练成本与精度特点。</li>
-  <li>说明 STE 在反向做了什么、为什么需要它（提示：round 与 clip 的导数）。</li>
-  <li>说出 MXFP4 的块大小、scale 类型、元素格式。</li>
-  <li>说出 MXFP4 元素相对定点整数的两点优势，并各举一个机制理由。</li>
-  <li>解释"QAT 不恢复精度只补偿"的含义，并说出补偿程度取决于哪些因素。</li>
-</ul>
-<p>本章对照了 PTQ 与 QAT，并延伸到 MXFP4 浮点量化。至此量化的基础机制已讲完——末章汇总来源与教学说明。</p>
+<h3 id="ch5-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>PTQ 与 QAT 各自的训练成本与精度特点是什么？</p>
+    <details>
+    <summary>解答：PTQ 免重训、低位宽掉点；QAT 需重训、低位宽下显著更好</summary>
+    <p>PTQ 训练全程高精度权重，训练后用 128–512 校准样本统计激活范围确定 $(s,z)$，无需重训、分钟到小时级；INT8 通常可接受，INT4 及以下精度下降显著。QAT 需要重训或微调、与训练成本同量级；INT8 下略好于 PTQ，INT4 及以下显著更好，是低位宽主流。QAT 不恢复精度只补偿——权重仍以低精度部署，补偿程度取决于训练数据、QAT 配置与模型本身。</p>
+    </details>
+  </li>
+  <li>
+    <p>STE 在反向做了什么？为什么需要它？</p>
+    <details>
+    <summary>解答：约定导数恒为 1，让梯度穿过不可导的 round/clip</summary>
+    <p>量化中的 $\mathrm{round}$ 几乎处处导数为 0、$\mathrm{clip}$ 在端点外导数为 0，梯度无法穿过量化算子。STE（直通估计器）直接约定 $\partial\hat{w}/\partial w\equiv 1$，让上游梯度原样传回高精度权重 $w$，训练因此得以进行；权重更新发生在 $w$ 上，前向算的却是 $\hat{w}$，权重朝"低精度下仍能减小损失"的方向调整。STE 只是可用的梯度路径，不保证最优。</p>
+    </details>
+  </li>
+  <li>
+    <p>MXFP4 的块结构是什么？元素相对定点整数有哪两点优势？</p>
+    <details>
+    <summary>解答：块 32 + E8M0 scale + E2M1 元素；独立指数与离群值隔离</summary>
+    <p>MXFP4 把每 32 个连续值组成一个块，块共享一个 8-bit E8M0 power-of-two scale（$s_b=2^{e_b}$），每个元素存 4-bit E2M1 浮点（1 符号 + 2 指数 + 1 尾数），每块 136 bit、有效位宽 4.25 bit。相对定点 INT4 的两点优势：其一，E2M1 元素自带 2-bit 指数，块内不同元素指数可不同，块内动态范围比固定步长的定点网格更宽；其二，块共享 scale 把离群值的影响局限在其所在块内，且 power-of-two scale 使反量化退化为指数位的加法，硬件无需乘法器。</p>
+    </details>
+  </li>
+</ol>
+<p>本章对照了 PTQ 与 QAT，并延伸到 MXFP4 浮点量化。至此量化的基础机制已讲完——末章汇总来源与范围说明。</p>
 
-<h2 id="sources-and-teaching-notes">来源与教学说明</h2>
+<h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <ul>
   <li><b>C1</b>（仿射量化公式 $x_q=\mathrm{clip}(\mathrm{round}(x/s)+z, q_{\min}, q_{\max})$，$\hat{x}=s(x_q-z)$）：Gholami, Kim, Dong, Yao, Mahoney, Keutzer. <i>A Survey of Quantization Methods for Efficient Neural Network Inference</i>. arXiv:2103.13630, 2021, §2.1；aiwiki.ai/wiki/quantization（同一公式的现代统一写法）。</li>
   <li><b>C2</b>（对称量化 $z=0$、范围 $[-2^{b-1}+1, 2^{b-1}-1]$、$s=\max(|x|)/(2^{b-1}-1)$）：Gholami et al. 2021 §2.2；NVIDIA Developer Blog "Model Quantization: Concepts, Methods, and Why It Matters"（AbsMax 方法）。</li>
@@ -1068,7 +1219,7 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
   <li><b>C9</b>（MXFP4 块结构：块 32 + E8M0 scale + E2M1 元素 + $\hat{x}_i=s_b\cdot\mathrm{FP4}(q_i)$）：Rouhani et al. <i>Microscaling Formats (MX) v1.0</i>. OCP Specification, 2023；emergentmind.com/topics/mxfp4；zeroentropy.dev/concepts/mxfp4；AMD ROCm blog "High-Accuracy MXFP4, MXFP6, and Mixed-Precision Models"。</li>
 </ul>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <ul>
   <li><b>F1</b>（仿射量化与反量化）：来源同 C1。</li>
   <li><b>F2</b>（对称量化特例）：F1 在 $z=0$ 下的特例；来源同 C2。</li>
@@ -1076,7 +1227,7 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
   <li><b>F4</b>（STE 约束 $\partial\hat{w}/\partial w\equiv 1$）：来源同 C8。</li>
 </ul>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <ul>
   <li><b>N1</b>（每参数字节：FP32=4、FP16/BF16=2、INT8=1、INT4=0.5；7B 模型 FP16 约 14 GB、INT8 约 7 GB、INT4 约 3.5 GB）：Gholami et al. 2021 §1；NVIDIA Developer Blog（Llama2 7B 在 FP16 下约 14 GB 的例子）。实验条件：参数量 × 字节数 / 参数；INT4 以 4 bit/参数计算。</li>
   <li><b>N2</b>（MXFP4 块大小 32、元素 4 bit、scale 8 bit、每块 136 bit、有效位宽 4.25 bit）：OCP Microscaling Formats v1.0；emergentmind.com/topics/mxfp4；zeroentropy.dev/concepts/mxfp4。实验条件：OCP 规范定义。</li>
@@ -1084,23 +1235,23 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
   <li><b>N4</b>（E2M1 可表示的 16 个有限值 $\{0,\pm0.5,\pm1,\pm1.5,\pm2,\pm3,\pm4,\pm6\}$，最大绝对值 6）：OCP Microscaling Formats v1.0；emergentmind.com/topics/mxfp4；AMD ROCm blog。实验条件：E2M1 编码（含 subnormal）。</li>
 </ul>
 
-<h3>教学示例</h3>
+<h3>构造示例</h3>
 <ul>
   <li>向量 $[1.2, 3.4, 5.6]$ 的 INT4 对称量化（均匀量化章、E1）：构造目的——选三个幅度递增、最小值非零、便于手算的值，展示 scale 由 $\max(|x|)$ 决定、舍入误差不超过 $s/2$。数字为教学构造，不代表真实模型权重。</li>
   <li>向量 $[1.2, 3.4, 5.6, 50.0]$ 的 per-tensor INT4 量化（量化误差章、E2）：在 E1 基础上加入一个离群值 50，控制变量展示离群值如何让正常值的误差从 $[-0.4, 0]$ 量级跳到 $[-3.4, 0]$ 量级。50 为教学构造的离群值，便于手算。</li>
   <li>per-block 把 $[1.2, 3.4, 5.6]$ 与 $[50.0]$ 分两块（粒度章、代码 E3）：构造目的——展示把离群值隔离到单独块后正常块精度恢复。块大小为教学简化（实际 MXFP4 块大小固定 32）。</li>
-  <li>均匀量化章完成检查中的 $[2.0, 4.0, 6.0]$ INT4 对称量化：构造目的——让读者独立手算一组相似但不同的值（应得 $s=6/7$、$x_q=[2,5,7]$、$\hat{x}\approx[1.71,4.29,6.0]$）。</li>
+  <li>均匀量化章本章问题中的 $[2.0, 4.0, 6.0]$ INT4 对称量化：构造目的——让读者独立手算一组相似但不同的值（应得 $s=6/7$、$x_q=[2,5,7]$、$\hat{x}\approx[1.71,4.29,6.0]$）。</li>
   <li>本章伪代码与可运行代码：使用 $[1.2,3.4,5.6]$ 与离群值版本，与正文 E1/E2 同步；代码用 Python list 与 <code>round</code> 实现最简对称量化，便于读者对照公式。</li>
 </ul>
 
-<h3>教学解释与类比边界</h3>
+<h3>辅助解释与类比边界</h3>
 <ul>
   <li>"量化网格类比刻度尺"：把低精度网格类比为一把刻度较粗的尺子——真实值落在两刻度之间时读最近的刻度。这个类比只帮助理解 round 与 clip 的几何含义；不覆盖 zero-point 的偏移作用（非对称量化中刻度尺的原点不在 0）、不覆盖浮点元素格式（MXFP4 元素网格非等间距）。</li>
   <li>"STE 类比透明窗户"（本章 callout）：前向时量化把权重替换为低精度近似（窗户把它看成低精度），反向时 STE 令导数为 1 让梯度原样穿过（窗户对梯度透明）。这个类比只解释 STE 在反向做的事——让梯度绕过不可导的 round/clip。失效边界：不保证训练收敛、不覆盖 STE 的其它变体（如 LSQ 让 scale 也参与梯度）、不意味着 STE 是唯一或最优的反向处理。</li>
   <li>"per-tensor 单点故障"（量化误差章 callout）：把 per-tensor 的离群值污染类比为"一个值毒化整张张量"。这个类比只解释 per-tensor 在离群值面前的失败模式；不意味着 per-tensor 在所有数据上都失败（无离群值时 per-tensor 仍是合理选择）。</li>
 </ul>
 
-<h3>教学简化及其限制</h3>
+<h3>简化条件及其限制</h3>
 <ul>
   <li><b>舍入约定简化</b>：本文手算统一用"四舍五入"（round half up），实际工程（PyTorch、TensorRT）默认 round half to even（banker's rounding）。可推出：手算结果与工程实现的误差在最后一位上可能有 1 的差异。不可推出：工程实现一定与手算完全一致。</li>
   <li><b>INT4 对称范围取 $[-7,7]$</b>：本文统一用对称范围 $[-2^{b-1}+1, 2^{b-1}-1]$（牺牲一端一等级换对称）。可推出：对称量化的反量化可简化为 $\hat{x}=s\,x_q$。不可推出：所有工程实现都用 $[-127,127]$。</li>
