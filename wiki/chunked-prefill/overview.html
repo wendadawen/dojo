@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta name="description" content="Chunked prefill 把长 prefill 切成等大块逐块执行，配合 piggybacking 与 stall-free 调度（token budget），消除长 prompt 进入时的 generation stall。详解块间 KV 依赖、切块三项代价、chunk 大小权衡以及 CPP 消气泡机制。">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chunked Prefill · 概览 · Dojo</title>
+  <meta name="dojo:tag" content="serving">
+  <meta name="dojo:topics" content="推理系统,调度,并行,延迟优化">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:summary" content="长 prefill 卡住同批 decode 数秒。chunked prefill 切成等大块：$N$ 块产生 $\frac{N(N-1)}{2}$ 次 KV 重复读；decode 搭 prefill 块车近乎免费；token budget 实现 stall-free；与 PP 组合成 CPP 消气泡。">
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 推理系统与调度</span>
+      <h1>Chunked Prefill（分块预填充）</h1>
+      <p class="lead">把长 prefill 切成等计算量的块逐块执行，配合 decode 搭车与 stall-free 调度，消除长 prompt 进入时同批 decode 停摆数秒的问题。</p>
+      <p class="meta">更新于 2026-08-19</p>
+    </header>
+
+<h2>问题背景</h2>
+<p>LLM 推理的 prefill 迭代是 compute-bound（LLaMA-13B 在 A6000 上一个 512 token 请求即可饱和单卡算力<sup>[1]</sup>），decode 迭代是 memory-bound（小批量下每 token 成本可达 prefill 的约 200 倍<sup>[2]</sup>）。连续批处理把两者混在同一次迭代里，调度器若优先算完新到的长 prompt，进行中的 decode 在整个长 prefill 期间不产出 token——token 间隔从毫秒级跳到秒级（generation stall）。</p>
+
+<p><sup>[1]</sup> Sarathi §1：on an A6000 GPU, for the LLaMA13B model, a prefill with a sequence length of 512 tokens saturates GPU compute even at a batch size of just one。<sup>[2]</sup> Sarathi §1：at small batch sizes, the decode cost per token can be as high as ∼200 times the prefill cost per token。</p>
+
+<h2>核心机制</h2></p>
+<ul>
+<li><b>切块</b>：把一个 prefill 请求切成近似等计算量的块，逐块执行。块间只靠 KV cache 衔接（后续块的 attention 读前面所有块的 K/V），不传递层输出；切成 $N$ 块时第一块的 KV 被重复读 $N-1$ 次，共 $\frac{N(N-1)}{2}$ 次额外块级读取。</li>
+<li><b>搭车（piggybacking）</b>：一个批次 = 一个 prefill chunk + 尽量多的 decode。权重读一次同时服务两者，搭车 decode 的成本比纯 decode 批最多低一个数量级（前提：chunk 够大以饱和算力）。</li>
+<li><b>stall-free 调度</b>：token budget 限制每次迭代的 token 总量，新请求以 chunk 加入当前批次、从不暂停进行中的 decode——迭代时长有上界，token 间隔平稳。</li>
+<li><b>CPP</b>：与流水线并行组合，等大的块使各 micro-batch 时长均匀，顺带消掉流水线气泡（Sarathi 在 GPT-3 上气泡缩小 6.29 倍）。</li>
+</ul>
+
+<h2>关键结论与边界</h2>
+<ul>
+<li>chunked prefill 不加速单请求 prefill（总计算量不变、访存微升），改善的是延迟结构与批均衡。</li>
+<li>chunk 越小 token 间隔越稳，但 KV 重复读按平方量级增长、算术强度与固定开销摊薄变差；chunk 257 比 256 的 prefill 时间高 32%（tile 量化），取值须对齐并满足 TBT SLO。</li>
+<li>收益依赖场景：MLA 架构在 chunked piggyback 下有重复投影开销；它是 co-located 部署的优化，与 PD 分离是两条路线——什么条件下走哪条，见 <a href="index.html">完整说明页</a>末尾链接的 Beyond the Buzz 论文。</li>
+</ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
