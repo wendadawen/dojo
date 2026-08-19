@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="chunked prefill 把长 prefill 切成等计算量的块逐块执行，配合 piggybacking（decode 搭车）与 stall-free 调度（token budget），消除长 prompt 进入时的 generation stall。讲解块间 KV cache 依赖、切块的三项代价、chunk 大小权衡，以及与流水线并行组合（CPP）消除气泡的机制。">
+  <meta name="dojo:summary" content="长 prefill 会让同批 decode 停摆数秒（generation stall）。chunked prefill 把它切成等计算量的块：块间只靠 KV cache 衔接（$N$ 块产生 $\frac{N(N-1)}{2}$ 次重复读），decode 搭 prefill 块的车近乎免费（权重读一次服务两者），token budget 给每次迭代封顶实现 stall-free。与 PP 组合成 CPP，等大的块顺带消掉流水线气泡。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="推理系统,调度,并行,延迟优化">
+  <meta name="dojo:tag" content="serving">
+  <title>Chunked Prefill：切块预填充与搭车调度</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Chunked Prefill</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Chunked Prefill（分块预填充）：让长 prompt 不再卡住 decode</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：SARATHI（Agrawal et al., 2023, arXiv:2308.16369，chunked prefill 与 piggybacking）；Sarathi-Serve（Agrawal et al., 2024, arXiv:2403.02310，stall-free 调度与 token budget）；Beyond the Buzz（Mitra et al., 2025, arXiv:2506.05508，CPP 在 prefill 池的应用）。</p>
+</blockquote>
+
+<p>一位用户正在逐字看着模型输出——以几十毫秒的间隔蹦一个 token（示意值），阅读体验流畅。此刻另一位用户提交了一个 8000 token 的长 prompt。如果调度器决定"先把这段 prefill 算完再说"，第一位用户的输出会停顿数秒：整个长 prompt 的 prefill 计算期间，同卡上所有进行中的 decode 都不产出新 token<sup>[C9]</sup>。chunked prefill（分块预填充）针对这个问题把长 prefill 切成多个近似等大的块逐块计算，配合"decode 搭车"的批构造与"从不暂停"的调度，让长 prompt 的进入不再卡住任何人。</p>
+
+<p>本文的学习目标包括：解释长 prefill 为什么卡住同批 decode（generation stall）；说明切块规则与块间依赖（KV cache 累积、不传层输出）；解释 decode 搭车为什么近乎免费、stall-free 调度怎么保证迭代时长有上界；给出 chunk 大小的权衡清单；说明 chunked prefill 与流水线并行组合（CPP）为什么顺带消掉气泡。前置概念：prefill/decode 两阶段与 KV cache 见 <a href="../moe-serving/index.html">MoE Serving</a>，注意力的因果掩码见 <a href="../causal-mask/index.html">因果掩码</a>，memory-bound 与 compute-bound 见 <a href="../gpu-execution-model/index.html">GPU 执行模型</a>，流水线气泡见 <a href="../model-parallelism/index.html">模型并行</a>。</p>
+
+<section class="learning-goals">
+<h2>核心问题</h2>
+<ol class="chapter-questions">
+<li>
+<p>为什么一个长 prefill 会拖慢同机所有进行中的 decode（generation stall）？</p>
+<details>
+<summary>解答：连续批处理混批迭代，prefill 迭代时长被上千 token 主导</summary>
+<p>连续批处理中 prefill 与 decode 混在同一次迭代里执行。prefill 并行处理全部输入 token、是 compute-bound，一个 512 token 的请求即可饱和单卡算力；decode 每次迭代每请求只处理一个 token、是 memory-bound，小批量下每 token 成本可达 prefill 的约 200 倍。若调度器优先完成 prefill（vLLM 类做法），进行中的 decode 在整个长 prefill 迭代期间不产出 token，token 间隔被拉长到秒级（实测可持续数秒）。完整论证见第 1 章。</p>
+</details>
+</li>
+<li>
+<p>chunked prefill 怎么切块？块与块之间靠什么衔接、不靠什么？</p>
+<details>
+<summary>解答：按等计算量切块，块间只靠 KV cache 衔接</summary>
+<p>把一个 prefill 请求切成近似等计算量的块，逐块过全部层。块与块之间唯一的依赖是 attention：每个后续块的 attention 必须读取同一 prompt 前面所有块产生的 KV cache（切成 $N$ 块时第一块的 KV 被重复读 $N-1$ 次）。块之间不传递层输出——prefill 各 token 位置的输出互相独立，每块独立过全部层，FFN 总计算量不变。完整论证见第 2 章。</p>
+</details>
+</li>
+<li>
+<p>为什么 decode 搭 prefill 块的车近乎免费？stall-free 调度怎么保证 decode 不被卡？</p>
+<details>
+<summary>解答：权重读一次服务两者；token budget 限制每次迭代时长</summary>
+<p>decode 是 memory-bound：每次迭代的主要时间花在从显存读模型权重上。一个 prefill chunk 与多个 decode 同批时，权重只需读一次就同时服务两者，搭车 decode 的成本比纯 decode 批最多低一个数量级（不是零）。stall-free 调度用 token budget 限制每次迭代允许的 token 总量：新请求以 chunk 形式加入当前批次、从不暂停进行中的 decode，每次迭代时长因此有上界，token 间隔不再有秒级尖刺。完整论证见第 3 章。</p>
+</details>
+</li>
+<li>
+<p>chunk 大小（token budget）怎么选？选小了有什么代价？</p>
+<details>
+<summary>解答：TBT 更稳 vs 三项开销上升的权衡</summary>
+<p>chunk 越小、每次迭代越短、token 间隔（time-between-tokens, TBT，与 TPOT/TTL 同义）越平稳，但三项代价随块数上升：KV cache 重复读次数按 $\frac{N(N-1)}{2}$ 增长（$N$ 为块数）；算术强度下降导致 GPU 利用率降低；kernel 启动等固定开销摊薄变差。此外 chunk 需对齐 GPU tile（chunk 257 比 256 的 prefill 时间高 32% 的实例），且必须够大以饱和算力（搭车"免费"的论证前提）。工程上由 TBT SLO 与开销的一次性 profiling 决定。完整论证见第 4 章。</p>
+</details>
+</li>
+<li>
+<p>chunked prefill 与流水线并行组合（CPP）为什么能同时消掉流水线气泡？</p>
+<details>
+<summary>解答：等计算量切块使 micro-batch 时长均匀，流水线被填满</summary>
+<p>PP 气泡的来源之一是各 micro-batch 计算时长不均（FTL = First Token Latency，首 token 延迟）。chunked prefill 把长 prefill 切成等计算量的块，每个块作为 micro-batch 进流水线，各 slot 时长均匀，填充期与排空期之外的空转被显著压缩——Sarathi 在 GPT-3 流水线部署上气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍。Beyond the Buzz 论文中 CPP 是 prefill 池在严格 FTL 约束下兼顾高吞吐的最优策略。完整论证见第 5 章。</p>
+</details>
+</li>
+</ol>
+</section>
+
+<h2 id="generation-stall">1. 长 prefill 为什么卡住所有人</h2>
+
+<p>先建立两类迭代的负载画像。prefill 迭代并行处理输入的全部 token：一次 8000 token 的 prefill 是一个巨大的矩阵乘，算力直接打满——Sarathi 的实测显示 LLaMA-13B 在 A6000 上一个 512 token 的 prefill 请求（批大小仅为 1）即可饱和 GPU 算力<sup>[C3, N2]</sup>。decode 迭代相反：每个请求每次只处理一个 token（上一个迭代自己生成的），计算量极小，时间几乎全花在从显存读模型权重上——memory-bound。小批量下 decode 的每 token 成本可达 prefill 的约 200 倍<sup>[C2, N1]</sup>。两类迭代的详细对比见下表：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>prefill 迭代</th><th>decode 迭代</th></tr></thead>
+<tbody>
+<tr><td>每次迭代处理的 token</td><td>输入序列全部（可上千）</td><td>每请求 1 个</td></tr>
+<tr><td>瓶颈类型</td><td>compute-bound（算力饱和<sup>[C1, C3]</sup>）</td><td>memory-bound（权重读取主导）</td></tr>
+<tr><td>小批量利用率</td><td>单请求即可饱和（512 token / A6000 / LLaMA-13B<sup>[N2]</sup>）</td><td>很低，靠大批量摊薄权重读取</td></tr>
+<tr><td>迭代时长量级</td><td>长（随 token 数增长）</td><td>短（毫秒级）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>现在看 stall 怎么发生。连续批处理（continuous batching，Orca 提出的迭代级调度：每次迭代可加入新请求、移除完成请求）把 prefill 与 decode 混在同一个批里迭代。Sarathi-Serve 观察到：prefill 优先的调度器（如 vLLM 的做法——新请求的 prefill 被尽快执行）会让一次迭代装进整个长 prompt，这次迭代因为上千 token 的计算量而持续很久；期间同批所有进行中的 decode 一个 token 都不产出<sup>[C9]</sup>。对正在看输出的用户来说，token 间隔从毫秒级跳到秒级——Sarathi-Serve 在 vLLM 上实测到持续数秒的 generation stall<sup>[C9]</sup>。</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">decode 稳定产出</div>
+      <div class="dg-node-note">每迭代一个 token，间隔毫秒级</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">长 prefill 迭代插入</div>
+      <div class="dg-node-note">一次迭代装下整个 8000 token prompt</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">decode 停摆</div>
+      <div class="dg-node-note">迭代期间 0 个新 token，持续数秒<sup>[C9]</sup></div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">generation stall 的产生链（节点间箭头为因果推进）：长 prefill 迭代的时长主导了同批 decode 的 token 间隔。数字 8000 为构造示例的设定值，秒级停顿为 Sarathi-Serve 的实测观察<sup>[C9]</sup>。</figcaption>
+</figure>
+
+<h3 id="stall-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>prefill 与 decode 的迭代时长为什么差几个数量级？</p>
+<details>
+<summary>解答：compute-bound vs memory-bound，token 数差三个数量级</summary>
+<p>prefill 迭代处理输入序列的全部 token（可上千），大矩阵乘把算力打满，属 compute-bound；decode 迭代每请求只处理 1 个 token，计算量极小、时间由权重读取主导，属 memory-bound<sup>[C1]</sup>。Sarathi 的量化：LLaMA-13B/A6000 上 512 token 的单个 prefill 请求即饱和算力<sup>[C3, N2]</sup>；小批量下 decode 每 token 成本约为 prefill 的 200 倍<sup>[C2, N1]</sup>。数量级差异来自"每次迭代处理的 token 数"（全部 vs 单个）与"瓶颈类型"（算力 vs 访存）的叠加。</p>
+</details>
+</li>
+<li>
+<p>为什么"先把长 prefill 算完"不是一个合理的调度选择？</p>
+<details>
+<summary>解答：一次迭代装下整个 prompt，同批 decode 全程停摆</summary>
+<p>连续批处理里同一批的请求一起迭代。调度器若优先执行新请求的完整 prefill（vLLM 类做法），这一次迭代就要算完整个长 prompt（数千 token），迭代时长被拉长到远超正常 decode 迭代；期间批内所有进行中的 decode 请求不产出任何 token，它们的用户看到输出停顿——Sarathi-Serve 实测这种停顿可持续数秒<sup>[C9]</sup>。TBT（相邻 token 间隔）SLO 因此被系统性违反。这不是实现缺陷而是调度策略的结构性代价：不切分 prefill，"尽快开始算"与"不让别人等"就不可兼得。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="chunk-mechanism">2. 把长 prefill 切成块：机制与代价</h2>
+
+<p>chunked prefill 的核心动作：把一个 prefill 请求切成近似等计算量的块（chunk），每块包含固定数量的输入 token，逐块执行<sup>[C4]</sup>。8000 token 的 prompt 按 512 一块切成 16 块后，单次迭代最多装一块——迭代时长从"整个 prompt"降到"一个块"，第 1 章的 stall 结构被拆掉了（数字为构造示例的整数化设定）。</p>
+
+<h3 id="chunk-dependency">2.1 块间依赖：只靠 KV cache 衔接</h3>
+
+<p>块与块之间怎么衔接？关键观察是 attention 的因果结构（见<a href="../causal-mask/index.html">因果掩码</a>）：prompt 内每个 token 的 attention 只看它之前的 token。把 prompt 切成块后，第 $k$ 块的 token 在做 attention 时，需要前面第 1 到 $k-1$ 块所有 token 的 K/V——这些 K/V 已经由前序块算出并缓存在 KV cache 里。所以块间传递的数据是累积的 KV cache：每块进入计算前，前面块的 KV 已经就位<sup>[C5]</sup>。</p>
+
+<p>不传递的是层输出。prefill 阶段每个 token 位置在各层的前向输出（最终的 logits 与各层的 K/V）只依赖它自己与之前的 token，不依赖同 prompt 其他位置的输出——这是因果掩码的直接推论（基于证据的推断：由因果注意力结构与 Sarathi 的块数据流图推出）<sup>[C6]</sup>。因此每块独立过全部层，块之间不需要等待对方的层输出，第 2 块不必等第 1 块"过完最后一层"才能开始过第一层——只需要第 1 块的 KV 就位。</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 210" role="img" aria-label="chunked prefill 的块间数据流：KV 累积、块独立过层">
+  <rect class="dg-box" x="20" y="30" width="130" height="50"/>
+  <text x="85" y="50" font-size="13" fill="currentColor" text-anchor="middle">chunk 1（512 tok）</text>
+  <text x="85" y="68" font-size="11" fill="currentColor" text-anchor="middle">过全部层</text>
+  <rect class="dg-box" x="20" y="130" width="130" height="50"/>
+  <text x="85" y="150" font-size="13" fill="currentColor" text-anchor="middle">chunk 2（512 tok）</text>
+  <text x="85" y="168" font-size="11" fill="currentColor" text-anchor="middle">过全部层</text>
+  <rect class="dg-box dg-accent" x="230" y="80" width="150" height="50"/>
+  <text x="305" y="100" font-size="12" fill="currentColor" text-anchor="middle">KV cache 累积</text>
+  <text x="305" y="118" font-size="11" fill="currentColor" text-anchor="middle">chunk 1 的 K/V 就位</text>
+  <rect class="dg-box" x="450" y="80" width="210" height="50"/>
+  <text x="555" y="100" font-size="12" fill="currentColor" text-anchor="middle">chunk 2 的 attention</text>
+  <text x="555" y="118" font-size="11" fill="currentColor" text-anchor="middle">读 chunk 1 + chunk 2 的 K/V</text>
+  <line class="dg-line" x1="150" y1="55" x2="228" y2="90"/>
+  <line class="dg-line" x1="150" y1="155" x2="228" y2="120"/>
+  <line class="dg-line" x1="380" y1="105" x2="448" y2="105"/>
+</svg>
+<figcaption class="diagram-caption">chunked prefill 的块间数据流（构造示例：8000 token 切 16 块，图中画前 2 块）。左侧两个块各自独立过全部 $L$ 层；实线箭头是唯一的块间依赖——chunk 1 产生的 KV 进入 cache，chunk 2 的 attention 读取它（见<a href="../causal-mask/index.html">因果掩码</a>）。不存在"chunk 1 的层输出流向 chunk 2"的箭头。</figcaption>
+</figure>
+
+<h3 id="chunk-cost">2.2 切块的三个代价</h3>
+
+<p>切块不是免费的，代价随块数 $N$ 上升：</p>
+
+<ul>
+<li><b>KV cache 重复读</b>。第 $k$ 块的 attention 要读前面所有块的 KV，所以第 1 块的 KV 被读 $N-1$ 次、第 2 块被读 $N-2$ 次……额外读取总次数为<sup>[C5]</sup>
+<p>$$\sum_{i=1}^{N}(N-i) = \frac{N(N-1)}{2}\ \text{次块级读取}.$$</p>
+<ul>
+<li>$N$：一个 prompt 被切成的块数；$i$：块序号（第 $i$ 块的 KV 被后续块读 $N-i$ 次）。</li>
+</ul>
+<p>计算量本身不变（FFN 对每块独立计算、总量与不切时相同<sup>[C5]</sup>），变的是访存量。Sarathi-Serve 同时指出：即便切得很细，attention prefill 仍是 compute-bound 操作，这项开销在实践中可容忍<sup>[C5]</sup>。</p>
+</li>
+<li><b>算术强度下降</b>。chunk 越小，每块的矩阵越小，每字节访存对应的计算量越低，GPU 利用率下降<sup>[C13]</sup>。</li>
+<li><b>固定开销摊薄变差</b>。kernel 启动等固定开销按迭代次数重复，块越多迭代越多、每次迭代越短，固定开销占比上升<sup>[C13]</sup>。</li>
+</ul>
+
+<p>此外还有 tile 量化效应：GPU 把矩阵乘切成固定尺寸的 tile 分给线程块，矩阵维度不对齐 tile 尺寸时部分线程块做无用计算。Sarathi-Serve 给出一个量级：chunk 取 257 比 256 的 prefill 计算时间高 32%——只差 1 个 token<sup>[C12, N3]</sup>。chunk 大小应该对齐到 tile 友好的 2 的幂。</p>
+
+<p>构造示例：把 4096 token 的 prompt 切成 8 块（每块 512），额外 KV 读取为 $\frac{8\times 7}{2} = 28$ 块次；切成 4 块（每块 1024）则为 $\frac{4\times 3}{2} = 6$ 块次。块数翻倍，重复读次数按 $N^2$ 量级增长（块数翻倍，重复读约 4 倍）——这是"块不能切太细"的第一性来源。</p>
+
+<h3 id="chunk-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>块之间传递层输出吗？为什么？</p>
+<details>
+<summary>解答：不传递；块间唯一依赖是 KV cache</summary>
+<p>不传递。prefill 阶段每个 token 位置的各层输出只依赖它自己和之前的 token（因果掩码的结构），同 prompt 不同位置的输出互相独立，所以第 2 块不需要第 1 块的任何层输出。第 2 块唯一需要的是第 1 块算出的 K/V——第 2 块的 attention 要对第 1 块的 token 做 attention<sup>[C5]</sup>。因此块间数据流是"KV cache 累积"而不是"层输出接力"：每块独立过全部层，进入前只需前序块的 KV 就位。（后半句"输出互相独立"为由因果结构推出的推断，前半句"attention 读前序块 KV"为 Sarathi-Serve 明确陈述<sup>[C5]</sup>。）</p>
+</details>
+</li>
+<li>
+<p>把 4096 token 切成 8 块和 4 块，额外 KV 读取分别多少？说明什么趋势？</p>
+<details>
+<summary>解答：28 次与 6 次；块数增长使重复读按平方量级增长</summary>
+<p>按"第 $i$ 块的 KV 被读 $N-i$ 次"计数<sup>[C5, F1]</sup>：$N=8$ 时 $\frac{8\times 7}{2} = 28$ 块次；$N=4$ 时 $\frac{4\times 3}{2} = 6$ 块次。块数翻倍，额外读取从 6 涨到 28（约 4.7 倍），按 $N^2$ 量级增长。趋势：切块越细，KV 重复访存的开销越突出；同时 Sarathi-Serve 指出 attention prefill 本身 compute-bound，实践中该开销可容忍<sup>[C5]</sup>——所以它只是权衡清单的一项，不是切块的否决项。数字为构造示例（整数化设定）。</p>
+</details>
+</li>
+<li>
+<p>为什么 chunk 取 257 反而比 256 慢？</p>
+<details>
+<summary>解答：tile 量化——维度不对齐 tile 时线程块做多余计算</summary>
+<p>GPU 执行矩阵乘时把矩阵切成固定尺寸的 tile 分配给线程块，每个线程块做等量的算术；矩阵维度不是 tile 尺寸整数倍时，最后一个不完整的 tile 也要占用一个完整线程块，其中大部分计算是多余的（tile 量化效应）。Sarathi-Serve 实测 chunk 257 比 256 的 prefill 计算时间高 32%<sup>[C12, N3]</sup>——多 1 个 token 触发一整列多余的 tile。工程含义：chunk 大小要取 tile 友好的值（如 2 的幂），而不是"随便一个够小的数"。该数字来自特定 GPU 与 kernel 的实例，量级在其他硬件上可能不同。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="piggyback-stallfree">3. decode 搭车与不停止的调度</h2>
+
+<p>切块解决"长 prefill 卡人"，还差一半：被切出来的块本身仍是 compute-bound 的迭代，而同卡的 decode 依旧 memory-bound——能不能让它们同批执行、各取所需？这就是 piggybacking（搭车）。</p>
+
+<h3 id="piggyback">3.1 piggybacking：一个批次，两种负载</h3>
+
+<p>Sarathi 的 decode-maximal batching 构造一个混合批次：装一个 prefill chunk，剩余槽位全部填 decode<sup>[C7]</sup>。为什么 decode 搭车近乎免费？因为一次迭代里模型权重只需从显存读一遍：prefill chunk 的巨大矩阵乘正在把算力用满，同批的 decode 请求顺带用同一份权重算自己的小矩阵乘——decode 的边际成本只剩它自己的少量计算与激活访存。Sarathi 的实测：搭车 decode 的成本比纯 decode 批最多低一个数量级<sup>[C7]</sup>。</p>
+
+<p>注意"最多低一个数量级"不是零：搭车 decode 仍占批容量与少量计算，说"完全免费"是错的<sup>[C7]</sup>。这个论证的前提是 chunk 够大以饱和算力——512 token 在 A6000/LLaMA-13B 上就够<sup>[C3, N2]</sup>，chunk 远小于饱和点时"免费"程度弱化。</p>
+
+<p>chunked prefill 与 piggybacking 是相互成就的：一个 prefill 只有一次，但切成 $N$ 块就有 $N$ 个搭车机会。不切块时，批里要么是纯 prefill（decode 停摆）、要么是纯 decode（算力闲置）；切块后每个 chunk 迭代都能带上 decode<sup>[C8]</sup>。</p>
+
+<h3 id="stall-free">3.2 stall-free：token budget 上界</h3>
+
+<p>有了混合批次还不够——如果调度器一次塞进太多 chunk，迭代照样超长。Sarathi-Serve 的 stall-free 调度给每次迭代加一个 token budget（token 预算）$\tau$：一次迭代中所有请求的 token 总数（prefill chunk 的 token + 各 decode 的 token）不超过 $\tau$<sup>[C10]</sup>。新请求到达时，以 chunk 形式加入当前迭代（用剩余预算装下它的第一块或若干块），进行中的 decode 从不暂停<sup>[C10]</sup>。效果：每次迭代的计算量有上界，迭代时长有上界，token 间隔不再出现秒级尖刺——stall 消失。</p>
+
+<p>构造示例：批容量按 token 计 512（$\tau = 512$），当前有 64 个进行中的 decode，一个 8000 token 的新请求到达。本次迭代装：64 个 decode token + 1 个 448 token 的 prefill chunk（首块）；下一次迭代同样 64 + 448（第二块）……约 18 次迭代后 prefill 完成，期间 64 个 decode 每次迭代都产出 token。对照不切分的情形：一次迭代装 8000 token，64 个 decode 停摆整个迭代时长。token 间隔从"秒级尖刺"变成"轻微抬升的平稳值"。</p>
+
+<h3 id="piggyback-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>为什么搭车的 decode"近乎免费"？论证前提是什么？</p>
+<details>
+<summary>解答：权重读一次服务两者；前提是 chunk 饱和算力</summary>
+<p>decode 迭代是 memory-bound：时间主要花在读模型权重。混合批次中权重只需读一遍，prefill chunk 的矩阵乘在占用算力的同时，decode 请求用同一份权重完成自己的计算，搭车 decode 的成本比纯 decode 批最多低一个数量级<sup>[C7]</sup>——不是零，它仍占批容量和少量计算。论证前提是 chunk 足够大以饱和算力：LLaMA-13B/A6000 上 512 token 即饱和<sup>[C3, N2]</sup>；若 chunk 远小于饱和点，prefill chunk 自己也不饱和算力，"搭车免费"的论证弱化。</p>
+</details>
+</li>
+<li>
+<p>token budget 怎么同时做到"新请求立刻开始"与"旧请求不被卡"？</p>
+<details>
+<summary>解答：预算限制单次迭代 token 总量，新请求以 chunk 进、decode 不停</summary>
+<p>token budget $\tau$ 规定单次迭代中所有 token（chunk 的 + decode 的）总数不超过 $\tau$<sup>[C10]</sup>。新请求到达时立刻以 chunk 形式进入当前迭代——"立刻开始"由切块保证（第一块不必等整个 prompt）；单次迭代的计算量被 $\tau$ 封顶——迭代时长有上界，进行中的 decode 每次迭代照常产出，"不被卡"由预算保证。两个性质合起来：新请求的进入只把 token 间隔轻微抬高（一次迭代多装了一个 chunk），不再产生秒级停顿。$\tau$ 的取值是第 4 章的权衡主题。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="budget-tradeoff">4. 块要多大：token budget 的权衡</h2>
+
+<p>第 2、3 章给出了 chunk 大小的两端约束，这一章把它们拼成完整的权衡清单：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>chunk 越小</th><th>chunk 越大</th></tr></thead>
+<tbody>
+<tr><td>token 间隔（TBT）</td><td>每次迭代更短，间隔更平稳<sup>[C11]</sup></td><td>迭代更长，间隔尖刺更大</td></tr>
+<tr><td>KV 重复读</td><td>按 $\frac{N(N-1)}{2}$ 增长<sup>[F1]</sup></td><td>次数少</td></tr>
+<tr><td>GPU 利用率</td><td>算术强度低，利用率下降<sup>[C13]</sup></td><td>接近饱和</td></tr>
+<tr><td>固定开销</td><td>kernel 启动等摊薄差<sup>[C13]</sup></td><td>摊薄好</td></tr>
+<tr><td>tile 对齐</td><td colspan="2">与大小无关的两端要求：取 2 的幂这类 tile 友好值（257 vs 256 差 32%<sup>[C12]</sup>）</td></tr>
+<tr><td>搭车"免费"度</td><td>低于饱和点时论证弱化</td><td>饱和算力，搭车近乎免费<sup>[C3]</sup></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>工程决策方式：Sarathi-Serve 的做法是一次性 profiling——对不同的批 token 数测迭代时长，取满足 TBT SLO 的最大值作为 $\tau$<sup>[C11]</sup>。如果部署是流水线并行，$\tau$ 还要兼顾流水线气泡（见第 5 章）。</p>
+
+<h3 id="budget-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>把 chunk 从 1024 改成 256，哪些量变好、哪些变差？</p>
+<details>
+<summary>解答：间隔变平稳；重复读、利用率、固定开销三项变差</summary>
+<p>变好：每次迭代的 token 数从 1024 降到 256，迭代时长按比例缩短，进行中 decode 的 token 间隔更平稳、TBT 尾部更小<sup>[C11]</sup>。变差：同长度 prompt 的块数 $N$ 变为 4 倍，KV 重复读按 $\frac{N(N-1)}{2}$ 从 $N=4$ 时的 6 块次涨到 $N=16$ 时的 120 块次（精确比值 20 倍，按 $N^2$ 量级增长；prompt 长度 4096 的实例）<sup>[F1]</sup>；每块算术强度下降、GPU 利用率降低<sup>[C13]</sup>；迭代次数变 4 倍、kernel 启动等固定开销总占比上升<sup>[C13]</sup>。256 低于该实例饱和点 512<sup>[N2]</sup>，搭车"免费"论证在该硬件组合上弱化；说明这个取值在该硬件组合上已经偏小。正确做法是按 TBT SLO 与 profiling 定值，不是取"越小越好"。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="cpp">5. 与流水线并行合流：CPP</h2>
+
+<p>前面几章都在单卡（或单实例）语境下讨论。当部署是流水线并行（PP）时，chunked prefill 顺带解决了另一个问题：流水线气泡。</p>
+
+<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，流水线被均匀地填满，双重气泡都被压缩<sup>[C14]</sup>。Sarathi 在 GPT-3 流水线部署上实测气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。</p>
+
+<p>CPP 在 Beyond the Buzz 论文（PD 分离设计的系统性研究）中成为 prefill 池的标准答案：分离部署里 FTL（First Token Latency，首 token 延迟）约束只作用于 prefill 池，DeepSeek-R1 在 ISL（Input Sequence Length，输入序列长度）256K、64 GPU（EP（Expert Parallelism，专家并行）$\times$ PP = 64）的模拟中，增大 PP 维度持续降低 FTL 而吞吐基本保持——CPP 是严格 FTL SLA 下兼顾高吞吐的最优策略<sup>[C16]</sup>。同一论文还发现 co-located 基线里的 piggybacking 对注意力架构敏感：DeepSeek-R1 的 MLA（Multi-head Latent Attention，多头潜在注意力）在 chunked piggyback 下每个块都要重算 down/up 投影，产生额外开销（可临时缓存上投影 KV 缓解）<sup>[C17]</sup>——这是第 2 章"切块代价"在特定架构上的又一实例。完整讨论见 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页。</p>
+
+<h3 id="cpp-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>为什么等大的块能消掉流水线气泡，而"不等大的原始请求"不能？</p>
+<details>
+<summary>解答：气泡的第二来源是 micro-batch 时长不均，等大块把它抹平</summary>
+<p>PP 气泡有两个来源：一是结构性的填充期/排空期（见模型并行页，靠增大 micro-batch 数摊薄）；二是负载性的时长不均——不同请求的 prompt 长短不一、prefill 与 decode 迭代耗时差几个数量级，一个长 micro-batch 会让后面所有 stage 的节奏被拖住，短 micro-batch 让 stage 空等。chunked prefill 把一切长 prefill 切成等计算量的块，每个 slot 的耗时近乎一致，第二重气泡被消除，第一重也被均匀的 micro-batch 流压缩——Sarathi 实测 GPT-3 流水线部署气泡缩小 6.29 倍、吞吐提升 1.91 倍<sup>[C14, N4]</sup>。原始请求直接当 micro-batch 时长短不一，两重气泡都占。</p>
+</details>
+</li>
+<li>
+<p>Beyond the Buzz 论文对 CPP 的结论是什么？</p>
+<details>
+<summary>解答：CPP 是 prefill 池在严格 FTL 下的最优策略</summary>
+<p>在该论文的分离部署模拟中，FTL 约束只作用于 prefill（context）池；为在混合长度序列下压低 FTL 同时维持高吞吐，CPP 被发现尤其有效——DeepSeek-R1、ISL 256K、64 GPU（EP（Expert Parallelism，专家并行）$\times$ PP = 64）的设置里，随 PP 维度增大 FTL 持续降低而吞吐保持<sup>[C16]</sup>。机制与第 2、3 章一致：切块让长序列能在给定 FTL 内处理（每块小到一次迭代可完成），PP 让块在流水线中并行推进。该结论来自模拟器（论文的方法性质见其页面），适用条件是该模拟设置。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="boundary">6. 边界与相邻工作</h2>
+
+<p>chunked prefill 改善的是延迟结构与批内负载均衡，不改善单请求的 prefill 速度：总计算量不变（FFN 不变）甚至微升（KV 重复读、固定开销）<sup>[C5, C13]</sup>。它的收益依赖场景：chunk 要够大以饱和算力（搭车论证的前提<sup>[C3]</sup>）；架构敏感性上 MLA 的重复投影开销<sup>[C17]</sup>、宽松延迟目标与生成密集流量下 chunking 更有利（Beyond the Buzz 的结论）都是边界条件。</p>
+
+<p>与 PD 分离的关系：chunked prefill 是 co-located 部署内部的批构造优化——prefill 与 decode 仍在同一实例上，只是不再互相卡住；PD 分离则把两阶段放到不同实例、各自独立优化（动机见 <a href="../moe-serving/index.html">MoE Serving</a>）。两条路线是竞争关系也是互补基线：Beyond the Buzz 论文正是把 piggybacked co-located（本文机制）作为分离式部署的对照基线，系统回答"什么条件下该走哪条路"——见 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页。</p>
+
+<p>Sarathi-Serve 的端到端数字（尾延迟约束下的服务容量，相对 vLLM）：Mistral-7B 单 A100 为 2.6 倍、Yi-34B 双 A100 至 3.7 倍、Falcon-180B 流水线部署至 5.6 倍<sup>[C15, N5]</sup>；Sarathi 原版在 LLaMA-13B/A6000 上 decode 吞吐至多 10 倍、端到端吞吐 1.33 倍，LLaMA-33B/A100 上端到端 1.25 倍、decode 吞吐至多 4.25 倍<sup>[N6]</sup>。这些数字各自的实验条件不同，不能跨设置比较。</p>
+
+<h3 id="boundary-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>chunked prefill 让 prefill 变快了吗？它和 PD 分离是什么关系？</p>
+<details>
+<summary>解答：没有；它是 co-located 内的优化，与 PD 分离是两条路线</summary>
+<p>没有。单请求 prefill 的总计算量不变（FFN 不变），访存还微升（KV 重复读 $\frac{N(N-1)}{2}$、固定开销）<sup>[C5, F1, C13]</sup>——它改善的是系统层面的延迟结构（decode 不再被卡）与批均衡（搭车、流水线均匀化），不是单个 prefill 的速度。与 PD 分离的关系：chunked prefill 在同一实例内混批 prefill 块与 decode，是 co-located 部署的优化；PD 分离把两阶段放到不同实例分别优化。Beyond the Buzz 论文把 piggybacked co-located（本文机制）作为分离部署的对照基线，结论是分离在 prefill-heavy 流量与大模型下收益更大、小模型与生成密集流量下收益有限——即两条路线各有优势区间，完整论证见其论文页。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<ul>
+<li>C1–C4、C7、C8、N1、N2、N6：SARATHI（Agrawal et al., "SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills", 2023, arXiv:2308.16369）摘要、§1、§3、§4。</li>
+<li>C5（含 N-1/N-2 计数与"compute-bound 可容忍"）、C9–C13、F1 依据、N3、N5：Sarathi-Serve（Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve", 2024, arXiv:2403.02310）§2、§3、§4.2–4.3。KV 重复读计数在 Sarathi 原文为 N 次、Sarathi-Serve 为 N-1 次（是否计入首次读取的表述差异），本页采用 Sarathi-Serve 的计数。</li>
+<li>C6：由因果注意力结构（causal-mask 页）与 Sarathi 数据流图推出的推断，正文已标注。</li>
+<li>C14、N4：SARATHI 摘要与流水线实验（GPT-3）。</li>
+<li>C15：Sarathi-Serve 摘要（相对 vLLM 的服务容量提升）。</li>
+<li>C16、C17：Beyond the Buzz（Mitra et al., 2025, arXiv:2506.05508）§4（CPP 最优策略、MLA 重复投影开销）。</li>
+</ul>
+
+<h3>公式与来源（F）</h3>
+<ul>
+<li>F1：$\sum_{i=1}^{N}(N-i) = \frac{N(N-1)}{2}$，由 C5 的逐块计数直接求和（本页推导，标注为"由 C5 计数推出"）。</li>
+</ul>
+
+<h3>外部数字与实验条件（N）</h3>
+<ul>
+<li>N1：decode 每 token 成本约 200 倍于 prefill（小批量、A6000、LLaMA-13B），Sarathi §1。</li>
+<li>N2：512 token 单请求饱和 A6000（LLaMA-13B），Sarathi §1。</li>
+<li>N3：chunk 257 vs 256 prefill 时间 +32%，Sarathi-Serve §4.3，特定 GPU/kernel。</li>
+<li>N4：PP 气泡缩小 6.29 倍、吞吐 +1.91 倍（GPT-3 流水线），Sarathi 摘要。</li>
+<li>N5：Sarathi-Serve vs vLLM 服务容量 2.6/3.7/5.6 倍（Mistral-7B 单 A100 / Yi-34B 双 A100 / Falcon-180B PP），Sarathi-Serve 摘要。</li>
+<li>N6：Sarathi 吞吐提升（LLaMA-13B/A6000：decode 至多 10 倍、端到端 1.33 倍；LLaMA-33B/A100：端到端 1.25 倍、decode 至多 4.25 倍），Sarathi 摘要。</li>
+</ul>
+
+<h3>构造示例</h3>
+<ul>
+<li>8000 token prompt / 512 每块 / 16 块 / 64 个 decode 请求：贯穿示例的整数化设定，说明切块与搭车机制，非实测工作负载。</li>
+<li>4096 token 切 8 块（28 块次）vs 4 块（6 块次）：验证 F1 的平方量级增长。</li>
+<li>$\tau = 512$、64 decode + 448 chunk 的迭代构成：说明 token budget 机制。</li>
+</ul>
+
+<h3>辅助解释与类比边界</h3>
+<ul>
+<li>"搭车近乎免费"：描述"权重读一次同时服务 chunk 与 decode"这一局部关系；不是零成本（最多低一个数量级<sup>[C7]</sup>），且以 chunk 饱和算力为前提。</li>
+</ul>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>块间 KV 依赖的讨论假设 KV cache 已就位（不涉及 KV 传输与显存布局问题，见 MoE Serving 页）。</li>
+<li>token budget 讨论假设单实例；多实例（PD 分离）下的调度是 Beyond the Buzz 论文页的主题。</li>
+<li>Sarathi/Sarathi-Serve 的数字各自绑定其实验设置（模型、GPU、SLO），跨设置比较无效；本页引用时均标注条件。</li>
+<li>CPP 气泡消除为量化结论（6.29 倍<sup>[N4]</sup>），但残余不均在请求长度差异极大时仍存在（GPipe 对分区不均的讨论同理）。</li>
+</ul>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>
