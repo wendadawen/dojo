@@ -670,7 +670,7 @@
 <p><b>主要依据</b>：Zhai, Mustafa, Kolesnikov, Beyer. "Sigmoid Loss for Language Image Pre-Training." ICCV 2023 Oral, arXiv:2303.15343v4（2023-09-27）, §3.1 CLIP softmax 损失公式、§3.2 SigLIP 损失公式与 bias 初始化、§3.3 chunked 实现、§4.2 batch size 影响、§4.4 SigLiT 84.5%、§4.5 SigLIP from scratch 72.1%、Table 1 / Table 2 实验数据、摘要 batch=1M 边际收益消失结论。</p>
 </blockquote>
 
-<p>用 4 个 TPUv4、2 天训练，SigLIP 达到 ImageNet zero-shot 84.5%；同等水平的 CLIP 需要约 2500 TPUv3-days。这一算力差距的核心不在模型架构——两者都是双塔 + 共享嵌入空间 + 可学习温度——而在损失函数：SigLIP 把 CLIP 的 softmax 对比损失换成逐对 sigmoid 二分类损失，每个 (image, text) 对独立判断"配不配"，不依赖 batch 内其他对。本文回答：这一替换的形式差异在哪、可学习 bias $b$ 为什么是关键、batch size 与损失如何解耦、以及 SigLIP 在小算力场景的优势与边界。前置概念为 <a href="../../wiki/vit/index.html">ViT</a>（图像塔架构）与 <a href="../../wiki/standard-attention/index.html">标准注意力</a>（softmax 形式与数值稳定 trick）。</p>
+<p>用 4 个 TPUv4、2 天训练，SigLIP 达到 ImageNet zero-shot 84.5%；同等水平的 CLIP 需要约 2500 TPUv3-days。这一算力差距的核心不在模型架构——两者都是双塔 + 共享嵌入空间 + 可学习温度——而在损失函数：SigLIP 把 CLIP 的 softmax 对比损失换成逐对 sigmoid 二分类损失，每个 (image, text) 对独立判断"配不配"，不依赖 batch 内其他对。本文回答：这一替换的形式差异在哪、可学习 bias $b$ 为什么是关键、batch size 与损失如何解耦、以及 SigLIP 在小算力场景的优势与边界。涉及的基础概念是 <a href="../../wiki/vit/index.html">ViT</a>（图像塔架构）与 <a href="../../wiki/standard-attention/index.html">标准注意力</a>（softmax 形式与数值稳定 trick）。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -705,7 +705,7 @@
     <li>以为 SigLIP 总是比 CLIP 好——<strong>正确</strong>：论文 §4.2 显示 sigmoid 显著优于 softmax 仅在 batch &lt; 16k；batch 增大时优势缩小；batch &gt; 32k 后多语言 retrieval 反而下降</li>
     <li>以为只要把 CLIP 的 softmax 换成 sigmoid 就能 work，不需要 bias——<strong>正确</strong>：可学习 bias $b$ 是 SigLIP 公式中的关键组成；论文 §3.2 明确指出没有 $b$ 时初始 logits 因"1 正 vs $|B|-1$ 负"严重失衡而使训练初期产生大量错误方向梯度</li>
     <li>以为 SigLIP 用 sigmoid 是为了避免 softmax 数值不稳定——<strong>正确</strong>：数值稳定性是次要收益；论文 §1 明确动机是"conceptually decouples the batch size from the definition of the task"——把 batch size 与损失定义解耦；softmax 数值问题早已通过 log-sum-exp trick 解决</li>
-    <li>以为 MoonViT-V2 不从 SigLIP 初始化是因为 SigLIP 不好——<strong>正确</strong>：K3 选择从零训练更稳定，与 SigLIP 质量无关；MoonViT-V2 的目标是"视频 + 自定义训练目标"，与 SigLIP 的"静态图像 + 对比损失"目标不同；详见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a> 概念页</li>
+    <li>以为 MoonViT-V2 不从 SigLIP 初始化是因为 SigLIP 不好——<strong>正确</strong>：K3 选择从零训练更稳定，与 SigLIP 质量无关；MoonViT-V2 的目标是"视频 + 自定义训练目标"，与 SigLIP 的"静态图像 + 对比损失"目标不同；详见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a></li>
   </ul>
 </section>
 
@@ -713,7 +713,7 @@
 
 <p>用 32k batch 训 CLIP，要把每个对 (image $i$, text $j$) 的相似度 $x_i\cdot y_j$ 与整个 batch 的所有相似度聚合到一起算 softmax——分母 $\sum_j e^{t x_i\cdot y_j}$ 依赖 batch 内所有 $y_j$。能不能让每个 (image, text) 对只看自己就被评分？这是 SigLIP 要回答的问题。</p>
 
-<p>理解 SigLIP 之前要先看清 CLIP 的损失怎么算。CLIP（Radford et al. 2021）用双塔架构：图像塔 $f$ 把图像 $I_i$ 映射到嵌入 $f(I_i)$，文本塔 $g$ 把文本 $T_j$ 映射到嵌入 $g(T_j)$；嵌入经 L2 归一化得 $x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$，落在共享嵌入空间；图像塔常用 <a href="../../wiki/vit/index.html">ViT</a>（已讲过 patch + Transformer 编码机制），文本塔常用 Transformer。CLIP 的训练目标是对 batch 内 $|B|$ 个 (image, text) 配对样本，让正对的相似度高于负对——这通过 softmax 损失实现（softmax 在 <a href="../../wiki/standard-attention/index.html">标准注意力</a> 概念页已给出，这里只使用其结果）：</p>
+<p>理解 SigLIP 之前要先看清 CLIP 的损失怎么算。CLIP（Radford et al. 2021）用双塔架构：图像塔 $f$ 把图像 $I_i$ 映射到嵌入 $f(I_i)$，文本塔 $g$ 把文本 $T_j$ 映射到嵌入 $g(T_j)$；嵌入经 L2 归一化得 $x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$，落在共享嵌入空间；图像塔常用 <a href="../../wiki/vit/index.html">ViT</a>（已讲过 patch + Transformer 编码机制），文本塔常用 Transformer。CLIP 的训练目标是对 batch 内 $|B|$ 个 (image, text) 配对样本，让正对的相似度高于负对——这通过 softmax 损失实现（softmax 见 <a href="../../wiki/standard-attention/index.html">标准注意力</a>，这里只使用其结果）：</p>
 
 <p>$$\mathcal{L}_{\text{CLIP}}=-\frac{1}{2|B|}\sum_{i=1}^{|B|}\left(\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_i\cdot y_j}}+\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_j\cdot y_i}}\right).$$ <sup>[F2]</sup></p>
 
@@ -998,7 +998,7 @@
 <p><strong>常见误解</strong>。 SigLIP 不是普遍比 CLIP 好。论文 §4.2 明确显示 sigmoid 显著优于 softmax 仅在 batch &lt; 16k；batch 增大时优势缩小。脱离 batch size 谈"SigLIP 比 CLIP 好"是误读。</p>
 </div>
 
-<p><strong>K3 选择"不从 SigLIP 初始化"的衔接</strong>。SigLIP 的训练目标是"静态图像 + 对比损失"，学到的视觉表示适合图像-文本检索、zero-shot 分类等任务。MoonViT-V2 是 K3 的视觉编码器，目标是"视频 + 自定义训练目标"——K3 选择从零训练更稳定，与 SigLIP 质量无关，是设计取向不同。MoonViT-V2 已有独立概念页 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a>。理解 SigLIP 是理解"为什么 K3 可以选择不从 SigLIP 初始化"的前置——既知道 SigLIP 学到的表示适合什么、也知道 MoonViT-V2 的目标为什么与之不同。</p>
+<p><strong>K3 选择"不从 SigLIP 初始化"的衔接</strong>。SigLIP 的训练目标是"静态图像 + 对比损失"，学到的视觉表示适合图像-文本检索、zero-shot 分类等任务。MoonViT-V2 是 K3 的视觉编码器，目标是"视频 + 自定义训练目标"——K3 选择从零训练更稳定，与 SigLIP 质量无关，是设计取向不同。MoonViT-V2 的完整机制见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a>。理解 SigLIP 是理解"为什么 K3 可以选择不从 SigLIP 初始化"的前置——既知道 SigLIP 学到的表示适合什么、也知道 MoonViT-V2 的目标为什么与之不同。</p>
 
 <details>
 <summary>补充：SigLIP 与 CLIP 的分布式 chunked 实现对比</summary>
@@ -1067,7 +1067,7 @@
 <p><strong>简化二：$|B|=4$ 手算用 $t=10, b=-10$ 与 $x_i\cdot y_j=0$ 的简化假设</strong>。可推出：$b$ 抵消初始失衡的机制不依赖 $x_i\cdot y_j$ 具体值。不可推出：真实训练中嵌入迅速学到结构后 $x_i\cdot y_j$ 不为 0 的行为。</p>
 <p><strong>简化三：只引用 SigLiT 84.5% 与 SigLIP 72.1% 两个代表数字</strong>。可推出：SigLIP 在小算力场景的算力优势由这两个数字与 CLIP ~2500 TPUv3-days 对照充分支持。不可推出：SigLiT B/8 L 79.8%、SigLIP 16k batch 71.0% 等中间配置及多语言 mSigLIP 的完整 36 种语言结果。</p>
 <p><strong>简化四：不展开 chunked 分布式实现的完整伪代码</strong>。可推出：SigLIP 不需 all-gather 的工程优势由 §3.3 一句话说明即可。不可推出：论文图 1 的 chunked 实现细节（device 间 swap 文本嵌入、cross-device sum）。</p>
-<p><strong>简化五：MoonViT-V2 设计只一句话提及</strong>。可推出：K3 选择"不从 SigLIP 初始化"的衔接原因。不可推出：MoonViT-V2 的具体机制（27 层、从零训练、RMSNorm、去 bias、视频分解注意力），详见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a> 概念页。</p>
+<p><strong>简化五：MoonViT-V2 设计只一句话提及</strong>。可推出：K3 选择"不从 SigLIP 初始化"的衔接原因。不可推出：MoonViT-V2 的具体机制（27 层、从零训练、RMSNorm、去 bias、视频分解注意力），详见 <a href="../../wiki/moonvit-v2/index.html">MoonViT-V2</a>。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

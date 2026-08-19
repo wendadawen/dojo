@@ -701,7 +701,7 @@
 
 <p>一个 MoE 层有 256 个路由专家、每 token 激活 8 个，想扩到 896 个专家、每 token 激活 16 个——直觉上"专家多了、每个 token 走的路径多了"应该更好。但在分布式部署里，每多一个被选中的专家，就要把整个 $d$ 维向量送过去、把 $d$ 维变换后的向量取回来，还要从显存读一份 $d$ 维的专家权重。扩大路由倍数时，这部分通信与显存带宽随路由倍数线性增长，常常比 FLOPs 本身更先到瓶颈。LatentMoE 用两次投影把路由专家放进更窄的隐空间，让这部分开销不再随全宽 $d$ 走。</p>
 
-<p>本页以 NVIDIA 论文 arXiv:2601.18089 为主源，讲清 LatentMoE 通用架构——它把路由专家的输入输出从模型全宽 $d$ 投影到更窄的隐空间 $\ell$（$\ell < d$）再计算，使扩大专家池时路由通信与专家权重流量不再随路由倍数线性增长，并把节省的预算重新投入到更多专家与更高 top-k。K3 的 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 是它的稳定化变体，由独立概念页负责。读者应已了解 top-K MoE 的基本概念（router、top-k、加权和）与 shared+routed 专家组织；若没有，先读<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 2、3 章与<a href="../deepseek-moe/index.html">《DeepSeekMoE》</a>。本页要回答：LatentMoE 用什么结构变化缓解路由开销？省下的预算花到哪里？压缩比能不能无限放大？</p>
+<p>本页以 NVIDIA 论文 arXiv:2601.18089 为主源，讲清 LatentMoE 通用架构——它把路由专家的输入输出从模型全宽 $d$ 投影到更窄的隐空间 $\ell$（$\ell < d$）再计算，使扩大专家池时路由通信与专家权重流量不再随路由倍数线性增长，并把节省的预算重新投入到更多专家与更高 top-k。K3 的 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 是它的稳定化变体，完整机制见该页。读者应已了解 top-K MoE 的基本概念（router、top-k、加权和）与 shared+routed 专家组织；若没有，先读<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 2、3 章与<a href="../deepseek-moe/index.html">《DeepSeekMoE》</a>。本页要回答：LatentMoE 用什么结构变化缓解路由开销？省下的预算花到哪里？压缩比能不能无限放大？</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -751,13 +751,13 @@
 
 <h2 id="standard-moe-cost">1. 扩大专家池的代价——标准 MoE 的全宽路由开销</h2>
 
-<p>先回顾标准 MoE 层的结构（完整机制见<a href="../moe-serving/index.html">前置概念页</a>第 2 章）。一层里有 $N$ 个路由专家（每个是一个小 FFN），每来一个 token，router 给所有专家打分，只让得分最高的 $k$ 个（top-$k$）专家真正计算，最后按门控权重 $g_i$ 加权求和：</p>
+<p>先回顾标准 MoE 层的结构（完整机制见<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 2 章）。一层里有 $N$ 个路由专家（每个是一个小 FFN），每来一个 token，router 给所有专家打分，只让得分最高的 $k$ 个（top-$k$）专家真正计算，最后按门控权重 $g_i$ 加权求和：</p>
 
 <p>$$y(x)=\sum_{i\in S_k(x)} g_i(x)\cdot E_i(x)$$</p>
 
 <p>这里 $x \in \mathbb{R}^d$ 是 token 的输入向量，$d$ 是模型隐层宽度；$E_i(x)$ 是第 $i$ 个路由专家对 $x$ 的输出，仍是 $d$ 维；$S_k(x)$ 是 router 为 $x$ 选中的 $k$ 个专家下标集合；$g_i(x)$ 是门控权重。关键事实是：<strong>每个被选中的路由专家都接收完整的 $d$ 维 token、输出 $d$ 维，专家 FFN 的权重矩阵也在 $d$ 维空间</strong><sup>[C2]</sup>。</p>
 
-<p>在分布式部署里（专家并行 EP，把专家分片到多张 GPU，见<a href="../moe-serving/index.html">前置页</a>第 3 章），这一点会变成真实的开销。每个"token–专家"对都要 dispatch 一个 $d$ 维向量到选中专家所在的卡、combine 一个 $d$ 维向量回来，这一步通常用 all-to-all 通信实现。同时每个被选中的专家要从 GPU 高速显存（HBM）读一份 $d$ 维的 FFN 权重才能算——在低延迟场景下，这部分读取常常是延迟大头<sup>[C2]</sup>（设计原则 1、2）。</p>
+<p>在分布式部署里（专家并行 EP，把专家分片到多张 GPU，见<a href="../moe-serving/index.html">《MoE 大模型推理与服务基础》</a>第 3 章），这一点会变成真实的开销。每个"token–专家"对都要 dispatch 一个 $d$ 维向量到选中专家所在的卡、combine 一个 $d$ 维向量回来，这一步通常用 all-to-all 通信实现。同时每个被选中的专家要从 GPU 高速显存（HBM）读一份 $d$ 维的 FFN 权重才能算——在低延迟场景下，这部分读取常常是延迟大头<sup>[C2]</sup>（设计原则 1、2）。</p>
 
 <p><strong>构造示例。</strong> 取 $d=4096$。若每 token 激活 $k=8$ 个路由专家，那么每 token 的路由 dispatch 量是 $k \times d = 8 \times 4096 = 32768$ 个数；扩到 $k=16$ 时翻倍到 $65536$ 个数。每个被选中的专家还要从 HBM 读一份 $d$ 维权重的 FFN，这部分流量也随 $k$ 线性增长。扩大路由倍数（$N$ 与 $k$ 同时放大）时，dispatch 通信量 $\propto k \cdot d$、专家权重读取量 $\propto k \cdot d$——FLOPs 也涨，但通信与带宽常常先到瓶颈。</p>
 
@@ -792,7 +792,7 @@
 
 <h2 id="latent-moe-layer">2. LatentMoE 的层结构——共享分支全宽、路由分支隐空间</h2>
 
-<p>LatentMoE 沿用 DeepSeekMoE 提出的"共享专家 + 路由专家"组织（见<a href="../deepseek-moe/index.html">DeepSeekMoE 概念页</a>）：共享专家对所有 token 恒激活、承载通用变换；路由专家参与 top-$k$ 选择、承载差异化变换。在此之上，LatentMoE 做了一个关键改造——<strong>把路由分支的两端各加一次共享线性投影，让路由专家在一个比 $d$ 更窄的隐空间 $\ell$ 里工作</strong><sup>[C1]</sup>。</p>
+<p>LatentMoE 沿用 DeepSeekMoE 提出的"共享专家 + 路由专家"组织（见 <a href="../deepseek-moe/index.html">DeepSeekMoE</a>）：共享专家对所有 token 恒激活、承载通用变换；路由专家参与 top-$k$ 选择、承载差异化变换。在此之上，LatentMoE 做了一个关键改造——<strong>把路由分支的两端各加一次共享线性投影，让路由专家在一个比 $d$ 更窄的隐空间 $\ell$ 里工作</strong><sup>[C1]</sup>。</p>
 
 <p>具体做法分三步。第一，下投影 $W_\downarrow \in \mathbb{R}^{\ell \times d}$ 把 token 从模型全宽 $d$ 压到隐空间 $\ell$：</p>
 
@@ -1092,7 +1092,7 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
 
 <p>LatentMoE 作为通用架构由 NVIDIA 论文（Elango et al., 2026）系统提出；Kimi K3 的 <strong>Stable LatentMoE</strong> 是 LatentMoE 主结构 + 三件稳定化的合称<sup>[C6]</sup>。两者主结构一致——都是"共享专家全宽 + 路由专家隐空间 + 两端投影"；区别在于 K3 在此基础上加了三件稳定化，以应对 $N=896, k=16$（稀疏度 56）的极端稀疏与 2.8T 规模下的两个失败模式：路由分支激活爆炸与近千专家负载失衡。</p>
 
-<p>三件稳定化这里只点名，完整机制见<a href="../stable-latent-moe/index.html">Stable LatentMoE 概念页</a>：</p>
+<p>三件稳定化这里只点名，完整机制见<a href="../stable-latent-moe/index.html">Stable LatentMoE</a>：</p>
 <ul>
   <li><strong>Normalized LatentMoE</strong>：在 $W_\uparrow$ 前加 RMSNorm，稳定路由聚合 $u$ 的尺度。这使 K3 的 Eq. 11 在 $W_\uparrow$ 作用于 $\mathrm{RMSNorm}(u)$ 而非 $u$ 本身——这是 K3 相对原始 LatentMoE 公式 F2 的一处差异。</li>
   <li><strong>SiTU-GLU</strong>：有界激活函数，防止路由分支连续矩阵乘法链（$W_\downarrow \to$ 路由 FFN $\to W_\uparrow$）的激活爆炸。</li>
@@ -1189,10 +1189,10 @@ reinvestment 后: N'=32, k'=8, 组合数 C(32,8)=10518300
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（LatentMoE 正式定义：路由分支两端加 $W_\downarrow$/$W_\uparrow$，路由专家在 $\ell$ 维计算，共享专家与 router 仍在 $d$ 维）：[L] Elango et al., 2026, arXiv:2601.18089, Figure 1(b) 与 §2。C2（标准 MoE 全宽路由开销：dispatch 通信与专家权重读取随 top-$k$ 与 $d$ 线性增长；低延迟场景显存带宽受限、高吞吐场景通信受限）：[L] §1 与 §2，设计原则 1、2；前置页 <a href="../moe-serving/index.html">moe-serving</a> §3。C3（路由部分开销按 $d/\ell$ 比例缩小）：[L] Figure 1 caption（"reduces routed parameter loads and all-to-all traffic by a factor of $d/\ell$"）。C4（Reinvestment：按 $\alpha = d/\ell$ 放大 $N$ 与 $K$；中间维度 $m$ 保持不变，非线性容量 $U_\text{eff}=K\cdot m$ 随 $K$ 放大而提升）：[L] Figure 1 caption 与设计原则 V。区分：设计原则 III 指压缩阶段（$d\to\ell$ 时 $K,m$ 均不变、$U_\text{eff}$ 不变），设计原则 V 指 reinvestment（放大 $K$、$m$ 不变、$U_\text{eff}$ 提升）。C5（压缩下限与投影成本：特征秩下限、投影自身成本、不 reinvestment 会掉点）：[L] 设计原则 4；[R] Sebastian Raschka, "Latent MoE"（投影不等于整体加速）；[L] §3 消融实验。C6（Stable LatentMoE = LatentMoE + 三件稳定化）：[K3] Kimi K3 技术报告 §2.3；<a href="../stable-latent-moe/index.html">stable-latent-moe 概念页</a>。C7（router 仍在 $d$ 维工作）：[L] §2（"the router still computes gating decisions from the model's hidden representation"）。</p>
+<p>C1（LatentMoE 正式定义：路由分支两端加 $W_\downarrow$/$W_\uparrow$，路由专家在 $\ell$ 维计算，共享专家与 router 仍在 $d$ 维）：[L] Elango et al., 2026, arXiv:2601.18089, Figure 1(b) 与 §2。C2（标准 MoE 全宽路由开销：dispatch 通信与专家权重读取随 top-$k$ 与 $d$ 线性增长；低延迟场景显存带宽受限、高吞吐场景通信受限）：[L] §1 与 §2，设计原则 1、2；<a href="../moe-serving/index.html">moe-serving</a> §3。C3（路由部分开销按 $d/\ell$ 比例缩小）：[L] Figure 1 caption（"reduces routed parameter loads and all-to-all traffic by a factor of $d/\ell$"）。C4（Reinvestment：按 $\alpha = d/\ell$ 放大 $N$ 与 $K$；中间维度 $m$ 保持不变，非线性容量 $U_\text{eff}=K\cdot m$ 随 $K$ 放大而提升）：[L] Figure 1 caption 与设计原则 V。区分：设计原则 III 指压缩阶段（$d\to\ell$ 时 $K,m$ 均不变、$U_\text{eff}$ 不变），设计原则 V 指 reinvestment（放大 $K$、$m$ 不变、$U_\text{eff}$ 提升）。C5（压缩下限与投影成本：特征秩下限、投影自身成本、不 reinvestment 会掉点）：[L] 设计原则 4；[R] Sebastian Raschka, "Latent MoE"（投影不等于整体加速）；[L] §3 消融实验。C6（Stable LatentMoE = LatentMoE + 三件稳定化）：[K3] Kimi K3 技术报告 §2.3；<a href="../stable-latent-moe/index.html">stable-latent-moe</a>。C7（router 仍在 $d$ 维工作）：[L] §2（"the router still computes gating decisions from the model's hidden representation"）。</p>
 
 <h3>公式与来源（F）</h3>
-<p>F1（标准 MoE 层 $y = \sum g_i E_i$）：引自前置页 <a href="../moe-serving/index.html">moe-serving</a> 第 2 章 F1；[L] §1 标准 MoE 定义。F2（LatentMoE 层 $u = \sum p_i E_i^{\text{routed}}(W_\downarrow x)$，$y = \sum E_j^{\text{shared}}(x) + W_\uparrow u$）：由 [L] Figure 1(b) 结构描述与 [K3] Eq. 11（去掉 RMSNorm 回到通用形式）综合得出。F3（路由部分开销缩小比例 $\approx d/\ell$）：[L] Figure 1 caption。F4（reinvestment：$N \to \alpha N$、$k \to \alpha k$，$\alpha = d/\ell$）：[L] Figure 1 caption。</p>
+<p>F1（标准 MoE 层 $y = \sum g_i E_i$）：引自 <a href="../moe-serving/index.html">moe-serving</a> 第 2 章 F1；[L] §1 标准 MoE 定义。F2（LatentMoE 层 $u = \sum p_i E_i^{\text{routed}}(W_\downarrow x)$，$y = \sum E_j^{\text{shared}}(x) + W_\uparrow u$）：由 [L] Figure 1(b) 结构描述与 [K3] Eq. 11（去掉 RMSNorm 回到通用形式）综合得出。F3（路由部分开销缩小比例 $\approx d/\ell$）：[L] Figure 1 caption。F4（reinvestment：$N \to \alpha N$、$k \to \alpha k$，$\alpha = d/\ell$）：[L] Figure 1 caption。</p>
 
 <h3>外部数字与实验条件（N）</h3>
 <p>N1（K3 配置：$d=7168, \ell=3584, N=896, k=16, N_s=2$，稀疏度 56）：[K3] §2.3 与官方 <code>config.json</code>（<code>moonshotai/Kimi-K3</code>）。N2（Nemotron-3 Super：$4096 \to 1024 \to 4096$，120B 总参/12B 激活）：[L] §4；[R] "Latent MoE"。N3（Nemotron-3 Ultra：$8192 \to 2048 \to 8192$，550B 总参/55B 激活，512 路由专家、top-22、1 共享专家，中间维度 5120/10240）：[R] "Nemotron 3 Ultra and Latent MoE Scaling"。N4（16B 消融：压缩比到 4 时质量保持，再压缩需 reinvestment）：[L] §3 消融实验。N5（投影额外计算约 9%，K2-1T 规模投影）：[L] "Projected Serving Impact at Trillion-Parameter Scale"。N6（iso-accuracy 下 LatentMoE 在吞吐-延迟 Pareto 前沿上给出 1.24x–3.46x 加速，标准 MoE 需多约 350B 参数）：[L] Figure 2 与 §4；本页正文未直接引用 N6，仅在此登记。</p>
