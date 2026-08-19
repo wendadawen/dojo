@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="模型并行的两条基本路径：张量并行（TP）按层内矩阵维度切分，流水线并行（PP）按层堆叠深度切分。讲解 Megatron-LM 的列切/行切方案、每层 2 次 all-reduce 的通信结构、GPipe 的流水线气泡公式，以及为什么 TP 留在 NVLink 域内、PP 可以跨机组合部署。">
+  <meta name="dojo:summary" content="模型并行把单个模型切到多块 GPU：张量并行（TP）按层内矩阵维度切，FFN 列切+行切使每层前向只需 2 次 all-reduce；流水线并行（PP）按层堆叠深度切，气泡占比为 $\frac{p-1}{m+p-1}$，增大 micro-batch 数可摊薄。TP 通信频繁需留在 NVLink 域内，PP 通信稀疏可跨机，推理系统常以 TP $\times$ PP 组合部署。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="并行,通信,推理系统,模型部署">
+  <meta name="dojo:tag" content="parallelism">
+  <title>模型并行（Model Parallelism）：把一个模型切到多块 GPU 的两条路</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 960px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #ffffff; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: var(--bg);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    .diagram svg .dg-bubble { fill: none; stroke: var(--border); stroke-dasharray: 4 3; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">模型并行</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">模型并行（Model Parallelism）：把一个模型切到多块 GPU 的两条路</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Megatron-LM（Shoeybi et al., 2019, arXiv:1909.08053，张量并行切分方案）；GPipe（Huang et al., 2018, arXiv:1811.06965，流水线并行与气泡）；Sarathi（Agrawal et al., 2023, arXiv:2308.16369，TP 的互联需求讨论）。</p>
+</blockquote>
+
+<p>一块 80 GB 的 GPU 放不下 405B 参数的模型——哪怕只算权重本身。要让这类模型跑起来，必须把模型切开、分布到多块 GPU 上协同完成每一次前向计算。切法只有两条基本路径：按层内矩阵的维度切（张量并行，Tensor Parallelism，TP），或按层堆叠的深度切（流水线并行，Pipeline Parallelism，PP）。两条路径的通信结构完全不同，因此适合部署在不同的互联拓扑上，实际系统几乎总是组合使用。</p>
+
+<p>"模型并行"在部分文献（如 Megatron-LM）中狭义地指层内切分，与"流水线并行"并列；本页取广义用法，把两者都算作模型并行，正文首次引入各术语时会说明这一历史语境。本文的学习目标包括：说明两条切分路径各自切的是什么；解释张量并行怎么切一个 Transformer 层、每层需要哪些通信；推导流水线并行的气泡占比；说明 TP 与 PP 为什么分别适合机内与跨机互联、推理系统为什么组合使用。本文讨论的是推理 serving 场景；前置概念：多头注意力结构见 <a href="../standard-attention/index.html">标准注意力</a>，all-reduce 等集合通信与 NVLink/跨机网络分层见 <a href="../gpu-communication/index.html">GPU 通信</a>，prefill/decode 两阶段与 KV cache 见 <a href="../moe-serving/index.html">MoE Serving</a>。</p>
+
+<section class="learning-goals">
+<h2>核心问题</h2>
+<ol class="chapter-questions">
+<li>
+<p>模型并行的两条基本路径（TP 与 PP）各自切的是什么？为什么说它们是正交的？</p>
+<details>
+<summary>解答：TP 按层内矩阵维度切，PP 按层堆叠深度切</summary>
+<p>TP（张量并行）把每一层的权重矩阵按行或列切分，每张 GPU 持有每一层的一部分，所有卡参与每一层的计算，层内通过集合通信拼回完整结果；PP（流水线并行）把连续若干层组成的段（stage）放到不同卡上，数据像流水线一样逐段流过，卡间只在 stage 边界传一次激活值。两者正交：可以同时在层内切 TP、在层间切 PP，总卡数等于两个维度的乘积（如 TP $\times$ PP）。完整论证见第 1 章、第 2 章与第 3 章。</p>
+</details>
+</li>
+<li>
+<p>张量并行怎么切一个 Transformer 层？一层前向需要几次通信、发生在哪里？</p>
+<details>
+<summary>解答：FFN 列切+行切，attention 按 head 切，一层前向 2 次 all-reduce</summary>
+<p>FFN 的第一个矩阵乘按权重矩阵列切、第二个按行切：列切让逐元素的非线性激活（GeLU）可以在每张卡上本地应用，行切让第二段乘法直接消费本地输出得到部分积，最后把各卡部分积求和。attention 把 Q/K/V 投影按列切，使每个注意力头的计算完整落在一张卡上，输出投影按行切直接消费本地结果。这样每个子块各需 1 次 all-reduce，一个标准 Transformer 层（attention + FFN）前向共 2 次 all-reduce。完整论证见第 1 章。</p>
+</details>
+</li>
+<li>
+<p>流水线并行为什么有气泡？气泡占比由什么决定、怎么摊薄？</p>
+<details>
+<summary>解答：填充期与排空期的空转，占比 $(p-1)/(m+p-1)$，增大 $m$ 摊薄</summary>
+<p>PP 各 stage 串行依赖：首个 micro-batch 逐级前进时，后面的 stage 在等待（填充期）；最后 micro-batch 逐级离开时，前面的 stage 在等待（排空期）。一个 step 的总 slot 数为 $m+p-1$（$m$ 为 micro-batch 数、$p$ 为 stage 数），每个 stage 空转 $p-1$ 个 slot，气泡占比 $(p-1)/(m+p-1)$。增大 $m$ 可摊薄气泡（GPipe 实验中 $m \ge 4p$ 时可忽略），但推理部署的 $m$ 受 batch size 限制。完整论证见第 2 章。</p>
+</details>
+</li>
+<li>
+<p>TP 和 PP 各自适合什么互联拓扑，为什么推理系统常常组合使用？</p>
+<details>
+<summary>解答：TP 要 NVLink 域内，PP 可跨机，TP $\times$ PP 组合覆盖两种拓扑</summary>
+<p>TP 每层前向 2 次 all-reduce、通信次数随层数线性增长，对带宽和延迟敏感，超出 NVLink 域后 all-reduce 走跨机网络、代价急剧上升，因此通常限制在单机内；PP 每个 micro-batch 只在相邻 stage 边界传一次激活值，通信频率低、单次量小，可以容忍跨机低速互联。典型推理部署因此是"机内 TP（或 EP）、跨机 PP"，如 DeepSeek-R1 在 64 GPU 上用 EP $\times$ PP = 64 的组合。完整论证见第 3 章。</p>
+</details>
+</li>
+</ol>
+</section>
+
+<h2 id="tp-split">1. 一层怎么切：张量并行</h2>
+
+<p>先看一个具体问题。构造示例：设 FFN 的输入 $X$ 是 $1\times 4$ 的行向量，第一个权重矩阵 $A$ 为 $4\times 4$，第二个权重矩阵 $B$ 为 $4\times 4$，全程无偏置。FFN 的计算是 $Y = \mathrm{GeLU}(XA)B$，其中 GeLU 是逐元素非线性激活。现在把 $A$、$B$ 分到两张卡上，要求每张卡只持有一半权重、只算一半乘法，最后拼出和单卡完全相同的结果——切法不止一种，但只有一种能把卡间同步压到最少。</p>
+
+<h3 id="tp-ffn">1.1 FFN：第一段列切，第二段行切</h3>
+
+<p>关键观察是 GeLU 的逐元素性。如果把 $A$ 按行切（$A = \begin{bmatrix} A_1 \\ A_2 \end{bmatrix}$，配合 $X$ 按列切），两卡各得 $XA_i$，但合并结果需要 $\mathrm{GeLU}(X_1A_1 + X_2A_2)$——求和在非线性之前，两卡必须先同步一次才能过激活函数。Megatron-LM 放弃了这个方案，改为把 $A$ 按列切：<sup>[C2]</sup></p>
+
+<p>$$A = [A_1, A_2],\qquad [Y_1, Y_2] = [\mathrm{GeLU}(XA_1),\ \mathrm{GeLU}(XA_2)].$$</p>
+
+<ul>
+<li>$A_1, A_2$：$A$ 按列切成的两个 $4\times 2$ 子矩阵，各归一张卡。</li>
+<li>$X$：完整输入，两张卡都持有（输入是激活值不是权重，复制成本远小于权重）。</li>
+<li>$Y_1, Y_2$：激活后输出的左右两段，各在一张卡上，无需通信即可各自过 GeLU。</li>
+</ul>
+
+<p>列切把求和推迟到了非线性之后，GeLU 可以在每张卡上独立应用。第二段乘 $B$ 时配合按行切 $B = \begin{bmatrix} B_1 \\ B_2 \end{bmatrix}$（$B_i$ 为 $2\times 4$）：第一张卡算 $Y_1B_1$，第二张卡算 $Y_2B_2$，两者都是 $1\times 4$ 的完整形状，且</p>
+
+<p>$$Y B = (Y_1B_1 + Y_2B_2).$$</p>
+
+<p>两卡各得一个"部分积"，只需一次求和（all-reduce）就得到最终输出<sup>[C2, F1]</sup>。下图展示这一数据流：</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 235" role="img" aria-label="FFN 张量并行切分数据流">
+  <rect class="dg-box" x="15" y="92" width="80" height="50"/>
+  <foreignObject x="15" y="92" width="80" height="50"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align:center">$X$</div></foreignObject>
+  <rect class="dg-box" x="150" y="18" width="250" height="72"/>
+  <foreignObject x="160" y="24" width="230" height="60"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="font-size:14px">GPU 1：<br/>$\mathrm{GeLU}(XA_1)$，再乘 $B_1$</div></foreignObject>
+  <rect class="dg-box" x="150" y="145" width="250" height="72"/>
+  <foreignObject x="160" y="151" width="230" height="60"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="font-size:14px">GPU 2：<br/>$\mathrm{GeLU}(XA_2)$，再乘 $B_2$</div></foreignObject>
+  <rect class="dg-box dg-accent" x="455" y="92" width="120" height="50"/>
+  <foreignObject x="455" y="92" width="120" height="50"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align:center;font-size:14px">all-reduce<br/>求和</div></foreignObject>
+  <rect class="dg-box" x="615" y="92" width="50" height="50"/>
+  <foreignObject x="615" y="92" width="50" height="50"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align:center">$Y$</div></foreignObject>
+  <line class="dg-line" x1="95" y1="105" x2="148" y2="60"/>
+  <line class="dg-line" x1="95" y1="129" x2="148" y2="175"/>
+  <line class="dg-line" x1="400" y1="60" x2="452" y2="107"/>
+  <line class="dg-line" x1="400" y1="175" x2="452" y2="127"/>
+  <line class="dg-line" x1="575" y1="117" x2="612" y2="117"/>
+</svg>
+<figcaption class="diagram-caption">FFN 张量并行的数据流：输入 $X$ 复制到两卡；每卡先用本地列块 $A_i$ 算 $\mathrm{GeLU}(XA_i)$，再乘本地行块 $B_i$ 得部分积；all-reduce 把两个部分积求和得到完整输出 $Y$。蓝色 accent 框内的一次 all-reduce 是这个子块唯一的卡间通信。</figcaption>
+</figure>
+
+<p>代入具体数字验证等价性。构造示例：取</p>
+
+<p>$$X = [1, 1, 1, 1],\quad A = \begin{bmatrix} 1 & 1 & 0 & 0 \\ 2 & 2 & 0 & 0 \\ 0 & 0 & 3 & 3 \\ 0 & 0 & 4 & 4 \end{bmatrix},\quad B = A.$$</p>
+
+<p>按列切 $A_1 = A_{:, 0:2}$、$A_2 = A_{:, 2:4}$。直接计算 $XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；分段 $XA_1 = [3, 3, 0, 0]$、$XA_2 = [0, 0, 7, 7]$，拼接 $[XA_1, XA_2] = [3, 3, 7, 7] = XA$，过 GeLU 后（记 $\mathrm{GeLU}(v)$ 逐元素作用）再乘 $B$。两卡路径：GPU 1 算 $\mathrm{GeLU}(XA_1)B_1$，GPU 2 算 $\mathrm{GeLU}(XA_2)B_2$，两者之和与单卡 $\mathrm{GeLU}(XA)B$ 完全一致——分块乘法保证 $[Y_1, Y_2]\begin{bmatrix} B_1 \\ B_2 \end{bmatrix} = Y_1B_1 + Y_2B_2$，这里不需要任何近似。</p>
+
+<details>
+<summary>展开：上面构造示例的完整手算</summary>
+<p>构造示例（数字自设，目的是验证切分等价性，不代表真实模型）。取 $X = [1,1,1,1]$、$A$ 为上面同一块对角矩阵、$B = A$。记 $G(\cdot)$ 为任意逐元素函数（GeLU 即其一例）。第一步，$XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；按列切后 GPU 1 拿 $A_1$（$A$ 的前两列），算得 $XA_1 = [3, 3, 0, 0]$；GPU 2 拿 $A_2$（$A$ 的后两列），算得 $XA_2 = [0, 0, 7, 7]$。两段拼接恰好是 $[4,4,4,8]$——列切的直接效果就是输出按列分段。第二步，关键观察：$G$ 逐元素作用，所以 $G(XA)$ 按列分段等于各段分别过 $G$，即 $G(XA) = [G(XA_1),\ G(XA_2)]$。单卡结果可改写为</p>
+<p>$$G(XA)\,B = [G(XA_1),\ G(XA_2)] \begin{bmatrix} B_1 \\ B_2 \end{bmatrix} = G(XA_1)B_1 + G(XA_2)B_2,$$</p>
+<p>第二个等号是分块乘法恒等式。而等式右边的两项正好是 GPU 1、GPU 2 各自本地算出的部分积——两卡各算一项，all-reduce 求和即得单卡结果。注意这个论证对任何逐元素函数 $G$ 都成立，不需要代入 GeLU 的具体数值；等价性的全部来源是"列切让逐元素函数可分段作用 + 行切让分块乘法可拆成部分积之和"。</p>
+</details>
+
+<h3 id="tp-attention">1.2 Attention：按头切，通信藏在投影里</h3>
+
+<p>多头注意力天然适合切分：每个注意力头有自己独立的 Q/K/V 投影和输出投影，头与头之间本来就不交换中间结果（详见<a href="../standard-attention/index.html">标准注意力</a>）。TP 把 Q/K/V 三个投影矩阵按列切，使每个头的矩阵乘完整落在一张卡上；attention 输出后的线性投影按行切，直接消费本地各头的输出<sup>[C3]</sup>。整个过程与 FFN 的结构同构：列切第一段、行切第二段，attention 子块前向同样只需 1 次 all-reduce（把各卡的部分输出求和）<sup>[C3, C4]</sup>。</p>
+
+<p>值得强调的是切分粒度的对齐：切在头的边界上，每张卡拿到整数个头。若卡数超过头数，头无法再分，这就是 TP 与 KV 头数关系（KV 复制因子）的一种来源（基于 TP 切分粒度对齐头数与 KV 头数之比的推断，论文未明文论述）——该机制在 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页的带宽公式中有直接应用。</p>
+
+<h3 id="tp-comm-count">1.3 一层两次通信</h3>
+
+<p>把两个子块拼起来：一个标准 Transformer 层 = attention 子块 + FFN 子块，每个子块 1 次 all-reduce，所以 TP 之下每层前向共 2 次 all-reduce，反向再各 2 次<sup>[C4, N2]</sup>。一个 61 层的模型做一次 TP 前向要发起 122 次 all-reduce——通信次数不随切分粗细变化，但每卡计算量随卡数增多而变小，通信在总时间里的占比因此升高。这个"次数多、每层都要"的结构是第 3 章拓扑结论的直接原因。</p>
+
+<h3 id="tp-split-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>为什么 FFN 第一段必须列切而不是行切？</p>
+<details>
+<summary>解答：GeLU 逐元素，列切把求和推迟到非线性之后</summary>
+<p>行切（$A = \begin{bmatrix} A_1 \\ A_2 \end{bmatrix}$ 配合 $X$ 按列拆）得到的两段需要先求和 $X_1A_1 + X_2A_2$ 才能过 GeLU——因为 GeLU 是非线性的，$\mathrm{GeLU}(u+v) \ne \mathrm{GeLU}(u) + \mathrm{GeLU}(v)$，求和必须发生在激活之前，两卡在激活函数前就要同步一次。列切让每卡拿到输出的一段列，GeLU 逐元素地本地应用，同步被推迟到第二段乘法之后的最终求和，整个 FFN 只剩 1 次 all-reduce（Megatron-LM §3 的分析）。结论成立的条件是激活函数逐元素作用；如果激活是跨维度的（如 softmax 对整行归一化），列切不再有这个优势。</p>
+</details>
+</li>
+<li>
+<p>attention 为什么按头切就能在 attention 内部不通信？</p>
+<details>
+<summary>解答：头与头独立，Q/K/V 列切使每个头的计算完整落在一卡</summary>
+<p>多头注意力的每个头独立计算自己的 Q/K/V 投影与注意力分数，头之间只在最后拼接输出时汇合。TP 按 Q/K/V 投影的列切分，切面正好落在头的边界上（每张卡分到整数个头），每个头从投影到注意力输出全程在一张卡内完成；输出线性投影再按行切，直接消费本地头的输出。因此 attention 内部（投影、注意力计算）不需要任何卡间通信，唯一的通信在输出投影后的 all-reduce（Megatron-LM §3）。条件是每卡分到整数个头；卡数超过头数时无法继续对齐切分。</p>
+</details>
+</li>
+<li>
+<p>一个 $L$ 层模型 TP 前向一共几次 all-reduce？</p>
+<details>
+<summary>解答：$2L$ 次</summary>
+<p>每层两个子块（attention、FFN）各 1 次 all-reduce，共 2 次；$L$ 层堆叠后线性叠加为 $2L$ 次<sup>[C4]</sup>。例如 61 层模型一次前向 122 次 all-reduce。这个计数只覆盖 Megatron-LM 式的标准切分；嵌入层与输出层的切分可能附加通信，本页不展开。通信次数与 TP 卡数无关（不因切得更细而减少），但每卡计算量随卡数上升而下降，因此通信时间占比随卡数上升——这是 TP 不能无限加卡的结构性原因之一。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="pp-bubbles">2. 整摞层怎么分：流水线并行与气泡</h2>
+
+<p>第 1 章把一层切开分给多卡；另一种切法保持每层完整，把层堆叠的方向切开：第 1–16 层放卡 A（第一个 stage），第 17–32 层放卡 B，依此类推。数据像流水线一样流过各 stage，每个 stage 只算自己那段层、把输出激活值传给下一个 stage——这就是流水线并行（PP）<sup>[C5]</sup>。卡间通信只发生在相邻 stage 的边界上，每个 micro-batch 传一次激活值<sup>[C5]</sup>。</p>
+
+<p>这里出现一个问题：模型有 $p$ 个 stage、一次要处理 $m$ 个 micro-batch（micro-batch 是为填满流水线而把小批次切成的更小单元），卡与卡之间怎么协作？答案是一起跑同一个"step"：第 1 个 micro-batch 从 stage 1 进入，逐级前进；它走到哪，后面的 stage 才有活干。反过来，最后一个 micro-batch 离开 stage 1 后，stage 1 就闲下来了，要等整个 step 结束。</p>
+
+<h3 id="pp-derivation">2.1 气泡占比 $(p-1)/(m+p-1)$ 的推导</h3>
+
+<p>推导目标：求一个流水线 step 中每个 stage 的空闲时间占比。已知 $p$ 个 stage 串行依赖、$m$ 个 micro-batch 依次进入，每个 slot（一个 stage 处理一个 micro-batch 的时间格）等长。</p>
+
+<p>关键观察是总 slot 数。第 1 个 micro-batch 走完全程需要 $p$ 个 slot（每个 stage 停留 1 个）。它抵达最后一个 stage 后，剩余 $m-1$ 个 micro-batch 每隔 1 个 slot 从流水线末端出来一个——但它们早已在途中。从 step 开始到最后一个 micro-batch 离开，总时长为</p>
+
+<p>$$T_{step} = (m + p - 1)\ \text{个 slot}.$$</p>
+
+<p>其次，数每个 stage 的忙碌时间。每个 stage 处理全部 $m$ 个 micro-batch 各一个 slot，忙碌 $m$ 个 slot；空转 $(m+p-1) - m = p-1$ 个 slot。气泡占比为<sup>[C6, F2]</sup></p>
+
+<p>$$\frac{p-1}{m+p-1}.$$</p>
+
+<p>两个快速检查。第一，$m \to \infty$ 时占比趋于 0——micro-batch 越多，填充期与排空期占比越小，这就是"摊薄"。第二，$p = 1$ 时占比为 0——没有流水线就没有气泡，公式退化为单卡情况，边界正确。</p>
+
+<p>下图以 $p=4$、$m=4$ 为例展示填充期与排空期（构造示例，数字自设）：</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 258" role="img" aria-label="流水线并行的时间槽图，展示填充期与排空期的气泡">
+  <text x="95" y="20" class="dg-label" font-size="12" fill="currentColor" text-anchor="middle">slot 1</text>
+  <text x="173" y="20" font-size="12" fill="currentColor" text-anchor="middle">2</text>
+  <text x="251" y="20" font-size="12" fill="currentColor" text-anchor="middle">3</text>
+  <text x="329" y="20" font-size="12" fill="currentColor" text-anchor="middle">4</text>
+  <text x="407" y="20" font-size="12" fill="currentColor" text-anchor="middle">5</text>
+  <text x="485" y="20" font-size="12" fill="currentColor" text-anchor="middle">6</text>
+  <text x="563" y="20" font-size="12" fill="currentColor" text-anchor="middle">7</text>
+  <text x="80" y="63" font-size="13" fill="currentColor" text-anchor="end">stage 1</text>
+  <text x="80" y="111" font-size="13" fill="currentColor" text-anchor="end">stage 2</text>
+  <text x="80" y="159" font-size="13" fill="currentColor" text-anchor="end">stage 3</text>
+  <text x="80" y="207" font-size="13" fill="currentColor" text-anchor="end">stage 4</text>
+  <rect class="dg-box" x="57" y="40" width="76" height="34"/>
+  <text x="95" y="61" font-size="13" fill="currentColor" text-anchor="middle">mb 1</text>
+  <rect class="dg-box" x="135" y="40" width="76" height="34"/>
+  <text x="173" y="61" font-size="13" fill="currentColor" text-anchor="middle">mb 2</text>
+  <rect class="dg-box" x="213" y="40" width="76" height="34"/>
+  <text x="251" y="61" font-size="13" fill="currentColor" text-anchor="middle">mb 3</text>
+  <rect class="dg-box" x="291" y="40" width="76" height="34"/>
+  <text x="329" y="61" font-size="13" fill="currentColor" text-anchor="middle">mb 4</text>
+  <rect class="dg-bubble" x="369" y="40" width="76" height="34"/>
+  <rect class="dg-bubble" x="447" y="40" width="76" height="34"/>
+  <rect class="dg-bubble" x="525" y="40" width="76" height="34"/>
+  <rect class="dg-bubble" x="57" y="88" width="76" height="34"/>
+  <rect class="dg-box" x="135" y="88" width="76" height="34"/>
+  <text x="173" y="109" font-size="13" fill="currentColor" text-anchor="middle">mb 1</text>
+  <rect class="dg-box" x="213" y="88" width="76" height="34"/>
+  <text x="251" y="109" font-size="13" fill="currentColor" text-anchor="middle">mb 2</text>
+  <rect class="dg-box" x="291" y="88" width="76" height="34"/>
+  <text x="329" y="109" font-size="13" fill="currentColor" text-anchor="middle">mb 3</text>
+  <rect class="dg-box" x="369" y="88" width="76" height="34"/>
+  <text x="407" y="109" font-size="13" fill="currentColor" text-anchor="middle">mb 4</text>
+  <rect class="dg-bubble" x="447" y="88" width="76" height="34"/>
+  <rect class="dg-bubble" x="525" y="88" width="76" height="34"/>
+  <rect class="dg-bubble" x="57" y="136" width="76" height="34"/>
+  <rect class="dg-bubble" x="135" y="136" width="76" height="34"/>
+  <rect class="dg-box" x="213" y="136" width="76" height="34"/>
+  <text x="251" y="157" font-size="13" fill="currentColor" text-anchor="middle">mb 1</text>
+  <rect class="dg-box" x="291" y="136" width="76" height="34"/>
+  <text x="329" y="157" font-size="13" fill="currentColor" text-anchor="middle">mb 2</text>
+  <rect class="dg-box" x="369" y="136" width="76" height="34"/>
+  <text x="407" y="157" font-size="13" fill="currentColor" text-anchor="middle">mb 3</text>
+  <rect class="dg-box" x="447" y="136" width="76" height="34"/>
+  <text x="485" y="157" font-size="13" fill="currentColor" text-anchor="middle">mb 4</text>
+  <rect class="dg-bubble" x="525" y="136" width="76" height="34"/>
+  <rect class="dg-bubble" x="57" y="184" width="76" height="34"/>
+  <rect class="dg-bubble" x="135" y="184" width="76" height="34"/>
+  <rect class="dg-bubble" x="213" y="184" width="76" height="34"/>
+  <rect class="dg-box" x="291" y="184" width="76" height="34"/>
+  <text x="329" y="205" font-size="13" fill="currentColor" text-anchor="middle">mb 1</text>
+  <rect class="dg-box" x="369" y="184" width="76" height="34"/>
+  <text x="407" y="205" font-size="13" fill="currentColor" text-anchor="middle">mb 2</text>
+  <rect class="dg-box" x="447" y="184" width="76" height="34"/>
+  <text x="485" y="205" font-size="13" fill="currentColor" text-anchor="middle">mb 3</text>
+  <rect class="dg-box" x="525" y="184" width="76" height="34"/>
+  <text x="563" y="205" font-size="13" fill="currentColor" text-anchor="middle">mb 4</text>
+  <text x="57" y="242" font-size="12" fill="currentColor">实心框：该 stage 正在处理对应 micro-batch（mb 1–4）；虚线框：气泡（stage 空闲）。</text>
+</svg>
+<figcaption class="diagram-caption">$p=4$ 个 stage、$m=4$ 个 micro-batch 的流水线时间槽图（构造示例）。总 slot 数 $m+p-1=7$；每个 stage 忙 4 个 slot、空 3 个 slot，气泡占比 $3/7\approx 0.43$。左下三角是填充期（首 micro-batch 尚未抵达后面的 stage），右上三角是排空期（尾 micro-batch 尚未离开前面的 stage）。</figcaption>
+</figure>
+
+<h3 id="pp-amortize">2.2 摊薄与推理的约束</h3>
+
+<p>公式给出两个直接的工程含义。其一，气泡占比只依赖 $p$ 与 $m$ 的相对大小：$p=4, m=4$ 时占 $3/7\approx 0.43$；$m$ 提高到 16 后降到 $3/19\approx 0.16$。GPipe 的训练实验发现 $m \ge 4p$ 时气泡可忽略<sup>[N1]</sup>。其二，推理场景没有训练那么自由：$m$ 受 batch size 限制，batch 小（比如交互式服务每个 step 只处理几个请求）时 $m$ 天然小，气泡难以摊薄——这正是推理系统在 PP 部署上吃亏的结构性原因，也是 <a href="../chunked-prefill/index.html">chunked prefill</a> 通过"把一个 prefill 切成多个等大的 micro-batch"来缓解的问题。</p>
+
+<details>
+<summary>补充：气泡占比的两种极端与反向传播的影响</summary>
+<p>两个极端检查公式：$m=1$ 时占比 $(p-1)/p$，趋近 1——单个 micro-batch 时流水线几乎全程空转，PP 完全退化；$p=1$ 时占比为 0，无流水线则无气泡。训练场景中反向传播沿同一流水线反向进行，GPipe 的同步 step 结构下填充期与排空期在前向和反向各出现一次，但 slot 计数结构不变，公式量级仍成立；本页聚焦推理，只要求读者知道训练推导是公式的出处（GPipe §2.3）。推理时各请求的 prefill/decode 迭代时长不均，会让"每个 slot 等长"的假设近似失效，实际气泡可能更大——Sarathi 论文对此有分析，机制链接见 <a href="../chunked-prefill/index.html">chunked prefill</a> 页。</p>
+</details>
+
+<h3 id="pp-split-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>PP 的卡间通信发生在哪里、每次传什么？</p>
+<details>
+<summary>解答：相邻 stage 边界，传一次激活张量</summary>
+<p>PP 把模型按层堆叠切成连续的 stage（分区），数据逐段流过。每个 micro-batch 从一个 stage 流到下一个时，前一个 stage 把自己在最后一个层算出的激活张量（该段的输出）传给下一个 stage——每对相邻 stage 之间、每个 micro-batch 只传这一次<sup>[C5]</sup>。通信量是激活值的大小（与序列长度、隐藏维度成正比），不是权重（权重驻留在各 stage 本地不动）也不是梯度（推理无反向）。GPipe 据此指出 PP 不需要高速互联也能有效扩展<sup>[C7]</sup>。</p>
+</details>
+</li>
+<li>
+<p>$p=4$、$m=4$ 与 $p=4$、$m=16$ 的气泡占比分别是多少？说明了什么？</p>
+<details>
+<summary>解答：$3/7\approx 0.43$ 与 $3/19\approx 0.16$，增大 $m$ 摊薄气泡</summary>
+<p>占比公式 $(p-1)/(m+p-1)$<sup>[C6, F2]</sup>。$m=4$：$3/7\approx 0.43$，近一半时间各 stage 在空转；$m=16$：$3/19\approx 0.16$，摊薄到六分之一。固定 $p$ 增大 $m$，分母增大而分子不变，占比单调下降——这就是"用更多 micro-batch 填满流水线"。GPipe 实验给出经验阈值 $m \ge 4p$ 时气泡可忽略<sup>[N1]</sup>；推理部署的 $m$ 受 batch size 限制，小 batch 服务难以满足该阈值，这是 PP 在推理中的结构性代价。</p>
+</details>
+</li>
+<li>
+<p>为什么说"PP 卡数越多吞吐越高"是误解？</p>
+<details>
+<summary>解答：气泡占比随 $p$ 上升，需要更大的 $m$ 才能摊薄</summary>
+<p>固定 $m$ 增大 $p$：分子 $p-1$ 增大、分母 $m+p-1$ 也增大，占比 $(p-1)/(m+p-1)$ 单调上升（对 $p$ 求导为正：$m/(m+p-1)^2 > 0$）。也就是说 stage 切得越多、每个 step 的空转占比越大，要保持气泡不恶化就必须按比例增大 $m$。"加卡就能加吞吐"忽略了串行依赖带来的空转；只有当 $m$ 能同步增大时，更多 stage 才有意义。推理小 batch 场景 $m$ 上限低，深层 PP 的气泡代价尤其突出。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="tp-vs-pp-topology">3. 两种切法的通信代价：TP 圈在机内，PP 跨机</h2>
+
+<p>前两章分别得到两种切法的通信画像：TP 每层 2 次 all-reduce、次数多且逐层发生；PP 每个 micro-batch 只在边界传一次激活、频率低量小。这一章把两个画像放到互联拓扑上对比——为什么实际部署几乎总是"机内 TP、跨机 PP"。</p>
+
+<h3 id="comm-structure">3.1 通信结构对比</h3>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>维度</th><th>张量并行 TP</th><th>流水线并行 PP</th></tr></thead>
+<tbody>
+<tr><td>通信时机</td><td>每层 2 次 all-reduce（attention、FFN 各 1）<sup>[C4]</sup></td><td>每个 micro-batch 过 stage 边界 1 次点对点传输<sup>[C5]</sup></td></tr>
+<tr><td>次数随规模</td><td>随层数线性增长（$2L$ 次/前向）<sup>[N2]</sup></td><td>随 micro-batch 数线性增长，与层数无关</td></tr>
+<tr><td>单次通信量</td><td>与隐藏维度成正比（整层激活）</td><td>与隐藏维度成正比（单个 micro-batch 的边界激活）</td></tr>
+<tr><td>对互联的要求</td><td>高带宽、低延迟（all-reduce 是全局同步）<sup>[C8]</sup></td><td>可容忍较低带宽（通信稀疏）<sup>[C7]</sup></td></tr>
+<tr><td>典型部署位置</td><td>NVLink/NVSwitch 域内（单机）</td><td>跨机（IB/以太网）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>TP 的约束来自 all-reduce 的全局性：每一次 all-reduce 都要求所有 TP 卡同步参与（语义见 <a href="../gpu-communication/index.html">GPU 通信</a>），任何一张卡慢一点，其他卡都要等它。Sarathi 论文对此的总结是：TP 在 DGX A100 的 8 GPU NVLink 互联上有效，Pope et al. 展示过在专用 TPUv4 pod 上扩展到 256 设备，但缺乏高速互联（hyper-cluster）时大规模 TP 性能差<sup>[C8]</sup>。PP 则相反：GPipe 明确指出其通信只需在分区边界传激活张量，"没有高速互联的加速器上也能有效扩展"<sup>[C7]</sup>。</p>
+
+<h3 id="composition">3.2 组合部署：TP $\times$ PP</h3>
+
+<p>两条路径正交，组合后的总卡数 = TP 维度 $\times$ PP 维度<sup>[C9]</sup>。一个典型的 8 卡双机部署：每台机器 4 卡做 TP（NVLink 域内），两台机器之间做 PP 2 stage，记作 TP 4 $\times$ PP 2 = 8。MoE 模型把 FFN 换成专家层时，机内维度常是专家并行（EP，机制见 <a href="../moe-serving/index.html">MoE Serving</a>），组合记号同构——DeepSeek-R1 在 64 GPU 上用 EP $\times$ PP = 64 就是此类实例<sup>[C9]</sup>。</p>
+
+<figure class="diagram">
+  <div class="dg-stack">
+    <div class="dg-layer">
+      <span class="dg-layer-label">节点 1</span>
+      <span class="dg-layer-body">GPU 0–3：TP 4（NVLink 域内，每层 2 次 all-reduce），承载 stage 1 的全部层</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">节点 2</span>
+      <span class="dg-layer-body">GPU 4–7：TP 4（NVLink 域内），承载 stage 2 的全部层；与节点 1 之间按 PP 传边界激活</span>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">TP 4 $\times$ PP 2 = 8 的组合部署（构造示例）：机内每层做张量并行（高频 all-reduce 走 NVLink），机间做流水线并行（低频边界激活传输走跨机网络）。自下而上是数据流方向：请求先流经节点 1 的 stage，再进入节点 2。</figcaption>
+</figure>
+
+<h3 id="dp-ep-note">3.3 与数据并行、专家并行的边界</h3>
+
+<p>数据并行（DP）与模型并行容易混淆：DP 每张卡持有一份完整模型、处理不同数据，卡间只在训练时同步梯度；模型并行每张卡只有部分模型、协作处理同一份数据<sup>[C10]</sup>。推理 serving 中 DP 的常见形态是"多个完整副本各接一部分流量"，与 TP/PP 属于不同层次的扩展手段。专家并行（EP）按专家维度切 MoE 层、通信是 all-to-all，机制属于 <a href="../moe-serving/index.html">MoE Serving</a> 页的职责，本页只把它当作组合记号中的一个维度。PP 与输入分块还有一个重要组合（CPP），它同时缓解气泡与长 prefill 问题，完整机制见 <a href="../chunked-prefill/index.html">chunked prefill</a> 页。</p>
+
+<h3 id="topology-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>为什么 TP 通常不超过单机 8 卡？</p>
+<details>
+<summary>解答：all-reduce 全局同步，跨机后通信代价急剧上升</summary>
+<p>TP 每层前向 2 次 all-reduce，$L$ 层模型一次前向 $2L$ 次<sup>[C4, N2]</sup>；每次 all-reduce 都是所有 TP 卡的全局同步，等待最慢的卡。机内 NVLink/NVSwitch 提供高带宽低延迟的聚合能力（见 GPU 通信页），8 卡是常见的 NVLink 域大小；超出域后 all-reduce 的数据要走跨机网络，带宽通常低一个量级且延迟高，通信时间迅速吞掉切分带来的并行收益。Sarathi 论文指出大规模 TP 在缺乏高速互联时性能差<sup>[C8]</sup>。因此"TP 越多卡越好"不成立：卡数增加时每卡计算量变小而通信次数不变，通信占比持续上升。</p>
+</details>
+</li>
+<li>
+<p>组合记号 TP $\times$ PP = 总卡数里，两个维度分别绑定了哪种互联？</p>
+<details>
+<summary>解答：TP 绑机内 NVLink 域，PP 绑跨机网络</summary>
+<p>TP 维度内每层做 2 次 all-reduce（全局同步、高频），必须放在高带宽低延迟的机内 NVLink 域；PP 维度上每个 micro-batch 只在相邻 stage 边界传一次激活（低频点对点），可以走跨机 IB/以太网<sup>[C5, C7, C8]</sup>。所以 TP $\times$ PP 的组合天然把两种通信模式各自匹配到合适的互联层：机内解决高频同步、机间只承载稀疏的边界流量。DeepSeek-R1 的 EP $\times$ PP = 64 实例中同样遵循该结构，只是机内维度换成了专家并行的 all-to-all<sup>[C9]</sup>。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="tradeoffs">4. TP 与 PP 的取舍</h2>
+
+<p>机制讲完，这一章把两种切法放回"选型"的语境。以下对比是对第 1–3 章机制的综合判断（分析性判断），不是某篇论文的直接结论。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>考量</th><th>选 TP 的理由</th><th>选 PP 的理由</th></tr></thead>
+<tbody>
+<tr><td>降低单请求延迟</td><td>每卡只算每层的一部分，单层计算时间缩短，对交互性约束直接有效（分析性判断，基于 §1.3 每层前向 2 次 all-reduce 的通信代价结构<sup>[C4]</sup>，非 Sarathi 原文直接论断）</td><td>stage 数增多不缩短单层时间，只提高吞吐容量</td></tr>
+<tr><td>扩展卡数</td><td>受 NVLink 域限制（典型 8 卡）<sup>[C8]</sup></td><td>不受机内限制，可跨机扩展<sup>[C7]</sup></td></tr>
+<tr><td>隐性代价</td><td>all-reduce 次数不随卡数减少、通信占比上升</td><td>气泡占比 $(p-1)/(m+p-1)$ 随深度上升，需要大 $m$ 摊薄<sup>[C6]</sup></td></tr>
+<tr><td>对小 batch 服务</td><td>批小时通信占比问题被放大</td><td>气泡问题被放大（$m$ 小）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>重要边界：本页讲的是两种切法的机制与代价结构，不回答"给定模型、流量和延迟约束下最优配置是什么"。最优配置恰恰是一个巨大的搜索问题——它依赖模型架构与规模、输入输出长度、延迟目标、硬件拓扑的组合，这正是 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文用模拟器系统性研究的对象：该论文在 prefill 与 decode 两池上独立选择切分策略（TP/EP/PP/CPP 的组合），并给出"大模型、prefill-heavy 流量下分离收益最大"等结论。本页提供阅读该论文所需的全部切分机制基础。</p>
+
+<h3 id="tradeoffs-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>给定 8 卡单机，模型放得下单层太慢，和模型放不下需要跨机，分别优先考虑哪种切法？</p>
+<details>
+<summary>解答：前者 TP（降单层时间），后者 PP（扩容量不受域限制）</summary>
+<p>模型放得下但单层计算太慢（例如交互式服务对 TTL 敏感）：TP 把每层切开，每卡只算一部分、单层时间缩短，all-reduce 的通信在 8 卡 NVLink 域内可以承受<sup>[C4, C8]</sup>。模型放不下单机：PP 把层堆叠切到多机，只受跨机网络承载的稀疏边界流量约束，是机外扩展的主路径<sup>[C7]</sup>；代价是气泡随深度上升，需要足够的 micro-batch 填流水（$m \ge 4p$ 经验阈值<sup>[N1]</sup>）。实际系统两者叠加：TP 解决机内速度，PP 解决跨机容量。此为对第 1–3 章机制的综合判断（分析性判断），成立条件是 NVLink 域 = 8 卡、跨机网络带宽明显低于机内的典型部署形态。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<ul>
+<li>C2–C4、C9（组合正交性部分为推断）、C10：Megatron-LM（Shoeybi et al., "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism", 2019, arXiv:1909.08053）§1、§2.3（C10 背景节）、§3（切分与 all-reduce）。</li>
+<li>C5（§2 分区与 micro-batch）、C6–C7（§2.3 Performance Optimization 气泡开销公式与 $m \ge 4p$ 阈值、低通信量论证）、N1（§2.3）：GPipe（Huang et al., "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism", 2018, arXiv:1811.06965）。</li>
+<li>C8：Sarathi（Agrawal et al., "SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills", 2023, arXiv:2308.16369）§1（TP 的互联需求与 hyper-cluster 限制）。</li>
+<li>C9 的 EP $\times$ PP = 64 实例：Beyond the Buzz（Mitra et al., 2025, arXiv:2506.05508）§4（disaggregation_in_practice.tex），图 caption 明示 "DeepSeek-R1 with ISL of 256K on 64 GPUs using EP and PP (EP $\times$ PP = 64)"。</li>
+</ul>
+
+<h3>公式与来源（F）</h3>
+<ul>
+<li>F1：FFN 列切/行切的本地计算与部分积结构，Megatron-LM §3 Eq.(2)(3) 与 Figure 3a。</li>
+<li>F2：气泡占比 $(p-1)/(m+p-1)$，GPipe §2.3（"This bubble time is O((K-1)/(M+K-1))"）；slot 推导为本页按原文结构的复述。</li>
+</ul>
+
+<h3>外部数字与实验条件（N）</h3>
+<ul>
+<li>N1：$m \ge 4p$ 时气泡可忽略，GPipe §2.3，训练实验。</li>
+<li>N2：单层前向 2 次 all-reduce（$L$ 层共 $2L$ 次），Megatron-LM §3。</li>
+</ul>
+
+<h3>构造示例</h3>
+<ul>
+<li>$X$、$A$、$B$ 的具体数字（$1\times 4$ 输入、$4\times 4$ 矩阵）：验证列切/行切数学等价性，便于手算，不代表真实模型维度。</li>
+<li>$p=4, m=4$ 与 $m=16$ 的气泡占比计算：验证 F2 公式的数量级与摊薄趋势；比例结构来自 F2，具体 $p$、$m$ 取值为整数化设定。</li>
+<li>TP 4 $\times$ PP 2 = 8 的组合部署图：说明组合记号的空间含义，非具体产品配置。</li>
+</ul>
+
+<h3>辅助解释与类比边界</h3>
+<ul>
+<li>"数据像流水线一样流过各 stage"：描述 PP 的数据流方向这一局部关系；不覆盖反向传播时梯度沿流水线反向流动的训练场景。</li>
+</ul>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>气泡推导假设每个 slot 等长、各 stage 负载均衡。GPipe 原文指出分区不均会导致负载失衡；推理场景 prefill/decode 迭代时长不均会让实际气泡更大。公式用于说明数量级与趋势，不能当作推理部署气泡的精确预测。</li>
+<li>TP 计数（每层 2 次 all-reduce）只覆盖 Megatron-LM 式标准切分的 attention 与 FFN 子块；嵌入层、输出层切分及序列并行变体不在本页范围。</li>
+<li>attention 按 head 切分的对齐要求（每卡整数个头）以 MHA/GQA 结构为前提；MLA 等低秩 KV 结构的切分有额外约束，本页不展开（见 <a href="../mla/index.html">MLA</a> 页）。</li>
+</ul>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+</body>
+</html>
