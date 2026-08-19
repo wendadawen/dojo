@@ -1,0 +1,77 @@
+# DFlash 审查记录（第 2 轮）
+
+- 页面版本：wiki/dflash/index.html + overview.html（第 1 轮修复后）
+- 论文版本：arXiv:2602.06036v2 TeX 源码（2026-05-28 修订；已固定 `/tmp/dflash-research/tex/`）
+- 审查时间：2026-08-19
+- 审查者：第 2 轮独立审查者（未参与写作、未读 `wiki/dflash/research/`）
+- 已完整阅读章节：abstract、intro、related、preliminaries、method、experiments、conclusion、appendix、tables/results/main、tables/results/reasoning；首页按页顺序从 §1 到「来源与范围说明」完整阅读，折叠块全部展开；overview.html 完整阅读
+- 独立核查：4 张内联 PNG 全部 base64 解出查看；外部一手来源 https://inco.ai/blog/dflash2/ WebFetch 核对（NVIDIA 15× / Google 3× / 3.5M+ 下载 / SGLang+vLLM+TensorRT-LLM+llama.cpp / DFlash 2 路径选择器 + 两抽头动态卷积均得到支持）
+
+## 问题
+
+- [阻断·技术] index.html 全文：第 1 轮修复"200 处裸 × → $\times$"执行方式错误——所有 `×` 被替换为字面 `\times`，但漏了加 `$` 包裹。实测 204 处 `\times` 中 **196 处不在 `$...$` 内**，渲染时浏览器直接显示 `4.91\times`、`6.09\times`、`4.32`、`2.7\times` 这类字面 TeX 文本；intro 段、主表 4 行、SGLang 表 7 行、vLLM 表 4 行、LLaMA 表 9 行、KV 注入表 4 行、Q1-Q5 答案 summary、本章问题 summary、§5 评价表、来源说明段落几乎所有数字均受影响｜引文依据：实测 196/204 在数学定界符外（python 计数 `re.findall(r"\\\\times")` 并按 `$` 计数奇偶判定）；第 1 轮日志声称"200 处裸 Unicode × → $\times$"，但页面 grep 后仅有 8 处正确包裹，196 处仍以字面 `\times` 形式出现在正文/表格/折叠块 summary 与 label 中｜修复要求：将全部 196 处字面 `\times` 替换为 `$\times$`（在 $..$ 内）；表格 `<td>`、summary `<summary>`、正文 `<p>`、列表 `<li>` 等位置同等处理；同时确认不破坏已有的真数学环境——保留 `<td>$(\tau$ 6.54)</td>` 这类已正确包裹的部分，仅修复未包裹的纯文本/表格单元格里的 `\times`｜修复：｜复验：
+- [阻断·格式] index.html line 6：`<meta name="description" content="...实现 6\times 无损加速、相对 EAGLE-3 高 2.5\times...">`——`meta description` 是纯文本字段，应写为 `6× 无损加速、相对 EAGLE-3 高 2.5×` 或 `$6\times$ ... $2.5\times$`，check.md §5 要求"页面 `<head>` 包含**有效的纯文本** `description`"，字面 `\times` 不构成有效纯文本｜引文依据：直接读取 line 6 `content="...6\times 无损加速、相对 EAGLE-3 高 2.5\times..."`；check.md §5 发布条件明文 "有效的纯文本 description"｜修复要求：改为 `实现 6× 无损加速、相对 EAGLE-3 高 2.5×` 或 `实现 $6\times$ 无损加速、相对 EAGLE-3 高 $2.5\times$`，确保纯文本读得通；dojo:summary（可渲染）可保留 `$...$` 包裹——但 description 必须是纯文本｜修复：｜复验：
+
+- [重要·技术] index.html lines 727, 759, 766, 789, 819, 876, 1001, 1011-1014, 1019, 1023, 1026, 1030, 1040-1046, 1051, 1061-1064, 1069, 1079-1087, 1124, 1131, 1146, 1147, 1150：C/F/N 编号体系 body 与 sources list 互相错位——① **C5** sources 定义为"无 KV 注入的纯块扩散草稿 2–3×"（line 1171），但论文 A.2 标题实为 "Diffusion Drafter without Target Feature"（appendix.tex line 11），描述应改为"无 target 特征条件"——此误定义被 §2 line 876、Q5 答案 line 766、§5 表 line 1150 三处用作"KV 注入是 4–6× 主要来源"的归因证据，但 Tab 10 实测删除的是全部 target 特征（既无输入融合也无 KV 注入），归因应改为"target 特征条件"；② **C6**（单步并行预测整块，§4.1 末段）在 sources 定义但 body 0 次引用——正文 line 745/832/865/921 共 4 处单步起草声明全部错引为 [C9]（C9 实为早期位置加权损失）；③ **C15** sources 标"未引用为论断"但 body 5 次引用（line 1073 LLaMA 同数据、1092 同数据复述、1151 未与 TiDAR 对比、1152 生态数字、隐含多次），与"未引用"自相矛盾；④ **C16** sources = LLaMA 同数据对照但 body 5 次以 [C16] 作"分析性推断"标注（line 1030、1051×2、1145、1147），按 sources 映射则这些 [C16] 标错，按 body 用途则 sources 映射错；⑤ **C17** sources = 高并发收益缩水机制解释（分析性推断）但 body 0 次引用；⑥ **[N15]** body line 977 引用但 sources 未定义；⑦ **[N14]** body 0 次引用但 sources 定义为"更多模型 A.4 Tab. 11"——Tab 11（更多模型 + MTP 对照 + GPT-OSS-20B/120B）整个实验块在页面零呈现且无省略说明｜引文依据：grep 统计 `[C5]=0 [C6]=0 [C9]=7 [C11]=0 [C15]=5 [C16]=5 [C17]=0 [N14]=0 [N15]=1`（注 `[C5, N11]` 复合形式 3 次，故 C5/N11 在 body 实际被引用但作为复合标注）；sources line 1166-1197 给出 C1-C17/N1-N15 定义；appendix.tex line 11 `subsection{Diffusion Drafter without Target Feature}`；正文 §4.1 "we train a five-layer block diffusion draft model \emph{without} any conditioning from the target model"（method.tex line 9）｜修复要求：① 把 sources C5 描述改为"无 target 特征条件的纯块扩散草稿 2–3×"，将 §2/§5 三处归因改为"target 特征条件"；② 单步并行起草四处 [C9] 全部改为 [C6]；③ C15 删除"未引用为论断"备注或重新分配；④ 把"分析性推断"标注重新分配到 C17 并将正文 [C16] 全部改为 [C17]（同时更新 sources line 1145、1147 等）；⑤ 把 N15 列入 sources（800K 数据构造）；⑥ 在 §4 增加 §4.7「更多模型与 MTP 对照（Tab. 11）」并补 [N14]，或显式声明该附录实验因范围未纳入；⑦ sources line 1197 N13 章节号 `§5.5 Tab. 4` 改为 `§5.4 Tab. 4`（Long Context Adaptation 在 §5.4，Ablation 在 §5.5）｜修复：｜复验：
+
+- [重要·技术] overview.html line 64 + index.html lines 766, 876, 1092, 1146, 1150：四段独立论断将 Tab 10（naive diffusion，无 target 特征条件）误归因为"KV 注入是 4–6× 主要来源"——naive ablation 删除的是全部 target 特征条件（既无输入融合也无 KV 注入），论文 A.2 标题与正文均明示"without any conditioning from the target model"，KV 注入相对输入融合的增量见 Tab 9（+0.4×/τ），是 target 特征条件而非仅 KV 注入贡献了主增益。出现在 overview 关键结论、index Q5 答案、§2 line 876、§5 表 line 1150 共 4 处｜引文依据：method.tex line 9 "we train a five-layer block diffusion draft model \emph{without} any conditioning from the target model"；appendix.tex line 11 标题 `Diffusion Drafter without Target Feature`；Tab 9 DFlash KV vs input fusion 行 τ 差 0.7/0.5/0.4 vs DFlash KV τ 4.2/4.0/3.0｜修复要求：将四处"证明 KV 注入是 4–6× 的来源"改为"证明 target 特征条件（输入融合/KV 注入总和）是 4–6× 的来源；KV 注入相对输入融合的额外增量见 §4.6 / Tab. 9"；并在 C5 sources 定义里把"无 KV 注入"改为"无 target 特征条件"｜修复：｜复验：
+
+- [重要·技术] overview.html line 64："EAGLE-3(60) 在并发 16/32 出现 0.6–0.9×（比基线还慢）"——Tab 5 实际值：GSM8K c16/c32 = 0.9/0.6，HumanEval 0.9/0.6，Alpaca 0.8/0.5；范围应为 **0.5–0.9×**｜引文依据：exp.tex lines 199-205 GSM8K EAGLE-3(60) `1.9× / 1.6× / 1.3× / 0.9× / 0.6×`；lines 219-224 HumanEval `2.0× / 1.7× / 1.3× / 0.9× / 0.6×`；lines 239-241 Alpaca `1.8× / 1.5× / 1.2× / 0.8× / 0.5×`｜修复要求：改为"EAGLE-3(60) 在并发 16/32 出现 0.5–0.9×（比基线还慢，最低 Alpaca c32 的 0.5×）"｜修复：｜复验：
+
+- [重要·技术] index.html lines 1011-1014（Tab 1 第 6 列）+ line 1019："DFlash 对 EAGLE-3(16) 提升"列按行计算 DFlash 均值/EAGLE-3(16) 均值得 2.7/2.5/2.8/2.4，但正文与 Q4/Q5 答案（line 759、1124）以及 intro（line 727）均引论文 headline "2.4× improvement over EAGLE-3 (16)"（§5.1 实测计算 T=0 DFlash 4.9× vs EAGLE-3(60) 2.08× ≈ 2.4× 实际接近 EAGLE-3(60) 比值而非 EAGLE-3(16)），未说明表内"提升"列与论文"2.4×"的计算口径差异，读者会读到 2.7/2.8 与 2.4 并存产生误解 | 引文依据：tables/results/main.tex 数值 `4.91× / 4.24× / 4.86× / 4.03×` 对 EAGLE-3(16) `1.81× / 1.72× / 1.76× / 1.68×`；exp.tex line 19 原文 "achieves an average speedup of 4.9× over the autoregressive baseline, corresponding to a 2.4× improvement over EAGLE-3 (16)"——按 T=0 均值 DFlash 4.885/EAGLE-3(16) 1.785 = 2.74，按 EAGLE-3(60) 2.05 = 2.38；说明 paper 的 "2.4×" 在数值上更接近 E3(60) 比值 | 修复要求：表头"DFlash 对 EAGLE-3(16) 提升"列加注脚说明"本页按各行均值与 EAGLE-3(16) 均值的比值计算，论文 §5.1 给出的 2.4×/2.2× 是 DFlash 平均 vs EAGLE-3(60) 的比值"，或在表脚注明计算口径；或删去自算列改用论文原文的 2.4×/2.2× | 修复：｜复验：
+
+- [重要·技术] index.html line 766（Q5 答案）："高并发收益缩水但仍为正（并发 32 SGLang 仍 2.8–2.9×）[N4]"——未限定任务；SGLang Tab 3 并发 32 实际：Q3-4B Math500 2.9×、HumanEval 2.2×；Q3-8B Math500 2.8×、HumanEval 2.4×；Coder HumanEval 3.1×、LCB 2.3×、MBPP 3.1×；范围 **2.2–3.1×**。"仍 2.8–2.9×" 仅覆盖 Math500 两行而题干是"高并发收益缩水"的通论 | 引文依据：exp.tex lines 56, 67, 80, 91, 104, 115, 126（c32 加速比序列） | 修复要求：改为"并发 32 时 SGLang 数学类任务仍 2.8–2.9×，全任务（含 HumanEval/LCB）范围 2.2–3.1×" | 修复：｜复验：
+
+- [重要·技术] index.html lines 759, 1124（Q4 答案 + §4 章问题答案）："vLLM Qwen3.5-9B 并发 1 为 4.0–4.6×"——vLLM Tab 12 c1 实际：Math500 4.0×、HumanEval 4.6×、MT-Bench **3.0×**；范围应为 **3.0–4.6×**｜引文依据：appendix.tex lines 135 `849 (4.0×) & 969 (4.6×) & 627 (3.0×)`｜修复要求：两处均改为"3.0–4.6×"｜修复：｜复验：
+
+- [重要·技术] index.html line 1069："同一对模型的 Transformers 后端数字未单列，但 SGLang vs vLLM 数字可推断 vLLM 落后约 0.5–1×——这是引擎实现差异，不是方法问题"——① 没有论文段落给出 0.5–1× 的数值范围（唯一可比同模型 SGLang Qwen3.5-9B c8 来自 Tab 11：3.5×/3.4×/2.5× vs vLLM c8：3.2×/3.4×/2.2×，差 0.3×/0.0×/0.3×，与"0.5–1×"不符）；② 推断性归因"引擎实现差异，不是方法问题"无来源；③ 未标注 [C16] 分析性推断 | 引文依据：appendix.tex lines 135-138（vLLM Tab 12）和 lines 92-94（Tab 11 SGLang Qwen3.5-4B）、lines 97-99（Qwen3.5-9B 在 c8 的 3.5/3.4/2.5） | 修复要求：① 删除具体数值范围；② 改为"vLLM 与 SGLang 在 Qwen3.5-9B 同并发下 SGLang 加速略高 0.0–0.3×（Tab. 11 c8 vs Tab. 12 c8），可能是调度与 Spec Engine 实现差异 [C16]（分析性推断）"；或简化为"引擎实现不同"一句话 | 修复：｜复验：
+
+- [重要·技术] index.html line 1197 sources "N13（长上下文）：§5.5 Tab. 4"——Long Context Adaptation 在 §5.4（exp.tex line 139 `subsection{Long Context Adaptation}`），§5.5 才是 Ablation Study。N13 章节号笔误影响溯源定位 | 引文依据：exp.tex `\subsection{Long Context Adaptation}` line 139；`\subsection{Ablation Study}\label{sec:exp-ablation}` line 174 | 修复要求：`§5.5` → `§5.4` | 修复：｜复验：
+
+- [重要·技术] index.html lines 795/799 + lines 938/942：图编号 round-1 重排残留两处反向混淆——① §1 line 795 正文"下图是论文 Figure 4 给出的一组实测对比"（实为 Figure 3，draft latency），其 figcaption line 799 正确写"论文 Figure 3"；② §3.2 line 938 正文"论文 Figure 3 把这块稀疏掩码画出来"（实为 Figure 4，training attention），其 figcaption line 942 首句正确写"论文 Figure 4"但末尾仍残留"Figure 3 标题为「DFlash training attention」" | 引文依据：TeX figure 顺序——intro fig:speedup → Figure 1；prelim fig:inference → Figure 2；prelim fig:draft_cost → Figure 3；method fig:train → Figure 4；appendix fig:ablation_acc → Figure 5 | 修复要求：① line 795 "Figure 4" → "Figure 3"；② line 938 "Figure 3" → "Figure 4"；③ line 942 末尾"Figure 3 标题为「DFlash training attention」" → "Figure 4 标题为「DFlash training attention」" | 修复：｜复验：
+
+- [重要·可读性] index.html 第 1136 行 <h2 id="evaluation">5. 方法评价——收益边界与适用判断</h2> 之后无任何「本章问题」h3 块，§1–§4 全部带 `本章问题 + <details><summary>解答：…</summary>…</details>`（line 806, 908, 981, 1118），§5 唯独缺失；write.md §4.10 要求"每个正文章节末尾 h3 固定为「本章问题」" | 引文依据：直接 grep `本章问题` 4 处（第 1/2/3/4 章），§5 区域 line 1136-1160 无对应块；write.md 4.10 第 1 句 | 修复要求：在 §5 评价表 + 方法定位段之后插入 `<h3 id="evaluation-questions">本章问题</h3>` 与至少一个 Q&A（如"DFlash 的主要边界在哪里？什么条件下加速大幅缩水？"），总结 §5 表中已陈述的结论 | 修复：｜复验：
+
+- [重要·可读性] index.html line 729 引导段声称"前置概念——投机解码循环、注意力中的 K/V、块扩散范式、EAGLE-3 的特征级自回归起草——在对应链接页已讲过，本文只引用其结论"，但全文 `grep href="../` 只命中 `block-diffusion/index.html`（×3）和 `dflash2/index.html`，未对投机解码（`../speculative-decoding/index.html` 已存在）、EAGLE-3（`../eagle-speculative/index.html` 已存在）给出链接；与 write.md 4.1 "正文首次依赖前置概念时给出概念页链接" 不符 | 引文依据：`ls .. | grep` 列出 `block-diffusion`、`eagle-speculative`、`speculative-decoding` 等页均存在；grep `href="\.\./[a-z0-9-]*/index.html"` index.html 结果 | 修复要求：① line 729 改为"前置概念本文只引用其结论"或删去"在对应链接页已讲过"；② §1 首次使用 F1 投机解码速度公式时加 `../speculative-decoding/index.html`；③ 首次提到 EAGLE-3 / EAGLE 系列时加 `../eagle-speculative/index.html`；④ overview.html 概览首次出现"投机解码""EAGLE-3""KV 注入""块扩散"时同样补概念页链接 | 修复：｜复验：
+
+- [重要·技术] index.html 缺对 gamma 双语义说明。F1/F3/F2 在 §3 用 γ 表示每周期草稿 token 数（preliminaries.tex line 15 "propose γ tokens"；line 21 "τ ∈ [1, γ+1]"），F6 在 §3.3 / Eq.(4) 用 γ 表示损失权重衰减率超参（method.tex line 51 `exp(-(k-1)/γ)`），§3.3 line 953 仅声明 `γ：衰减率超参` 而未说明该符号与 §3 的 γ 不同含义；appendix A.1 line 7 同时规定 `γ for the loss decay set to 7/5/4 for block size 16/10/8`。round-1 声称补"γ 双语义说明"，页面未在 §3 与 §3.3 之间或 §3.3 段首放置一行对照说明 | 引文依据：preliminaries.tex line 15/21；method.tex line 51；appendix.tex line 7；grep "双语义\|两个含义\|两种含义\|同一符号\|注意.*γ.*区别\|与.*γ.*不同" index.html 0 结果 | 修复要求：在 line 953 处补一句"注：本 γ 与 §3 的每周期草稿长度 γ 是同一符号但语义不同：§3 的 γ 是推测长度预算（preliminaries.tex Eq.(1) 之后定义 τ∈[1,γ+1]），本节的 γ 是衰减率超参（appendix A.1 给出块大小 16/10/8 对应 γ=7/5/4）" | 修复：｜复验：
+
+- [重要·技术] index.html line 727 引言段："它在 Qwen3-8B 上拿到 6.1× 无损加速、相对 EAGLE-3 高 2.4×[C1]"——按 sources 映射 C1 仅覆盖"2–3× 起草天花板"（§1 引言第二段）；6.1× 与 2.4× 分别对应 §1 引言末段 "up to a 6.1× speedup on Qwen3-8B" 与 §5.1 T=0 平均 / EAGLE-3(60) 比值，不应共用 C1 | 引文依据：intro.tex line 24 "achieves up to a 6.1× speedup on Qwen3-8B" 与 "nearly 2.5× faster than EAGLE-3"；exp.tex line 19 "2.4× improvement over EAGLE-3 (16)"；sources line 1167 "C1（2–3× 起草天花板）：§1 引言第二段" | 修复要求：将 6.1×/2.4× 改为不带 C 编号（intro 末段无对应 C 编号，§5.1 数据走 N1），或为 6.1× 增列 C、2.4× 改标 [N1]；同 round-1 修复的"C1 引用错位"仍残留此一处 | 修复：｜复验：
+
+- [轻微·格式] index.html line 1203「辅助解释与类比边界」段描述"正文将「起草成本」类比于「起跑前的发力——力的方向对、但每一步都要从零蓄力，因此被线性拖慢」仅用于辅助直觉"，但正文（line 772-822 完整 §1 起草为什么慢章）无此"起跑"类比——辅助解释与类比边界段在描述一个不存在的类比，构成内部矛盾 | 引文依据：grep "起跑" index.html 仅 line 1203 一处；§1 正文无相应措辞 | 修复要求：要么在 §1 正文补上该起跑类比，要么从 line 1203 删去该类比的描述 | 修复：｜复验：
+
+- [轻微·格式] overview.html line 43, 65：3 处裸 Unicode `×`（`6× 无损加速`、`相对 EAGLE-3 高 2.5×`、`4–6× 的主要来源`）未走 `$6\times$` 包裹——与 write.md 4.2 "无 Unicode 数学字符直接出现" 不符。round-1 修复 index 时未处理 overview | 引文依据：grep -c `×` overview.html → 3 行；overview 加载 KaTeX（line 8-9）故应统一 `$6\times$` 等 | 修复要求：3 处均改为 `$6\times$`、`$2.5\times$`、`$4$–$6\times$` | 修复：｜复验：
+
+- [轻微·格式] index.html line 1030 引文 "（论文 §5.2 概述为「roughly 4.5× and 3.9×」）" 内含 2 处裸 Unicode `×`；引述论文原文亦应按 write.md 4.2 走 `$4.5\times$`、`$3.9\times$` | 引文依据：grep -c `×` index.html 在 line 1030；与 index line 1030 quoted text 一致 | 修复要求：改为 `$4.5\times$`、`$3.9\times$`（引号内仍可保留原文字，但数学符号需 `$...$`） | 修复：｜复验：
+
+- [轻微·格式] index.html line 874 "$W_c$ 是新增的「唯一参数化组件」，$5D\times D$ 维" 与同页 line 842 "$W_c\in\mathbb{R}^{D\times 5D}$" 内文维度序不一致（前者 5D×D，后者 D×5D）。appendix A.3 `W_c ∈ R^{D×5D}` 唯一来源 | 引文依据：appendix.tex lines 51-55；line 842 vs line 874 文本对照 | 修复要求：line 874 改为 `$D\times 5D$ 维` 或 `$\mathbb{R}^{D\times 5D}$ 维` | 修复：｜复验：
+
+- [轻微·格式] index.html line 1146 §5 评价表"对话类（MT-Bench）收益最低（2.5–2.8× T=0）[N1]"——T=0 MT-Bench 实际为 Q3-4B 2.85×、Q3-8B 2.75×，正确范围 2.75–2.85×（round-1 已在 line 1026 与 line 766 修正为 2.75–2.85，但 §5 评价表残留 2.5–2.8） | 引文依据：tables/results/main.tex T=0 DFlash MT-Bench `2.85×` 与 `2.75×`；line 1026、766 同页已有正确表述 | 修复要求：line 1146 改为 `2.75–2.85× T=0` | 修复：｜复验：
+
+- [轻微·格式] index.html line 1051 "并发 32 时仍 2.3–3.1×"——SGLang Tab 3 c32 实际最低 2.2×（Q3-4B HumanEval），范围应为 2.2–3.1× | 引文依据：exp.tex line 67 `2.2×` | 修复要求：line 1051 改为 `2.2–3.1×` | 修复：｜复验：
+
+- [轻微·格式] index.html line 1026 "T=0 2.75–2.85×、T=1 2.47×[N1, N2]"——T=1 MT-Bench 实际为 Q3-4B 2.67× 与 Q3-8B 2.47×，应给 2.47–2.67× | 引文依据：tables/results/main.tex T=1 DFlash MT-Bench `2.67×` 与 `2.47×` | 修复要求：line 1026 改为 `T=1 2.47–2.67×` | 修复：｜复验：
+
+- [轻微·格式] index.html line 1023 Fig 1 figcaption："DFlash（蓝）、EAGLE-3（绿）、自回归基线（灰）"——图内数字 2.23/2.05/2.05/2.17/1.93/1.81/1.90 与 Tab 1 中 EAGLE-3(60) 完全一致（而非 EAGLE-3(16) 的 1.94/1.81/1.79/1.89/1.69/1.57/1.63），caption 未注明比的是 EAGLE-3(60) | 引文依据：解出的 PNG Fig 1 EAGLE-3 柱顶数值 2.23/2.05/2.05/2.17/1.93/1.81/1.90 vs tables/results/main.tex lines 28-30 | 修复要求：figcaption 加注"图内 EAGLE-3 柱对应 EAGLE-3(60) 树大小，论文 §5.1 给出 T=0 EAGLE-3(16) 与 EAGLE-3(60) 两组对照" | 修复：｜复验：
+
+- [轻微·格式] index.html lines 1114, 1116：消融数字未限定任务列。line 1114 "3L/5L/8L 在 Math500 的加速分别为 4.69×/4.71×/4.64×，τ 5.64/5.99/6.33"——四组数仅适用 Math500 列（Tab 6），HumanEval 与 MT-Bench 列不同。line 1116 "b16→b16 τ 6.33；b16→b8 τ 5.09；b8→b16 τ 5.02"——同上 | 引文依据：exp.tex lines 276-278（Tab 6 各列数值）与 lines 333-337（Tab 8 各列）| 修复要求：line 1114 改为"Tab 6 Math500 列：3L/5L/8L 加速 4.69×/4.71×/4.64×，τ 5.64/5.99/6.33；HumanEval 与 MT-Bench 见 Tab. 6 全表"；line 1116 改为"Tab 8 Math500 列 τ 序列：b16→b16 = 6.33；..." | 修复：｜复验：
+
+- [轻微·格式] index.html line 932 §3.1："如果训练时把序列均匀切块，每块的第一个 token 也是前一块的最后一 token"——"最后一"应为"最后一个" | 引文依据：直接读 line 932 | 修复要求：补"个" | 修复：｜复验：
+
+- [轻微·格式] index.html line 795 §1："EAGLE-3 的 1 层草稿延迟随 token 数线性增长，3 层/5 层 DFlash（5 层深度、单次前向、并行起草整块）几乎与 token 数无关"——括号"5 层深度"上下文同时指代 3 层与 5 层两种深度，措辞不通顺 | 引文依据：直接读 line 795 | 修复要求：改为"3 层与 5 层 DFlash（单次前向、并行起草整块）" | 修复：｜复验：
+
+- [轻微·技术] index.html line 1167 sources C5 定义同时被正文 §2 line 876 / §5 表 line 1150 用作"KV 注入是主要来源"的论据；前一条已列；此处仅标注：在 sources line 1171 的 C5 描述本身与 A.2 标题不一致，与同一轮审查 "naive diffusion '同档'误判" 同源未消除（round-1 修复未覆盖此处） | 引文依据：sources line 1171 vs appendix.tex line 11 | 修复要求：sources line 1171 改为"C5（无 target 特征条件的纯块扩散草稿 2–3×）：§4.1 Inference 段尾；A.2 Table 10（标题『Diffusion Drafter without Target Feature』）" | 修复：｜复验：
+
+## 结论
+
+- 统计：阻断 2 / 重要 13 / 轻微 11（合计 26 条；个别问题多条独立记录）
+- 处置：**返回修复**。第 1 轮"200 处裸 × → $\times$"在 index.html 上系统性地执行错误（替换为字面 `\times` 而未加 `$` 包裹），导致 196 处数学符号未渲染并伴随 meta description 错误——属阻断级；此外 C/F/N 编号体系（body ↔ sources ↔ 论文 A.2 标题）系统性不一致与 KV 注入归因错误跨多章重复出现。建议按以下优先级修复：
+  1. 将 196 处字面 `\times` 全部加 `$...$` 包裹（阻断 #1）
+  2. 修正 meta description 字面 `\times`（阻断 #2）
+  3. 统一 C/F/N 编号体系（C5/C6/C15/C16/C17/N14/N15 + N13 §号）：重排 sources 与正文引用，使每个 C/F/N 都能在论文 v2 TeX 中定位到支持内容，并消除"无 KV 注入 vs 无 target 特征"的归因错配（重要 #3 与 #15）
+  4. 修复 EAGLE-3(60) 0.5–0.9×、vLLM c1 3.0–4.6×、SGLang c32 2.2–3.1× 等 6 处数值范围与口径错误（重要 #4–#9）
+  5. 补 §5「本章问题」块（重要 #12）
+  6. 补 γ 双语义说明与投机解码/EAGLE-3 概念链接（重要 #13–#14）
+  7. 修图编号（Fig 3 / Fig 4）round-1 残留（重要 #11）
+  8. 处理 11 条轻微项（overview 裸 ×、起跑类比、$W_c$ 维度序、T=1 MT-Bench 范围、Fig 1 caption 注明 E3(60)、消融数字标注任务列、§3.1 字"个"补字、line 795 括注改写、Tab 11 实验覆盖决定等）
+- 不进入发布条件：阻断未关闭前不可发布；阻断与重要合计 15 条全部关闭后，再决定是否进入第 3 轮独立审查
