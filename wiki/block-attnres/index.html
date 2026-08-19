@@ -702,7 +702,7 @@
 <p><b>主要依据</b>：Kimi K3 Technical Report §2.2 Eq.(8)(9)(10)（2026-07-28）；HuggingFace 官方 <code>config.json</code>（<code>attn_res_block_size=12</code>、<code>num_hidden_layers=93</code>）。K3 加权三次的具体位置参考 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对（2026-08-07 修订）。</p>
 </blockquote>
 
-<p>K3 主干 93 层，标准残差把所有前层输出以系数 1 累加进同一个流——第 1 层 embedding 在第 93 层只占 1/93，且无法被后续层按内容找回。Block AttnRes 把它当作深度方向的 RNN 瓶颈：每层用可学习 pseudo-query 对"embedding + 此前块级快照 + 当前块 partial sum"做 softmax 加权检索，把送入归一化的输入从"当前残差流"替换为"attention 检索结果"。它不取消标准残差（K3 仍逐层累加 attention 与 MLP 输出），而是在其上叠加块级加权选择，与 token 方向的 attention、channel 方向的 MoE 同级，构成 K3 的三维信息流。本文依赖前置概念<a href="../residual-connection/index.html">残差连接</a>，只使用其结论；softmax 与 RMSNorm 作为公式零件使用，不展开为独立概念页。本文要回答：Full AttnRes 的公式是什么、Block AttnRes 如何把内存从 $O(Ld)$ 降到 $O(Nd)$、K3 的 8 块×12 层配置与加权三次的具体位置、以及 softmax kernel 中 RMSNorm 的作用。</p>
+<p>K3 主干 93 层，标准残差把所有前层输出以系数 1 累加进同一个流——第 1 层 embedding 在第 93 层只占 1/93，且无法被后续层按内容找回。Block AttnRes 把它当作深度方向的 RNN 瓶颈：每层用可学习 pseudo-query 对"embedding + 此前块级快照 + 当前块 partial sum"做 softmax 加权检索，把送入归一化的输入从"当前残差流"替换为"attention 检索结果"。它不取消标准残差（K3 仍逐层累加 attention 与 MLP 输出），而是在其上叠加块级加权选择，与 token 方向的 attention、channel 方向的 MoE 同级，构成 K3 的三维信息流。本文直接使用<a href="../residual-connection/index.html">残差连接</a>（把每层输入直接加到该层变换的输出上）的结论；softmax 与 RMSNorm 作为公式零件使用，不展开。本文要回答：Full AttnRes 的公式是什么、Block AttnRes 如何把内存从 $O(Ld)$ 降到 $O(Nd)$、K3 的 8 块×12 层配置与加权三次的具体位置、以及 softmax kernel 中 RMSNorm 的作用。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -747,7 +747,7 @@
 
 <h2 id="standard-residual-bottleneck">1. 标准残差在深度上的瓶颈——为什么需要 AttnRes</h2>
 
-<p>标准残差连接（<a href="../residual-connection/index.html">前置概念页</a>）的形式是 $h_{l+1}=h_l+F_l(h_l)$：把第 $l$ 层的输入 $h_l$ 直接加到该层变换 $F_l$ 的输出上。展开 $L$ 层后，第 $L$ 层的残差流是</p>
+<p>标准<a href="../residual-connection/index.html">残差连接</a>的形式是 $h_{l+1}=h_l+F_l(h_l)$：把第 $l$ 层的输入 $h_l$ 直接加到该层变换 $F_l$ 的输出上。展开 $L$ 层后，第 $L$ 层的残差流是</p>
 
 $$h_L = h_1 + \sum_{l=1}^{L-1} F_l(h_l).$$
 
@@ -823,7 +823,7 @@ $$h_L = h_1 + \sum_{l=1}^{L-1} F_l(h_l).$$
 </table>
 </div>
 
-<p>需要强调的是：AttnRes <b>替代的是"等权累加"这个聚合方式"</b>，不是取消标准残差本身。K3 仍逐层累加 attention 与 MLP 的输出（保留标准残差的梯度流动性质，见前置概念页）；AttnRes 是叠加在等权累加之上的"块级加权选择"，把送入归一化的输入从"当前残差流"替换为"用 attention 检索块级历史表征得到的结果"。这个区分是本文最常见的误解之一，后面 K3 具体配置一章会再用 K3 的实际配置印证。<sup>[C1]</sup></p>
+<p>需要强调的是：AttnRes <b>替代的是"等权累加"这个聚合方式"</b>，不是取消标准残差本身。K3 仍逐层累加 attention 与 MLP 的输出（保留标准残差的梯度流动性质，见<a href="../residual-connection/index.html">残差连接</a>）；AttnRes 是叠加在等权累加之上的"块级加权选择"，把送入归一化的输入从"当前残差流"替换为"用 attention 检索块级历史表征得到的结果"。这个区分是本文最常见的误解之一，后面 K3 具体配置一章会再用 K3 的实际配置印证。<sup>[C1]</sup></p>
 
 <p>为了后续手算，先固定构造示例的小网络：$L=6$ 层、$d=2$、embedding $h_1=[1,0]$，各层输出 $f_1=[0,1]$、$f_2=[1,1]$、$f_3=[0.5,0.5]$、$f_4=[1,0.5]$、$f_5=[0.5,1]$、$f_6=[1,1]$（教学构造，不代表真实模型参数）。Full AttnRes 公式一章用它算第 6 层，Block AttnRes 分块一章升级为分 3 块。</p>
 
@@ -864,13 +864,13 @@ $$\phi(q_l, k_i) = \exp\!\bigl(q_l^\top \mathrm{RMSNorm}(k_i)\bigr),\qquad \alph
   <li><b>$q_l=w_l\in\mathbb{R}^d$</b>：层 $l$ 自带的可学习 pseudo-query，是参数向量，不依赖 $h_l$。</li>
   <li><b>$k_i$</b>：第 $i$ 个来源的 key。$i=0$ 时为 embedding $h_1$；$i\ge 1$ 时为第 $i$ 层输出 $f_i(h_i)$。</li>
   <li><b>$v_i$</b>：第 $i$ 个来源的 value，与 $k_i$ 同源。</li>
-  <li><b>$\mathrm{RMSNorm}(k_i)$</b>：对 key 按均方根归一化，最小说明见下文。</li>
+  <li><b>$\mathrm{RMSNorm}(k_i)$</b>：对 key 按均方根归一化，定义见下文。</li>
   <li><b>$\phi(q_l, k_i)$</b>：softmax kernel，输出正数供 softmax 归一化。</li>
   <li><b>$\alpha_{i\to l}$</b>：层 $l$ 对来源 $i$ 的 attention 权重，所有 $\alpha_{i\to l}$ 之和为 1。</li>
   <li><b>$h_l$</b>：层 $l$ 的输出（这里指 AttnRes 加权后的结果，会送入后续归一化与子层）。</li>
 </ul>
 
-<p><b>RMSNorm 最小说明</b>。RMSNorm 把向量按其均方根归一化（Zhang & Sennrich 2019，K3 报告引用 [148]）<sup>[F5]</sup>：</p>
+<p><b>RMSNorm</b> 把向量按其均方根归一化（Zhang & Sennrich 2019，K3 报告引用 [148]）<sup>[F5]</sup>：</p>
 
 $$\mathrm{RMSNorm}(x) = \frac{x}{\sqrt{\tfrac{1}{d}\sum_{j=1}^d x_j^2 + \epsilon}} \approx \frac{x}{\|x\|_2 / \sqrt d}.$$
 
@@ -1456,7 +1456,7 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
   <li><b>Full AttnRes 与 Block AttnRes 手算暂时不加 RMSNorm</b>。简化做法：先用 $\phi(q,k)=\exp(q^\top k)$ 手算，RMSNorm 一章再加 RMSNorm 重算对比。可推出：attention 检索的本质是 softmax 加权。不可推出：真实 K3 的权重分布——K3 实际 kernel 始终含 RMSNorm（Eq.9），不存在"不加 RMSNorm"的版本。</li>
   <li><b>小例子用 $d=2$</b>。简化做法：用 $d=2$ 让 4-6 个候选的 softmax 与 RMSNorm 都能逐位手算。可推出：RMSNorm 的"按方向选择"性质。不可推出：$d=7168$ 时的具体数字——真实 K3 的 $\sqrt{7168}\approx 84.7$，机制相同但数字不直观，RMSNorm 的性质与 $d$ 无关。</li>
   <li><b>伪代码省略工程细节</b>。简化做法：伪代码只展示 Block AttnRes 的分块、候选、attention 三步循环。可推出：Block AttnRes 的数学定义与数据流。不可推出：K3 的实际 kernel 实现——K3 的 Block AttnRes kernel 是两阶段 schedule（inter-block + intra-block，见 §5.4.2）、含 online softmax 与 TP/SP 通信，工程优化改变吞吐与显存，不改变数学定义。</li>
-  <li><b>softmax 与 RMSNorm 不展开为独立概念页</b>。简化做法：两者在本文中只作为公式零件使用，给最小说明。可推出：AttnRes 公式的理解。不可推出：softmax 的变体、RMSNorm 的推导与工程实现——读者可参考 Goodfellow et al. 2016 §6.2.2（softmax）与 Zhang & Sennrich 2019（RMSNorm）。</li>
+  <li><b>softmax 与 RMSNorm 不展开</b>。简化做法：两者只作为公式零件使用，仅给出定义。可推出：AttnRes 公式的理解。不可推出：softmax 的变体、RMSNorm 的推导与工程实现——读者可参考 Goodfellow et al. 2016 §6.2.2（softmax）与 Zhang & Sennrich 2019（RMSNorm）。</li>
   <li><b>K3 加权三次的具体位置用间接证据</b>。简化做法：K3 报告原文只确认"each module 各加权一次"+ 末尾聚合，具体三次位置引用 dataflow note 对源码的核对。可推出：K3 每层加权两次 + 末尾一次的总体结构。不可推出：源码层面的实现细节——若源码与 dataflow note 描述不一致，本文相应描述需修订。</li>
 </ul>
 
@@ -1468,7 +1468,7 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
 </ul>
 
 <hr>
-<p>本文是 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 的前置概念页。dataflow note 描述 K3 整体前向数据流（含 AttnRes 在每层的具体执行），本文聚焦 AttnRes 这一概念本身的动机、公式与边界。两者的 AttnRes 描述一致，但侧重不同。</p>
+<p>本文聚焦 AttnRes 这一概念本身的动机、公式与边界；<a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 描述 K3 整体前向数据流（含 AttnRes 在每层的具体执行）。两者的 AttnRes 描述一致，但侧重不同。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
