@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DualPath 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整解析 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">论文概览 · LLM 推理系统</span>
+      <h1>DualPath：在 agentic LLM 推理中打破 PD 分离的存储带宽瓶颈</h1>
+      <p class="lead">本文在 PD 分离推理架构中新增 $\text{storage}\to\text{decode}\to\text{CNIC-RDMA}\to\text{prefill}$ 第二条 KV-Cache 加载路径，把分散在所有节点的 storage NIC 带宽聚合到 KV-Cache 读取上。</p>
+      <p class="meta"><a href="https://arxiv.org/abs/2602.21548">arXiv:2602.21548</a> · PKU + Tsinghua + DeepSeek-AI · 2026-02-26</p>
+    </header>
+
+    
+
+
+
+<h2>主要贡献</h2>
+<ol>
+<li>识别 agentic LLM 推理从计算密集退化为 I/O 密集：trace 平均 98.7% 命中率把 prefill 阶段变成 KV-Cache 加载为主，cache-compute ratio 达 22 GB/PFLOP（DS V3.2），Qwen2.5-32B 高达 117-267 GB/PFLOP；同时硬件代际差距让 I/O-compute 比 14.4× 下降。</li>
+<li>设计 DualPath 双路径加载：在 storage→prefill 之外新增 storage→decode→CNIC-RDMA→prefill 路径，按层粒度与 layerwise prefill 流水重叠，配合 Full Block 存储 + Layer Block 传输 + trie 寻址。</li>
+<li>推导双路径不引入新瓶颈的 P/D 比例区间：$\tfrac{s}{g-s} \le P/D \le \min\!\left\{\tfrac{g-2s}{s}, \tfrac{g-s}{2s}, \tfrac{M/(Bs)-3}{2}\right\}$，典型 (g=8, s=1) 配置下为 $1/7 \le P/D \le 7/2$。</li>
+<li>设计 CNIC-centric 流量管理：所有数据（含本地 H2D/D2H）走 GPU 配对 CNIC 的 GPUDirect RDMA，让 CNIC 的 virtual lane arbiter 统一调度；InfiniBand 用四 VL 把推理通信放高优先级（约 94% 带宽，<code>qos_high_limit=240</code>），KV-Cache 放低优先级。</li>
+<li>设计 Adaptive Request Scheduler：inter-engine 调度按读队列阈值 $\alpha$ 与 token 阈值 $\beta$ 分 PE/DE 候选，DE 组内按 $Z=1.05 \times \text{平均}$ 选低 token DE；intra-engine 按 300 ms compute quota 装 batch，超限时 chunked prefill。</li>
+</ol>
+
+<h2>方法概述</h2>
+<p>DualPath 由三个相互依赖的组件构成。第一是双路径数据流：传统 storage→prefill 之外新增 storage→decode→CNIC-RDMA→prefill 路径，由调度器在请求粒度上选 path A 或 path B；两条路径都按 layerwise prefill 的层粒度与计算流水重叠。块布局上，存储交互用 Full Block $[\text{layer}, \text{tokens}, \text{bytes}]$，层间传输用 Layer Block $[1, \text{tokens}, \text{bytes}]$，trie 树按前缀寻址 hit KV。第二是 CNIC-centric 流量管理：把所有进出 GPU 的流量改走 GPU 配对 CNIC 的 GPUDirect RDMA，让 CNIC 的 virtual lane arbiter 统一调度，规避 GPUDirect Storage / CUDA copy engine 与集合通信竞争 PCIe 的问题。第三是 Adaptive Request Scheduler：inter-engine 调度按读队列长度与 token 数选 PE/DE/读路径，intra-engine 按 compute quota 装 batch，达成 SNIC 负载均衡（Max/Avg 1.18）与 attention 层时间对齐（Max/Avg 1.06）。</p>
+
+<h2>关键结论</h2>
+<ul>
+<li>离线 batch inference：DS 660B 最高 1.87× over Basic，与 Oracle 性能接近（说明 I/O 已被吃满）；DS 27B 最高 1.78×，受 1P1D 存储带宽限制。P/D 比例从 1P1D 到 2P1D 到 1P2D 三对等效直接证明存储带宽是主导瓶颈。</li>
+<li>在线 serving：APS 容量 DS 27B $1.67\times$、DS 660B $2.25\times$（论文 abstract 的 average $1.96\times$ 来自这两个数字的算术平均 $(1.67+2.25)/2=1.96$ 吻合，页面推断；论文未明示均值是算术还是几何）；SLO TTFT $\le 4\,\text{s}$、TPOT $\le 50\,\text{ms}$ 全部满足；TPOT/TTST 不劣化。</li>
+<li>消融：仅加 layerwise prefill 平均 -17.21% JCT，再加 dual-path 平均 -38.19%，再叠加 scheduling 平均 -45.62%（DS 660B、64K MAL、1024/2048 agents）；dual-path 是主要收益来源，scheduling 是放大器。</li>
+<li>大规模：1152 GPU 部署下离线 48P96D vs 2P4D 的 JCT 几乎不变（3167s vs 3201s，agent 数 24×），在线 22× 吞吐；调度器 CPU &lt; 10 cores。</li>
+</ul>
+
+<h2>前置概念</h2>
+<p>理解本文需要：<a href="../../wiki/moe-serving/index.html#s5-prefill-decode-kvcache">PD 分离与 KV-Cache（moe-serving §5）</a>、<a href="../../wiki/standard-attention/index.html">标准 attention（standard-attention）</a>、<a href="../../wiki/mla/index.html">MLA</a>、<a href="../../wiki/dsa/index.html">DeepSeek Sparse Attention</a>、<a href="../../wiki/mqa-gqa/index.html">GQA（mqa-gqa）</a>、<a href="../../wiki/gpu-communication/index.html">RDMA/IB/RoCE/PCIe（gpu-communication）</a>、<a href="../../wiki/moe-serving/index.html#s3-ep-alltoall">MoE 专家并行（moe-serving §3）</a>。</p>
+
+    <!-- 概览正文：研究问题、主要贡献、方法概述和关键结论；不展开公式推导。 -->
+
+    <footer>Dojo · 概览 · 机制细节见完整解析页</footer>
+  </main>
+</body>
+</html>
