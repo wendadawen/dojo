@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KV cache（键值缓存）· 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 $\to$</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · KV cache</span>
+      <h1>KV cache（键值缓存）：让每个新 token 免于重算全部历史</h1>
+      <p class="lead">推理时保存每个 token 在每层的注意力 $k/v$ 向量：与查询无关，算一次可反复用，把自回归生成的平方级重算降为线性——代价是线性增长的显存占用。</p>
+      <p class="meta">更新于 2026-08-19</p>
+    </header>
+
+<h2>这是什么</h2>
+<p>KV cache 是推理时保存的注意力 key/value 张量：每个 token 在每一层算出的 $k$、$v$ 向量被留下来，后续每步生成直接读取，不再重算。它解决的问题是自回归生成的重复计算——每个新 token 的注意力都需要全部历史的 K/V。</p>
+
+<h2>为什么需要它</h2>
+<p>注意力中第 $t$ 个 token 的查询 $q_t$ 要与全部历史 $k_1,\ldots,k_t$ 计算相似度并聚合全部 $v_1,\ldots,v_t$。这些 $k_i,v_i$ 只由第 $i$ 个 token 的输入与模型参数决定（$k_i=x_i W_K$），与当前查询无关，因此算一次即可反复使用。不缓存时生成 $n$ 个 token 需要约 $n^2/2$ 组 K/V 计算，缓存后降为 $n$ 组。</p>
+
+<h2>核心机制</h2>
+<ul>
+<li><b>两阶段产生与使用</b>：prefill 一次性并行处理全部输入 token 并写入其 KV cache；decode 每步只算 1 个新 token 的 $k,v$ 追加进缓存，用 $q$ 读取全部缓存。prefill 计算密集，decode 访存密集。</li>
+<li><b>大小公式</b>：每 token 字节数 $=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$（K/V 两份、层数、KV 头数、头维度、每元素字节数）。GQA 通过减少 KV 头数直接缩小缓存。</li>
+<li><b>实例</b>：Llama-3.1-8B（GQA，32 层、8 KV 头、头维 128、bf16）为 128 KB/token；20,000 token 文档约 2.44 GB，128K 上下文窗口的单请求 16 GB。MHA 的 OPT-13B 为 800 KB/token。</li>
+</ul>
+
+<h2>关键结论与边界</h2>
+<ul>
+<li>KV cache 随 token 数线性增长、随并发请求数相乘，且与静态模型权重共用显存（13B 模型 40GB A100 上权重约 65%、KV cache 约 30%）——40 GB 只够 Llama-3.1-8B 缓存约 0.3M token。</li>
+<li>缓存只省计算、不省存储：显存不足时只能逐出（重算）或分层（搬到 CPU/SSD 再搬回），这是分页管理、前缀缓存与分层传输等后续机制的全部动机。</li>
+<li>公式适用于标准 MHA/GQA 结构；KV 量化只改变 $b$，sliding window、稀疏注意力、MLA 等结构不在其内。</li>
+</ul>
+
+    <!-- 概览正文：定义、问题背景、主要机制、关键结论与边界；不展开公式推导与计算示例。 -->
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
