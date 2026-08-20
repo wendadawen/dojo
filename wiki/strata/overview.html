@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Strata · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整解析 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">论文概览 · LLM 长上下文 serving</span>
+      <h1>Strata：分层 KV cache 缓存框架</h1>
+      <p class="lead">长上下文 LLM 服务把 KV cache 从 CPU 内存搬回 GPU 的带宽利用率只有 22%（GH200 上 5%），74% prefill 时间阻塞在 I/O；Strata 用 GPU-assisted I/O、布局解耦、cache-aware 调度三招回应，对 vLLM+LMCache 同 TTFT 吞吐最高 $5\times$。</p>
+      <p class="meta">arXiv:2508.18572v2 · Xie et al. · OSDI 2026 · 更新于 2026-08-19</p>
+    </header>
+
+<h2>研究问题</h2>
+<p>长上下文 LLM 的 KV cache 装不进 GPU 显存，生产系统把缓存分层到 CPU 内存甚至 SSD。问题出在"搬回来"这一步——把 KV cache 从 CPU 内存搬回 GPU 的带宽利用率低得让人意外（8192 token 加载只达 PCIe 5.0 理论带宽的约 22%，GH200 上低至约 5%），结果 74% 的 prefill 时间阻塞在 I/O 上、吞吐降 4 倍。</p>
+
+<h2>主要贡献</h2>
+<ul>
+<li><b>GPU-assisted I/O</b>：用 CUDA kernel（数千线程各搬一小块）代替 cudaMemcpyAsync，2 block × 1024 thread 配置把 I/O 关进少数 SM、几乎不干扰计算（prefill 损失 <5%），把带宽利用率推回接近理论上限。</li>
+<li><b>布局解耦</b>：GPU 保持 layer-first（计算友好），host 与外部存储用 page-first（传输友好），布局转换由 I/O 线程对偏移多做一次算术完成、几乎零开销；磁盘加载 8192 token 延迟最多降 4 倍。</li>
+<li><b>Cache-aware 调度</b>：把 PCIe 带宽当一等资源——transient node 防 delay hit、均衡 batch（load/compute 比例阈值 100）防 loading-bound、bubble filling 用 decode 批填空泡（decode 饱和 HBM 带宽、加载饱和 PCIe 带宽，资源正交）。</li>
+</ul>
+
+<h2>方法概述</h2>
+<p>Strata 基于 SGLang 实现，构建在 SGLang 的 RadixAttention 之上，把 RadixTree 扩展为 HiRadixTree（含 transient node 与跨内存层元数据）。Cache Controller（数据面）管理 GPU HBM、CPU DRAM、External Storage 三层之间的数据流与布局；Scheduler（控制面）组批时考虑带宽资源，按"均衡批 + bubble filling"避免 loading-bound。论文已在某领先 AI 公司生产部署，ROCm 后端兼容 AMD GPU。</p>
+
+<h2>关键结论</h2>
+<ul>
+<li>H200 上 LooGLE（长文档问答，avg 输入 21,613 token）端到端：Strata 对 vLLM+LMCache 与 SGLang-HiCache 同 TTFT 吞吐最多 5x（Llama-70B 行），对 TensorRT-LLM 最多 3.75x。</li>
+<li>消融：I/O 机制单独最高 2.3x 峰值吞吐、调度单独最高 1.8x（相对 SGLang-HiCache）；低请求率调度收益大、高请求率 I/O 主导。</li>
+<li>页大小负担消除：SGLang-HiCache 调到其最优页 512 也只有 Strata-IO 的 93%（命中率低 2.4%）。</li>
+<li>GH200：I/O 机制把持续带宽从 40 推到 150 GB/s；调度改进是吃满 Grace Hopper 类平台的必要条件——仅有 I/O 不敌 H200 上完整 Strata。</li>
+<li>短上下文（ShareGPT）：无退化；底层 SGLang 引擎的 kernel 差异略弱于 vLLM/TensorRT-LLM，Strata 沿用未消除这一差距。</li>
+</ul>
+
+<h2>适用边界</h2>
+<p>方法适用于长上下文 prefill 主导、分层缓存已成必需的负载；实验用 1TB pinned DRAM（GH200 400GB），迁移需相应内存规划。不解决跨实例全局缓存协调（Mooncake/MemServe 方向）、近似/语义缓存（CacheGen/CacheBlend）、模型结构（稀疏注意力）。Disk 未纳入端到端实验（基线对 disk 支持有限）。</p>
+    <!-- 概览正文：研究问题、主要贡献、方法概述和关键结论；不展开公式推导。 -->
+
+    <footer>Dojo · 概览 · 机制细节见完整解析页</footer>
+  </main>
+</body>
+</html>
