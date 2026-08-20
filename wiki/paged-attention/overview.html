@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PagedAttention（分页注意力）· 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 $\to$</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · PagedAttention</span>
+      <h1>PagedAttention（分页注意力）：把 KV cache 切成页，消掉显存浪费</h1>
+      <p class="lead">vLLM 借操作系统分页思想管理 KV cache：固定大小页 + 页表映射 + 按需分配，把显存有效利用率从两三成提到接近全量——代价是小页让跨内存层搬运退化为碎片化小传输。</p>
+      <p class="meta">更新于 2026-08-19</p>
+    </header>
+
+<h2>这是什么</h2>
+<p>PagedAttention 是 vLLM 提出的 KV cache 分页管理机制：把每个请求的 KV cache 切成固定 token 数的页，页在显存中不必连续，用页表维护逻辑顺序。注意力的数学计算不变，变的只是存储布局与 kernel 取数方式。</p>
+
+<h2>解决什么问题</h2>
+<p>此前的系统按请求的最大可能长度预分配连续显存，产生三类浪费：为未来 token 的预留槽、实际长度小于最大长度的内部碎片、大小不一的预留块之间的外部碎片。vLLM 实测既有系统只有 20.4%–38.2% 的 KV cache 显存真正存了 token 状态——浪费直接压低可并发的批大小。</p>
+
+<h2>核心机制</h2>
+<ul>
+<li><b>固定大小页 + 页表</b>：序列的逻辑页号映射到任意空闲物理页，注意力 kernel 沿页表逐页取数，对上层透明。</li>
+<li><b>按需分配</b>：token 写满当前页才申请新页——预留槽清零；所有页同大小，任何空闲页可用——外部碎片清零；内部碎片只剩每请求最后一页（至多一页）。</li>
+<li><b>页级共享</b>：共享前缀的序列可让页表指向同一物理页，是跨请求 KV cache 复用的实现基础。</li>
+</ul>
+
+<h2>关键结论与边界</h2>
+<ul>
+<li>分页解决的是显存<b>利用率</b>，不是容量：装不下的缓存仍要逐出或分层。</li>
+<li>页很小（TensorRT-LLM 32 / vLLM 16 / SGLang 1 token），序列散布在互不相邻的页中；跨内存层搬运只能逐页小传输，实测 8192 token 加载仅约 22% PCIe 5.0 带宽——这是分层缓存传输瓶颈的来源。</li>
+<li>页大小是显存效率、缓存命中粒度、管理开销、传输单元四向权衡的旋钮，没有普适最优；Strata 的 GPU-assisted I/O 让传输效率退出这个权衡。</li>
+</ul>
+
+    <!-- 概览正文：定义、问题背景、主要机制、关键结论与边界；不展开公式推导与计算示例。 -->
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
