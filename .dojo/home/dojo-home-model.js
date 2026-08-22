@@ -37,9 +37,32 @@
     return `${lead.slice(0, 22).trim()}…`;
   }
 
+  function compareByTitle(a, b) {
+    return a.title.localeCompare(b.title, "zh-CN") || a.id.localeCompare(b.id);
+  }
+
+  function sortPages(pages, sort) {
+    const ordered = pages.slice();
+    if (sort === "oldest") {
+      ordered.sort(
+        (a, b) =>
+          (a.date || "9999-99-99").localeCompare(b.date || "9999-99-99") ||
+          compareByTitle(a, b),
+      );
+    } else if (sort === "title") {
+      ordered.sort(compareByTitle);
+    } else {
+      ordered.sort(
+        (a, b) =>
+          (b.date || "").localeCompare(a.date || "") || compareByTitle(a, b),
+      );
+    }
+    return ordered;
+  }
+
   function filterPages(pages, state) {
     const query = normalize(state.query);
-    return pages
+    const matched = pages
       .filter((page) => !state.type || page.type === state.type)
       .filter((page) => !state.topic || (page.topics || []).includes(state.topic))
       .filter((page) => {
@@ -51,9 +74,8 @@
           page.tag,
           ...(page.topics || []),
         ].join(" ")).includes(query);
-      })
-      .slice()
-      .sort((a, b) => a.title.localeCompare(b.title, "zh-CN"));
+      });
+    return sortPages(matched, state.sort || "newest");
   }
 
   function getFilterOptions(pages) {
@@ -132,6 +154,7 @@
           <span class="card-meta">
             <span class="type-badge type-${escapeHtml(page.type)}">${escapeHtml(typeLabel(page.type))}</span>
             ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
+            ${page.date ? `<time class="date-chip" datetime="${escapeHtml(page.date)}">${escapeHtml(page.date)}</time>` : ""}
           </span>
           <h2>${escapeHtml(page.title)}</h2>
           <p>${escapeHtml(summary)}</p>

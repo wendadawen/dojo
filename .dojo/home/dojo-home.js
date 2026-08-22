@@ -6,6 +6,7 @@
     search: document.getElementById("search-input"),
     type: document.getElementById("type-filter"),
     topic: document.getElementById("topic-filter"),
+    sort: document.getElementById("sort-order"),
     tabs: [...document.querySelectorAll("[data-view]")],
     libraryView: document.getElementById("library-view"),
     mapView: document.getElementById("map-view"),
@@ -22,11 +23,32 @@
     graphModes: [...document.querySelectorAll("[data-graph-mode]")],
   };
   const initialGraphMode = window.matchMedia("(max-width: 760px)").matches ? "2d" : "3d";
+  const SORT_STORAGE_KEY = "dojo-home-sort";
+  const SORT_OPTIONS = new Set(["newest", "oldest", "title"]);
+
+  function loadStoredSort() {
+    try {
+      const stored = window.localStorage.getItem(SORT_STORAGE_KEY);
+      return SORT_OPTIONS.has(stored) ? stored : "newest";
+    } catch (error) {
+      return "newest";
+    }
+  }
+
+  function storeSort(value) {
+    try {
+      window.localStorage.setItem(SORT_STORAGE_KEY, value);
+    } catch (error) {
+      /* file:// or restricted contexts: ignore */
+    }
+  }
+
   const state = {
     catalog: null,
     query: "",
     type: "",
     topic: "",
+    sort: loadStoredSort(),
     view: "library",
     graphMode: initialGraphMode,
   };
@@ -235,6 +257,14 @@
       state.topic = elements.topic.value;
       applyFilters();
     });
+    if (elements.sort) {
+      elements.sort.value = state.sort;
+      elements.sort.addEventListener("change", () => {
+        state.sort = elements.sort.value;
+        storeSort(state.sort);
+        applyFilters();
+      });
+    }
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
     elements.graphModes.forEach((button) => {
       button.addEventListener("click", () => setGraphMode(button.dataset.graphMode));
