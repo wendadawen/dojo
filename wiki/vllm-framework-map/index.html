@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="vLLM 框架全景地图：进程架构（API Server / EngineCore / GPU Worker / DP Coordinator）、五层代码分层（入口/引擎/执行/模型/编译）、跨层子系统（采样/推测解码/结构化输出/KV传输/LoRA 等）、关键设计决策与官方设计文档索引，附走读路线与进度基准。">
+  <meta name="dojo:summary" content="vLLM 由五层组成：入口层（entrypoints/renderers/multimodal）、引擎层（两进程架构、调度、KV 管理）、执行层（executor/worker/attention 后端）、模型层（200+ 模型、28 种量化、10 种加载器）、编译层（torch.compile 与 cudagraph），外加采样、推测解码、结构化输出、KV 跨机传输等跨层子系统。进程上按 API Server + EngineCore + GPU Worker + DP Coordinator 划分，单机 TP=4 共 6 个进程。关键设计：VllmConfig 全局配置对象、统一模型构造签名、分片与量化在初始化时完成。本页是源码走读的总索引与进度基准。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="推理引擎">
+  <meta name="dojo:tag" content="vLLM">
+  <title>vLLM 框架全景：五层架构、进程模型与子系统地图 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.75 var(--body); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 3rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1, h2, h3 { font-family: var(--body); line-height: 1.3; }
+    h1 { margin: .5rem 0 1rem; font-size: 2.35rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.6rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.08rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    p { margin: 1.15rem 0; }
+    a { color: var(--accent); }
+    code { font: .84em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--soft); border: 1px solid var(--border); border-radius: 8px; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin: 1.5rem 0; padding: .2rem 1.25rem; border-left: 3px solid var(--border); color: var(--muted); }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .45rem 0; }
+    table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--ui); }
+    th, td { padding: .7rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { body { font-size: 17px; } .wrap { padding-top: 2rem; } h1 { font-size: 2rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav><a href="../../index.html">← 返回 Dojo</a></nav>
+    <header>
+      <span class="eyebrow">学习记录 · 推理引擎</span>
+      <h1>vLLM 框架全景：五层架构、进程模型与子系统地图</h1>
+      <p class="lead">vLLM 的进程按 API Server、EngineCore、GPU Worker、DP Coordinator 四类划分；代码按入口、引擎、执行、模型、编译五层组织，外加采样、推测解码、结构化输出、KV 传输等跨层子系统。本页给出完整的模块地图、关键设计决策、官方设计文档索引与走读路线，作为源码走读的总索引与进度基准。</p>
+      <p class="meta">更新于 2026-08-21 · 类型：框架总览（vLLM 0.22.2.dev）</p>
+    </header>
+
+    <h2 id="proc">1. 进程架构</h2>
+    <p>一个部署中的进程数量由并行度决定：API Server 默认与数据并行数相同；EngineCore 每个数据并行 rank 一个；GPU Worker 每张卡一个；数据并行大于 1 时额外有一个 DP Coordinator 做负载均衡与 MoE 同步。</p>
+    <table>
+      <tr><th>进程类型</th><th>数量</th><th>职责</th></tr>
+      <tr><td>API Server</td><td>默认 = DP（可配）</td><td>HTTP 请求、tokenize、多模态预处理、流式返回；与所有 EngineCore 经 ZMQ 多对多连接</td></tr>
+      <tr><td>EngineCore</td><td>= DP</td><td>调度器、KV cache 管理、忙等循环、向 worker 派发</td></tr>
+      <tr><td>GPU Worker</td><td>= DP × PP × TP（即卡数）</td><td>加载权重、执行 forward、管理显存</td></tr>
+      <tr><td>DP Coordinator</td><td>DP&gt;1 时 1 个</td><td>跨 DP rank 负载均衡、MoE 同步</td></tr>
+    </table>
+    <p>单机 4 卡 TP=4 共 6 个进程（1 API + 1 EngineCore + 4 Worker）；8 卡 TP=2 DP=4 共 17 个进程。进程间通信三类：请求与结果走 ZMQ（单机 ipc、跨机 tcp）；EngineCore 到 worker 的调用广播走共享内存环形缓冲 + ZMQ 发布订阅；GPU 之间走 NCCL。</p>
+
+    <svg viewBox="0 0 760 230" width="100%" style="max-width:700px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="进程拓扑示意">
+      <rect x="10" y="20" width="740" height="80" rx="10" fill="none" stroke="#d8dee4" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <rect x="30" y="35" width="140" height="40" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="100" y="53" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">API Server</text>
+      <text x="100" y="68" text-anchor="middle" font-size="10" fill="#57606a">tokenize / 预处理</text>
+      <rect x="310" y="35" width="140" height="40" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="380" y="53" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">EngineCore</text>
+      <text x="380" y="68" text-anchor="middle" font-size="10" fill="#57606a">调度 / KV 管理</text>
+      <rect x="590" y="35" width="140" height="40" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="660" y="53" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">GPU Worker ×N</text>
+      <text x="660" y="68" text-anchor="middle" font-size="10" fill="#57606a">forward / 显存</text>
+      <path d="M 170 55 L 306 55" stroke="#9a6700" stroke-width="1.5" marker-end="url(#m1)"/>
+      <text x="238" y="48" text-anchor="middle" font-size="10" fill="#9a6700">ZMQ</text>
+      <path d="M 450 55 L 586 55" stroke="#9a6700" stroke-width="1.5" marker-end="url(#m1)"/>
+      <text x="518" y="48" text-anchor="middle" font-size="10" fill="#9a6700">共享内存 + XPUB</text>
+      <rect x="590" y="120" width="140" height="36" rx="6" fill="none" stroke="#57606a" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="660" y="142" text-anchor="middle" font-size="11" fill="#57606a">GPU 间 NCCL</text>
+      <path d="M 660 75 L 660 116" stroke="#57606a" stroke-width="1" marker-end="url(#m2)"/>
+      <rect x="30" y="170" width="220" height="36" rx="6" fill="none" stroke="#57606a" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="140" y="192" text-anchor="middle" font-size="11" fill="#57606a">DP Coordinator（DP&gt;1 时）</text>
+      <defs>
+        <marker id="m1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9a6700"/></marker>
+        <marker id="m2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+      </defs>
+    </svg>
+
+    <h2 id="layers">2. 五层代码地图</h2>
+
+    <h3>2.1 入口层</h3>
+    <table>
+      <tr><th>目录</th><th>内容</th></tr>
+      <tr><td><code>entrypoints/</code></td><td>openai / anthropic / grpc / mcp / cli / 离线 LLM 类 / pooling / 语音入口</td></tr>
+      <tr><td><code>renderers/</code></td><td>prompt 渲染：chat 模板、tokenize、各模型专用 renderer</td></tr>
+      <tr><td><code>multimodal/</code></td><td>图片 / 音频 / 视频的 processor、哈希、占位符、缓存</td></tr>
+    </table>
+
+    <h3>2.2 引擎层</h3>
+    <table>
+      <tr><th>目录</th><th>内容</th></tr>
+      <tr><td><code>v1/engine/</code></td><td>两进程架构（AsyncLLM / EngineCoreClient / EngineCoreProc / EngineCore）、忙等循环、DP Coordinator</td></tr>
+      <tr><td><code>v1/core/sched/</code></td><td>Scheduler 调度器、请求队列、抢占、统一 token 推进</td></tr>
+      <tr><td><code>v1/core/kv_cache_*</code></td><td>block_pool、kv_cache_manager、coordinator、prefix caching 哈希</td></tr>
+    </table>
+
+    <h3>2.3 执行层</h3>
+    <table>
+      <tr><th>目录</th><th>内容</th></tr>
+      <tr><td><code>v1/executor/</code></td><td>UniProc（TP=1 同进程）/ Multiproc（每卡一进程）/ Ray</td></tr>
+      <tr><td><code>v1/worker/</code></td><td>Worker、WorkerWrapper、GPUModelRunner（输入准备、forward、输出）</td></tr>
+      <tr><td><code>v1/attention/</code></td><td>backend 选择器（与 platforms 联动）+ 约 22 种后端：flash_attn / flashinfer / triton / gdn / mamba / mla / rocm 等</td></tr>
+    </table>
+
+    <h3>2.4 模型层</h3>
+    <table>
+      <tr><th>目录</th><th>内容</th></tr>
+      <tr><td><code>model_executor/models/</code></td><td>约 300 个模型文件 + registry 注册表（架构名 → 类）</td></tr>
+      <tr><td><code>model_executor/layers/</code></td><td>公共层：linear、rotary（RoPE）、MLA、mamba、fused_moe、vocab_parallel_embedding、activation</td></tr>
+      <tr><td><code>model_executor/layers/quantization/</code></td><td>约 28 种量化：fp8 / gptq / awq / modelopt / bitsandbytes / compressed_tensors / experts_int8 等；在模型初始化时介入而非加载后</td></tr>
+      <tr><td><code>model_executor/model_loader/</code></td><td>约 10 种加载器：default / sharded_state / runai_streamer / tensorizer / gguf / bitsandbytes / dummy</td></tr>
+    </table>
+
+    <h3>2.5 编译层</h3>
+    <table>
+      <tr><th>目录</th><th>内容</th></tr>
+      <tr><td><code>compilation/</code></td><td>torch.compile 集成（Dynamo 捕获 → Inductor 编译）、piecewise cudagraph、CUDAGraphWrapper、vLLM IR（函数式中间表示）、编译缓存</td></tr>
+    </table>
+
+    <h2 id="subsys">3. 跨层子系统地图</h2>
+    <table>
+      <tr><th>子系统</th><th>位置</th><th>内容</th></tr>
+      <tr><td>采样</td><td><code>v1/sample/</code></td><td>sampler、logits 处理器、拒绝采样（推测解码用）、思考预算状态</td></tr>
+      <tr><td>推测解码</td><td><code>v1/spec_decode/</code></td><td>EAGLE、ngram（含 GPU 版）、medusa、draft model、suffix decoding 等约 14 个模块</td></tr>
+      <tr><td>结构化输出</td><td><code>v1/structured_output/</code></td><td>4 种 grammar 后端：xgrammar / guidance / outlines / lm_format_enforcer</td></tr>
+      <tr><td>KV 卸载与传输</td><td><code>v1/kv_offload/</code>、<code>distributed/kv_transfer/</code></td><td>KV connector 体系：mooncake / nixl / lmcache / hf3fs / moriio / flexkv 等（PD 分离、KV 复用）</td></tr>
+      <tr><td>分布式并行</td><td><code>distributed/</code></td><td>TP/PP/DP/EP 状态管理、EPLB 专家负载均衡、自定义 all-reduce、CUDA IPC、无状态协调器</td></tr>
+      <tr><td>LoRA</td><td><code>lora/</code></td><td>LoRA 模型、层、ops、权重与请求映射管理</td></tr>
+      <tr><td>Pooling</td><td><code>v1/pool/</code></td><td>embedding / 评分等非生成任务的输出聚合</td></tr>
+      <tr><td>平台抽象</td><td><code>platforms/</code></td><td>CUDA / ROCm / XPU / CPU 等平台探测、attention 后端选择、设备能力</td></tr>
+    </table>
+
+    <svg viewBox="0 0 760 300" width="100%" style="max-width:720px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="五层与子系统全景">
+      <text x="20" y="24" font-size="13" fill="#57606a" font-family="sans-serif">五层（请求流向，自上而下）</text>
+      <rect x="20" y="34" width="380" height="36" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="210" y="56" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">入口层 entrypoints / renderers / multimodal</text>
+      <rect x="20" y="82" width="380" height="36" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="210" y="104" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">引擎层 v1/engine / v1/core</text>
+      <rect x="20" y="130" width="380" height="36" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="210" y="152" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">执行层 v1/executor / v1/worker / v1/attention</text>
+      <rect x="20" y="178" width="380" height="36" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="210" y="200" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">模型层 models / layers / quantization / loader</text>
+      <rect x="20" y="226" width="380" height="36" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="210" y="248" text-anchor="middle" font-size="12" fill="#24292f" font-family="monospace">编译层 compilation</text>
+      <path d="M 210 70 L 210 78" stroke="#57606a" stroke-width="1.2" marker-end="url(#g1)"/>
+      <path d="M 210 118 L 210 126" stroke="#57606a" stroke-width="1.2" marker-end="url(#g1)"/>
+      <path d="M 210 166 L 210 174" stroke="#57606a" stroke-width="1.2" marker-end="url(#g1)"/>
+      <path d="M 210 214 L 210 222" stroke="#57606a" stroke-width="1.2" marker-end="url(#g1)"/>
+      <text x="440" y="24" font-size="13" fill="#57606a" font-family="sans-serif">跨层子系统（服务各层）</text>
+      <g font-size="11" fill="#24292f" font-family="monospace">
+        <rect x="440" y="34" width="300" height="28" rx="6" fill="none" stroke="#8c959f" stroke-width="1"/>
+        <text x="590" y="52" text-anchor="middle">sample（采样）</text>
+        <rect x="440" y="70" width="300" height="28" rx="6" fill="none" stroke="#8c959f" stroke-width="1"/>
+        <text x="590" y="88" text-anchor="middle">spec decode（推测解码）</text>
+        <rect x="440" y="106" width="300" height="28" rx="6" fill="none" stroke="#8c959f" stroke-width="1"/>
+        <text x="590" y="124" text-anchor="middle">structured output（结构化输出）</text>
+        <rect x="440" y="142" width="300" height="28" rx="6" fill="none" stroke="#8c959f" stroke-width="1"/>
+        <text x="590" y="160" text-anchor="middle">kv offload + kv transfer（KV 传输）</text>
+        <rect x="440" y="178" width="300" height="28" rx="6" fill="none" stroke="#8c959f" stroke-width="1"/>
+        <text x="590" y="196" text-anchor="middle">distributed（并行）/ lora / pool</text>
+        <rect x="440" y="214" width="300" height="28" rx="6" fill="none" stroke="#8c959f" stroke-width="1"/>
+        <text x="590" y="232" text-anchor="middle">platforms（平台抽象）</text>
+      </g>
+      <defs>
+        <marker id="g1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+      </defs>
+    </svg>
+
+    <h2 id="design">4. 关键设计决策</h2>
+    <p>官方架构总览给出三个贯穿全部代码的决策：</p>
+    <ol>
+      <li><strong>VllmConfig 全局配置对象</strong>：所有类接收同一个完整配置对象而非散装参数。新增功能只需在 VllmConfig 加字段，任何层直接读取，不用层层改构造函数——这是应对快速演进的扩展性设计。</li>
+      <li><strong>统一模型构造签名</strong>：所有模型构造函数统一为 <code>__init__(*, vllm_config, prefix="")</code>。ModelRunner 不必知道模型类型即可创建模型；视觉语言模型可由子模型组合而成。prefix 用于非均匀量化（模型不同部分用不同量化）。</li>
+      <li><strong>分片与量化在初始化时完成</strong>：不在加载后处理。以 405B 模型跑 16 卡为例，若先加载全部再分片，每卡都要装下 810GB；初始化时分片则每层只创建自己需要的分片，显存开销最小。量化同理。</li>
+    </ol>
+
+    <h2 id="docs">5. 官方设计文档索引</h2>
+    <p>仓库 <code>docs/design/</code> 共 30 篇设计文档，按主题归类：</p>
+    <table>
+      <tr><th>主题</th><th>文档</th></tr>
+      <tr><td>架构总览</td><td>arch_overview（进程模型、类层次、设计决策）</td></tr>
+      <tr><td>核心机制</td><td>paged_attention（历史内核文档）、prefix_caching（块哈希与多模态哈希）、hybrid_kv_cache_manager、cuda_graphs、cuda_graphs_multimodal</td></tr>
+      <tr><td>编译</td><td>torch_compile、torch_compile_multimodal、vllm_ir、optimization_levels、debug_vllm_compile</td></tr>
+      <tr><td>子系统</td><td>attention_backends、model_runner_v2、mm_processing、custom_op、logits_processors、fusions、fused_moe_modular_kernel、moe_kernel_features、dbo、metrics</td></tr>
+      <tr><td>分布式</td><td>multiprocessing（fork/spawn 取舍）、nixl_kv_cache_lease、nixl_kv_push_connector</td></tr>
+      <tr><td>扩展</td><td>plugin_system、endpoint_plugins、io_processor_plugins、lora_resolver_plugins、huggingface_integration</td></tr>
+    </table>
+
+    <h2 id="roadmap">6. 走读路线与进度基准</h2>
+    <h3>6.1 生命周期主线</h3>
+    <p>① 请求进来（前端预处理）→ ② ZMQ 交给 EngineCore → ③ 主循环收请求进调度器 → ④ 调度选批 → ⑤ 模型 forward → ⑥ 采样出新 token → ⑦ 更新 KV cache → ⑧ 新 token 回下一轮 → ⑨ 结果回 API Server。</p>
+
+    <h3>6.2 三段式路线</h3>
+    <table>
+      <tr><th>段</th><th>内容</th><th>目的</th></tr>
+      <tr>
+        <td>第一段</td>
+        <td>走完生命周期主线：_preprocess 剩余三函数 → _model_forward → postprocess → 采样（v1/sample）→ KV cache 管理（block_pool / kv_cache_manager）→ 循环收尾</td>
+        <td>打通一次请求的完整闭环</td>
+      </tr>
+      <tr>
+        <td>第二段</td>
+        <td>框架支柱：attention 后端选择器（v1/attention/selector + platforms 联动）→ 编译层全流程（torch_compile 设计文档对照）→ 模型层骨架（公共层体系、量化初始化介入、加载器）</td>
+        <td>理解框架的三大支柱机制</td>
+      </tr>
+      <tr>
+        <td>第三段</td>
+        <td>按兴趣选：推测解码（eagle）/ 结构化输出 / KV 跨机传输（PD 分离）/ LoRA / pooling</td>
+        <td>扩展视野</td>
+      </tr>
+    </table>
+
+    <h3>6.3 进度基准表</h3>
+    <p>本表随走读推进更新，作为个人的进度仪表盘：</p>
+    <table>
+      <tr><th>模块</th><th>进度</th><th>深度</th><th>对应笔记</th></tr>
+      <tr><td>入口层（render / tokenize / 图片预处理）</td><td>✅ 完成</td><td>深（含实测）</td><td>图片两段处理 note</td></tr>
+      <tr><td>引擎层（两进程 / 忙等循环 / 调度选批）</td><td>✅ 完成</td><td>深</td><td>框架总览 note</td></tr>
+      <tr><td>执行层 executor / Worker</td><td>✅ 完成</td><td>深</td><td>框架总览 note</td></tr>
+      <tr><td>GPUModelRunner.execute_model</td><td>🟡 约 80%（_preprocess 四函数余 3）</td><td>中</td><td>inputs embeds note</td></tr>
+      <tr><td>KV cache 管理（block_pool / manager / prefix 哈希）</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
+      <tr><td>采样（v1/sample）</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
+      <tr><td>attention 后端选择</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
+      <tr><td>模型层（公共层 / 量化 / 加载器）</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
+      <tr><td>编译层</td><td>🟡 cudagraph 专题已走，compile 流程未走</td><td>中</td><td>inputs embeds note（部分）</td></tr>
+      <tr><td>spec_decode / structured_output / kv_transfer / lora / pool</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
+      <tr><td>平台抽象（platforms）</td><td>✅ 专题已走（探测机制）</td><td>中</td><td>—</td></tr>
+    </table>
+    <p>生命周期主线的当前位置：⑤（模型 forward），下一站为 _preprocess 剩余三函数（_gather_mm_embeddings、embed_input_ids、_prepare_mm_inputs）。</p>
+
+    <h2 id="ref">来源与范围说明</h2>
+    <ul>
+      <li>本地代码库扫描（vLLM 0.22.2.dev）：各层目录结构、模块计数（约 22 种 attention 后端、28 种量化方法、300 个模型文件、14 个 v1 侧 KV connector 及 mooncake/nixl 等子目录实现、14 个推测解码模块）</li>
+      <li>官方设计文档：仓库 docs/design/ 目录（arch_overview、paged_attention、prefix_caching、multiprocessing、cuda_graphs、torch_compile、model_runner_v2、vllm_ir 等 30 篇）</li>
+      <li>进程数量公式与设计决策摘自 arch_overview.md；fork/spawn 取舍详见 multiprocessing.md</li>
+      <li>本页为走读索引，模块机制不在本页展开；已深入的部分见关联笔记（两进程架构、图片两段处理、inputs embeds 与 cudagraph）</li>
+    </ul>
+
+    <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
+  </main>
+</body>
+</html>
