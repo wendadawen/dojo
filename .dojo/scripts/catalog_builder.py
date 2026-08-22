@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -103,6 +104,45 @@ def discover_pages(root: Path) -> list[Path]:
     return sorted((root / "wiki").glob("*/index.html"))
 
 
+def git_first_seen_dates(root: Path) -> dict[str, str]:
+    """Return {posix path: YYYY-MM-DD} for each wiki file's first commit.
+
+    Uses a single `git log --reverse` pass; a file's date is the earliest
+    commit in which the path appears (added or renamed into place). Falls
+    back to an empty dict when git history is unavailable (e.g. shallow).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "log",
+                "--reverse",
+                "--format=%aI",
+                "--name-only",
+                "--",
+                "wiki/",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+    dates: dict[str, str] = {}
+    current: Optional[str] = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}T.*", stripped):
+            current = stripped[:10]
+        elif stripped.startswith("wiki/") and current:
+            dates.setdefault(stripped, current)
+    return dates
+
+
 def parse_page(root: Path, page_path: Path) -> dict:
     relative = page_path.relative_to(root).as_posix()
     parser = WikiHTMLParser()
@@ -152,7 +192,10 @@ def normalize_target(source: str, href: str) -> Optional[str]:
 
 def build_catalog(root: Path) -> dict:
     root = root.resolve()
+    first_seen = git_first_seen_dates(root)
     pages = [parse_page(root, path) for path in discover_pages(root)]
+    for page in pages:
+        page["date"] = first_seen.get(page["path"], "")
     page_ids = {page["id"] for page in pages}
     edge_counts: Counter = Counter()
     warnings: list[dict] = []
