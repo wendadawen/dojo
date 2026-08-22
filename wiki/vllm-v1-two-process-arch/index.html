@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="vLLM V1 框架总览：两进程划分、EngineCore 忙等循环、Executor/Worker/Runner 三层执行架构、collective_rpc 统一调用接口，以及框架层全部类与进程的对应关系辨析。">
+  <meta name="dojo:summary" content="vLLM V1 由 APIServer 与 EngineCore 两进程组成：前者经 AsyncLLM 与 EngineCoreClient 只做请求接发，后者的 run_busy_loop 忙等循环逐回合完成调度、forward、采样与更新；回合内经 Executor→Worker→Runner 三层下发，collective_rpc 用方法名字符串统一 TP=1 直调与 TP&gt;1 广播。文末一次性辨析 EngineClient、AsyncLLM、EngineCoreClient、EngineCore、EngineCoreProc、WorkerWrapper、Worker、GPUModelRunner 等全部类的归属与关系。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="推理引擎">
+  <meta name="dojo:tag" content="vLLM">
+  <title>vLLM V1 框架总览：两进程、忙等循环与三层执行架构 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.75 var(--body); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 3rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1, h2, h3 { font-family: var(--body); line-height: 1.3; }
+    h1 { margin: .5rem 0 1rem; font-size: 2.35rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.6rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.08rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    p { margin: 1.15rem 0; }
+    a { color: var(--accent); }
+    code { font: .84em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--soft); border: 1px solid var(--border); border-radius: 8px; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin: 1.5rem 0; padding: .2rem 1.25rem; border-left: 3px solid var(--border); color: var(--muted); }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .45rem 0; }
+    table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--ui); }
+    th, td { padding: .7rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { body { font-size: 17px; } .wrap { padding-top: 2rem; } h1 { font-size: 2rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav><a href="../../index.html">← 返回 Dojo</a></nav>
+    <header>
+      <span class="eyebrow">学习记录 · 推理引擎</span>
+      <h1>vLLM V1 框架总览：两进程、忙等循环与三层执行架构</h1>
+      <p class="lead">APIServer 进程经 AsyncLLM 与 EngineCoreClient 只做请求接发；调度与模型执行同处 EngineCore 进程，由 run_busy_loop 忙等循环逐回合推进，回合内经 Executor→Worker→Runner 三层下发，collective_rpc 以方法名字符串统一单卡直调与多卡广播。文末一次性辨析框架层全部类与进程的对应关系。</p>
+      <p class="meta">更新于 2026-08-21 · 类型：源码走读结论（vLLM 0.22.2.dev，TP=1 单机）</p>
+    </header>
+
+    <h2 id="split">1. 两进程的职责划分与证据</h2>
+    <p>vLLM V1（<code>vllm serve</code> 启动）运行时包含两个独立进程，各自持有不同的代码：</p>
+    <table>
+      <tr><th>进程</th><th>持有的对象</th><th>职责</th></tr>
+      <tr>
+        <td>APIServer<br>（主进程）</td>
+        <td><code>AsyncLLM</code>、<code>EngineCoreClient</code>（实现类 <code>MPClient</code>）、<code>OutputProcessor</code>、<code>Detokenizer</code>、多模态预处理</td>
+        <td>接收 OpenAI 请求、渲染 prompt、发送请求、接收结果并返回用户</td>
+      </tr>
+      <tr>
+        <td>EngineCore<br>（后台进程）</td>
+        <td><code>EngineCoreProc</code> → <code>EngineCore</code> → <code>Scheduler</code>、<code>UniProcExecutor</code> → <code>Worker</code> → <code>GPUModelRunner</code> 与模型本身</td>
+        <td>调度、模型 forward、采样、KV cache 管理</td>
+      </tr>
+    </table>
+    <p>这一划分可用 profiler 产生的两份 trace 验证：APIServer 进程的 trace 中出现的 vLLM 模块只有 <code>core_client.py</code>、<code>output_processor.py</code>、<code>renderers/</code> 等，不含调度器与 worker；EngineCore 进程的 trace 则包含 <code>scheduler.py</code>、<code>gpu_worker.py</code>、<code>gpu_model_runner.py</code>。两个 trace 的主 pid 不同，分别对应启动日志中的 APIServer 与 EngineCore 进程号。</p>
+
+    <h2 id="loop">2. 忙等循环与回合结构</h2>
+    <p>EngineCore 进程的入口是 <code>run_busy_loop</code>，它以一个 while 循环交替执行两个动作：</p>
+<pre><code class="language-python">def run_busy_loop(self):
+    while self._handle_shutdown():
+        self._process_input_queue()   # 从输入队列收请求，无活时阻塞等待
+        self._process_engine_step()   # 执行一步：调度→forward→采样→更新
+</code></pre>
+    <p><code>_process_input_queue</code> 从 ZMQ 输入队列取消息，按类型分发：<code>ADD</code> 调用 <code>add_request</code> 将请求放入调度器，<code>ABORT</code> 取消请求，<code>UTILITY</code> 执行控制类调用。<code>_process_engine_step</code> 调用 <code>step_fn</code> 完成一个执行回合，把结果放入输出队列送回 APIServer。</p>
+    <p>该循环结构可在 EngineCore 进程 trace 的主线程上验证：函数事件按时间排列呈现 <code>_process_input_queue → _process_engine_step → step_with_batch_queue</code> 的重复序列，一次采样中共出现 23 个完整回合。</p>
+
+    <svg viewBox="0 0 720 150" width="100%" style="max-width:640px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="忙等循环结构示意">
+      <rect x="20" y="45" width="180" height="50" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="110" y="65" text-anchor="middle" font-size="14" font-family="monospace" fill="#24292f">_process_input_queue</text>
+      <text x="110" y="84" text-anchor="middle" font-size="11" fill="#57606a">收请求 / 阻塞等待</text>
+      <rect x="270" y="45" width="180" height="50" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="360" y="65" text-anchor="middle" font-size="14" font-family="monospace" fill="#24292f">_process_engine_step</text>
+      <text x="360" y="84" text-anchor="middle" font-size="11" fill="#57606a">执行一步</text>
+      <path d="M 200 70 L 262 70" stroke="#0969da" stroke-width="1.5" marker-end="url(#arr)"/>
+      <path d="M 270 108 Q 360 138 458 108" fill="none" stroke="#57606a" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr2)"/>
+      <text x="360" y="142" text-anchor="middle" font-size="11" fill="#57606a">循环</text>
+      <defs>
+        <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0969da"/></marker>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+      </defs>
+    </svg>
+
+    <h3 id="loop-detail">2.4 回合内的钩子、空转与容错</h3>
+    <p><code>_process_engine_step</code> 内部依次调用 <code>pre_engine_step</code>、<code>step_fn</code>、<code>post_engine_step</code>、<code>post_step</code>。两个"步后"钩子职责不同：<code>post_engine_step</code> 累计本回合耗时并写入调度统计（忙时统计）；<code>post_step</code> 仅在使用推测解码时更新草稿 token。</p>
+    <p>回合末尾有一个条件休眠：当本回合没有执行模型但调度器仍有请求时，调用 <code>time.sleep(0.001)</code> 让出 GIL，使后台的 KV 传输线程得以推进，避免忙等饿死后台线程。</p>
+    <p>回合内的容错由 <code>log_error_detail</code> 上下文管理器承担：它用 <code>@contextmanager</code> 装饰，<code>yield</code> 处即为 <code>with</code> 块代码的执行位置；模型执行抛异常时，先 dump 引擎配置、调度输出与统计信息，再重新抛出异常。</p>
+
+    <h3 id="step-variant">2.5 step 与 step_with_batch_queue 的选择</h3>
+    <p><code>step_fn</code> 指向哪个函数由 batch 队列是否建立决定：<code>batch_queue_size &gt; 1</code> 时建立队列并指向 <code>step_with_batch_queue</code>，否则指向 <code>step</code>。而 <code>batch_queue_size</code> 在 UniProcExecutor 下由 <code>async_scheduling</code> 决定（2 或 1）。<code>async_scheduling</code> 未显式设置时默认为 <code>None</code>，vLLM 会在配置阶段将其自动置为开启（除非模型类型或推测解码方式不兼容）。因此默认部署下实际执行的是 <code>step_with_batch_queue</code>：它优先填充深度为 2 的 batch 队列，队列已满或无可调度请求时才等待最早一批完成——这样 GPU 执行与下一批的调度准备得以重叠。这一结论可由 trace 中出现的是 <code>step_with_batch_queue</code> 而非 <code>step</code> 验证。</p>
+
+    <h2 id="layers">3. 三层执行架构：Executor → Worker → Runner</h2>
+    <p>从 EngineCore 到模型 forward 之间有三层对象，各管一件事：</p>
+    <table>
+      <tr><th>层</th><th>名字含义</th><th>职责</th></tr>
+      <tr><td><code>Executor</code></td><td>执行者</td><td>多卡组织：创建多少 worker、调用如何分发（广播）、结果如何收集</td></tr>
+      <tr><td><code>Worker</code></td><td>工人</td><td>单卡生命周期：初始化设备、加载权重、每步执行、健康检查、休眠唤醒</td></tr>
+      <tr><td><code>GPUModelRunner</code></td><td>跑手</td><td>forward 细节：准备输入、调用模型、处理采样输出</td></tr>
+    </table>
+    <p>分层的设计收益是职责隔离：更换并行度只动 Executor，更换模型只动 Runner，互不影响。</p>
+
+    <svg viewBox="0 0 720 190" width="100%" style="max-width:640px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三层执行架构示意">
+      <rect x="60" y="15" width="600" height="42" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="360" y="41" text-anchor="middle" font-size="14" font-family="monospace" fill="#24292f">Executor（管多卡：分发调用、收集结果）</text>
+      <rect x="60" y="75" width="600" height="42" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="360" y="101" text-anchor="middle" font-size="14" font-family="monospace" fill="#24292f">Worker（管单卡：设备、权重、每步执行）</text>
+      <rect x="60" y="135" width="600" height="42" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="360" y="161" text-anchor="middle" font-size="14" font-family="monospace" fill="#24292f">GPUModelRunner（管 forward：准备输入、调用模型）</text>
+      <path d="M 360 57 L 360 71" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr3)"/>
+      <path d="M 360 117 L 360 131" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr3)"/>
+      <defs>
+        <marker id="arr3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+      </defs>
+    </svg>
+
+    <h3 id="worker-duty">3.2 Worker 的具体职责</h3>
+    <p><code>Worker</code>（GPU worker）的方法按生命周期分三组。启动阶段：<code>init_device</code> 初始化 GPU、<code>load_model</code> 加载权重、<code>determine_available_memory</code> 测量可用显存、<code>initialize_from_config</code> 初始化 KV cache、<code>compile_or_warm_up_model</code> 编译模型。每步执行：<code>execute_model</code> 跑模型、<code>sample_tokens</code> 采样。管理：<code>check_health</code> 健康检查、<code>sleep</code>/<code>wake_up</code> 休眠唤醒、LoRA 相关方法、profiler 启停。Worker 自己不实现 forward 细节，而是把这部分交给持有的 <code>GPUModelRunner</code>。</p>
+
+    <h3 id="wrapper">3.3 WorkerWrapperBase 包装层</h3>
+    <p>Executor 持有的不是 Worker 本体，而是 <code>WorkerWrapperBase</code>。这层包装承担三件事：延迟初始化（构造时只记录 worker 的模块名与类名，<code>init_worker</code> 被调用时才真正实例化）；生命周期管理（shutdown、健康检查）；统一门面（<code>__getattr__</code> 把所有属性访问转发给内部 worker，<code>execute_model</code> 等方法在转发前附加多模态缓存处理）。因此在 trace 中会先看到 <code>worker_base.py</code> 的转发帧，再看到 <code>gpu_worker.py</code> 的执行帧。</p>
+
+    <h3 id="worker-cls">3.4 worker_cls="auto" 的解析</h3>
+    <p>配置中 <code>worker_cls</code> 默认为字符串 <code>"auto"</code>，表示由平台决定。平台不是写死的：模块导入时不做探测，首次访问 <code>current_platform</code> 时才触发懒加载，逐个运行各平台插件函数；CUDA 插件用 NVML 检测本机 NVIDIA GPU 数量（<code>nvmlDeviceGetCount() &gt; 0</code>），命中即选中 <code>CudaPlatform</code>。选中后由平台把 <code>"auto"</code> 替换为具体类名 <code>vllm.v1.worker.gpu_worker.Worker</code>，<code>WorkerWrapperBase.init_worker</code> 再用 <code>resolve_obj_by_qualname</code> 按类名导入并实例化。</p>
+
+    <h3 id="runner-v12">3.5 model_runner 的 v1/v2</h3>
+    <p>Runner 存在 v1/v2 两个实现，但两者都是 <code>GPUModelRunner</code> 类，差异在内部行为。v2 默认仅对单一架构集合启用（如 <code>Qwen3ForCausalLM</code>，且要求非 MoE、非量化、安装了 Triton）；不在名单内的架构（如 <code>Qwen3_5ForConditionalGeneration</code>）走 v1 实现。也可用环境变量强制指定。此区分与引擎的 V0/V1 代际无关——v1/v2 runner 都属于 V1 引擎。</p>
+
+    <h2 id="rpc">4. collective_rpc：统一的跨 worker 调用接口</h2>
+    <p>EngineCore 对 worker 的所有调用（<code>execute_model</code>、<code>sample_tokens</code> 等）都走 <code>collective_rpc</code>这一个入口，传入的是<strong>方法名字符串</strong>而非函数对象。使用字符串是为了可传递：同一接口既要支持单卡也要支持多卡广播，函数对象无法跨进程传输，而字符串可以。EngineCore 的代码因此完全不感知卡数——TP=1 与 TP=8 使用同一行调用。</p>
+
+    <h3 id="rpc-uni">4.1 UniProcExecutor 路径（TP=1）</h3>
+<pre><code class="language-python"># collective_rpc 内部（非阻塞分支）
+result = run_method(self.driver_worker, method, args, kwargs)
+# run_method：按方法名字符串从对象上取方法再调用
+func = getattr(obj, method)
+return func(*args, **kwargs)
+</code></pre>
+    <p>TP=1 时 worker 与 EngineCore 同进程，<code>run_method</code> 直接以 <code>getattr</code> 找到方法并调用，没有跨进程开销。</p>
+
+    <h3 id="rpc-multi">4.2 MultiprocExecutor 路径（TP&gt;1）</h3>
+    <p>TP&gt;1 时每个 GPU 一个独立 worker 进程（<code>WorkerProc</code>）。调用被序列化后放进广播消息队列 <code>rpc_broadcast_mq</code>：该队列对小消息用共享内存环形缓冲传输，对超过阈值的消息退化为 ZMQ 发布订阅（XPUB/SUB）。每个 worker 从队列收到同一份消息，各自在自己进程内解析并执行，结果写回各自的 response 消息队列。Executor 侧返回一个 future，其内部等待全部 worker 的 response 队列并聚合结果——因此 N 卡场景下调用方拿到的仍是单个 future，其中包含 N 份回复。方法名若传入的是函数对象而非字符串，则先经 cloudpickle 序列化为字节再广播。</p>
+
+    <h2 id="step-four">5. 每回合四动作与一次请求往返</h2>
+    <table>
+      <tr><th>动作</th><th>调用链</th><th>产出</th></tr>
+      <tr><td>调度</td><td><code>Scheduler.schedule</code></td><td><code>SchedulerOutput</code>：本步各请求的 token 数、KV block 分配</td></tr>
+      <tr><td>执行</td><td><code>model_executor.execute_model</code> → <code>collective_rpc</code> → <code>Worker.execute_model</code> → <code>GPUModelRunner.execute_model</code></td><td>logits</td></tr>
+      <tr><td>采样</td><td><code>model_executor.sample_tokens</code> → sampler</td><td>新 token id</td></tr>
+      <tr><td>更新</td><td><code>Scheduler.update_from_output</code></td><td>更新请求状态与 KV cache，产出 <code>EngineCoreOutputs</code></td></tr>
+    </table>
+    <p>调度器没有 prefill 与 decode 两个阶段：每个请求只维护 <code>num_computed_tokens</code>（已计算数）与 <code>num_tokens_with_spec</code>（目标数），每步在 token 预算内尽量推进前者追上后者。一个 983 token 的 prefill 请求表现为单回合内调度 983 个 token，之后的 decode 每回合只推进 1 个 token。这一分布同样体现在 trace 中：EngineCore 主线程的高频事件集中在 forward 与 KV cache 管理函数上，调度函数的调用频率远低于前者。</p>
+    <p>两进程间一次请求往返的五要素：输入为 <code>EngineCoreRequest</code>（普通字段经 MsgpackEncoder 序列化，张量走带外共享内存传输）；状态为 <code>EngineCoreProc</code> 的输入与输出两个队列；关键参数为 ZMQ 地址（同机 <code>ipc://</code>，跨机 <code>tcp://host:port</code>）；主要步骤为 <code>add_request_async</code> 经 ZMQ 发送 ADD → <code>_process_input_queue</code> 收到并放入调度器 → 回合执行 → 结果放入输出队列 → APIServer 的 output_handler 循环拉取；输出为 <code>EngineCoreOutputs</code>，经 <code>OutputProcessor</code> 转为 <code>RequestOutput</code> 推给用户。</p>
+
+    <h2 id="classes">6. 类与进程大全辨析</h2>
+    <p>这套架构的命名最容易混淆。先看命名规律，再按进程分组列出全部类，最后给出关系图与易混对照。</p>
+
+    <h3 id="naming">6.1 命名规律</h3>
+    <ul>
+      <li><strong>Client 结尾</strong>：客户端——连接、驱动别人的那一端</li>
+      <li><strong>Proc 结尾</strong>：进程入口——负责把自己装进一个独立进程</li>
+      <li><strong>Executor / Worker / Runner</strong>：执行链三层，越往下越靠近模型本体</li>
+      <li><strong>Wrapper / Base 结尾</strong>：包装壳或抽象基类，不自己干活</li>
+      <li><strong>Async 前缀</strong>：异步版本（用 await，等待时让出控制权）</li>
+    </ul>
+
+    <h3 id="api-classes">6.2 APIServer 进程的类</h3>
+    <table>
+      <tr><th>类</th><th>是什么</th></tr>
+      <tr><td><code>EngineClient</code>（ABC）</td><td>"引擎客户端"的抽象接口，定义 <code>generate</code>、<code>add_request</code> 等能力。位于引擎代际无关的公共层</td></tr>
+      <tr><td><code>AsyncLLM</code></td><td><code>EngineClient</code> 的唯一实现，V1 引擎的前端对象。收请求、发请求、收结果；内部持有 EngineCoreClient 与 OutputProcessor，并运行 output_handler 后台循环</td></tr>
+      <tr><td><code>EngineCoreClient</code>（ABC）</td><td>"连接 EngineCore 的客户端"抽象。注意与 <code>EngineClient</code> 是两个东西：后者是引擎总接口，前者专指跨进程通信</td></tr>
+      <tr><td><code>MPClient</code></td><td><code>EngineCoreClient</code> 的 ZMQ 实现，实际部署使用的那个</td></tr>
+      <tr><td><code>InprocClient</code></td><td><code>EngineCoreClient</code> 的同进程实现（不跨进程的场合）</td></tr>
+    </table>
+
+    <h3 id="core-classes">6.3 EngineCore 进程的类</h3>
+    <table>
+      <tr><th>类</th><th>是什么</th></tr>
+      <tr><td><code>EngineCore</code></td><td>引擎本体：持有 Scheduler 与 model_executor，提供 step 系列方法。注释自称 "Inner loop of vLLM's Engine"</td></tr>
+      <tr><td><code>EngineCoreProc</code></td><td><code>EngineCore</code> 的进程包装：提供 ZMQ 服务端、把 EngineCore 装进后台进程、跑 <code>run_busy_loop</code>。<strong>整个架构里唯一创建进程的类</strong></td></tr>
+      <tr><td><code>Scheduler</code></td><td>调度器：选批、定 token 数、分配 KV block</td></tr>
+      <tr><td><code>Executor</code>（ABC）</td><td>执行器抽象，经 <code>get_class</code> 按配置选择实现</td></tr>
+      <tr><td><code>UniProcExecutor</code></td><td>TP=1：单进程，worker 与 EngineCore 同进程，直接调用</td></tr>
+      <tr><td><code>MultiprocExecutor</code></td><td>TP&gt;1：每 GPU 一个 worker 进程，广播调用</td></tr>
+      <tr><td><code>RayExecutor</code></td><td>用 Ray actor 管理 worker 的实现（集群部署）</td></tr>
+      <tr><td><code>WorkerWrapperBase</code></td><td>worker 的包装壳：延迟初始化、生命周期、<code>__getattr__</code> 门面转发。Executor 实际持有的是它</td></tr>
+      <tr><td><code>WorkerBase</code>（ABC）</td><td>worker 抽象基类</td></tr>
+      <tr><td><code>Worker</code></td><td>GPU worker（gpu_worker.py）：单卡总管，init_device/load_model/execute_model/sample_tokens/check_health</td></tr>
+      <tr><td><code>GPUModelRunner</code></td><td>forward 跑手：准备输入、调用模型、处理输出。worker 内最贴近模型的一层</td></tr>
+    </table>
+
+    <h3 id="class-map">6.4 继承与持有关系全景</h3>
+    <svg viewBox="0 0 760 400" width="100%" style="max-width:720px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="类关系全景图">
+      <rect x="20" y="10" width="340" height="380" rx="10" fill="none" stroke="#d8dee4" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="190" y="34" text-anchor="middle" font-size="13" fill="#57606a" font-family="sans-serif">APIServer 进程</text>
+      <rect x="40" y="50" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="190" y="72" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">AsyncLLM（前端引擎）</text>
+      <rect x="40" y="120" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="190" y="142" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">EngineCoreClient / MPClient</text>
+      <rect x="40" y="330" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="190" y="352" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">OutputProcessor / Detokenizer</text>
+      <path d="M 190 84 L 190 116" stroke="#57606a" stroke-width="1.2" marker-end="url(#a1)"/>
+      <text x="200" y="104" font-size="11" fill="#8c959f">持有</text>
+
+      <rect x="400" y="10" width="340" height="380" rx="10" fill="none" stroke="#d8dee4" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="570" y="34" text-anchor="middle" font-size="13" fill="#57606a" font-family="sans-serif">EngineCore 进程</text>
+      <rect x="420" y="50" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="570" y="72" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">EngineCoreProc（ZMQ 服务端）</text>
+      <rect x="420" y="120" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="570" y="142" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">EngineCore（引擎本体）</text>
+      <rect x="420" y="190" width="145" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="492" y="212" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">Scheduler</text>
+      <rect x="585" y="190" width="135" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="652" y="212" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">UniProcExecutor</text>
+      <rect x="420" y="255" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="570" y="277" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">WorkerWrapperBase</text>
+      <rect x="420" y="320" width="300" height="34" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="570" y="342" text-anchor="middle" font-size="13" font-family="monospace" fill="#24292f">Worker（GPU worker）</text>
+      <rect x="420" y="385" width="300" height="0" rx="6" fill="none"/>
+      <text x="570" y="384" text-anchor="middle" font-size="12" font-family="monospace" fill="#57606a">→ GPUModelRunner → 模型</text>
+      <path d="M 570 84 L 570 116" stroke="#57606a" stroke-width="1.2" marker-end="url(#a1)"/>
+      <text x="580" y="104" font-size="11" fill="#8c959f">继承 EngineCore</text>
+      <path d="M 570 154 L 570 186" stroke="#57606a" stroke-width="1.2" marker-end="url(#a1)"/>
+      <text x="580" y="174" font-size="11" fill="#8c959f">持有</text>
+      <path d="M 652 224 L 652 251" stroke="#57606a" stroke-width="1.2" marker-end="url(#a1)"/>
+      <path d="M 570 289 L 570 316" stroke="#57606a" stroke-width="1.2" marker-end="url(#a1)"/>
+      <text x="580" y="309" font-size="11" fill="#8c959f">包装</text>
+      <path d="M 340 137 L 416 64" stroke="#9a6700" stroke-width="1.5" marker-end="url(#a2)"/>
+      <text x="362" y="88" font-size="11" fill="#9a6700" font-family="sans-serif">ZMQ</text>
+      <defs>
+        <marker id="a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+        <marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9a6700"/></marker>
+      </defs>
+    </svg>
+
+    <h3 id="confuse">6.5 最易混淆的对照</h3>
+    <table>
+      <tr><th>混淆对</th><th>区别</th></tr>
+      <tr><td><code>EngineClient</code> vs <code>EngineCoreClient</code></td><td>前者是引擎总接口（AsyncLLM 的父类）；后者是"连接 EngineCore 的通信客户端"（MPClient 的父类）。一个管接发请求，一个管跨进程连线</td></tr>
+      <tr><td><code>EngineCore</code> vs <code>EngineCoreProc</code></td><td>前者是引擎本体（干活）；后者是进程壳（把本体装进后台进程并提供 ZMQ 服务端）</td></tr>
+      <tr><td><code>Worker</code> vs <code>WorkerWrapperBase</code></td><td>前者是工人；后者是工人的包装壳（延迟初始化 + 门面）。Executor 持有的是后者</td></tr>
+      <tr><td><code>Worker</code> vs <code>GPUModelRunner</code></td><td>前者管单卡全生命周期；后者只管 forward 细节。前者持有后者</td></tr>
+      <tr><td><code>UniProcExecutor</code> vs <code>MultiprocExecutor</code></td><td>TP=1：worker 同进程直调；TP&gt;1：每卡独立 worker 进程，广播调用</td></tr>
+      <tr><td><code>AsyncLLM</code>（V1）vs <code>LLMEngine</code>（V0）</td><td>引擎代际之别。V1 默认用 AsyncLLM；V0 的 LLMEngine 不继承 EngineClient</td></tr>
+    </table>
+
+    <h3 id="class-vs-proc">6.6 类与进程的边界</h3>
+    <p>所有上述名字都是类，没有哪个名字本身是进程。后端进程由 <code>EngineCoreProc.run_engine_core</code> 作为入口、经 <code>multiprocessing.Process</code> 创建，是这套架构里唯一的进程创建点；APIServer 进程即 <code>vllm serve</code> 的主进程。TP=1 时 UniProcExecutor 的 worker 与 EngineCore 共用后端进程；TP&gt;1 时 MultiprocExecutor 为每张 GPU 额外创建 worker 进程。</p>
+
+    <h2 id="ref">来源与范围说明</h2>
+    <h3>源码定位</h3>
+    <ul>
+      <li><code>vllm/v1/engine/async_llm.py</code>：<code>AsyncLLM</code>（71）、<code>_add_request</code>（409）、<code>_run_output_handler</code>（651）</li>
+      <li><code>vllm/engine/protocol.py</code>：<code>EngineClient</code>（40）</li>
+      <li><code>vllm/v1/engine/core_client.py</code>：<code>EngineCoreClient</code>（70）、<code>InprocClient</code>（278）、<code>MPClient</code>（464）</li>
+      <li><code>vllm/v1/engine/core.py</code>：<code>EngineCore</code>（96）、<code>step</code>（438）、<code>step_with_batch_queue</code>（490）、<code>EngineCoreProc</code>（1004）、<code>run_busy_loop</code>（1364）、<code>_process_input_queue</code>（1374）、<code>_process_engine_step</code>（1405）、<code>_handle_shutdown</code>（1431）</li>
+      <li><code>vllm/v1/engine/utils.py</code>：后端进程创建（149–150）、ZMQ 地址 ipc/tcp 选择（<code>get_engine_zmq_addresses</code>）</li>
+      <li><code>vllm/config/vllm.py</code>：<code>async_scheduling</code> 默认开启逻辑（995 起）、v2 runner 名单（71）、<code>_is_default_v2_model_runner_model</code>（549）</li>
+      <li><code>vllm/v1/executor/abstract.py</code>：<code>Executor</code>（37）、<code>get_class</code>（48）</li>
+      <li><code>vllm/v1/executor/uniproc_executor.py</code>：<code>UniProcExecutor</code>（45）、<code>AsyncOutputFuture</code>（26）、<code>collective_rpc</code>（80）</li>
+      <li><code>vllm/v1/executor/multiproc_executor.py</code>：<code>FutureWrapper</code>（81）、<code>MultiprocExecutor</code>（114）、<code>WorkerProc</code>（572）、collective_rpc 广播（372）</li>
+      <li><code>vllm/v1/serial_utils.py</code>：<code>run_method</code>（486）</li>
+      <li><code>vllm/v1/worker/worker_base.py</code>：<code>WorkerBase</code>（40）、<code>WorkerWrapperBase</code>（189）</li>
+      <li><code>vllm/v1/worker/gpu_worker.py</code>：<code>Worker</code>（111）、<code>execute_model</code>（803）</li>
+      <li><code>vllm/v1/worker/gpu_model_runner.py</code>：<code>GPUModelRunner</code>（411）、<code>execute_model</code>（4029）</li>
+      <li><code>vllm/v1/core/sched/scheduler.py</code>：<code>Scheduler</code>（82）、<code>schedule</code>（360）</li>
+      <li><code>vllm/platforms/cuda.py</code>：worker_cls 解析（246–247）</li>
+      <li><code>vllm/platforms/__init__.py</code>：<code>cuda_platform_plugin</code>（60）、NVML 检测（75）、<code>__getattr__</code> 懒加载（262）</li>
+      <li><code>vllm/config/parallel.py</code>：<code>worker_cls: str = "auto"</code>（246）</li>
+      <li><code>vllm/distributed/device_communicators/shm_broadcast.py</code>：<code>MessageQueue</code>（358）</li>
+      <li><code>vllm/v1/engine/core.py</code>：<code>log_error_detail</code>（393）</li>
+      <li><code>vllm/hcf_mixin/v1/engine/core_mixin.py</code>：<code>pre_engine_step</code>（28）、<code>post_engine_step</code>（32）</li>
+    </ul>
+    <h3>trace 证据</h3>
+    <ul>
+      <li>APIServer 进程 trace：<code>torch_profiles/TENCENT64.site_87521.async_llm.*.pt.trace.json.gz</code>——只含 core_client/output_processor/renderers 等模块</li>
+      <li>EngineCore 进程 trace：<code>torch_profiles/rank0.*.pt.trace.json.gz</code>——含 scheduler/gpu_worker/gpu_model_runner，主线程 23 个回合序列；<code>step_with_batch_queue</code> 出现而 <code>step</code> 未出现</li>
+      <li>环境：vLLM 0.22.2.dev、torch 2.11.0+cu130、Qwen3.5-0.8B、TP=1 单机</li>
+    </ul>
+    <h3>方法边界</h3>
+    <ul>
+      <li>回合序列由 trace 中函数事件的时间序重建（该 torch 版本 profiler 的 <code>with_stack</code> 无法捕获调用栈，已用最小用例验证），不是调用栈直接给出</li>
+      <li>结论限定 TP=1 单机；MultiProc（TP&gt;1）与 Ray 后端下 worker 进程归属不同，仅在相应章节说明其差异</li>
+      <li>UniProcExecutor CPU 线程管理的相关上游修复 PR（限制 torch intra-op 线程数）未在本地代码核实，仅确认本地 UniProcExecutor 无线程限制代码、MultiprocExecutor 有（置 OMP_NUM_THREADS=1）</li>
+    </ul>
+
+    <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
+  </main>
+</body>
+</html>

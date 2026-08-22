@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="vLLM 多模态图片的两段处理：APIServer 进程用 HF image_processor 将图片预处理为 pixel_values，EngineCore 进程的 _execute_mm_encoder 调用 embed_multimodal 做视觉编码并按图片哈希缓存。">
+  <meta name="dojo:summary" content="多模态图片在 vLLM 中分两段处理：APIServer 用 HF image_processor 完成 resize 与归一化，产出 pixel_values 与 image_grid_thw（由 smart_resize 按 factor=28 计算的分块网格）；EngineCore 的 _execute_mm_encoder 经收集、合批后调用 embed_multimodal 跑视觉编码器，结果按 mm_hash 缓存，decode 阶段直接复用。合批时字段类型决定合并方式：BatchedField 形状相同则 stack、不同则退化为 list，拆批仅由 modality、字段集合与 SharedField 数据决定。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="推理引擎">
+  <meta name="dojo:tag" content="vLLM">
+  <title>多模态图片的预处理在 APIServer，ViT 编码在 EngineCore · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.75 var(--body); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 3rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1, h2, h3 { font-family: var(--body); line-height: 1.3; }
+    h1 { margin: .5rem 0 1rem; font-size: 2.35rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.6rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.08rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    p { margin: 1.15rem 0; }
+    a { color: var(--accent); }
+    code { font: .84em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--soft); border: 1px solid var(--border); border-radius: 8px; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin: 1.5rem 0; padding: .2rem 1.25rem; border-left: 3px solid var(--border); color: var(--muted); }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .45rem 0; }
+    table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--ui); }
+    th, td { padding: .7rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { body { font-size: 17px; } .wrap { padding-top: 2rem; } h1 { font-size: 2rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav><a href="../../index.html">← 返回 Dojo</a></nav>
+    <header>
+      <span class="eyebrow">学习记录 · 推理引擎</span>
+      <h1>多模态图片的预处理在 APIServer，ViT 编码在 EngineCore</h1>
+      <p class="lead">前端 render 链路用 HF image_processor 完成图片加载与 smart_resize，产出 pixel_values 与 image_grid_thw 随请求发送；EngineCore 的 _execute_mm_encoder 调用 embed_multimodal 跑视觉编码器，结果按图片哈希缓存在 encoder_cache 供 decode 复用。合批时字段类型决定合并方式，拆批仅由 modality、字段集合与 SharedField 数据决定。</p>
+      <p class="meta">更新于 2026-08-21 · 类型：源码走读结论（vLLM 0.22.2.dev，Qwen3.5，TP=1）</p>
+    </header>
+
+    <h2 id="split">1. 分界在哪里：两段各自做什么</h2>
+    <p>一张图片从进入 vLLM 到产生图像特征，被拆成两段，分属两个进程：</p>
+    <table>
+      <tr><th>阶段</th><th>进程</th><th>做的事</th><th>产出</th></tr>
+      <tr>
+        <td>预处理</td>
+        <td>APIServer</td>
+        <td>加载图片、smart_resize、归一化（纯 CPU）</td>
+        <td><code>MultiModalKwargsItem</code>：pixel_values + image_grid_thw，附带哈希与占位符位置</td>
+      </tr>
+      <tr>
+        <td>视觉编码</td>
+        <td>EngineCore</td>
+        <td>跑视觉编码器 ViT 的 forward（GPU）</td>
+        <td>图像特征 embedding，按 mm_hash 缓存</td>
+      </tr>
+    </table>
+    <p>这一分界可用 profiler 的两份 trace 验证。APIServer 进程的 trace 出现的是 <code>fetch_image</code>、<code>multimodal/processing/processor.py</code>、<code>renderers/</code> 等预处理函数，没有视觉编码器的 forward；EngineCore 进程的 trace 出现 <code>_execute_mm_encoder</code>、<code>_process_image_input</code>、<code>embed_multimodal</code> 等编码函数。APIServer 进程内部还进一步分线程：图片文件的加载 IO（<code>load_file</code>、<code>rgba_to_rgb</code>）与多模态处理（HF processor 调用）分布在不同线程上，与主线程的请求接发并行。</p>
+
+    <svg viewBox="0 0 760 210" width="100%" style="max-width:720px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="图片两段处理分界">
+      <rect x="10" y="30" width="270" height="150" rx="10" fill="none" stroke="#d8dee4" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="145" y="52" text-anchor="middle" font-size="13" fill="#57606a" font-family="sans-serif">APIServer 进程（CPU）</text>
+      <rect x="25" y="62" width="240" height="30" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="145" y="82" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">fetch image（加载图片）</text>
+      <rect x="25" y="105" width="240" height="30" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="145" y="125" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">image processor（resize/归一化）</text>
+      <text x="145" y="160" text-anchor="middle" font-size="12" fill="#57606a">产出 pixel values + image grid thw</text>
+
+      <rect x="300" y="88" width="150" height="34" rx="8" fill="none" stroke="#9a6700" stroke-width="1.2"/>
+      <text x="375" y="109" text-anchor="middle" font-size="12" fill="#9a6700" font-family="sans-serif">ZMQ + 带外传张量</text>
+      <path d="M 265 105 L 296 105" stroke="#9a6700" stroke-width="1.5" marker-end="url(#b1)"/>
+      <path d="M 450 105 L 480 105" stroke="#9a6700" stroke-width="1.5" marker-end="url(#b1)"/>
+
+      <rect x="484" y="30" width="270" height="150" rx="10" fill="none" stroke="#d8dee4" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="619" y="52" text-anchor="middle" font-size="13" fill="#57606a" font-family="sans-serif">EngineCore 进程（GPU）</text>
+      <rect x="499" y="62" width="240" height="30" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="619" y="82" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">execute mm encoder（收集/合批）</text>
+      <rect x="499" y="105" width="240" height="30" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="619" y="125" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">embed multimodal（ViT forward）</text>
+      <text x="619" y="160" text-anchor="middle" font-size="12" fill="#57606a">图像特征 → encoder cache（按 mm hash）</text>
+      <defs>
+        <marker id="b1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9a6700"/></marker>
+      </defs>
+    </svg>
+
+    <h2 id="frontend">2. 前端段：HTTP 请求到 pixel_values</h2>
+    <p>请求进入 OpenAI 入口后，图片沿一条链路被处理：<code>render_chat_request</code>（chat completion serving）→ <code>render_messages_async</code>（HfRenderer）→ <code>parse_chat_messages_async</code> 识别消息中的图片并调 <code>fetch_image</code> 加载 → <code>_process_multimodal</code> → <code>mm_processor.apply</code> → <code>call_hf_processor_mm_only</code> → 最终由 HF 的 <code>image_processor</code> 完成 resize 与归一化。产出的 <code>MultiModalKwargsItem</code> 含两个字段：pixel_values（归一化后的像素张量）与 image_grid_thw（分块网格），随请求一同序列化发送。</p>
+    <p><code>image_grid_thw</code> 由 transformers 的 <code>smart_resize</code> 计算：把图片高宽各自取整到 factor=28 的倍数、总像素限制在 min/max 范围内、尽量保持宽高比，再除以 28 得到网格数。两个真实例子：980×986 的图片被缩放后切为 grid [1, 62, 62]，对应 3844 个 patch；2310×2310 的图片切为 grid [1, 144, 144]，对应 20736 个 patch。图片的 token 占位数量即由网格推出。</p>
+
+    <h2 id="backend">3. 后端段：_execute_mm_encoder 的视觉编码</h2>
+
+    <h3 id="collect">3.1 收集</h3>
+    <p>调度器产出的 <code>SchedulerOutput.scheduled_encoder_inputs</code> 记录本步需要编码的项，结构为 <code>{请求ID: 图片下标列表}</code>。存下标而不存数据：数据可能已在编码缓存中或可从远端获取，调度器只决定"哪些项需要编码"。<code>_batch_mm_inputs_from_scheduler</code> 按下标从各请求的 mm_features 取出数据，整理为三个平行列表：图片哈希、图片数据、以及 (请求ID, 占位符位置) 引用——后者用于把图片映射回所属请求，从而查到该请求使用的 LoRA 适配器。占位符位置即 <code>PlaceholderRange</code>（offset + length），标记图片在 token 序列中的插入点。</p>
+
+    <h3 id="batching">3.2 合批机制</h3>
+    <p><code>group_and_batch_mm_kwargs</code> 把收集到的项组织成一批批可整体送入编码器的数据。机制分两层：<strong>怎么合并</strong>与<strong>什么时候拆批</strong>。</p>
+    <p>每个字段（FieldElem）携带一个 field 对象，决定合批时数据的合并方式（<code>reduce_data</code>）：</p>
+    <table>
+      <tr><th>字段类型</th><th>合并方式</th><th>语义</th></tr>
+      <tr><td><code>MultiModalBatchedField</code></td><td>各 item 数据形状相同 → <code>torch.stack</code> 成一个张量；形状不同 → 以列表返回</td><td>每个 item 拥有独立的一份张量（如 pixel_values）</td></tr>
+      <tr><td><code>MultiModalSharedField</code></td><td>取第一个 item 的数据（batch[0]）</td><td>同一份数据复制给 batch 内所有 item（如跨 patch 共享的配置），合并时留一份即可</td></tr>
+    </table>
+    <p>拆批判定由每项的 group id 决定：把 item 的所有字段按名排序，每个字段记为 (字段名, 哈希)，其中<strong>只有 SharedField 字段参与哈希计算，BatchedField 字段哈希恒为空</strong>。相邻项的 group id 相同才落入同批。因此拆批当且仅当三种情况：modality 不同（外层按 modality 分组）；字段名集合不同（group id 的键不一致）；SharedField 字段的数据不同（哈希不一致）。BatchedField 的数据——包括图片大小、网格形状——完全不参与拆批判定：形状不同的图片留在同一批，只是合并时 pixel_values 退化为列表而非堆叠成张量。社区的单元测试（<code>tests/multimodal/test_utils.py</code> 的 TestGroupAndBatchMmItems）覆盖了后两种拆批条件：字段集合不同拆批、SharedField 值不同拆批。</p>
+
+    <svg viewBox="0 0 760 200" width="100%" style="max-width:720px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="合批机制：合并方式与拆批条件">
+      <text x="30" y="30" font-size="13" fill="#57606a" font-family="sans-serif">合并方式（由字段类型决定）</text>
+      <rect x="30" y="42" width="330" height="30" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="195" y="62" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">BatchedField：同形状 stack / 异形状 list</text>
+      <rect x="30" y="80" width="330" height="30" rx="6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+      <text x="195" y="100" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">SharedField：取 batch[0]</text>
+      <text x="30" y="140" font-size="13" fill="#57606a" font-family="sans-serif">拆批条件（group id 不同才拆）</text>
+      <rect x="30" y="152" width="330" height="30" rx="6" fill="none" stroke="#9a6700" stroke-width="1.2"/>
+      <text x="195" y="172" text-anchor="middle" font-size="12" fill="#24292f">modality 不同 / 字段集合不同 / Shared 数据不同</text>
+      <text x="390" y="62" font-size="12" fill="#57606a" font-family="sans-serif">图片大小、网格形状</text>
+      <text x="390" y="80" font-size="12" fill="#57606a" font-family="sans-serif">不参与拆批判定</text>
+      <text x="390" y="100" font-size="12" fill="#57606a" font-family="sans-serif">（BatchedField 哈希恒为空）</text>
+    </svg>
+
+    <h3 id="encode">3.3 编码</h3>
+    <p>每批数据以关键字参数展开传入 <code>model.embed_multimodal</code>，其内部对 image modality 调 <code>_process_image_input</code> 跑视觉编码器 forward，产出每个图片项的特征张量。调用处把模型对象当作 <code>SupportsMultiModal</code> 协议使用——协议只要求对象具有这些多模态方法，不依赖具体模型类，因此任何实现了该组方法的视觉语言模型都能走同一条编码路径。</p>
+
+    <h3 id="cache">3.4 缓存</h3>
+    <p>编码结果按图片哈希写入 <code>encoder_cache</code>。视觉编码只在图片首次被调度的 prefill 回合执行；decode 回合需要图片特征时直接读缓存（<code>_gather_mm_embeddings</code> 按 PlaceholderRange 取对应片段），不再跑 ViT。同一图片被多个请求使用时也命中同一缓存条目。</p>
+
+    <h2 id="why">4. 为什么这样分</h2>
+    <p>预处理是纯 CPU 工作——图片解码、缩放、归一化，放在 APIServer 可以用独立线程做，不占用引擎进程；视觉编码需要 GPU 与模型权重，必须靠近模型所在进程，且编码结果要立即进入缓存供后续回合使用。把重活留在离 GPU 最近的地方、轻活留在离请求最近的地方，是这条分界线的动机。</p>
+
+    <h2 id="ref">来源与范围说明</h2>
+    <h3>源码定位</h3>
+    <ul>
+      <li>前端链路：<code>vllm/entrypoints/chat_utils.py</code>（parse_chat_messages_async，1895）、<code>vllm/renderers/hf.py</code>（render_messages_async，1254）、<code>vllm/renderers/base.py</code>（_process_multimodal，672）、<code>vllm/multimodal/processing/processor.py</code>（apply，1663）、<code>vllm/transformers_utils/processor.py</code>（call_hf_processor_mm_only，531）、<code>vllm/multimodal/utils.py</code>（fetch_image，284）</li>
+      <li>smart_resize：<code>transformers/models/qwen2_vl/image_processing_qwen2_vl.py</code>（62）</li>
+      <li>后端链路：<code>vllm/v1/worker/gpu_model_runner.py</code>（_preprocess，3405；_execute_mm_encoder，2895；_batch_mm_inputs_from_scheduler，2852；_gather_mm_embeddings，3106；encoder_cache 写入，3100）</li>
+      <li>合批机制：<code>vllm/multimodal/utils.py</code>（_get_group_hash，135；_batch_mm_items，142；group_and_batch_mm_items，163；group_and_batch_mm_kwargs，211）、<code>vllm/multimodal/inputs.py</code>（MultiModalBatchedField，464；MultiModalSharedField，607）</li>
+      <li>编码：<code>vllm/model_executor/models/qwen3_vl.py</code>（embed_multimodal，2676；_process_image_input，2092）</li>
+      <li>占位符：<code>vllm/multimodal/inputs.py</code>（PlaceholderRange，119）</li>
+    </ul>
+    <h3>验证数据</h3>
+    <ul>
+      <li>smart_resize 数值：对 testdata 真实图片（980×986 与 2310×2310）用模型自带的 HF processor 实际运行得到</li>
+      <li>合批行为：对 group_and_batch_mm_kwargs 用真实 processor 输出实际运行——两张网格不同的图片合为一批（pixel_values 以列表返回），图片与音频拆为两批，字段集合不同的两张图拆为两批</li>
+      <li>trace 证据：<code>torch_profiles/TENCENT64.site_87521.async_llm.*.pt.trace.json.gz</code>（预处理函数分布）与 <code>torch_profiles/rank0.*.pt.trace.json.gz</code>（编码函数分布）</li>
+      <li>单元测试：社区仓库 <code>tests/multimodal/test_utils.py</code>（TestGroupAndBatchMmItems，本地安装包未含 tests，依据仓库路径与测试内容核对）</li>
+      <li>环境：vLLM 0.22.2.dev、Qwen3.5-0.8B（Qwen3_5ForConditionalGeneration）、TP=1 单机</li>
+    </ul>
+    <h3>边界</h3>
+    <ul>
+      <li>合批验证使用的输入由本地脚本构造（字段与真实 processor 输出一致），覆盖 modality 拆批、字段集合拆批、大小不拆三种情形；SharedField 数据不同的拆批情形依据源码与单元测试，未在本地复现</li>
+      <li>跨进程的编码缓存传输（ec_connector）不在本页范围</li>
+    </ul>
+
+    <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
+  </main>
+</body>
+</html>

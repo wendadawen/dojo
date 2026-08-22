@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="vLLM 多模态模型的 forward 输入统一为 inputs_embeds：不管 batch 是否含图，全部 token 先过 embedding 层，图片位置的特征用 is_multimodal 掩码覆写。格式统一使 cudagraph 只需捕获单一输入的图，decode 批次以 FULL 模式重放，大 prefill 因超出捕获尺寸走 eager。">
+  <meta name="dojo:summary" content="多模态模型（Qwen3.5）的模型 forward 有两个输入分支：inputs_embeds 直接使用、input_ids 过 embedding 层。图像特征只能以 embedding 形式进入，token id 无法承载。vLLM V1 的解法是统一输入：_preprocess 把全部 token 过 embed_input_ids，图片位置再用 is_multimodal 掩码覆写为 ViT 特征，纯文本 batch 也走同一路径。于是被 torch.compile 捕获的模型主体只有一种输入格式（v0 曾按两种输入各编译一张图）。dispatch 按 batch 形状选模式：decode 的 uniform 小批次命中 FULL 重放，983 token 的大 prefill 超出捕获尺寸走 eager。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="推理引擎">
+  <meta name="dojo:tag" content="vLLM">
+  <title>多模态模型统一以 inputs_embeds 输入，cudagraph 只需捕获单一格式的图 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.75 var(--body); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 3rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1, h2, h3 { font-family: var(--body); line-height: 1.3; }
+    h1 { margin: .5rem 0 1rem; font-size: 2.35rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.6rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.08rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    p { margin: 1.15rem 0; }
+    a { color: var(--accent); }
+    code { font: .84em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--soft); border: 1px solid var(--border); border-radius: 8px; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin: 1.5rem 0; padding: .2rem 1.25rem; border-left: 3px solid var(--border); color: var(--muted); }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .45rem 0; }
+    table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--ui); }
+    th, td { padding: .7rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { body { font-size: 17px; } .wrap { padding-top: 2rem; } h1 { font-size: 2rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav><a href="../../index.html">← 返回 Dojo</a></nav>
+    <header>
+      <span class="eyebrow">学习记录 · 推理引擎</span>
+      <h1>多模态模型统一以 inputs_embeds 输入，cudagraph 只需捕获单一格式的图</h1>
+      <p class="lead">模型 forward 的两个输入分支中，图像特征只能走 embedding；vLLM V1 让多模态模型的全部 token 都先过 embedding 层，图片位置再用 is_multimodal 掩码覆写为 ViT 特征，纯文本 batch 亦走同一路径。格式统一使被捕获的模型主体只有一种输入，decode 命中 FULL 重放，大 prefill 超出捕获尺寸走 eager。</p>
+      <p class="meta">更新于 2026-08-21 · 类型：源码走读结论（vLLM 0.22.2.dev，Qwen3.5，TP=1）</p>
+    </header>
+
+    <h2 id="problem">1. 问题：两种输入格式与 cudagraph 的固定性矛盾</h2>
+    <p>被 <code>support_torch_compile</code> 装饰的模型主体（如 <code>Qwen3LLMModel</code>）的 forward 里有一个输入分支：</p>
+<pre><code class="language-python">if inputs_embeds is not None:
+    hidden_states = inputs_embeds            # 分支一：直接使用 embedding
+else:
+    hidden_states = self.embed_input_ids(input_ids)  # 分支二：token id 过 embedding 层
+</code></pre>
+    <p>而 cudagraph 的特性是<strong>捕获的图固定不变</strong>：一次捕获录制一段固定的执行流程，之后每次重放的都是这段流程。这带来一个矛盾：图像特征是 ViT 输出的浮点向量，只能以 embedding 形式进入模型，token id 无法承载它；纯文本却天然是 token id。如果两种输入各走各的分支，被捕获的图就有两种形态，管理与调度都会变复杂。</p>
+
+    <h2 id="unify">2. 解法：统一成 inputs_embeds（一个格式，一张图）</h2>
+    <p><code>GPUModelRunner._preprocess</code> 的多模态分支（<code>supports_mm_inputs and is_first_rank and not is_encoder_decoder</code> 三个条件：模型支持多模态、流水线第一段、非编解码架构）统一执行如下流程：</p>
+
+    <svg viewBox="0 0 760 170" width="100%" style="max-width:700px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="统一 inputs embeds 流程">
+      <rect x="20" y="55" width="200" height="40" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="120" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">全部 token 过 embedding 层</text>
+      <rect x="270" y="55" width="220" height="40" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="380" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">图片位置覆写为 ViT 特征</text>
+      <rect x="540" y="55" width="200" height="40" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
+      <text x="640" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">inputs embeds 进模型</text>
+      <path d="M 220 75 L 266 75" stroke="#57606a" stroke-width="1.5" marker-end="url(#c1)"/>
+      <path d="M 490 75 L 536 75" stroke="#57606a" stroke-width="1.5" marker-end="url(#c1)"/>
+      <text x="380" y="130" text-anchor="middle" font-size="12" fill="#57606a">is multimodal 掩码：True 的位置换特征，False 的位置保留文本 embedding</text>
+      <defs>
+        <marker id="c1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+      </defs>
+    </svg>
+
+    <h3 id="mixed">2.1 混合 batch（既有纯文本请求又有图片请求）</h3>
+    <p>没有单独的"纯文本路径"。整个 batch 的所有 token 一起调 <code>embed_input_ids</code> 过 embedding 层，得到每个位置的文本 embedding；随后 <code>_merge_multimodal_embeddings</code> 用 <code>is_multimodal</code> 布尔掩码做一次覆写：<code>inputs_embeds[is_multimodal] = 图像特征</code>。掩码为 True 的位置（图片占位符处）被换成 ViT 特征，为 False 的位置（文本 token）保持原样。输出是一个形状统一的张量，纯文本请求与图片请求的区别只剩"每个位置的 embedding 来自哪里"。</p>
+
+    <h3 id="text-only">2.2 全纯文本 batch</h3>
+    <p>同样走这条路径：<code>_execute_mm_encoder</code> 发现没有待编码项直接返回，特征列表为空，<code>embed_input_ids</code> 检测到特征列表为空时跳过覆写、原样返回文本 embedding。也就是说，多模态模型上纯文本请求也承担一次 embedding 层计算——这是格式统一优先于单次计算开销的取舍。</p>
+
+    <h3 id="text-model">2.3 对比：纯文本模型走 input_ids</h3>
+    <p>非多模态模型走相反的取舍：<code>_preprocess</code> 的文本分支直接把 token id 作为输入，embedding 层留在模型主体内部。源码注释说明原因：若改用 embedding 输入，embedding 层就无法进入 CUDA graph，性能不划算。纯文本模型没有图像特征要拼，不存在格式统一的压力，自然选择让 embedding 层入图。</p>
+
+    <h3 id="v0">2.4 v0 双编译到 v1 单图</h3>
+    <p>V0 引擎的处理方式是对两种输入各编译一份 CUDA graph（注释原话 "double compiling the CUDA graph, once with input_ids and again with inputs_embeds"）。V1 改为统一 embedding 输入后，只需捕获一种输入格式的图，不再需要双份编译。</p>
+
+    <h2 id="dispatch">3. prefill 与 decode 的模式差异</h2>
+    <p>输入格式统一解决的是"图长什么样"；每步用不用 cudagraph、用哪种模式，由 <code>CudagraphDispatcher.dispatch</code> 按 batch 形状查表决定：token 数超出最大捕获尺寸、或该形状没有捕获记录时，返回 NONE（eager 执行）。</p>
+    <table>
+      <tr><th>场景</th><th>batch 特征</th><th>结果</th><th>trace 证据</th></tr>
+      <tr>
+        <td>decode</td>
+        <td>uniform 小批次（每请求 1 token），形状命中捕获记录</td>
+        <td>FULL 模式重放整个模型主体</td>
+        <td>19 次 cudagraph replay 全部落在 decode 段</td>
+      </tr>
+      <tr>
+        <td>大 prefill</td>
+        <td>983 token 单批，超出捕获尺寸上限</td>
+        <td>NONE，eager 执行</td>
+        <td>prefill 段（execute_context_1(983)）内 0 次 replay，但可见 dispatch 调用</td>
+      </tr>
+    </table>
+    <p>配置层面的默认模式是 <code>FULL_AND_PIECEWISE</code>：decode 批次用 FULL，prefill 与混合批次用 PIECEWISE（把注意力等不适合入图的算子留在图外，其余分段捕获）。本例的 983 token prefill 因尺寸超限进一步落到 eager，属于 dispatch 查表的自然结果，而非配置禁用。</p>
+
+    <h2 id="ref">来源与范围说明</h2>
+    <h3>源码定位</h3>
+    <ul>
+      <li>forward 分支：<code>vllm/model_executor/models/qwen3_vl.py</code>（Qwen3LLMModel forward 的 inputs_embeds 分支，1522；embed_input_ids，2747；support_torch_compile 装饰，1499）</li>
+      <li>统一输入：<code>vllm/v1/worker/gpu_model_runner.py</code>（_preprocess 多模态分支，3432 起；文本分支注释"not desirable for performance"，3489；v0 双编译注释，3468）</li>
+      <li>掩码覆写：<code>vllm/model_executor/models/utils.py</code>（_merge_multimodal_embeddings，456；覆写语句 inputs_embeds[is_multimodal]，477）</li>
+      <li>dispatch：<code>vllm/v1/cudagraph_dispatcher.py</code>（dispatch，239；尺寸超限返回 NONE，282）</li>
+      <li>模式定义：<code>vllm/config/compilation.py</code>（CUDAGraphMode，53；FULL_AND_PIECEWISE，63；模式说明 docstring，590 起）</li>
+    </ul>
+    <h3>trace 证据</h3>
+    <ul>
+      <li><code>torch_profiles/rank0.*.pt.trace.json.gz</code>：prefill 段（execute_context_1(983)_generation_0(0)，约 85ms）内 0 次 replay；其后 decode 段 19 次 replay（torch/cuda/graphs.py 的 replay）</li>
+      <li>环境：vLLM 0.22.2.dev、Qwen3.5-0.8B、TP=1 单机</li>
+    </ul>
+    <h3>边界</h3>
+    <ul>
+      <li>结论基于 Qwen3.5（decoder-only 多模态）；encoder-decoder 架构走独立分支（is_encoder_decoder 为真时不进多模态分支），不在本页范围</li>
+      <li>推测解码（EAGLE/MTP）与 cudagraph 的交互未在本次走读中覆盖</li>
+    </ul>
+
+    <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
+  </main>
+</body>
+</html>
