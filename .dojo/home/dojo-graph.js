@@ -311,8 +311,32 @@
       }
     }
     global3d.d3VelocityDecay(.45);
-    global3d.d3Force("charge").strength(-155);
+    global3d.d3Force("charge").strength(-155).distanceMax(360);
     global3d.d3Force("link").distance(52);
+    // 零连线节点没有弹簧约束，会被斥力一路推离主体成离散点；
+    // 斥力限制作用半径（distanceMax）之外，再向全图质心加弱引力把它们收住
+    global3d.d3Force("gravity", (alpha) => {
+      const nodes = global3d.graphData().nodes;
+      if (!nodes || !nodes.length) return;
+      let cx = 0;
+      let cy = 0;
+      let cz = 0;
+      for (let i = 0; i < nodes.length; i++) {
+        cx += nodes[i].x;
+        cy += nodes[i].y;
+        cz += nodes[i].z;
+      }
+      cx /= nodes.length;
+      cy /= nodes.length;
+      cz /= nodes.length;
+      const k = 0.045 * alpha;
+      for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        n.vx += (cx - n.x) * k;
+        n.vy += (cy - n.y) * k;
+        n.vz += (cz - n.z) * k;
+      }
+    });
     graph3dResize = new ResizeObserver(() => {
       if (!global3d) return;
       global3d.width(container.clientWidth).height(container.clientHeight);
@@ -344,5 +368,6 @@
     preload3d: load3dDependencies,
     focusGlobal,
     resize,
+    _graph3d: () => global3d,
   };
 }(window));
