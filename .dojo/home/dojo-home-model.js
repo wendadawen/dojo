@@ -86,7 +86,7 @@
     };
   }
 
-  function nodeFor(page, role = "normal") {
+  function nodeFor(page, role = "normal", match = true) {
     return {
       data: {
         id: page.id,
@@ -96,29 +96,40 @@
         type: page.type,
         topics: page.topics || [],
         role,
+        match,
         degree: (page.incoming_count || 0) + (page.outgoing_count || 0),
       },
     };
   }
 
-  function edgeFor(edge) {
+  function edgeFor(edge, matchIds) {
+    const match = !matchIds || matchIds.has(edge.source) || matchIds.has(edge.target);
     return {
       data: {
         id: edge.id,
         source: edge.source,
         target: edge.target,
         count: edge.count,
+        match,
       },
+      classes: match ? undefined : "is-adjacent",
     };
   }
 
-  function makeGlobalElements(catalog, visibleIds) {
+  function makeGlobalElements(catalog, visibleIds, matchIds) {
     const allowed = visibleIds || new Set(catalog.pages.map((page) => page.id));
     return {
-      nodes: catalog.pages.filter((page) => allowed.has(page.id)).map((page) => nodeFor(page)),
+      nodes: catalog.pages
+        .filter((page) => allowed.has(page.id))
+        .map((page) => {
+          const match = !matchIds || matchIds.has(page.id);
+          const node = nodeFor(page, "normal", match);
+          if (!match) node.classes = "is-adjacent";
+          return node;
+        }),
       edges: catalog.edges
         .filter((edge) => allowed.has(edge.source) && allowed.has(edge.target))
-        .map(edgeFor),
+        .map((edge) => edgeFor(edge, matchIds)),
     };
   }
 

@@ -135,7 +135,7 @@
       <h3>${model.escapeHtml(page.title)}</h3>
       <p class="detail-description">${model.escapeHtml(page.summary || page.description || "暂无摘要")}</p>
       <div class="detail-actions">
-        <a class="detail-open" href="${model.escapeHtml(page.path)}">阅读文档&nbsp; ↗</a>
+        <a class="detail-open" href="${model.escapeHtml(page.path)}" target="_blank" rel="noopener">阅读文档&nbsp; ↗</a>
       </div>
       ${relationGroup("引用本文", "篇", page.incoming || [], "incoming")}
       ${relationGroup("本文引用", "篇", page.outgoing || [], "outgoing")}`;
@@ -146,11 +146,23 @@
   async function renderMap() {
     if (!state.catalog) return;
     resetMapDetails();
-    const visibleIds = new Set(filteredPages().map((page) => page.id));
+    const matched = filteredPages();
+    const isFiltered = Boolean(state.query || state.type || state.topic);
+    const matchIds = isFiltered ? new Set(matched.map((page) => page.id)) : null;
+    // 搜索时把每个命中节点的引用和被引用（一跳邻居）一并纳入地图
+    const visibleIds = new Set(matchIds || matched.map((page) => page.id));
+    if (matchIds) {
+      for (const page of matched) {
+        (page.incoming || []).forEach((id) => visibleIds.add(id));
+        (page.outgoing || []).forEach((id) => visibleIds.add(id));
+      }
+    }
     const edgeCount = state.catalog.edges.filter(
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
     ).length;
-    elements.mapCount.textContent = `${visibleIds.size} 个节点 · ${edgeCount} 条引用`;
+    elements.mapCount.textContent = matchIds
+      ? `${matchIds.size} 篇匹配 · ${visibleIds.size} 个节点 · ${edgeCount} 条引用`
+      : `${visibleIds.size} 个节点 · ${edgeCount} 条引用`;
     elements.globalGraph.hidden = state.graphMode !== "2d";
     elements.globalGraph3d.hidden = state.graphMode !== "3d";
     graph.setMode(state.graphMode);
@@ -163,6 +175,7 @@
           visibleIds,
           renderMapDetails,
           resetMapDetails,
+          matchIds,
         );
       } else {
         graph.destroy3d();
@@ -172,6 +185,7 @@
           visibleIds,
           renderMapDetails,
           resetMapDetails,
+          matchIds,
         );
       }
       setStatus("");
@@ -192,6 +206,7 @@
           visibleIds,
           renderMapDetails,
           resetMapDetails,
+          matchIds,
         );
         setStatus("3D 不可用，当前显示 2D。", true);
         return;
@@ -276,7 +291,10 @@
     });
     document.addEventListener("click", (event) => {
       const open = event.target.closest("[data-open-path]");
-      if (open) window.location.href = open.dataset.openPath;
+      if (open) {
+        window.open(open.dataset.openPath, "_blank", "noopener");
+        return;
+      }
       const mapTarget = event.target.closest("[data-map-id]");
       if (mapTarget) {
         graph.focusGlobal(mapTarget.dataset.mapId, state.graphMode === "3d");

@@ -81,6 +81,8 @@
         },
       },
       { selector: ".is-dimmed", style: { opacity: .055 } },
+      { selector: "node.is-adjacent", style: { opacity: .38 } },
+      { selector: "edge.is-adjacent", style: { opacity: .12 } },
       {
         selector: "edge.is-focused",
         style: {
@@ -182,13 +184,13 @@
     hoveredId = null;
   }
 
-  function renderGlobal(container, catalog, visibleIds, onSelect, onClear) {
+  function renderGlobal(container, catalog, visibleIds, onSelect, onClear, matchIds) {
     requireCytoscape();
     destroyGlobal();
     selectedId = null;
     hoveredId = null;
     activeMode = "2d";
-    const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds);
+    const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds, matchIds);
     globalCy = root.cytoscape({
       container,
       elements: [...elements.nodes, ...elements.edges],
@@ -243,8 +245,8 @@
     });
   }
 
-  function graph3dData(catalog, visibleIds) {
-    const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds);
+  function graph3dData(catalog, visibleIds, matchIds) {
+    const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds, matchIds);
     return {
       nodes: elements.nodes.map((item) => ({ ...item.data })),
       links: elements.edges.map((item) => ({ ...item.data })),
@@ -355,12 +357,13 @@
     global3d
       .nodeColor((node) => {
         const base = nodeBaseColor(node);
-        return !focusId || isNeighbor(node.id, focusId) ? base : colorWithAlpha(base, .1);
+        if (focusId) return isNeighbor(node.id, focusId) ? base : colorWithAlpha(base, .1);
+        return node.match === false ? colorWithAlpha(base, .3) : base;
       })
       .linkColor((link) => (
         focusedLink(link)
           ? focusedLinkColor(link)
-          : colorWithAlpha(color.line, focusId ? .045 : .4)
+          : colorWithAlpha(color.line, focusId ? .045 : (link.match === false ? .12 : .4))
       ))
       .linkWidth((link) => focusedLink(link) ? .5 : .18)
       .linkDirectionalArrowLength((link) => focusedLink(link) ? 3.4 : 1.8)
@@ -410,7 +413,7 @@
     );
   }
 
-  async function render3d(container, catalog, visibleIds, onSelect, onClear) {
+  async function render3d(container, catalog, visibleIds, onSelect, onClear, matchIds) {
     destroy3d();
     selectedId = null;
     hoveredId = null;
@@ -420,13 +423,13 @@
     if (generation !== renderGeneration || activeMode !== "3d") return;
 
     graph3dContainer = container;
-    const data = graph3dData(catalog, visibleIds);
+    const data = graph3dData(catalog, visibleIds, matchIds);
     graph3dNeighbors = buildNeighborMap(data.links);
     graph3dNodes = new Map(data.nodes.map((node) => [node.id, node]));
     let fitted = false;
 
     global3d = root.ForceGraph3D()(container)
-      .backgroundColor(cssVar("--surface", "#fffefa"))
+      .backgroundColor(cssVar("--paper", "#f7f5ef"))
       .graphData(data)
       .showNavInfo(false)
       .nodeLabel(() => "")
