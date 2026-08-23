@@ -3,7 +3,6 @@
   let graph3dContainer = null;
   let graph3dResize = null;
   let graph3dNeighbors = new Map();
-  let graph3dNodes = new Map();
   let spriteTextClass = null;
   let forceGraph3dPromise = null;
   let selectedId = null;
@@ -11,7 +10,8 @@
   let activeMode = "3d";
   let renderGeneration = 0;
   let cameraListenerAbort = null;
-  const MAX_VISIBLE_LABELS = 8;
+  let graph3dSprites = new Map();
+  let labelFocusId = null;
 
   function cssVar(name, fallback) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
@@ -51,6 +51,8 @@
     global3d = null;
     graph3dContainer = null;
     hoveredId = null;
+    graph3dSprites.clear();
+    labelFocusId = null;
   }
 
   function pause3d() {
@@ -92,17 +94,34 @@
     return neighbors;
   }
 
-  function ranked3dIds(ids, limit) {
-    return [...ids]
-      .map((id) => graph3dNodes.get(id))
-      .filter(Boolean)
-      .sort((a, b) => (b.degree || 0) - (a.degree || 0))
-      .slice(0, limit)
-      .map((node) => node.id);
+  // 标签精灵按节点缓存：创建一次反复复用，hover 时只改颜色/字高，不重建对象
+  function labelSpriteFor(node) {
+    let sprite = graph3dSprites.get(node.id);
+    if (!sprite) {
+      sprite = new spriteTextClass(node.shortLabel);
+      sprite.material.depthWrite = false;
+      sprite.center.y = -.9;
+      sprite.textHeight = 5;
+      sprite.color = colors().ink;
+      graph3dSprites.set(node.id, sprite);
+    }
+    return sprite;
   }
 
-  function visible3dLabelIds() {
-    return new Set(graph3dNodes.keys());
+  function setLabelEmphasis(id) {
+    if (labelFocusId === id) return;
+    const palette = colors();
+    const previous = graph3dSprites.get(labelFocusId);
+    if (previous) {
+      previous.color = palette.ink;
+      previous.textHeight = 5;
+    }
+    const current = graph3dSprites.get(id);
+    if (current) {
+      current.color = palette.accent;
+      current.textHeight = 6.2;
+    }
+    labelFocusId = id;
   }
 
   function nodeId(value) {
@@ -153,11 +172,11 @@
     }
   }
 
+  // hover/点击时的强调更新：只改材质颜色，不重建标签与连线几何体
   function refresh3d() {
-    if (!global3d || !spriteTextClass) return;
+    if (!global3d) return;
     const color = colors();
     const focusId = selectedId || hoveredId;
-    const labelIds = visible3dLabelIds();
     const nodeBaseColor = (node) => (
       node.type === "paper" ? color.paper : node.type === "note" ? color.note : color.accent
     );
@@ -173,6 +192,7 @@
       linkDirection(link) === "incoming" ? color.incoming : color.outgoing
     );
 
+    setLabelEmphasis(focusId);
     global3d
       .nodeColor((node) => {
         const base = nodeBaseColor(node);
@@ -184,20 +204,9 @@
           ? focusedLinkColor(link)
           : colorWithAlpha(color.line, focusId ? .045 : (link.match === false ? .12 : .4))
       ))
-      .linkWidth((link) => focusedLink(link) ? .5 : .18)
-      .linkDirectionalArrowLength((link) => focusedLink(link) ? 3.4 : 1.8)
       .linkDirectionalArrowColor((link) => (
         focusedLink(link) ? focusedLinkColor(link) : colorWithAlpha(color.line, .32)
-      ))
-      .nodeThreeObject((node) => {
-        if (!labelIds.has(node.id)) return null;
-        const label = new spriteTextClass(node.shortLabel);
-        label.material.depthWrite = false;
-        label.color = node.id === focusId ? color.accent : color.ink;
-        label.textHeight = node.id === focusId ? 6.2 : 5;
-        label.center.y = -.9;
-        return label;
-      });
+      ));
   }
 
   function focus3dCamera(id, duration = 650) {
@@ -239,7 +248,6 @@
     graph3dContainer = container;
     const data = graph3dData(catalog, visibleIds, matchIds);
     graph3dNeighbors = buildNeighborMap(data.links);
-    graph3dNodes = new Map(data.nodes.map((node) => [node.id, node]));
     let fitted = false;
     // 用户一旦操作过视角，引擎停止时不再自动缩放到全图
     let userAdjustedCamera = false;
@@ -258,10 +266,13 @@
       .nodeResolution(18)
       .nodeOpacity(.96)
       .nodeThreeObjectExtend(true)
+      .nodeThreeObject((node) => labelSpriteFor(node))
       .linkOpacity(1)
+      .linkWidth(() => .18)
+      .linkDirectionalArrowLength(() => 1.8)
       .linkDirectionalArrowRelPos(1)
       .warmupTicks(50)
-      .cooldownTicks(260)
+      .cooldownTicks(180)
       .onNodeHover((node) => {
         hoveredId = node ? node.id : null;
         container.style.cursor = node ? "pointer" : "";
@@ -291,6 +302,15 @@
       controls.zoomSpeed = .55;
       controls.enablePan = true;
     }
+    // Retina 屏封顶 1.5 倍像素比：2 倍绘制像素近乎翻倍，视觉差异小、滚轮流畅度差异大
+    if (typeof global3d.renderer === "function") {
+      const renderer = global3d.renderer();
+      if (renderer && renderer.setPixelRatio) {
+        renderer.setPixelRatio(Math.min(root.devicePixelRatio || 1, 1.5));
+        renderer.getSize && renderer.setSize(graph3dContainer.clientWidth, graph3dContainer.clientHeight);
+      }
+    }
+    global3d.d3VelocityDecay(.45);
     global3d.d3Force("charge").strength(-155);
     global3d.d3Force("link").distance(52);
     graph3dResize = new ResizeObserver(() => {
