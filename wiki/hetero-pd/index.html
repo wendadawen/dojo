@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="NVIDIA P + AMD D 异构 PD 分离实测：proxy 双投递、三层握手、RDMA WRITE 传 KV；每 block 1351680 B 的字节构成、异构可行的条件与脆弱性、失败路径与实测时序。">
+  <meta name="dojo:summary" content="P（NVIDIA，HPC_ATTN）与 D（AMD，HYVL_INT8_ATTN）经 FlexibleConnector + NIXL + Mooncake + RoCE 做 PD 分离：proxy 按 request_id 双投递，P 只出 1 个 token，KV 以 1351680 B/block 原样 RDMA WRITE 推给 D。异构可行的硬条件是两侧 KV 布局逐字节相同；实测 KV 传输仅占端到端 0.12%。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="推理部署">
+  <meta name="dojo:tag" content="PD 分离">
+  <title>异构 PD 分离全链路 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #fff; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.75 var(--body); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 3rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1, h2, h3 { font-family: var(--body); line-height: 1.3; }
+    h1 { margin: .5rem 0 1rem; font-size: 2.35rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.6rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.08rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    p { margin: 1.15rem 0; }
+    a { color: var(--accent); }
+    code { font: .84em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--soft); border: 1px solid var(--border); border-radius: 8px; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin: 1.5rem 0; padding: .2rem 1.25rem; border-left: 3px solid var(--border); color: var(--muted); }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .45rem 0; }
+    table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--ui); }
+    th, td { padding: .7rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    figure { margin: 2rem 0; }
+    figure svg { width: 100%; height: auto; display: block; }
+    figcaption { margin-top: .6rem; color: var(--faint); font: 13px/1.5 var(--ui); text-align: center; }
+    footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { body { font-size: 17px; } .wrap { padding-top: 2rem; } h1 { font-size: 2rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav><a href="../../index.html">← 返回 Dojo</a></nav>
+    <header>
+      <span class="eyebrow">学习记录 · 推理部署</span>
+      <h1>异构 PD 分离全链路</h1>
+      <p class="lead">P 侧 NVIDIA 与 D 侧 AMD 的 attention backend、专家并行、网卡全不一样，KV 却能直接 RDMA 对拷。原因有两个：入口由 proxy 双投递、三层握手只交换元数据不动数据；传输层字节原样搬运，唯一硬条件是两侧 KV cache 布局逐字节相同。实测 KV 传输仅占端到端 0.12%，瓶颈在 decode。</p>
+      <p class="meta">更新于 2026-08-22 · 类型：部署实测归档</p>
+    </header>
+
+    <p>PD 分离（prefill/decode disaggregation，背景见<a href="../beyond-buzz-disaggregation/index.html">另一篇笔记</a>）把一次生成拆到两台机器：P 节点算完 prompt 的 <a href="../kv-cache/index.html">KV cache</a> 就交棒，D 节点拿着 KV 逐 token decode。实测环境两侧完全异构：</p>
+
+    <table>
+      <tr><th></th><th>P（prefill）</th><th>D（decode）</th></tr>
+      <tr><td>GPU</td><td>8× NVIDIA RTX PRO 5000 72GB（Blackwell）</td><td>8× AMD MI300X 192GB（ROCm）</td></tr>
+      <tr><td>attention backend</td><td>HPC_ATTN</td><td>HYVL_INT8_ATTN</td></tr>
+      <tr><td>专家并行 / 序列并发</td><td>EP=2 / max-num-seqs=32</td><td>EP=8 / max-num-seqs=64</td></tr>
+      <tr><td>RoCE 网卡命名</td><td>mlx5_bond_*</td><td>bnxt_re_bond*</td></tr>
+      <tr><td>connector / 角色</td><td>MultiConnector(Flexible+Offloading)，kv_both</td><td>FlexibleConnector，kv_consumer</td></tr>
+    </table>
+
+    <p>模型是 20B 级 MoE-VL（w8a8c8 量化），测试用例为一张 500×625 的 webp 图 + 「详细描述一下图像中的内容」，得到 362 个 prompt token（其中 340 个图像 token），生成 64 个 output token。传输组件为 FlexibleConnector + NIXL + Mooncake + RoCE。</p>
+
+    <h2>1. 入口分发：proxy 按 request_id 双投递</h2>
+
+    <p>请求入口不是任何一台 vLLM，而是跑在 P 节点上、独立于 vLLM 的 proxy（8000 端口）。proxy 把同一个 request_id 拆成两个请求投出去：给 P 的 <code>max_tokens=1</code>——只做 prefill、产出第一个 token；给 D 的 <code>max_tokens=真实值</code>，并在 <code>kv_transfer_params</code> 里带上 P 的控制面地址，D 由此知道去哪里等 KV。</p>
+
+    <figure>
+      <svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="入口分发拓扑">
+        <defs>
+          <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)"/></marker>
+          <marker id="arrm" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"/></marker>
+        </defs>
+        <rect x="20" y="120" width="120" height="52" rx="8" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="80" y="141" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">client (test.sh)</text>
+        <text x="80" y="159" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">/v1/chat/completions</text>
+
+        <rect x="230" y="112" width="180" height="68" rx="8" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="320" y="134" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">proxy · P 节点 :8000</text>
+        <foreignObject x="234" y="140" width="172" height="38">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.5 var(--mono);color:var(--muted);text-align:center;">独立于 vLLM<br/>同一 <span style="font-family:var(--mono)">request_id</span> 双投递</div>
+        </foreignObject>
+
+        <rect x="500" y="30" width="230" height="86" rx="8" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="615" y="52" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">P 节点 :8021</text>
+        <foreignObject x="504" y="58" width="222" height="54">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.6 var(--mono);color:var(--muted);text-align:center;"><span style="color:var(--text)">max_tokens=1</span>，只做 prefill<br/>算完 KV 推给 D</div>
+        </foreignObject>
+
+        <rect x="500" y="196" width="230" height="104" rx="8" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="615" y="218" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">D 节点 :8021</text>
+        <foreignObject x="504" y="224" width="222" height="72">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.6 var(--mono);color:var(--muted);text-align:center;"><span style="color:var(--text)">max_tokens=64</span>（真实值）<br/>kv_transfer_params:<br/>remote_prefill=P:33981<br/>负责全部 decode</div>
+        </foreignObject>
+
+        <line x1="140" y1="146" x2="222" y2="146" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr)"/>
+        <path d="M410,130 C450,120 460,90 494,76" fill="none" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr)"/>
+        <path d="M410,162 C450,172 460,220 494,242" fill="none" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <line x1="540" y1="196" x2="540" y2="120" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#arrm)"/>
+        <text x="532" y="128" text-anchor="end" font-family="var(--mono)" font-size="11" fill="var(--muted)">① D 连 P:33981 建连</text>
+        <line x1="680" y1="120" x2="680" y2="192" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#arrm)"/>
+        <text x="672" y="188" text-anchor="end" font-family="var(--mono)" font-size="11" fill="var(--muted)">② RDMA WRITE</text>
+      </svg>
+      <figcaption>图 1：入口拓扑。实线是 HTTP 请求路径，虚线是建连与 KV 传输路径。</figcaption>
+    </figure>
+
+    <p><strong>必须打 proxy 8000，不能直接打 8021</strong>。打错的表现完全不同，而且都很隐蔽：</p>
+
+    <table>
+      <tr><th>错误入口</th><th>实际发生什么</th><th>表现</th></tr>
+      <tr><td>直接打 P:8021</td><td>P 单机跑完全部 token，PD 完全没参与</td><td><code>request_decode_time_seconds=0</code>、<code>kv_transfer_e2e_time_ms=0</code>、<code>kv_transfer_params=null</code>；返回结果完全正常，<strong>极易误判为 PD 已生效</strong></td></tr>
+      <tr><td>直接打 D:8021 并手动塞 kv_transfer_params</td><td>D 挂起等 KV，但没有 proxy 通知 P 做 prefill</td><td>等满 120 s（<code>VLLM_TRANSFER_TIME_OUT</code>）后 KV transfer timeout，<code>finish_reason=abort</code>，只吐 1 个 token</td></tr>
+    </table>
+
+    <h2>2. 建连：三层握手</h2>
+
+    <p>请求到来之前，两侧要把 RDMA 通路建好。整个过程没有中心注册（无 etcd/redis）——P 的地址由 proxy 在请求里带给 D；也没有心跳，靠 TCP 长连接保活。</p>
+
+    <h3>第 1 层：Scheduler 间的 TCP 控制面</h3>
+    <p>P 启动时在 <code>VLLM_KV_META_BASE_PORT + dp_rank</code> 上监听（实测端口 33981），登记为 <code>kv_meta_addr</code>。D 主动连过来，双方互发 <code>(node_info, workers_info)</code>，并校验 TP 兼容性、计算 <code>compute_target_rank()</code>。</p>
+    <p><code>node_info</code> 是一个 15 字段的自我描述，其中三份信息分工明确：</p>
+    <table>
+      <tr><th>信息</th><th>内容</th><th>是否参与 compat_hash</th></tr>
+      <tr><td><code>compat_manifest</code></td><td>影响正确性的字段：<code>dtype</code>、<code>kv_cache_dtype</code>、<code>block_size</code>、<code>head_size</code>、<code>num_hidden_layers</code>、<code>attn_quant_config</code> 等</td><td>是</td></tr>
+      <tr><td><code>capabilities</code></td><td>异构字段：<code>attention_backend</code>、<code>moe_backend</code>、<code>gpu_name</code>、<code>ep_size</code>、<code>max_num_seqs</code> 等</td><td>否（故意排除）</td></tr>
+      <tr><td>寻址与并行度</td><td><code>kv_meta_addr</code>、<code>http_port</code>、<code>tp_size</code>、<code>total_num_kv_heads</code> 等</td><td>部分</td></tr>
+    </table>
+    <p>设计意图：<strong>正确性必须一致（manifest 参与哈希），性能实现可以各异（capabilities 不参与）</strong>。正因为后者不入哈希，P 用 HPC_ATTN/EP=2、D 用 HYVL_INT8_ATTN/EP=8 才能共存。<code>tp_size</code> 与 <code>total_num_kv_heads</code> 另有用途：两侧 TP 不等时，靠它们把远程 block id 重映射（<code>tp_ratio</code> / <code>head_offset</code>）。</p>
+    <p>隐患在于 <code>compat_hash</code> 只收集、不强制。类注释明写「This method only gathers information; it does NOT enforce any validation」——哈希不匹配时只是可被观测，不会拦住启动。</p>
+
+    <h3>第 2 层：NIXL agent 元数据交换（每个 TP rank 一对）</h3>
+    <p>每个 worker 调 <code>export_local_agent()</code> 导出一个二元组，经第 1 层的 TCP 通道转发给对端，对端 <code>import_remote_agent()</code> 消化。TP=8，所以共 8 对 agent。scheduler 只做转发与配对，真正的 RDMA 握手发生在 worker 之间。</p>
+    <table>
+      <tr><th>导出物</th><th>内容</th><th>性质</th></tr>
+      <tr><td><code>agent_metadata</code></td><td>RDMA 建连凭证，不透明二进制 blob</td><td>内部结构在 NIXL 库里，vLLM 只搬运不解析；按 RDMA 通用要素推测含 GID/QP/rkey（推断，未实证）</td></tr>
+      <tr><td><code>kv_mem_info</code></td><td>显存位置清单，每条四元组：(起始地址, 总字节数, GPU 序号, layer_name)</td><td>完全可实证；layer_name 只有 <code>"ALL_LAYERS"</code>（80 层打包成一块）</td></tr>
+    </table>
+    <p><code>kv_mem_info</code> 是同一个对象干两件事：交给 <code>register_memory(..., "VRAM")</code> 把显存注册给网卡（允许远程直接读写），同时发给对端声明「我的 KV cache 在哪、多大」。对端拿到后展开成 descriptor 列表：<code>addr[i] = base_addr + i × 1351680</code>。这就是 P 能算出「D 的第 N 个 block 落在哪个显存地址」的依据，建链时一次算好，请求时不再询问。</p>
+
+    <h3>第 3 层：RoCE 网卡自动选路（异构的关键）</h3>
+    <p>NIXL 走 Mooncake 后端时，创建 agent 前自动扫 <code>/sys/class/infiniband</code>，只保留满足三个条件的网卡：RoCE v2、IPv4 映射 GID、网卡 IP 不等于管控 IP（管理网卡没有到对端的 RoCE 通路）。筛选结果写进 <code>MC_TE_FILTERS</code>。两侧各筛出 8 张数据面网卡，正好对应 8 个 TP rank——尽管两边网卡命名体系完全不同（NVIDIA 的 <code>mlx5_bond_*</code> 与 AMD 的 <code>bnxt_re_bond*</code>）。</p>
+    <p>没有这份白名单时，Mooncake 会退化去用管理网卡，报 <code>Process failed for slice</code>；一张可用网卡都找不到时直接抛异常，代码注释的原话是「Failing loudly here beats a silent KV transfer timeout later」——宁可启动就响，不要事后静默超时。</p>
+
+    <figure>
+      <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三层握手时序">
+        <defs>
+          <marker id="arr2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)"/></marker>
+        </defs>
+        <rect x="120" y="16" width="200" height="36" rx="8" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="220" y="39" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">P scheduler（监听 :33981）</text>
+        <rect x="440" y="16" width="200" height="36" rx="8" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="540" y="39" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">D scheduler（主动发起）</text>
+        <line x1="220" y1="52" x2="220" y2="284" stroke="var(--border)" stroke-width="1.2"/>
+        <line x1="540" y1="52" x2="540" y2="284" stroke="var(--border)" stroke-width="1.2"/>
+
+        <line x1="536" y1="92" x2="228" y2="92" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr2)"/>
+        <foreignObject x="180" y="70" width="400" height="18">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.4 var(--mono);color:var(--text);text-align:center;">① ("decode_node", node_info, workers_info)</div>
+        </foreignObject>
+        <line x1="224" y1="124" x2="532" y2="124" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr2)"/>
+        <foreignObject x="180" y="102" width="400" height="18">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.4 var(--mono);color:var(--text);text-align:center;">(node_name, node_info, workers_info)</div>
+        </foreignObject>
+
+        <line x1="224" y1="176" x2="532" y2="176" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr2)"/>
+        <line x1="536" y1="168" x2="228" y2="168" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#arr2)"/>
+        <foreignObject x="180" y="146" width="400" height="18">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.4 var(--mono);color:var(--text);text-align:center;">② NIXL 元数据交换（8 对 agent）</div>
+        </foreignObject>
+        <foreignObject x="180" y="184" width="400" height="18">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.4 var(--mono);color:var(--muted);text-align:center;">(agent_metadata, kv_mem_info)，底层完成 RoCE QP 建连</div>
+        </foreignObject>
+
+        <rect x="60" y="222" width="640" height="56" rx="8" fill="var(--bg)" stroke="var(--border)"/>
+        <foreignObject x="70" y="228" width="620" height="44">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.7 var(--mono);color:var(--text);text-align:center;">③ prep_xfer_dlist()：预建 descriptor 列表<br/><span style="color:var(--muted)">addr[i] = base_addr + i × 1351680，len[i] = 1351680</span></div>
+        </foreignObject>
+      </svg>
+      <figcaption>图 2：建连三层握手。控制面走 TCP，数据面（RoCE QP）在元数据交换后由 Mooncake 建立。</figcaption>
+    </figure>
+
+    <h2>3. 一次请求的完整时序</h2>
+
+    <p>建连完成后，一次请求在数据面走五步：</p>
+    <ol>
+      <li><strong>双投递</strong>：proxy 把同一 request_id 分别发给 P（<code>max_tokens=1</code>）和 D（<code>max_tokens=64</code>）。</li>
+      <li><strong>D 分配 block 并告知 P</strong>：362 个 token 需要 6 个 block（每 block 64 slot，$6\times64=384 \geq 362$），D 把 <code>block_ids</code> 经控制面发给 P——相当于告诉 P「写到我的哪几个块」。</li>
+      <li><strong>P prefill</strong>：ViT 把图像编码为 [340, 4096]，拼进文本得到 [362, 4096]，过 80 层语言骨干，每层把 K/V 写进 KV cache，实测 ttft 约 150 ms。</li>
+      <li><strong>入队发送</strong>：<code>save_kv_layer()</code> 把 block 放进发送队列。实测走 unified 模式——最后一层算完后一次发全部 block；layerwise 模式（设 <code>VLLM_PD_LAYERWISE_THRESHOLD</code>）可边算边传以隐藏延迟，未启用。</li>
+      <li><strong>RDMA WRITE + decode</strong>：P 主动把 6 个 block 写进 D 的显存（descriptor 建链时已预建，请求时只做索引，这是传输能压到毫秒级的原因之一），D 收到完成通知后开始 decode。</li>
+    </ol>
+
+    <p>一组实测时序（前缀缓存命中，P 的 prefill 被部分跳过；关闭缓存的数据见第 7 节）：</p>
+    <table>
+      <tr><th>时刻</th><th>事件</th></tr>
+      <tr><td>15:54:03.902</td><td>proxy → D 收到请求（max_tokens=64）</td></tr>
+      <tr><td>15:54:03.904</td><td>proxy → P 收到同一 request_id（max_tokens=1）</td></tr>
+      <tr><td>15:54:04.017</td><td>P prefill 完成，ttft=0.126 s，image_tokens=340</td></tr>
+      <tr><td>15:54:04.024</td><td>D 侧日志 <code>[Decode Worker] KV recv done</code></td></tr>
+      <tr><td>15:54:04.025</td><td>P 侧日志 <code>[Prefill Worker] KV send done</code>：6 blocks / 8110080 B / 6.9 ms / 1.09 GB/s</td></tr>
+      <tr><td>15:54:06.545</td><td>D 全部完成：64 token，端到端 2.64 s</td></tr>
+    </table>
+
+    <h2>4. KV 的字节构成：1351680 是怎么来的</h2>
+
+    <p>传输的最小单元是 block，一个 block 打包全部 80 层（cross-layer 模式，layer_name 只有 <code>ALL_LAYERS</code> 一个 key）。每个 block 恰好 1351680 字节，可由模型参数直接推导：</p>
+
+    $$1351680 = \underbrace{2}_{K,V} \times \underbrace{64}_{\text{block\_size}} \times \underbrace{1}_{\text{KV head/rank}} \times \underbrace{132}_{128\ \text{head\_size} + 4} \times \underbrace{80}_{\text{层数}} = 16896\ \text{B/层} \times 80\ \text{层}$$
+
+    <ul>
+      <li><strong>KV head 每 rank 1 个</strong>：模型 GQA 共 8 个 KV head（64 个 Q head 共享 8 个 KV head，8:1），TP=8 切下来每 rank 恰好 1 个。</li>
+      <li><strong>132 = 128 + 4</strong>：每行 128 字节数据加 4 个元素的 scale 尾部。K 的 scale 是动态值（per-token-per-head 量化，每 32 个 token 一组 fp32），必须随数据走，内嵌在 block 尾部；V 的 scale 是静态 per-head 值，直接从 checkpoint 的 <code>_v_scale</code> 读，不进 cache，槽位空置（约 3% 浪费）。</li>
+      <li><strong>D 侧读取用零拷贝视图</strong>：<code>split_hyvl_kv_cache()</code> 把 (64, 132) reshape 成 (66, 128)——前 64 行是 KV 数据，后 2 行是 scale（64/32=2 组），不搬数据。</li>
+    </ul>
+
+    <figure>
+      <svg viewBox="0 0 760 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="block 内字节布局">
+        <defs>
+          <marker id="arr3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"/></marker>
+        </defs>
+        <text x="380" y="26" text-anchor="middle" font-family="var(--ui)" font-size="13" fill="var(--text)">1 层 × 1 KV head = 16896 B（分配视角 2 × 64 × 132）</text>
+
+        <rect x="70" y="46" width="290" height="34" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="215" y="68" text-anchor="middle" font-family="var(--mono)" font-size="12" fill="var(--text)">K 数据 · int8 · 64 行 × 128 B</text>
+        <rect x="70" y="84" width="290" height="20" fill="var(--bg)" stroke="var(--accent)" stroke-dasharray="4 3"/>
+        <text x="215" y="99" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">K scale · fp32 · 2 行（每 32 token 一组，动态）</text>
+
+        <rect x="400" y="46" width="290" height="34" fill="var(--soft)" stroke="var(--border)"/>
+        <foreignObject x="404" y="52" width="282" height="22">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:12px/1.5 var(--mono);color:var(--text);text-align:center;">V 数据 · fp8_e4m3 · 64 行 × 128 B</div>
+        </foreignObject>
+        <rect x="400" y="84" width="290" height="20" fill="var(--bg)" stroke="var(--border)" stroke-dasharray="4 3"/>
+        <text x="545" y="99" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">V scale 槽位 · 空置（静态值在 checkpoint）</text>
+
+        <path d="M215,112 C215,140 190,146 190,164" fill="none" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#arr3)"/>
+        <path d="M545,112 C545,140 570,146 570,164" fill="none" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#arr3)"/>
+
+        <rect x="120" y="170" width="520" height="40" rx="8" fill="var(--soft)" stroke="var(--border)"/>
+        <text x="380" y="188" text-anchor="middle" font-family="var(--mono)" font-size="12.5" fill="var(--text)">1 个 block = 80 层 × 16896 B = 1351680 B</text>
+        <foreignObject x="130" y="192" width="500" height="16">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.4 var(--mono);color:var(--muted);text-align:center;">6 blocks × 64 slot = 384 $\geq$ 362 prompt token；8 rank 并行共 61.9 MiB</div>
+        </foreignObject>
+      </svg>
+      <figcaption>图 3：block 内布局。K 半块与 V 半块各 66 行（64 行数据 + 2 行 scale 位），每半块 8448 B。</figcaption>
+    </figure>
+
+    <p>实测速率：关闭前缀缓存后单 rank 传输 8110080 B 用时 4.4 ms（约 1.70 GB/s，热路径）；冷路径 17.8 ms（约 0.42 GB/s）。日志中 GB/s 按 $10^9$ 基数计算。</p>
+
+    <h2>5. 异构可行的条件与脆弱性</h2>
+
+    <p>传输层不做任何格式转换——字节原样 RDMA WRITE，D 侧按自己的 backend 解释。所以两个不同的 backend 能直接对拷，不是碰巧，而是<strong>两侧独立算出了逐字节相同的 KV 布局</strong>：</p>
+
+    <table>
+      <tr><th></th><th>P 侧 HPC_ATTN</th><th>D 侧 HYVL_INT8_ATTN</th></tr>
+      <tr><td><code>get_kv_cache_shape()</code></td><td>(nb, 2, block_size, num_kv_heads, head_size + padded)</td><td>(nb, 2, block_size, num_kv_heads, head_size + K_SCALE_BYTES)</td></tr>
+      <tr><td>尾部字节数</td><td><strong>动态算</strong>（见下）</td><td><strong>固定 4</strong>（K_SCALE_BYTES）</td></tr>
+      <tr><td>代入结果</td><td>(nb, 2, 64, 1, 132)</td><td>(nb, 2, 64, 1, 132) — 相同</td></tr>
+    </table>
+
+    <p>P 侧的尾部字节数由 <code>_fp8_per_head_scale_elems_padded()</code> 计算：</p>
+
+    $$\text{raw} = 4,\qquad \text{unit} = \frac{\text{head\_size}}{\gcd(\text{block\_size},\ \text{head\_size})},\qquad \text{elems} = \left\lceil \frac{\text{raw}}{\text{unit}} \right\rceil \times \text{unit}$$
+
+    <p>约束来自零拷贝 reshape：cache 按 (block_size, head_size+elems) 分配、运行时 reshape 成 (pad_total_rows, head_size)，元素总数必须守恒，所以 elems × block_size 必须能被 head_size 整除。代入 block_size=64、head_size=128：$\gcd(64,128)=64$，unit = 2，elems = 4——与 D 侧固定值恰好一致，两侧每层每 block 同为 16896 B。</p>
+
+    <p><strong>这个一致是脆弱的、靠参数组合碰上的</strong>。反例：head_size=192、block_size=64 时 $\gcd=64$、unit=3、elems=6 $\neq$ 4，两侧布局就不再匹配；而第 2 节说过 <code>compat_hash</code> 只报告不阻止——布局错配会变成静默的数据损坏风险，只能在观测侧发现。</p>
+
+    <p>另有两处「允许不同」：一是 <code>block_stride</code>，P 若走 cross-layer split KV 则 stride=2，D 的 backend 不 split 则 stride=1，两侧各用各自的 stride 计算索引（descriptor 长度建链时已按对端参数算好）；二是 D 侧代码注释明确 HYVL_INT8_ATTN 不能加进 K/V-outer 布局的 backend 集合——它是 NHD 序且 scale 内嵌在每个 head 尾部，属于另一套布局约定。</p>
+
+    <h2>6. 失败路径与可观测点</h2>
+
+    <table>
+      <tr><th>场景</th><th>行为</th></tr>
+      <tr><td>NIXL 传输失败</td><td><code>check_xfer_state(handle) != "DONE"</code> → 记 error、加入 failed_agents、尝试 <code>reconnect_remote_agent()</code>；重连失败则该 agent 置 None 后续跳过</td></tr>
+      <tr><td>D 收不到 KV</td><td>scheduler 检查 <code>VLLM_TRANSFER_TIME_OUT</code>（默认 120 s）超时 → 广播 kv_timeout → worker 清理待发送块 → 请求 abort</td></tr>
+      <tr><td>P 侧 prefill 失败</td><td>主动发 <code>prefill_failed</code> 通知 D，D 立即释放请求，不用等满 120 s</td></tr>
+      <tr><td>kv_load_failure_policy 不一致</td><td>P 配了 recompute 但 D 启动命令没给该参数、实际生效 fail → D 没有 recompute 兜底，拿不到 KV 只能超时 abort</td></tr>
+    </table>
+
+    <p>D 侧超时日志（ttft 恰好 120.010 s、只吐 1 个 token 是特征）：</p>
+    <pre><code>[scheduler.py] KV transfer timeout for requests: ['96e84c9bb06d25ca']
+[flexible_connector.py] KV timeout for [...], no need to send kvcache!
+Finished request: ... finish_reason=abort, ttft=120.010s, output_tokens=1</code></pre>
+
+    <p>排障时直接搜这些日志字符串（P 侧发送 / D 侧接收 / 建连 / 选路 / 失败）：</p>
+    <pre><code>L=<service.log 路径>   # 注意 grep -a：日志含二进制字符
+
+grep -a "\[Prefill Worker\] KV send done"  $L   # P 侧 KV 发送
+grep -a "\[Decode Worker\] KV recv done"   $L   # D 侧 KV 接收
+grep -a "Connected to remote NIXL agent\|Connected to remote prefill" $L
+grep -a "Mooncake host IP pinned\|Mooncake IB device whitelist"       $L
+grep -a "KV transfer timeout\|NIXL transfer failed\|prefill_failed"   $L</code></pre>
+
+    <p>另外两个字符串 <code>kv_send_start</code> / <code>kv_recv_done</code> 与社区版本不同，日志里搜不到。指标侧有 <code>vllm:flexible_connector_*</code> 系列（connect_attempts / connect_failures / nixl_send_ops / nixl_send_time_seconds_total / nixl_send_bytes / nixl_recv_timeouts）和直方图 <code>vllm:kv_transfer_e2e_time_seconds</code>；其中 nixl_send_time 与 bytes 来自 NIXL 自身 telemetry（日志里 <code>source=nixl_telemetry</code>），是硬件级数据而非时钟估算。</p>
+
+    <h2>7. 实测结论：传输不是瓶颈</h2>
+
+    <p>关掉前缀缓存后的干净数据（cached_tokens=0，362 prompt / 64 output）：</p>
+
+    <table>
+      <tr><th>阶段</th><th>耗时</th><th>占比</th></tr>
+      <tr><td>proxy 分发 + P prefill</td><td>约 150 ms</td><td>4%</td></tr>
+      <tr><td>KV RDMA 传输</td><td>4.4 ms</td><td><strong>0.12%</strong></td></tr>
+      <tr><td>D decode（64 token @ 17.3 tok/s）</td><td>3.48 s</td><td><strong>96%</strong></td></tr>
+    </table>
+
+    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么；单请求吞吐上，走 PD（20.3 tok/s）比 D 本机跑全程（23.5 tok/s）略慢，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
+
+    <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。多请求并发下的整体吞吐才是 PD 的收益所在，单请求对比体现不出来。</p>
+
+    <h3>复现要点</h3>
+    <ul>
+      <li>入口必须走 proxy 的 8000 端口，不要直连任一侧的 8021。</li>
+      <li>关前缀缓存两侧注入方式不同：一侧写系统 environment 文件即可生效（启动脚本经 <code>ssh bash -l</code> 拉起、只透传白名单变量，但 ssh 层会 source 它）；另一侧的启动脚本 source 的平台环境文件里硬编码 <code>VLLM_ENABLE_PREFIX_CACHING="1"</code> 且只读，只能在 source 之后再 export 覆盖。</li>
+      <li>验证 PD 生效：两侧分别 grep <code>KV send done</code> / <code>KV recv done</code>。</li>
+      <li>重启前确认显存归零（NVIDIA 侧 <code>nvidia-smi --query-gpu=memory.used</code>，AMD 侧 <code>rocm-smi</code>），否则 OOM；清残留进程时不要用 <code>pkill -f "VLLM::"</code> 全局名字匹配——会误伤平台管控进程（实测曾把一台节点打成不可达），应先定位 <code>vllm serve</code> 主进程再按进程树 kill。</li>
+    </ul>
+
+    <h2>来源与范围说明</h2>
+    <table>
+      <tr><th>内容</th><th>依据</th></tr>
+      <tr><td>全部数字、日志与时序</td><td>内部实测记录（异构 PD 部署，2026-08）：两侧服务日志的内建 timing 与 PD 事件日志、config、代码走读、torch profiler 四类数据源</td></tr>
+      <tr><td>握手与传输机制</td><td>vLLM <code>flexible_connector.py</code>：<code>node_info</code> / <code>compat_manifest</code> / <code>export_local_agent()</code> / <code>prep_xfer_dlist()</code> / <code>import_remote_agent()</code> 等（以符号名为准，行号随版本漂移）</td></tr>
+      <tr><td>KV 布局</td><td><code>hpc_attn.py</code> 的 <code>_fp8_per_head_scale_elems_padded()</code>；<code>hyvl_int8_attn.py</code> 的 <code>K_SCALE_BYTES</code> 与 <code>split_hyvl_kv_cache()</code></td></tr>
+      <tr><td>agent_metadata 内部结构（GID/QP/rkey）</td><td>推断，非代码实证；源记录已标注</td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:14px">范围：只覆盖 PD 链路；模型结构（ViT/MoE/config 细节）与 D 侧 kernel 级耗时分析（cos_sin_cache 重复转换、all-reduce 自旋等待）不在其中。相关阅读：<a href="../beyond-buzz-disaggregation/index.html">PD 分离动机</a>、<a href="../kv-cache/index.html">KV cache 基础</a>、<a href="../gpu-communication/index.html">GPU 通信</a>、<a href="../model-parallelism/index.html">并行方式</a>。</p>
+
+    <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
+  </main>
+</body>
+</html>
