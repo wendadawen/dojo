@@ -14,13 +14,10 @@
     count: document.getElementById("result-count"),
     empty: document.getElementById("empty-state"),
     clear: document.getElementById("clear-filters"),
-    globalGraph: document.getElementById("global-graph"),
     globalGraph3d: document.getElementById("global-graph-3d"),
     mapWorkspace: document.getElementById("map-workspace"),
     mapDetails: document.getElementById("map-details"),
-    graphModes: [...document.querySelectorAll("[data-graph-mode]")],
   };
-  const initialGraphMode = window.matchMedia("(max-width: 760px)").matches ? "2d" : "3d";
   const SORT_STORAGE_KEY = "dojo-home-sort";
   const SORT_OPTIONS = new Set(["newest", "oldest", "title"]);
 
@@ -48,7 +45,6 @@
     topic: "",
     sort: loadStoredSort(),
     view: "library",
-    graphMode: initialGraphMode,
   };
   let last3dKey = null;
 
@@ -156,74 +152,28 @@
         (page.outgoing || []).forEach((id) => visibleIds.add(id));
       }
     }
-    elements.globalGraph.hidden = state.graphMode !== "2d";
-    elements.globalGraph3d.hidden = state.graphMode !== "3d";
-    graph.setMode(state.graphMode);
+    elements.globalGraph3d.hidden = false;
     try {
-      if (state.graphMode === "3d") {
-        graph.destroyGlobal();
-        const mapKey = `${state.query}|${state.type}|${state.topic}`;
-        if (graph.has3d() && mapKey === last3dKey) {
-          graph.resume3d();
-          setStatus("");
-          return;
-        }
-        last3dKey = mapKey;
-        await graph.render3d(
-          elements.globalGraph3d,
-          state.catalog,
-          visibleIds,
-          renderMapDetails,
-          resetMapDetails,
-          matchIds,
-        );
-      } else {
-        graph.destroy3d();
-        graph.renderGlobal(
-          elements.globalGraph,
-          state.catalog,
-          visibleIds,
-          renderMapDetails,
-          resetMapDetails,
-          matchIds,
-        );
-      }
-      setStatus("");
-    } catch (error) {
-      if (state.graphMode === "3d") {
-        state.graphMode = "2d";
-        elements.graphModes.forEach((button) => {
-          const active = button.dataset.graphMode === "2d";
-          button.classList.toggle("is-active", active);
-          button.setAttribute("aria-pressed", String(active));
-        });
-        elements.globalGraph.hidden = false;
-        elements.globalGraph3d.hidden = true;
-        graph.destroy3d();
-        graph.renderGlobal(
-          elements.globalGraph,
-          state.catalog,
-          visibleIds,
-          renderMapDetails,
-          resetMapDetails,
-          matchIds,
-        );
-        setStatus("3D 不可用，当前显示 2D。", true);
+      const mapKey = `${state.query}|${state.type}|${state.topic}`;
+      if (graph.has3d() && mapKey === last3dKey) {
+        graph.resume3d();
+        setStatus("");
         return;
       }
+      last3dKey = mapKey;
+      await graph.render3d(
+        elements.globalGraph3d,
+        state.catalog,
+        visibleIds,
+        renderMapDetails,
+        resetMapDetails,
+        matchIds,
+      );
+      setStatus("");
+    } catch (error) {
       elements.mapDetails.innerHTML = `<div class="map-empty"><h3>知识地图错误</h3><p>${model.escapeHtml(error.message)}</p></div>`;
       setStatus("知识地图错误。", true);
     }
-  }
-
-  function setGraphMode(mode) {
-    state.graphMode = mode;
-    elements.graphModes.forEach((button) => {
-      const active = button.dataset.graphMode === mode;
-      button.classList.toggle("is-active", active);
-      button.setAttribute("aria-pressed", String(active));
-    });
-    if (state.view === "map") renderMap();
   }
 
   function setView(view) {
@@ -238,7 +188,6 @@
     if (view === "map" && state.catalog) {
       renderMap();
     } else {
-      graph.destroyGlobal();
       graph.pause3d();
     }
   }
@@ -281,10 +230,20 @@
       });
     }
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
-    elements.graphModes.forEach((button) => {
-      button.addEventListener("click", () => setGraphMode(button.dataset.graphMode));
-    });
     elements.clear.addEventListener("click", clearFilters);
+    // 悬停卡片时预取对应文档，点开时基本不用等
+    const prefetched = new Set();
+    elements.grid.addEventListener("mouseover", (event) => {
+      const card = event.target.closest("[data-open-path]");
+      if (!card) return;
+      const path = card.dataset.openPath;
+      if (prefetched.has(path)) return;
+      prefetched.add(path);
+      const link = document.createElement("link");
+      link.rel = "prefetch";
+      link.href = path;
+      document.head.appendChild(link);
+    });
     document.addEventListener("click", (event) => {
       const open = event.target.closest("[data-open-path]");
       if (open) {
@@ -293,7 +252,7 @@
       }
       const mapTarget = event.target.closest("[data-map-id]");
       if (mapTarget) {
-        graph.focusGlobal(mapTarget.dataset.mapId, state.graphMode === "3d");
+        graph.focusGlobal(mapTarget.dataset.mapId, true);
         renderMapDetails(mapTarget.dataset.mapId);
       }
     });
@@ -335,11 +294,6 @@
   }
 
   bindEvents();
-  elements.graphModes.forEach((button) => {
-    const active = button.dataset.graphMode === state.graphMode;
-    button.classList.toggle("is-active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
   resetMapDetails();
   load();
 }());

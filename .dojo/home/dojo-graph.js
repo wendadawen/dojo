@@ -1,5 +1,4 @@
 (function attachDojoGraph(root) {
-  let globalCy = null;
   let global3d = null;
   let graph3dContainer = null;
   let graph3dResize = null;
@@ -9,8 +8,9 @@
   let forceGraph3dPromise = null;
   let selectedId = null;
   let hoveredId = null;
-  let activeMode = "2d";
+  let activeMode = "3d";
   let renderGeneration = 0;
+  let cameraListenerAbort = null;
   const MAX_VISIBLE_LABELS = 8;
 
   function cssVar(name, fallback) {
@@ -31,147 +31,16 @@
     };
   }
 
-  function graphStyle() {
-    const color = colors();
-    return [
-      {
-        selector: "node",
-        style: {
-          label: "",
-          width: "mapData(degree, 0, 17, 15, 28)",
-          height: "mapData(degree, 0, 17, 15, 28)",
-          "background-color": color.accent,
-          "border-width": 2,
-          "border-color": color.surface,
-          "overlay-opacity": 0,
-        },
-      },
-      {
-        selector: "node.show-label",
-        style: {
-          label: "data(shortLabel)",
-          color: color.ink,
-          "font-size": 10,
-          "font-family": "system-ui, sans-serif",
-          "font-weight": 600,
-          "text-wrap": "wrap",
-          "text-max-width": 96,
-          "text-valign": "bottom",
-          "text-margin-y": 8,
-          "text-background-color": color.surface,
-          "text-background-opacity": .86,
-          "text-background-padding": 2,
-          "text-background-shape": "roundrectangle",
-          "min-zoomed-font-size": 7,
-        },
-      },
-      { selector: 'node[type = "paper"]', style: { "background-color": color.paper } },
-      { selector: 'node[type = "note"]', style: { "background-color": color.note } },
-      {
-        selector: "edge",
-        style: {
-          width: 1.1,
-          opacity: .32,
-          "line-color": color.line,
-          "target-arrow-color": color.line,
-          "target-arrow-shape": "triangle",
-          "arrow-scale": .65,
-          "curve-style": "bezier",
-          "overlay-opacity": 0,
-        },
-      },
-      { selector: ".is-dimmed", style: { opacity: .055 } },
-      { selector: "node.is-adjacent", style: { opacity: .38 } },
-      { selector: "edge.is-adjacent", style: { opacity: .12 } },
-      {
-        selector: "edge.is-focused",
-        style: {
-          opacity: .96,
-          width: 2.35,
-          "line-color": color.accent,
-          "target-arrow-color": color.accent,
-          "arrow-scale": .8,
-        },
-      },
-      {
-        selector: "edge.is-incoming",
-        style: {
-          opacity: .98,
-          width: 2.6,
-          "line-color": color.incoming,
-          "target-arrow-color": color.incoming,
-          "arrow-scale": .85,
-        },
-      },
-      {
-        selector: "edge.is-outgoing",
-        style: {
-          opacity: .98,
-          width: 2.6,
-          "line-color": color.outgoing,
-          "target-arrow-color": color.outgoing,
-          "arrow-scale": .85,
-        },
-      },
-      {
-        selector: "node.is-focused",
-        style: {
-          opacity: 1,
-          width: 29,
-          height: 29,
-          "border-width": 4,
-          "border-color": color.surface,
-          "font-size": 12,
-          "text-max-width": 120,
-          "text-background-opacity": 1,
-          "text-background-padding": 3,
-          "min-zoomed-font-size": 6,
-          "z-index": 20,
-        },
-      },
-    ];
-  }
 
-  function requireCytoscape() {
-    if (!root.cytoscape) throw new Error("Cytoscape 未加载");
-  }
 
-  function clearFocus(cy) {
-    cy.elements().removeClass("is-focused is-dimmed is-incoming is-outgoing show-label");
-  }
 
-  function topNodes(nodes, limit = MAX_VISIBLE_LABELS) {
-    return nodes
-      .slice()
-      .sort((a, b) => (b.data("degree") || 0) - (a.data("degree") || 0))
-      .slice(0, limit);
-  }
 
-  function showCoreLabels(cy) {
-    cy.nodes().removeClass("show-label");
-    topNodes(cy.nodes().toArray()).forEach((node) => node.addClass("show-label"));
-  }
 
-  function focusNode(cy, node) {
-    const neighborhood = node.closedNeighborhood();
-    clearFocus(cy);
-    cy.elements().not(neighborhood).addClass("is-dimmed");
-    neighborhood.addClass("is-focused");
-    node.connectedEdges().forEach((edge) => {
-      edge.addClass(edge.target().id() === node.id() ? "is-incoming" : "is-outgoing");
-    });
-    const neighbors = topNodes(node.neighborhood("node").toArray(), MAX_VISIBLE_LABELS - 1);
-    node.addClass("show-label");
-    neighbors.forEach((neighbor) => neighbor.addClass("show-label"));
-  }
 
-  function destroyGlobal() {
-    if (globalCy) globalCy.destroy();
-    globalCy = null;
-  }
 
   function destroy3d() {
     renderGeneration += 1;
+    if (cameraListenerAbort) cameraListenerAbort.abort();
     if (graph3dResize) graph3dResize.disconnect();
     graph3dResize = null;
     if (global3d) {
@@ -201,66 +70,6 @@
     return true;
   }
 
-  function renderGlobal(container, catalog, visibleIds, onSelect, onClear, matchIds) {
-    requireCytoscape();
-    destroyGlobal();
-    selectedId = null;
-    hoveredId = null;
-    activeMode = "2d";
-    const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds, matchIds);
-    globalCy = root.cytoscape({
-      container,
-      elements: [...elements.nodes, ...elements.edges],
-      style: graphStyle(),
-      minZoom: .25,
-      maxZoom: 2.6,
-      wheelSensitivity: .2,
-      layout: {
-        name: "cose",
-        animate: false,
-        fit: true,
-        padding: 68,
-        randomize: true,
-        componentSpacing: 130,
-        nodeRepulsion: 22000,
-        nodeOverlap: 70,
-        idealEdgeLength: 145,
-        edgeElasticity: 80,
-        nestingFactor: 1.15,
-        gravity: .32,
-        numIter: 2400,
-        nodeDimensionsIncludeLabels: false,
-      },
-    });
-    showCoreLabels(globalCy);
-
-    globalCy.on("tap", "node", (event) => {
-      selectedId = event.target.id();
-      focusNode(globalCy, event.target);
-      onSelect(selectedId);
-    });
-
-    globalCy.on("mouseover", "node", (event) => {
-      container.style.cursor = "pointer";
-      if (!selectedId) focusNode(globalCy, event.target);
-    });
-
-    globalCy.on("mouseout", "node", () => {
-      container.style.cursor = "";
-      if (!selectedId) {
-        clearFocus(globalCy);
-        showCoreLabels(globalCy);
-      }
-    });
-
-    globalCy.on("tap", (event) => {
-      if (event.target !== globalCy) return;
-      selectedId = null;
-      clearFocus(globalCy);
-      showCoreLabels(globalCy);
-      if (onClear) onClear();
-    });
-  }
 
   function graph3dData(catalog, visibleIds, matchIds) {
     const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds, matchIds);
@@ -292,15 +101,8 @@
       .map((node) => node.id);
   }
 
-  function visible3dLabelIds(focusId) {
-    if (!focusId) {
-      return new Set(ranked3dIds(graph3dNodes.keys(), MAX_VISIBLE_LABELS));
-    }
-    const neighbors = graph3dNeighbors.get(focusId) || new Set();
-    return new Set([
-      focusId,
-      ...ranked3dIds(neighbors, MAX_VISIBLE_LABELS - 1),
-    ]);
+  function visible3dLabelIds() {
+    return new Set(graph3dNodes.keys());
   }
 
   function nodeId(value) {
@@ -355,7 +157,7 @@
     if (!global3d || !spriteTextClass) return;
     const color = colors();
     const focusId = selectedId || hoveredId;
-    const labelIds = visible3dLabelIds(focusId);
+    const labelIds = visible3dLabelIds();
     const nodeBaseColor = (node) => (
       node.type === "paper" ? color.paper : node.type === "note" ? color.note : color.accent
     );
@@ -391,12 +193,7 @@
         if (!labelIds.has(node.id)) return null;
         const label = new spriteTextClass(node.shortLabel);
         label.material.depthWrite = false;
-        label.color = color.ink;
-        label.backgroundColor = node.id === focusId
-          ? "rgba(255,254,250,.96)"
-          : "rgba(255,254,250,.72)";
-        label.padding = 1.2;
-        label.borderRadius = .8;
+        label.color = node.id === focusId ? color.accent : color.ink;
         label.textHeight = node.id === focusId ? 6.2 : 5;
         label.center.y = -.9;
         return label;
@@ -444,6 +241,13 @@
     graph3dNeighbors = buildNeighborMap(data.links);
     graph3dNodes = new Map(data.nodes.map((node) => [node.id, node]));
     let fitted = false;
+    // 用户一旦操作过视角，引擎停止时不再自动缩放到全图
+    let userAdjustedCamera = false;
+    if (cameraListenerAbort) cameraListenerAbort.abort();
+    cameraListenerAbort = new AbortController();
+    const signal = cameraListenerAbort.signal;
+    container.addEventListener("wheel", () => { userAdjustedCamera = true; }, { passive: true, signal });
+    container.addEventListener("pointerdown", () => { userAdjustedCamera = true; }, { signal });
 
     global3d = root.ForceGraph3D()(container)
       .backgroundColor(cssVar("--paper", "#f7f5ef"))
@@ -477,11 +281,16 @@
         if (onClear) onClear();
       })
       .onEngineStop(() => {
-        if (fitted || selectedId) return;
+        if (fitted || selectedId || userAdjustedCamera) return;
         fitted = true;
         global3d.zoomToFit(650, 55);
       });
 
+    const controls = global3d.controls();
+    if (controls) {
+      controls.zoomSpeed = .55;
+      controls.enablePan = true;
+    }
     global3d.d3Force("charge").strength(-155);
     global3d.d3Force("link").distance(52);
     graph3dResize = new ResizeObserver(() => {
@@ -494,38 +303,26 @@
 
   function focusGlobal(id, moveCamera = false) {
     selectedId = id;
-    if (globalCy) {
-      const node = globalCy.$id(id);
-      if (node.length) focusNode(globalCy, node);
-    }
     if (global3d) {
       refresh3d();
       if (moveCamera) focus3dCamera(id);
     }
   }
 
-  function setMode(mode) {
-    activeMode = mode;
-  }
-
   function resize() {
-    if (globalCy) globalCy.resize();
     if (global3d && graph3dContainer) {
       global3d.width(graph3dContainer.clientWidth).height(graph3dContainer.clientHeight);
     }
   }
 
   root.DojoGraph = {
-    renderGlobal,
     render3d,
-    destroyGlobal,
     destroy3d,
     pause3d,
     has3d,
     resume3d,
     preload3d: load3dDependencies,
     focusGlobal,
-    setMode,
     resize,
   };
 }(window));
