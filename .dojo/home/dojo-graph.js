@@ -184,6 +184,23 @@
     hoveredId = null;
   }
 
+  function pause3d() {
+    if (global3d) global3d.pauseAnimation();
+  }
+
+  function has3d() {
+    return Boolean(global3d);
+  }
+
+  function resume3d() {
+    if (!global3d) return false;
+    if (graph3dContainer) {
+      global3d.width(graph3dContainer.clientWidth).height(graph3dContainer.clientHeight);
+    }
+    global3d.resumeAnimation();
+    return true;
+  }
+
   function renderGlobal(container, catalog, visibleIds, onSelect, onClear, matchIds) {
     requireCytoscape();
     destroyGlobal();
@@ -439,7 +456,7 @@
       .nodeThreeObjectExtend(true)
       .linkOpacity(1)
       .linkDirectionalArrowRelPos(1)
-      .warmupTicks(120)
+      .warmupTicks(50)
       .cooldownTicks(260)
       .onNodeHover((node) => {
         hoveredId = node ? node.id : null;
@@ -487,20 +504,6 @@
     }
   }
 
-  function reset(mode = activeMode) {
-    selectedId = null;
-    hoveredId = null;
-    if (mode === "3d" && global3d) {
-      refresh3d();
-      global3d.zoomToFit(650, 55);
-      return;
-    }
-    if (globalCy) {
-      clearFocus(globalCy);
-      globalCy.fit(undefined, 68);
-    }
-  }
-
   function setMode(mode) {
     activeMode = mode;
   }
@@ -517,8 +520,11 @@
     render3d,
     destroyGlobal,
     destroy3d,
+    pause3d,
+    has3d,
+    resume3d,
+    preload3d: load3dDependencies,
     focusGlobal,
-    reset,
     setMode,
     resize,
   };
