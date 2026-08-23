@@ -16,10 +16,8 @@
     clear: document.getElementById("clear-filters"),
     globalGraph: document.getElementById("global-graph"),
     globalGraph3d: document.getElementById("global-graph-3d"),
-    mapCount: document.getElementById("map-count"),
     mapWorkspace: document.getElementById("map-workspace"),
     mapDetails: document.getElementById("map-details"),
-    resetMap: document.getElementById("reset-map"),
     graphModes: [...document.querySelectorAll("[data-graph-mode]")],
   };
   const initialGraphMode = window.matchMedia("(max-width: 760px)").matches ? "2d" : "3d";
@@ -52,6 +50,7 @@
     view: "library",
     graphMode: initialGraphMode,
   };
+  let last3dKey = null;
 
   function setStatus(message, isError = false) {
     elements.status.textContent = message;
@@ -157,18 +156,19 @@
         (page.outgoing || []).forEach((id) => visibleIds.add(id));
       }
     }
-    const edgeCount = state.catalog.edges.filter(
-      (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
-    ).length;
-    elements.mapCount.textContent = matchIds
-      ? `${matchIds.size} 篇匹配 · ${visibleIds.size} 个节点 · ${edgeCount} 条引用`
-      : `${visibleIds.size} 个节点 · ${edgeCount} 条引用`;
     elements.globalGraph.hidden = state.graphMode !== "2d";
     elements.globalGraph3d.hidden = state.graphMode !== "3d";
     graph.setMode(state.graphMode);
     try {
       if (state.graphMode === "3d") {
         graph.destroyGlobal();
+        const mapKey = `${state.query}|${state.type}|${state.topic}`;
+        if (graph.has3d() && mapKey === last3dKey) {
+          graph.resume3d();
+          setStatus("");
+          return;
+        }
+        last3dKey = mapKey;
         await graph.render3d(
           elements.globalGraph3d,
           state.catalog,
@@ -239,7 +239,7 @@
       renderMap();
     } else {
       graph.destroyGlobal();
-      graph.destroy3d();
+      graph.pause3d();
     }
   }
 
@@ -285,10 +285,6 @@
       button.addEventListener("click", () => setGraphMode(button.dataset.graphMode));
     });
     elements.clear.addEventListener("click", clearFilters);
-    elements.resetMap.addEventListener("click", () => {
-      graph.reset(state.graphMode);
-      resetMapDetails();
-    });
     document.addEventListener("click", (event) => {
       const open = event.target.closest("[data-open-path]");
       if (open) {
@@ -325,6 +321,13 @@
         setStatus(`目录中有 ${state.catalog.warnings.length} 条链接警告。`, true);
       } else {
         setStatus("");
+      }
+      // 空闲时预载 3D 引擎，用户点开知识地图时不用现场下载
+      const preload = () => { graph.preload3d(); };
+      if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(preload, { timeout: 4000 });
+      } else {
+        window.setTimeout(preload, 2500);
       }
     } catch (error) {
       showLoadError(error);
