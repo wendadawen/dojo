@@ -27,5 +27,6 @@ index.html    GitHub Pages 首页应用
 - 产出统一为 HTML 页面，写入 `wiki/<name>/`；目录与 Graph 由 GitHub Pages 构建扫描 `wiki/*/index.html` 生成。
 - 页面 `<head>` 包含 `description`（纯文本）、`dojo:summary`（可含 `$...$` 公式）、`dojo:type`、`dojo:topics`、`dojo:tag`。
 - 页面以 `../../libs/` 引用共享库。
+- 页面图片存入 `wiki/<name>/assets/`，用相对路径 `assets/...` 引用。
 - 生成页面后运行 `.dojo/scripts/validate.py <页面路径>`。
 - 未获明确授权，不执行 commit、push、仓库重命名或部署。
