@@ -720,7 +720,7 @@
 <p>看这张图，固定切分会产生两种失败模式：</p>
 
 <p>下图展示 PD 合设在固定切分下的两种失败：prefill 占了太多 SM 时，就绪的 decode 被挡住（队头阻塞）；为 decode 留的 SM 没活干时，prefill 又用不上（资源气泡）。</p>
-<img src="assets/img-06.png" alt="PD 合设的两种失败模式：队头阻塞与资源气泡">
+<img src="assets/img-06.webp" alt="PD 合设的两种失败模式：队头阻塞与资源气泡">
 <p><b>图（原文 Figure 2）</b>：左侧是 head-of-line blocking——一个不可抢占的长 prefill kernel 占着 SM，延迟敏感的 decode 只能等；右侧是 resource bubble——为 decode 预留的 SM 在它没就绪工作时闲置，prefill 想用也用不上。论文给的数量级差距很关键：prefill kernel 能跑几十到几百毫秒，decode kernel 只要几百微秒，差好几个数量级 [C4]。把贯穿场景代进去：那个 2 毫秒的 prefill GEMM 如果挡住 decode，decode 要白白等 84–101 倍于自己执行的时间 [C5]。</p>
 
 <p>合设还有个没解决的毛病：每张 GPU 都被切分，每个阶段拿到的本地资源更少，要达到同样的延迟目标就得用更宽的并行度，通信更多，而 prefill 和 decode 的 dispatch/combine 还挤在同一条网络上互相干扰 [C3]。</p>
@@ -763,7 +763,7 @@
 <p>看架构图：</p>
 
 <p>下图把一个节点的 GPU 分成三类服务器：prefill attention、decode attention、共享的 MoE。</p>
-<img src="assets/img-05.png" alt="ExpertPlex 架构：prefill/decode attention 服务器与共享 MoE 服务器">
+<img src="assets/img-05.webp" alt="ExpertPlex 架构：prefill/decode attention 服务器与共享 MoE 服务器">
 <p><b>图（原文 Figure 3）</b>：每个节点把一部分 GPU 分给 prefill 服务器、一部分给 decode 服务器、剩下的给 MoE 服务器（前两类可以为空）。prefill 和 decode 服务器各自跑自己的 attention 模块，MoE 服务器托管专家、为两个阶段执行专家计算 [C6]。attention 服务器和 MoE 服务器之间的数据通路，「3. APK：在 tile 边界上调度 GPU」和「4. 通信：让 attention 侧发起一切」会展开。</p>
 
 <div class="callout callout-yellow">
@@ -829,7 +829,7 @@
 <p>难点在于：高性能 kernel 是流水线的——一个 CTA 里 TMA warp 可能在加载 tile k+1，而 math warp 在消费 tile k；cluster 里多个 CTA 又靠 TMA 组播绑在一起。如果各 CTA 各自独立地在 tile 边界检查并切换，一个切了另一个没切，就会有人永远等不到旧阶段的数据或 mbarrier，死锁。而每次 tile 后把整个 cluster 同步一下虽能防死锁，却把微秒级流水线串行化了，等于白搞 [C7]。</p>
 
 <p>下图展示 APK 的解法：抢占决策沿 GPU 存储层级逐级传播，一次协作决策保证 cluster 一致切换。</p>
-<img src="assets/img-04.png" alt="tile 级抢占决策沿存储层级传播">
+<img src="assets/img-04.webp" alt="tile 级抢占决策沿存储层级传播">
 <p><b>图（原文 Figure 4）</b>：attention 服务器通过一个 system-scope 的字 $P$ 发出紧急 decode 信号；CTA 0 在自己当前操作的 tile 边界读到 $P$，为每个 cluster $i$ 写一个 device-scope 的字 $p_i$；每个 cluster 只读自己的 $p_i$，避免反复访问系统内存和全局 barrier；cluster leader 在下一个 tile 边界把决策经 DSMEM 广播给所有参与 TMA 组播的 CTA；CTA 内部第一个流水线 warp 读到决策后广播给本 warp，再用 mbarrier 交接通知后面的 warp [C7]。决策在一个检查 epoch 内固定，所以没有 CTA 能在看到决策后再领一个旧阶段的 tile。最慢的 CTA 最多跑完当前 tile，整个 cluster 就收敛到新阶段。</p>
 
 <p>于是抢占上界是：<strong>一个 tile 执行时间 + 一次本地 cluster 检查 epoch</strong>，而且这个上界与被中断操作的总长度无关 [C7]。全程在 GPU 内完成，不需要 CPU 介入、不需要重新启动 kernel，因此兼容 CUDA Graph 重放。</p>
@@ -896,7 +896,7 @@
 <p>MoE 服务器只暴露 buffer 和就绪字，<strong>没有匹配的通信 kernel、也没有常驻轮询 SM</strong>。于是跨阶段等待环被消除，死锁没了；MoE 侧的通信 kernel 也被拿掉，APK 因此能把一个阶段的 MoE 计算和另一个阶段的 dispatch/combine 重叠起来 [C8]。</p>
 
 <p>下图展示这种跨阶段重叠：因为 MoE 侧不再有通信 kernel 占着，SM 可以在 decode 等待 combine 时跑 prefill tile，或在 prefill 传输在途时跑紧急 decode tile。</p>
-<img src="assets/img-03.png" alt="attention 发起一侧传输带来的跨阶段通信-计算重叠">
+<img src="assets/img-03.webp" alt="attention 发起一侧传输带来的跨阶段通信-计算重叠">
 <p><b>图（原文 Figure 5）</b>：去掉 MoE 侧通信 kernel 后，APK 能让一阶段的通信与另一阶段的计算重叠——例如 prefill tile 与 decode 的 combine 并行、或 decode tile 与 prefill 的 dispatch 并行。这种重叠不受 TBO/SBO 那种阶段内依赖链的限制，只要有活就能让 SM 忙着 [C8]。</p>
 
 <div class="callout callout-yellow">
@@ -1054,7 +1054,7 @@
 </table>
 </div>
 <p>下图是这条 Pareto 前沿：APK 是唯一既进入 decode 低延迟区、又保持 prefill 高性能的机制 [C10][C15]。</p>
-<img src="assets/img-01.png" alt="GPU 共享机制的 Pareto 前沿">
+<img src="assets/img-01.webp" alt="GPU 共享机制的 Pareto 前沿">
 <p><b>图（原文 Figure 11）</b>：横轴 prefill 性能、纵轴 decode 延迟。CUDA stream 优先级让 decode 大幅劣化；MPS 和 Green Context 保住了 decode 但拖慢 prefill；只有 APK 同时落在「decode 低延迟 + prefill 高性能」的左下区域 [C10][C15]。</p>
 
 <p><b>tile 调度开销 [C16]：</b>对照 DeepGEMM，prefill 的 contiguous 布局调度开销 &lt;12%；decode 的 masked 布局开销 &lt;20 微秒（激活专家多时相对开销 &lt;10%）。</p>
