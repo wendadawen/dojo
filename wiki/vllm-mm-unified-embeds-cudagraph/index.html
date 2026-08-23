@@ -8,7 +8,7 @@
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理引擎">
   <meta name="dojo:tag" content="vLLM">
-  <title>多模态模型统一以 inputs_embeds 输入，cudagraph 只需捕获单一格式的图 · Dojo</title>
+  <title>多模态统一输入与 cudagraph · Dojo</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
   <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
@@ -53,7 +53,7 @@
     <nav><a href="../../index.html">← 返回 Dojo</a></nav>
     <header>
       <span class="eyebrow">学习记录 · 推理引擎</span>
-      <h1>多模态模型统一以 inputs_embeds 输入，cudagraph 只需捕获单一格式的图</h1>
+      <h1>多模态统一输入与 cudagraph</h1>
       <p class="lead">模型 forward 的两个输入分支中，图像特征只能走 embedding；vLLM V1 让多模态模型的全部 token 都先过 embedding 层，图片位置再用 is_multimodal 掩码覆写为 ViT 特征，纯文本 batch 亦走同一路径。格式统一使被捕获的模型主体只有一种输入，decode 命中 FULL 重放，大 prefill 超出捕获尺寸走 eager。</p>
       <p class="meta">更新于 2026-08-21 · 类型：源码走读结论（vLLM 0.22.2.dev，Qwen3.5，TP=1）</p>
     </header>
@@ -71,30 +71,30 @@ else:
     <p><code>GPUModelRunner._preprocess</code> 的多模态分支（<code>supports_mm_inputs and is_first_rank and not is_encoder_decoder</code> 三个条件：模型支持多模态、流水线第一段、非编解码架构）统一执行如下流程：</p>
 
     <svg viewBox="0 0 760 170" width="100%" style="max-width:700px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="统一 inputs embeds 流程">
-      <rect x="20" y="55" width="200" height="40" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
-      <text x="120" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">全部 token 过 embedding 层</text>
-      <rect x="270" y="55" width="220" height="40" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
-      <text x="380" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">图片位置覆写为 ViT 特征</text>
-      <rect x="540" y="55" width="200" height="40" rx="8" fill="none" stroke="#0969da" stroke-width="1.5"/>
-      <text x="640" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="#24292f">inputs embeds 进模型</text>
-      <path d="M 220 75 L 266 75" stroke="#57606a" stroke-width="1.5" marker-end="url(#c1)"/>
-      <path d="M 490 75 L 536 75" stroke="#57606a" stroke-width="1.5" marker-end="url(#c1)"/>
-      <text x="380" y="130" text-anchor="middle" font-size="12" fill="#57606a">is multimodal 掩码：True 的位置换特征，False 的位置保留文本 embedding</text>
+      <rect x="20" y="55" width="200" height="40" rx="8" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="120" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="var(--text)">全部 token 过 embedding 层</text>
+      <rect x="270" y="55" width="220" height="40" rx="8" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="380" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="var(--text)">图片位置覆写为 ViT 特征</text>
+      <rect x="540" y="55" width="200" height="40" rx="8" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="640" y="79" text-anchor="middle" font-size="12" font-family="monospace" fill="var(--text)">inputs embeds 进模型</text>
+      <path d="M 220 75 L 266 75" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#c1)"/>
+      <path d="M 490 75 L 536 75" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#c1)"/>
+      <text x="380" y="130" text-anchor="middle" font-size="12" fill="var(--muted)">is multimodal 掩码：True 的位置换特征，False 的位置保留文本 embedding</text>
       <defs>
-        <marker id="c1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#57606a"/></marker>
+        <marker id="c1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker>
       </defs>
     </svg>
 
-    <h3 id="mixed">2.1 混合 batch（既有纯文本请求又有图片请求）</h3>
+    <h3 id="mixed">混合 batch（既有纯文本请求又有图片请求）</h3>
     <p>没有单独的"纯文本路径"。整个 batch 的所有 token 一起调 <code>embed_input_ids</code> 过 embedding 层，得到每个位置的文本 embedding；随后 <code>_merge_multimodal_embeddings</code> 用 <code>is_multimodal</code> 布尔掩码做一次覆写：<code>inputs_embeds[is_multimodal] = 图像特征</code>。掩码为 True 的位置（图片占位符处）被换成 ViT 特征，为 False 的位置（文本 token）保持原样。输出是一个形状统一的张量，纯文本请求与图片请求的区别只剩"每个位置的 embedding 来自哪里"。</p>
 
-    <h3 id="text-only">2.2 全纯文本 batch</h3>
+    <h3 id="text-only">全纯文本 batch</h3>
     <p>同样走这条路径：<code>_execute_mm_encoder</code> 发现没有待编码项直接返回，特征列表为空，<code>embed_input_ids</code> 检测到特征列表为空时跳过覆写、原样返回文本 embedding。也就是说，多模态模型上纯文本请求也承担一次 embedding 层计算——这是格式统一优先于单次计算开销的取舍。</p>
 
-    <h3 id="text-model">2.3 对比：纯文本模型走 input_ids</h3>
+    <h3 id="text-model">对比：纯文本模型走 input_ids</h3>
     <p>非多模态模型走相反的取舍：<code>_preprocess</code> 的文本分支直接把 token id 作为输入，embedding 层留在模型主体内部。源码注释说明原因：若改用 embedding 输入，embedding 层就无法进入 CUDA graph，性能不划算。纯文本模型没有图像特征要拼，不存在格式统一的压力，自然选择让 embedding 层入图。</p>
 
-    <h3 id="v0">2.4 v0 双编译到 v1 单图</h3>
+    <h3 id="v0">v0 双编译到 v1 单图</h3>
     <p>V0 引擎的处理方式是对两种输入各编译一份 CUDA graph（注释原话 "double compiling the CUDA graph, once with input_ids and again with inputs_embeds"）。V1 改为统一 embedding 输入后，只需捕获一种输入格式的图，不再需要双份编译。</p>
 
     <h2 id="dispatch">3. prefill 与 decode 的模式差异</h2>
@@ -119,20 +119,20 @@ else:
     <h2 id="ref">来源与范围说明</h2>
     <h3>源码定位</h3>
     <ul>
-      <li>forward 分支：<code>vllm/model_executor/models/qwen3_vl.py</code>（Qwen3LLMModel forward 的 inputs_embeds 分支，1522；embed_input_ids，2747；support_torch_compile 装饰，1499）</li>
-      <li>统一输入：<code>vllm/v1/worker/gpu_model_runner.py</code>（_preprocess 多模态分支，3432 起；文本分支注释"not desirable for performance"，3489；v0 双编译注释，3468）</li>
-      <li>掩码覆写：<code>vllm/model_executor/models/utils.py</code>（_merge_multimodal_embeddings，456；覆写语句 inputs_embeds[is_multimodal]，477）</li>
-      <li>dispatch：<code>vllm/v1/cudagraph_dispatcher.py</code>（dispatch，239；尺寸超限返回 NONE，282）</li>
-      <li>模式定义：<code>vllm/config/compilation.py</code>（CUDAGraphMode，53；FULL_AND_PIECEWISE，63；模式说明 docstring，590 起）</li>
+      <li>forward 分支：<code>vllm/model_executor/models/qwen3_vl.py</code>（Qwen3LLMModel forward 的 inputs_embeds 分支；embed_input_ids；support_torch_compile 装饰）</li>
+      <li>统一输入：<code>vllm/v1/worker/gpu_model_runner.py</code>（_preprocess 多模态分支，3432 起；文本分支注释"not desirable for performance"；v0 双编译注释）</li>
+      <li>掩码覆写：<code>vllm/model_executor/models/utils.py</code>（_merge_multimodal_embeddings；覆写语句 inputs_embeds[is_multimodal]）</li>
+      <li>dispatch：<code>vllm/v1/cudagraph_dispatcher.py</code>（dispatch；尺寸超限返回 NONE）</li>
+      <li>模式定义：<code>vllm/config/compilation.py</code>（CUDAGraphMode；FULL_AND_PIECEWISE；模式说明 docstring，590 起）</li>
     </ul>
     <h3>trace 证据</h3>
     <ul>
-      <li><code>torch_profiles/rank0.*.pt.trace.json.gz</code>：prefill 段（execute_context_1(983)_generation_0(0)，约 85ms）内 0 次 replay；其后 decode 段 19 次 replay（torch/cuda/graphs.py 的 replay）</li>
+      <li>EngineCore 进程 trace：prefill 段（execute_context_1(983)_generation_0(0)，约 85ms）内 0 次 replay；其后 decode 段 19 次 replay（torch/cuda/graphs.py 的 replay）</li>
       <li>环境：vLLM 0.22.2.dev、Qwen3.5-0.8B、TP=1 单机</li>
     </ul>
     <h3>边界</h3>
     <ul>
-      <li>结论基于 Qwen3.5（decoder-only 多模态）；encoder-decoder 架构走独立分支（is_encoder_decoder 为真时不进多模态分支），不在本页范围</li>
+      <li>结论基于 Qwen3.5（decoder-only 多模态）；encoder-decoder 架构走独立分支（is_encoder_decoder 为真时不进多模态分支），不在其中</li>
       <li>推测解码（EAGLE/MTP）与 cudagraph 的交互未在本次走读中覆盖</li>
     </ul>
 

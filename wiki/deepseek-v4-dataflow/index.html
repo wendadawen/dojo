@@ -111,7 +111,7 @@
 
   <h2 id="points">3. 要点</h2>
 
-  <h3>3.1 整体结构：两种注意力逐层交替 + 四份残差流</h3>
+  <h3>整体结构：两种注意力逐层交替 + 四份残差流</h3>
   <ul>
     <li><b>沿序列</b>：61 层里 HCA（<code>compress_ratio=128</code>）与 CSA（<code>compress_ratio=4</code>）交替。<code>compress_ratios</code> 前 12 项为 <code>[128,128,4,128,4,128,4,128,4,128,4,128]</code>——第 0、1 层连续两层 HCA，此后严格奇偶交替，最终 HCA 31 层、CSA 30 层。只有 CSA 层带 Indexer，checkpoint 中恰好 30 层含 <code>attn.indexer.*</code>。</li>
     <li><b>压缩不是池化</b>：每个压缩条目是 <code>wgate</code> 从隐藏状态算出的 softmax 权重对 <code>wkv</code> 结果的加权和，再加可学习位置偏置 <code>ape</code>。实测将其与均值池化对比，相对差异 0.76，确认权重是数据相关的。</li>
@@ -119,7 +119,7 @@
     <li><b>沿宽度</b>：每层 384 个路由专家取 top-6，另有 1 个共享专家恒激活。路由专家占总参数 96.8%（1.547T / 1.599T），但每 token 只激活 6/384。</li>
   </ul>
 
-  <h3>3.2 CSA（Compressed Sparse Attention，30 层）</h3>
+  <h3>CSA（Compressed Sparse Attention，30 层）</h3>
   <ul>
     <li>压缩率 4 且启用重叠：<code>Compressor</code> 中 <code>self.overlap = compress_ratio == 4</code>，使 <code>wkv</code>/<code>wgate</code> 输出宽度翻倍（真实权重 <code>layers.2.attn.compressor.wkv.weight</code> 形状 [1024, 7168]，正好是 HCA 层 [512, 7168] 的两倍）。</li>
     <li>重叠的含义：每个压缩条目由 $2m=8$ 个原始条目产生，softmax 在 8 个元素上归一化（实测归一化宽度=8）；但相邻条目复用彼此的一半来源，因此序列长度仍只压到 1/4，而非 1/8。</li>
@@ -127,14 +127,14 @@
     <li>Indexer 的 query 与主注意力的 query 共享同一个低秩潜向量 <code>qr</code>（<code>q_norm(wq_a(x))</code>），只是各自用不同的 <code>wq_b</code> 上投影。</li>
   </ul>
 
-  <h3>3.3 HCA（Heavily Compressed Attention，31 层）</h3>
+  <h3>HCA（Heavily Compressed Attention，31 层）</h3>
   <ul>
     <li>压缩率 128、不重叠，softmax 在 128 个元素上归一化（实测归一化宽度=128）。无 Indexer，也无稀疏选择——所有压缩条目全部参与注意力。</li>
     <li>正是因为压得足够狠，才可以不做稀疏化：1M 上下文下每层只有 8192 个压缩条目，与滑窗 128 合计 8320，规模已经可控。</li>
     <li>YaRN 只在带压缩的层生效。<code>model.py</code> 中若 <code>compress_ratio</code> 为 0 则用 <code>rope_theta=10000</code> 且关闭 YaRN；带压缩的层用 <code>compress_rope_theta=160000</code>。压缩条目的位置索引是压缩后的块号，跨度被压掉，因此需要单独的 theta。</li>
   </ul>
 
-  <h3>3.4 两种层共有的四个细节</h3>
+  <h3>两种层共有的四个细节</h3>
   <ul>
     <li><b>滑窗与压缩条目同处一个 softmax</b>：<code>model.py</code> 把窗口索引与压缩索引 <code>cat</code> 成一个 <code>topk_idxs</code> 再调用一次 <code>sparse_attn</code>。即两条分支不是各算一次注意力再融合，而是共享同一个归一化分母。实测把压缩索引拼进去后输出变化 1.57，确认其参与同一归一化。</li>
     <li><b>Attention sink</b>：每头一个可学习标量，$\mathrm{Exp}(z'_h)$ 直接加进 softmax 分母。实测 sink 取 5 时注意力权重之和降到 0.26，即该头可以选择几乎不看任何 KV。</li>
@@ -142,7 +142,7 @@
     <li><b>分组输出投影</b>：$128 \times 512 = 65536$ 维直接投回 7168 代价过高，故按 <code>o_groups=16</code> 分组，每组先降到 <code>o_lora_rank=1024</code>（<code>wo_a</code> [16384, 4096]）再合并投回（<code>wo_b</code> [7168, 16384]）。</li>
   </ul>
 
-  <h3>3.5 mHC（Manifold-Constrained Hyper-Connections）</h3>
+  <h3>mHC（Manifold-Constrained Hyper-Connections）</h3>
   <ul>
     <li>每层的混合参数由当前残差流算出，不是静态权重：把 4 份残差拼成 28672 维，经 <code>hc_attn_fn</code>（真实形状 [24, 28672]）投到 24 维，再切成 pre(4) / post(4) / comb(16) 三段。</li>
     <li>pre 为 $\sigma(\cdot)+\varepsilon$，post 为 $2\sigma(\cdot)$，comb 经 Sinkhorn 迭代投影后作为 $4\times4$ 残差混合矩阵。</li>
@@ -151,7 +151,7 @@
     <li>代价很小：每层 mHC 参数约 1.38M，61 层合计 0.084B，占总参数 0.005%。</li>
   </ul>
 
-  <h3>3.6 MoE 路由</h3>
+  <h3>MoE 路由</h3>
   <ul>
     <li><b>评分函数从 V3 的 sigmoid 换成 sqrt(softplus)</b>。实测差异集中在高分区：logit=12 时 sigmoid 已饱和到 0.999994，sqrt(softplus) 仍在按 $\sqrt{z}$ 增长到 3.46。含义是高置信路由之间的亲和度差异不会被压平。</li>
     <li><b>bias 只参与选择、不进权重</b>：<code>scores + bias</code> 用于 topk，而权重从未加 bias 的 <code>original_scores</code> 里 gather。实测把专家 0 的 bias 抬到 5 后它被挤进 top-6，但拿到的权重仍基于原始分数 0.73。这是 auxiliary-loss-free 均衡的关键——调节被选频率而不扭曲输出系数。</li>
@@ -159,7 +159,7 @@
     <li>专家精度分层：路由专家为 FP4（张量头显示 I8 [3072, 3584]，即沿 K 维两值打包，配 <code>scale</code> F8_E8M0 [3072, 224]），而共享专家是 FP8 [3072, 7168] 未降到 FP4。</li>
   </ul>
 
-  <h3>3.7 长上下文效率的来源</h3>
+  <h3>长上下文效率的来源</h3>
   <p>注意力开销由每 token 的候选集规模决定。按官方配置实算：</p>
   <table>
     <tr><th>上下文</th><th>CSA 层候选集</th><th>HCA 层候选集</th></tr>
@@ -189,18 +189,18 @@ mHC(61层)            0.08 B    0.0%
 合计              1598.84 B = 1.599 T        官方宣称 1.6T
 
 每 token 激活 = 61 层 × 6 专家 (24.18 B) + 非专家部分 (24.68 B) = 48.85 B    官方宣称 49B</pre>
-  <div class="note">实测脚本与完整输出存于本页 <code>research/</code> 目录：<code>kernel_ref.py</code> 为算子等价实现，<code>t1</code>~<code>t11</code> 为各项验证，<code>all_results.txt</code> 为一次性跑完全部脚本的原始输出。</div>
+  <div class="note">实测脚本与完整输出存于 <code>research/</code> 目录：<code>kernel_ref.py</code> 为算子等价实现，<code>t1</code>~<code>t11</code> 为各项验证，<code>all_results.txt</code> 为一次性跑完全部脚本的原始输出。</div>
 
   <h2 id="sources">来源与范围说明</h2>
   <table>
     <tr><th>项目</th><th>依据</th></tr>
     <tr><td>全部 config 数值</td><td>官方 <code>config.json</code> 与 <code>inference/config.json</code>：huggingface.co/deepseek-ai/DeepSeek-V4-Pro</td></tr>
-    <tr><td>数据流路径、压缩逻辑、路由逻辑、cache 布局</td><td>官方 <code>inference/model.py</code>（827 行）与 <code>inference/kernel.py</code>（536 行）</td></tr>
+    <tr><td>数据流路径、压缩逻辑、路由逻辑、cache 布局</td><td>官方 <code>inference/model.py</code> 与 <code>inference/kernel.py</code></td></tr>
     <tr><td>张量形状与 dtype</td><td>真实 checkpoint 的 safetensors 文件头（HTTP Range 读取，64 个分片、145116 个张量）</td></tr>
     <tr><td>CSA / HCA / mHC 的设计动机与公式</td><td>技术报告 arXiv:2606.19348v1《DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence》第 2 节</td></tr>
     <tr><td>Sinkhorn 收敛性、sink 效果、路由行为、压缩语义、参数量</td><td>本机实测，脚本见 <code>research/</code></td></tr>
   </table>
-  <p style="color:var(--muted);font-size:14px">核对说明：页面所有结构性论断均以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出，未采用第三方转述。一处与报告表述存在差别并已在正文标明：报告称 mHC 的残差矩阵被投影到双随机流形，而官方 kernel 在 <code>hc_sinkhorn_iters=20</code> 下只保证列和精确为 1，行和的收敛程度取决于 comb logits 的尺度。训练相关部分（Muon 优化器、后训练蒸馏流程）不属于前向数据流，本页未涉及。</p>
+  <p style="color:var(--muted);font-size:14px">核对说明：全部结构性论断均以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出，未采用第三方转述。一处与报告表述存在差别并已在正文标明：报告称 mHC 的残差矩阵被投影到双随机流形，而官方 kernel 在 <code>hc_sinkhorn_iters=20</code> 下只保证列和精确为 1，行和的收敛程度取决于 comb logits 的尺度。训练相关部分（Muon 优化器、后训练蒸馏流程）不属于前向数据流，不在其中。</p>
 
   <footer>Dojo · 学习完成后按需留档，不自动生成进度档案。</footer>
 </main>
