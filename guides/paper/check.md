@@ -106,7 +106,7 @@
 - 数学符号全部使用 LaTeX 书写，自绘结构图为 HTML 或内联 SVG
 - 可运行代码的结果与页面描述一致
 - 关键论断和数字已重新核对固定版本论文
-- 页面 `<head>` 包含有效的纯文本 `description`、可渲染 `dojo:summary`、`dojo:type=paper`、`dojo:topics`、`dojo:tag`
+- 页面 `<head>` 包含有效的纯文本 `description`、可渲染 `dojo:summary`、`dojo:type=paper`、`dojo:topics`、`dojo:tag`；`dojo:topics` 取值限于 AGENTS.md 列出的固定大类（validate.py 会拒绝词表外的主题）
 - `overview.html` 与 `index.html` 相互链接
 - 页面引用的概念链接有效，或具有明确占位
 - 递归生成的前置概念页已完成各自质检
