@@ -1,0 +1,28 @@
+# OPD 初稿检查
+
+- 输入版本：scope.md / evidence.md / outline.md / glossary.md 全部已确定；evidence.md 后续追加 F7（策略梯度-散度等价推导）。
+- 大纲落实：
+  - 章节：5 章正文 + 来源与范围说明，逐章按 outline.md 落地
+  - 学习目标：核心问题 5 条，每条配解答折叠块，答案指明完整论证所在章节
+  - 前置知识：知识蒸馏页链接；KL/策略梯度/softmax 等基础概念按 KD 页先例作最小定义内联（不触发递归生成）
+  - 贯穿示例：3-token 词表的 next-token 分布与学生采样结果，跨 S2/S3 复用
+  - 误解和边界：常见误解块列 4 条；S5 收束能力边界
+  - 过渡：每章末段自然过渡到下一章
+- 目标覆盖检查：
+  - Q1（分布失配与 OPD 解法）→ S1 完整回答（off-policy 失配、GKD 框架、自采样 SFT 反例）
+  - Q2（一步训练机制）→ S2 完整回答（四步流程图、逐 token 分数公式、策略梯度最小定义、教师角色表、K3 变体）
+  - Q3（手算 per-token 奖励）→ S2 完整回答（3-token 词表三个采样的 r、期望分数 = −KL 恒等式、完整手算折叠块、代码实跑验证）
+  - Q4（效率来源与证据）→ S3 完整回答（bits 论证、unhackable、partial rollout、Qwen3 Table 21、TML 计算量、GKD 实验）
+  - Q5（边界）→ S4（实现选择）+ S5（边界）两章合答
+- 代码运行：
+  - wiki/opd/index.html 中唯一可运行代码块已实际执行：进入命令 `/Users/wendadawen/.workbuddy/binaries/python/versions/3.13.12/bin/python3`，退出码 0
+  - 实际输出与页面预期输出逐字符一致（经 html.unescape 提取并比对）
+- 机械检查：
+  - `python3 .dojo/scripts/validate.py wiki/opd/index.html` → validation ok
+  - `python3 .dojo/scripts/validate.py wiki/opd/overview.html` → validation ok
+- 公式渲染与交互：
+  - headless Chrome `--dump-dom` + 探针脚本：katex 节点 148、display 节点 13、错误 0、dg-node 内公式 7、残留未渲染 `$` 0
+  - 探针报告的 9 处 .katex 矩形重叠为 KaTeX 测量盒基线预留的几何伪影（与组件库「foreignObject 渲染宽度约为 1.6×」的同类现象同源），整页截图核查无可见字符压线
+  - 过程中修复两处遗留问题：JSD 公式与 GKD+RL 公式将 `<sup>` 放在了闭合 `$$` 之前导致不渲染，已分别移到闭合 `$$` 之后
+  - 过程中修复三处真实行内公式过宽/过高导致的视觉侵入：KL 最小定义改用 `\log\big(P(c)/Q(c)\big)`、策略梯度段落里改为 $\nabla_\theta\log\pi_S(y_t)\cdot A$（完整条件见上图）、S2 期望分数代入改为 display 公式
+- 写作偏差：无
