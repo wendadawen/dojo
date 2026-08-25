@@ -17,6 +17,8 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 
+from catalog_builder import ALLOWED_TOPICS
+
 
 LOCAL_ASSET_RE = re.compile(r'''(?:href|src)=["']([^"']+)["']''')
 ID_RE = re.compile(r"""\bid=["']([^"']+)["']""")
@@ -188,6 +190,18 @@ def validate_page(path: Path) -> list[str]:
         for name in REQUIRED_WIKI_META:
             if not inspector.meta.get(name):
                 errors.append(f"missing metadata: {name}")
+
+        # 主题取值必须是封闭词表内的大类，防止主题再次碎片化
+        topics = [
+            item.strip()
+            for item in re.split(r"[,，]", inspector.meta.get("dojo:topics", ""))
+            if item.strip()
+        ]
+        for topic in topics:
+            if topic not in ALLOWED_TOPICS:
+                errors.append(
+                    f"unknown topic: {topic} (allowed: {', '.join(ALLOWED_TOPICS)})"
+                )
 
         description = inspector.meta.get("description", "")
         summary = inspector.meta.get("dojo:summary", "")

@@ -27,6 +27,20 @@ def split_topics(value: str) -> list[str]:
     return [item.strip() for item in re.split(r"[,，]", value) if item.strip()]
 
 
+# 主题封闭词表：页面 dojo:topics 只能从中取值，validate.py 同样按此校验。
+# 需要新增大类时改这里并同步 AGENTS.md。
+ALLOWED_TOPICS = [
+    "注意力机制",
+    "模型结构",
+    "推理系统",
+    "内存与缓存",
+    "并行与通信",
+    "训练与优化",
+    "多模态",
+    "数学基础",
+]
+
+
 class WikiHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -158,6 +172,8 @@ def parse_page(root: Path, page_path: Path) -> dict:
     )
     summary_meta = parser.meta.get("dojo:summary", "").strip()
     summary = summary_meta or description
+    page_topics = split_topics(parser.meta.get("dojo:topics", ""))
+    invalid_topics = [t for t in page_topics if t not in ALLOWED_TOPICS]
 
     return {
         "id": relative,
@@ -166,9 +182,10 @@ def parse_page(root: Path, page_path: Path) -> dict:
         "description": clean_text(description),
         "summary": clean_text(summary),
         "type": parser.meta.get("dojo:type", "").strip() or "unknown",
-        "topics": split_topics(parser.meta.get("dojo:topics", "")),
+        "topics": page_topics,
         "tag": parser.meta.get("dojo:tag", "").strip(),
         "_has_summary": bool(summary_meta),
+        "_invalid_topics": invalid_topics,
         "_hrefs": parser.hrefs,
     }
 
@@ -207,6 +224,8 @@ def build_catalog(root: Path) -> dict:
             warnings.append({"type": "unclassified", "source": page["id"]})
         if not page["topics"]:
             warnings.append({"type": "missing_topics", "source": page["id"]})
+        for topic in page.pop("_invalid_topics"):
+            warnings.append({"type": "unknown_topic", "source": page["id"], "topic": topic})
         if not page["tag"]:
             warnings.append({"type": "missing_tag", "source": page["id"]})
         for href in page.pop("_hrefs"):

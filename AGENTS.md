@@ -26,6 +26,7 @@ index.html    GitHub Pages 首页应用
 
 - 产出统一为 HTML 页面，写入 `wiki/<name>/`；目录与 Graph 由 GitHub Pages 构建扫描 `wiki/*/index.html` 生成。
 - 页面 `<head>` 包含 `description`（纯文本）、`dojo:summary`（可含 `$...$` 公式）、`dojo:type`、`dojo:topics`、`dojo:tag`。
+- `dojo:topics` 只能从固定大类中选：注意力机制、模型结构、推理系统、内存与缓存、并行与通信、训练与优化、多模态、数学基础；需要新大类时先改 `.dojo/scripts/catalog_builder.py` 的 `ALLOWED_TOPICS` 再使用。
 - 页面以 `../../libs/` 引用共享库。
 - 页面图片存入 `wiki/<name>/assets/`，用相对路径 `assets/...` 引用。
 - 生成页面后运行 `.dojo/scripts/validate.py <页面路径>`。
