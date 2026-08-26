@@ -671,7 +671,7 @@
 <p><b>主要依据</b>：Zhai, Mustafa, Kolesnikov, Beyer. "Sigmoid Loss for Language Image Pre-Training." ICCV 2023 Oral, arXiv:2303.15343v4（2023-09-27）, §3.1 CLIP softmax 损失公式、§3.2 SigLIP 损失公式与 bias 初始化、§3.3 chunked 实现、§4.2 batch size 影响、§4.4 SigLiT 84.5%、§4.5 SigLIP from scratch 72.1%、Table 1 / Table 2 实验数据、摘要 batch=1M 边际收益消失结论。</p>
 </blockquote>
 
-<p>用 4 个 TPUv4、2 天训练，SigLIP 达到 ImageNet zero-shot 84.5%；同等水平的 CLIP 需要约 2500 TPUv3-days。这一算力差距的核心不在模型架构——两者都是双塔 + 共享嵌入空间 + 可学习温度——而在损失函数：SigLIP 把 CLIP 的 softmax 对比损失换成逐对 sigmoid 二分类损失，每个 (image, text) 对独立判断"配不配"，不依赖 batch 内其他对。本文回答：这一替换的形式差异在哪、可学习 bias $b$ 为什么是关键、batch size 与损失如何解耦、以及 SigLIP 在小算力场景的优势与边界。涉及的基础概念是 <a href="../../wiki/vit/index.html">ViT</a>（图像塔架构）与 <a href="../../wiki/standard-attention/index.html">标准注意力</a>（softmax 形式与数值稳定 trick）。</p>
+<p>用 4 个 TPUv4、2 天训练，SigLIP 达到 ImageNet zero-shot 84.5%；同等水平的 CLIP 需要约 2500 TPUv3-days。这一算力差距的核心不在模型架构——两者都是双塔 + 共享嵌入空间 + 可学习温度——而在损失函数：SigLIP 把 CLIP 的 softmax 对比损失换成逐对 sigmoid 二分类损失，每个 (image, text) 对独立判断"配不配"，不依赖 batch 内其他对。本文回答：这一替换的形式差异在哪、可学习 bias $b$ 为什么是关键、batch size 与损失如何解耦、以及 SigLIP 在小算力场景的优势与边界。涉及的基础概念是 <a href="../../wiki/clip/index.html">CLIP</a>（双塔架构与 softmax 对比损失，本文的改造对象）、<a href="../../wiki/vit/index.html">ViT</a>（图像塔架构）与 <a href="../../wiki/standard-attention/index.html">标准注意力</a>（softmax 形式与数值稳定 trick）。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -714,7 +714,7 @@
 
 <p>用 32k batch 训 CLIP，要把每个对 (image $i$, text $j$) 的相似度 $x_i\cdot y_j$ 与整个 batch 的所有相似度聚合到一起算 softmax——分母 $\sum_j e^{t x_i\cdot y_j}$ 依赖 batch 内所有 $y_j$。能不能让每个 (image, text) 对只看自己就被评分？这是 SigLIP 要回答的问题。</p>
 
-<p>理解 SigLIP 之前要先看清 CLIP 的损失怎么算。CLIP（Radford et al. 2021）用双塔架构：图像塔 $f$ 把图像 $I_i$ 映射到嵌入 $f(I_i)$，文本塔 $g$ 把文本 $T_j$ 映射到嵌入 $g(T_j)$；嵌入经 L2 归一化得 $x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$，落在共享嵌入空间；图像塔常用 <a href="../../wiki/vit/index.html">ViT</a>（已讲过 patch + Transformer 编码机制），文本塔常用 Transformer。CLIP 的训练目标是对 batch 内 $|B|$ 个 (image, text) 配对样本，让正对的相似度高于负对——这通过 softmax 损失实现（softmax 见 <a href="../../wiki/standard-attention/index.html">标准注意力</a>，这里只使用其结果）：</p>
+<p>理解 SigLIP 之前要先看清 CLIP 的损失怎么算。CLIP（Radford et al. 2021，整体机制见 <a href="../../wiki/clip/index.html">CLIP</a>）用双塔架构：图像塔 $f$ 把图像 $I_i$ 映射到嵌入 $f(I_i)$，文本塔 $g$ 把文本 $T_j$ 映射到嵌入 $g(T_j)$；嵌入经 L2 归一化得 $x_i=f(I_i)/\|f(I_i)\|_2$、$y_j=g(T_j)/\|g(T_j)\|_2$，落在共享嵌入空间；图像塔常用 <a href="../../wiki/vit/index.html">ViT</a>（已讲过 patch + Transformer 编码机制），文本塔常用 Transformer。CLIP 的训练目标是对 batch 内 $|B|$ 个 (image, text) 配对样本，让正对的相似度高于负对——这通过 softmax 损失实现（softmax 见 <a href="../../wiki/standard-attention/index.html">标准注意力</a>，这里只使用其结果）：</p>
 
 <p>$$\mathcal{L}_{\text{CLIP}}=-\frac{1}{2|B|}\sum_{i=1}^{|B|}\left(\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_i\cdot y_j}}+\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j=1}^{|B|}e^{t\,x_j\cdot y_i}}\right).$$ <sup>[F2]</sup></p>
 
@@ -747,7 +747,7 @@
 <p>这带来两个问题：</p>
 
 <ul>
-  <li><strong>小 batch 下梯度噪声大</strong>。每个对的梯度信号是"对 hardest negative 的相对优势"。batch 小时（如 $|B|=256$），hardest negative 往往是"运气不好没采到难样本"——梯度信号弱且噪声大。论文 §4.2 实证显示 sigmoid 损失在 batch &lt; 16k 时显著优于 softmax，正是因为小 batch 下 softmax 的 hardest negative 池太小。</li>
+  <li><strong>小 batch 下梯度噪声大</strong>。每个对的梯度信号是"对 hardest negative 的相对优势"。batch 小时（如 $|B|=256$），hardest negative 往往是"运气不好没采到难样本"——梯度信号弱且噪声大。论文 §4.2 实证显示 sigmoid 损失在 batch &lt; 16k 时显著优于 softmax。一种直观解释是小 batch 下 softmax 的 hardest negative 池太小（本页推断，论文未作此归因）。</li>
   <li><strong>分布式训练需要 expensive all-gather</strong>。当 batch 被切分到多个设备时，每个设备需要先 all-gather 全部 $|B|$ 个嵌入到本地才能算分母——这是 CLIP 训练在多设备上的核心通信瓶颈。论文 §3.3 专门讨论这一点。</li>
 </ul>
 
