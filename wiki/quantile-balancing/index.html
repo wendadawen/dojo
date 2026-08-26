@@ -765,8 +765,6 @@ $$T_i = \text{argtopk}(s_i + b), \qquad p_{i,j} = \frac{s_{i,j}}{\sum_{r \in T_i
 
 <p>用两个快速检查验证 bias 的角色。第一，如果所有专家的 bias 同时加常数 $c$，则 $s_{i,j} + b_j + c = (s_{i,j} + b_j) + c$，Top-k 选择不变——因为所有分数同时平移，相对排序不变。第二，归一化权重 $p_{i,j}$ 不含 $b$，所以 bias 完全不影响专家的输出权重，只影响"这个 token 分给谁"。</p>
 
-<p>bias 能调节负载：给冷门专家加正 bias 会提高它进入 Top-k 的概率，给过热专家减 bias 会降低它被选中的概率。但 bias 本身怎么更新？下一章看 DeepSeek-V3 的做法和它的瓶颈。</p>
-
 <p>本章说明了 bias 在路由中的角色——只影响选谁，不进权重。但 bias 本身怎么更新、为什么固定步长更新在大规模时失效——下一章讲 DeepSeek-V3 的 sign 更新及其瓶颈。</p>
 
 <h3 id="ch1-questions">本章问题</h3>
@@ -810,8 +808,6 @@ $$b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \text{sign}(\bar{\ell}^{(t)} - \ell_j^{
 <p>构造示例。假设 $\gamma = 0.001$，某专家负载 $\ell_j = 100$，目标 $\bar{\ell} = 50$（多了 50 个）。$\text{sign}(50 - 100) = \text{sign}(-50) = -1$，每步 bias 减 $0.001$。另一个场景中负载 $\ell_j = 51$（只多了 1 个），$\text{sign}(50 - 51) = \text{sign}(-1) = -1$，每步 bias 也减 $0.001$。两种差距相差 50 倍，但 bias 的更新幅度完全相同——sign 丢失了"差多远"的信息。前者需要约 50000 步才能把 bias 调到合理水平。</p>
 
 <p>K3 将 routed expert 池扩大到 <strong>896 per layer</strong>，每个 token 选 <strong>16 个</strong>（$k=16$）。这些数字来自 K3 官方 config.json（<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>topk_method: "noaux_tc"</code>）。<sup>[C17, N1]</sup> 专家数从前代 K2 的 384 扩大到 896（K3 报告 Table 1）后，sign 更新只保留方向的缺陷被放大：收敛慢、均衡附近震荡、部分专家长期训练不足，拖慢专家并行训练。</p>
-
-<p>sign 更新只走固定小步，QB 的思路是：能不能从当前分数分布直接算出"正确的 bias 应该是多少"——不是走一小步，而是一步跳到目标？</p>
 
 <p>本章说明了 sign 更新在大规模专家时的瓶颈——只保留方向、步长固定。但能不能从当前分数分布直接算出"正确的 bias 应该是多少"——下一章讲 QB 的核心机制。</p>
 
@@ -1334,53 +1330,53 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 <h2 id="sources-and-scope">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>
-- C1–C13：Kimi K3 Technical Report §2.3.3 (Eq.13–14) 及 Appendix C (Derivation of Quantile Balancing, Eq.20–27, Algorithm 1)。<br>
-- C14–C16：K3 报告 §2.3.3 histogram 段及 Appendix D (Histogram-Based Quantile Estimation)。<br>
-- C2（DeepSeek-V3 sign 更新）：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report (arXiv:2412.19437) §3.3 auxiliary-loss-free 策略。WebSearch 确认原文：overload 则 $b_j \leftarrow b_j - \gamma$，underload 则 $b_j \leftarrow b_j + \gamma$，等价于 $b_j + \gamma \cdot \text{sign}(\bar{\ell} - \ell_j)$。<br>
-- C17（K3 config）：HuggingFace <code>moonshotai/Kimi-K3/config.json</code>，<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>moe_router_activation_func: "sigmoid"</code>, <code>topk_method: "noaux_tc"</code>。
-</p>
+<ul>
+  <li>C1–C13：Kimi K3 Technical Report §2.3.3 (Eq.13–14) 及 Appendix C (Derivation of Quantile Balancing, Eq.20–27, Algorithm 1)。</li>
+  <li>C14–C16：K3 报告 §2.3.3 histogram 段及 Appendix D (Histogram-Based Quantile Estimation)。</li>
+  <li>C2（DeepSeek-V3 sign 更新）：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report (arXiv:2412.19437) §3.3 auxiliary-loss-free 策略。原文：overload 则 $b_j \leftarrow b_j - \gamma$，underload 则 $b_j \leftarrow b_j + \gamma$，等价于 $b_j + \gamma \cdot \text{sign}(\bar{\ell} - \ell_j)$。</li>
+  <li>C17（K3 config）：HuggingFace <code>moonshotai/Kimi-K3/config.json</code>，<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>moe_router_activation_func: "sigmoid"</code>, <code>topk_method: "noaux_tc"</code>。</li>
+</ul>
 
 <h3>公式与来源（F）</h3>
-<p>
-- F1 (Eq.13 路由)：K3 报告 §2.3.3 Eq.13。<br>
-- F2 (DeepSeek-V3 sign 更新)：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report §3.3。<br>
-- F3 (QB 更新 Eq.14)：K3 报告 §2.3.3 Eq.14。<br>
-- F4 (对偶目标 Eq.23)：K3 报告 Appendix C Eq.23，由 Eq.20–22 推导。<br>
-- F5 (coordinate minimizer Eq.25–26)：K3 报告 Appendix C Eq.25–26。<br>
-- F6 (sign subgradient Eq.27)：K3 报告 Appendix C Eq.27。<br>
-- F7 (直方图恢复)：K3 报告 Appendix D。
-</p>
+<ul>
+  <li>F1 (Eq.13 路由)：K3 报告 §2.3.3 Eq.13。</li>
+  <li>F2 (DeepSeek-V3 sign 更新)：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report §3.3。</li>
+  <li>F3 (QB 更新 Eq.14)：K3 报告 §2.3.3 Eq.14。</li>
+  <li>F4 (对偶目标 Eq.23)：K3 报告 Appendix C Eq.23，由 Eq.20–22 推导。</li>
+  <li>F5 (coordinate minimizer Eq.25–26)：K3 报告 Appendix C Eq.25–26。</li>
+  <li>F6 (sign subgradient Eq.27)：K3 报告 Appendix C Eq.27。</li>
+  <li>F7 (直方图恢复)：K3 报告 Appendix D。</li>
+</ul>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>
-- N1（896 专家、top-16）：config.json <code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>。条件：K3 LatentMoE 层。K2 的 384 专家来自 K3 报告 Table 1（K2→K3 对比）。<br>
-- N2（$B=1000$ 误差几个 $10^{-3}$）：K3 报告 Appendix D Properties。条件：sigmoid router scores $\in (0,1)$。<br>
-- N3（通信 &lt;1%）：K3 报告 Appendix D。条件：K3 配置。
-</p>
+<ul>
+  <li>N1（896 专家、top-16）：config.json <code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>。条件：K3 LatentMoE 层。K2 的 384 专家来自 K3 报告 Table 1（K2→K3 对比）。</li>
+  <li>N2（$B=1000$ 误差几个 $10^{-3}$）：K3 报告 Appendix D Properties。条件：sigmoid router scores $\in (0,1)$。</li>
+  <li>N3（通信 &lt;1%）：K3 报告 Appendix D。条件：K3 配置。</li>
+</ul>
 
 <h3>构造示例</h3>
-<p>
-- $8 \times 4$ 分数矩阵（1 位小数）为人为构造，构造目的是使初始负载恰好为 (4,3,1,0) 且 QB 一步收敛到 (2,2,2,2)，便于手算验证。分数不代表真实模型输出。<br>
-- sign 更新的 $\gamma=0.001$、负载从 100 降到 50 的数字为构造数据，说明 sign 丢失幅度信息。<br>
-- 代码使用纯 Python 列表，逐 token 排序，便于观察每一步。
-</p>
+<ul>
+  <li>$8 \times 4$ 分数矩阵（1 位小数）为人为构造，构造目的是使初始负载恰好为 (4,3,1,0) 且 QB 一步收敛到 (2,2,2,2)，便于手算验证。分数不代表真实模型输出。</li>
+  <li>sign 更新的 $\gamma=0.001$、负载从 100 降到 50 的数字为构造数据，说明 sign 丢失幅度信息。</li>
+  <li>代码使用纯 Python 列表，逐 token 排序，便于观察每一步。</li>
+</ul>
 
 <h3>辅助解释与类比边界</h3>
-<p>
-- "要进 Top-k 必须超过的分数线"是对 cutoff $\alpha_i$ 的教学解释，只帮助理解其直觉含义。正式定义是 Top-(k+1) 路由中第 (k+1) 个 biased score 的值。<br>
-- margin 的直觉"专家对 token 的吸引力减去门槛"只帮助理解正负号含义。正式定义是 $s_{i,j} - \alpha_i$。<br>
-- "过热专家压低 bias、冷门专家抬高 bias"是方向直觉，正式依据是分位数公式。
-</p>
+<ul>
+  <li>"要进 Top-k 必须超过的分数线"是对 cutoff $\alpha_i$ 的教学解释，只帮助理解其直觉含义。正式定义是 Top-(k+1) 路由中第 (k+1) 个 biased score 的值。</li>
+  <li>margin 的直觉"专家对 token 的吸引力减去门槛"只帮助理解正负号含义。正式定义是 $s_{i,j} - \alpha_i$。</li>
+  <li>"过热专家压低 bias、冷门专家抬高 bias"是方向直觉，正式依据是分位数公式。</li>
+</ul>
 
 <h3>简化条件及其限制</h3>
-<p>
-- 手算例子使用 $m=8, n=4, k=1$。可推出：QB 四步流程的计算逻辑。不可推出：真实规模（$m \approx 10^6, n=896, k=16$）下的性能与直方图估计的必要性。<br>
-- 代码逐 token 排序取分位数。可推出：分位数与 bias 的对应关系。不可推出：真实工程的张量操作与 all-reduce 通信模式。<br>
-- 手算例子恰好一步收敛。可推出：一轮 QB 更新在给定旧 cutoff 下保证目标负载。不可推出：一般情况一步收敛——论文报告近 $10^3$ 专家时几步内收敛。<br>
-- 对偶推导省略线性松弛整性的证明。可推出：对偶目标与 coordinate minimizer 的形式。不可推出：二部图 b-matching 多面体整性的完整证明。<br>
-- 直方图分位数恢复的 EMA 平滑作为扩展提及。可推出：EMA 可减少批次间采样噪声。不可推出：EMA 的具体公式与实现细节。
-</p>
+<ul>
+  <li>手算例子使用 $m=8, n=4, k=1$。可推出：QB 四步流程的计算逻辑。不可推出：真实规模（$m \approx 10^6, n=896, k=16$）下的性能与直方图估计的必要性。</li>
+  <li>代码逐 token 排序取分位数。可推出：分位数与 bias 的对应关系。不可推出：真实工程的张量操作与 all-reduce 通信模式。</li>
+  <li>手算例子恰好一步收敛。可推出：一轮 QB 更新在给定旧 cutoff 下保证目标负载。不可推出：一般情况一步收敛——论文报告近 $10^3$ 专家时几步内收敛。</li>
+  <li>对偶推导省略线性松弛整性的证明。可推出：对偶目标与 coordinate minimizer 的形式。不可推出：二部图 b-matching 多面体整性的完整证明。</li>
+  <li>直方图分位数恢复的 EMA 平滑作为扩展提及。可推出：EMA 可减少批次间采样噪声。不可推出：EMA 的具体公式与实现细节。</li>
+</ul>
 
 <p>本文从 auxiliary-loss-free 路由出发，说明了 QB 如何从一次前向传播的路由分数分位数直接推导出每个专家的 bias——替代 DeepSeek-V3 的固定步长 sign 更新，在 896 专家时仍能几步内收敛。核心是四步流程（Top-(k+1) 取 cutoff、计算 margins、取分位数、mean-centering），本质是对偶目标的精确 coordinate minimizer。训练时用直方图估计以固定通信成本恢复分位数，推理时 bias 冻结、零额外开销。开篇「核心问题」列出的五个问题已在前述各章完整作答。</p>
 

@@ -824,13 +824,13 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>实测后果明显。8192 token（页 32、Llama-3.1-8B）从 CPU 加载到 GPU 的带宽利用率仅约 22%<sup>[C8, N3]</sup>；带宽更高的平台反而利用率更低——GH200 把 PCIe 换成 NVLink、峰值带宽是 PCIe 的 6 倍，但实测利用率跌到约 5%<sup>[N3]</sup>（同样的页布局导致同样的小传输，但相对目标带宽更高，所以相对比例更低）。换言之，硬件升级无法挽救布局带来的带宽浪费。</p>
 
-<p>看图 1 在 LooGLE + Qwen2.5-14B 上的表现：</p>
+<p>图 1 显示 Strata 在 LooGLE + Qwen2.5-14B 上的表现：</p>
 
-<p><b>引导句</b>：图 1（原文 Figure 1）展示了 prefill 批的 Load/Compute Ratio 分布（右轴为 I/O stall 占比）——优化 I/O 前 74% prefill 时间阻塞在 KV 传输、优化 I/O 后仍有 24% 阻塞在缓存加载。</p>
+<p>图 1（原文 Figure 1）展示了 prefill 批的 Load/Compute Ratio 分布（右轴为 I/O stall 占比）——优化 I/O 前 74% prefill 时间阻塞在 KV 传输、优化 I/O 后仍有 24% 阻塞在缓存加载。</p>
 <img src="assets/img-14.webp" alt="图（原文 Figure 1）：LooGLE + Qwen2.5-14B 上 Load/Compute Ratio 的 CDF 与 I/O stall 占比">
 <p><b>图（原文 Figure 1）</b>：横轴为每批的 Load/Compute Ratio（从 CPU 加载的 token 数 / 新输入 token 数），左轴为 CDF、右轴为 I/O stall 占 prefill 时间的百分比。红色曲线（基线 SGLang offload）显示 I/O stall 占比可超过 74%，绿色曲线（Strata 优化 I/O 后）即使移除小页传输开销，仍有高达 24% prefill 时间阻塞在 cache 加载——说明调度器已把 I/O 优化后仍可能无法完全隐藏加载延迟，是第二类瓶颈的征兆<sup>[C7, N2]</sup>。</p>
 
-<p><b>引导句</b>：图 3 给出多平台实测带宽利用率。</p>
+<p>图 3 给出多平台实测带宽利用率。</p>
 <img src="assets/img-13.webp" alt="图（原文 Figure 3）：不同平台加载 8192 token KV cache 的延迟与带宽利用率">
 <p><b>图（原文 Figure 3）</b>：8192 token KV cache（页 32、Llama-3.1-8B）从 CPU 加载到 GPU 在不同平台上的延迟与带宽利用率。H200（PCIe 5.0）约 22%，带宽更高的 GH200（NVLink，峰值 6 倍于 PCIe）反而跌至约 5%<sup>[C8, N3]</sup>。同样的小传输布局、更高带宽的硬件，相对利用率反而更低。</p>
 
@@ -838,9 +838,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>直觉上的"修"是放大页大小：单次传输变大、$S$ 变大、利用率上升。但放大页同时改了三个目标的方向，而且两个反向。</p>
 
-<p>看图 2 的实验。ShareGPT、Mistral-24B、H200、SGLang 上把页大小从 1 扫到 1024：</p>
+<p>图 2 的实验：ShareGPT、Mistral-24B、H200、SGLang 上把页大小从 1 扫到 1024：</p>
 
-<p><b>引导句</b>：图 2 显示页大小对缓存命中率与 TTFT 的影响——页越大命中率越低，TTFT 上升最多 2 倍（P90 2.9 倍）。</p>
+<p>图 2 显示页大小对缓存命中率与 TTFT 的影响——页越大命中率越低，TTFT 上升最多 2 倍（P90 2.9 倍）。</p>
 <img src="assets/img-12.webp" alt="图（原文 Figure 2）：ShareGPT + Mistral-24B 上页大小对缓存命中率与 TTFT 的影响">
 <p><b>图（原文 Figure 2）</b>：页大小从 1 增至 1024 时，缓存命中率随页增大显著下降，平均 TTFT 最多上升 2 倍、P90 上升 2.9 倍<sup>[C6, N4]</sup>。原因是按页匹配（<a href="../paged-attention/index.html">PagedAttention</a>）：共享前缀不是页大小整数倍时，末尾不足一页的 token 全部落空（页面尾部对齐损失是按页匹配机制的直接推论，标注为推断：论文 §3.1 L39–42 仅指出"cache matching is performed on a per-page basis"是命中率下降原因，未展开尾部对齐的具体量化）；页越大、按页匹配的粒度越粗，命中率越低。</p>
 
@@ -912,9 +912,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>具体做法：<b>少量大 CUDA block</b>。把 I/O kernel 设计成 2 个 CUDA block、每个 1024 线程<sup>[C10, N5]</sup>。少 block 让硬件调度器把它们装进同一两个 SM（可低至 1 个），剩下的一百多个 SM 留给计算 kernel。再配合绕过 cache 的底层指令（cache-bypass loads/stores）减少 cache 污染。</p>
 
-<p>看图 5 的微基准（H200 上 I/O kernel 与 prefill/decode 同跑）：</p>
+<p>图 5 的微基准（H200 上 I/O kernel 与 prefill/decode 同跑）：</p>
 
-<p><b>引导句</b>：图 5 显示资源配额对 I/O kernel 干扰的影响——2 个 1024 线程 block 是兼顾吞吐与干扰的甜点。</p>
+<p>图 5 显示资源配额对 I/O kernel 干扰的影响——2 个 1024 线程 block 是兼顾吞吐与干扰的甜点。</p>
 <img src="assets/img-11.webp" alt="图（原文 Figure 5）：I/O kernel 资源配额 vs prefill/decode 干扰">
 <p><b>图（原文 Figure 5）</b>：横轴是 I/O kernel 占用的 CUDA block 数与每 block 线程数，纵轴是同跑场景下的吞吐（数据传输、prefill、decode）与互相干扰百分比。仅用 2 个 1024 线程 block 时，Strata 达到约 50 GB/s 传输吞吐、prefill 性能损失 <5%、decode 损失约 10%<sup>[N5]</sup>。这一组数字决定了默认配额：CPU$\to$GPU 加载用 2 block（关键路径），GPU$\to$CPU 备份用 1 block（非关键路径，备份带宽本就够用）。</p>
 
@@ -949,9 +949,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h3 id="two-layouts">3.1 两种布局的职责</h3>
 
-<p>看图 6 对比 layer-first 与 page-first 两种布局。</p>
+<p>图 6 对比 layer-first 与 page-first 两种布局。</p>
 
-<p><b>引导句</b>：图 6 显示 layer-first（GPU 计算友好）与 page-first（传输友好）布局的差别。</p>
+<p>图 6 显示 layer-first（GPU 计算友好）与 page-first（传输友好）布局的差别。</p>
 <img src="assets/img-10.webp" alt="图（原文 Figure 6）：layer-first 布局与 page-first 布局对比">
 <p><b>图（原文 Figure 6）</b>：layer-first（左）将同一层各 token 的 K/V 连续排列，与逐层计算对齐——kernel 从一段连续内存即可完成该层注意力。page-first（右）将同一页的各层连续排列，单页成为一次大传输——搬运粒度大、传输高效，但用于 GPU 计算时需要一层间接寻址（先查页表再定位各层数据），kernel 实现复杂化。</p>
 
@@ -961,9 +961,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>GPU-assisted I/O 给出一条出路：I/O 线程读源数据时，对偏移多做一次算术运算即可算出目的地址——把"读旧布局 $\to$ 写新布局"内嵌在 I/O 流程里，开销可忽略<sup>[C11]</sup>。结果：GPU 保留 layer-first（不破坏计算），host/存储用 page-first（不损失传输），I/O 时做一次布局转换。</p>
 
-<p>看图 12 的微基准：同样页 32、8192 token，从本地磁盘加载到 CPU 内存时，page-first 布局的延迟最多降低 4 倍（vs layer-first）<sup>[C11, N9]</sup>。这是布局解耦在存储层的具体收益。</p>
+<p>图 12 的微基准：同样页 32、8192 token，从本地磁盘加载到 CPU 内存时，page-first 布局的延迟最多降低 4 倍（vs layer-first）<sup>[C11, N9]</sup>。这是布局解耦在存储层的具体收益。</p>
 
-<p><b>引导句</b>：图 12 给出磁盘加载下 page-first 与 layer-first 布局的延迟对比。</p>
+<p>图 12 给出磁盘加载下 page-first 与 layer-first 布局的延迟对比。</p>
 <img src="assets/img-09.webp" alt="图（原文 Figure 12）：磁盘加载 8192 token 不同布局的延迟">
 <p><b>图（原文 Figure 12）</b>：8192 token KV cache（页 32、不同模型）从本地磁盘加载到 CPU 内存时，page-first 布局的延迟显著低于 layer-first，最多 4 倍<sup>[N9]</sup>。</p>
 
@@ -1000,9 +1000,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h3 id="system-overview">4.1 系统全景</h3>
 
-<p>看图 4 的架构图。</p>
+<p>图 4 为架构图。</p>
 
-<p><b>引导句</b>：图 4 展示 Strata 的数据流——请求$\to$Scheduler$\to$GPU Executor + Cache Controller（GPU HBM / CPU DRAM / External Storage），HiRadixTree 作为页表与元数据。</p>
+<p>图 4 展示 Strata 的数据流——请求$\to$Scheduler$\to$GPU Executor + Cache Controller（GPU HBM / CPU DRAM / External Storage），HiRadixTree 作为页表与元数据。</p>
 <img src="assets/img-08.webp" alt="图（原文 Figure 4）：Strata 系统架构">
 <p><b>图（原文 Figure 4）</b>：请求进入 Request Queue。Scheduler 在当前批执行期间持续估算可用系统资源与队列请求的资源需求，选子集组成下一批并 Dispatch 到 GPU Executor，同时向 Cache Controller 发起 KV cache 加载请求（Store / Load）。GPU Executor 与 Cache Controller 同步（Completion ACK），确保执行到某层时该层 KV cache 已就绪。Cache Controller 管理 GPU HBM、CPU DRAM、External Storage 三层之间的数据流。HiRadixTree 是 SGLang RadixTree 的扩展，存各页元数据（GPU 索引、CPU 索引、hit 计数等）。prefill 完成后经 continuous batching 合并进统一 decoding batch，Scheduler 沿用 SGLang 的 prefill 优先（缩 TTFT）+ decode 合大批（提吞吐）实践。Strata 用 P-D co-location：同一 GPU 时间上交替执行 prefill 与 decode 批<sup>[C17, C18]</sup>。</p>
 
@@ -1016,11 +1016,11 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>阈值机制：只有匹配 token 数超过默认阈值 <b>100</b> 才推迟<sup>[C14, N7]</sup>——少量 token 的共享不值得推迟（推迟本身有调度开销且会让该请求的 TTFT 后移）。</p>
 
-<p><b>引导句</b>：图 7 把 FIFO 与 Strata 的调度时间线放在同一坐标轴：FIFO 行为在上行，Strata 行为在下行，每段按颜色标识 miss/device hit/host hit/transfer/decoding，蓝色箭头标注三策略对应位置。</p>
+<p>图 7 把 FIFO 与 Strata 的调度时间线放在同一坐标轴：FIFO 行为在上行，Strata 行为在下行，每段按颜色标识 miss/device hit/host hit/transfer/decoding，蓝色箭头标注三策略对应位置。</p>
 <img src="assets/img-07.webp" alt="图（原文 Figure 7）：FIFO vs Strata 调度时间线对比，标注 Delay Hit、Balance Batch、Stall Hiding 三策略对应位置">
 <p><b>图（原文 Figure 7）</b>：橙色块=prefill 批含 cache miss、绿色块=device hit（GPU 显存命中）、紫色块=host hit（CPU 内存命中）、蓝色块=data transfer、灰色块=decoding batch。FIFO 行 A0+A1、B0+B1、C+D0、D1+F、G、Decoding；Strata 行 A0+B0、A1+B1、C+F、D0+D1、Decoding、G。三策略分别由三处蓝色箭头标注（图中标注）<sup>[C14, C15, C16]</sup>。</p>
 
-<p>看图 7（FIFO vs Strata）的对比，FIFO 行 A0+A1（两个请求都 miss 同一段），Strata 把 A0+A1 拆成 A0+B0 与 A1+B1：B0/B1 与 A0/A1 共享不同段 cache miss，能避免同批 miss 的重复 prefill——这就是 delay hit 缓解<sup>[C14]</sup>。</p>
+<p>图 7（FIFO vs Strata）的对比：FIFO 行 A0+A1（两个请求都 miss 同一段），Strata 把 A0+A1 拆成 A0+B0 与 A1+B1：B0/B1 与 A0/A1 共享不同段 cache miss，能避免同批 miss 的重复 prefill——这就是 delay hit 缓解<sup>[C14]</sup>。</p>
 
 <h3 id="balanced-batch">4.3 均衡 batch：配平加载与计算</h3>
 
@@ -1028,10 +1028,10 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>具体策略（Algorithm 1）<sup>[C15]</sup>：从队首请求开始组批，每步检查加入请求后是否仍非 loading-bound：① 不 bound 则加入，并优先吸收与其 <b>bundle hit</b> 的请求（共享上下文的请求放在同一批，共享加载且省显存与片上带宽——与 delay hit 相对）；② bound 则进降级列表，批不满再从降级列表补充；③ 防饿死：每轮组批总从队首开始、降级请求保留原序。</p>
 
-<p>看图 7 的 Balance Batch 标注：C+D0 在 FIFO 中是 bound（C 的 load + D0 的 load 都进预填），Strata 改成 C+F（F 与 C 的 cache hit 比 D0 多）以平衡——同样完成预填但计算负载更重，掩盖加载。</p>
+<p>图 7 的 Balance Batch 标注：C+D0 在 FIFO 中是 bound（C 的 load + D0 的 load 都进预填），Strata 改成 C+F（F 与 C 的 cache hit 比 D0 多）以平衡——同样完成预填但计算负载更重，掩盖加载。</p>
 
 <details class="code-details">
-<summary>Algorithm 1：均衡 batch 构建（伪代码）</summary>
+<summary>代码：Algorithm 1 均衡 batch 构建（伪代码）</summary>
 <div class="code-block">
 <pre><code class="language-text">输入：请求队列 Q；当前正在构建的批 B 起始为空
 状态：降级列表 D ← []
@@ -1069,7 +1069,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>论文提到也可插入 prefill 批来填充空泡——这适用于 P-D 分离部署（论文未实验）<sup>[C16]</sup>。本文讨论的 P-D co-location 下，decode 是最安全的填空选项。</p>
 
-<p>看图 7 的 Stall Hiding 标注：G 单独一请求的加载（下方 PCIe IO 行的 G 块）期间，Strata 在上方插入 Decoding 批——G PCIe 加载与 Decoding 并行进行。</p>
+<p>图 7 的 Stall Hiding 标注：G 单独一请求的加载（下方 PCIe IO 行的 G 块）期间，Strata 在上方插入 Decoding 批——G PCIe 加载与 Decoding 并行进行。</p>
 
 <figure class="diagram">
 <svg viewBox="0 0 700 280" role="img" aria-label="HiRadixTree 中 transient node 状态流转示意">
@@ -1098,7 +1098,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
   <rect class="dg-box" x="60" y="160" width="580" height="80" rx="6" style="stroke-dasharray:4 4"/>
   <text x="350" y="184" text-anchor="middle">贯穿示例：请求 A 到达，命中 B 的 transient 节点（匹配 token 数 200 &gt; 阈值 100）</text>
   <text x="350" y="204" text-anchor="middle"> A 推迟到下一轮调度，置于队首</text>
-  <text x="350" y="222" text-anchor="middle"> B 完成 prefill（in-flight \to{} standard），A 直接复用 B 的缓存</text>
+  <text x="350" y="222" text-anchor="middle"> B 完成 prefill（in-flight 转为 standard），A 直接复用 B 的缓存</text>
 </svg>
 <figcaption class="diagram-caption">HiRadixTree 中 transient node 的三个状态与流转：in-queue（请求引用新上下文）$\to$ in-flight（prefill 进行中）$\to$ standard node（带内存索引、可复用）。贯穿示例展示匹配 token 数 200 &gt; 阈值 100 时 delay hit 延迟执行的执行轨迹（严格大于阈值才推迟，§4.3.1）。</figcaption>
 </figure>
@@ -1144,9 +1144,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h3 id="e2e-results">5.2 端到端结果</h3>
 
-<p>看图 8 全景（H200）：</p>
+<p>图 8 为全景（H200）：</p>
 
-<p><b>引导句</b>：图 8 给出 H200 上三模型四数据集的吞吐-TTFT 全景。曲线越靠右上越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。</p>
+<p>图 8 给出 H200 上三模型四数据集的吞吐-TTFT 全景。曲线越靠右上越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。</p>
 <img src="assets/img-06.webp" alt="图（原文 Figure 8）：H200 上三模型四数据集端到端吞吐-TTFT 对比">
 <p><b>图（原文 Figure 8）</b>：每行一个数据集，纵轴 Average TTFT (s)、横轴 Throughput (output tokens/s)，曲线终点由请求率驱动。曲线越靠右下越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。Strata 在所有长上下文（前三行）上显著领先 short context（ShareGPT，末行）上各系统接近。LooGLE 上 Strata 对 Llama-70B 达到 abstract 的 5x vs vLLM-LMCache 与 3.75x vs TensorRT-LLM（详见下表）。</p>
 
@@ -1180,7 +1180,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>在 Qwen-14B、H200、LooGLE 上加三个变体：Strata-IO（仅 GPU-assisted I/O，I/O 机制）、Strata-Schedule-Only（仅三阶段调度）、Strata-IO-LPM（GPU-assisted I/O + 最长前缀匹配调度）<sup>[C20]</sup>。结果见图 9。</p>
 
-<p><b>引导句</b>：图 9 显示 Strata-IO、Strata-Schedule-Only、Strata-IO-LPM 与完整 Strata 的吞吐-TTFT 曲线对比——各机制独立有效，组合更优。</p>
+<p>图 9 显示 Strata-IO、Strata-Schedule-Only、Strata-IO-LPM 与完整 Strata 的吞吐-TTFT 曲线对比——各机制独立有效，组合更优。</p>
 <img src="assets/img-05.webp" alt="图（原文 Figure 9）：消融 Strata-IO / Schedule-Only / IO-LPM 的吞吐-延迟对比">
 <p><b>图（原文 Figure 9）</b>：相对 SGLang-HiCache 基线，Strata-IO 与 Strata-Schedule-Only 分别最高 2.3x 与 1.8x 峰值吞吐<sup>[N12, C20]</sup>。两者各从一个角度缓解 loading stall：低请求率下调度收益大（批小、I/O 压力轻，调度可更有效掩盖加载）；高请求率下 I/O 主导（批大、加载量大，I/O 机制是维持高吞吐的关键）。vLLM-LMCache 与 TensorRT-HiCache 也用 CUDA kernel 加速 KV cache I/O，与 Strata-IO 低请求率下相当，高请求率下 Strata-IO 维持更高吞吐（干扰抑制更有效）。Strata-IO-LPM（最长前缀匹配调度）低请求率下因提高在设备页复用而获益，高请求率下因频繁逐出无法保持。</p>
 
@@ -1188,13 +1188,13 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>页大小实验：SGLang-HiCache 在不同页大小下与 Strata-IO 比较峰值吞吐（归一化为 Strata-IO）。</p>
 
-<p><b>引导句</b>：图 10 显示 SGLang-HiCache 在不同页大小下的峰值吞吐（相对 Strata-IO 归一化）——即便调到自身最优页 512 也只能达到 93%，且命中率低 2.4%。</p>
+<p>图 10 显示 SGLang-HiCache 在不同页大小下的峰值吞吐（相对 Strata-IO 归一化）——即便调到自身最优页 512 也只能达到 93%，且命中率低 2.4%。</p>
 <img src="assets/img-04.webp" alt="图（原文 Figure 10）：SGLang-HiCache 不同页大小 vs Strata-IO 的归一化峰值吞吐">
 <p><b>图（原文 Figure 10）</b>：SGLang-HiCache 的峰值吞吐随页大小先升后降：页小 $\to$ I/O stall 多、吞吐低；页大 $\to$ hit rate 下降、吞吐也低。最优页 512 达到 Strata-IO 的 93%，主因命中率低 2.4%<sup>[N13, C21]</sup>（论文未明说 2.4% 相对哪个具体对照配置，数字本身见 §5.3.2）。Strata-IO 的 GPU-assisted I/O 让 I/O 效率对页大小不敏感，传输约束被摘出权衡。</p>
 
 <p>cache distance 实验：同上下文请求在到达流中的分布影响各机制收益。三种工作负载：<b>最小距离</b>（同上下文请求连续到达）、<b>shuffle</b>（原 LooGLE）、<b>最大距离</b>（同上下文请求尽量分散）<sup>[C22]</sup>。</p>
 
-<p><b>引导句</b>：图 11 展示三种 cache distance 下各机制的贡献分解。</p>
+<p>图 11 展示三种 cache distance 下各机制的贡献分解。</p>
 <img src="assets/img-03.webp" alt="图（原文 Figure 11）：三种 cache distance 下各机制贡献分解">
 <p><b>图（原文 Figure 11）</b>：最小距离时无需分层缓存（高局部性），delay hit 缓解贡献最大（峰值吞吐 +42%）；shuffle 与最大距离时 I/O 机制分别 +76% 与 +95%（距离越大命中 CPU DRAM 越多，I/O 优化空间越大）；均衡 batch 再 +11% 与 +12%；stall hiding 再 +8% 与 +3%（shuffle 方差大、stall hiding 收益更高）。最大距离时 delay hit 缓解无收益（高距离天然减少 delay hit 现象的发生）<sup>[N14, C22]</sup>。</p>
 
@@ -1202,11 +1202,11 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>GH200 把 PCIe 换成 NVLink-C2C，CPU-GPU 带宽从 64 GB/s 跃升到 384 GB/s（6 倍）。问题：仅靠硬件升级能否吃满？</p>
 
-<p><b>引导句</b>：图 13 显示 GH200 上各系统的 TTFT 相对 H200 基线的对比。</p>
+<p>图 13 显示 GH200 上各系统的 TTFT 相对 H200 基线的对比。</p>
 <img src="assets/img-02.webp" alt="图（原文 Figure 13）：PCIe-5.0 vs Grace-Hopper 平台 TTFT 对比">
 <p><b>图（原文 Figure 13）</b>：标准 DMA 拷贝不加大页时无法有效利用硬件改进；仅靠硬件升级（GH200 上的 SGLang 基线）延迟下降有限，且不敌 H200 上的 Strata-IO。</p>
 
-<p><b>引导句</b>：图 14 给出持续带宽对比。</p>
+<p>图 14 给出持续带宽对比。</p>
 <img src="assets/img-01.webp" alt="图（原文 Figure 14）：Grace-Hopper 与 PCIe-5.0 持续带宽对比">
 <p><b>图（原文 Figure 14）</b>：Strata-IO 把持续带宽从 40 提到 150 GB/s；但 Strata-IO-GH（仅 I/O 机制，无调度）仍不敌 Strata-PCIe（完整版，H200 平台）——调度改进是吃满 Grace Hopper 类平台的必要条件。完整 Strata-GH 接近 Oracle（无限带宽模拟）性能<sup>[C23, N15]</sup>。</p>
 
@@ -1244,23 +1244,48 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>本章是分析性评价，内容属于分析性判断，不是论文的结论。</p>
 </div>
 
-<h3 id="strengths">优点</h3>
+<h3 id="strengths">6.1 优点</h3>
 
 <p>Strata 的设计选择体现了一条贯穿主线——<b>把 I/O 路径与调度同时纳入带宽资源模型</b>。三杠杆 $X=C\cdot S/L$ 框架贯穿：I/O kernel 解决 $C$ 与 $S$ 的双重受限，cache-aware 调度把带宽作为调度器的一等资源（均衡 batch 的 ratio、bubble filling 的资源正交）。这不是把已有技巧堆叠，而是先识别瓶颈的杠杆、再对每一杠杆出招——这是论文设计连贯性所在。布局解耦（GPU layer-first、host/存储 page-first）是另一个体现"先识别约束再解耦"的设计选择：原本要权衡的两难被免费的 I/O 线程算术消除，方法干净。</p>
 
 <p>工程上：基于 SGLang 实现且已在一家领先 AI 公司生产部署<sup>[C25]</sup>——production grade 不是口号。ROCm 后端兼容 AMD GPU<sup>[C26]</sup>，跨平台部署可行。基线版本固定（vLLM v0.8.5、LMCache v0.2.1、TensorRT-LLM v0.17.0、SGLang v0.4.5）使数字可比。</p>
 
-<h3 id="limits">局限</h3>
+<h3 id="limits">6.2 局限</h3>
 
 <p>三个真实但可接受的代价。其一，I/O kernel 占用 SM 与算力。2 block $\times$ 1024 thread 的方案给 prefill 留 <5% 损失、decode 留 10%<sup>[N5, C10]</sup>——非零，长上下文收益（5$\times$ 量级）远超代价，但部署在 decode 主导的短上下文负载上仍净亏。其二，多个阈值依赖 tuning：loading_bound 比例阈值 100（论文 §4.3.2 L162 说该阈值硬件/模型相关、可分别 profiling）；transient node 匹配阈值 100（论文 §4.3.1 L115 给出默认值，未指定硬件相关性）<sup>[C14, C15]</sup>。文中给出的阈值在 Llama-70B + LooGLE 等具体配置下有效，未给出自动调整算法，部署到不同平台或模型需重做 profiling。其三，端到端实验中 disk 未纳入（基线系统对 disk 支持有限）<sup>[N19]</sup>，机制描述（最佳努力预取）有但实验缺失；SSD 缓存的实际收益未量化。</p>
 
 <p>更本质的边界：方法解决的是"单机内的搬运与调度"。它不解决 KV cache 容量本身的物理限制、不解决跨实例的全局协调（Mooncake/MemServe 方向）、不替代近似缓存（CacheGen/CacheBlend）。论文 §7 Conclusion 的展望段提及未来可能集成专用 on-chip 内存 I/O 加速器<sup>[C28]</sup>。</p>
 
-<h3 id="applicable">适用场景与位置</h3>
+<h3 id="applicable">6.3 适用场景与位置</h3>
 
 <p>适用条件：长上下文 prefill 主导负载（短上下文收益趋近于零但也无退化）；分层缓存已成必需（否则搬运对象不存在）；具备足够 CPU pinned 内存（论文用 1TB、GH200 400GB）。在 LooGLE 等典型 RAG 负载上效果显著；在 cache distance 极大（请求间共享少）的负载上 I/O 机制仍贡献最大（+95%）、调度贡献小；在 cache distance 极小（局部性极强）的负载上分层缓存本身不必要、delay hit 缓解贡献最大。</p>
 
 <p>与相邻工作的相对位置：与 Mooncake/MemServe 正交——Strata 关注单机 P-D co-location 下的内存管理与调度，Mooncake/MemServe 关注跨实例的全局池化，二者可集成但解决的问题不同。与 CachedAttention/Pensieve/FlashGen 是一族——Strata 替代了它们的"层间重叠假设在长上下文下成立"的隐含前提，并在同样的 I/O 路径上加了 GPU-assisted 实现。与 CacheGen/CacheBlend 是另一族——前者做精确前缀缓存（Strata 路线），后者做语义级近似缓存（精度换压缩比）。Strata 在精确缓存前提下保证请求精度不受影响<sup>[C27]</sup>。</p>
+
+<h3 id="evaluation-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>Strata 方法评价的核心优点是什么？</p>
+    <details>
+    <summary>解答：设计连贯性与工程可用性</summary>
+    <p>设计主线是把 I/O 路径与调度同时纳入带宽资源模型，三杠杆 $X=C\cdot S/L$ 框架贯穿全部组件；布局解耦把"layer-first 与 page-first 的两难"用空闲 I/O 线程的算术消除。工程上基于 SGLang 实现且已在生产部署，ROCm 后端兼容 AMD GPU，基线版本固定使数字可比。</p>
+    </details>
+  </li>
+  <li>
+    <p>Strata 的三个主要代价或局限是什么？</p>
+    <details>
+    <summary>解答：SM 占用、阈值调优与实验边界</summary>
+    <p>其一，I/O kernel 占用 SM 与算力（prefill 留不到 5% 损失、decode 留 10%），decode 主导的短上下文负载上净亏；其二，多个阈值依赖按硬件/模型 profiling，未给自动调整算法；其三，端到端实验未纳入 disk，SSD 缓存收益未量化。更本质的边界：方法只解决单机内的搬运与调度，不解决 KV cache 容量物理限制与跨实例全局协调。</p>
+    </details>
+  </li>
+  <li>
+    <p>什么负载适合部署 Strata？</p>
+    <details>
+    <summary>解答：长上下文 prefill 主导 + 分层缓存必需</summary>
+    <p>适用条件：长上下文 prefill 主导负载（短上下文收益趋近零但无退化）、分层缓存已成必需（否则无搬运对象）、具备足够 CPU pinned 内存。cache distance 极大的负载上 I/O 机制贡献最大（+95%）；cache distance 极小的负载上分层缓存本身不必要、delay hit 缓解贡献最大。</p>
+    </details>
+  </li>
+</ol>
 
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
