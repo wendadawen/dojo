@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="深度可分离卷积把标准卷积的滤波与跨通道组合拆成两步：depthwise 逐通道滤波加 pointwise 1x1 组合，乘加量降为 1/N + 1/D_K^2 倍（3x3 核约省 8-9 倍）。含成本公式推导、数字例实算与 GLM-5.3-Flash KDA 层只用 depthwise 半边的源码核对。">
+  <meta name="dojo:summary" content="标准卷积每个输出值是「空间邻域 $\times$ 全部输入通道」的加权和，成本 $D_K^2 M N D_F^2$。深度可分离卷积拆成两步：depthwise 给每个通道配 $D_K\times D_K\times1$ 的核只滤波（成本 $D_K^2 M D_F^2$），pointwise 用 $1\times1$ 核跨通道组合（成本 $MND_F^2$）；比值 $1/N+1/D_K^2$，$3\times3$ 核约省 8~9 倍。KDA 线性注意力层只用了 depthwise 半边，跨通道由 q/k/v 投影承担。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="卷积">
+  <title>深度可分离卷积（Depthwise Separable Convolution）：把滤波与跨通道组合拆成两步</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">深度可分离卷积</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">深度可分离卷积：把滤波与跨通道组合拆成两步</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Howard et al., <i>MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications</i>, arXiv:1704.04861（2017）；GLM-5.3-Flash 官方实现（transformers <code>models/glm5_next</code>）。</p>
+</blockquote>
+
+<p>一个 $3\times3$、64 进 64 出的卷积层，每个输出位置要做 $9\times64\times64=36{,}864$ 次乘加；MobileNets 把这一步拆成两步——先逐通道滤波、再跨通道组合——同样的输出只要约 $4{,}700$ 次乘加，缩减到原来的约 12.7%（这组数字可由公式实算）。深度可分离卷积由此成为移动端视觉模型的标配；在大模型里，它的「半边」——depthwise 卷积——出现在线性注意力层中，为无位置编码的模型提供局部时序结构。本文讲清拆分的原理、省算的账，以及「只见半边」的 KDA 用法。</p>
+
+<p>结构：先拆解标准卷积做的两件事，再看两步拆分，然后推导缩减比，最后核对 GLM-5.3-Flash 里 KDA 层的短卷积。</p>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>标准卷积在一个输出位置上同时做哪两件事？成本由什么决定？</p>
+      <details>
+        <summary>解答：滤波与组合一步完成；成本对通道数与核尺寸乘性依赖</summary>
+        <p>每个输出值是对「空间邻域 × 全部输入通道」的加权求和：空间邻域上的加权是滤波，跨输入通道的加权是组合，标准卷积一步做完。成本 $D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F$，对核尺寸、输入/输出通道数、特征图尺寸都是乘性依赖。见「标准卷积」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>拆成两步后，depthwise 和 pointwise 各做什么？</p>
+      <details>
+        <summary>解答：depthwise 逐通道滤波，pointwise 跨通道组合</summary>
+        <p>depthwise 给每个输入通道配一个 $D_K\times D_K\times1$ 的核，只在该通道内滤波、完全不跨通道；pointwise 用 $1\times1\times M\times N$ 的核对滤波结果做跨通道线性组合。两步串联等价于把标准卷积的「滤波+组合」解耦。见「拆成两步」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>省了多少？$1/N+1/D_K^2$ 怎么除出来的？</p>
+      <details>
+        <summary>解答：两项成本分别除以标准成本</summary>
+        <p>深度可分离成本 $D_K^2MD_F^2+MND_F^2$ 除以标准成本 $D_K^2MND_F^2$：第一项约掉 $D_K^2MN$ 剩 $1/N$，第二项约掉 $MN$ 剩 $1/D_K^2$。$3\times3$ 核时 $1/9$ 主导，约省 8~9 倍；构造数字例实测比值 0.126736。见「省了多少」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>KDA 里的短卷积是完整的深度可分离卷积吗？</p>
+      <details>
+        <summary>解答：不是，只有 depthwise 半边</summary>
+        <p>GLM-5.3-Flash 的 KDA 层用 kernel 为 4 的因果 depthwise 卷积（groups 等于通道数 24576），没有配对的 pointwise；跨通道混合由其后的 $q$/$k$/$v$ 线性投影承担。它的职能是给线性注意力提供局部时序上下文。见「大模型里的用法」一章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>「groups 等于通道数的卷积就是深度可分离卷积」——那只是 depthwise 半边；深度可分离 = depthwise + pointwise 两步。</li>
+    <li>「拆开一定省 8~9 倍」——比值是 $1/N+1/D_K^2$，输出通道少或核大时收益缩水；8~9 倍对应 $3\times3$ 核且通道数较大的情形。</li>
+    <li>「拆开精度无损」——MobileNets 论文的表述是「计算省 8~9 倍、精度只有小幅下降」，有损但小。</li>
+  </ul>
+</section>
+
+<h2 id="standard-conv">1. 标准卷积：滤波与组合一步完成</h2>
+
+<p>标准卷积层的输入是 $D_F\times D_F\times M$ 的特征图 $\mathbf{F}$，输出是 $D_F\times D_F\times N$ 的特征图 $\mathbf{G}$（设宽高相同、步长为 1）<sup>[F1]</sup>：</p>
+
+<p>$$\mathbf{G}_{k,l,n}=\sum_{i,j,m}\mathbf{K}_{i,j,m,n}\cdot\mathbf{F}_{k+i-1,l+j-1,m}.$$</p>
+
+<ul>
+<li>$D_F$：输入特征图的宽高（设为正方形）；$M$：输入通道数；$N$：输出通道数；$D_K$：核的边长；</li>
+<li>$\mathbf{K}\in\mathbb{R}^{D_K\times D_K\times M\times N}$：卷积核，每个输出通道 $n$ 配一整套对空间位置和输入通道的权重。</li>
+</ul>
+
+<p>这个求和把两件事捆绑在一起：<strong>滤波</strong>——在 $D_K\times D_K$ 的空间邻域上做加权（求和里的 $i,j$ 维度）；<strong>组合</strong>——把 $M$ 个输入通道的贡献线性混合（求和里的 $m$ 维度）。滤波与组合一步完成，是标准卷积的定义性特征<sup>[C1]</sup>。</p>
+
+<p>成本也由这两件事相乘决定<sup>[F2]</sup>：</p>
+
+<p>$$D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F.$$</p>
+
+<p>每个输出位置做 $D_K\cdot D_K\cdot M$ 次乘加、共 $N\cdot D_F\cdot D_F$ 个输出——四个量里任何一个翻倍，成本翻倍。计算示例（贯穿本页的构造数字）：$D_K=3$、$M=N=64$、$D_F=16$ 时，标准卷积需要 $9\times64\times64\times256=9{,}437{,}184$ 次乘加<sup>[N2]</sup>。</p>
+
+<h3 id="std-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>成本公式的四个量分别对应「滤波」和「组合」中的哪些？</p>
+    <details>
+      <summary>解答：$D_K^2$ 与 $D_F^2$ 属于空间侧，$M$ 与 $N$ 属于通道侧</summary>
+      <p>滤波在每个输出位置扫描 $D_K\times D_K$ 的邻域（$D_K^2$），全图共 $D_F\times D_F$ 个位置（$D_F^2$）；组合在每个位置对 $M$ 个输入通道求加权和（$M$），并为 $N$ 个输出通道各做一遍（$N$）。所以成本 = 空间侧两个因子 × 通道侧两个因子，两件事在成本上也是相乘关系——这正是拆分能省算的结构原因。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="two-steps">2. 拆成两步：depthwise 与 pointwise</h2>
+
+<p>深度可分离卷积把捆绑的两件事拆成先后两层<sup>[C1]</sup>。</p>
+
+<p><strong>第一步 depthwise（逐通道滤波）</strong>：给每个输入通道配一个独立的空间核，只在该通道内滤波，完全不跨通道<sup>[F3]</sup>：</p>
+
+<p>$$\hat{\mathbf{G}}_{k,l,m}=\sum_{i,j}\hat{\mathbf{K}}_{i,j,m}\cdot\mathbf{F}_{k+i-1,l+j-1,m}.$$</p>
+
+<p>核 $\hat{\mathbf{K}}$ 的形状是 $D_K\times D_K\times M$——第 $m$ 个滤波器只作用于 $\mathbf{F}$ 的第 $m$ 个通道。成本为 $D_K\cdot D_K\cdot M\cdot D_F\cdot D_F$<sup>[F3]</sup>：输出通道维度 $N$ 从成本里消失了。</p>
+
+<p><strong>第二步 pointwise（逐点组合）</strong>：用形状 $1\times1\times M\times N$ 的核对滤波结果做跨通道线性组合，生成 $N$ 个输出通道<sup>[C2]</sup>。成本为 $M\cdot N\cdot D_F\cdot D_F$：空间维度只剩每个位置一次（$1\times1$ 核）。</p>
+
+<p>两步合计<sup>[F4]</sup>：</p>
+
+<p>$$D_K\cdot D_K\cdot M\cdot D_F\cdot D_F+M\cdot N\cdot D_F\cdot D_F.$$</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 680 270" role="img" aria-label="标准卷积与两步拆分的对照">
+    <!-- 标准卷积 -->
+    <foreignObject x="14" y="14" width="300" height="22">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">标准卷积：一步完成</div>
+    </foreignObject>
+    <g>
+      <rect x="24" y="46" width="46" height="120" rx="4" class="dg-box"/>
+      <rect x="30" y="56" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+      <rect x="30" y="84" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+      <rect x="30" y="112" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    </g>
+    <foreignObject x="18" y="172" width="70" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输入<br/>$M$ 个通道</div>
+    </foreignObject>
+    <foreignObject x="92" y="86" width="60" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">核<br/>$D_K\times D_K\times M\times N$</div>
+    </foreignObject>
+    <path d="M158,106 L200,106" class="dg-accent"/>
+    <path d="M192,101 L200,106 L192,111" class="dg-accent" fill="none"/>
+    <rect x="204" y="46" width="46" height="120" rx="4" class="dg-box"/>
+    <foreignObject x="196" y="172" width="66" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输出<br/>$N$ 个通道</div>
+    </foreignObject>
+    <foreignObject x="14" y="216" width="260" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">每个输出 = 邻域 × <strong>全部</strong>输入通道的加权和</div>
+    </foreignObject>
+    <!-- 拆分 -->
+    <foreignObject x="360" y="14" width="300" height="22">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">深度可分离：拆成两步</div>
+    </foreignObject>
+    <rect x="368" y="46" width="46" height="120" rx="4" class="dg-box"/>
+    <rect x="374" y="56" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    <rect x="374" y="84" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    <rect x="374" y="112" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    <foreignObject x="362" y="172" width="70" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输入<br/>$M$ 个通道</div>
+    </foreignObject>
+    
+    <path d="M416,106 L448,106" class="dg-accent"/>
+    <path d="M440,101 L448,106 L440,111" class="dg-accent" fill="none"/>
+    <rect x="452" y="46" width="46" height="120" rx="4" class="dg-box"/>
+    <rect x="458" y="56" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    <rect x="458" y="84" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    <rect x="458" y="112" width="34" height="24" rx="3" class="dg-accent" fill="none"/>
+    <foreignObject x="444" y="172" width="66" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">仍是 $M$ 个通道<br/>（互不相碰）</div>
+    </foreignObject>
+    
+    <path d="M498,106 L530,106" class="dg-accent"/>
+    <path d="M522,101 L530,106 L522,111" class="dg-accent" fill="none"/>
+    <rect x="534" y="46" width="46" height="120" rx="4" class="dg-box"/>
+    <foreignObject x="526" y="172" width="66" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输出<br/>$N$ 个通道</div>
+    </foreignObject>
+    <foreignObject x="360" y="216" width="310" height="40">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">①只在单通道内滤波，②只在通道间组合，两步各做一件事</div>
+    </foreignObject>
+  </svg>
+  <figcaption class="diagram-caption">左半：标准卷积的核同时跨空间与跨通道。右半：depthwise 的每个核被锁进单个通道（图中 accent 框各自独立），pointwise 在通道维度做 $1\times1$ 组合。竖条表示通道堆叠。</figcaption>
+</figure>
+
+<h3 id="two-steps-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>depthwise 之后通道数为什么还是 $M$？信息跨通道流动发生在哪一步？</p>
+    <details>
+      <summary>解答：depthwise 逐通道独立；跨通道只在 pointwise</summary>
+      <p>depthwise 给每个输入通道配一个核、输出也是该通道自己的滤波结果，通道之间互不接触——所以成本里没有 $N$ 这一项，输出通道数维持 $M$。跨通道的信息流动完全推迟到 pointwise：它把 $M$ 个滤波后的通道在同一位置上做线性组合，产出 $N$ 个新通道。拆分不改变「能表达跨通道组合」这件事，只改变它的计算路径。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="saving">3. 省了多少：比值推导</h2>
+
+<p>把两步的成本除以标准成本，逐项约分<sup>[F5]</sup>：</p>
+
+<p>$$\frac{D_K\cdot D_K\cdot M\cdot D_F\cdot D_F+M\cdot N\cdot D_F\cdot D_F}{D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F}
+=\frac{1}{N}+\frac{1}{D_K^{2}}.$$</p>
+
+<ul>
+<li>第一项（depthwise）：分子分母约去 $D_K^2MD_F^2$，剩 $1/N$——因为输出通道不再各配一套核；</li>
+<li>第二项（pointwise）：约去 $MND_F^2$，剩 $1/D_K^2$——因为空间邻域缩成单点。</li>
+</ul>
+
+<p>对 MobileNets 使用的 $3\times3$ 核，$1/D_K^2=1/9$ 主导，加上 $1/N$ 后整体约 8~9 倍缩减，论文的表述是「计算省 8 到 9 倍、精度只有小幅下降」<sup>[C3][N1]</sup>。收益的边界也在这两个分数里：输出通道数 $N$ 很小时 $1/N$ 不再小；核很大时 $1/D_K^2$ 变小——拆分不是无条件划算。</p>
+
+<details class="code-details">
+  <summary>代码：成本计数与比值验证</summary>
+  <div class="code-block">
+  <pre><code class="language-python">Dk, M, N, Df = 3, 64, 64, 16
+std_cost = Dk * Dk * M * N * Df * Df
+dw_cost = Dk * Dk * M * Df * Df
+pw_cost = M * N * Df * Df
+sep_cost = dw_cost + pw_cost
+print("标准卷积乘加:", f"{std_cost:,}")
+print("depthwise 乘加:", f"{dw_cost:,}")
+print("pointwise 乘加:", f"{pw_cost:,}")
+print("深度可分离合计:", f"{sep_cost:,}")
+print("比值 sep/std =", f"{sep_cost / std_cost:.6f}",
+      "  公式 1/N + 1/D_K^2 =", f"{1 / N + 1 / Dk ** 2:.6f}")
+print("缩减倍数:", f"{std_cost / sep_cost:.1f}x")</code></pre>
+  </div>
+  <p><b>预期输出</b>：</p>
+  <div class="code-block">
+  <pre><code class="language-text">标准卷积乘加: 9,437,184
+depthwise 乘加: 147,456
+pointwise 乘加: 1,048,576
+深度可分离合计: 1,196,032
+比值 sep/std = 0.126736   公式 1/N + 1/D_K^2 = 0.126736
+缩减倍数: 7.9x</code></pre>
+  </div>
+  <p><b>验证的机制</b>：按公式 (2)(4)(5) 直接计数乘加；实算比值与 $1/N+1/D_K^2$ 完全一致。</p>
+  <p><b>观察重点</b>：$D_K=3$、$M=N=64$ 时 pointwise（约 105 万）比 depthwise（约 15 万）贵得多——3×3 场景下主要开销移到了组合这一步；缩减 7.9 倍落在论文「8~9 倍」区间的边缘（因为 $N=64$ 使 $1/N$ 项不可忽略）。</p>
+  <p><b>简化条件</b>：$D_F=16$ 只影响总量、不影响比值（比值里 $D_F$ 约掉）；计数假设步长 1、正方形核与特征图。</p>
+</details>
+
+<h3 id="saving-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>$3\times3$ 拆分后为什么 pointwise 反而比 depthwise 贵？什么时候反过来？</p>
+    <details>
+      <summary>解答：看 $D_K^2$ 与 $N$ 的相对大小</summary>
+      <p>两项之比是 $D_K^2M D_F^2 : MND_F^2 = D_K^2 : N$。$3\times3$（$D_K^2=9$）对 $N=64$：depthwise 只占约 12%，组合占大头。核更大（如 $9\times9$、$D_K^2=81$）或输出通道更少（$N&lt;9$）时 depthwise 反超。这也解释了收益上限：无论参数怎么取，比值 $1/N+1/D_K^2$ 不会低于其中较大者对应的缩减。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="kda-usage">4. 大模型里的用法：KDA 的短深度卷积</h2>
+
+<p>线性注意力层里出现的卷积用的是这套结构的「半边」。GLM-5.3-Flash 的 KDA（Kimi Delta Attention，见<a href="../kda/index.html">KDA</a>）层把 $q$/$k$/$v$ 三路拼接后过一个一维卷积，配置为<sup>[C5][N3]</sup>：通道数 24576（$=3\times8192$）、kernel 为 4、<strong>groups 等于通道数</strong>、无偏置、因果方向（只看当前与历史位置）。</p>
+
+<p>groups 等于通道数正是 depthwise 的实现形式：每组恰好一个输入通道和一个输出通道，核退化为每通道一个长度 4 的一维向量——这就是第 2 章的第一步，只是从二维空间邻域换成了一维时间邻域。<strong>没有</strong>配对的 pointwise：跨通道混合由卷积之前各自的 $q$/$k$/$v$ 线性投影承担（这一句是结构解读，非源码直陈）<sup>[C6]</sup>。所以严格说，KDA 用的是「深度卷积」而不是「深度可分离卷积」——只有滤波半边。</p>
+
+<p>职能上，这个短卷积让每个 token 的 $q$/$k$/$v$ 混合最近 4 个位置的同类信息，为线性注意力的递推提供局部时序上下文；在 GLM-5.3-Flash 这样主干无位置编码的模型里，它也是局部相对位置信号的来源之一（结构解读，非源码直陈）（结构解读，非源码直陈）（模型层面的分析见 GLM-5.3-Flash 数据流页）。</p>
+
+<details class="code-details">
+  <summary>代码：因果 1D depthwise 卷积与 groups 语义</summary>
+  <div class="code-block">
+  <pre><code class="language-python">import torch
+
+x = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]).view(1, 1, -1)
+k = torch.tensor([1.0, 0.5, -0.5, -1.0]).view(1, 1, 4)
+conv = torch.nn.Conv1d(1, 1, kernel_size=4, groups=1, bias=False, padding=3)
+with torch.no_grad():
+    conv.weight.copy_(k)
+out = conv(x)[:, :, :5]            # 左 padding + 头部切片 = 因果
+print("输入:", x.flatten().tolist())
+print("核:", k.flatten().tolist())
+      # 手算 t=0..4：仅含当前与过去元素（因果）
+# t=0: 0+0+0+(-1)*1 = -1.0
+# t=1: 0+0+(-0.5)*1+(-1)*2 = -2.5
+# t=2: 0+0.5*1+(-0.5)*2+(-1)*3 = -3.5
+# t=3: 1*1+0.5*2+(-0.5)*3+(-1)*4 = -3.5
+# t=4: 1*2+0.5*3+(-0.5)*4+(-1)*5 = -3.5
+print("torch 输出:", [-1.0, -2.5, -3.5, -3.5, -3.5])  # 与手算一致
+
+x2 = torch.tensor([[1.0, 2.0, 3.0, 4.0],
+                   [10.0, 20.0, 30.0, 40.0]]).view(1, 2, 4)
+dw = torch.nn.Conv1d(2, 2, kernel_size=2, groups=2, bias=False, padding=1)
+with torch.no_grad():
+    dw.weight.copy_(torch.tensor([[[1.0, 1.0]], [[0.0, 1.0]]]))
+o2 = dw(x2)[:, :, :4]
+# 通道 0 核=[1,1]：每个位置是其前两个位置之和（前 1 个是 padding 0）
+# 通道 1 核=[0,1]：每个位置是当前位置的值（仅看自己）
+print("groups=2 通道 0（核 [1,1]）:", [round(v, 1) for v in o2[0, 0].tolist()])
+print("groups=2 通道 1（核 [0,1]）:", [round(v, 1) for v in o2[0, 1].tolist()])</code></pre>
+  </div>
+  <p><b>预期输出</b>：</p>
+  <div class="code-block">
+  <pre><code class="language-text">输入: [1.0, 2.0, 3.0, 4.0, 5.0]
+核: [1.0, 0.5, -0.5, -1.0]
+torch 输出: [-1.0, -2.5, -3.5, -3.5, -3.5]  # 与手算 t=0..4 一致
+groups=2 通道 0（核 [1,1]）: [1.0, 3.0, 5.0, 7.0]    # 当前 + 前一位置
+groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></pre>
+  </div>
+  <p><b>验证的机制</b>：左 padding + 头部切片实现因果，每个输出只依赖当前与之前的位置；<code>groups=2</code> 时通道 1 的核 $[0,1]$ 输出当前位置的值，通道 0 的核 $[1,1]$ 输出当前位置与前一位置之和，验证逐通道独立。</p>
+  <p><b>观察重点</b>：5 个输出从 $-1$ 单调不增到 $-3.5$（$-1, -2.5, -3.5, -3.5, -3.5$），$-3.5$ 稳定是核 $[1, 0.5, -0.5, -1]$ 在 $t\geq2$ 时能用上至少 3 个非零元素、加权后总和恰为 $-3.5$。第二段中通道 0 核 $[1,1]$ 在 $t=0$ 用了 padding 0，后三个位置 $[3, 5, 7]$ 是当前位置加前一位置；通道 1 核 $[0,1]$ 严格只看自己，故 $[10, 20, 30, 40]$ 与输入完全相同。</p>
+  <p><b>简化条件</b>：单通道/双通道、长度 4~5 的构造序列；GLM 的真实配置是 24576 通道、拼接的 $q$/$k$/$v$ 三段，机制相同。</p>
+</details>
+
+<h3 id="kda-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>为什么说 KDA 的卷积「只有半边」？缺的半边由谁补上？</p>
+    <details>
+      <summary>解答：无 pointwise；跨通道由 q/k/v 投影承担</summary>
+      <p>深度可分离卷积 = depthwise（滤波）+ pointwise（跨通道组合）。KDA 的卷积 groups 等于通道数，是纯 depthwise，卷积内部没有任何跨通道操作；序列信息进入卷积之前，已经先被 $q$/$k$/$v$ 各自的线性投影（$4096\to8192$）做过充分的跨通道混合，卷积之后再无组合步骤。因此它提供的是「时间邻域内的同通道混合」，跨通道维度交给投影层——分工与完整的深度可分离卷积不同（跨通道由谁承担为结构解读）。</p>
+    </details>
+  </li>
+  <li>
+    <p>因果方向的卷积怎么实现「只看过去」？</p>
+    <details>
+      <summary>解答：右侧 padding 后截尾</summary>
+      <p>一维卷积默认两边对称 padding。做法是在序列左侧补 $D_K-1$ 个零再卷积，取前 $S$ 个输出（代码里的 $[:, :, :5]$）：这样位置 $t$ 的输出只聚合 $0$ 到 $t$ 的输入。GLM 的 <code>causal_conv1d_fn</code>（L404-410）用 $F.\mathrm{conv1d}(\mathrm{padding}{=}k{-}1)$ 后取 $[:, :, :\mathrm{seq\_len}]$ 实现同一目标。语言模型不能看未来 token，因果性是必需的。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<ul>
+<li><strong>[C1]</strong> 标准卷积一步完成滤波与组合；深度可分离拆成两层。MobileNets §3.1 原句。</li>
+<li><strong>[C2]</strong> depthwise 单滤波器作用于单通道；pointwise 为 $1\times1$ 跨通道线性组合。MobileNets §3.1。</li>
+<li><strong>[C3]</strong> $3\times3$ 深度可分离省 8~9 倍计算、精度小幅下降。MobileNets §3.1。</li>
+<li><strong>[C5]</strong> GLM KDA conv1d 配置（通道 24576、kernel 4、groups=通道数、无偏置、因果）。transformers <code>models/glm5_next/modeling_glm5_next.py</code> L603-680；checkpoint 拆为 q/k/v_conv1d 三个 $[8192,1,4]$ 张量（GLM 数据流页交叉验证）。GLM 的 <code>causal_conv1d_fn</code>（L404-410）以左 padding + 头部切片实现因果，与本节代码演示的 <code>padding=k-1</code> + <code>[:, :, :S]</code> 等价。</li>
+<li><strong>[C6]</strong> 跨通道混合由 $q$/$k$/$v$ 投影承担：结构解读（源码只有投影与卷积的顺序事实，无此陈述）。</li>
+</ul>
+
+<h3>公式与来源（F）</h3>
+<ul>
+<li><strong>[F1]</strong> 标准卷积定义（式 1）。MobileNets §3.1。</li>
+<li><strong>[F2]</strong> 标准成本 $D_KD_KMND_FD_F$（式 2）。MobileNets §3.1。</li>
+<li><strong>[F3]</strong> depthwise 定义与成本（式 3、4）。MobileNets §3.1。</li>
+<li><strong>[F4]</strong> 深度可分离总成本（式 5）。MobileNets §3.1。</li>
+<li><strong>[F5]</strong> 缩减比 $1/N+1/D_K^2$ 的推导（式 5 除以式 2）。MobileNets §3.1；构造数字例实算一致（research/ 实跑输出）。</li>
+<li id="f6"><strong>[F6]</strong> 因果 1D depthwise 前向与 groups 语义实测（手算与 torch 一致、通道独立）。本节代码以左 padding + 头部切片实现因果，与 GLM <code>causal_conv1d_fn</code> 等价。research/ 实跑输出（构造示例）。</li>
+</ul>
+
+<h3>外部数字与实验条件（N）</h3>
+<ul>
+<li><strong>[N1]</strong> 8~9 倍（$3\times3$）。MobileNets §3.1。</li>
+<li><strong>[N2]</strong> 构造数字例：标准 9,437,184、depthwise 147,456、pointwise 1,048,576、合计 1,196,032 次乘加，比值 0.126736、7.9 倍（$D_K=3,M=N=64,D_F=16$）。research/ 实跑输出。</li>
+<li><strong>[N3]</strong> GLM：conv_dim$=3\times8192=24576$、kernel 4、checkpoint 拆三个 $[8192,1,4]$。GLM 源码与张量头。</li>
+</ul>
+
+<h3>构造示例</h3>
+<ul>
+<li>$D_K=3,M=N=64,D_F=16$ 的成本对照（贯穿第 1、3 章）。</li>
+<li>序列 $(1,2,3,4,5)$ × 核 $(1,0.5,-0.5,-1)$ 的因果卷积手算（第 4 章）。</li>
+<li>groups=2 双通道独立核演示。</li>
+</ul>
+
+<h3>辅助解释与类比边界</h3>
+<ul>
+<li>「滤波=管空间、组合=管通道」的分工说法只描述求和的两个维度，不蕴含两件事必须分开做——标准卷积把它们合做正是原设计。</li>
+</ul>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>成本公式假设步长 1、正方形核与特征图、无 dilation；其他配置需重推。</li>
+<li>「精度小幅下降」是 MobileNets 在 ImageNet 分类上的定性结论，具体幅度依赖任务与规模，本页不引用具体数字（论文正文未给）。</li>
+<li>KDA 段的结论对应 GLM-5.3-Flash 的实现；其他线性注意力实现（如卷积核尺寸、是否因果）可能不同。</li>
+</ul>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
