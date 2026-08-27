@@ -1,0 +1,1344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="n-gram 用最近 n-1 个词近似整段历史的语言模型：链式法则与马尔可夫假设、计数即参数的 MLE 估计、组合数按词表 n 次方增长导致的稀疏与平滑，以及现代模型里哈希行号查可学习嵌入表的用法。全部数字与教材及实测核对。">
+  <meta name="dojo:summary" content="n-gram 用最近 $n-1$ 个词近似整段历史，概率由语料计数相除（MLE）直接得到；组合数按 $|V|^n$ 增长使任何有限语料稀疏，需平滑补零概率；现代模型把 n-gram 统计换成哈希行号查可学习嵌入表。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="数学基础">
+  <meta name="dojo:tag" content="概念解释">
+  <title>N-gram（n 元语法）：用最近几个词近似整段历史的语言模型 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">N-gram</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">N-gram（n 元语法）：用最近几个词近似整段历史的语言模型</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Jurafsky &amp; Martin,《Speech and Language Processing》第 3 版草稿（2026-08-19）第 3 章 "N-gram Language Models"；transformers@36deb0b5 的 Qwen4-Exp 实现。</p>
+</blockquote>
+
+<p>「The water of Walden Pond is so beautifully…」的下一个词，多数人押 blue、green 或 clear，而不是 refrigerator。判断依据只来自前面几个词——这个直觉就是 n-gram：语言模型给每个候选词赋概率，而概率的依据不必是整段历史，最近几个词往往够用。语言模型的完整定义见<a href="../pretraining/">预训练</a>。</p>
+<p>本文的学习路线：先看为什么整段历史算不动、近似式怎么写；再在三句小语料上手算概率；然后看计数方法的根本缺陷（稀疏）；最后看现代模型把 n-gram 统计换成哈希查表的用法。文中 Qwen 相关部分来自 Qwen3.8-Flash-Next 的实测。</p>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>语言模型的链式法则为什么算不动，n-gram 用什么近似绕过它？</p>
+      <details>
+        <summary>解答：历史组合爆炸，马尔可夫假设截断为最近 $n-1$ 个词</summary>
+        <p>句子概率按链式法则分解为逐词条件概率连乘，但每个条件概率 $P(w_k\mid w_{1:k-1})$ 依赖全部历史，特定长历史在语料中几乎不会重现，无法统计。n-gram 用马尔可夫假设把历史截断为最近 $n-1$ 个词：$P(w_{1:n})\approx\prod_k P(w_k\mid w_{k-n+1:k-1})$。完整推导见第 1 章。</p>
+      </details>
+    </li>
+    <li>
+      <p>n-gram 概率怎么从语料计数估计？小语料上手算是什么样？</p>
+      <details>
+        <summary>解答：计数相除（MLE），I am Sam 语料可整表手算</summary>
+        <p>最大似然估计等于 n-gram 出现次数除以其前缀出现次数：$P(w_n\mid w_{n-N+1:n-1})=C(w_{n-N+1:n})/C(w_{n-N+1:n-1})$。三句 I am Sam 语料上可手算出 $P(\mathrm{am}\mid I)=2/3$ 等全部概率并连乘出整句概率。手算过程见第 2 章。</p>
+      </details>
+    </li>
+    <li>
+      <p>为什么训练语料再大也会漏掉合法组合，平滑解决什么？</p>
+      <details>
+        <summary>解答：组合数按 $|V|^n$ 增长，未平滑 MLE 给未见组合零概率</summary>
+        <p>长度为 $n$ 的组合数按词表大小的 $n$ 次方增长，任何有限语料都只能覆盖其中一小部分；训练时未出现的组合概率被估为 0，一旦测试句含有它，整句概率连乘后为 0。平滑从高频事件匀出概率质量给未见事件，使概率不为零。证据与最小算例见第 3 章。</p>
+      </details>
+    </li>
+    <li>
+      <p>现代模型里 n-gram 统计还能怎么用？</p>
+      <details>
+        <summary>解答：哈希行号查可学习嵌入表，Qwen3.8-Flash-Next 注入 51.2B 这种表</summary>
+        <p>把以当前 token 结尾的 $n$ 个 token 经整数哈希映射到固定大小表的行号，查出的不是频率而是可学习向量；表容量远大于实际组合数使碰撞率可忽略。Qwen3.8-Flash-Next 在第 2 层注入 51.2B 参数的这种表（bigram 与 trigram 各 8 个头）。机制与实测见「从计数表到可学习查表」一章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>「n-gram 就是指 n 个词的序列」——它同时指序列和以最近 $n-1$ 个词为条件的概率模型两层含义，语境决定所指。</li>
+    <li>「语料够大计数就可靠」——组合数按 $|V|^n$ 增长，对数万词型以上的实际词表，万亿词语料对 trigram 仍然稀疏；教材 8 词 bigram 矩阵已大量为零。</li>
+    <li>「Qwen 的 n-gram 表存的是词组频率」——表里存的是可学习向量，哈希只决定查哪一行；频率从未被统计过。</li>
+  </ul>
+</section>
+
+<h2 id="chain-rule-markov">1. 链式法则算得动吗——马尔可夫近似从哪里来</h2>
+
+<p>语言模型要算的是「一个词在给定历史下的概率」$P(w\mid h)$。历史 $h$ 是当前词之前的全部 token。当 $h$ 是「The water of Walden Pond is so beautifully」这样的长句时，这个特定历史几乎不可能在语料中原样重现——语言是创造性的，任何具体上下文都可能是第一次出现，直接统计 $P(w\mid h)$ 无从下手。</p>
+
+<p>概率论给出的精确分解是链式法则<sup>[C3, F1]</sup>。对词序列 $w_{1:n}=(w_1,\ldots,w_n)$：</p>
+
+$$P(w_{1:n})=P(w_1)P(w_2\mid w_1)\cdots P(w_n\mid w_{1:n-1})=\prod_{k=1}^{n}P(w_k\mid w_{1:k-1})$$
+
+<p>这个分解本身不解决任何问题——每个条件概率仍然依赖全部历史。n-gram 模型的做法是把历史截断，只用最近 $n-1$ 个词<sup>[F2]</sup>。以 $n=2$（bigram）为例，近似式为：</p>
+
+$$P(w_{1:n})\approx\prod_{k=1}^{n}P(w_k\mid w_{k-1})$$
+
+<ul>
+<li>$w_k$：第 $k$ 个位置的词。</li>
+<li>$w_{k-1}$：它前一个词；$k=1$ 时以句首符号 $\langle s\rangle$ 充当。</li>
+<li>近似号 $\approx$：截断历史引入误差，等号只在历史恰好不影响预测时成立。</li>
+</ul>
+
+<p>这一步叫马尔可夫假设：预测只依赖最近有限个词，而不看更远的过去<sup>[C2]</sup>。$n$ 越大，近似越准、需要估计的参数也越多——这是贯穿全文的权衡。</p>
+
+<p>代入检查：$n=2$ 时每个条件只剩一个前词；$n=3$（trigram）时剩两个。术语上，2-gram 称 bigram，3-gram 称 trigram，「n-gram」一词既指这种 $n$ 个词的序列，也指用该近似建立的概率模型<sup>[C1]</sup>。</p>
+
+<details>
+<summary>补充：为什么句首句尾需要特殊符号</summary>
+<p>第一个词的条件 $P(w_1\mid\cdot)$ 没有前词可依。引入句首符号 $\langle s\rangle$ 让它变成 $P(w_1\mid\langle s\rangle)$；引入句尾符号 $\langle/s\rangle$ 让「句子在哪结束」也成为被预测的事件，从而使所有句子的概率可以归一。</p>
+</details>
+
+<h3 id="chain-rule-markov-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>为什么 $P(w\mid h)$ 在长历史下无法直接统计？</p>
+    <details>
+      <summary>解答：特定长历史几乎不重现</summary>
+      <p>$h$ 是当前词之前的全部 token。历史每加长一个词，可能的取值就乘上词表大小一次；具体的长上下文（如某个十几个词的从句）在语料中往往只出现零次或一次，基于它统计条件概率没有数据支撑。这不是工程问题，而是组合空间的性质。</p>
+    </details>
+  </li>
+  <li>
+    <p>bigram 近似把链式法则改成了什么？</p>
+    <details>
+      <summary>解答：条件只保留前一个词</summary>
+      <p>$P(w_{1:n})\approx\prod_{k=1}^{n}P(w_k\mid w_{k-1})$，第一个词以 $\langle s\rangle$ 为条件。每个条件概率只依赖前一个词，需要估计的参数量从「所有历史」降为「所有词对」，统计才成为可能。代价是丢掉了更早历史的信息。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="counting-mle">2. 计数就是参数——三句语料上手算</h2>
+
+<p>近似式确定了「需要哪些条件概率」，这一章回答数值从哪来。答案朴素得惊人：数一遍语料。对 $N$ 阶 n-gram，最大似然估计（MLE）<sup>[C4, F3]</sup>为：</p>
+
+$$P(w_n\mid w_{n-N+1:n-1})=\frac{C(w_{n-N+1:n})}{C(w_{n-N+1:n-1})}$$
+
+<ul>
+<li>$C(\cdot)$：某序列在语料中出现的次数；$N$ 即第 1 章的 $n$（教材用大写 $N$ 记阶数）。</li>
+<li>分子：完整 $n$ 元组的计数；分母：其前 $n-1$ 元前缀的计数。</li>
+<li>归一化的含义：同前缀的所有后继概率之和为 1。</li>
+</ul>
+
+<p>以下为教材 §3.1.2 自带的示例语料（非本页构造），三句话构成全部语料：</p>
+
+<div class="code-block">
+<pre><code class="language-text">&lt;s&gt; I am Sam &lt;/s&gt;
+&lt;s&gt; Sam I am &lt;/s&gt;
+&lt;s&gt; I do not like green eggs and ham &lt;/s&gt;</code></pre>
+</div>
+
+<p>数出分子分母即可得到全部 bigram 概率<sup>[N3]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>条件概率</th><th>分子/分母</th><th>值</th></tr></thead>
+<tbody>
+<tr><td>$P(I\mid\langle s\rangle)$</td><td>$2/3$</td><td>$0.6667$</td></tr>
+<tr><td>$P(\mathrm{Sam}\mid\langle s\rangle)$</td><td>$1/3$</td><td>$0.3333$</td></tr>
+<tr><td>$P(\mathrm{am}\mid I)$</td><td>$2/3$</td><td>$0.6667$</td></tr>
+<tr><td>$P(\mathrm{do}\mid I)$</td><td>$1/3$</td><td>$0.3333$</td></tr>
+<tr><td>$P(\mathrm{Sam}\mid\mathrm{am})$</td><td>$1/2$</td><td>$0.5000$</td></tr>
+<tr><td>$P(\langle/s\rangle\mid\mathrm{Sam})$</td><td>$1/2$</td><td>$0.5000$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>整句概率按第 1 章的连乘计算：</p>
+
+$$P(\langle s\rangle\ \mathrm{I\ am\ Sam}\ \langle/s\rangle)=\tfrac{2}{3}\times\tfrac{2}{3}\times\tfrac{1}{2}\times\tfrac{1}{2}=\tfrac{1}{9}\approx 0.1111$$
+
+<p>一个值得停下来的观察：这组概率就是 bigram 模型的全部参数——没有梯度、没有隐层，「训练」只是数数。这也是 n-gram 与神经语言模型的分界：后者把概率参数化为可学习函数，见<a href="../pretraining/">预训练</a>。</p>
+
+<details class="code-details">
+<summary>代码：I am Sam 语料的 bigram 统计与整句概率（实际运行）</summary>
+<div class="code-block">
+<pre><code class="language-python">from collections import Counter
+
+corpus = [
+    "&lt;s&gt; I am Sam &lt;/s&gt;",
+    "&lt;s&gt; Sam I am &lt;/s&gt;",
+    "&lt;s&gt; I do not like green eggs and ham &lt;/s&gt;",
+]
+bigram_counts = Counter()
+unigram_counts = Counter()
+for sent in corpus:
+    toks = sent.split()
+    for i in range(len(toks) - 1):
+        bigram_counts[(toks[i], toks[i + 1])] += 1
+    for t in toks:
+        unigram_counts[t] += 1
+
+def P(w_prev, w_next):
+    # bigram MLE：P(w_next | w_prev) = C(w_prev w_next) / C(w_prev)
+    return bigram_counts[(w_prev, w_next)] / unigram_counts[w_prev]
+
+sent = "&lt;s&gt; I am Sam &lt;/s&gt;".split()
+prob = 1.0
+for i in range(1, len(sent)):
+    prob *= P(sent[i - 1], sent[i])
+print(f"P(<s> I am Sam </s>) = {prob:.6f}")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">P(&lt;s&gt; I am Sam &lt;/s&gt;) = 0.111111</code></pre>
+</div>
+<p><b>验证的机制</b>：计数相除得到条件概率（正文 MLE 公式），连乘得到整句概率（第 1 章近似式）。</p>
+<p><b>观察重点</b>：六个概率全部由计数唯一确定，与正文表格逐项一致；整句概率 $1/9$ 可手算复核。</p>
+<p><b>简化条件</b>：无平滑（未见 bigram 概率为 0）、无词表截断；真实统计语言模型需要两者，见下一章。</p>
+</details>
+
+<h3 id="counting-mle-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>MLE 公式的分子分母各数什么？</p>
+    <details>
+      <summary>解答：完整 n-gram 的次数除以前缀的次数</summary>
+      <p>分子 $C(w_{n-N+1:n})$ 是完整 $n$ 元组在语料中的出现次数，分母 $C(w_{n-N+1:n-1})$ 是其 $n-1$ 元前缀的出现次数。相除后，同一前缀的所有后继的概率加起来恰为 1——每个前缀各有一套归一化，这正是「条件概率」的形式要求。</p>
+    </details>
+  </li>
+  <li>
+    <p>bigram 模型的「参数」和神经网络的参数有什么本质区别？</p>
+    <details>
+      <summary>解答：直接就是计数，无需梯度训练</summary>
+      <p>bigram 的参数是每个词对一个的条件概率，数值由语料计数唯一确定，「训练」只是遍历一遍语料数数。神经语言模型的参数是权重点，需要梯度下降从数据里学出来。前者可解释但稀疏不可泛化，后者把概率变成连续函数从而可泛化——这是两种范式的分界。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sparsity-smoothing">3. 语料再大也不够用——稀疏与平滑</h2>
+
+<p>计数方法的麻烦在规模。词表大小为 $|V|$ 时，可能的 bigram 组合有 $|V|^2$ 个、trigram 有 $|V|^3$ 个，而语料总词数是线性增长的。教材在 Berkeley 餐厅语料（9332 句、词表 $V=1446$<sup>[N2]</sup>）上给出 8 个高频词的 bigram 计数矩阵<sup>[C5]</sup>，下面节选其中 6 行——矩阵里大量格子为 0：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>i</th><th>want</th><th>to</th><th>eat</th><th>chinese</th><th>food</th><th>lunch</th><th>spend</th></tr></thead>
+<tbody>
+<tr><th>i</th><td>5</td><td>827</td><td>0</td><td>9</td><td>0</td><td>0</td><td>0</td><td>2</td></tr>
+<tr><th>want</th><td>2</td><td>0</td><td>608</td><td>1</td><td>6</td><td>6</td><td>5</td><td>1</td></tr>
+<tr><th>to</th><td>2</td><td>0</td><td>4</td><td>686</td><td>2</td><td>0</td><td>6</td><td>211</td></tr>
+<tr><th>eat</th><td>0</td><td>0</td><td>2</td><td>0</td><td>16</td><td>2</td><td>42</td><td>0</td></tr>
+<tr><th>chinese</th><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td><td>82</td><td>1</td><td>0</td></tr>
+<tr><th>food</th><td>15</td><td>0</td><td>15</td><td>0</td><td>1</td><td>4</td><td>0</td><td>0</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>0 的含义是灾难性的：矩阵中 $C(\mathrm{chinese},\mathrm{to})=0$，MLE 因此把 $P(\mathrm{to}\mid\mathrm{chinese})$ 估成 0；一旦测试句含有「chinese to」这样的未见组合，整句概率连乘后直接归零——无论句子的其余部分多合理。有限语料必然漏掉合法词序列<sup>[C5]</sup>，这不是数据质量问题，而是组合空间的性质。</p>
+
+<p>平滑是修正手段的总称：从频率较高的事件匀出一点概率质量，分给从未见过的事件<sup>[C6]</sup>。最简单的加一平滑（Laplace）把每个计数加 1：</p>
+
+$$P_{\mathrm{add1}}(w_n\mid w_{n-1})=\frac{C(w_{n-1}w_n)+1}{C(w_{n-1})+|V|}$$
+
+<p>构造数据。 设某前缀在语料中出现 6 次，词表 11 个词型，其中一个后继出现 5 次：平滑后它的概率从 $5/6\approx 0.833$ 变为 $6/17\approx 0.353$，而一个从未出现的后继从 0 变为 $1/17\approx 0.059$。零概率消失了，代价是整体变「平」。</p>
+
+<p>衡量「变平」的程度用困惑度：以 2 为底的每词交叉熵损失的指数（交叉熵见<a href="../cross-entropy/">交叉熵</a>），越低预测越好。教材的 WSJ 实验：3800 万词训练、150 万词测试，unigram/bigram/trigram 困惑度分别为 962/170/109<sup>[N1]</sup>——上下文从零个词到两个词，困惑度降到约 $1/9$，正说明「最近几个词携带了大部分预测信息」，也标注了 n-gram 的甜点区：再往大加 $n$，收益递减而稀疏加剧。</p>
+
+<details>
+<summary>补充：加一平滑为什么「太平」</summary>
+<p>加一给每个未见组合的分母加的是整个词表大小 $|V|$，等于强行假设「每个未见组合至少出现一次」。对大词表，这从高频组合匀走的概率太多，实际系统用折扣类方法（如 Kneser-Ney）只匀出很小一部分。本页只需理解平滑的动机与零概率的消除；算法族属于独立主题。</p>
+</details>
+
+<h3 id="sparsity-smoothing-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>为什么「语料够大」救不了稀疏？</p>
+    <details>
+      <summary>解答：组合数按 $|V|^n$ 增长，快于语料的线性增长</summary>
+      <p>词表 $|V|=1446$ 时 bigram 组合约 209 万个，trigram 约 30 亿个；而 Berkeley 语料只有 9332 句。组合数随 $n$ 指数增长、语料随采集线性增长，两者的缺口不会因语料变大而关闭——对数万词型以上的实际词表，万亿词级别的语料对 trigram 仍然稀疏。零矩阵的成因是结构性的，不是采样不足。</p>
+    </details>
+  </li>
+  <li>
+    <p>平滑救了什么、付出了什么？</p>
+    <details>
+      <summary>解答：消除零概率，代价是整体预测变保守</summary>
+      <p>救的是「未见组合导致整句概率归零」：加一后任何组合都有非零概率。代价是从高频组合匀出概率质量，模型整体变平、困惑度上升；匀多少是平滑算法的核心权衡。教材的表述是「从高频事件匀一点质量给从未见过的事件」。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="hash-lookup">4. 从计数表到可学习查表——现代模型里的 n-gram</h2>
+
+<p>第 3 章的结论可以换个说法：计数表这条路走不远，因为它要显式枚举组合。现代模型换了个思路——不存频率，存特征。做法是把以当前 token（分词后的最小单位）结尾的 $n$ 个 token 一起哈希成行号，再去查一张固定大小的可学习表：</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">n-gram 输入</div>
+      <div class="dg-node-note">以当前 token 结尾的 $n$ 个 token 的 id</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">整数哈希</div>
+      <div class="dg-node-note">各位置乘不同奇数乘子后异或，对质数取模</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">行号</div>
+      <div class="dg-node-note">模值加该头的偏移，落在该头行区间 $[\mathrm{off}_h, \mathrm{off}_h+P_h)$ 内</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">查嵌入表</div>
+      <div class="dg-node-note">取该行的可学习向量，不涉及任何计数</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">哈希查表的前向路径<sup>[C7]</sup>：同一行号每次查到同一个向量，向量本身由训练更新。</figcaption>
+</figure>
+
+<p>形式化地，第 $h$ 个哈希头把位置 $t$ 的 n-gram 映射为行号<sup>[F4]</sup>：</p>
+
+$$\mathrm{id}_h(t)=\left(\Big(\bigoplus_{p=0}^{n-1}\mathrm{ids}_{t-p}\cdot c_p\Big)\bmod P_h\right)+\mathrm{off}_h$$
+
+<ul>
+<li>$\mathrm{ids}_{t-p}$：往前数第 $p$ 个 token 的 id；$p=0$ 即当前 token，故共 $n$ 个位置参与。</li>
+<li>$c_p$：各位置的整数乘子，由 splitmix64 哈希派生的奇数——奇数与 $2^{64}$ 互质，乘法在模 $2^{64}$ 下可逆，不同输入不会塌缩到同一乘积。</li>
+<li>$P_h$：该头的质数词表大小（各头取不同质数）；$\mathrm{off}_h$：该头在整张表中的起始偏移。</li>
+</ul>
+
+<p>与计数表的根本区别在于查出来的东西<sup>[C7]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>计数表（第 2–3 章）</th><th>哈希嵌入表（本章）</th></tr></thead>
+<tbody>
+<tr><td>存什么</td><td>组合的出现频率</td><td>可学习向量（训练中被梯度更新）</td></tr>
+<tr><td>怎么定行</td><td>组合本身作为键（需显式枚举）</td><td>整数哈希（任意组合自动落入某行）</td></tr>
+<tr><td>稀疏问题</td><td>未枚举即丢失</td><td>以碰撞率衡量，表大即可忽略</td></tr>
+<tr><td>规模</td><td>随语料增长</td><td>建表时固定</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>碰撞率是这套设计的命门：两个不同 n-gram 落到同一行会共享一个向量。控制在可忽略水平的办法是把表做得远大于实际组合数。实测口径（每头独立统计重复行号）<sup>[N4]</sup>：Qwen3.8-Flash-Next 的每头质数表约 2000 万行，16 个头各查 2000 个随机 n-gram 时零碰撞；各查 4000 个时 64,000 次查询合计碰撞 7 次、最差单头 2 次（0.050%）。用本章的小例子可以直观感受量级——1000 个随机 bigram 在 211 行的小表上碰撞 79.2%，在同一量级的质数表（2000 万行）上为 0.0%。</p>
+
+<p>这一机制的真实部署：Qwen3.8-Flash-Next 在第 2 层注入一张 51.2B 参数的 n-gram 表，bigram 与 trigram 各占 8 个头，16 个头的质数词表合计 320,001,446 行，按 128 对齐补齐到 320,001,536 行、每行 160 维。查表结果经门控投影后加进残差流，只在全模型这一层出现。完整数据流见<a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>。</p>
+
+<details class="code-details">
+<summary>代码：同一语料的哈希行号计算与碰撞率对照（实际运行）</summary>
+<div class="code-block">
+<pre><code class="language-python">import random
+
+# 乘子取 Qwen3.8-Flash-Next checkpoint 的真实值（另一页已核对）
+MULTS = [23703573157769, 20109073645365]
+P_H = 20000003                       # 真实表第一个头的质数大小
+tok = {"&lt;s&gt;": 1, "I": 2, "am": 3, "Sam": 4, "do": 5, "&lt;/s&gt;": 6}  # 构造 id 映射
+ids = [tok[t] for t in "&lt;s&gt; I am Sam &lt;/s&gt;".split()]
+
+sh = [ids, [1] + ids[:-1]]           # 当前位置与前一位置（句首补 &lt;s&gt; 的 id）
+for t in range(2, len(ids)):
+    mixed = sh[0][t] * MULTS[0] ^ sh[1][t] * MULTS[1]
+    print(f"位置 {t}: 混合值 {mixed:,} -> 行号 {mixed % P_H:,}")
+
+random.seed(0)
+V = 248320
+for size, label in [(20000003, "质数表"), (211, "小表对照")]:
+    seen, coll = set(), 0
+    for _ in range(1000):
+        a, b = random.randrange(V), random.randrange(V)
+        row = ((a * MULTS[0]) ^ (b * MULTS[1])) % size
+        coll += row in seen
+        seen.add(row)
+    print(f"{label}（{size:,} 行）: 1000 个随机 bigram 碰撞 {coll} 次")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">位置 2: 混合值 110,194,991,134,961 -> 行号 14,605,717
+位置 3: 混合值 106,539,527,021,499 -> 行号 11,040,574
+位置 4: 混合值 220,389,982,269,922 -> 行号 9,211,431
+质数表（20,000,003 行）: 1000 个随机 bigram 碰撞 0 次
+小表对照（211 行）: 1000 个随机 bigram 碰撞 792 次</code></pre>
+</div>
+<p><b>验证的机制</b>：正文哈希公式（乘子相乘、异或、质数取模）与「表容量决定碰撞率」的结论。</p>
+<p><b>观察重点</b>：同一 I am Sam 语料在「计数就是参数」一章产出计数概率、在这里产出行号——两种表用同一输入干完全不同的事；小表与质数表的碰撞率对比显示表容量的作用。</p>
+<p><b>简化条件</b>：乘子为真实值但 token id 为构造映射；只演示 1 个头（真实 16 个头各有独立质数与偏移）；碰撞测试假设均匀随机输入。</p>
+</details>
+
+<h3 id="hash-lookup-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>哈希查表和计数表查表的本质区别是什么？</p>
+    <details>
+      <summary>解答：一个查可学习特征，一个查频率统计</summary>
+      <p>计数表以组合为键存频率，回答「这个组合多常见」，未枚举的组合无法回答；哈希表把任意组合映射到固定大小表的某一行，行里存的是可学习向量，回答「这个组合的特征是什么」，且随训练更新。稀疏问题在计数表里是丢失，在哈希表里退化为碰撞——后者可以用表容量控制到可忽略。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么乘子必须是奇数、表大小用质数？</p>
+    <details>
+      <summary>解答：可逆性（推导）与碰撞独立性（推断）</summary>
+      <p>奇数与 $2^{64}$ 互质，乘法在模 $2^{64}$ 下可逆，保证不同的 token id 不会因乘同一个乘子而塌缩；Qwen 实现里乘子上界还保证乘积不溢出 int64（数据流页有专门核对）。「不同质数使各头碰撞模式互不相同」是合理的设计推断，源码与论文均未明说此动机。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<p>C1 n-gram 定义与术语二义性：SLP3 §3.1"An n-gram is a sequence of n words…"与"in a bit of terminological ambiguity"句。C2 马尔可夫近似直觉：§3.1.1"instead of computing the probability of a word given its entire history, we can approximate the history by just the last few words"。C3 链式法则与 bigram 近似：§3.1 Eq.(3.3)(3.4)(3.9)。C4 MLE 计数估计：§3.1.2。C5 有限语料漏掉合法序列与零矩阵：§3.6 与 Figure 3.1（Berkeley 餐厅语料）。C6 平滑目标：§3.6 原文"Smoothing and discounting algorithms shave off a bit of probability mass from some more frequent events and give it to unseen events"。C7 哈希查表存可学习向量、16 头质数词表：transformers@36deb0b5 modeling_qwen4_exp.py L1018-1114。</p>
+
+<h3>公式与来源（F）</h3>
+<p>F1 链式法则：SLP3 Eq.(3.4)。F2 bigram 近似：Eq.(3.9)。F3 MLE 公式：§3.1.2。F4 哈希行号：源码 L1098-1110，本页实测复算。</p>
+
+<h3>外部数字与实验条件（N）</h3>
+<p>N1 WSJ 困惑度 962/170/109：§3.3，3800 万词训练、150 万词同域测试。N2 Berkeley 语料 9332 句、V=1446：Figure 3.1 图注。N3 I am Sam 概率列表：§3.1.2，本页代码复算一致。N4 Qwen 表尺寸与碰撞率：Qwen/Qwen3.8-Flash-Next@f5d08274 checkpoint 实测——质数与偏移按 data_offsets 用 HTTP Range 下载核对（数据流页 research/probe7_ngram_buffers.py）；碰撞率为 16 头 × 2000/4000 随机位置的口径实测（本页 research/collision_check.py）；表行数与参数量见数据流页 research/count_params.py。</p>
+
+<h3>构造示例</h3>
+<p>I am Sam 语料为教材自带示例语料；第 3 章加一平滑的「前缀 6 次、词表 11」数字为说明机制构造；「从计数表到可学习查表」一章的 token id 映射（1–6）与「1000 随机 bigram」的碰撞测试输入为构造，乘子与表大小取真实值。</p>
+
+<h3>辅助解释与类比边界</h3>
+<p>本页未使用类比作为论证；开篇的下一个词直觉只用于引入问题。所有概率与碰撞结论以正文公式与代码输出为准。</p>
+
+<h3>简化条件及其限制</h3>
+<p>正文全程用词（word）表述，现代实现统计的是子词 token——结论不变，词表更大稀疏更严重。「语料再大也不够用」一章只展开加一平滑一个算例，Kneser-Ney 等未涉及：不影响「零概率为何必须消除」的结论，但也不能据本页比较各平滑算法优劣。「从计数表到可学习查表」一章的代码只演示单头：真实模型 16 头各有独立质数与偏移，碰撞行为同理；源码在句尾符号处还会对右移历史做分段重置（避免 n-gram 跨样本边界），本页未展开该细节。教材版本为 2026-08-19 草稿，例句以该版为准。
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
