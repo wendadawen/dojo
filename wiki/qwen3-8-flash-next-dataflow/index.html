@@ -95,7 +95,7 @@
     <tr><td>MoE</td><td>512 专家取 top-10，中间维 640，另 1 共享专家</td><td><code>num_experts</code> / <code>num_experts_per_tok</code> / <code>moe_intermediate_size</code></td></tr>
     <tr><td>N-gram 注入层（0 起）</td><td>仅第 1 层</td><td><code>ple_layer_ids=[2]</code>（1 起）；权重中仅第 1 层有 <code>ple.*</code></td></tr>
     <tr><td>上下文长度</td><td>262144（原生）</td><td><code>max_position_embeddings</code></td></tr>
-    <tr><td><a href="../positional-encoding/">位置编码</a></td><td>交错 MRoPE，仅旋转头维前 64 维</td><td><code>partial_rotary_factor=0.25</code>、<code>mrope_section=[11,11,10]</code>、<code>rope_theta=1e7</code></td></tr>
+    <tr><td><a href="../positional-encoding/">位置编码</a></td><td><a href="../mrope/">交错 MRoPE</a>，仅旋转头维前 64 维</td><td><code>partial_rotary_factor=0.25</code>、<code>mrope_section=[11,11,10]</code>、<code>rope_theta=1e7</code></td></tr>
     <tr><td><a href="../speculative-decoding/">MTP 草稿层</a></td><td>1 层，2.61B 参数</td><td><code>mtp_num_hidden_layers</code>；权重前缀 <code>mtp.*</code> 共 31 个张量</td></tr>
     <tr><td>视觉编码器</td><td>27 层 ViT，宽 1152，patch 16，2×2 合并后输出 2560</td><td><code>vision_config</code>；0.449B 参数，展开见第 4 节</td></tr>
     <tr><td>权重精度</td><td>1655 个张量 BF16，3 个 I64 缓冲</td><td>张量头 dtype 统计</td></tr>
@@ -158,7 +158,7 @@
   <h3>N-gram Embedding（51.2B 哈希查表）</h3>
   <ul>
     <li><b>只在一层出现</b>：<code>ple_layer_ids=[2]</code>（1 起），即 0 起的第 1 层。源码另有校验要求该层必须是 GDN 层。真实权重中仅第 1 层含 <code>ple.*</code>，全模型只有这一处。</li>
-    <li><b>16 个头，每个头一张独立的质数大小词表</b>：头数为 $(\text{ngram\_size}-1)\times\text{heads\_per\_ngram} = (3-1)\times8 = 16$，前 8 个头处理 bigram、后 8 个处理 trigram。第 $i$ 个头的词表大小是 20,000,000 之后的第 $i+1$ 个质数，依次为 20000003、20000023、20000033、…、20000171。这 16 个数值以 I64 缓冲存在 checkpoint 里，已逐元素核对与源码派生完全一致。</li>
+    <li><b>16 个头，每个头一张独立的质数大小词表</b>：头数为 $(\text{ngram\_size}-1)\times\text{heads\_per\_ngram} = (3-1)\times8 = 16$，前 8 个头处理 <a href="../ngram/">bigram</a>、后 8 个处理 <a href="../ngram/">trigram</a>（背景见 <a href="../ngram/">N-gram</a> 概念页）。第 $i$ 个头的词表大小是 20,000,000 之后的第 $i+1$ 个质数，依次为 20000003、20000023、20000033、…、20000171。这 16 个数值以 I64 缓冲存在 checkpoint 里，已逐元素核对与源码派生完全一致。</li>
     <li><b>表尺寸完全可复现</b>：16 个质数之和为 320,001,446，按 <code>make_ngram_vocab_size_divisible_by=128</code> 向上对齐得 320,001,536（补 90 行）。真实权重 128 个分片的行数之和恰为 320,001,536，每行 160 维，故表参数量 $320001536 \times 160 = 51{,}200{,}245{,}760$，与张量头累加结果精确相等。用质数作模数是为了让不同头的哈希碰撞模式尽量独立。checkpoint 中的 <code>ngram_heads_offsets</code> 也已核对为这 16 个质数的前缀和。</li>
     <li><b>是哈希而非精确查表</b>：n-gram 的 id 由各位置 token 乘上不同乘子后逐位异或，再对该头的质数取模、加上该头的偏移得到。乘子的派生规则是 $c_j = 2\big(\mathrm{splitmix64}(s_0 + \gamma(j{+}1)) \bmod B\big) + 1$，其中 $s_0 = \text{seed} + 10007\,\ell$、$\gamma$ 为 splitmix64 的黄金比常数、$B = \lfloor\lfloor(2^{63}-1)/V\rfloor/2\rfloor$ 且 $V$ 为词表大小。本机核对 checkpoint 中三个真实乘子（23703573157769、20109073645365、8052911324071）与该公式逐元素一致，并由此确认 config 未显式给出的 <code>seed</code> 即默认值 1234。</li>
     <li><b>乘子的两个设计约束</b>：$2k+1$ 的形式使乘子恒为奇数，因而与 $2^{64}$ 互质、在模 $2^{64}$ 下可逆，不会把不同 token 压到同一乘积；$B$ 的定义则保证 $\text{token\_id} \times c_j$ 不溢出 int64（本机对三个真实乘子逐一验证通过）。本机用真实乘子重算 2000 个位置的 n-gram id，全部落在各自头的 $[\text{offset}, \text{offset}+\text{size})$ 区间内，bigram 与 trigram 头碰撞率均为 0.000%；换 4000 个位置时 bigram 头碰撞率 0.025%。</li>
@@ -227,7 +227,7 @@
   <p>另有 <code>vision_start_token_id=248053</code> 与 <code>vision_end_token_id=248054</code> 作为视觉块的边界标记，它们是普通文本 token，不被替换。</p>
 
   <h3>4.6 视觉 token 在语言侧只推进少量位置</h3>
-  <p>这是容易被忽略的一点。语言塔用三维 MRoPE，文本段的三个维度取同一个 <code>arange</code>；视觉段则由 <code>get_vision_position_ids</code> 生成 $(T, H, W)$ 三元组，$H$ 与 $W$ 各自在 $[\text{start}, \text{start}+\text{llm\_grid}-1]$ 内遍历。关键在于图像块结束后位置只推进 $\max(h, w) / \text{spatial\_merge\_size}$，而<b>不是</b>推进视觉 token 数。</p>
+  <p>这是容易被忽略的一点。语言塔用三维 <a href="../mrope/">MRoPE</a>，文本段的三个维度取同一个 <code>arange</code>；视觉段则由 <code>get_vision_position_ids</code> 生成 $(T, H, W)$ 三元组，$H$ 与 $W$ 各自在 $[\text{start}, \text{start}+\text{llm\_grid}-1]$ 内遍历。关键在于图像块结束后位置只推进 $\max(h, w) / \text{spatial\_merge\_size}$，而<b>不是</b>推进视觉 token 数。</p>
   <table>
     <tr><th>图像 grid</th><th>视觉 token 数</th><th>位置轴推进量</th><th>比值</th></tr>
     <tr><td>(1,28,28)</td><td>196</td><td>14</td><td>14.0×</td></tr>
