@@ -1,0 +1,60 @@
+==============================================================================
+探针 5：端到端前向（8 层缩小模型，结构特征与 45 层一致）
+==============================================================================
+      layer_types      = ['linear_attention', 'linear_attention', 'linear_attention', 'deepseek_sparse_attention', 'linear_attention', 'linear_attention', 'linear_attention', 'deepseek_sparse_attention']
+      mlp_layer_types  = ['dense', 'dense', 'dense', 'sparse', 'sparse', 'sparse', 'sparse', 'sparse']
+      indexer_types    = ['full', 'full', 'full', 'full', 'full', 'full', 'full', 'full']
+      hidden_size=4096 hc_mult=4 linear_num_heads=64 num_attention_heads=64
+      真实 45 层的类型序列前 8 项 = ['linear_attention', 'linear_attention', 'linear_attention', 'deepseek_sparse_attention', 'linear_attention', 'linear_attention', 'linear_attention', 'deepseek_sparse_attention']  与上面一致=True
+      缩小模型参数量 = 3,674,987,568 = 3.675 B（仅供跑通，不代表真实规模）
+==============================================================================
+5.1 prefill 数据流（B=1, S=12）
+==============================================================================
+      embed (1, 12, 4096) --expand--> hidden_streams (1, 12, 4, 4096)
+      入口四路是否完全相同 = True
+      末层 hidden_streams (1, 12, 4, 4096) --hc_head(mean)--> (1, 12, 4096) --RMSNorm--> (1, 12, 4096)
+      finite = True   输出 std = 0.999980
+      出口四路与其均值的平均绝对偏差 = ['0.5406', '0.4932', '0.4817', '0.5161']
+      四路是否已分化（非全相同）= True
+
+      逐步形状追踪（第 0 层 KDA + 第 3 层 DSA）：
+        L0.attn_hc               in=(1, 12, 4, 4096)  out=[(1, 12, 4), (1, 12, 4, 4), (1, 12, 4096)]
+        L0.input_layernorm       in=(1, 12, 4096)  out=(1, 12, 4096)
+        L0.self_attn[KDA]        in=None  out=(1, 12, 4096)
+        L0.ffn_hc                in=(1, 12, 4, 4096)  out=[(1, 12, 4), (1, 12, 4, 4), (1, 12, 4096)]
+        L0.post_attn_ln          in=(1, 12, 4096)  out=(1, 12, 4096)
+        L0.mlp[denseMLP]         in=(1, 12, 4096)  out=(1, 12, 4096)
+        L0.__layer__             in=(1, 12, 4, 4096)  out=[(1, 12, 4, 4096)]
+        L3.attn_hc               in=(1, 12, 4, 4096)  out=[(1, 12, 4), (1, 12, 4, 4), (1, 12, 4096)]
+        L3.input_layernorm       in=(1, 12, 4096)  out=(1, 12, 4096)
+        L3.self_attn[DSA]        in=None  out=[(1, 12, 4096), (1, 64, 12, 12)]
+        L3.ffn_hc                in=(1, 12, 4, 4096)  out=[(1, 12, 4), (1, 12, 4, 4), (1, 12, 4096)]
+        L3.post_attn_ln          in=(1, 12, 4096)  out=(1, 12, 4096)
+        L3.mlp[MoE]              in=(1, 12, 4096)  out=(1, 12, 4096)
+        L3.__layer__             in=(1, 12, 4, 4096)  out=[(1, 12, 4, 4096)]
+==============================================================================
+5.2 逐 token decode（延续 prefill 的 cache）
+==============================================================================
+      step 1: 输出 (1, 1, 4096)  finite=True  DSA kv 长度=13  KDA 状态=(1, 64, 128, 128)
+      step 2: 输出 (1, 1, 4096)  finite=True  DSA kv 长度=14  KDA 状态=(1, 64, 128, 128)
+      step 3: 输出 (1, 1, 4096)  finite=True  DSA kv 长度=15  KDA 状态=(1, 64, 128, 128)
+      step 4: 输出 (1, 1, 4096)  finite=True  DSA kv 长度=16  KDA 状态=(1, 64, 128, 128)
+
+      DSA 层 kv cache 随 token 线性增长：S=12 → 16
+      KDA 层循环状态形状恒定：(1, 64, 128, 128)（与 token 数无关）
+      这正是混合架构的目的：只有 11/45 层 的 KV 随长度增长，其余 34 层是常数状态
+==============================================================================
+5.3 单层内部数据流顺序（源码 L1291-1329 的执行序）
+==============================================================================
+      residual = h                              # [B,S,4,D]
+      post, comb, x = attn_hc(h)                # x:[B,S,D]  post:[B,S,4]  comb:[B,S,4,4]
+      x = input_layernorm(x)                    # RMSNorm
+      x = self_attn(x)                          # KDA 或 DSA(MLA+indexer)
+      h = post ⊗ x + comb^T @ residual          # 回写 4 路
+      residual = h
+      post, comb, x = ffn_hc(h)
+      x = post_attention_layernorm(x)
+      x = mlp(x)                                # MoE 或 dense MLP
+      h = post ⊗ x + comb^T @ residual
+      注意：两个站点各有独立的 mHC 参数（attn_hc / ffn_hc），互不共享
+      两个 RMSNorm 作用在「已压成单路」的张量上（[B,S,4096]），不是 4 路
