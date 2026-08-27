@@ -1,15 +1,15 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-page-node-id="V50Lt50GLSmjjsGJKWKMJJ">
-<head data-page-node-id="ZFuzyA9aRQZR3LlhhpRyPR">
-<meta charset="UTF-8" data-page-node-id="aa240uFIBaX6tXyhTSjbh2">
-<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="XToTXsknfPS6mFHyyu41i1">
-  <meta name="description" content="180B 参数多模态 MoE：48 层里 36 层 Gated DeltaNet 与 12 层 QSA 稀疏注意力按 3:1 交替、四条并行残差流由 Gated Residual 读写、51.2B 哈希 N-gram 查表只在第 2 层注入、512 专家 top-10，另含 27 层视觉 ViT 与交错 MRoPE 位置分配。全部数字由官方源码、真实 checkpoint 张量头与本机实测核对。" data-page-node-id="pxRBME3ZWKL34xity4Y7Dv">
-  <meta name="dojo:summary" content="180B 参数多模态 MoE：每 4 层中 3 层用 Gated DeltaNet 线性注意力、1 层用 QSA 稀疏注意力（每 4 个 token 压成一块，选 512 块共 2048 个 token）；残差流被复制为 4 条并由低秩门控读写；51.2B 参数的哈希 N-gram 查表只在第 2 层注入；FFN 为 512 专家 top-10 加 1 个共享专家，单 token 激活 6.04B；视觉侧 27 层 ViT 经 $2\times2$ 合并后替换占位符融入同一序列。" data-page-node-id="kKAJYlIMFiHUpxss1SBcqp">
-  <meta name="dojo:type" content="note" data-page-node-id="wg4xJdGmmtKIkeFaAHzS42">
-  <meta name="dojo:topics" content="模型结构,多模态" data-page-node-id="m08np3TZSML6edd4V3n1l0">
-  <meta name="dojo:tag" content="架构速查" data-page-node-id="02C4AyAGZMH6XIINOcJ3zY">
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="180B 参数多模态 MoE：48 层里 36 层 Gated DeltaNet 与 12 层 QSA 稀疏注意力按 3:1 交替、四条并行残差流由 Gated Residual 读写、51.2B 哈希 N-gram 查表只在第 2 层注入、512 专家 top-10，另含 27 层视觉 ViT 与交错 MRoPE 位置分配。全部数字由官方源码、真实 checkpoint 张量头与本机实测核对。">
+  <meta name="dojo:summary" content="180B 参数多模态 MoE：每 4 层中 3 层用 Gated DeltaNet 线性注意力、1 层用 QSA 稀疏注意力（每 4 个 token 压成一块，选 512 块共 2048 个 token）；残差流被复制为 4 条并由低秩门控读写；51.2B 参数的哈希 N-gram 查表只在第 2 层注入；FFN 为 512 专家 top-10 加 1 个共享专家，单 token 激活 6.04B；视觉侧 27 层 ViT 经 $2\times2$ 合并后替换占位符融入同一序列。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="模型结构,多模态">
+  <meta name="dojo:tag" content="架构速查">
 <title>Qwen3.8-Flash-Next 前向数据流 · Dojo</title>
-<link rel="stylesheet" href="../../libs/katex.min.css" data-page-node-id="sfZ4hZ8VhiqyvrAU2FZJ7Q">
+<link rel="stylesheet" href="../../libs/katex.min.css">
 <script src="../../libs/katex.min.js"></script>
 <script src="../../libs/auto-render.min.js"></script>
 <script src="../../libs/cytoscape.min.js"></script>
@@ -66,215 +66,215 @@
   @media (max-width: 640px) { body { font-size: 16px; } .wrap { padding-top: 1.5rem; } h1 { font-size: 1.7rem; } #cy { height: 470px; } }
 </style>
 </head>
-<body data-page-node-id="II1gLdg24qiL1ZBZ24qav6">
-<main class="wrap" data-page-node-id="nP2Bgmen3f4qkCeZefs2YZ">
-  <nav data-page-node-id="iyU2jXvY5VZedJ4OZqZptM"><a href="../../index.html" data-page-node-id="C5NNf3W7zAtpPh14B5y6iI">← 返回 Dojo</a></nav>
+<body>
+<main class="wrap">
+  <nav><a href="../../index.html">← 返回 Dojo</a></nav>
 
-  <header data-page-node-id="JEfJ8Zlz4uCdr5ERFWDDwU">
-    <span class="eyebrow" data-page-node-id="sD9I4oLEsmcNXfBxMWIPxj">学习笔记 · 模型架构</span>
-    <h1 data-page-node-id="DHCcLvgmPrmN6CD7yzDlK9">Qwen3.8-Flash-Next 前向数据流</h1>
-    <p class="lead" data-page-node-id="hk0H4NKVpIbzKHsBoSunEm">Qwen3.8-Flash-Next 是 180B 参数、每 token 激活 6.04B 的多模态 MoE 模型。48 层主干按 3:1 交替：每 4 层中前 3 层是 Gated DeltaNet 线性注意力，只保留一份与序列长度无关的固定状态；第 4 层是 QSA，把每 4 个连续 token 的索引键压成一块，由一个 4 头轻量索引器选出 512 块（合 2048 个 token）参与注意力。残差不是单条通路，而是入口处复制出的 4 条并行流，每个子层前后由低秩门控读出与写回。第 2 层额外注入一张 51.2B 参数的哈希 N-gram 查表，该表只被查询、不参与任何矩阵乘。FFN 全为 512 路由专家 top-10 加 1 个恒激活的共享专家。视觉侧是 27 层独立 ViT，输出经 2×2 合并对齐到主干宽度后，以替换占位符的方式融入同一序列，此后与文本共享全部 48 层。</p>
-    <p class="meta" data-page-node-id="VXRP0GT2hsF5OUKjUym5Qo">生成于 2026-08-27 · 依据官方 transformers 实现 + config.json + 真实 checkpoint 张量头与 I64 缓冲真值 + 本机实测</p>
+  <header>
+    <span class="eyebrow">学习笔记 · 模型架构</span>
+    <h1>Qwen3.8-Flash-Next 前向数据流</h1>
+    <p class="lead">Qwen3.8-Flash-Next 是 180B 参数、每 token 激活 6.04B 的多模态 <a href="../deepseek-moe/">MoE</a> 模型。48 层主干按 3:1 交替：每 4 层中前 3 层是 <a href="../gated-deltanet/">Gated DeltaNet</a> <a href="../linear-attention/">线性注意力</a>，只保留一份与序列长度无关的固定状态；第 4 层是 QSA，把每 4 个连续 token 的索引键压成一块，由一个 4 头轻量索引器选出 512 块（合 2048 个 token）参与注意力。<a href="../residual-connection/">残差</a>不是单条通路，而是入口处复制出的 4 条并行流，每个子层前后由低秩门控读出与写回。第 2 层额外注入一张 51.2B 参数的哈希 N-gram 查表，该表只被查询、不参与任何矩阵乘。FFN 全为 512 路由专家 top-10 加 1 个恒激活的共享专家。视觉侧是 27 层独立 <a href="../vit/">ViT</a>，输出经 2×2 合并对齐到主干宽度后，以替换占位符的方式融入同一序列，此后与文本共享全部 48 层。</p>
+    <p class="meta">生成于 2026-08-27 · 依据官方 transformers 实现 + config.json + 真实 checkpoint 张量头与 I64 缓冲真值 + 本机实测</p>
   </header>
 
-  <h2 id="specs" data-page-node-id="YNBGrqiNhYi4Kg7od7YY39">1. 关键规格</h2>
-  <p data-page-node-id="GPgeUPHd5XaS1Q1iueJRpQ">下表每一行都可回溯到具体依据。「config 键」列给出官方 <code data-page-node-id="YSlJNgjSZpjEhVc80mTYgf">config.json</code> 中的字段名，「核对」列说明该数字如何被独立验证。</p>
-  <table data-page-node-id="HgiQIBcpjmPc5MFgMee0ui">
-    <tr data-page-node-id="uXEU8Ekb81KJQrVMRGAMbH"><th data-page-node-id="Wy0Y3Xh9ye4lM5HUF8ZkNW">项目</th><th data-page-node-id="Gq97IBin5hxV6zi4f3uLYf">取值</th><th data-page-node-id="2rVBUTkkjjATk3cqpWcbLs">config 键 / 核对方式</th></tr>
-    <tr data-page-node-id="rcTlN5VHJSEffBG8kV34RD"><td data-page-node-id="bZDcCMqSCvMnGMLCBIXFiz">总参数量</td><td data-page-node-id="VDSNOaZCS0lPsxGP7lOyw1">179,999,981,424（180.0B）</td><td data-page-node-id="m3z82SB2fGX5ez4SQgtSwY">131 个分片张量头逐一累加，见 <code data-page-node-id="gzpDCeG9D0fqIWygeXObfx">count_params.py</code></td></tr>
-    <tr data-page-node-id="S1jMcPjA5JktKsVWFsaOQs"><td data-page-node-id="9wg2fV0UM6DxlOMuKCXYEX">语言主干（除 N-gram 表与 MTP）</td><td data-page-node-id="WQy6bmC14z4HQdOeD7yAX1">125.74B</td><td data-page-node-id="0cG2SK6D2PhNmb58BNiBBq">官方称「Transformer 参数 125B」，独立算得 125,743,653,760</td></tr>
-    <tr data-page-node-id="E5RL1iHGuPbakkLYYLJYRs"><td data-page-node-id="QUJsEfucrJmyQc7ih9ngvi">N-gram Embedding 表</td><td data-page-node-id="Y6aIwmk3BfIRbp4XoIDlud">51.20B</td><td data-page-node-id="4tGFPzrWMNbRYFK14aTIBi">官方称「51B」，独立算得 51,200,245,760</td></tr>
-    <tr data-page-node-id="1nC2RA7gC5xm1UXFGcgK4i"><td data-page-node-id="E58jUWCR5z4W5Dt45FHPQt">单 token 激活</td><td data-page-node-id="rlG3IXBLvzYEjszcpOp1Qg">6.04B（不含 embedding 与 lm_head）</td><td data-page-node-id="dsVcVlQGFPz5jV0jMkRRGK">官方称「激活 6B」，独立算得 6,035,598,720</td></tr>
-    <tr data-page-node-id="skohl6dpCdTZlj1WCAVBhY"><td data-page-node-id="AY7T6XbVtnQotH67ppdR3n">层数与层型</td><td data-page-node-id="j6Jvtefp2b394ZGDK8ViQz">48 层 = 36 GDN + 12 QSA</td><td data-page-node-id="fmWEnCmtlJzbEeMqGEl7t2"><code data-page-node-id="NBXgM4GqwC3bK4wuAftCDp">layer_types</code>；权重中 <code data-page-node-id="DABuSC2urWquS87mHHYgDZ">linear_attn</code> 恰 36 层、<code data-page-node-id="nFixzzJ9RwyOr4HMc06ZiH">self_attn</code> 恰 12 层</td></tr>
-    <tr data-page-node-id="jmAHSVTZxwvMbLjPE950k3"><td data-page-node-id="EvWHOY0ltq2ilgFMbon1f1">QSA 所在层（0 起）</td><td data-page-node-id="WYgejQ6FHzLrhaWJMEuJur">3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47</td><td data-page-node-id="BpKnEsjv9K2J6aqQdhKAsu"><code data-page-node-id="qRYyJGkYN7kD3VfDbLTWDD">full_attention_interval=4</code>；张量清单完全一致</td></tr>
-    <tr data-page-node-id="HBGl9uD5iXqp4MO2DjUjff"><td data-page-node-id="ZDH2Ex4JD56Rf0iITBsB5R">隐藏维度</td><td data-page-node-id="ernxFRxTAJFRk4LD21DM7Q">2560</td><td data-page-node-id="OrqHeoFxTZSHZMz301JMVC"><code data-page-node-id="pBEqMGESTI1tq18pjLNkzy">hidden_size</code></td></tr>
-    <tr data-page-node-id="LOJAHkIAcWXfa0HYMGQCXn"><td data-page-node-id="omEFrVnE3mhWARzQ9tiO6z">残差流条数与宽度</td><td data-page-node-id="V3ymTbpvPhdrwcK3MMxq5S">4 条，合计 10240</td><td data-page-node-id="CKv8uxwWCqWRVrF1FR55F0"><code data-page-node-id="DDBHF7CKTh7yiF3FP1tqGg">hc_count=4</code>；全部 <code data-page-node-id="NcEhB0lPQmqt8y8UJbkV4x">hc_norm</code> 张量形状为 [10240]</td></tr>
-    <tr data-page-node-id="BtQflS041jRZtD4GO9SJyl"><td data-page-node-id="4oCJdl52Nh7OA9kvMWXDz0">GDN 头配置</td><td data-page-node-id="zrCpHtLyOMIuWFS9GLW9vO">16 个键头、48 个值头，头维均 128</td><td data-page-node-id="gBbFd9zS8wGNeP5tLHEqZg"><code data-page-node-id="MHXohSztJcAAYBDlmEFNxz">linear_num_key_heads</code> / <code data-page-node-id="MlUwI979lFLZNRqa4qIh1e">linear_num_value_heads</code> / <code data-page-node-id="98C3teZSUxw9nGrfXUrFWL">linear_key_head_dim</code></td></tr>
-    <tr data-page-node-id="B4EFIDcCz0S5szaI2Dkevx"><td data-page-node-id="26TFyaaHWJuyTui3vBgRcT">QSA 头配置</td><td data-page-node-id="aExheDInrq6AAI3ZLhgLQi">24 个查询头、2 个 KV 头，头维 256</td><td data-page-node-id="Rt1SFi5WW6DSrnUCzNiMAo"><code data-page-node-id="PpNMP0zgWYnFcAMIajGJU8">num_attention_heads</code> / <code data-page-node-id="BBzrMlyXQfc5J3YwaMRn6w">num_key_value_heads</code> / <code data-page-node-id="4t7YxZJI1iEeVPNDkAIgvb">head_dim</code></td></tr>
-    <tr data-page-node-id="nxJ5cVtB404pyt3CkBaWgh"><td data-page-node-id="HDLksSf9USMgZbexGuVpDF">QSA 索引器</td><td data-page-node-id="MH8YcXp1LMkwPZumaqbKLL">4 查询头 + 1 键头，头维 128，压缩率 4，预算 2048</td><td data-page-node-id="iilB7eTbginKwjzWDJxtrj"><code data-page-node-id="AHLQcPVxvB9gfcb8GguNHA">indexer_*</code>；<code data-page-node-id="Cl0m4gOATlgtjNsP4dVpqT">index_qk_proj</code> 形状 [640, 2560] 印证 $(4+1)\times128$</td></tr>
-    <tr data-page-node-id="UrNIORITHaG30Zd1YJ8Qfd"><td data-page-node-id="ktEg7x9Vakxr6bA8rhDj8m">MoE</td><td data-page-node-id="9TrNixn1FSIDoGnBdmY3rK">512 专家取 top-10，中间维 640，另 1 共享专家</td><td data-page-node-id="qpeRcZw4BBHxbBLVHkcz5k"><code data-page-node-id="FHGmAGMglWvzY3nWr7QNVj">num_experts</code> / <code data-page-node-id="QMiBP9dqe0JAIjJ3RprOPx">num_experts_per_tok</code> / <code data-page-node-id="Uccns1mINN9cjnmBN1GNz1">moe_intermediate_size</code></td></tr>
-    <tr data-page-node-id="EmBJ84SGR9hLPCl8fFwDZj"><td data-page-node-id="9wnEwAH3XwDTUAUaG25YXp">N-gram 注入层（0 起）</td><td data-page-node-id="NErXKFEwdGx2MOg4EudptA">仅第 1 层</td><td data-page-node-id="WK4DIcucBfSGrZnJ7ewbJ3"><code data-page-node-id="M0KjJFx6ZSvg6uUNI5knXC">ple_layer_ids=[2]</code>（1 起）；权重中仅第 1 层有 <code data-page-node-id="9U5sYbQ2lk1zmbEifDbrhG">ple.*</code></td></tr>
-    <tr data-page-node-id="PRSx7epWtJzspq6kxFy280"><td data-page-node-id="6RHiyoHoNFMmuA5jhmz21G">上下文长度</td><td data-page-node-id="EArf9N4dFotKfBAQWmY9K1">262144（原生）</td><td data-page-node-id="DqDbXQNb8HAAn3N148G6DY"><code data-page-node-id="EfkbLOKnElQyrgllHA0TDI">max_position_embeddings</code></td></tr>
-    <tr data-page-node-id="dwhZczhcJXW6FIWsTRDRVo"><td data-page-node-id="4unuekd5MIpSH1XwPO1UQ0">位置编码</td><td data-page-node-id="u5gjAeLDbojhpyGR7108yd">交错 MRoPE，仅旋转头维前 64 维</td><td data-page-node-id="O0lHU857WtgriQQ4bRenix"><code data-page-node-id="4pp8FcItrvVTB88BkNR4GU">partial_rotary_factor=0.25</code>、<code data-page-node-id="iMTjqgGFhge2z5n2JkYVX0">mrope_section=[11,11,10]</code>、<code data-page-node-id="kM2sjU7otlDlOvZQ3PET0R">rope_theta=1e7</code></td></tr>
-    <tr data-page-node-id="H0DLHDzVXlXdU3CKcGrEi5"><td data-page-node-id="lYqs4CoqdcVB94RsjMcXWn">MTP 草稿层</td><td data-page-node-id="9UFQB3obYJIcHrQs2M9dHj">1 层，2.61B 参数</td><td data-page-node-id="aZ99eG3xb2i2NyRhGNNpwg"><code data-page-node-id="b0cfiPPSQN7eKsLrgEHHxM">mtp_num_hidden_layers</code>；权重前缀 <code data-page-node-id="wW9yV1GjVAguixDXcUNnSR">mtp.*</code> 共 31 个张量</td></tr>
-    <tr data-page-node-id="hZkBgdrYhj9vTrTW48m5IC"><td data-page-node-id="R4O2EF16sYRVNCqe8jb1sL">视觉编码器</td><td data-page-node-id="aQvP8VAiB3Cqwyy6KsIYFW">27 层 ViT，宽 1152，patch 16，2×2 合并后输出 2560</td><td data-page-node-id="mIxeqsgKVuYD2SLcWArnjm"><code data-page-node-id="q6Gs2G6g66nqZNBDCarYEy">vision_config</code>；0.449B 参数，展开见第 4 节</td></tr>
-    <tr data-page-node-id="PXpwZSFqwdZJXgUDuPn7bm"><td data-page-node-id="GXCa3cTkk5t6IBrlmCQnJr">权重精度</td><td data-page-node-id="5x5g83CwXyNMWhb4AqodQ1">1655 个张量 BF16，3 个 I64 缓冲</td><td data-page-node-id="wQdyL0IIcNVEymsJUDzOQp">张量头 dtype 统计</td></tr>
+  <h2 id="specs">1. 关键规格</h2>
+  <p>下表每一行都可回溯到具体依据。「config 键」列给出官方 <code>config.json</code> 中的字段名，「核对」列说明该数字如何被独立验证。</p>
+  <table>
+    <tr><th>项目</th><th>取值</th><th>config 键 / 核对方式</th></tr>
+    <tr><td>总参数量</td><td>179,999,981,424（180.0B）</td><td>131 个分片张量头逐一累加，见 <code>count_params.py</code></td></tr>
+    <tr><td>语言主干（除 N-gram 表与 MTP）</td><td>125.74B</td><td>官方称「Transformer 参数 125B」，独立算得 125,743,653,760</td></tr>
+    <tr><td>N-gram Embedding 表</td><td>51.20B</td><td>官方称「51B」，独立算得 51,200,245,760</td></tr>
+    <tr><td>单 token 激活</td><td>6.04B（不含 embedding 与 lm_head）</td><td>官方称「激活 6B」，独立算得 6,035,598,720</td></tr>
+    <tr><td>层数与层型</td><td>48 层 = 36 GDN + 12 QSA</td><td><code>layer_types</code>；权重中 <code>linear_attn</code> 恰 36 层、<code>self_attn</code> 恰 12 层</td></tr>
+    <tr><td>QSA 所在层（0 起）</td><td>3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47</td><td><code>full_attention_interval=4</code>；张量清单完全一致</td></tr>
+    <tr><td>隐藏维度</td><td>2560</td><td><code>hidden_size</code></td></tr>
+    <tr><td>残差流条数与宽度</td><td>4 条，合计 10240</td><td><code>hc_count=4</code>；全部 <code>hc_norm</code> 张量形状为 [10240]</td></tr>
+    <tr><td>GDN 头配置</td><td>16 个键头、48 个值头，头维均 128</td><td><code>linear_num_key_heads</code> / <code>linear_num_value_heads</code> / <code>linear_key_head_dim</code></td></tr>
+    <tr><td>QSA 头配置</td><td>24 个查询头、2 个 KV 头，头维 256</td><td><code>num_attention_heads</code> / <code>num_key_value_heads</code> / <code>head_dim</code></td></tr>
+    <tr><td>QSA 索引器</td><td>4 查询头 + 1 键头，头维 128，压缩率 4，预算 2048</td><td><code>indexer_*</code>；<code>index_qk_proj</code> 形状 [640, 2560] 印证 $(4+1)\times128$</td></tr>
+    <tr><td>MoE</td><td>512 专家取 top-10，中间维 640，另 1 共享专家</td><td><code>num_experts</code> / <code>num_experts_per_tok</code> / <code>moe_intermediate_size</code></td></tr>
+    <tr><td>N-gram 注入层（0 起）</td><td>仅第 1 层</td><td><code>ple_layer_ids=[2]</code>（1 起）；权重中仅第 1 层有 <code>ple.*</code></td></tr>
+    <tr><td>上下文长度</td><td>262144（原生）</td><td><code>max_position_embeddings</code></td></tr>
+    <tr><td><a href="../positional-encoding/">位置编码</a></td><td>交错 MRoPE，仅旋转头维前 64 维</td><td><code>partial_rotary_factor=0.25</code>、<code>mrope_section=[11,11,10]</code>、<code>rope_theta=1e7</code></td></tr>
+    <tr><td><a href="../speculative-decoding/">MTP 草稿层</a></td><td>1 层，2.61B 参数</td><td><code>mtp_num_hidden_layers</code>；权重前缀 <code>mtp.*</code> 共 31 个张量</td></tr>
+    <tr><td>视觉编码器</td><td>27 层 ViT，宽 1152，patch 16，2×2 合并后输出 2560</td><td><code>vision_config</code>；0.449B 参数，展开见第 4 节</td></tr>
+    <tr><td>权重精度</td><td>1655 个张量 BF16，3 个 I64 缓冲</td><td>张量头 dtype 统计</td></tr>
   </table>
 
-  <div class="note" data-page-node-id="IOjq3yjpEkL9V1pLANyDG4">config 中 <code data-page-node-id="3QcxxsnB4wK0rPyKyk9JCx">layer_types</code> 写的是 <code data-page-node-id="Vil0QcA9S3YNeMcymDfLd5">full_attention</code>，但 <code data-page-node-id="TglNtAKxlD1T7kcFEnv4pU">Qwen4ExpTextConfig.__post_init__</code> 会把它逐项改写成 <code data-page-node-id="HOVWvr47i51YGBLj4NA5dP">qwen_sparse_attention</code>，源码注释为「真实 checkpoint 对实际使用索引器的层写的是 <code data-page-node-id="6Oc45zhHtt2gxs08RetNtw">full_attention</code>」。因此这 12 层并非普通全注意力，而是带块选择的稀疏注意力，本页统一称 QSA。</div>
+  <div class="note">config 中 <code>layer_types</code> 写的是 <code>full_attention</code>，但 <code>Qwen4ExpTextConfig.__post_init__</code> 会把它逐项改写成 <code>qwen_sparse_attention</code>，源码注释为「真实 checkpoint 对实际使用索引器的层写的是 <code>full_attention</code>」。因此这 12 层并非普通全注意力，而是带块选择的<a href="../dsa/">稀疏注意力</a>，本页统一称 QSA。</div>
 
-  <h2 id="flow" data-page-node-id="LU7syESJPC8F02Qed2Tcbp">2. 交互式数据流</h2>
-  <p data-page-node-id="YyLtjuSZTvlk1dLh1SF0hT">下图是实际前向路径，也是本页的主体。九个标签页切换粒度：整体总览之外，还可下钻到 GDN 层、QSA 层、索引器、残差流、N-gram 注入、MoE 内部、视觉编码器与多模态融合。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。形状取自本机对等比缩小模型打点得到的实测记录，维度数字为官方 config 的真实取值。</p>
+  <h2 id="flow">2. 交互式数据流</h2>
+  <p>下图是实际前向路径，也是本页的主体。九个标签页切换粒度：整体总览之外，还可下钻到 GDN 层、QSA 层、索引器、残差流、N-gram 注入、MoE 内部、视觉编码器与多模态融合。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。形状取自本机对等比缩小模型打点得到的实测记录，维度数字为官方 config 的真实取值。</p>
 
-  <div class="viz" data-page-node-id="yGHH9ohLRoZyC5hJqzb6V2">
-    <div class="viz-head" data-page-node-id="Vuv9b6rbGY9PXnCbaTZAjo">
-      <div class="tabs" id="tabs" data-page-node-id="TERGDGFjwANbBDjUouQifn"></div>
-      <div class="crumb" id="crumb" data-page-node-id="5FcsBpCNT46ZIDG1CiMs5q"></div>
+  <div class="viz">
+    <div class="viz-head">
+      <div class="tabs" id="tabs"></div>
+      <div class="crumb" id="crumb"></div>
     </div>
-    <div id="cy" data-page-node-id="tFqjAImRG5k9Gbz986EHGD"></div>
-    <div class="legend" id="legend" data-page-node-id="rZqJoGQtdP5KNKrby7bVWe"></div>
+    <div id="cy"></div>
+    <div class="legend" id="legend"></div>
   </div>
-  <div id="tip" data-page-node-id="Kyukko5XOmYQGvcmtSg1cV"></div>
+  <div id="tip"></div>
 
-  <h2 id="points" data-page-node-id="8MralD0JMkr01sLYTQxY8C">3. 要点</h2>
+  <h2 id="points">3. 要点</h2>
 
-  <h3 data-page-node-id="EvB0V80Uh3QfijhkhPHNGR">整体结构：3:1 交替 + 四条残差流</h3>
-  <ul data-page-node-id="k6MwDGr0VIb5Qld0njvJEa">
-    <li data-page-node-id="7Dmd2OtOiIjTsKybluY6iR"><b data-page-node-id="YPlavslhuKnUbPeYgXmqvC">沿序列</b>：48 层按 <code data-page-node-id="K3E5rXeNAKET03eCMB8zGt">full_attention_interval=4</code> 排布，即第 3、7、11…47 层（0 起）为 QSA，其余 36 层为 GDN。真实权重里含 <code data-page-node-id="BwECaMOFIjpAkgpYuTpOOi">linear_attn.*</code> 的恰好 36 层、含 <code data-page-node-id="dEQ0kVGKLauLTH6TI0fKgl">self_attn.*</code> 的恰好 12 层，层号与 config 完全一致；12 个 QSA 层每层都带 <code data-page-node-id="EQ2mft0hcbOHYNHZfHGYbH">self_attn.indexer.*</code>，与源码中 <code data-page-node-id="HA46brjEz8utcOwgHGHauv">Qwen4ExpTextAttention.__init__</code> 无条件构造索引器的写法对应。</li>
-    <li data-page-node-id="5CEKFLDxmw4dODGbixJcEB"><b data-page-node-id="z5xoHQEyLHqBT6BPvmuAU6">沿深度</b>：入口处 <code data-page-node-id="TGyeukOCHmy05dOiXXLFzh">hidden_states.repeat(1, 1, 4)</code> 把 embedding 复制成 4 份，残差流此后全程为 $4\times2560=10240$ 宽。每层内部 <code data-page-node-id="bg6ezdY2GnqT23DXyd9pUu">attn_hyper_connection</code> 与 <code data-page-node-id="4LPgqVYMUdPWgyEkPFmMi5">mlp_hyper_connection</code> 各调用一次：前者把 4 条流归约成 2560 宽送进子层，后者把子层输出按每条流一个标量写回。子层内部维度不受残差条数影响。末端 <code data-page-node-id="LQKPKlfsBuszKYN96mAigF">hyper_connection_mixer</code> 把 4 条流收回 2560 宽再送 <code data-page-node-id="pAuWiAF713jv3z4PHmVNkZ">lm_head</code>。</li>
-    <li data-page-node-id="U2KYuBVgGt9S1BYxpJGjYI"><b data-page-node-id="rppOAewCKQvriFLhwzBr3n">沿宽度</b>：每层 512 个路由专家取 top-10，另有 1 个共享专家恒激活。路由专家占总参数 67.11%（120.80B / 180.00B），但每 token 只激活 10/512。</li>
-    <li data-page-node-id="HBBeY1fL1LUQxQXexRg9Ch"><b data-page-node-id="iCPy2raGgjNvkBm7uWVv03">额外两路</b>：第 1 层前注入 N-gram 查表特征，这是一条与注意力、FFN 并列的独立信息通道，且只出现一次；多模态输入时另有 27 层视觉 ViT 在进入主干前把像素变成同宽的 token，替换序列中的占位符（见第 4 节）。</li>
+  <h3>整体结构：3:1 交替 + 四条残差流</h3>
+  <ul>
+    <li><b>沿序列</b>：48 层按 <code>full_attention_interval=4</code> 排布，即第 3、7、11…47 层（0 起）为 QSA，其余 36 层为 GDN。真实权重里含 <code>linear_attn.*</code> 的恰好 36 层、含 <code>self_attn.*</code> 的恰好 12 层，层号与 config 完全一致；12 个 QSA 层每层都带 <code>self_attn.indexer.*</code>，与源码中 <code>Qwen4ExpTextAttention.__init__</code> 无条件构造索引器的写法对应。</li>
+    <li><b>沿深度</b>：入口处 <code>hidden_states.repeat(1, 1, 4)</code> 把 embedding 复制成 4 份，残差流此后全程为 $4\times2560=10240$ 宽。每层内部 <code>attn_hyper_connection</code> 与 <code>mlp_hyper_connection</code> 各调用一次：前者把 4 条流归约成 2560 宽送进子层，后者把子层输出按每条流一个标量写回。子层内部维度不受残差条数影响。末端 <code>hyper_connection_mixer</code> 把 4 条流收回 2560 宽再送 <code>lm_head</code>。</li>
+    <li><b>沿宽度</b>：每层 512 个路由专家取 top-10，另有 1 个共享专家恒激活。路由专家占总参数 67.11%（120.80B / 180.00B），但每 token 只激活 10/512。</li>
+    <li><b>额外两路</b>：第 1 层前注入 N-gram 查表特征，这是一条与注意力、FFN 并列的独立信息通道，且只出现一次；多模态输入时另有 27 层视觉 ViT 在进入主干前把像素变成同宽的 token，替换序列中的占位符（见第 4 节）。</li>
   </ul>
 
-  <h3 data-page-node-id="uhnR2zyRdlg3Q5qa8JGnRP">GDN（Gated DeltaNet，36 层）</h3>
-  <ul data-page-node-id="9asBLNYYcnxYue31N2I20M">
-    <li data-page-node-id="wzrR8HMCUibtSML5ac5ueI">状态是一个 $d_k \times d_v$ 的矩阵而非增长的 KV 序列。更新规则为 $S_t = \alpha_t S_{t-1} + k_t\big(\beta_t(v_t - S_{t-1}^{\top}k_t)\big)^{\top}$，输出 $o_t = S_t^{\top}q_t / \sqrt{d_k}$。括号里的 $v_t - S_{t-1}^{\top}k_t$ 是「当前值与状态已存内容之差」，即 delta rule 的名称来源：写入的是增量而非原值。</li>
-    <li data-page-node-id="NfzNCpNChdnLoLBtNShFpr">两个门都由输入投影得到：$\beta_t = \sigma(W_b x_t)$ 控制写入强度，$\alpha_t = \exp(g_t)$ 且 $g_t = -\exp(A_{\log})\,\mathrm{softplus}(W_a x_t + b_{dt})$ 控制遗忘速度。因为 $\exp(A_{\log})>0$ 且 $\mathrm{softplus}>0$，$g_t$ 恒为负，故 $\alpha_t \in (0,1)$ 必然是衰减。本机实测 $g_t$ 落在 $[-63.34, -0.15]$，衰减强度跨三个数量级。</li>
-    <li data-page-node-id="ZIAfrrqlNADo0A95YG1L41">48 个值头、16 个键头，比值 3，源码用 <code data-page-node-id="aIzTLQWMbj3dcMkG1w8Qx8">repeat_interleave</code> 把查询与键各复制 3 份对齐到 48 头。查询与键在进入递归前做 L2 归一化，这使 $S_{t-1}^{\top}k_t$ 的量级可控。</li>
-    <li data-page-node-id="65ZVKyghXlD9D0XRgIiX9A"><b data-page-node-id="rtUEI7q0ZClkepQMsPgbCL">两条计算路径等价</b>：prefill 走分块并行、decode 走逐 token 递归。本机在真实头数与头维（48/16 头、128 维、160 个 token）下实测，两者输出最大绝对差 $1.36\times10^{-7}$、末态差 $4.02\times10^{-7}$，确认是同一函数的两种实现。</li>
-    <li data-page-node-id="9hz5JHVnLCj5wAd9MNwbhs"><b data-page-node-id="GCpUz4eHdkMV4DhB8Usbum">易被忽略的状态</b>：GDN 前置一个 kernel 为 4 的深度可分离因果卷积。逐 token decode 时必须跨步保留 $\text{kernel}-1=3$ 个位置的通道状态，否则前 3 个历史位置被当作 0。本机对照实测：不保留状态时与 prefill 的最大差为 $8.45\times10^{-1}$，正确维护滑窗后降到 $1.49\times10^{-8}$。</li>
+  <h3>GDN（Gated DeltaNet，36 层）</h3>
+  <ul>
+    <li>状态是一个 $d_k \times d_v$ 的矩阵而非增长的 KV 序列。更新规则为 $S_t = \alpha_t S_{t-1} + k_t\big(\beta_t(v_t - S_{t-1}^{\top}k_t)\big)^{\top}$，输出 $o_t = S_t^{\top}q_t / \sqrt{d_k}$。括号里的 $v_t - S_{t-1}^{\top}k_t$ 是「当前值与状态已存内容之差」，即 <a href="../delta-rule/">delta rule</a> 的名称来源：写入的是增量而非原值。</li>
+    <li>两个门都由输入投影得到：$\beta_t = \sigma(W_b x_t)$ 控制写入强度，$\alpha_t = \exp(g_t)$ 且 $g_t = -\exp(A_{\log})\,\mathrm{softplus}(W_a x_t + b_{dt})$ 控制遗忘速度。因为 $\exp(A_{\log})>0$ 且 $\mathrm{softplus}>0$，$g_t$ 恒为负，故 $\alpha_t \in (0,1)$ 必然是衰减。本机实测 $g_t$ 落在 $[-63.34, -0.15]$，衰减强度跨三个数量级。</li>
+    <li>48 个值头、16 个键头，比值 3，源码用 <code>repeat_interleave</code> 把查询与键各复制 3 份对齐到 48 头。查询与键在进入递归前做 L2 归一化，这使 $S_{t-1}^{\top}k_t$ 的量级可控。</li>
+    <li><b>两条计算路径等价</b>：prefill 走分块并行、decode 走逐 token 递归。本机在真实头数与头维（48/16 头、128 维、160 个 token）下实测，两者输出最大绝对差 $1.36\times10^{-7}$、末态差 $4.02\times10^{-7}$，确认是同一函数的两种实现。</li>
+    <li><b>易被忽略的状态</b>：GDN 前置一个 kernel 为 4 的深度可分离因果卷积。逐 token decode 时必须跨步保留 $\text{kernel}-1=3$ 个位置的通道状态，否则前 3 个历史位置被当作 0。本机对照实测：不保留状态时与 prefill 的最大差为 $8.45\times10^{-1}$，正确维护滑窗后降到 $1.49\times10^{-8}$。</li>
   </ul>
 
-  <h3 data-page-node-id="SEeLfYspiSkVx9DNThOnZ6">QSA（Qwen Sparse Attention，12 层）</h3>
-  <ul data-page-node-id="DSRuW5DElsG7EnKpAovOCJ">
-    <li data-page-node-id="iN1b0Q60LgsR94gCrZmIc5"><b data-page-node-id="yGbPXjfjxAygfETd0QgQei">索引器与主注意力分离</b>：索引器有自己的 128 维查询与键，由 <code data-page-node-id="X6gpvtlYwhuwr9D7ccHJn0">index_qk_proj</code> 一次投影出 $(4+1)\times128=640$ 维再切分，与主注意力的 256 维头完全独立。源码强制 <code data-page-node-id="1q8Oq2RDk73MOobFuLLrwj">indexer_kv_heads=1</code>，即全部 4 个索引查询头共享同一份键。</li>
-    <li data-page-node-id="38t8USzh5oIzwnFWtPcsaG"><b data-page-node-id="TBU5kcK9PjB5aORAF2pToC">块压缩是均值池化</b>：每 4 个连续 token 的索引键取算术平均得到一个块表示，再做 RMS 归一化与 RoPE，位置取该块首个 token 的位置。这与 DeepSeek-V4 用数据相关权重加权求和的压缩不同，此处是无参数的固定池化。</li>
-    <li data-page-node-id="8aNUsT1JToU89ttZ6hzTBg"><b data-page-node-id="E3XBBH7WzaPnpLKVARqmaY">块得分先 ReLU 再按头求和</b>：$s_b = \frac{1}{\sqrt{128}}\sum_{h=1}^{4}\mathrm{ReLU}\!\left(q_h \cdot \bar{k}_b\right)$，注意不是 softmax。ReLU 的作用是让单个头的负相关无法抵消其他头的正相关。本机实测：同一输入下 ReLU 求和与直接求和选出的 top-512 块仅重叠 427 个（83.4%），确认这一处非线性实质影响选择结果。</li>
-    <li data-page-node-id="3ToFCP6VlMhQbi4oeG329a"><b data-page-node-id="LOgTAzIUWeF4p7WbabtCL3">选择粒度是块、代价是有损</b>：取 <code data-page-node-id="Ux7lCIeQeOHhggDK1aZZVq">block_topk</code> $=2048/4=512$ 个块，展开为 2048 个 token；末尾不足 4 个的残块无条件全部保留。本机实测「块内 token 最大得分」与「池化键得分」的相关系数为 0.6449，两者 top-512 块重叠 375 个（73.2%），说明块粒度选择无法完全还原 token 粒度的重要性排序。</li>
-    <li data-page-node-id="pQLGvdisIEkk4JDUQ8knCR"><b data-page-node-id="C05O4c1AbdCvH0UQbh0zQ1">可见范围随长度封顶</b>：本机按真实 config 逐位置实测，可见 token 数在 2048 以内时等于因果可见范围（占比 100%），超过后被钉死。位置 4000 时可见 2049 个（51.21%）、位置 8000 时 2049 个（25.61%）、位置 11999 时 2048 个（17.07%）。上界为 $512\times4+3=2051$，与源码分配的张量宽度一致。</li>
-    <li data-page-node-id="SWfiAOhMJxysV0BriUukvy"><b data-page-node-id="VTq4iNRWWfV1maxUH96RTF">输出侧带 sigmoid 门</b>：<code data-page-node-id="nWsDbVDI3tk48W9CH2HAQe">q_proj</code> 输出宽度是 $24\times256\times2=12288$，切成查询与门两半；注意力输出先乘 $\sigma(\text{gate})$ 再过 <code data-page-node-id="qpTjFscHdm9dJJn7IZWOsR">o_proj</code>。真实权重 <code data-page-node-id="021W8gybxEaupmVLZZIhhx">q_proj</code> 形状 [12288, 2560] 印证了这个两倍宽度。</li>
-    <li data-page-node-id="gtkYOmp3Uamtpn64YFVc1M"><b data-page-node-id="DQkoSVQgymGwvyFUWFucrh">部分 RoPE</b>：<code data-page-node-id="xpdz0AYSxeJCIbaRhRyuj8">partial_rotary_factor=0.25</code> 使旋转只作用于 256 维头的前 64 维，后 192 维原样通过。本机实测前 64 维最大变化 1.7148、后 64 维（索引器头维内）变化恒为 0，且旋转严格保范数（8.370453 到 8.370454）。源码另有约束 $\text{rotary\_dim} \le \text{indexer\_head\_dim}$，即 $64 \le 128$。</li>
+  <h3>QSA（Qwen Sparse Attention，12 层）</h3>
+  <ul>
+    <li><b>索引器与主注意力分离</b>：索引器有自己的 128 维查询与键，由 <code>index_qk_proj</code> 一次投影出 $(4+1)\times128=640$ 维再切分，与主注意力的 256 维头完全独立。源码强制 <code>indexer_kv_heads=1</code>，即全部 4 个索引查询头共享同一份键。</li>
+    <li><b>块压缩是均值池化</b>：每 4 个连续 token 的索引键取算术平均得到一个块表示，再做 RMS 归一化与 RoPE，位置取该块首个 token 的位置。这与 <a href="../dsa/">DeepSeek-V4</a> 用数据相关权重加权求和的压缩不同，此处是无参数的固定池化。</li>
+    <li><b>块得分先 ReLU 再按头求和</b>：$s_b = \frac{1}{\sqrt{128}}\sum_{h=1}^{4}\mathrm{ReLU}\!\left(q_h \cdot \bar{k}_b\right)$，注意不是 softmax。ReLU 的作用是让单个头的负相关无法抵消其他头的正相关。本机实测：同一输入下 ReLU 求和与直接求和选出的 top-512 块仅重叠 427 个（83.4%），确认这一处非线性实质影响选择结果。</li>
+    <li><b>选择粒度是块、代价是有损</b>：取 <code>block_topk</code> $=2048/4=512$ 个块，展开为 2048 个 token；末尾不足 4 个的残块无条件全部保留。本机实测「块内 token 最大得分」与「池化键得分」的相关系数为 0.6449，两者 top-512 块重叠 375 个（73.2%），说明块粒度选择无法完全还原 token 粒度的重要性排序。</li>
+    <li><b>可见范围随长度封顶</b>：本机按真实 config 逐位置实测，可见 token 数在 2048 以内时等于因果可见范围（占比 100%），超过后被钉死。位置 4000 时可见 2049 个（51.21%）、位置 8000 时 2049 个（25.61%）、位置 11999 时 2048 个（17.07%）。上界为 $512\times4+3=2051$，与源码分配的张量宽度一致。</li>
+    <li><b>输出侧带 sigmoid 门</b>：<code>q_proj</code> 输出宽度是 $24\times256\times2=12288$，切成查询与门两半；注意力输出先乘 $\sigma(\text{gate})$ 再过 <code>o_proj</code>。真实权重 <code>q_proj</code> 形状 [12288, 2560] 印证了这个两倍宽度。</li>
+    <li><b>部分 <a href="../rope/">RoPE</a></b>：<code>partial_rotary_factor=0.25</code> 使旋转只作用于 256 维头的前 64 维，后 192 维原样通过。本机实测前 64 维最大变化 1.7148、后 64 维（索引器头维内）变化恒为 0，且旋转严格保范数（8.370453 到 8.370454）。源码另有约束 $\text{rotary\_dim} \le \text{indexer\_head\_dim}$，即 $64 \le 128$。</li>
   </ul>
 
-  <h3 data-page-node-id="WyQ3Anh86yP7SEQ6l9YGpj">Gated Residual（四条并行残差流）</h3>
-  <ul data-page-node-id="fS9jxahczOZWwu1z5n3sJJ">
-    <li data-page-node-id="pxa6fHRpacuF10byiffqhX"><b data-page-node-id="gw8navPqQXfEA891WZRyj5">读出</b>：先对 10240 宽的残差做分组 RMS 归一化（每 2560 一组，共 4 组），再经 $10240 \to 320 \to 10240$ 的低秩瓶颈算出每条流每一维的 sigmoid 门，加权后沿流维求<b data-page-node-id="14BditIF1siMqbuAICTjMe">均值</b>得到 2560 宽的子层输入。公式为 $\tilde{x} = \frac{1}{4}\sum_{i=1}^{4} \sigma\!\big(W_{up}\,\mathrm{silu}(W_{down}\hat{x}/4)\big)_i \odot \hat{x}_i$，其中 $\hat{x}$ 是归一化后的四条流。</li>
-    <li data-page-node-id="HUKbm0fVcUd0akE9XcqY3N"><b data-page-node-id="HoPYd6DpZO8dxloIBeTl6m">写回</b>：子层输出 $y$（2560 宽）按每条流一个标量放大后加回原四条流：$x_i \leftarrow x_i + \lambda_i y$，其中 $\lambda_i = 2\sigma(W_{inj}\hat{x}/4)_i$。取值范围为 $(0,2)$，且 $W_{inj}$ 零初始化时 $\lambda_i$ 恰为 1，退化成标准恒等残差——本机实测四条流的 $\lambda$ 全为 1.0 验证了这一点。</li>
-    <li data-page-node-id="g1PXiyHnnnjsBl9vwky4FS"><b data-page-node-id="OnWcsN2vHKSK0PJWhhbg2m">四条流何时开始分化</b>：入口是纯复制，本机实测第 0 条与第 3 条流完全相同。第一次写回后因 $\lambda_i$ 不同而分化，实测四条流的增量 L2 范数为 51.88 / 52.68 / 52.06 / 49.72，从此各自演化。</li>
-    <li data-page-node-id="hy1txekPFyT6ELZVP384wE"><b data-page-node-id="aYmqd6pUVCguKFLTrKbhzK">末端收束不带注入</b>：<code data-page-node-id="wVEYKSDKKAsUn1LJkrxJYO">hyper_connection_mixer</code> 构造时 <code data-page-node-id="8FrAgjEyw7JvPnABc2NAmf">use_combine=False</code>，因此没有 <code data-page-node-id="rcOD9zmddNRdEZqhxuqPU3">block_inject_weight</code>。真实权重印证：该模块只有 <code data-page-node-id="VWhdVGQyI8Q5x1fGFzuISw">hc_norm</code>、<code data-page-node-id="BzswNiP9Unk4GXVVsrdYfD">input_mix_weight_down</code>、<code data-page-node-id="cAoGVj9jg7RteZMdC6i4Y5">input_mix_weight_up</code> 三个张量，比层内版本少 $4\times4\times2560=40960$ 个参数。</li>
-    <li data-page-node-id="icgw7ciA2341wSqa7srsui"><b data-page-node-id="zDrt0nHyGCwqt1aGTRF4UG">代价</b>：每层两组共 13,209,600 参数，48 层加末端 mixer 合计 640,624,640，占总参数 0.36%。该数字与按张量头分组累加的结果精确相等。</li>
+  <h3>Gated Residual（四条并行残差流）</h3>
+  <ul>
+    <li><b>读出</b>：先对 10240 宽的残差做分组 RMS 归一化（每 2560 一组，共 4 组），再经 $10240 \to 320 \to 10240$ 的低秩瓶颈算出每条流每一维的 sigmoid 门，加权后沿流维求<b>均值</b>得到 2560 宽的子层输入。公式为 $\tilde{x} = \frac{1}{4}\sum_{i=1}^{4} \sigma\!\big(W_{up}\,\mathrm{silu}(W_{down}\hat{x}/4)\big)_i \odot \hat{x}_i$，其中 $\hat{x}$ 是归一化后的四条流。</li>
+    <li><b>写回</b>：子层输出 $y$（2560 宽）按每条流一个标量放大后加回原四条流：$x_i \leftarrow x_i + \lambda_i y$，其中 $\lambda_i = 2\sigma(W_{inj}\hat{x}/4)_i$。取值范围为 $(0,2)$，且 $W_{inj}$ 零初始化时 $\lambda_i$ 恰为 1，退化成标准恒等残差——本机实测四条流的 $\lambda$ 全为 1.0 验证了这一点。</li>
+    <li><b>四条流何时开始分化</b>：入口是纯复制，本机实测第 0 条与第 3 条流完全相同。第一次写回后因 $\lambda_i$ 不同而分化，实测四条流的增量 L2 范数为 51.88 / 52.68 / 52.06 / 49.72，从此各自演化。</li>
+    <li><b>末端收束不带注入</b>：<code>hyper_connection_mixer</code> 构造时 <code>use_combine=False</code>，因此没有 <code>block_inject_weight</code>。真实权重印证：该模块只有 <code>hc_norm</code>、<code>input_mix_weight_down</code>、<code>input_mix_weight_up</code> 三个张量，比层内版本少 $4\times4\times2560=40960$ 个参数。</li>
+    <li><b>代价</b>：每层两组共 13,209,600 参数，48 层加末端 mixer 合计 640,624,640，占总参数 0.36%。该数字与按张量头分组累加的结果精确相等。</li>
   </ul>
 
-  <h3 data-page-node-id="C65LwDDMzX24MVNojmdG9t">N-gram Embedding（51.2B 哈希查表）</h3>
-  <ul data-page-node-id="uvLECYFHIjsmsLJT1yKky7">
-    <li data-page-node-id="rKOYZY06VMsNUFD01XDiqI"><b data-page-node-id="Aw4cSYFvP9rBVwNga9HtAO">只在一层出现</b>：<code data-page-node-id="eyBtzV0dGdodBz3k5gTZ4Q">ple_layer_ids=[2]</code>（1 起），即 0 起的第 1 层。源码另有校验要求该层必须是 GDN 层。真实权重中仅第 1 层含 <code data-page-node-id="2QAw0YVqxMHOiKMeUB3AHq">ple.*</code>，全模型只有这一处。</li>
-    <li data-page-node-id="NViIDZREd4anBZy27TqMim"><b data-page-node-id="HlHmNOzJws6p2iL117OYz5">16 个头，每个头一张独立的质数大小词表</b>：头数为 $(\text{ngram\_size}-1)\times\text{heads\_per\_ngram} = (3-1)\times8 = 16$，前 8 个头处理 bigram、后 8 个处理 trigram。第 $i$ 个头的词表大小是 20,000,000 之后的第 $i+1$ 个质数，依次为 20000003、20000023、20000033、…、20000171。这 16 个数值以 I64 缓冲存在 checkpoint 里，已逐元素核对与源码派生完全一致。</li>
-    <li data-page-node-id="uD0iancLL4EB1cPtXygH9z"><b data-page-node-id="kmQvFVb13fCqwiQNdKlMMu">表尺寸完全可复现</b>：16 个质数之和为 320,001,446，按 <code data-page-node-id="ArPlRae35J5OlV5FPaKWav">make_ngram_vocab_size_divisible_by=128</code> 向上对齐得 320,001,536（补 90 行）。真实权重 128 个分片的行数之和恰为 320,001,536，每行 160 维，故表参数量 $320001536 \times 160 = 51{,}200{,}245{,}760$，与张量头累加结果精确相等。用质数作模数是为了让不同头的哈希碰撞模式尽量独立。checkpoint 中的 <code data-page-node-id="5eIvoCBFD6ZDft3Slzk39o">ngram_heads_offsets</code> 也已核对为这 16 个质数的前缀和。</li>
-    <li data-page-node-id="M3l4AZDD5ENVCkskU3ajLL"><b data-page-node-id="1RBHm5un7AUBFBerR1rmXQ">是哈希而非精确查表</b>：n-gram 的 id 由各位置 token 乘上不同乘子后逐位异或，再对该头的质数取模、加上该头的偏移得到。乘子的派生规则是 $c_j = 2\big(\mathrm{splitmix64}(s_0 + \gamma(j{+}1)) \bmod B\big) + 1$，其中 $s_0 = \text{seed} + 10007\,\ell$、$\gamma$ 为 splitmix64 的黄金比常数、$B = \lfloor\lfloor(2^{63}-1)/V\rfloor/2\rfloor$ 且 $V$ 为词表大小。本机核对 checkpoint 中三个真实乘子（23703573157769、20109073645365、8052911324071）与该公式逐元素一致，并由此确认 config 未显式给出的 <code data-page-node-id="FmsoXTJ9z0U3W7gdcUiXRA">seed</code> 即默认值 1234。</li>
-    <li data-page-node-id="FaXmAbrTWgHqpXcEg0TA4K"><b data-page-node-id="P91KWFmwKXRUXnY9lgOtnA">乘子的两个设计约束</b>：$2k+1$ 的形式使乘子恒为奇数，因而与 $2^{64}$ 互质、在模 $2^{64}$ 下可逆，不会把不同 token 压到同一乘积；$B$ 的定义则保证 $\text{token\_id} \times c_j$ 不溢出 int64（本机对三个真实乘子逐一验证通过）。本机用真实乘子重算 2000 个位置的 n-gram id，全部落在各自头的 $[\text{offset}, \text{offset}+\text{size})$ 区间内，bigram 与 trigram 头碰撞率均为 0.000%；换 4000 个位置时 bigram 头碰撞率 0.025%。</li>
-    <li data-page-node-id="X9yGBqdkWFDY6GxVq8v3U9"><b data-page-node-id="p0SUeRim9KK0QGdogdoAXL">门控注入</b>：查表得到的 2560 维特征投影出「每条残差流一个键」与「四条流共享的一个值」，键与归一化后的残差流做内积得到门控标量 $g$，再经 $\mathrm{sign}(g)\sqrt{|g|}$ 变换后取 sigmoid。开方压缩大值、放大小值，而 <code data-page-node-id="DALYBG6fDRU3Du5yLIwlmO">sign</code> 保证不改变正负——本机实测变换前后符号完全一致。</li>
-    <li data-page-node-id="bE2ftcTW4DgrJqU09FgVB1"><b data-page-node-id="A4InSvxz0K9QJWfdi9gXha">空洞卷积补局部上下文</b>：kernel 4、dilation 等于 <code data-page-node-id="ZvgJTll407Torgj2TlXsoR">ngram_size=3</code>，逐通道作用于 10240 维，感受野覆盖相对位置 $\{-9,-6,-3,0\}$，需保留 $(4-1)\times3=9$ 个位置的状态。</li>
-    <li data-page-node-id="1rjobZMURDinE4NA7QERCn"><b data-page-node-id="khg4hqz0esRHGCgctCd11n">表不参与矩阵乘</b>：每 token 只从 16 个头各取 1 行 160 维，合 2560 个元素（恰等于 <code data-page-node-id="eAbCQEFGlKHe58HO2cRIqQ">ple_embed_dim</code>），bf16 下 5.00 KiB。相对 51.2B 的表体积，单 token 触达比例为 $5\times10^{-6}\%$。config 的并行方案把该表标为 <code data-page-node-id="fBGaE1ToVZnLPiim8shADR">colwise_gather_output</code>，注释说明其体积约 90 GiB，需要单独切分。</li>
+  <h3>N-gram Embedding（51.2B 哈希查表）</h3>
+  <ul>
+    <li><b>只在一层出现</b>：<code>ple_layer_ids=[2]</code>（1 起），即 0 起的第 1 层。源码另有校验要求该层必须是 GDN 层。真实权重中仅第 1 层含 <code>ple.*</code>，全模型只有这一处。</li>
+    <li><b>16 个头，每个头一张独立的质数大小词表</b>：头数为 $(\text{ngram\_size}-1)\times\text{heads\_per\_ngram} = (3-1)\times8 = 16$，前 8 个头处理 bigram、后 8 个处理 trigram。第 $i$ 个头的词表大小是 20,000,000 之后的第 $i+1$ 个质数，依次为 20000003、20000023、20000033、…、20000171。这 16 个数值以 I64 缓冲存在 checkpoint 里，已逐元素核对与源码派生完全一致。</li>
+    <li><b>表尺寸完全可复现</b>：16 个质数之和为 320,001,446，按 <code>make_ngram_vocab_size_divisible_by=128</code> 向上对齐得 320,001,536（补 90 行）。真实权重 128 个分片的行数之和恰为 320,001,536，每行 160 维，故表参数量 $320001536 \times 160 = 51{,}200{,}245{,}760$，与张量头累加结果精确相等。用质数作模数是为了让不同头的哈希碰撞模式尽量独立。checkpoint 中的 <code>ngram_heads_offsets</code> 也已核对为这 16 个质数的前缀和。</li>
+    <li><b>是哈希而非精确查表</b>：n-gram 的 id 由各位置 token 乘上不同乘子后逐位异或，再对该头的质数取模、加上该头的偏移得到。乘子的派生规则是 $c_j = 2\big(\mathrm{splitmix64}(s_0 + \gamma(j{+}1)) \bmod B\big) + 1$，其中 $s_0 = \text{seed} + 10007\,\ell$、$\gamma$ 为 splitmix64 的黄金比常数、$B = \lfloor\lfloor(2^{63}-1)/V\rfloor/2\rfloor$ 且 $V$ 为词表大小。本机核对 checkpoint 中三个真实乘子（23703573157769、20109073645365、8052911324071）与该公式逐元素一致，并由此确认 config 未显式给出的 <code>seed</code> 即默认值 1234。</li>
+    <li><b>乘子的两个设计约束</b>：$2k+1$ 的形式使乘子恒为奇数，因而与 $2^{64}$ 互质、在模 $2^{64}$ 下可逆，不会把不同 token 压到同一乘积；$B$ 的定义则保证 $\text{token\_id} \times c_j$ 不溢出 int64（本机对三个真实乘子逐一验证通过）。本机用真实乘子重算 2000 个位置的 n-gram id，全部落在各自头的 $[\text{offset}, \text{offset}+\text{size})$ 区间内，bigram 与 trigram 头碰撞率均为 0.000%；换 4000 个位置时 bigram 头碰撞率 0.025%。</li>
+    <li><b>门控注入</b>：查表得到的 2560 维特征投影出「每条残差流一个键」与「四条流共享的一个值」，键与归一化后的残差流做内积得到门控标量 $g$，再经 $\mathrm{sign}(g)\sqrt{|g|}$ 变换后取 sigmoid。开方压缩大值、放大小值，而 <code>sign</code> 保证不改变正负——本机实测变换前后符号完全一致。</li>
+    <li><b>空洞卷积补局部上下文</b>：kernel 4、dilation 等于 <code>ngram_size=3</code>，逐通道作用于 10240 维，感受野覆盖相对位置 $\{-9,-6,-3,0\}$，需保留 $(4-1)\times3=9$ 个位置的状态。</li>
+    <li><b>表不参与矩阵乘</b>：每 token 只从 16 个头各取 1 行 160 维，合 2560 个元素（恰等于 <code>ple_embed_dim</code>），bf16 下 5.00 KiB。相对 51.2B 的表体积，单 token 触达比例为 $5\times10^{-6}\%$。config 的并行方案把该表标为 <code>colwise_gather_output</code>，注释说明其体积约 90 GiB，需要单独切分。</li>
   </ul>
 
-  <h3 data-page-node-id="20Ymz0TbCr9dAvq6FnEfoL">MoE 路由</h3>
-  <ul data-page-node-id="Lf46IIoLQ2nuGWc8Mprebn">
-    <li data-page-node-id="VScCENRzik6FlLZkGgCMZT"><b data-page-node-id="27dxi1NVuD72Ffx0sF0OcQ">先全局 softmax 再对选中项重归一化</b>：在全部 512 个专家上做 softmax，取 top-10，再把这 10 个概率除以它们的和。本机实测 token 0 的 top-10 原始概率和仅 0.152946，重归一化后为 1.000000。含义是各专家的相对权重来自全局竞争，但最终系数之和恒为 1。</li>
-    <li data-page-node-id="lMnwJkAtDVSVvHo2cPVzIu"><b data-page-node-id="h7DvFhLFUx6gedGptQe1Gb">共享专家恒激活且带标量门</b>：共享专家不参与路由，输出乘一个逐 token 的 sigmoid 标量 $\sigma(W_g x)$ 后与路由结果相加。真实权重 <code data-page-node-id="lzt1sefExCQAo7deIyYaxj">shared_expert_gate</code> 形状 [1, 2560]，即每 token 只产生一个标量。</li>
-    <li data-page-node-id="MYRsES1S3kklyJmbFJh321"><b data-page-node-id="EnZIl3sPHFqf4TZyIGXbHp">激活比例</b>：单层全量 2,522,810,880 参数，激活 55,380,480，占 2.195%——约等于 $10/512=1.95\%$ 再加上共享专家与路由器。48 层路由专家合计 120,795,955,200，与张量头累加结果精确相等。</li>
+  <h3>MoE 路由</h3>
+  <ul>
+    <li><b>先全局 softmax 再对选中项重归一化</b>：在全部 512 个专家上做 softmax，取 top-10，再把这 10 个概率除以它们的和。本机实测 token 0 的 top-10 原始概率和仅 0.152946，重归一化后为 1.000000。含义是各专家的相对权重来自全局竞争，但最终系数之和恒为 1。</li>
+    <li><b>共享专家恒激活且带标量门</b>：共享专家不参与路由，输出乘一个逐 token 的 sigmoid 标量 $\sigma(W_g x)$ 后与路由结果相加。真实权重 <code>shared_expert_gate</code> 形状 [1, 2560]，即每 token 只产生一个标量。</li>
+    <li><b>激活比例</b>：单层全量 2,522,810,880 参数，激活 55,380,480，占 2.195%——约等于 $10/512=1.95\%$ 再加上共享专家与路由器。48 层路由专家合计 120,795,955,200，与张量头累加结果精确相等。</li>
   </ul>
 
-  <h3 data-page-node-id="BQSTJTDkKhyjuRkHjM2dEd">长上下文开销的来源</h3>
-  <p data-page-node-id="sb8LCqWNYAJqzMsFypaAMP">注意力开销由每 token 的候选集规模与缓存体积共同决定。按官方 config 实算：</p>
-  <table data-page-node-id="dWh7pOTWy7SMdAG7XnB7PB">
-    <tr data-page-node-id="Q3B0w8QfjaxeIwyeZWO7rG"><th data-page-node-id="rjDqjXQ4mDroQGSvGmxC7Q">上下文</th><th data-page-node-id="AC2D0gS39X9JIj36d90kei">QSA 层 KV（12 层）</th><th data-page-node-id="EO0F2yfiEGiNnQLiABi41U">索引器缓存（12 层）</th><th data-page-node-id="eOOIDidISCvwI95L1P5acU">GDN 状态（36 层）</th><th data-page-node-id="lXfv218UOqAracMDb2KJTM">合计</th></tr>
-    <tr data-page-node-id="8Yl16sPsoBSyViSNXbuisQ"><td data-page-node-id="Q0nM0q5YynqBjzxP603Kq0">4K</td><td data-page-node-id="XoaKnEopbpBiZrSm7dG3Cg">0.094 GiB</td><td data-page-node-id="rgC5s6nOmvhmWd9Al8DD68">0.012 GiB</td><td data-page-node-id="m7R6fsB8Ju3FnS2YL5Luj0">0.108 GiB</td><td data-page-node-id="gTijtbWDFRI7UldWfGgsKz">0.213 GiB</td></tr>
-    <tr data-page-node-id="NWtNWt53t8qmtv2OUhGHsR"><td data-page-node-id="DUAV5oMztd6IB6oVTOAHQZ">32K</td><td data-page-node-id="qoFK3fES1YCwYQ2xiS9434">0.750 GiB</td><td data-page-node-id="xvZYJgEjbZ9l2zbVPMnQGO">0.094 GiB</td><td data-page-node-id="JEPiMD6kfLprN2FOoaABXo">0.108 GiB</td><td data-page-node-id="GY0fECSGcEbNZlkw8cmB0B">0.951 GiB</td></tr>
-    <tr data-page-node-id="A5THjzqal7NHJewo0iq5ye"><td data-page-node-id="UIqxhTPVuluLaCdIFruuAG">256K</td><td data-page-node-id="URU0GZeOznGsLcUR2iUZJu">6.000 GiB</td><td data-page-node-id="hPtHJYq6kfdNGALOhYQArf">0.750 GiB</td><td data-page-node-id="3BjGHGeMEjy0Tv4CCJ5Zqx">0.108 GiB</td><td data-page-node-id="7L0tHVJaOyUMje8YT6IWHM">6.858 GiB</td></tr>
-    <tr data-page-node-id="c7Bu0y2MJMEcBCeuVknFM1"><td data-page-node-id="NH20wHi6OsnsOSyrA56IZS">1M</td><td data-page-node-id="jHoMTO3UvmSe9wle64AfKU">24.000 GiB</td><td data-page-node-id="yv0iElU2g9pL0SeI60OkVE">3.000 GiB</td><td data-page-node-id="SKrkee4QkF8Dw7jMk2yJXm">0.108 GiB</td><td data-page-node-id="7vfJw5nD5OpXO9SgNpVgyP">27.108 GiB</td></tr>
+  <h3>长上下文开销的来源</h3>
+  <p>注意力开销由每 token 的候选集规模与缓存体积共同决定。按官方 config 实算：</p>
+  <table>
+    <tr><th>上下文</th><th>QSA 层 KV（12 层）</th><th>索引器缓存（12 层）</th><th>GDN 状态（36 层）</th><th>合计</th></tr>
+    <tr><td>4K</td><td>0.094 GiB</td><td>0.012 GiB</td><td>0.108 GiB</td><td>0.213 GiB</td></tr>
+    <tr><td>32K</td><td>0.750 GiB</td><td>0.094 GiB</td><td>0.108 GiB</td><td>0.951 GiB</td></tr>
+    <tr><td>256K</td><td>6.000 GiB</td><td>0.750 GiB</td><td>0.108 GiB</td><td>6.858 GiB</td></tr>
+    <tr><td>1M</td><td>24.000 GiB</td><td>3.000 GiB</td><td>0.108 GiB</td><td>27.108 GiB</td></tr>
   </table>
-  <p data-page-node-id="lyAxQuifliL0hW8qz3QVa9">两个机制各自贡献不同：<b data-page-node-id="ni3kFD7HI3axwyCZX4fPCg">层型比例</b>让只有 12/48 层需要存 KV，若 48 层全为 QSA 型，1M 上下文下 KV 将达 96 GiB，实际 24 GiB 即降为 1/4；<b data-page-node-id="wHp1LH21tmACvq9DnHmta5">块选择</b>不减少缓存但限制计算，每个查询实际参与注意力的 token 数被钉死在 2048 上下，与序列长度脱钩。GDN 侧的状态为每层 3.00 MiB 递归状态（fp32，由 <code data-page-node-id="BVKuBqG5Inr8M9BVjZN8vI">mamba_ssm_dtype</code> 指定）加 60.00 KiB 卷积状态，36 层合计 0.108 GiB 且完全不随长度增长。</p>
-  <p data-page-node-id="n1TbGFc8w7gt5KV7Pu5DQa">需要注意 2048 这个预算是 config 的默认取值，块选择只在完整块数超过 512 时才实际生效；上下文短于约 2048 时每个查询仍能看到全部因果可见 token。</p>
+  <p>两个机制各自贡献不同：<b>层型比例</b>让只有 12/48 层需要存 <a href="../kv-cache/">KV</a>，若 48 层全为 QSA 型，1M 上下文下 KV 将达 96 GiB，实际 24 GiB 即降为 1/4；<b>块选择</b>不减少缓存但限制计算，每个查询实际参与注意力的 token 数被钉死在 2048 上下，与序列长度脱钩。GDN 侧的状态为每层 3.00 MiB 递归状态（fp32，由 <code>mamba_ssm_dtype</code> 指定）加 60.00 KiB 卷积状态，36 层合计 0.108 GiB 且完全不随长度增长。</p>
+  <p>需要注意 2048 这个预算是 config 的默认取值，块选择只在完整块数超过 512 时才实际生效；上下文短于约 2048 时每个查询仍能看到全部因果可见 token。</p>
 
-  <h2 id="vision" data-page-node-id="Eq2MgYdQWhJr0sxD8m9END">4. 视觉编码器与多模态融合</h2>
-  <p data-page-node-id="BYJDjWzgsE0p9mhX8n9Pm3">视觉侧是一个 27 层的独立 ViT，参数量 448,931,056（0.449B），只占全模型 0.249%。它的作用是把像素变成与语言主干同宽的 token，之后视觉与文本在同一序列里共享全部 48 层——不存在贯穿深度的独立视觉分支。下面的「视觉编码器」与「多模态融合」两个视图给出完整路径。</p>
+  <h2 id="vision">4. 视觉编码器与多模态融合</h2>
+  <p>视觉侧是一个 27 层的独立 ViT，参数量 448,931,056（0.449B），只占全模型 0.249%。它的作用是把像素变成与语言主干同宽的 token，之后视觉与文本在同一序列里共享全部 48 层——不存在贯穿深度的独立视觉分支。下面的「视觉编码器」与「多模态融合」两个视图给出完整路径。</p>
 
-  <h3 data-page-node-id="wuofQVkcH95Gs7UAAVIcc3">4.1 从像素到 patch：一次 3D 卷积</h3>
-  <p data-page-node-id="J3JU56UE6SkoH3tnmgtqEs"><code data-page-node-id="qQY9tRKqE3UK0xVPCT1ZnD">patch_embed</code> 是一个 <code data-page-node-id="homSh9EY9ePzFnTRkcpkEt">Conv3d</code>，kernel 与 stride 都等于 $(\text{temporal\_patch\_size}, \text{patch\_size}, \text{patch\_size}) = (2, 16, 16)$。因为二者相等，每个时空 patch 被独立映射、互不重叠，等价于对展平后的 $3\times2\times16\times16 = 1536$ 维向量做一次 $1536 \to 1152$ 的线性变换。真实权重 <code data-page-node-id="Yzh3F6iV3Jrkam7pH3ajwa">patch_embed.proj.weight</code> 形状 $[1152, 3, 2, 16, 16]$，元素数 1,769,472 恰等于 $1152 \times 1536$。静态图像沿时间维复制到 2 帧以匹配 <code data-page-node-id="MCgnyTKTeMOxJ4sfxp6OEc">temporal_patch_size</code>；视频则每 2 帧合成一个时间 patch。</p>
+  <h3>4.1 从像素到 patch：一次 3D 卷积</h3>
+  <p><code>patch_embed</code> 是一个 <code>Conv3d</code>，kernel 与 stride 都等于 $(\text{temporal\_patch\_size}, \text{patch\_size}, \text{patch\_size}) = (2, 16, 16)$。因为二者相等，每个时空 patch 被独立映射、互不重叠，等价于对展平后的 $3\times2\times16\times16 = 1536$ 维向量做一次 $1536 \to 1152$ 的线性变换。真实权重 <code>patch_embed.proj.weight</code> 形状 $[1152, 3, 2, 16, 16]$，元素数 1,769,472 恰等于 $1152 \times 1536$。静态图像沿时间维复制到 2 帧以匹配 <code>temporal_patch_size</code>；视频则每 2 帧合成一个时间 patch。</p>
 
-  <h3 data-page-node-id="7LkbFJ3rmUrYzmajTbVONI">4.2 位置信息：可学习方格重采样 + 二维 RoPE</h3>
-  <p data-page-node-id="ViUABuhXh5B9Zkf4fFuWD1">视觉侧同时用了两套位置信息，职责不同。</p>
-  <ul data-page-node-id="Mdnpw7TzsqGVuYIt11zlLM">
-    <li data-page-node-id="ClkpBExC3dIWVC1Io3vcZN"><b data-page-node-id="EmL1CdTTJU3uy9YAxHdd7M">可学习位置嵌入</b>：<code data-page-node-id="1UUGt8r4sJ1nWym7kn5ONB">num_position_embeddings=2304</code> 即一张 $48\times48$ 的方格，每格一个 1152 维向量。对每张图按其实际网格 $(\text{grid\_h}, \text{grid\_w})$ 做双线性重采样（<code data-page-node-id="xWWN6mRVJbINeHbkw5w7dZ">align_corners=True</code>），再与 patch 特征逐元素相加。本机实测 $48\times48 \to 8\times12$ 的重采样输出形状为 $(96, 1152)$，与 patch 数一致。这个设计的意义是位置信息跟随图像真实长宽比，不需要把输入 resize 成固定尺寸。</li>
-    <li data-page-node-id="MEztMDPBUMaKoFbF6trK4E"><b data-page-node-id="k4rjTy5sB460appPTqgkdF">二维 RoPE</b>：<code data-page-node-id="hNRVOG1LEKl5iQQTu7vYPW">Qwen4ExpVisionRotaryEmbedding</code> 的维度参数是 $\text{head\_dim}/2 = 72/2 = 36$，频率数 18。每个 patch 带一对 $(h, w)$ 坐标，外积展平后得 $2 \times 18 = 36$ 维，再与自身拼接成 72 维，恰好覆盖完整头维。本机实测旋转严格保范数（331.130646 到 331.130829）。这与语言塔的 <code data-page-node-id="BFKl9mkYopOylFBwWmgAlh">partial_rotary_factor=0.25</code> 只旋转 1/4 头维形成对照：视觉侧转满，语言侧留 3/4 不转。</li>
+  <h3>4.2 位置信息：可学习方格重采样 + 二维 RoPE</h3>
+  <p>视觉侧同时用了两套位置信息，职责不同。</p>
+  <ul>
+    <li><b>可学习位置嵌入</b>：<code>num_position_embeddings=2304</code> 即一张 $48\times48$ 的方格，每格一个 1152 维向量。对每张图按其实际网格 $(\text{grid\_h}, \text{grid\_w})$ 做双线性重采样（<code>align_corners=True</code>），再与 patch 特征逐元素相加。本机实测 $48\times48 \to 8\times12$ 的重采样输出形状为 $(96, 1152)$，与 patch 数一致。这个设计的意义是位置信息跟随图像真实长宽比，不需要把输入 resize 成固定尺寸。</li>
+    <li><b>二维 RoPE</b>：<code>Qwen4ExpVisionRotaryEmbedding</code> 的维度参数是 $\text{head\_dim}/2 = 72/2 = 36$，频率数 18。每个 patch 带一对 $(h, w)$ 坐标，外积展平后得 $2 \times 18 = 36$ 维，再与自身拼接成 72 维，恰好覆盖完整头维。本机实测旋转严格保范数（331.130646 到 331.130829）。这与语言塔的 <code>partial_rotary_factor=0.25</code> 只旋转 1/4 头维形成对照：视觉侧转满，语言侧留 3/4 不转。</li>
   </ul>
 
-  <h3 data-page-node-id="jBzVLxuFrliNdbMWj2rtVk">4.3 27 层 block：与语言塔的四处差别</h3>
-  <p data-page-node-id="3uZYh3umfqJHXikFa2Dss2">视觉 block 是标准 pre-norm 结构：$x \leftarrow x + \mathrm{Attn}(\mathrm{LN}(x))$，$x \leftarrow x + \mathrm{MLP}(\mathrm{LN}(x))$。相对语言主干有四处明显不同，都可由真实权重直接印证。</p>
-  <table data-page-node-id="fKDtA3V3CUCN3GpKktJB09">
-    <tr data-page-node-id="jdSePaJqoagiGxZWnzHt3H"><th data-page-node-id="7KVyuYyaj0FvHAx18jMV0B">项目</th><th data-page-node-id="PBgNNeH0r7rHALQPcJgEKf">视觉塔</th><th data-page-node-id="1mkWNn0zvJoRwykC2DsZsC">语言主干</th></tr>
-    <tr data-page-node-id="mKdbCsnFCDFgXvubP8JwCi"><td data-page-node-id="YsqF49OP9OVXFGKJxibb3w">归一化</td><td data-page-node-id="ooim7N6ghbwFXGhz6vm1NN">LayerNorm，带 bias，$\epsilon=10^{-6}$</td><td data-page-node-id="lH9FK0H5gZcVLI8eg56Na3">RMSNorm，无 bias，权重形式 $(1+w)$</td></tr>
-    <tr data-page-node-id="Zv7e0BvCI7oI6dzFD7ncJS"><td data-page-node-id="zqiH9LlYKPUvU5OKtVqUSq">线性层 bias</td><td data-page-node-id="H7KZPaVDdDXEbEMZV9h7B4">有（<code data-page-node-id="UlCyT6sFpe6mjCgiauIuJj">qkv.bias</code> $[3456]$、<code data-page-node-id="mnHw5YUapCMEc7tC40Drwx">linear_fc1.bias</code> $[4304]$ 等）</td><td data-page-node-id="3xwCLerAtQsoeLe8eG8R58">无（<code data-page-node-id="O9lFAFVce9QvpzxSlKV139">attention_bias=false</code>）</td></tr>
-    <tr data-page-node-id="rNc9g9t3f602T9pHLE2cDh"><td data-page-node-id="ycyCGBUC41s8GIeacEIhVI">注意力方向</td><td data-page-node-id="9NHUUl14xLpMirHIenAA9n">双向，<code data-page-node-id="0juNExH9GMsp5oaqsZcCoB">is_causal=False</code></td><td data-page-node-id="61bgse4ke7EVJt2iFPNZwE">因果，且 12 层带块选择</td></tr>
-    <tr data-page-node-id="6gBnOn8RJAAclVr6o6HNKB"><td data-page-node-id="2BAvVfD5Dk7nzMhN6ASFix">FFN</td><td data-page-node-id="EyGBB81N3lmvHKzBm5p3Ya">稠密 MLP，GELU（<code data-page-node-id="lAxZE1wAHO0CVTj3wkZbar">gelu_pytorch_tanh</code>）</td><td data-page-node-id="IkgC0L1abJQzueNlDPqVMc">512 专家 MoE，SwiGLU</td></tr>
+  <h3>4.3 27 层 block：与语言塔的四处差别</h3>
+  <p>视觉 block 是标准 pre-norm 结构：$x \leftarrow x + \mathrm{Attn}(\mathrm{LN}(x))$，$x \leftarrow x + \mathrm{MLP}(\mathrm{LN}(x))$。相对语言主干有四处明显不同，都可由真实权重直接印证。</p>
+  <table>
+    <tr><th>项目</th><th>视觉塔</th><th>语言主干</th></tr>
+    <tr><td>归一化</td><td>LayerNorm，带 bias，$\epsilon=10^{-6}$</td><td>RMSNorm，无 bias，权重形式 $(1+w)$</td></tr>
+    <tr><td>线性层 bias</td><td>有（<code>qkv.bias</code> $[3456]$、<code>linear_fc1.bias</code> $[4304]$ 等）</td><td>无（<code>attention_bias=false</code>）</td></tr>
+    <tr><td>注意力方向</td><td>双向，<code>is_causal=False</code></td><td>因果，且 12 层带块选择</td></tr>
+    <tr><td>FFN</td><td>稠密 MLP，GELU（<code>gelu_pytorch_tanh</code>）</td><td>512 专家 MoE，<a href="../swiglu/">SwiGLU</a></td></tr>
   </table>
-  <p data-page-node-id="FEi1sxNL2WngcDF1vkLeMh">注意力用 <code data-page-node-id="PHLQl9HOqxTDShvlQlCsYt">qkv</code> 合并投影（$1152 \to 3456$），16 头各 72 维，无 GQA。多图输入时用 <code data-page-node-id="6UEkt6vRahZ8whxdgS2M2N">cu_seqlens</code> 做变长打包，跨图像之间不互相注意。逐层形状不变，本机实测输入输出均为 $(96, 1152)$。</p>
+  <p>注意力用 <code>qkv</code> 合并投影（$1152 \to 3456$），16 头各 72 维，无 <a href="../mqa-gqa/">GQA</a>。多图输入时用 <code>cu_seqlens</code> 做变长打包，跨图像之间不互相注意。逐层形状不变，本机实测输入输出均为 $(96, 1152)$。</p>
 
-  <h3 data-page-node-id="tXorlXn0yJKeUFqBG0zWQF">4.4 merger：2×2 空间合并并对齐语言主干宽度</h3>
-  <p data-page-node-id="MuzFpmyzapHtdWziH9o56a"><code data-page-node-id="kxZBEbGMRu39XbbKCRnxJr">PatchMerger</code> 把空间上 $2\times2$ 相邻的 4 个 patch 拼成 $1152\times4 = 4608$ 维，经 $4608 \to 4608 \to 2560$ 两层投影输出。因为 <code data-page-node-id="x4lhFad2WV2JlyrDEHyXqc">use_postshuffle_norm=False</code>，LayerNorm 作用在<b data-page-node-id="TaFHyhQ8td92gllNtKZe7l">合并前</b>的 1152 维上，之后才 reshape 成 4608。输出宽度 2560 与语言主干 <code data-page-node-id="uYALETxNYhJWyV0b6bUwlD">hidden_size</code> 相等，这是两侧能直接拼接的前提。</p>
-  <p data-page-node-id="KhZExwLYLEveYlGBQnZ89D">视觉 token 数由 $\text{n\_tokens} = \prod(\text{grid\_thw}) / \text{spatial\_merge\_size}^2$ 给出。按官方 config 实算：</p>
-  <table data-page-node-id="fbf4VL0KCUUNyKsH68TfEN">
-    <tr data-page-node-id="Dfei94xJjfTlkZOTXxExJu"><th data-page-node-id="2cwzNX5hLuWCX6WFGh8IPf">输入</th><th data-page-node-id="y7r0VEQRfWikZNTlZjLNf6">grid (t,h,w)</th><th data-page-node-id="GgvUHYHNyBWOyvBTWKVOpK">patch 数</th><th data-page-node-id="paUxggFnBzakBobzMq05id">视觉 token</th><th data-page-node-id="K3tBgri5j3L1AUOsHgUxr3">占 262144 上下文</th></tr>
-    <tr data-page-node-id="FE43VnsriAdYD4SHmxqErU"><td data-page-node-id="ubWMi5mWNAErgId0tQwUwH">448×448 图</td><td data-page-node-id="i37OD75dDf5m8z1rSYJ4eq">(1,28,28)</td><td data-page-node-id="bjEL1IbfPcI3rVvuC882vK">784</td><td data-page-node-id="uaudxYnxDQssk4S3UR6xN9">196</td><td data-page-node-id="YDinH4UCEQ6B9B2UDaU8su">0.075%</td></tr>
-    <tr data-page-node-id="LJpFvhqQ0ZordPez9p5m8E"><td data-page-node-id="H5UQFkvLXtxuJdvtbGi5Ns">896×896 图</td><td data-page-node-id="WFUOH8Emoo6jto0BvXx09C">(1,56,56)</td><td data-page-node-id="pKdIJzS2H3uN3JhGgvSoMU">3,136</td><td data-page-node-id="eXsBA0rPZO5H8Iu0SSa84M">784</td><td data-page-node-id="G3l4FvU7NNVVYt125ekuKE">0.299%</td></tr>
-    <tr data-page-node-id="R5NG25ZxJEjByXHdg5ok76"><td data-page-node-id="W5gDrbVd8KUDwIrivDvR1z">1344×1344 图</td><td data-page-node-id="hKjayxWRTt86TZBuDjKHEg">(1,84,84)</td><td data-page-node-id="XIMK8kDgQFNxE9U18hroZF">7,056</td><td data-page-node-id="CHXWl6HzcXg1wNrQMIQsdh">1,764</td><td data-page-node-id="YbdSuClfABIP9RQwETIyAk">0.673%</td></tr>
-    <tr data-page-node-id="mWPGQtKy8T5cWwhcIyz4us"><td data-page-node-id="DMXcjuoCOWv0rfeoydjmrc">1920×1080 图</td><td data-page-node-id="udcSqoV0zdnKMcWD1fzjeC">(1,66,120)</td><td data-page-node-id="2bMxKF07c4GAEKfM1YHmgS">7,920</td><td data-page-node-id="1awIKfBLBzlNgwAdHl03w6">1,980</td><td data-page-node-id="BWUjNGFOjfDq3iVY1RRL4P">0.755%</td></tr>
-    <tr data-page-node-id="Q2NIWqf3o4FL2DJx6Rv5HT"><td data-page-node-id="0bHxfCnrmDHJa77li1OM8U">16 帧 448×448 视频</td><td data-page-node-id="MiR0sZIGXIDCgk0DYRsveQ">(8,28,28)</td><td data-page-node-id="LBjfFOaOtn6QkHCSBFqVpG">6,272</td><td data-page-node-id="CRXwLxQ69ZcixbDnLreqff">1,568</td><td data-page-node-id="xcTNOk5ktxnulfrMLB9BHB">0.598%</td></tr>
+  <h3>4.4 merger：2×2 空间合并并对齐语言主干宽度</h3>
+  <p><code>PatchMerger</code> 把空间上 $2\times2$ 相邻的 4 个 patch 拼成 $1152\times4 = 4608$ 维，经 $4608 \to 4608 \to 2560$ 两层投影输出。因为 <code>use_postshuffle_norm=False</code>，LayerNorm 作用在<b>合并前</b>的 1152 维上，之后才 reshape 成 4608。输出宽度 2560 与语言主干 <code>hidden_size</code> 相等，这是两侧能直接拼接的前提。</p>
+  <p>视觉 token 数由 $\text{n\_tokens} = \prod(\text{grid\_thw}) / \text{spatial\_merge\_size}^2$ 给出。按官方 config 实算：</p>
+  <table>
+    <tr><th>输入</th><th>grid (t,h,w)</th><th>patch 数</th><th>视觉 token</th><th>占 262144 上下文</th></tr>
+    <tr><td>448×448 图</td><td>(1,28,28)</td><td>784</td><td>196</td><td>0.075%</td></tr>
+    <tr><td>896×896 图</td><td>(1,56,56)</td><td>3,136</td><td>784</td><td>0.299%</td></tr>
+    <tr><td>1344×1344 图</td><td>(1,84,84)</td><td>7,056</td><td>1,764</td><td>0.673%</td></tr>
+    <tr><td>1920×1080 图</td><td>(1,66,120)</td><td>7,920</td><td>1,980</td><td>0.755%</td></tr>
+    <tr><td>16 帧 448×448 视频</td><td>(8,28,28)</td><td>6,272</td><td>1,568</td><td>0.598%</td></tr>
   </table>
 
-  <h3 data-page-node-id="ejnZn0t7DolcULZqdziVzv">4.5 融合：替换占位符而非拼接</h3>
-  <p data-page-node-id="Noz9287IMdMJ6UITkfeNXc">融合用 <code data-page-node-id="Ps41mUNfHOUgiJQSK4botd">inputs_embeds.masked_scatter(image_mask, image_embeds)</code>，即把序列中 <code data-page-node-id="MHCGblC2tbR1gkIpX3hzGn">image_token_id=248056</code>（视频为 <code data-page-node-id="nCgmMeYg2frQcJw0DNPkR9">248057</code>）的占位符位置<b data-page-node-id="qix9TQ47M7TFE3FybhXtOl">原地替换</b>成视觉特征，序列长度不变。因此视觉 token 数必须与占位符数严格相等，这个对应关系由 processor 在构造 prompt 时保证。本机构造 4 个占位符的小例子实测：替换后占位符位置为视觉特征、其余位置保持原文本 embedding，序列形状不变。</p>
-  <p data-page-node-id="P5wD1gJUvgxnmNkassPMLf">另有 <code data-page-node-id="VslmFT9198DcEMj1Da35Bz">vision_start_token_id=248053</code> 与 <code data-page-node-id="CUU3F9ymcfbHvXhDzbweKq">vision_end_token_id=248054</code> 作为视觉块的边界标记，它们是普通文本 token，不被替换。</p>
+  <h3>4.5 融合：替换占位符而非拼接</h3>
+  <p>融合用 <code>inputs_embeds.masked_scatter(image_mask, image_embeds)</code>，即把序列中 <code>image_token_id=248056</code>（视频为 <code>248057</code>）的占位符位置<b>原地替换</b>成视觉特征，序列长度不变。因此视觉 token 数必须与占位符数严格相等，这个对应关系由 processor 在构造 prompt 时保证。本机构造 4 个占位符的小例子实测：替换后占位符位置为视觉特征、其余位置保持原文本 embedding，序列形状不变。</p>
+  <p>另有 <code>vision_start_token_id=248053</code> 与 <code>vision_end_token_id=248054</code> 作为视觉块的边界标记，它们是普通文本 token，不被替换。</p>
 
-  <h3 data-page-node-id="LQ73bYptCo7RjBjZJg2MVP">4.6 视觉 token 在语言侧只推进少量位置</h3>
-  <p data-page-node-id="ha5NJ1VUvBeUm5SYBeDtId">这是容易被忽略的一点。语言塔用三维 MRoPE，文本段的三个维度取同一个 <code data-page-node-id="WIhPWBK2YKwX4p1c8AweoZ">arange</code>；视觉段则由 <code data-page-node-id="SKOfEbuBaeF823HCg4rDNT">get_vision_position_ids</code> 生成 $(T, H, W)$ 三元组，$H$ 与 $W$ 各自在 $[\text{start}, \text{start}+\text{llm\_grid}-1]$ 内遍历。关键在于图像块结束后位置只推进 $\max(h, w) / \text{spatial\_merge\_size}$，而<b data-page-node-id="6a0GPjHs3pkcjlL5DrCFgy">不是</b>推进视觉 token 数。</p>
-  <table data-page-node-id="V61ra9kXE0QRgD4Idgl3ft">
-    <tr data-page-node-id="tm6IAeMXXp6Xbdw8vbPMXc"><th data-page-node-id="eTzIgMwQf3Srs3jW8PUZzI">图像 grid</th><th data-page-node-id="KAmojLJPC9Ka5XUzfDiDi8">视觉 token 数</th><th data-page-node-id="FH3qFTHuhBplCahMnFGC2f">位置轴推进量</th><th data-page-node-id="RNp4c6Wj5WkFs547CJQWb5">比值</th></tr>
-    <tr data-page-node-id="37OeGSUEmLlyv2l5Y8FT60"><td data-page-node-id="4MjutNJBDzBCE6lF3x5oco">(1,28,28)</td><td data-page-node-id="RoejUSU1vNpQvAoFYyLYdm">196</td><td data-page-node-id="CP4MGemJvxhMyXokt91bqG">14</td><td data-page-node-id="FlHBybdpbAJueILGFArfOQ">14.0×</td></tr>
-    <tr data-page-node-id="RYV6rQ2ForjJEyUVsf8LTI"><td data-page-node-id="2pkYYiYtW1GAP0VCSGlc31">(1,56,56)</td><td data-page-node-id="W67ZH44Plj6QvLl3Wdb8l2">784</td><td data-page-node-id="mkOLh8ltnCAUAiajUzDYWO">28</td><td data-page-node-id="nKHf3yP2gd8OFh9c33EaXM">28.0×</td></tr>
-    <tr data-page-node-id="QMPulMUR2vWKn3gGV2KFXa"><td data-page-node-id="7QFqKffDz0DyqlhD5dJOtp">(1,84,84)</td><td data-page-node-id="Ef6u6EEG0pf8OEUB2lZNaX">1,764</td><td data-page-node-id="mnXBzV4zDd89hnJOOZ3NDo">42</td><td data-page-node-id="80lVvWeBequcvOAoDDwCKD">42.0×</td></tr>
-    <tr data-page-node-id="YydVGtYhyu32KH6T9EK6JK"><td data-page-node-id="m7e2WZhr7Ra5JCPeEcyQ1u">(1,66,120)</td><td data-page-node-id="wAotlra7AmjAkzK9NvXuRC">1,980</td><td data-page-node-id="KIdIQs7XUAfNjFbHvIJ3Fi">60</td><td data-page-node-id="GGHlx4c3MlEsASsMv5BVuU">33.0×</td></tr>
+  <h3>4.6 视觉 token 在语言侧只推进少量位置</h3>
+  <p>这是容易被忽略的一点。语言塔用三维 MRoPE，文本段的三个维度取同一个 <code>arange</code>；视觉段则由 <code>get_vision_position_ids</code> 生成 $(T, H, W)$ 三元组，$H$ 与 $W$ 各自在 $[\text{start}, \text{start}+\text{llm\_grid}-1]$ 内遍历。关键在于图像块结束后位置只推进 $\max(h, w) / \text{spatial\_merge\_size}$，而<b>不是</b>推进视觉 token 数。</p>
+  <table>
+    <tr><th>图像 grid</th><th>视觉 token 数</th><th>位置轴推进量</th><th>比值</th></tr>
+    <tr><td>(1,28,28)</td><td>196</td><td>14</td><td>14.0×</td></tr>
+    <tr><td>(1,56,56)</td><td>784</td><td>28</td><td>28.0×</td></tr>
+    <tr><td>(1,84,84)</td><td>1,764</td><td>42</td><td>42.0×</td></tr>
+    <tr><td>(1,66,120)</td><td>1,980</td><td>60</td><td>33.0×</td></tr>
   </table>
-  <p data-page-node-id="WGE2zeq4isR62AjbFfmFgP">本机实测一个 $(1,28,28)$ 的图接在 8 个文本 token 之后：196 个视觉 token 的 $T$ 维恒为 8，$H$ 与 $W$ 在 $[8, 21]$ 内遍历，后续文本从位置 22 开始而非 204。含义是一张大图会消耗序列长度（即上下文预算），但在位置编码轴上前进很少，因此 <code data-page-node-id="E7vYtpvb9gJDWmybm7Cjqx">max_position_embeddings=262144</code> 约束的是位置轴上限而非 token 数上限。</p>
+  <p>本机实测一个 $(1,28,28)$ 的图接在 8 个文本 token 之后：196 个视觉 token 的 $T$ 维恒为 8，$H$ 与 $W$ 在 $[8, 21]$ 内遍历，后续文本从位置 22 开始而非 204。含义是一张大图会消耗序列长度（即上下文预算），但在位置编码轴上前进很少，因此 <code>max_position_embeddings=262144</code> 约束的是位置轴上限而非 token 数上限。</p>
 
-  <h3 data-page-node-id="nAMRnDER70ScnSt9QTLlkT">4.7 语言塔 MRoPE 的交错排布</h3>
-  <p data-page-node-id="YmJktIvi4tUISumlnRt1jt">语言塔只有 64 维参与旋转（$256 \times 0.25$），对应 32 个频率槽位，需要被 $T/H/W$ 三个维度分摊。<code data-page-node-id="YpkHTNoiy8or7vSjFM7A0S">mrope_section=[11,11,10]</code> 之和恰为 32。<code data-page-node-id="UqeYXfFYrvlyp4DyoxUKm0">mrope_interleaved=true</code> 时的分配方式是：以 $T$ 维为底，再把 $H$ 覆盖到 <code data-page-node-id="ACoEtHJI7sdxenFufVeWFF">slice(1, 33, 3)</code>、$W$ 覆盖到 <code data-page-node-id="CHDYraGTI26OhSOjnD5JA2">slice(2, 30, 3)</code>。本机实测得到的槽位归属为：</p>
-  <pre data-page-node-id="YaxUTfYtHxF7mG3XetA08A">槽位  0..15 : T H W T H W T H W T H W T H W T
+  <h3>4.7 语言塔 MRoPE 的交错排布</h3>
+  <p>语言塔只有 64 维参与旋转（$256 \times 0.25$），对应 32 个频率槽位，需要被 $T/H/W$ 三个维度分摊。<code>mrope_section=[11,11,10]</code> 之和恰为 32。<code>mrope_interleaved=true</code> 时的分配方式是：以 $T$ 维为底，再把 $H$ 覆盖到 <code>slice(1, 33, 3)</code>、$W$ 覆盖到 <code>slice(2, 30, 3)</code>。本机实测得到的槽位归属为：</p>
+  <pre>槽位  0..15 : T H W T H W T H W T H W T H W T
 槽位 16..31 : H W T H W T H W T H W T H W T H</pre>
-  <p data-page-node-id="3H2XxFeVEJNNprOA5MGifo">各维占用 $T=11$、$H=11$、$W=10$，与 <code data-page-node-id="wKtdqrr9k1zFrst49DJmKb">mrope_section</code> 逐项对应。三个维度在全部 32 个槽位上交错分布而非各占一段，这样每个维度都覆盖从低频到高频的完整范围（低频对应长程距离、高频对应近距离）。$W$ 比 $T$ 和 $H$ 少一个槽位，是因为 32 不能被 3 整除。这与 chunked 排布 $[TT\ldots HH\ldots WW\ldots]$ 的差别正是源码 <code data-page-node-id="ewcIjpaIpSEEZ3S96YGMU2">apply_interleaved_mrope</code> 文档字符串所描述的。</p>
+  <p>各维占用 $T=11$、$H=11$、$W=10$，与 <code>mrope_section</code> 逐项对应。三个维度在全部 32 个槽位上交错分布而非各占一段，这样每个维度都覆盖从低频到高频的完整范围（低频对应长程距离、高频对应近距离）。$W$ 比 $T$ 和 $H$ 少一个槽位，是因为 32 不能被 3 整除。这与 chunked 排布 $[TT\ldots HH\ldots WW\ldots]$ 的差别正是源码 <code>apply_interleaved_mrope</code> 文档字符串所描述的。</p>
 
-  <h3 data-page-node-id="0BbnoIIDDGpKREbTCySciv">4.8 视觉编码器参数量分组</h3>
-  <table data-page-node-id="vPracnS7O1b4B58lWYtCbv">
-    <tr data-page-node-id="jmEt0JJHaix2CWj8VRmazj"><th data-page-node-id="iGrIKklD4RGX7oTnTDbZQT">分组</th><th data-page-node-id="7aHn73oQwlfXyCOXm6Y81G">参数量</th><th data-page-node-id="i0vA08GcfAiEy9tyIUnQmS">占视觉塔</th></tr>
-    <tr data-page-node-id="e4cBAJPGPvWjwQU2AJ4Y3S"><td data-page-node-id="LyKSdXbJFLZZzxQUpo6C3L">27 层 MLP</td><td data-page-node-id="idL1dmPVbaCZLc8zm2G1lT">267,890,544</td><td data-page-node-id="8TeB6Uv4v2tDpOSYnWeZId">59.67%</td></tr>
-    <tr data-page-node-id="ERscF4BUqVLFRPU6gURGnA"><td data-page-node-id="sdaieO0hKUYSTIuTYwYOd6">27 层 attention</td><td data-page-node-id="c6SD96jLZXQmvOcBG8MkyF">143,451,648</td><td data-page-node-id="bV7btylXG4WhFwTPgFYdzc">31.95%</td></tr>
-    <tr data-page-node-id="mqSBuFwbWPgjgIxz1qsb65"><td data-page-node-id="StjxTyPCAUByCctc9PFReD">merger</td><td data-page-node-id="1kdZ8ZB1vxJPm2lYZYM7VD">33,039,616</td><td data-page-node-id="wFpuW6KK9axjzPyVAdUpIB">7.36%</td></tr>
-    <tr data-page-node-id="zYk96khEwWozU9E38cZfFH"><td data-page-node-id="IckXuI4hbFFNWVSHhAa8jn">pos_embed（48×48 表）</td><td data-page-node-id="gYarEJG1HgrMqHPSGZMjqn">2,654,208</td><td data-page-node-id="4UeMYKgZ68HegcE5jHD7cS">0.59%</td></tr>
-    <tr data-page-node-id="XqjG9aoOotkLD7FmfBafMY"><td data-page-node-id="ZDY66OrJzN4c1FFIJRBs5g">patch_embed（Conv3d）</td><td data-page-node-id="vxHjf26dLdZQBvMHxmbLxw">1,770,624</td><td data-page-node-id="q55cGDqZEwfQSXXrrTHaYq">0.39%</td></tr>
-    <tr data-page-node-id="75UpJIJKJtdlMyg9uLbxfJ"><td data-page-node-id="oHqAJ3rUa80A4ANrXOkVYs">27 层 LayerNorm</td><td data-page-node-id="pApROP8a1OzjSWWpARBTN6">124,416</td><td data-page-node-id="P3ce9qiUEabZED3OrPHH83">0.03%</td></tr>
-    <tr data-page-node-id="6oAUjodj1n2biKiJKB1F4y"><td data-page-node-id="9mmB3K3Ko5Yff1fdLvOVkh"><b data-page-node-id="m7o5zrasyAyzyePJ89avHy">合计</b></td><td data-page-node-id="luvhuR4ISA7A143CQ3eYbD"><b data-page-node-id="Bi2GcDBQ8N5sofZd3o6Bhm">448,931,056</b></td><td data-page-node-id="aoVL8Jrw1oF9WBbYsdtHXt">100.00%</td></tr>
+  <h3>4.8 视觉编码器参数量分组</h3>
+  <table>
+    <tr><th>分组</th><th>参数量</th><th>占视觉塔</th></tr>
+    <tr><td>27 层 MLP</td><td>267,890,544</td><td>59.67%</td></tr>
+    <tr><td>27 层 attention</td><td>143,451,648</td><td>31.95%</td></tr>
+    <tr><td>merger</td><td>33,039,616</td><td>7.36%</td></tr>
+    <tr><td>pos_embed（48×48 表）</td><td>2,654,208</td><td>0.59%</td></tr>
+    <tr><td>patch_embed（Conv3d）</td><td>1,770,624</td><td>0.39%</td></tr>
+    <tr><td>27 层 LayerNorm</td><td>124,416</td><td>0.03%</td></tr>
+    <tr><td><b>合计</b></td><td><b>448,931,056</b></td><td>100.00%</td></tr>
   </table>
-  <p data-page-node-id="H8Pu2iB3pHKJOjsE2vPxM6">MLP 占近六成源于 <code data-page-node-id="yMbmEVCif732CSzGEFNect">intermediate_size=4304</code> 是 <code data-page-node-id="Gti9S70biU0gRCLChlwkGD">hidden_size</code> 的 3.74 倍。27 层的理论参数量 411,466,608 与真实权重累加结果精确相等；merger 的 33,039,616 亦精确对上。</p>
+  <p>MLP 占近六成源于 <code>intermediate_size=4304</code> 是 <code>hidden_size</code> 的 3.74 倍。27 层的理论参数量 411,466,608 与真实权重累加结果精确相等；merger 的 33,039,616 亦精确对上。</p>
 
-  <h2 id="verify" data-page-node-id="NUdzTN9YqhMN3gfHuzRDPU">5. 核对方式</h2>
-  <p data-page-node-id="h4brPTNKKAVh3xGaPQNDiP">本页的数字分三类来源，各自的取得方式如下。</p>
-  <p data-page-node-id="QQgy25KtsqJjMotxUtt74W"><b data-page-node-id="1j9eRcE0TjVEPO9ESsGkcF">结构与维度</b>：用 HTTP Range 请求读取全部 131 个 safetensors 分片的 JSON 文件头（合计 228,712 字节，未下载权重本体），得到 1658 个张量的名称、形状与 dtype。以此交叉验证源码推导：config 声明的层型分布、索引器所在层、N-gram 分片数、超连接模块构成、视觉塔各模块形状均与张量清单逐项吻合。另有 32 项从 config 推导到张量形状的断言全部通过，覆盖 GDN 的 <code data-page-node-id="p5L4FFtz6cx393YrqQiL1Y">conv_dim</code> 组成、QSA 的两倍宽 <code data-page-node-id="gWm5LqleyqqwsI5NpFC6Sv">q_proj</code>、索引器投影宽度、超连接低秩维度、N-gram 每头维度等；视觉侧另有 14 项独立断言。</p>
-  <p data-page-node-id="AIRLQt6Miu4n2LDezyPwd8"><b data-page-node-id="SSpEODeVBneCnWJtHCH5cd">公式与数值行为</b>：按官方 <code data-page-node-id="KyB0RZFuX1q04W15gnrit4">modeling_qwen4_exp.py</code> 逐行语义复现各算子，用官方 config 的真实头数与头维在随机张量上实跑。这类验证不需要真实权重——待验证的是计算规则本身，而非某组特定参数下的输出。已完成的对照包括：GDN 分块与递归两条路径的等价性、delta rule 状态更新的小规模手算复核（2 token 正交键，手算末态与实跑差 $3.34\times10^{-6}$）、索引器块选择的逐位置可见数、ReLU 求和与直接求和的选择差异、池化的信息损失、部分 RoPE 的作用范围与保范性、超连接门控取值范围、N-gram 质数表尺寸与碰撞率、路由归一化行为、视觉侧的 patch 投影等价性与位置重采样、视觉 RoPE 的维度构成与保范性、MRoPE 交错槽位归属、视觉 token 计数与位置推进量、<code data-page-node-id="sFzgdiMPhZUg3KNJul3wqR">masked_scatter</code> 融合行为。</p>
-  <p data-page-node-id="pxCQ2g6b0QHMbDrW2HX95H"><b data-page-node-id="jESTHOYzOI1hUfvQfiqJfn">checkpoint 中的缓冲数值</b>：N-gram 的三个 I64 缓冲（<code data-page-node-id="AjduVyPxSorkFEFjKwFKKI">layer_multipliers</code>、<code data-page-node-id="JH26GpF6KdefOGg43AnSec">ngram_heads_vocab_sizes</code>、<code data-page-node-id="opLl01pmFFQoLp9hUs4wMe">ngram_heads_offsets</code>，共 35 个 int64）按 <code data-page-node-id="UP2ioj1v9CbhYKpCsdW013">data_offsets</code> 用 Range 请求精确下载了 280 字节，与源码派生结果逐元素比对，全部一致。这同时确认了 config 未显式给出的 <code data-page-node-id="BdXB9A3hPXjBDnqZlxSlTs">seed=1234</code>。</p>
-  <p data-page-node-id="zlpfOXEKuvB21OjdkjGB2V"><b data-page-node-id="tDMJ3JSeII5ebhIW17o24O">端到端数据流</b>：构造一个保留全部结构特征的等比缩小模型（8 层，层型为 GDN、GDN、GDN、QSA 重复两轮，第 1 层带 N-gram 注入，隐藏维 64，4 条残差流，8 专家 top-2 加共享专家），跑通整段 prefill 与逐 token decode。逐层形状记录确认残差流全程 256 宽（即 $4\times64$）、子层内部 64 宽、GDN 缓存为常数形状而 QSA 的 KV 随长度增长。两种模式的 logits 最大绝对差为 $5.36\times10^{-7}$。</p>
-  <div class="note" data-page-node-id="ELt33aBRZO4F6DRwIOXVHb">两处值得记录的排查过程。其一，缩小模型最初实现时 prefill 与 decode 相差 $4.38\times10^{-1}$；逐项排除后定位到 GDN 前置深度卷积在 decode 时未保留跨步状态，单独写对照脚本确认「每步独立卷积」误差 $8.45\times10^{-1}$、「维护 kernel-1 滑窗」误差 $1.49\times10^{-8}$，修正后复验通过，这也纠正了缓存体积的初次估算（卷积状态需 $\text{kernel}-1=3$ 个位置而非 4 个）。其二，N-gram 乘子的派生公式最初按常见写法推测为 <code data-page-node-id="CHshnde4J7pOPSEbbJSKmW">splitmix64(seed + 10007*layer + pos) % vocab_size</code>，与 checkpoint 真实值（23703573157769）差了几个数量级；回读源码 <code data-page-node-id="Z59UnQ2SSjp9dwrWN0Mn37">_build_layer_multipliers</code> 才发现三处都不同：splitmix64 的输入是 $s_0 + \gamma(j{+}1)$ 而非 $s_0 + j$、模数是 $\lfloor\lfloor(2^{63}-1)/V\rfloor/2\rfloor$ 而非 $V$、且结果被强制为奇数。这说明凡涉及具体数值的公式都必须与 checkpoint 实值对撞，仅凭源码阅读印象容易出错。</div>
-  <p data-page-node-id="UFlcEdnsetIm3hxZZfBeE0">实测脚本与一次性跑完全部脚本的原始输出（1058 行）存于 <code data-page-node-id="7LeuEAbl7sNmD8kWXrAKJG">research/</code> 目录：<code data-page-node-id="gofkBYdoXODHfZQWaB8pvt">read_headers.py</code> 读张量头，<code data-page-node-id="xeKktJZa3bcu5VouW8IsZe">verify_structure.py</code> 做结构交叉验证，<code data-page-node-id="2MjSzHC4p7R14P4g9xwWEL">count_params.py</code> 核算参数量，<code data-page-node-id="1cYkitPeZj2O4CtoGze4Bw">assert_dims.py</code> 做 config 到张量形状的断言，<code data-page-node-id="JWFTjs9gcZnaQsLFFFQesj">probe1</code>~<code data-page-node-id="BsEICFogoDhhBeleR6321U">probe6</code> 为各机制的数值验证，<code data-page-node-id="Dh6d4ngFotJGI3GWBpHzmE">probe7_ngram_buffers.py</code> 核对 checkpoint 缓冲真值，<code data-page-node-id="17oR9AUkWMVsMH4tGGu2EG">probe8_vision.py</code> 覆盖视觉塔与 MRoPE，<code data-page-node-id="v5mIxKYofMZoB7OmlVzmFF">render_check.py</code> 做页面渲染实测，<code data-page-node-id="KcngI2wgv9aNlENjFJ2t6w">measured-output.txt</code> 为原始输出。</p>
+  <h2 id="verify">5. 核对方式</h2>
+  <p>本页的数字分三类来源，各自的取得方式如下。</p>
+  <p><b>结构与维度</b>：用 HTTP Range 请求读取全部 131 个 safetensors 分片的 JSON 文件头（合计 228,712 字节，未下载权重本体），得到 1658 个张量的名称、形状与 dtype。以此交叉验证源码推导：config 声明的层型分布、索引器所在层、N-gram 分片数、超连接模块构成、视觉塔各模块形状均与张量清单逐项吻合。另有 32 项从 config 推导到张量形状的断言全部通过，覆盖 GDN 的 <code>conv_dim</code> 组成、QSA 的两倍宽 <code>q_proj</code>、索引器投影宽度、超连接低秩维度、N-gram 每头维度等；视觉侧另有 14 项独立断言。</p>
+  <p><b>公式与数值行为</b>：按官方 <code>modeling_qwen4_exp.py</code> 逐行语义复现各算子，用官方 config 的真实头数与头维在随机张量上实跑。这类验证不需要真实权重——待验证的是计算规则本身，而非某组特定参数下的输出。已完成的对照包括：GDN 分块与递归两条路径的等价性、delta rule 状态更新的小规模手算复核（2 token 正交键，手算末态与实跑差 $3.34\times10^{-6}$）、索引器块选择的逐位置可见数、ReLU 求和与直接求和的选择差异、池化的信息损失、部分 RoPE 的作用范围与保范性、超连接门控取值范围、N-gram 质数表尺寸与碰撞率、路由归一化行为、视觉侧的 patch 投影等价性与位置重采样、视觉 RoPE 的维度构成与保范性、MRoPE 交错槽位归属、视觉 token 计数与位置推进量、<code>masked_scatter</code> 融合行为。</p>
+  <p><b>checkpoint 中的缓冲数值</b>：N-gram 的三个 I64 缓冲（<code>layer_multipliers</code>、<code>ngram_heads_vocab_sizes</code>、<code>ngram_heads_offsets</code>，共 35 个 int64）按 <code>data_offsets</code> 用 Range 请求精确下载了 280 字节，与源码派生结果逐元素比对，全部一致。这同时确认了 config 未显式给出的 <code>seed=1234</code>。</p>
+  <p><b>端到端数据流</b>：构造一个保留全部结构特征的等比缩小模型（8 层，层型为 GDN、GDN、GDN、QSA 重复两轮，第 1 层带 N-gram 注入，隐藏维 64，4 条残差流，8 专家 top-2 加共享专家），跑通整段 prefill 与逐 token decode。逐层形状记录确认残差流全程 256 宽（即 $4\times64$）、子层内部 64 宽、GDN 缓存为常数形状而 QSA 的 KV 随长度增长。两种模式的 logits 最大绝对差为 $5.36\times10^{-7}$。</p>
+  <div class="note">两处值得记录的排查过程。其一，缩小模型最初实现时 prefill 与 decode 相差 $4.38\times10^{-1}$；逐项排除后定位到 GDN 前置深度卷积在 decode 时未保留跨步状态，单独写对照脚本确认「每步独立卷积」误差 $8.45\times10^{-1}$、「维护 kernel-1 滑窗」误差 $1.49\times10^{-8}$，修正后复验通过，这也纠正了缓存体积的初次估算（卷积状态需 $\text{kernel}-1=3$ 个位置而非 4 个）。其二，N-gram 乘子的派生公式最初按常见写法推测为 <code>splitmix64(seed + 10007*layer + pos) % vocab_size</code>，与 checkpoint 真实值（23703573157769）差了几个数量级；回读源码 <code>_build_layer_multipliers</code> 才发现三处都不同：splitmix64 的输入是 $s_0 + \gamma(j{+}1)$ 而非 $s_0 + j$、模数是 $\lfloor\lfloor(2^{63}-1)/V\rfloor/2\rfloor$ 而非 $V$、且结果被强制为奇数。这说明凡涉及具体数值的公式都必须与 checkpoint 实值对撞，仅凭源码阅读印象容易出错。</div>
+  <p>实测脚本与一次性跑完全部脚本的原始输出（1058 行）存于 <code>research/</code> 目录：<code>read_headers.py</code> 读张量头，<code>verify_structure.py</code> 做结构交叉验证，<code>count_params.py</code> 核算参数量，<code>assert_dims.py</code> 做 config 到张量形状的断言，<code>probe1</code>~<code>probe6</code> 为各机制的数值验证，<code>probe7_ngram_buffers.py</code> 核对 checkpoint 缓冲真值，<code>probe8_vision.py</code> 覆盖视觉塔与 MRoPE，<code>render_check.py</code> 做页面渲染实测，<code>measured-output.txt</code> 为原始输出。</p>
 
-  <h2 id="sources" data-page-node-id="YSgvTNvjXFRGbqjLNGzI8q">来源与范围说明</h2>
-  <table data-page-node-id="VZhDNXYHv8YkKAxcBc5kUg">
-    <tr data-page-node-id="iibktespCQBGwTkbn7yC7k"><th data-page-node-id="luFMzXG8lqioHOK1BnaATz">项目</th><th data-page-node-id="9C1Qc5RLIDHEqPtU2Ux5P3">依据</th></tr>
-    <tr data-page-node-id="F4Ww9YwjWHjXcn0ljpVCGe"><td data-page-node-id="FvnXPSqhP03KqAjnKCxymE">全部 config 数值</td><td data-page-node-id="jL8iVEAQtwRV37tHSx0rHG">官方 <code data-page-node-id="NYxezWwn5nRq2peQKlcgMD">config.json</code>：huggingface.co/Qwen/Qwen3.8-Flash-Next，commit <code data-page-node-id="tVcFvHP3kpFKppAfZICV44">f5d08274</code></td></tr>
-    <tr data-page-node-id="FlFc0iFjnZ7cVFp2ssnCdI"><td data-page-node-id="nQEDDHk9g7ykYsVVeSVDGo">数据流路径、各算子公式、缓存布局</td><td data-page-node-id="hetgurOOsWbJd6kBIv1rcf">官方实现 huggingface/transformers commit <code data-page-node-id="JLyvDpwH8xVW3rwCe5ZRbt">36deb0b5</code>，<code data-page-node-id="ED2z9xYH39yIcSyqKdpRAu">src/transformers/models/qwen4_exp/</code> 下 <code data-page-node-id="c7ESfhvsEdSnXPjn8A5g7n">configuration_qwen4_exp.py</code>、<code data-page-node-id="YQDBI5ncAu5h90abJOTPUR">modeling_qwen4_exp.py</code>、<code data-page-node-id="KFzjDGSb5WDJli6KCfI1Vi">modular_qwen4_exp.py</code></td></tr>
-    <tr data-page-node-id="PToK7tBT6FCl868IJLBI6s"><td data-page-node-id="RzZgu7xHHi2a6h0x7vTHHh">张量形状与 dtype、层型分布、参数量</td><td data-page-node-id="v0U6HWKL8MRImfufssVBv3">真实 checkpoint 的 safetensors 文件头（HTTP Range 读取，131 个分片、1658 个张量）</td></tr>
-    <tr data-page-node-id="fv3BkmcAHQmxn64ArrVqZK"><td data-page-node-id="XIqOpOpj11ghxwGZwrC6Nd">N-gram 哈希乘子、各头词表大小与偏移的具体数值</td><td data-page-node-id="LqFpXTr1JuQ6hTNSKJGNLR">真实 checkpoint 的 I64 缓冲（按 <code data-page-node-id="Ld5NpFMRwtVUI4qSaUKBKH">data_offsets</code> 用 Range 精确下载 280 字节，35 个 int64 逐元素核对）</td></tr>
-    <tr data-page-node-id="EubFlqYWP8M9u01rM1PO9Z"><td data-page-node-id="q0nt1YdAGMe4DX8k4ktSvb">等价性、选择行为、碰撞率、门控取值、逐层形状、视觉数据流、MRoPE 排布</td><td data-page-node-id="ZcIiDhDngBdLdUcyKqsZhQ">本机实测，脚本与原始输出见 <code data-page-node-id="yRf3Fh6obUDKkWXb3vrusw">research/</code></td></tr>
+  <h2 id="sources">来源与范围说明</h2>
+  <table>
+    <tr><th>项目</th><th>依据</th></tr>
+    <tr><td>全部 config 数值</td><td>官方 <code>config.json</code>：huggingface.co/Qwen/Qwen3.8-Flash-Next，commit <code>f5d08274</code></td></tr>
+    <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方实现 huggingface/transformers commit <code>36deb0b5</code>，<code>src/transformers/models/qwen4_exp/</code> 下 <code>configuration_qwen4_exp.py</code>、<code>modeling_qwen4_exp.py</code>、<code>modular_qwen4_exp.py</code></td></tr>
+    <tr><td>张量形状与 dtype、层型分布、参数量</td><td>真实 checkpoint 的 safetensors 文件头（HTTP Range 读取，131 个分片、1658 个张量）</td></tr>
+    <tr><td>N-gram 哈希乘子、各头词表大小与偏移的具体数值</td><td>真实 checkpoint 的 I64 缓冲（按 <code>data_offsets</code> 用 Range 精确下载 280 字节，35 个 int64 逐元素核对）</td></tr>
+    <tr><td>等价性、选择行为、碰撞率、门控取值、逐层形状、视觉数据流、MRoPE 排布</td><td>本机实测，脚本与原始输出见 <code>research/</code></td></tr>
   </table>
-  <p style="color:var(--muted);font-size:14px" data-page-node-id="6c8B6QYC04WLEUQNmnVW8C">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方对外表述的 125B Transformer 参数、51B N-gram 参数、6B 激活参数三项均已独立复现（分别算得 125.74B、51.20B、6.04B）。一处需要特别说明的差别：config 中 <code data-page-node-id="XWSqzkWHQepO3VjVmAMtsX">layer_types</code> 的 <code data-page-node-id="qxADZL6vVVqFIZGl59DI4E">full_attention</code> 会被配置类 <code data-page-node-id="0iTfGMEYHuP37KoEQyiOI1">__post_init__</code> 改写为 <code data-page-node-id="GN3WxG6E11bQAGBX3RJWg6">qwen_sparse_attention</code>，字面取值与实际行为不同，本页统一按实际行为称 QSA。N-gram 的三个 I64 缓冲已下载真实数值并与源码派生公式逐元素比对通过，据此确认 config 未显式给出的 <code data-page-node-id="6WnKTXL3DHXLYAAe0dwKzr">seed=1234</code>。本页覆盖语言主干、视觉编码器与多模态融合的完整前向数据流；训练方案、优化器、后训练流程，以及 MTP 草稿层的调度策略不在范围内。</p>
+  <p style="color:var(--muted);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方对外表述的 125B Transformer 参数、51B N-gram 参数、6B 激活参数三项均已独立复现（分别算得 125.74B、51.20B、6.04B）。一处需要特别说明的差别：config 中 <code>layer_types</code> 的 <code>full_attention</code> 会被配置类 <code>__post_init__</code> 改写为 <code>qwen_sparse_attention</code>，字面取值与实际行为不同，本页统一按实际行为称 QSA。N-gram 的三个 I64 缓冲已下载真实数值并与源码派生公式逐元素比对通过，据此确认 config 未显式给出的 <code>seed=1234</code>。本页覆盖语言主干、视觉编码器与多模态融合的完整前向数据流；训练方案、优化器、后训练流程，以及 MTP 草稿层的调度策略不在范围内。</p>
 </main>
 
 <script>
