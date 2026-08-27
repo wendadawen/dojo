@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FP8 块量化 · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 量化</span>
+      <h1>FP8 块量化</h1>
+      <p class="lead">权重用 8 位浮点 E4M3 存储、每 128×128 块一个缩放因子：显存减半以上，精度靠分块隔离离群值保住。</p>
+      <p class="meta">更新于 2026-08-27</p>
+    </header>
+
+    <h2>定位摘要</h2>
+<p>FP8 块量化是把权重（训练时也包括激活）压进 8 位浮点 E4M3 格式存储与计算的方案：每个 $128\times128$ 的权重块单独算一个缩放因子 $s=448/\max|W_{\text{block}}|$，把块内最大绝对值对准 E4M3 的最大正规数 448。GLM-5.3-Flash 以此把 321.3 B 参数压到平均 1.022 字节/参数。</p>
+
+<h2>问题背景</h2>
+<p>E4M3 只有 8 个比特（1 符号 + 4 指数 + 3 尾数），可表示区间 $[-448,448]$、每个 binade 只有 8 档取值。直接存储会浪费区间或溢出；逐张量 max 对齐缩放又被离群值绑架——一个大幅离群值拉大整张量的 scale，普通元素落进粗网格。</p>
+
+<h2>核心机制</h2>
+<ul>
+<li><strong>格式</strong>：E4M3 不表示无穷、只留一个 NaN 位模式，把最大幅值从 240 提升到 448；溢出饱和而非变 inf。E5M2（5 位指数、32 个 binade）负责动态范围大的梯度，两者分工。</li>
+<li><strong>分块</strong>：权重按 $128\times128$、激活按 $1\times128$（逐 token）分组，离群值只影响自己所在的块；checkpoint 存 scale 的倒数（weight_scale_inv），反量化乘回。</li>
+<li><strong>配套</strong>：FP8 GEMM 的硬件累加只有约 14 位精度，DeepSeek-V3 每 128 个内积元素提升到 FP32 寄存器累加；分块缩放让小组内「共享指数」，从而全张量统一用 E4M3（此前惯例梯度用 E5M2）。</li>
+</ul>
+
+<h2>关键结论与边界</h2>
+<ul>
+<li>GLM-5.3-Flash 实证：37,338 个 scale 形状全部等于 $\lceil N/128\rceil\times\lceil K/128\rceil$、F32 存储；KDA 层全部投影零量化，只有大矩阵乘权重走 FP8。</li>
+<li>块不是越小越好：DeepSeek-V3 的实验中激活梯度按 $128\times128$ 块量化导致训练发散，token 相关离群值需要逐 token 粒度。</li>
+<li>&lt;0.25% 的相对 loss 误差是 DeepSeek-V3 特定实验条件（两规模、约 1T token）的结论；1.022 字节/参数说明量化覆盖率，不是精度指标。</li>
+</ul>
+
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
