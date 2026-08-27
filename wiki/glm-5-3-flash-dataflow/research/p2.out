@@ -1,0 +1,95 @@
+==============================================================================
+探针 2：DSA 层（MLA 主路 + k-pool indexer），真实 config 维度
+==============================================================================
+[2.1] DSA 层参数张量（真实维度）
+      q_a_proj.weight                            (1536, 4096)     6,291,456
+      q_a_layernorm.weight                       (1536,)         1,536
+      q_b_proj.weight                            (16384, 1536)    25,165,824
+      kv_a_proj_with_mqa.weight                  (512, 4096)     2,097,152
+      kv_a_layernorm.weight                      (512,)           512
+      kv_b_proj.weight                           (32768, 512)    16,777,216
+      o_proj.weight                              (4096, 16384)    67,108,864
+      indexer.index_kpool_compress_ape           (4, 128)           512
+      indexer.index_kpool_compress_gate          (128, 4096)       524,288
+      indexer.wq_b.weight                        (4096, 1536)     6,291,456
+      indexer.wk.weight                          (128, 4096)       524,288
+      indexer.k_norm.weight                      (128,)           128
+      indexer.k_norm.bias                        (128,)           128
+      indexer.weights_proj.weight                (32, 4096)       131,072
+      合计 124,914,432 = 124.91 M，其中 indexer 7,471,872 = 7.47 M (5.98%)
+
+[2.2] NoPE 确认
+      config.qk_rope_head_dim = 0  (configuration 里 validate_architecture 要求必须为 0，>0 直接报错)
+      qk_nope_head_dim = 256, v_head_dim = 256, qk_head_dim = nope+rope = 256
+      config.mla_use_nope = True
+      Glm5NextTextModel.forward 里传 position_embeddings=None，DSA 层不调用任何 apply_rotary
+      → 全部 45 层文本主干不含任何位置编码，位置信息只来自 KDA 层的因果递推与 conv1d
+==============================================================================
+2.3 KV cache 实测形态（transformers 实现口径）
+==============================================================================
+      prefill S=40: 输出 (1, 40, 4096)  finite=True
+      cache.keys   (1, 64, 40, 256)   (B, num_heads, S, qk_head_dim)
+      cache.values (1, 64, 40, 256) (B, num_heads, S, v_head_dim)
+      展开口径每 token 元素 = heads*(qk+v) = 64*(256+256) = 32,768  → bf16 64.0 KiB/token/层
+      潜向量口径每 token 元素 = kv_lora_rank + rope = 512+0 = 512  → bf16 1.000 KiB/token/层
+      两者相差 64×。官方 transformers 实现（expand_kv 后再 cache）
+      走的是展开口径；MLA 的显存优势要靠推理框架自行 cache 潜向量实现（本探针不能证明后者）
+      DSA 层数 = 11；潜向量口径全模型 = 11.00 KiB/token
+==============================================================================
+2.4 indexer k-pool 压缩机制（实测候选数与选择宽度）
+==============================================================================
+      index_kpool=4  index_topk=2048  index_n_heads=32  index_head_dim=128
+      select_k = index_topk // index_kpool = 2048//4 = 512 个池
+      always_select_tail=True → 输出宽度 = index_topk + (kpool-1) = 2051
+      softmax_scale = head_dim^-0.5 = 0.08838835
+      打分公式：relu(q·pool_k * scale) 逐头 → 乘 weights_proj(x)*n_heads^-0.5 后按头求和
+      每头权重系数 n_heads^-0.5 = 0.17677670
+      S=    16  候选池=     4  实选池=    4  覆盖 token≈    16  稀疏度=100.00%  打分次数=     4(vs 稠密 16)
+      S=    40  候选池=    10  实选池=   10  覆盖 token≈    40  稀疏度=100.00%  打分次数=    10(vs 稠密 40)
+      S=  1024  候选池=   256  实选池=  256  覆盖 token≈  1024  稀疏度=100.00%  打分次数=   256(vs 稠密 1024)
+      S=  4096  候选池=  1024  实选池=  512  覆盖 token≈  2048  稀疏度= 50.00%  打分次数=  1024(vs 稠密 4096)
+      S= 16384  候选池=  4096  实选池=  512  覆盖 token≈  2048  稀疏度= 12.50%  打分次数=  4096(vs 稠密 16384)
+==============================================================================
+2.5 实测注意力 mask（每个 query 实际可见的 key 数量）
+==============================================================================
+      注：本 checkpoint 全为 indexer_types='full'，next_skip_topk=False，
+      forward 返回 None（无需向下传），因此直接调用 indexer 取选择结果
+      真实 index_topk=2048，需 S > 2048 才出现稀疏；先看 S 小于预算的情形
+      S=16: topk_indices (1, 16, 2051)；可见数前8=[1, 2, 3, 4, 5, 6, 7, 8]  末3=[14, 15, 16]
+              因果上限前8=[1, 2, 3, 4, 5, 6, 7, 8]  完全等于因果掩码=True
+      S=40: topk_indices (1, 40, 2051)；可见数前8=[1, 2, 3, 4, 5, 6, 7, 8]  末3=[38, 39, 40]
+              因果上限前8=[1, 2, 3, 4, 5, 6, 7, 8]  完全等于因果掩码=True
+==============================================================================
+2.6 缩小 index_topk 观察稀疏选择（结构不变，仅缩预算）
+==============================================================================
+      index_topk=16, kpool=4 → select_k=4 池, 输出宽度=16+3=19
+      topk_indices (1, 64, 19)  （= index_topk + kpool-1 = 19 ✓）
+      每 query 可见 key 数（前 20 个 query）=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 16]
+      对应因果上限                    =[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+      query 63 可见 16 个 key（因果上限 64）→ 稀疏率 25.0%
+      被选中的原始 token 下标（query 63，去掉 -1）= [20, 21, 22, 23, 32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51]
+
+      尾巴（always_select_tail）语义核对：
+      append_visible_tail 用 tail_count = visible_count % kpool 决定尾巴长度（L1008），
+      因此 visible_count 恰为 kpool 整数倍时 tail_count=0，没有不完整池，尾巴为空。
+        query 60: 可见= 61  tail_count=61%4=1  期望尾巴=[60]  尾巴全在选中集=True  选中数=17
+        query 61: 可见= 62  tail_count=62%4=2  期望尾巴=[60, 61]  尾巴全在选中集=True  选中数=18
+        query 62: 可见= 63  tail_count=63%4=3  期望尾巴=[60, 61, 62]  尾巴全在选中集=True  选中数=19
+        query 63: 可见= 64  tail_count=64%4=0  期望尾巴=[]  尾巴全在选中集=True  选中数=16
+==============================================================================
+2.7 跨层 top-k 共享（indexer_types）
+==============================================================================
+      config.indexer_types 取值分布 = {'full': 45}
+      本 checkpoint 全部为 'full' → 每个 DSA 层各自跑 indexer，无共享
+      源码支持共享：skip_topk = indexer_types[i]=='shared' 时 indexer=None，
+      改用上层传入的 prev_topk_indices（L1130-1134, L1189-1191）
+      实测带 indexer 的 DSA 层 = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43]
+      与 checkpoint 张量交叉验证结果一致（见 verify_structure.out [4]）
+      config.index_share_for_mtp_iteration = True
+==============================================================================
+2.8 DSA 层 decode 一步（增量）
+==============================================================================
+      输出 (1, 1, 4096)  finite=True
+      cache 增长到 (1, 64, 41, 256)（S 40 → 41）
+      forward 返回的 topk（next_skip_topk=False）= None
+      直接调 indexer 得到 decode 选择 (1, 1, 2051)  （1 个 query 对全部 42 个 kv 位置做选择）

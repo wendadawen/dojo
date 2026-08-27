@@ -1,0 +1,88 @@
+==============================================================================
+探针 6：视觉塔与多模态 token 排布
+==============================================================================
+[6.1] vision_config 全字段（来自官方 config.json）
+      attention_bias                   True
+      attention_dropout                0.0
+      depth                            24
+      hidden_act                       'silu'
+      hidden_size                      1024
+      image_size                       448
+      in_channels                      3
+      initializer_range                0.02
+      intermediate_size                4096
+      model_type                       'glm5_next_vision'
+      num_heads                        16
+      out_hidden_size                  4096
+      patch_size                       14
+      projection_intermediate_size     10240
+      rms_norm_eps                     1e-05
+      spatial_merge_size               2
+      swiglu_limit                     10.0
+      temporal_patch_size              2
+
+      out_hidden_size=4096  text hidden_size=4096  相等=True
+      → 视觉输出可直接 masked_scatter 进文本 embedding，无需额外投影层
+==============================================================================
+6.2 patch 数与视觉 token 数换算
+==============================================================================
+      patch_size=14  spatial_merge_size=2  temporal_patch_size=2
+      源码 L1877：split_sizes = grid_thw.prod(-1) // spatial_merge_size**2
+      → 视觉 token 数 = (T*H_patch*W_patch) / 2^2 = (T*H_p*W_p)/4
+
+                  输入图像      grid(t,h,w)    patch 数    视觉 token  压缩比
+               448x448      (1, 32, 32)       1024         256    784 像素/token
+               896x896      (1, 64, 64)       4096        1024    784 像素/token
+             1344x1344      (1, 96, 96)       9216        2304    784 像素/token
+
+      视频（8 帧 448x448，temporal_patch_size=2）：
+        get_video_features（L1845-1864）先把 [b,3] 的 video_grid_thw 展平成每帧 [1,h,w]
+        8 帧 → grid_thw=(8,32,32) → 视觉 token = 8*32*32//4 = 2048
+==============================================================================
+6.3 视觉塔实跑（depth 24→2 以便本机跑通，其余维度全为真实值）
+==============================================================================
+      输入 pixel_values (1024, 1176)  = (patch 数, C*t_patch*p*p = 3*2*14*14)
+      grid_thw = [[1, 32, 32]]
+      patch_embed 后           (1024, 1024)
+      经 2 个 block + post_layernorm 后  (1024, 1024)
+      last_hidden_state（downsample 后） (256, 4096)
+      pooler_output（merger 后）        (256, 4096)
+      期望视觉 token 数 = 1024//4 = 256  实测=256  一致=True
+      输出维度 4096 == 文本 hidden_size 4096 = True
+      finite=True
+
+      downsample: Conv2d(1024→4096, kernel=2, stride=2) —— 空间 2x2 合并同时升维到文本宽度
+      merger: proj → LayerNorm → GELU → SwiGLU(context=10240) → down
+==============================================================================
+6.4 图像与视频共用同一 token id（与其他 VLM 的关键差异）
+==============================================================================
+      image_token_id = 154854   video_token_id = 154855
+      image_start/end = 154830/154831
+      video_start/end = 154832/154833
+      源码 L1909-1916 注释明写：img token == vid token，靠 start/end span 区分
+      判定式：in_video_span = cumsum(==video_start) > cumsum(==video_end)
+               special_image_mask = (ids==image_token_id) & ~in_video_span
+               special_video_mask = (ids==image_token_id) &  in_video_span
+
+      构造 input_ids（7=普通文本 token）：
+        ['txt', 'IMG', 'IMG', 'txt', 'V_S', 'IMG', 'IMG', 'IMG', 'V_E', 'txt', 'IMG', 'txt']
+        in_video_span  [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]
+        image_mask     [0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]  → 3 个图像 token
+        video_mask     [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0]  → 3 个视频 token
+      注意 video_token_id=154855 在此路径下未被用于掩码判定
+==============================================================================
+6.5 视觉特征注入文本序列（masked_scatter）
+==============================================================================
+      inputs_embeds (1, 12, 4096)  image_features (3, 4096)
+      形状校验（L1921-1924）：n_image_tokens * hidden == features.numel() → 3*4096 == 12288  True
+      masked_scatter 后被替换的位置 = [1, 2, 10]
+      期望位置 = [1, 2, 10]  一致=True
+      注入后走 language_model（input_ids=None, inputs_embeds=merged），L1973-1981
+==============================================================================
+6.6 视觉塔参数量（真实 depth=24）与 checkpoint 对照
+==============================================================================
+      按官方 depth=24 构建，参数量 = 563,627,008 = 563.63 M
+      checkpoint 实测 visual 命名空间参数量 = 563,627,008 = 563.63 M
+      一致 = True   差值 = 0
+      视觉塔占全模型（321.32 B）比例 = 0.175%
+      视觉塔全部为 BF16（未量化），checkpoint dtype 交叉验证见 verify_structure [8]
