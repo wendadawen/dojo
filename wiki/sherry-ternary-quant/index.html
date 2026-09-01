@@ -1,0 +1,1489 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Sherry 稀疏三值量化（STQ1_0）：以 3:4 稀疏约束把三值权重压到规整的 1.25 bit，含编码结构、字节布局、量化决策与实测。">
+  <meta name="dojo:summary" content="三值权重两种旧打包各有硬伤：2-bit 浪费、1.67-bit 不规整。Sherry 强制每 4 个权重恰好一个零，组合数从 $3^4=81$ 压到 $32=2^5$，5 bit 编码零浪费、平均 1.25 bit/权重；加块级 fp16 缩放系数后文件开销 $1.3125$ bpw。量化决策上，加权最小二乘缩放加 imatrix 零位选择把加权平方误差压低约九成。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="推理系统">
+  <meta name="dojo:tag" content="权重量化,三值量化,Sherry,STQ1_0,llama.cpp,GGUF,Hy4">
+  <title>Sherry 稀疏三值量化（STQ1_0）：3:4 稀疏把三值权重压到规整的 1.25 bit</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Sherry 稀疏三值量化</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Sherry 稀疏三值量化（STQ1_0）：3:4 稀疏把三值权重压到规整的 1.25 bit</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Sherry 论文（arXiv:2601.07892；llama.cpp PR #22836 述及其被 ACL 2026 接收）、llama.cpp PR #22836（STQ1_0 内核）、HuggingFace AngelSlim/Hy4-preview-GGUF 模型卡（PTQ 编码器与 Hy4 配方）</p>
+</blockquote>
+
+<p>2026 年 9 月，腾讯混元发布 Hy4 preview 轻量版：一个总参数约 770B、BF16 权重约 1.5 TB 的混合专家模型，权重被压缩到约 214 GB<sup>[N6]</sup>。压缩最激进的一档是部分层的路由专家 gate/up 投影：这一档平均每个权重只占约 1.31 bpw，用的是本页的主角——Sherry 稀疏三值量化，在 llama.cpp 中的落地名为 STQ1_0。</p>
+
+<p>Sherry 是一种带结构约束的三值量化：权重量化到 $\{-d, 0, +d\}$ 三个取值，并强制每 4 个权重中恰好一个为零（3:4 稀疏）。这条约束让 4 个权重恰好用 5 bit 编码，平均 1.25 bit/权重；同时 4 是 2 的幂，天然匹配 SIMD 硬件的通道结构<sup>[C4]</sup>。本页依次回答：这个格式为什么存在、怎么编码、落到文件占多少字节、量化误差由什么决定、推理为什么快。</p>
+
+<p>本页用到三个背景概念，首次使用时只给最小含义：权重量化指把浮点权重近似为低比特离散值乘共享缩放系数，即 $x \approx d \cdot q$，bpw（bits per weight）为平均每权重占用的 bit 数；SIMD 指一条指令对 $2$ 的幂个数据通道并行执行同一操作，其查表指令的查找表容量有限（如 x86 vpshufb 为 16 项，对应 4 bit 索引）；imatrix 是用校准数据统计出的逐权重重要性。此外，混合专家（MoE）模型的路由专家是按输入路由激活的前馈网络权重，是超大模型参数的集中地；各层分别压到多少比特属于另一个概念，见 <a href="../mixed-precision-quant/index.html">MIX-STQ1_0 逐层混合精度量化</a>。</p>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>已有的三值打包方式（2-bit、1.67-bit）各自亏在哪里，3:4 稀疏为什么能同时做到更小和更规整？</p>
+      <details>
+        <summary>解答：2-bit 浪费、1.67-bit 卡在 SIMD 对齐上；3:4 把组合数压到 $32=2^5$</summary>
+        <p>三值权重的存储理论下限为每权重 $\log_2 3 \approx 1.585$ bit。2-bit 打包保持 SIMD 对齐，但每权重比下限多花约四分之一；1.67-bit 打包把 3 个权重压进 5 bit，bit 数接近下限，但组大小 3 不是 2 的幂，解码需要位重排，实测常比 2-bit 还慢。3:4 稀疏强制每 4 个权重中恰好一个为零，合法组合从 $3^4=81$ 降到 $\binom{4}{3}\times 2^3=32=2^5$，5 bit 恰好装下、没有浪费，且组大小 4 直接对齐 SIMD 通道。完整论证见「三值量化的打包困境」与「3:4 稀疏三值——4 个权重恰好 5 bit」两章。</p>
+      </details>
+    </li>
+    <li>
+      <p>4 个权重具体如何编码成 5 bit，又如何解码回 $\{-d, 0, +d\}$？</p>
+      <details>
+        <summary>解答：4 bit 索引查 16 项码本，1 bit 控制整体符号，再乘 $d$</summary>
+        <p>32 种合法组合按镜像对称拆成 16 对：码本只存每对中的一份（零位位置加三个非零通道的相对符号），用 4 bit 索引；剩下 1 bit 记录取这一对中的哪一份，即整体符号是否翻转。16 项码本恰好填满 SIMD 查表指令的 4-bit 索引上限。解码三步：查码本得到模式、按符号位翻转、乘块级缩放系数 $d$。完整论证与手算示例见「3:4 稀疏三值——4 个权重恰好 5 bit」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>文件里 256 个权重实际占多少字节，1.3125 bpw 与 1.25 bit 的差是什么？</p>
+      <details>
+        <summary>解答：42 字节 = 32B 索引 + 8B 符号 + 2B 缩放系数；差值是缩放的摊销</summary>
+        <p>256 个权重共 64 组。64 组索引占 $64 \times 4$ bit = 32 字节，64 个符号位占 8 字节，再加一个全块共享的 fp16 缩放系数 2 字节，合计 42 字节，即 $(32+8+2)\times 8 / 256 = 1.3125$ bpw。1.25 bit 是纯权重编码，多出的 0.0625 bit 是 fp16 缩放系数摊到每个权重上的开销（$16/256=0.0625$）。完整账目见「STQ1_0 字节布局——1.3125 bpw 的账」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>缩放系数 $d$ 和「哪个权重置零」怎么选，不同选法误差差多少？</p>
+      <details>
+        <summary>解答：加权最小二乘求 $d$、按 imatrix 增量代价选零位，比 amax 朴素法误差降约九成</summary>
+        <p>格式只决定能表示什么，误差大小由两个决策决定。llama.cpp 上游量化器取 $d$ 为块内最大绝对值（amax）并置零绝对值最小者，amax 会把 $d$ 钉在 256 个权重中最大的离群值上。AngelSlim 为 Hy4 写的训练后编码器改为：加权最小二乘 $d=\sum w_i x_i q_i / \sum w_i q_i^2$，以及按 imatrix 加权的增量代价选择零位，两者交替 3 轮；在 1200 行真实专家权重上，仅最小二乘缩放就使加权平方误差下降 89.7%，imatrix 零位再降剩余部分的 4.1%。论文训练侧则用平均绝对值缩放（Sparse-AbsMean），并证明其为 L2 重建误差最优。完整论证与实测见「量化决策——缩放系数与零位怎么选」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>这个格式推理为什么快，实测数字如何？</p>
+      <details>
+        <summary>解答：查表加点积完成解码、无需位重排；M4 Pro 上比 TQ1_0 小 11% 且更快</summary>
+        <p>组大小 4 对齐 SIMD 通道，STQ1_0 内核进一步按 stride-16 分组（组内取 $w_0, w_{16}, w_{32}, w_{48}$），使查表解码后各通道与顺序存储的激活天然对齐，一条查表指令加点积即可完成，不需要任何位重排。Apple M4 Pro 上同一 1B 模型：STQ1_0 体积 358 MiB、decode 147.47 t/s，比 TQ1_0（401.5 MiB、138.87 t/s）小约 11% 且更快，比 TQ2_0 小约 20%。论文 CPU 实测（Table 4）：0.7B 模型 Sherry 148.27 t/s 对 1.67-bit 基线 TL2 的 116.83 t/s（快约 27%），3B 模型官方表述为快 18%；精度上 1B 与 1.67-bit SOTA 持平（0.519 对 0.519），3B 略低（0.567 对 0.576）。完整数据见「为什么快——SIMD 解码与实测」一章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>「1.25 bit 就是文件实际开销」——1.25 bit 只是纯权重编码；加块级 fp16 缩放系数摊销后，文件实际为 1.3125 bpw。</li>
+    <li>「3:4 稀疏是剪掉 25% 权重所以更小」——bit 节省来自合法组合数从 81 压到 32 使 5 bit 够用；稀疏约束压缩的是编码空间，文件里并不按稀疏格式存储。</li>
+    <li>「Hy4 轻量版是用 Sherry 训练出来的」——Hy4 用的是同一格式，但走训练后量化（PTQ），编码器是 AngelSlim 另写的加权最小二乘加 imatrix 版本，不经过论文的量化感知训练。</li>
+    <li>「一组就是内存里相邻的 4 个权重」——概念上 4 个一组不绑定内存顺序；STQ1_0 内核实际按 stride-16 分组，这是为 SIMD 对齐做的实现选择。</li>
+  </ul>
+</section>
+
+<h2 id="packing-dilemma">1. 三值量化的打包困境</h2>
+
+<p>三值量化把每个权重约束到三个取值 $\{-1, 0, +1\}$，整块权重再共享一个缩放系数 $d$，反量化即 $x \approx d \cdot q$<sup>[C1]</sup>。三个取值的信息量是每权重 $\log_2 3 \approx 1.585$ bit，这是无约束三值存储的理论下限<sup>[C3]</sup>。问题在于：下限不是 2 的幂，怎么把三值权重装进字节，直接决定推理时解码的快慢。</p>
+
+<p>在 Sherry 之前有两条路线。第一条是 2-bit 对齐打包：每个权重占 2 bit，三个取值映射到四个码点中的三个。它保持了 SIMD 对齐，解码简单，但每权重比理论下限多花约四分之一：多出 $2-1.585=0.415$ bit，相对下限多 $(2-1.585)/1.585 \approx 26\%$<sup>[C2]</sup>。第二条是 1.67-bit 不规则打包：把 3 个权重压进 5 bit（$3^3=27 &lt; 32=2^5$），bit 数降到约 1.67（llama.cpp 的 TQ1_0 加上缩放摊销为 1.6875 bpw<sup>[C13]</sup>）。但组大小 3 不是 2 的幂，与 SIMD 按 $2$ 的幂个通道并行处理的结构根本冲突，解码必须逐位重排，实测常常比 2-bit 还慢：论文在 i7-14700HX 上测 0.7B 模型，1.67-bit 的 TL2 为 116.83 t/s，慢于 2-bit 的 I2_S 的 132.13 t/s<sup>[C2, N3]</sup>。</p>
+
+<p>还有一条看似现成的路是借硬件稀疏：2:4 稀疏（每 4 个权重保留 2 个）——但 GPU 的稀疏加速单元（如 Tensor Core 的 2:4 支持）面向 fp16/fp32 高精度运算，论文指出这类单元并不与超低比特量化配合，对三值权重不可用<sup>[C6]</sup>。即便只看编码，2:4 的合法模式按镜像对称折算只有 12 种，填不满 16 项查找表，仍有 bit 浪费；50% 的稀疏度对模型精度伤害也明显<sup>[C6]</sup>。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>打包方式</th><th>bit/权重</th><th>组大小</th><th>与 SIMD 的关系</th><th>实际后果</th></tr></thead>
+<tbody>
+<tr><td>2-bit 对齐</td><td>2.00</td><td>1（逐权重）</td><td>对齐</td><td>比理论下限多花约四分之一</td></tr>
+<tr><td>1.67-bit（3 权重 / 5 bit）</td><td>约 1.67</td><td>3</td><td>不对齐，解码需位重排</td><td>实测常慢于 2-bit</td></tr>
+<tr><td>2:4 稀疏三值</td><td>约 1.25（模式用不满）</td><td>4</td><td>对齐但码本用不满</td><td>50% 稀疏度伤精度</td></tr>
+<tr class="highlight-row"><td>Sherry 3:4 稀疏三值</td><td>1.25</td><td>4</td><td>对齐且码本恰好填满</td><td>又小又规整（「3:4 稀疏三值」一章起展开）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Sherry 的出发点：与其在「对齐但浪费」和「紧凑但慢」之间二选一，不如给权重加一条结构约束，让编码空间本身缩小到 2 的幂。这就是下一章的 3:4 稀疏。</p>
+
+<h3 id="packing-dilemma-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>三值权重存储的理论下限是多少，2-bit 和 1.67-bit 两种打包各自差在哪？</p>
+    <details>
+      <summary>解答：下限 $\log_2 3 \approx 1.585$ bit；2-bit 多花约四分之一，1.67-bit 破坏 SIMD 对齐</summary>
+      <p>无约束三值每权重的信息量为 $\log_2 3 \approx 1.585$ bit。2-bit 打包每权重占 2 bit，比下限多花约四分之一（$0.415$ bit，相对下限约 26%），换来 SIMD 对齐与简单解码。1.67-bit 打包把 3 个权重压进 5 bit，bit 数接近下限，但组大小 3 与 SIMD 的 $2$ 的幂通道冲突，解码要逐位重排，论文实测其 CPU 速度慢于 2-bit（116.83 t/s 对 132.13 t/s，0.7B 模型）。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么不直接用硬件支持的 2:4 稀疏？</p>
+    <details>
+      <summary>解答：12 种模式填不满 16 项码本仍有浪费，且 50% 稀疏度伤精度</summary>
+      <p>三个理由。其一，GPU 的稀疏加速单元面向 fp16/fp32 高精度运算，论文明确这类单元与超低比特量化并不配合，对三值权重不可用。其二，即便只看编码：2:4 稀疏每 4 个权重保留 2 个，按镜像对称折算的合法模式只有 $\binom{4}{2}\times 2^{2-1}=12$ 种，填不满 4-bit 索引的 16 项查找表，存储上仍有浪费。其三，50% 稀疏度对精度伤害明显。Sherry 的 3:4 保持 75% 密度（25% 稀疏），模式数 16 恰好填满码本，兼顾了精度与编码效率。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="format">2. 3:4 稀疏三值——4 个权重恰好 5 bit</h2>
+
+<h3 id="format-count">2.1 合法组合怎么数</h3>
+
+<p>Sherry 加的约束只有一条：每 4 个权重为一组，组内恰好一个为零，其余三个取 $\pm 1$<sup>[C4]</sup>。数一下合法组合：零的位置有 $\binom{4}{3}=4$ 种选法，三个非零位置各有正、负两种符号，共 $2^3=8$ 种，合计</p>
+
+<p>$$\binom{4}{3} \times 2^3 = 32 = 2^5.$$</p>
+
+<ul>
+  <li>$\binom{4}{3}$：从 4 个位置中选 3 个非零位置（等价于选 1 个零位）的方式数。</li>
+  <li>$2^3$：三个非零位置各自的符号组合数。</li>
+</ul>
+
+<p>32 恰好等于 $2^5$，所以一组 4 个权重用 5 bit 就能编码，不多也不少，平均每权重 $5/4 = 1.25$ bit<sup>[F1]</sup>。对照无约束情形：4 个三值权重有 $3^4=81$ 种组合，至少需要 $\log_2 81 \approx 6.34$ bit。3:4 约束把编码空间砍掉约六成，这正是每权重 1.25 bit 能低于无约束三值下限 $\log_2 3 \approx 1.585$ bit 的原因——下限针对的是每权重仍有 3 种可能性的无约束三值，加了稀疏约束后每个位置的可能性已经不到 3 种，并不存在矛盾。</p>
+
+<h3 id="format-structure">2.2 5 bit 的内部结构</h3>
+
+<p>5 bit 不是随便切分的。注意任何合法模式整体取反（所有 $\pm 1$ 互换）仍是合法模式，32 种组合因此配成 16 对镜像。码本只存每对中的一份，共 $\binom{4}{3}\times 2^{3-1}=16$ 种模式，用 4 bit 索引；剩下 1 bit 记录取这一对中的哪一份，即整体符号是否翻转<sup>[C5, F2]</sup>。</p>
+
+<p>16 这个数字不是巧合：标准 SIMD 查表指令（如 x86 的 vpshufb）受 128-bit 寄存器限制，单条指令的查找表容量是 16 项，恰好对应 4 bit 索引<sup>[C6]</sup>。3:4 的码本恰好 16 项，解码时一条查表指令就能把整个组的模式还原出来（ARM NEON 内核用双表指令 <code>vqtbl2q</code> 实现 32 种状态的解码<sup>[C7]</sup>）。这也是组大小选 4 的硬件理由：组更大（如 8 个一组）索引宽度会超出查表指令上限，组为 3 则回到不对齐的老问题。</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">4 个权重</div>
+      <div class="dg-node-note">一组浮点权重 $x$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">量化决策</div>
+      <div class="dg-node-note">定零位、符号与缩放 $d$（「量化决策」一章）</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">5 bit 码</div>
+      <div class="dg-node-note">4 bit 索引 + 1 bit 符号</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">查码本 + 符号翻转</div>
+      <div class="dg-node-note">16 项码本，一条 SIMD 查表指令</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">乘 $d$ 还原</div>
+      <div class="dg-node-note">得到 $\{-d, 0, +d\}$</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">左半（前三个节点）为离线编码，只做一次；右半（后两个节点）为每次推理的解码路径，全部按 SIMD 通道并行。</figcaption>
+</figure>
+
+<h3 id="format-example">2.3 一组权重的编码手算</h3>
+
+<p>构造示例。取一组 4 个权重 $x=(0.6,\ -0.1,\ 0.5,\ -0.7)$，设缩放系数 $d=0.6$（$d$ 怎么来是「量化决策」一章的内容，这里先当作已知）。数字为便于复算而构造，不代表真实权重分布。</p>
+
+<p>第一步定零位：绝对值最小的是 $-0.1$，在第 2 个位置，置零。第二步定符号：其余三个取符号，得 $q=(+1,\ 0,\ +1,\ -1)$。这个组对应码本中「零在第 2 位、相对符号为 $(+,+,-)$」的条目（4 bit 索引），符号位取「不翻转」（1 bit）。第三步反量化验证：$d \cdot q = (0.6,\ 0,\ 0.6,\ -0.6)$，逐元素误差为 $(0,\ 0.1,\ 0.1,\ 0.1)$，平方误差和为 $0.03$。</p>
+
+<p>整个组在文件里只占 5 bit；误差集中在被置零的 $-0.1$ 和两个被量化到 $\pm d$ 的权重上。$d$ 取别的值误差会怎么变，是「量化决策——缩放系数与零位怎么选」一章的问题。</p>
+
+<h3 id="format-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>4 个三值权重加 3:4 约束后有多少种合法组合，为什么 5 bit 刚好够？</p>
+    <details>
+      <summary>解答：$\binom{4}{3}\times 2^3=32=2^5$，恰好饱和 5 bit</summary>
+      <p>零的位置有 4 种选法，三个非零位置的符号共 $2^3=8$ 种，合计 32 种合法组合，恰好等于 $2^5$。因此 5 bit 编码没有任何浪费，平均 $5/4=1.25$ bit/权重。无约束时 4 个三值权重有 $3^4=81$ 种组合，至少需要约 6.34 bit——稀疏约束把编码空间压缩了约六成，这才是 bit 节省的来源。</p>
+    </details>
+  </li>
+  <li>
+    <p>5 bit 内部如何组织，解码一步做什么？</p>
+    <details>
+      <summary>解答：4 bit 索引查 16 项码本，1 bit 整体符号；解码 = 查表、翻转、乘 $d$</summary>
+      <p>利用镜像对称，32 种组合配成 16 对，码本每对存一份（零位位置加三个非零通道的相对符号），4 bit 索引；另 1 bit 记录整体符号是否翻转。16 项码本恰好填满 SIMD 查表指令的 4-bit 索引上限。解码时先一条查表指令还原模式，再按符号位翻转，最后乘块级缩放系数 $d$，得到 $\{-d,0,+d\}$。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="layout">3. STQ1_0 字节布局——1.3125 bpw 的账</h2>
+
+<h3 id="layout-bytes">3.1 42 字节的构成</h3>
+
+<p>STQ1_0 是 Sherry 格式在 llama.cpp 中的落地。它以 256 个权重为一个块组织存储<sup>[C7]</sup>：256 个权重共 64 组，64 组索引共 $64 \times 4 = 256$ bit，即 32 字节（记为 <code>qs[32]</code>）；64 个符号位共 8 字节（记为 <code>sign[8]</code>）；再加一个全块共享的 fp16 缩放系数，2 字节。合计</p>
+
+<p>$$(32 + 8 + 2) \times 8 / 256 = 1.3125 \ \text{bpw}.$$</p>
+
+<ul>
+  <li>$32$：64 组 $\times$ 4 bit 索引占用的字节数。</li>
+  <li>$8$：64 个符号位占用的字节数。</li>
+  <li>$2$：一个 fp16 缩放系数 $d$ 占用的字节数。</li>
+</ul>
+
+<p>这就是「1.25 bit」与「1.3125 bpw」两个数字的关系：前者是纯权重编码，后者多出的 $0.0625$ bit 是 fp16 缩放系数摊到每个权重上的开销（$16\ \text{bit}/256=0.0625$）<sup>[F3, N1]</sup>。上一章手算的那组权重如果落在这个块里，它的 4 bit 索引占 32 字节索引区中的半个字节，符号位占 8 字节符号区中的 1 位。</p>
+
+<figure class="diagram">
+  <div class="dg-stack">
+    <div class="dg-layer">
+      <span class="dg-layer-label">qs 32B</span>
+      <span class="dg-layer-body">64 组 $\times$ 4 bit 码本索引（每组 4 个权重）</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">sign 8B</span>
+      <span class="dg-layer-body">64 个 $\times$ 1 bit 整体符号位，与索引一一对应</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">$d$ 2B</span>
+      <span class="dg-layer-body">fp16 缩放系数，全块 256 个权重共享</span>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">STQ1_0 一个 256 权重块的 42 字节布局；三层自上而下为文件中的存储顺序。</figcaption>
+</figure>
+
+<h3 id="layout-stride">3.2 stride-16 分组——组不是相邻的 4 个</h3>
+
+<p>「3:4 稀疏三值」一章说「4 个权重一组」，这是编码概念，并不绑定内存中的顺序。STQ1_0 内核在每个 64 权重块内实际按 stride-16 取组：第一组是 $(w_0, w_{16}, w_{32}, w_{48})$，第二组是 $(w_1, w_{17}, w_{33}, w_{49})$，依此类推<sup>[C8]</sup>。</p>
+
+<p>这样排的理由纯粹是硬件：查表解码后，每个 SIMD lane 寄存器里持有的是一段连续 16 个权重的三值；而激活（按 Q8_K 量化，llama.cpp 的 8-bit 块量化激活格式）在内存中顺序存储。stride-16 分组让权重 lane 与激活天然对齐，一条加载指令就能把激活读进对应通道，随后直接做整型点积，全程没有数据重排<sup>[C8]</sup>。这个实现选择不改变编码逻辑——每组内部仍然是「一个零、三个正负一」，只是哪 4 个权重算一组发生了变化。</p>
+
+<h3 id="layout-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>256 个权重的 42 个字节都是什么？</p>
+    <details>
+      <summary>解答：32 字节索引 + 8 字节符号 + 2 字节 fp16 缩放系数</summary>
+      <p>256 个权重共 64 组：64 组 $\times$ 4 bit 索引 = 32 字节，64 个 $\times$ 1 bit 符号 = 8 字节，全块共享一个 fp16 缩放系数 2 字节，合计 42 字节，即 $(32+8+2)\times 8/256 = 1.3125$ bpw。其中纯权重编码为 1.25 bit，其余 0.0625 bit 是缩放系数的摊销。</p>
+    </details>
+  </li>
+  <li>
+    <p>stride-16 分组是什么，为什么不连续取 4 个？</p>
+    <details>
+      <summary>解答：组内取 $w_0, w_{16}, w_{32}, w_{48}$，让解码后的 lane 与激活对齐</summary>
+      <p>STQ1_0 内核在 64 权重块内按 stride-16 分组，而非取内存中相邻的 4 个。这样查表解码后每个 SIMD lane 寄存器恰好对应一段连续 16 个权重，与顺序存储的激活一一对齐，一条加载指令即可读入激活并直接点积，无需任何数据重排。编码逻辑（每组一个零、三个 $\pm 1$）不变，变的只是哪些权重构成一组。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="decisions">4. 量化决策——缩放系数与零位怎么选</h2>
+
+<p>格式只决定「能表示什么」；量化误差的大小取决于两个决策：缩放系数 $d$ 取多少，以及组内哪个权重置零。围绕这两个决策有三套做法，分别对应论文的训练侧、llama.cpp 上游量化器和 AngelSlim 为 Hy4 写的训练后编码器。</p>
+
+<div class="callout callout-yellow">
+<p>三套做法对应不同场景，不要混用结论：Sparse-AbsMean 是论文在量化感知训练（QAT）中使用的缩放规则；llama.cpp 上游量化器面向「已经落在三值网格上」的 QAT 产物做格式转换；AngelSlim 编码器面向训练后量化（PTQ），直接把浮点权重压进 STQ1_0，Hy4 轻量版走的就是这条路。</p>
+</div>
+
+<h3 id="decisions-scale">4.1 缩放系数的三种选法</h3>
+
+<p>第一种，平均绝对值（Sparse-AbsMean，论文训练侧）：置零绝对值最小的权重后，$d$ 取留存权重的平均绝对值<sup>[C9]</sup>：</p>
+
+<p>$$d = \frac{1}{|S|} \sum_{i \in S} |x_i|,$$</p>
+
+<ul>
+  <li>$S$：组内（或通道内）未被置零的权重索引集合，$|S|$ 为其大小。</li>
+  <li>$x_i$：第 $i$ 个原始浮点权重。</li>
+</ul>
+
+<p>论文附录 D 证明该取法最小化 L2 重建误差<sup>[F4]</sup>。</p>
+
+<p>第二种，最大值（amax，llama.cpp 上游量化器）：$d$ 取块内绝对值最大的权重<sup>[C10]</sup>。它保证任何权重都不溢出，但 $d$ 被 256 个权重中最大的离群值钉死——其余几百个权重都要跟着这个离群值的尺度走。</p>
+
+<p>第三种，加权最小二乘（AngelSlim 编码器）：直接以加权重建误差为目标，$\min_d \sum_{i \in S} w_i (x_i - d q_i)^2$，对 $d$ 求导令其为零，得<sup>[C11, F5]</sup></p>
+
+<p>$$d = \frac{\sum_{i \in S} w_i\, x_i\, q_i}{\sum_{i \in S} w_i\, q_i^2},$$</p>
+
+<ul>
+  <li>$w_i$：第 $i$ 个权重的重要性，来自 imatrix（校准数据统计）。</li>
+  <li>$q_i \in \{-1, +1\}$：第 $i$ 个权重量化后的符号。</li>
+</ul>
+
+<p>沿用「3:4 稀疏三值」一章的手算组 $x=(0.6,-0.1,0.5,-0.7)$ 对照（构造示例）：amax 取 $d=0.7$，反量化为 $(0.7, 0, 0.7, -0.7)$，平方误差和 $0.01+0.01+0.04+0=0.06$；而 $d=0.6$ 时为 $0.03$。一个偏大的离群值把 $d$ 抬高后，所有非零权重一起承担误差。</p>
+
+<h3 id="decisions-zero">4.2 零位的两种选法</h3>
+
+<p>第一种，绝对值最小（argmin，上游量化器与论文训练侧）：组内置零 $|x_j|$ 最小者，直觉是「丢掉最小的损失最小」。</p>
+
+<p>第二种，imatrix 增量代价（AngelSlim 编码器）：置零使下式最小的位置<sup>[C11, F6]</sup>：</p>
+
+<p>$$\arg\min_j \ w_j \left( x_j^2 - (|x_j| - d)^2 \right).$$</p>
+
+<ul>
+  <li>$x_j^2$：把该权重置零（且不靠缩放补偿）带来的误差。</li>
+  <li>$(|x_j|-d)^2$：保留该权重、量化到 $\pm d$ 带来的误差。</li>
+  <li>括号内是「保留它的净收益」乘上重要性 $w_j$；净收益最小的位置被置零。</li>
+</ul>
+
+<p>一个容易看漏的事实：当重要性全为 1 时，两种规则完全等价——此时代价化简为 $2|x_j|d - d^2$，随 $|x_j|$ 单调递增，取最小的就是 argmin。只有 imatrix 非均匀时，第二种规则才会选出不同的零位（下面的代码实测验证了这两点）。</p>
+
+<h3 id="decisions-measure">4.3 误差实测：三种做法差多少</h3>
+
+<p>下面的代码对一个构造的 256 权重块完整实现三种做法：amax 加 argmin 零位（上游量化器）、加权最小二乘加 argmin 零位、加权最小二乘加 imatrix 零位交替 3 轮（AngelSlim 编码器），并打印各自的加权平方误差。代码还验证了「重要性全 1 时两种零位规则等价」和「STQ1_0 字节布局」一章的字节账。结论先行：构造块上 amax 的加权平方误差约为加权最小二乘的 6 倍（$117.51$ 对 $19.60$），零位选择再降到 $17.75$；官方在 1200 行真实专家权重上的对应数字是仅换缩放即降 $89.7\%$、imatrix 零位再降剩余部分的 $4.1\%$<sup>[N5]</sup>。</p>
+
+<details class="code-details">
+<summary>代码：三种量化决策的加权平方误差对比</summary>
+<div class="code-block">
+<pre><code class="language-python">import random
+
+random.seed(20260901)
+
+# 构造示例：固定种子的伪随机权重与伪随机重要性，
+# 模拟一个 256 权重块（64 组，每组 4 个）及其 imatrix
+weights = [random.gauss(0.0, 0.5) for _ in range(256)]
+imatrix = [random.uniform(0.2, 2.0) for _ in range(256)]
+GROUPS = [weights[i:i + 4] for i in range(0, 256, 4)]
+IM_GROUPS = [imatrix[i:i + 4] for i in range(0, 256, 4)]
+
+
+def quantize(groups, im_groups, scale_mode, zero_mode, rounds=1):
+    """对 64 个四权重组做 3:4 稀疏三值量化，返回 (d, qs, 加权SSD)。"""
+    d = max(abs(x) for g in groups for x in g)  # 初值 amax
+    qs = None
+    for _ in range(rounds):
+        qs = []
+        for g, w in zip(groups, im_groups):
+            if zero_mode == "argmin":
+                z = min(range(4), key=lambda j: abs(g[j]))
+            else:  # imatrix 增量代价：置零 w*(x^2-(|x|-d)^2) 最小者
+                z = min(range(4),
+                        key=lambda j: w[j] * (g[j] ** 2 - (abs(g[j]) - d) ** 2))
+            qs.append([0 if j == z else (1 if g[j] > 0 else -1) for j in range(4)])
+        if scale_mode == "amax":
+            d = max(abs(x) for g in groups for x in g)
+        else:  # 加权最小二乘：d = Σ w·x·q / Σ w·q^2，仅对非零 lane 求和
+            num = sum(wi * x * q
+                      for g, w, qs_g in zip(groups, im_groups, qs)
+                      for wi, x, q in zip(w, g, qs_g))
+            den = sum(wi * q * q
+                      for w, qs_g in zip(im_groups, qs)
+                      for wi, q in zip(w, qs_g))
+            d = num / den
+    wssd = sum(wi * (x - d * q) ** 2
+               for g, w, qs_g in zip(groups, im_groups, qs)
+               for wi, x, q in zip(w, g, qs_g))
+    return d, qs, wssd
+
+
+for name, scale_mode, zero_mode, rounds in [
+    ("amax + argmin 零位（上游量化器）", "amax", "argmin", 1),
+    ("WLS + argmin 零位", "wls", "argmin", 1),
+    ("WLS + imatrix 零位，交替 3 轮（AngelSlim）", "wls", "incremental", 3),
+]:
+    d, qs, wssd = quantize(GROUPS, IM_GROUPS, scale_mode, zero_mode, rounds)
+    print(f"{name}: d={d:.4f} 加权SSD={wssd:.4f}")
+
+# 均匀重要性下两种零位规则是否一致
+d0 = 0.6
+same = all(
+    min(range(4), key=lambda j: abs(g[j]))
+    == min(range(4), key=lambda j: g[j] ** 2 - (abs(g[j]) - d0) ** 2)
+    for g in GROUPS
+)
+print(f"\n重要性全 1 时 argmin 与增量代价零位一致: {same}"
+      "（代价 2|x|d-d^2 随 |x| 递增）")
+
+# 贯穿示例：一组 4 个权重 (0.6, -0.1, 0.5, -0.7)，d=0.6
+x = [0.6, -0.1, 0.5, -0.7]
+d = 0.6
+z = min(range(4), key=lambda j: abs(x[j]))
+q = [0 if j == z else (1 if x[j] > 0 else -1) for j in range(4)]
+deq = [d * v for v in q]
+err = [abs(a - b) for a, b in zip(x, deq)]
+print(f"\n贯穿示例: x={x} -> q={q} (零在第 {z + 1} 位)")
+print(f"反量化={[round(v, 4) for v in deq]} "
+      f"逐元素误差={[round(e, 4) for e in err]} "
+      f"SSD={sum(e * e for e in err):.4f}")
+d_amax = max(abs(v) for v in x)
+ssd_a = sum((a - d_amax * b) ** 2 for a, b in zip(x, q))
+print(f"同一组用 amax d={d_amax}: SSD={ssd_a:.4f}")
+
+# 编码空间与字节账
+print(f"\n4 权重组合数: C(4,3)*2^3 = {4 * 8} = 2^5（5 bit 恰好装下）")
+index_bytes = 64 * 4 // 8
+sign_bytes = 64 // 8
+total = index_bytes + sign_bytes + 2
+print(f"256 权重: 索引 {index_bytes}B + 符号 {sign_bytes}B + fp16 scale 2B = {total}B")
+print(f"bpw = {total}*8/256 = {total * 8 / 256}")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">amax + argmin 零位（上游量化器）: d=1.1743 加权SSD=117.5101
+WLS + argmin 零位: d=0.5152 加权SSD=19.6010
+WLS + imatrix 零位，交替 3 轮（AngelSlim）: d=0.5381 加权SSD=17.7533
+
+重要性全 1 时 argmin 与增量代价零位一致: True（代价 2|x|d-d^2 随 |x| 递增）
+
+贯穿示例: x=[0.6, -0.1, 0.5, -0.7] -> q=[1, 0, 1, -1] (零在第 2 位)
+反量化=[0.6, 0.0, 0.6, -0.6] 逐元素误差=[0.0, 0.1, 0.1, 0.1] SSD=0.0300
+同一组用 amax d=0.7: SSD=0.0600
+
+4 权重组合数: C(4,3)*2^3 = 32 = 2^5（5 bit 恰好装下）
+256 权重: 索引 32B + 符号 8B + fp16 scale 2B = 42B
+bpw = 42*8/256 = 1.3125</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>quantize</code> 的 <code>scale_mode</code> 与 <code>zero_mode</code> 分别对应 4.1、4.2 的三种缩放选法与两种零位选法；<code>wssd</code> 即加权平方误差 $\sum w_i(x_i-dq_i)^2$。</p>
+<p><b>观察重点</b>：amax 的 $d=1.1743$ 被块内最大离群值钉死，加权 SSD 高达 117.51；换加权最小二乘后 $d$ 回到权重主体尺度（0.5152），误差降到 19.60；再换 imatrix 零位并交替 3 轮，进一步降到 17.75。改进的大头在缩放系数，零位选择是第二轮优化——这个比例关系与官方在真实权重上的结论一致。</p>
+<p><b>简化条件</b>：权重与 imatrix 都是固定种子的构造数据，不是真实模型权重和校准统计；只演示单个 256 权重块、概念上的连续分组（stride-16 是内核存储布局，与量化决策无关）；真实编码器面向整个专家矩阵逐块处理。官方在 1200 行真实专家权重上的测量是：仅最小二乘缩放使加权平方误差下降 89.7%，imatrix 零位再降剩余部分的 4.1%<sup>[N5]</sup>。</p>
+</details>
+
+<p>格式、布局、决策都确定后，剩下的问题是：这套设计在真实硬件上跑多快。</p>
+
+<h3 id="decisions-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>amax 选 $d$ 为什么差？</p>
+    <details>
+      <summary>解答：$d$ 被单个离群值钉死，其余权重一起承担被抬高的尺度</summary>
+      <p>amax 取块内 256 个权重中绝对值最大者作为 $d$，保证不溢出，但 $d$ 完全由一个离群值决定。手算对照：组 $(0.6,-0.1,0.5,-0.7)$ 用 amax 得 $d=0.7$，平方误差和 0.06；用贴合主体的 $d=0.6$ 则为 0.03。代码实测 256 权重块上 amax 的加权 SSD（117.51）约为加权最小二乘（19.60）的 6 倍。</p>
+    </details>
+  </li>
+  <li>
+    <p>加权最小二乘缩放与 imatrix 零位各自改进了什么、改进多少？</p>
+    <details>
+      <summary>解答：前者把 $d$ 拉回权重主体尺度，后者按重要性重选零位；官方数据为 -89.7% 与剩余的 -4.1%</summary>
+      <p>加权最小二乘直接最小化加权重建误差，$d=\sum w_i x_i q_i/\sum w_i q_i^2$，不再被离群值绑架；imatrix 零位按 $w_j(x_j^2-(|x_j|-d)^2)$ 的净收益选零位，重要性高的权重更可能被保留。官方在 1200 行真实专家权重上测得：仅换缩放就使加权平方误差降 89.7%，imatrix 零位再降剩余部分的 4.1%。两者交替 3 轮收敛。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="speed">5. 为什么快——SIMD 解码与实测</h2>
+
+<h3 id="speed-decode">5.1 解码不需要位重排</h3>
+
+<p>回顾「3:4 稀疏三值」一章的解码路径：查 16 项码本、按符号位翻转、乘 $d$。其中查表是一条 SIMD 指令完成的——码本 16 项恰好等于查表指令的索引上限<sup>[C5, C6]</sup>。stride-16 分组保证解码后的权重 lane 与顺序存储的激活对齐，读入激活后直接做整型点积<sup>[C8]</sup>。整条路径没有任何逐位拆解或数据重排，这正是 1.67-bit 的 3 路打包做不到的事。</p>
+
+<h3 id="speed-benchmark">5.2 实测数字</h3>
+
+<p>第一组实测来自 STQ1_0 内核的 PR：在 Apple M4 Pro 上，把同一个社区复现的 Sherry-1B checkpoint 统一转成 bf16 再分别量化为四种格式，纯 CPU 8 线程跑 llama-bench<sup>[C13, N2]</sup>（PR 未给出 Q1_0 的 bpw，表中以「—」表示）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>格式</th><th>bpw</th><th>体积</th><th>pp512（t/s）</th><th>tg128（t/s）</th></tr></thead>
+<tbody>
+<tr class="highlight-row"><td>STQ1_0</td><td>1.31</td><td>358.00 MiB</td><td>$732.69 \pm 20.00$</td><td>$147.47 \pm 1.36$</td></tr>
+<tr><td>TQ1_0（1.67-bit 三值）</td><td>1.69</td><td>401.50 MiB</td><td>$728.69 \pm 19.88$</td><td>$138.87 \pm 0.96$</td></tr>
+<tr><td>TQ2_0（2-bit 三值）</td><td>2.06</td><td>445.00 MiB</td><td>$689.25 \pm 16.61$</td><td>$175.06 \pm 1.30$</td></tr>
+<tr><td>Q1_0（1-bit 二值）</td><td>—</td><td>336.25 MiB</td><td>$768.47 \pm 14.75$</td><td>$109.62 \pm 16.93$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>逐对读这张表：相对同为三值的 TQ1_0，STQ1_0 体积小约 11%，decode（tg128）反而更快；相对 TQ2_0，体积小约 20%，decode 慢一些——按 TQ2_0 每权重整 2 bit 的编码结构推断，其解码可直接取符号位而无需查表，用存储换速度（推断，非来源结论）；这正是「三值量化的打包困境」一章的权衡在数字上的重现。相对 1-bit 的 Q1_0，STQ1_0 的体积只大 6%，tg128 高约 35%；且按论文结果，1-bit 二值配置相对 1.25-bit 三值有约 3 个百分点的精度差距<sup>[C13]</sup>。</p>
+
+<p>第二组是论文在 Intel i7-14700HX 上的端到端实测（QAT 后的模型）<sup>[C14, N3]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>规模</th><th>方法</th><th>bit/权重</th><th>速度（t/s）</th><th>体积（MB）</th></tr></thead>
+<tbody>
+<tr><td>0.7B</td><td>BF16</td><td>16</td><td>34.01</td><td>1360.0</td></tr>
+<tr><td>0.7B</td><td>I2_S（2-bit）</td><td>2.0</td><td>132.13</td><td>256.56</td></tr>
+<tr><td>0.7B</td><td>TL2（1.67-bit）</td><td>1.67</td><td>116.83</td><td>233.44</td></tr>
+<tr class="highlight-row"><td>0.7B</td><td>Sherry</td><td>1.25</td><td>148.27</td><td>205.50</td></tr>
+<tr><td>3B</td><td>BF16</td><td>16</td><td>7.55</td><td>6190.0</td></tr>
+<tr><td>3B</td><td>I2_S（2-bit）</td><td>2.0</td><td>41.87</td><td>873.65</td></tr>
+<tr><td>3B</td><td>TL2（1.67-bit）</td><td>1.67</td><td>38.80</td><td>846.01</td></tr>
+<tr class="highlight-row"><td>3B</td><td>Sherry</td><td>1.25</td><td>45.55</td><td>712.40</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>1.67-bit 的 TL2 再次慢于 2-bit 的 I2_S，而 Sherry 在 bit 最低的同时速度最快。精度方面，LLaMA-3.2 1B 上 Sherry 与 1.67-bit 的 SOTA 方法 Tequila 平均精度持平（0.519 对 0.519，五个零样本任务），bit 数少 25%；3B 上 0.567 对 0.576；在推理密集型的 ARC-Challenge 上 Sherry 两个规模都反超 Tequila<sup>[C14, N4]</sup>。在 Hy4 的官方算子对比中，STQ1_0 在 bit 最低的同时速度与 IQ1_M 基本持平、明显快于同样冲低比特的 IQ1_S<sup>[C15]</sup>。</p>
+
+<h3 id="speed-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>解码一个块需要哪几步，为什么不需要位重排？</p>
+    <details>
+      <summary>解答：查表、符号翻转、乘 $d$；16 项码本加 stride-16 分组让全程按通道并行</summary>
+      <p>解码三步：一条 SIMD 查表指令按 4-bit 索引从 16 项码本还原整组模式，按符号位做整体翻转，最后乘块级缩放系数 $d$。stride-16 分组使解码后的权重 lane 与顺序存储的激活一一对齐，激活一条加载指令读入后直接整型点积，全程没有逐位拆解或数据重排——1.67-bit 的 3 路打包正因为组大小 3 不是 2 的幂而做不到这一点。</p>
+    </details>
+  </li>
+  <li>
+    <p>STQ1_0 相对 TQ1_0、TQ2_0、Q1_0 的体积与速度如何？</p>
+    <details>
+      <summary>解答：比 TQ1_0 小约 11% 且 decode 更快；比 TQ2_0 小约 20%；比 Q1_0 大约 6% 但 decode 快约 35%</summary>
+      <p>M4 Pro 同一 1B 模型实测：STQ1_0 为 358 MiB、tg128 147.47 t/s；TQ1_0 为 401.5 MiB、138.87 t/s；TQ2_0 为 445 MiB、175.06 t/s；Q1_0 为 336.25 MiB、109.62 t/s。STQ1_0 在三值格式中体积最小，decode 快于 TQ1_0、慢于 TQ2_0（后者用存储换免查表）；相对 1-bit 的 Q1_0，以约 6% 体积换约 35% decode 速度和约 3 个百分点的精度优势。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="training-side">6. 训练侧的 weight trapping 与 Arenas——本页边界</h2>
+
+<p>Sherry 论文还有一半内容在训练侧，本页只给出最小说明并划定边界。论文观察到：硬性的 3:4 稀疏约束会让训练梯度同质化，权重分布退化成类似二值的形态，无法利用三值集合的表达能力，称为 weight trapping；用有效秩衡量，3:4 稀疏训练的梯度矩阵有效秩低于 750（总维度 4096），坍缩程度与二值量化相当<sup>[C12]</sup>。</p>
+
+<p>论文的对策是 Arenas（退火残差通路）：训练时给三值线性层并联一条带退火系数的全精度通路</p>
+
+<p>$$Y = X T \alpha + \lambda_t \cdot X W,$$</p>
+
+<ul>
+  <li>$T$：三值权重；$\alpha$：其缩放系数（即本页统一记的 $d$）。</li>
+  <li>$W$：全精度残差权重；$\lambda_t$：随训练进度退火、训练结束时为 0 的系数。</li>
+</ul>
+
+<p>残差通路把连续梯度注入反向传播，打破同质化；训练结束 $\lambda_t$ 退火为 0 后整条通路移除，推理时没有任何额外开销<sup>[C12]</sup>。</p>
+
+<div class="callout callout-blue">
+<p>边界声明：Hy4 轻量版使用 STQ1_0 格式，但走训练后量化（PTQ），不经过量化感知训练，因此不使用 weight trapping 分析与 Arenas 机制；其量化误差控制靠「量化决策」一章的编码器完成。Arenas 的调度方案与消融实验见论文（arXiv:2601.07892）。</p>
+</div>
+
+<h3 id="training-side-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>Sherry 论文的训练侧机制是什么，Hy4 轻量版用不用？</p>
+    <details>
+      <summary>解答：weight trapping 问题与 Arenas 退火残差通路；Hy4 走 PTQ，不使用</summary>
+      <p>论文发现硬性 3:4 约束导致训练梯度同质化、权重退化为类二值形态（weight trapping），对策是训练期并联一条带退火系数的全精度残差通路 $Y=XT\alpha+\lambda_t XW$，训练结束通路移除、推理零开销。Hy4 轻量版只在推理格式上使用 STQ1_0，量化由 AngelSlim 的训练后编码器完成，不经过量化感知训练，因此不涉及这两个训练侧机制。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<p>Sherry 论文 <em>Sherry: Hardware-Efficient 1.25-Bit Ternary Quantization via Fine-grained Sparsification</em>，arXiv:2601.07892v1（2026-01-12；其被 ACL 2026 接收一事出自 llama.cpp PR #22836 的述及，arXiv 页未标注）：C1 见 §2.1（三值约束定义）；C2 见 §2.3 与 §3.1（1.67-bit 打包的缺陷与速度）；C3 见 §2.3（理论下限 $\log_2 3 \approx 1.58$）；C4 见 §3.1（附录 A 给 5-bit 结构、附录 C 给 16 模式折算与 2:4 对比）；C5 见附录 A/C；C6 见 §3.1 与附录 C.1/C.2（LUT 约束、2:4 的 12 状态与稀疏加速单元限定）；C9/F4 见方法节与附录 D；C12 见方法与实验节；C14/N3/N4 见 Table 1、Table 4。llama.cpp PR #22836「ggml-cpu: add STQ1_0 ternary quantization with ARM NEON vec_dot kernel」：C5、C7、C8、C13、N2 见引言、Stride-16 节、Performance 节，TQ1_0 的 1.6875 bpw 亦出自其引言。HuggingFace AngelSlim/Hy4-preview-GGUF 模型卡（2026-08 读取）：C10、C11、F5、F6、N5 见「Our encoder」节。腾讯混元官方技术文章「Hy4 preview 轻量版」（2026-09-01）：C15 与 N6 中「1.5 TB / 214 GB」概数，其中算子速度对比仅作定性引用；N6 中文件名与 bpw 出自模型卡文件表。</p>
+
+<h3>公式与来源（F）</h3>
+<p>F1（$\binom{4}{3}\times 2^3=32$）：论文 §3.1（附录 A 给 5-bit 打包结构、附录 C 给 16 模式折算 $\binom{4}{3}\times 2^{3-1}=16$ 即 F2），组合计数可直接复算。F3（42 字节账）：由 PR #22836 与模型卡给出的布局描述直接换算。F4（平均绝对值缩放）：论文方法节，附录 D 给出 L2 最优性证明；本页写为组内形式，论文原文按输出通道给出，二者同义。F5、F6（加权最小二乘缩放、imatrix 增量代价零位）：模型卡「Our encoder」节原文公式。</p>
+
+<h3>外部数字与实验条件（N）</h3>
+<p>N1：42 字节/256 权重、1.3125 bpw，格式定义（PR #22836、模型卡）。N2：M4 Pro（12 核、24GB）llama-bench，社区复现 Sherry-1B checkpoint 统一转 bf16 后量化，纯 CPU（-ngl 0）8 线程（PR #22836 Performance 表）。N3：i7-14700HX 端到端速度（论文 Table 4）；3B 的 18% 加速为论文 §4.2 原文，0.7B 的约 27% 由 Table 4 数字复算。N4：LLaMA-3.2-1B/3B，UltraFineWeb 10B tokens QAT，PIQA/ARC-E/ARC-C/HellaSwag/WinoGrande 五任务零样本平均，3 次运行（论文 Table 1 及其实验节）。N5：1200 行真实 Hy4 专家权重上的加权平方误差对比（模型卡）。N6：Hy4-preview-STQ1_0.gguf 213.66 GiB、平均 2.38 bpw（模型卡文件表；整模为混合精度，STQ1_0 仅用于其中部分层）；「1.5 TB 压到约 214 GB」概数与 770B 参数规模出自混元官方文章与模型卡。</p>
+
+<h3>构造示例</h3>
+<p>「3:4 稀疏三值」与「量化决策」两章的手算组 $x=(0.6,-0.1,0.5,-0.7)$ 与 $d=0.6$：为便于复算而构造，用于展示编码与缩放系数对误差的影响，不代表真实权重分布。「量化决策」一章代码中的 256 个伪随机权重与伪随机 imatrix：固定种子构造，用于对比三种量化决策的误差方向，其数值不可外推到真实模型。</p>
+
+<h3>简化条件及其限制</h3>
+<p>本页的量化演示以单个 256 权重块为单位、按概念上的连续分组进行；真实编码器面向整个专家矩阵逐块处理，内核存储按 stride-16 分组（不影响量化决策结论）。代码中的 imatrix 为构造数据，真实 imatrix 来自校准集统计，因此代码误差数字只说明方向，官方测量以 N5 为准。M4 Pro 与论文 CPU 的速度数字绑定各自硬件与线程条件，不可跨硬件直接比较。N4 的精度结论在 QAT 条件下成立；PTQ 场景的精度表现取决于编码器质量（「量化决策」一章）与逐层比特分配（见 MIX-STQ1_0 页），不能由本页数字直接推出。</p>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>逐层混合精度量化 · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 推理系统</span>
+      <h1>逐层混合精度量化（MIX-STQ1_0）</h1>
+      <p class="lead">推理量化中按层（或张量族）分别指定比特档位的策略：固定平均比特预算，把比特从耐压的层挪给敏感的层，体积几乎不变而整体误差更低。与训练语境的 FP16/BF16「混合精度」只是同名。</p>
+      <p class="meta">更新于 2026-09-01</p>
+    </header>
+
+    <h2>问题背景</h2>
+    <p>把一个大模型压到 2 bit 量级，最省事的做法是所有层用同一档格式，但这隐含「各层对量化误差的耐受度相同」的假设——它通常不成立。两层两档的构造示例可以说明：平均 bpw 相同的两个分配方案，总误差可以差 2.5 倍。Hy4 preview 轻量版（约 1.5 TB 压到 213.66 GiB）的 MIX-STQ1_0 就是逐层分档策略的实例：对照方案 UD-IQ1_M 的专家低档止步于 IQ1_M（1.75 bpw），MIX-STQ1_0 把低档压到 STQ1_0（1.3125 bpw），省下的比特按敏感度加给需要的层。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li><b>预算视角</b>：决策变量是每层的量化档位，约束是平均 bpw（决定文件体积），目标是最小化整体量化误差；预算不变时，分配方向本身决定误差。</li>
+      <li><b>敏感度来自校准</b>：imatrix（重要性矩阵）是用校准文本在浮点模型上前向统计的逐权重重要性；它同时服务于 STQ1_0 编码器的缩放与零位决策（见 <a href="../sherry-ternary-quant/index.html">Sherry 稀疏三值量化</a>）和层档位推导。</li>
+      <li><b>Hy4 配方</b>：占参数 97.7% 的路由专家 gate/up 按 imatrix 分成 29 层 STQ1_0（1.3125 bpw）与 48 层 IQ2_XXS（2.0625 bpw），平均 1.78 bpw；down 投影直写残差流、误差不被后续门控衰减，刻意高两档用 IQ3_XXS；注意力 Q5_K、MLA 分量 Q8_0，DSA 索引器、router、norms 等小体量张量保持 F32。</li>
+      <li><b>不只看敏感度</b>：down 的高档是结构性理由（残差流位置），注意力与 MLA 的高档源于 llama.cpp 自动提档逻辑不覆盖 256 专家与拆分命名，关键小张量按功能保留精度。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>整模 213.66 GiB（2.38 bpw），小于 UD-IQ1_M 的 219.83 GiB（2.44 bpw），约为 Q4_K_M（435.20 GiB、4.86 bpw）的一半；路由专家平均 1.78 bpw（可由层数与档位复算），官方称该方案比 UD-IQ1_M 节省 5 GB 以上存储空间。</li>
+      <li>厂商自报评测与 BF16 差距一两分内（MCPAtlas 83.7 到 83.2、SWE-Bench 多语言 82.9 到 81.3、MRCR 81.3 到 81.1、IFBench 73.5 到 72.5），保留率 98.1%–99.8%；厂商自报、单次运行、无第三方复现。</li>
+      <li>策略只决定「每层用哪个格式」：不解决单层编码质量（STQ1_0 编码器职责）、不做通道级分配、不处理激活量化；结论依赖校准代表性与运行时格式支持（hyv4 与 STQ1_0 均需补丁）。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>

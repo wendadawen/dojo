@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sherry 稀疏三值量化 · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 推理系统</span>
+      <h1>Sherry 稀疏三值量化（STQ1_0）</h1>
+      <p class="lead">一种带 3:4 稀疏约束的三值权重量化格式：每 4 个权重恰好一个零，使 4 个权重恰好用 5 bit 编码——平均 1.25 bit/权重，同时对齐 SIMD 硬件，解决了三值量化「小的不快、快的不小」的打包困境。</p>
+      <p class="meta">更新于 2026-09-01</p>
+    </header>
+
+    <h2>问题背景</h2>
+    <p>三值量化把权重压到 $\{-d, 0, +d\}$ 三个取值，理论存储下限约每权重 1.585 bit，但这个数不是 2 的幂，装进字节时必须在两条烂路里选一条：2-bit 对齐打包每权重比理论下限多花约四分之一；1.67-bit 不规则打包（3 个权重压进 5 bit）组大小 3 与 SIMD 通道数冲突，解码要逐位重排，实测比 2-bit 还慢。Hy4 preview 轻量版（1.5 TB 压到约 214 GB）用 Sherry 这套格式（落地名 STQ1_0）把其中最激进的一档权重压到平均约 1.25 bit（落到文件约 1.31 bpw）。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li><b>3:4 稀疏约束</b>：每 4 个权重中恰好一个为零，其余三个取 $\pm 1$。合法组合从 $3^4=81$ 压到 $\binom{4}{3}\times 2^3=32=2^5$，5 bit 编码零浪费，平均 1.25 bit/权重。</li>
+      <li><b>4 bit 索引 + 1 bit 符号</b>：利用镜像对称，32 种组合配成 16 对，4 bit 索引查 16 项码本（恰好填满 SIMD 查表指令的索引上限），1 bit 控制整体符号翻转。</li>
+      <li><b>块级缩放</b>：每 256 个权重共享一个 fp16 缩放系数，文件布局为 32B 索引 + 8B 符号 + 2B 缩放 = 42 字节，合计 1.3125 bpw。</li>
+      <li><b>stride-16 分组</b>：内核按 $w_0, w_{16}, w_{32}, w_{48}$ 取组，使解码后的权重 lane 与顺序存储的激活天然对齐，查表加点积即可完成解码，无需位重排。</li>
+      <li><b>量化决策</b>：误差大小由缩放系数与零位选择决定；AngelSlim 的训练后编码器用加权最小二乘缩放加 imatrix 零位（替代上游的 amax 加 argmin），在真实专家权重上把加权平方误差压低约九成。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>M4 Pro 实测同一 1B 模型：STQ1_0 比 TQ1_0（1.67-bit）体积小约 11% 且 decode 更快；比 TQ2_0（2-bit）小约 20%；论文 CPU 实测比 1.67-bit 基线快（0.7B 按 Table 4 复算约 27%，3B 官方为 18%）；精度上 1B 与 1.67-bit SOTA 持平（0.519 对 0.519），3B 略低（0.567 对 0.576）（QAT 条件下）。</li>
+      <li>「1.25 bit」是纯权重编码，文件实际开销为 1.3125 bpw（含缩放摊销）。</li>
+      <li>Sherry 论文还包含训练侧机制（weight trapping 与 Arenas 退火残差通路），但 Hy4 轻量版走训练后量化，只使用格式与编码器，不涉及训练侧内容。</li>
+      <li>该格式只解决单层的比特表示；各层分别压到多少比特属于逐层混合精度问题，见 <a href="../mixed-precision-quant/index.html">MIX-STQ1_0 逐层混合精度量化</a>。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
