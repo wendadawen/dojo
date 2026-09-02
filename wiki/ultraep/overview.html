@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="UltraEP 论文概览：首个面向机架级节点上大规模专家并行 MoE 训练与 serving prefill 的精确负载实时均衡器，用配额耦合副本创建与 token 重路由，训练达强制均衡 ideal 的 94.6%、prefill 93.9%。">
+  <meta name="dojo:summary" content="按历史负载周期性搬专家跟不上真实漂移。UltraEP 用配额 $u_{e,r}$ 把「建不建副本」与「接多少 token」并成一个变量，二分最小可行阈值 $\tau$ 直接优化重路由后的负载上界；搬运侧用 persistent tile streaming 与 $\sqrt{|\mathcal{H}(e)|-1}$ 宽度的 chunk 中继。训练达强制均衡 ideal 的 94.6%、prefill 93.9%，热路径开销占总延迟 1.8%。">
+  <meta name="dojo:type" content="paper">
+  <meta name="dojo:topics" content="并行与通信,推理系统,模型结构">
+  <meta name="dojo:tag" content="MoE 专家并行负载均衡">
+  <title>UltraEP · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整解析 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">论文概览 · MoE 专家并行负载均衡</span>
+      <h1>UltraEP：机架级节点上的精确负载实时专家均衡</h1>
+      <p class="lead">大规模专家并行下，按历史负载周期性搬专家跟不上真实的负载漂移。UltraEP 把均衡搬到 gating 之后的关键路径上，每个 microbatch、每一层都用精确负载重新规划一次。</p>
+      <p class="meta"><a href="https://arxiv.org/abs/2606.04101v3">arXiv:2606.04101v3</a> · Xinming Wei 等，北京大学计算机学院等 · 论文 v3 提交于 2026-06-18 · 本页更新于 2026-09-01</p>
+    </header>
+
+    
+<h2>论文做了什么</h2>
+
+<p>混合专家（MoE）模型把每层的前馈网络拆成许多个专家，每个 token 只激活其中少数几个。专家并行（EP）把这些专家分散到多块 GPU 上，token 按路由结果经 all-to-all 通信送到承载所选专家的那块卡。基础机制见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。</p>
+
+<p>代价是负载不均衡：token 在专家之间分布不均，各 rank 分到的 token 数量差别很大，而 rank 之间每层都要同步、整步耗时由最慢的那个决定。论文把后果写成三条——计算拖尾、token all-to-all 瓶颈、超载设备上的活跃内存尖峰，且随 EP 度数增大而复合放大。</p>
+
+<p>已有做法是复制热专家。EPLB 是被广泛部署的实现，常见部署用最近几个批次的路由历史估计负载、每隔若干步重新均衡一次，以此把规划与搬运的开销摊薄。UltraEP 质疑的正是这个「历史加周期」的组合：它不做预测，直接用 gating 算完后立即可得的真实负载，每个 microbatch、每一层重新规划一次，把均衡操作放在关键路径上。覆盖范围是训练与 serving prefill，不含 decode——论文的理由是 decode 受访存限制，计算侧不均衡的影响被访存延迟稀释。</p>
+
+<h2>主要贡献</h2>
+
+<ul>
+<li><b>从预测式转向精确负载。</b>已有方案用历史统计在 gating 之前把布局算好，代价是预测误差；UltraEP 用 gating 之后的真实负载，代价是规划与专家状态搬运落在关键路径上。论文的观察是前沿 MoE 模型上专家热度在批次、层与数据域之间快速漂移，历史统计不仅跟不上，还可能让不均衡变差、制造新的拖尾点。</li>
+<li><b>用配额把复制与重路由并成一个问题。</b>已有系统先决定副本放哪、再用 round-robin 之类的启发式分流，优化的是重路由之前的专家热度；UltraEP 直接求解每个专家实例最终承接的负载配额，优化对象因此是重路由之后各 rank 的总负载——也就是真正决定耗时的那个量。</li>
+<li><b>为不规则的专家搬运定制 RSN 通信。</b>均衡流量是运行期自适应的稀疏传输图，静态集合通信支撑不好，瓶颈从链路带宽转到控制路径开销。UltraEP 把权重与梯度切成 tile 交给常驻的 persistent kernel 流式搬运，并为副本很多的热专家构建两级 chunk 中继树。</li>
+<li><b>内存布局让「每层重搬」在预算上成立。</b>冗余槽不保存优化器状态、权重与梯度 buffer 跨层复用，把单个冗余槽的开销压低到几十 MB 量级。</li>
+</ul>
+
+<h2>方法概述</h2>
+
+<p><b>可行的前提是机架级节点。</b>标准 RDMA 集群的高带宽 scale-up 域只覆盖单台 4 卡或 8 卡服务器，跨机要走带宽低一个量级的 scale-out 网络；EP64 必然跨机，论文判断在热路径上搬大量专家状态不实用。机架级节点（RSN）把 scale-up 域扩到整机架、通常 64 张卡以上，一个 EP 组可以整体留在这个高带宽域内，热路径均衡才物理可行。相关的带宽与访问方式见 <a href="../gpu-communication/index.html">GPU 通信</a>。论文同时强调 RSN 是必要不充分——还剩控制面的决策窗口与数据面的不规则搬运两个问题。</p>
+
+<p><b>专家布局。</b>每个 rank 有固定数量的主槽与冗余槽：主槽承载某逻辑专家的原始实例并保留完整的权重、梯度与优化器状态；冗余槽放一份副本或留空，不存优化器状态、且权重与梯度 buffer 跨层共享。UltraEP 只复制、从不重排主专家，理由是大 EP 下每 rank 只剩两到四个本地主专家，重排的边际收益递减而状态迁移代价可观。反向结束后每个主专家把所有副本贡献的梯度归约回自己的梯度 buffer，优化器只在主专家上更新，因此训练语义与不做均衡时一致。</p>
+
+<p><b>配额规划。</b>配额是分配给某个专家实例的最终 token 负载。它一个变量绑住两件事：大于零意味着这里要有一份实例，数值本身则是这份实例接多少流量。求解方式是二分搜索最小可行的负载阈值，每次探测跑一个贪心可行性判定——按残余超额降序访问超载 rank、按总负载降序访问其主专家，把负载转给空闲最大的合法目标 rank，单次转移量低于配额下限就不接受。被接受的转移同时创建副本并写下它的配额，于是放置本身已经编码了有效的流量容量。重路由随后只负责把配额拆分到各源 rank，并优先让本地 token 消费本地配额以减少跨 rank 流量；这一步只改变哪个源消费某个配额、不改变配额本身，因此不破坏已解出的阈值。整个求解在 GPU 上完成，用单个流式多处理器上的一个协作线程块跨 warp 评估多个阈值探测。</p>
+
+<p><b>通信执行。</b>权重与梯度切成固定大小的 tile，规划结果编译成常驻设备的搬运任务；persistent kernel 的线程块反复取下一个 tile 并对共享内存双缓冲，把任务查表、地址翻译与同步折进流水线。线程块数量按重叠窗口调整：前向关键路径多给以吃满带宽，被重叠的反向路径则限制 SM 占用。副本数超过阈值的热专家改走两级中继，中继集合的宽度近似取 $\sqrt{|\mathcal{H}(e)|-1}$（$|\mathcal{H}(e)|$ 为含主实例的实例数）以平衡两级；中继按连续 tile 组成的 chunk 转发，收到一个 chunk 就立刻发给叶子，两级因此流水线化、不引入全局屏障。相关的 tile、persistent kernel 与共享内存概念见 <a href="../gpu-execution-model/index.html">GPU 执行模型</a>。</p>
+
+<h2>关键结论</h2>
+
+<ul>
+<li><b>训练达到强制均衡上界的 94.6%，prefill 达到 93.9%。</b>「强制均衡」是论文构造的上界基线，做法是改掉 router 让 token 均匀分到各专家。这两个数是平均值：训练三个模型分别为 96.4%、91.2%、96.1%，prefill 区间是 90% 到 97%。摘要中的 94.3% 是这两项的总平均。实验条件为公有云 RSN 集群、每机架 64 卡、bf16，训练用 2 或 4 个机架、prefill 用 1 个机架。</li>
+<li><b>相对基线的提升要看清基线。</b>摘要的 1.49 倍是相对「完全不做均衡」、训练与 serving 的平均；训练相对 Megatron-LM 是 1.42 倍，prefill 相对 SGLang 是 1.56 倍、相对 EPLB 是 1.29 倍。均衡后的 rank 级不均衡度从 1.30 到 4.01 降到 1.01 到 1.04。</li>
+<li><b>热路径开销只占总延迟 1.8%。</b>在 Qwen3-235B-A22B 训练上按 MoE 层分解，UltraEP 的非 MoE 部分相对上界基线前向只多 0.33 ms、反向可忽略。剩余与上界的差距主要落在 token all-to-all（前向高 33%），论文的归因是真实路由本身的不均匀，而不是残余不均衡或均衡开销——因此不能把不均衡度 1.01 直接读成「吞吐只差 1%」。</li>
+<li><b>配额求解相对强化基线更好也更省。</b>论文构造了 EPLB$+$ 基线（喂精确负载、保留 EPLB 的规划与 round-robin 重路由、换上 UltraEP 的通信）来隔离规划算法本身的贡献。模拟均值上，结果不均衡 1.03 对 1.19，求解耗时省 27.4%，消耗的冗余槽数少 57.9%。</li>
+<li><b>专家权重分发相对主流通信后端快 3.1 到 5.5 倍。</b>对照对象是 torch.distributed 的批量 send/recv 与调优后的 DeepEP，条件为 Qwen3-235B、EP64。随着 fan-out 增长，UltraEP 维持在约 0.28 ms 近乎恒定，无中继变体则线性上升。</li>
+<li><b>活跃内存峰值也被压平。</b>不做均衡时 MoE 活跃内存峰值相对上界基线在训练中高 2 倍、serving 中高 11 倍，UltraEP 把它降到接近上界。注意两者口径不同：训练侧关闭了活跃值重计算并取初期高倾斜阶段的峰值，serving 侧只含当前层的瞬时活跃值。</li>
+<li><b>生产训练维持 92% 以上。</b>内部模型 RefMoE-288B-A16B 在 EP32 下相对不做均衡平均增益 9.6%，loss 曲线符合预期的预训练轨迹。这是单模型、单配置的结果，且两个参照点都是采样估计。</li>
+</ul>
+
+<p>机制细节、公式推导、可复算的配额求解示例与完整实验对照见 <a href="index.html">完整解析</a>。</p>
+
+
+    <footer>Dojo · 概览 · 机制细节见完整解析页</footer>
+  </main>
+</body>
+</html>

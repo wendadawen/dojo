@@ -1,0 +1,2137 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="gSjlBjH1SVXR7KIcDByjH0">
+<head data-page-node-id="gHSzrQPT6l27A1Rl0cmpTz">
+  <meta charset="UTF-8" data-page-node-id="9GPrYifVMgRjWDYlmTzfbL">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="3KeYWTPL1QxwHO5JUGGp7W">
+  <meta name="description" content="UltraEP 是首个面向机架级节点上大规模专家并行 MoE 训练与 serving prefill 的精确负载实时均衡器。它用配额把副本创建与 token 重路由耦合成一个变量，在 gating 之后的关键路径上每个 microbatch 每一层重新规划，并用 persistent tile streaming 与 chunk streaming relay 执行不规则的专家状态搬运。" data-page-node-id="B4CBEESI2KrmfpxupAYw6B">
+  <meta name="dojo:summary" content="按历史负载周期性搬专家跟不上真实漂移。UltraEP 用配额 $u_{e,r}$ 把「建不建副本」与「接多少 token」并成一个变量，二分最小可行阈值 $\tau$ 直接优化重路由后的负载上界；搬运侧用 persistent tile streaming 与 $\sqrt{|\mathcal{H}(e)|-1}$ 宽度的 chunk 中继。训练达强制均衡 ideal 的 94.6%、prefill 93.9%，热路径开销占总延迟 1.8%。" data-page-node-id="p0hoo4RnlZAPa4FoPJtgoZ">
+  <meta name="dojo:type" content="paper" data-page-node-id="hwLxZU1MtQMYml7D9X3mKu">
+  <meta name="dojo:topics" content="并行与通信,推理系统,模型结构" data-page-node-id="IOkzUzf8bneBFLmeqelGJh">
+  <meta name="dojo:tag" content="MoE 专家并行负载均衡" data-page-node-id="YO8pK6crvljEVpLyEcZ0Ib">
+  <title>UltraEP：用配额驱动的实时规划在机架级节点上做精确负载专家均衡</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css" data-page-node-id="6Kb4OS2VW407USLhbvSSJe">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light" data-page-node-id="71itQRXWJVWK6zYF23dnoW">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled data-page-node-id="ZZPB4LIIBWovmyRJRGUX0p">
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+    /* ============ 学习目标与误解提示 ============ */
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body data-page-node-id="EvOPr4IF5dXkvkc1FmO5lw">
+
+<div class="progress-bar" id="progress" data-page-node-id="1WK2H9DYPOshmpVDtKqIGZ"></div>
+
+<nav class="nav" data-page-node-id="TjqWBuNMdCG16Ou62ulsst">
+  <div class="nav-inner" data-page-node-id="HQjUoCxZFhFuIn1SKOuw4G">
+    <span class="nav-brand" data-page-node-id="wWkZ36YcyTqhK3COk2aVjc">UltraEP</span>
+    <div class="nav-links" data-page-node-id="ccYGzqz67ftSBbWxktmy51">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页" data-page-node-id="SLNKkIJHlED7fUpKjBj6dA">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览" data-page-node-id="BD8VWfS9BOS8nrYSIZKy4g">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题" data-page-node-id="YLAKjQDuloNdNcPZXKPjDJ">
+        <span class="icon-moon" data-page-node-id="AZfGWprkmsYGj5sqTcZpFx">◐</span>
+        <span class="icon-sun" data-page-node-id="SsH78Jz1Syf4y60Rml2W5X">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc" data-page-node-id="KOWGOZw7x1FYBCMKygmFT8">
+  <div class="toc-title" data-page-node-id="OuF1MD8vv4I7XpWotqMXQB">目录</div>
+  <ul id="tocList" data-page-node-id="KTwqn8goihkmUl7SuPPm0z"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox" data-page-node-id="D1w1WU78PBLXLPXOWDhdDH">
+  <img id="lightboxImg" src="" alt="" data-page-node-id="GBqteqN1vEgzvHFTFXWROT">
+  <div class="lightbox-caption" id="lightboxCaption" data-page-node-id="LQM1nMM38iPlc8izqWZ12L"></div>
+</div>
+
+<h1 class="title" data-page-node-id="7sbZDfHOxog4FPySp6SbVy">UltraEP：用配额驱动的实时规划在机架级节点上做精确负载专家均衡</h1>
+<p class="reading-time" id="readingTime" data-page-node-id="ImNTPf45u7z1VFBUOYGStC"></p>
+
+<blockquote class="meta" data-page-node-id="6yhPIWwmpmVxtczRF7CPKE">
+<p data-page-node-id="QI3sG1pt3Ecl3qJUkydbFC"><b data-page-node-id="yQZaWtGQ6HRb1lGNhgSFV8">论文</b>：UltraEP: Unleash MoE Training and Inference on Rack-Scale Nodes with Near-Optimal Load Balancing</p>
+<p data-page-node-id="QdC2ylzVZdrkWEmx7DxjMu"><b data-page-node-id="wyxNADyi3KPdsWx8NuQei5">作者</b>：Xinming Wei, Chao Jin, Tuo Dai, Yinmin Zhong, Shan Yu, Chengxu Yang, Bingyang Wu, Zili Zhang, Jing Mai, Qianchao Zhu, Zhouyang Li, Yuliang Liu, Guojie Luo；北京大学计算机学院、小红书、上海人工智能实验室及独立研究者</p>
+<p data-page-node-id="U2yM027vQs7TErmWDebC7G"><b data-page-node-id="N0SOnOfNoG6IDbCsM2tZgX">发表</b>：arXiv 预印本，2026，v3（2026-06-18 提交，v1 与 v2 已由作者撤回）</p>
+<p data-page-node-id="K47QPQZdZzKEIluTUU24Nc"><b data-page-node-id="KaTKwt1G33kEJ017Y4v8cG">链接</b>：<a href="https://arxiv.org/abs/2606.04101v3" data-page-node-id="cE4xwQk3sKl80NckkhoGfN">https://arxiv.org/abs/2606.04101v3</a></p>
+</blockquote>
+
+<p data-page-node-id="ZEhYDOyqGOgvxPoOpqsJMK">混合专家（Mixture-of-Experts，MoE）模型把每层的前馈网络拆成许多个专家，每个 token 只激活其中少数几个。专家并行（expert parallelism，EP）把这些专家分散到多块 GPU 上，token 按路由结果经 all-to-all 通信被送到承载所选专家的那块卡。MoE、router、top-$k$ 稀疏激活、专家并行与 all-to-all 的基础机制见 <a href="../moe-serving/index.html" data-page-node-id="YNljdxyKsD2KoDx5BVHNtP">MoE 大模型推理与服务基础</a>。</p>
+
+<p data-page-node-id="jCsT3W45ygXB3sRvG7HWfE">这套做法的代价是负载不均衡。token 在专家之间分布本来就不均匀，专家又被分散到不同 rank 上，于是各 rank 分到的 token 数量差别很大。rank 之间每层都要同步，整步耗时由最慢的那个决定。论文把这件事的后果写成三条：计算拖尾（straggler）、token all-to-all 瓶颈、超载设备上的活跃内存尖峰；EP 度数越大，这三者越复合放大（§1）。</p>
+
+<p data-page-node-id="DnqfDEnK9Hr7pRUZny1gA1">已有的应对办法是复制热专家：把负载高的专家在多块卡上各放一份副本，让 token 分摊过去。EPLB 是被广泛部署的实现，它按给定负载算出一份专家布局；常见部署会用最近几个批次的路由历史来估计负载、每隔若干步重新均衡一次，以此把规划与搬运的开销摊薄（§1）。</p>
+
+<p data-page-node-id="gyW0Lg1NpuIMaMKJDYp93J">UltraEP 质疑的是这个「历史 + 周期」的组合。它的做法是：不预测，直接用 gating 算完后立即可得的真实负载，每个 microbatch、每一层都重新规划一次，把均衡操作放在关键路径上。能这么做的前提是机架级节点（rack-scale node，RSN）把高带宽的 scale-up 域从单台 4/8 卡服务器扩展到整个机架，一个 EP 组可以整体装进这个域内。</p>
+
+<section class="learning-goals" data-page-node-id="LFGCm2FyzY0WDsKmjvHsmC">
+  <h2 data-page-node-id="zO5B0r42ydWDpupH8HWFgO">核心问题</h2>
+  <ol class="chapter-questions" data-page-node-id="cYsQ8834612kHfNvDPj0XM">
+    <li data-page-node-id="hl7BGFAanlMFts79VreqEy">
+      <p data-page-node-id="QRt50zXh0imWRPsFIPYHvc">为什么按历史负载周期性均衡，在前沿 MoE 模型上会失效？</p>
+      <details data-page-node-id="Z5LkBRkeufYyEuTonnYAYc">
+        <summary data-page-node-id="sJnZ1sOzBbCemCoyU7EU7B">解答：专家热度在批次、层与数据域之间快速漂移，而大 EP 让每个 rank 只剩两到四个主专家，专家级抖动直接变成 rank 级倾斜</summary>
+        <p data-page-node-id="LpfqOlzK1Vr7KcEmv2CVIm">论文在训练和 serving prefill 两侧都观测到非平稳的负载。prefill 侧，专家热度随语义域（science、coding、mixed）剧烈变化，同一域内热专家也逐批漂移，mixed 输入还会叠加多种路由模式（§3）。训练侧，初期路由尚未特化因而不稳定；后期虽然平均分布变平滑，但辅助损失的负反馈持续重调专家利用率，即便 DeepSeek 式的路由 bias 补偿也不能消除振荡，microbatch 之间还有采样随机性带来的抖动（§3）。</p>
+        <p data-page-node-id="wwoTA16xsgsPvHAlxfZamh">放大机制在于大 EP：EP 度数越大，每个 rank 承载的主专家越少（论文说常为两个或四个），一个专家变热就没有同 rank 的其他专家来摊薄，于是专家级的路由动态直接转成明显的 rank 间倾斜（§3）。此时用旧统计算出的布局会双向失准——按旧热度建的副本收不到流量，新变热的专家却没有副本，论文因此观察到 EPLB 甚至会加剧不均衡、制造新的尖峰与 straggler。完整论证见第 1 章。</p>
+      </details>
+    </li>
+    <li data-page-node-id="Mt2SSrItJ4Z0hQA48yWi3H">
+      <p data-page-node-id="DJ87rCJJNe6Ufat9GvlfWT">精确负载只在 gating 之后才能拿到，为什么这件事在机架级节点上才变得可行？</p>
+      <details data-page-node-id="I6rYEeysEPEifjy8YcYYMB">
+        <summary data-page-node-id="iARC4iWXpj5Jdo1JvmcHm4">解答：精确负载迫使规划与专家状态搬运进入关键路径，只有 scale-up 域覆盖整个 EP 组时这份搬运才搬得完</summary>
+        <p data-page-node-id="rpNyfcZpySoAS6pO1DP848">gating 算完才知道本次每个 token 选了哪些专家，因此基于精确负载的均衡操作必然落在关键路径上：前向要把主专家权重搬到远端副本，训练的反向还要搬梯度或优化器状态（§1）。标准 RDMA 集群里高带宽 scale-up 只覆盖单台 4 卡或 8 卡服务器，跨机要走带宽低得多的 scale-out；EP64 必然跨机，论文的判断是在热路径上跨多机搬大量专家状态代价过高、不实用（§1）。</p>
+        <p data-page-node-id="i9zLj6YvzqNNKPccM1Ag2M">RSN 把 scale-up 域扩到整机架、通常 64 张卡以上，机架内跨服务器的 GPU 仍由机架级 scale-up fabric 直连，每卡带宽达数百 GB/s 且具备 load/store 内存语义（§2.1）。一个 EP 组可以整体留在这个域内，热路径均衡才在物理上成立。但论文明确 RSN 是必要不充分：控制面要在 gating 与 token dispatch 之间的短窗口里出高质量决策，数据面要执行静态集合通信支撑不好的不规则、易变搬运，缺乏协同设计时这些开销容易把均衡收益抹掉（§1、§4.4）。完整论证见第 2 章。</p>
+      </details>
+    </li>
+    <li data-page-node-id="diSO25CJ76UBjFK5YnseME">
+      <p data-page-node-id="AOFxxGWk3OF3T1ZG7FYZn6">配额求解为什么比「先定副本、再用 round-robin 分流」既均衡得更好、又更省资源？</p>
+      <details data-page-node-id="grCPv3giZhkZU4gBeh3KSW">
+        <summary data-page-node-id="pPAnNeLgnBaPQH0Ov1YtNP">解答：配额同时回答「建不建副本」与「建了接多少 token」，因此优化的直接对象是 reroute 之后的负载上界</summary>
+        <p data-page-node-id="6SCRZjtgQGwa1397aQAYQB">配额 $u_{e,r}$ 的定义是某个专家实例最终承接的 token 负载。它一个变量绑住两件事：$u_{e,r}>0$ 意味着 rank $r$ 上要有 $e$ 的物理实例，数值本身则是该实例的流量。UltraEP 二分搜索最小可行阈值 $\tau$，每次探测跑一个贪心可行性判定：按残余超额降序访问超载 rank、按总负载降序访问其主专家，把负载尽量多地转给空闲最大的合法目标 rank，单次转移量不足 $u_{\min}$ 就不接受（§5.1）。因为放置本身已经编码了有效的流量容量，副本只在能带来足够均衡收益时才被实体化。</p>
+        <p data-page-node-id="J96QSYZkQnE9RH552LW30D">EPLB 家族优化的是 reroute 之前的热度，副本建了却可能收不到多少流量，reroute 交给独立启发式（如 round-robin）时也不保证各 rank 总负载相等。论文的模拟均值对照是：结果不均衡 1.03 对 1.19，求解耗时 0.111 ms 对 0.153 ms（省 27.4%），消耗的冗余槽数 45 对 107（少 57.9%），在飞 token 占比从 99.9% 降到 96.0%（Table 3）。完整论证见第 4 章。</p>
+      </details>
+    </li>
+    <li data-page-node-id="2EWIOJOhuGRltDGbV5wKtb">
+      <p data-page-node-id="yvibckGYapmzcClrZBDZoS">每个 microbatch、每一层都重新搬一遍专家权重，为什么没把均衡收益吃掉？</p>
+      <details data-page-node-id="XAhzYFrHzAftuYcPoyxgwE">
+        <summary data-page-node-id="Z25R6DxwA4LEcLVyqQwIN9">解答：内存上靠冗余槽跨层复用把单槽压到几十 MB，时间上靠 tile 流水线与 chunk 中继把搬运压到亚毫秒</summary>
+        <p data-page-node-id="pkmF22cxB82GJoDhu9KvZG">三件事共同成立才划得来。内存侧，冗余槽不保存优化器状态、权重与梯度 buffer 跨层共享，Qwen3-235B-A22B（94 个 MoE 层、128 专家）下单个冗余槽从 3.3 GB 权重加 6.6 GB 梯度降到每 rank 36 MB 加 72 MB（§4.1）；代价是前向关键路径上多出逐层权重实体化的紧期限。通信侧，权重与梯度切成固定大小 tile 编译成常驻设备的搬运任务，persistent kernel 的线程块反复取下一个 tile 并对共享内存双缓冲，把任务查表、地址翻译与同步折进流水线（§6.1）；副本数超过 4 的热专家改走两级中继，中继前沿取在 $\sqrt{\lvert\mathcal{H}(e)\rvert-1}$ 附近，按连续 tile 组成的 chunk 流式转发而不设全局阶段屏障（§6.2）。</p>
+        <p data-page-node-id="SbLkL0Ll7nXcrYaHIJCvO1">实测结果（Figure 13，Qwen3-235B-A22B 训练，单层平均）：非 MoE 部分相对强制均衡的 ideal 前向只多 0.33 ms、反向可忽略，占总延迟的 1.8%。专家权重分发相对 torch.distributed 与 DeepEP 快 3.1$\times$ 到 5.5$\times$，且随 fan-out 增长维持在约 0.28 ms 近乎恒定（Figure 16）。完整论证见第 3 章与第 5 章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<h2 id="glossary" data-page-node-id="KzxWIl2DzXDBXWpJu1125G">术语速查</h2>
+
+<div class="table-scroll" data-page-node-id="AZLlrHq5ZTChdKgjZVdDcn">
+<table data-page-node-id="mTR7rnX9KXzJwqDn37QKu3">
+<thead data-page-node-id="fkTMQ6ZZQHTSH4o6AIMKaw"><tr data-page-node-id="cy9k8is7nnmx7iaRcfiNWN"><th data-page-node-id="U4EKSgxvmtSPxa5DdAeBSN">术语</th><th data-page-node-id="J9WXaNc7oOZipWR48BZGNa">含义</th></tr></thead>
+<tbody data-page-node-id="y2RoHGXmS5IsQY87fHLVBa">
+<tr data-page-node-id="urmIgljUM7lkRLo5dwzyZZ"><td data-page-node-id="4F1oOlyBNHfHq6Vq2Y5pOc">专家并行（EP）</td><td data-page-node-id="d62WVJmVFRuvlFkXgvuEnm">把 MoE 的专家切分到多块 GPU，token 按路由结果经 all-to-all 送到承载所选专家的卡上</td></tr>
+<tr data-page-node-id="joaZNF7LNy5qxUPnQiA2vz"><td data-page-node-id="BbXTkIyniY8WENQ2u6HQI7">大规模专家并行（large-EP）</td><td data-page-node-id="H5Xg5t3QLJgs7OZZai72Re">论文指 32 路或 64 路量级的 EP</td></tr>
+<tr data-page-node-id="CBBAQO8EAjHZE5JfIBQC2J"><td data-page-node-id="QL6U7kIXfXoFTUXuhCj6Jo">机架级节点（RSN）</td><td data-page-node-id="K6uxvonljQsAzullfLMxZ2">把高带宽 scale-up 域从单台 4/8 卡服务器扩展到整机架、通常 64 张卡以上的形态；机架内跨服务器的 GPU 仍直连</td></tr>
+<tr data-page-node-id="LeHXRF8t4Wlf5zflOFsReZ"><td data-page-node-id="ikn5HK87jqmA533lpnEiSn">scale-up / scale-out</td><td data-page-node-id="K1Dhvk7yQzFRZiSDmr9fsj">scale-up 是机内或机架内的高带宽直连域（每卡数百 GB/s，load/store 内存语义）；scale-out 是包交换网络（通常每张网卡数十 GB/s）</td></tr>
+<tr data-page-node-id="qtXIekdSPlwI9xxvOuFCDE"><td data-page-node-id="pRNzF3yU6G6SGvcIYp6QnG">逻辑专家 / 物理专家</td><td data-page-node-id="huvMiG7hfKUSqf6aQB7r5q">逻辑专家是模型定义的专家身份；物理专家是某个 rank 实体化出来的一份实例</td></tr>
+<tr data-page-node-id="BesKdLOkFGMBrF2XbHn4s0"><td data-page-node-id="gNATwDoHN2B6zd6WPDVZmd">主槽 / 冗余槽</td><td data-page-node-id="ILphEpjGiBUr0eO73TzVWw">主槽放逻辑专家的原始实例，保留完整权重、梯度与优化器状态；冗余槽放一份副本或留空，不存优化器状态且 buffer 跨层复用</td></tr>
+<tr data-page-node-id="KYPHvBTz2ASVlnM3mAdyu9"><td data-page-node-id="JlAPvOeAhpBdSRC7unAqjA">配额（quota）</td><td data-page-node-id="KeR1Qyv59de7xf3R2CQ4pM">分配给某个专家实例的最终 token 负载 $u_{e,r}$，同时决定副本建不建与建了之后接多少</td></tr>
+<tr data-page-node-id="ZqbcJIJE2wNIRSUp3qWNx6"><td data-page-node-id="JcyDMIoFTpD2ix2btWHriX">重路由（reroute）</td><td data-page-node-id="BFxKFlJruyMdx6RW7eV16n">把 router 输出从「token 到逻辑专家」改写成「token 到物理专家」</td></tr>
+<tr data-page-node-id="hWT8XlHFkaFCKxfuUkC0F8"><td data-page-node-id="uhttPWJm1GXJRM81ROQgJS">精确负载（exact load）</td><td data-page-node-id="8Sw7EubRJyCvJUo6HTwRYp">gating 之后立即可得的本次真实 token 分布，区别于按历史统计得到的预测</td></tr>
+<tr data-page-node-id="cbUS53TnmvIP0EoTNr7ER5"><td data-page-node-id="1DLg47s4jHdvNxz17x5doI">热路径（hot path）</td><td data-page-node-id="4BnkOqjchxULn0GbLQiZav">单次前向中无法被其他计算掩盖、直接计入端到端延迟的执行段</td></tr>
+<tr data-page-node-id="usbq4Mu3rOrwPgBVRfB7g4"><td data-page-node-id="Ysu7i14JRb0GT3Q8fh38JT">不均衡度（imbalance ratio）</td><td data-page-node-id="t7vv7ZdvkFN6BkCwBDxXOc">最大负载除以平均负载。论文有两种口径：专家级（最大专家负载比均值）与 rank 级（最大 rank 负载比均值），本页每次使用时说明是哪一种</td></tr>
+<tr data-page-node-id="isrzEyqWEH4oBIHiAiBBxX"><td data-page-node-id="H8CMls6PAH482hi1DCYRGV">EPLB</td><td data-page-node-id="kJFGZ6dZhWYkKGDH5QFlHJ">被广泛部署的均衡器，用冗余专家策略按给定负载算布局；常见部署用最近路由历史周期性重均衡</td></tr>
+<tr data-page-node-id="SzgTSXZBQ8HAvGhFbNT5cl"><td data-page-node-id="ogUovugMFpk8XJZHU83gyy">EPLB$+$</td><td data-page-node-id="GE8qP9WPWV74HZL8JDG5XV">论文构造的强化基线：喂精确负载、用标准 EPLB 加 round-robin 重路由，通信机制换成 UltraEP 的</td></tr>
+<tr data-page-node-id="T0cQRTlnWwrpqwHVwoLiW0"><td data-page-node-id="FwEXAtCDKL2114sz0F8VnY">LPLB</td><td data-page-node-id="KwIYOBpIobmXt7eBnGqpZO">线性规划求解器，在 EPLB 之上为每个 microbatch 调整重路由，限制每个专家至多一个副本</td></tr>
+<tr data-page-node-id="8H7VzugcOEJGd9S2h687SX"><td data-page-node-id="MVVHo6sK1dRYZdMJLd3G44">强制均衡 ideal</td><td data-page-node-id="SwC34K5uoy4cG9lpHxcHeU">论文构造的上界基线：改掉 router，让 token 均匀分到各专家</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="running-example" data-page-node-id="uSjnWejRIKBHlqRIi5mZVg">贯穿全文的最小例子</h2>
+
+<p data-page-node-id="QtlhCUnlw5Tg7nq6J81Ta5">论文的机制用一个可以手算的小例子最容易看清。本页从这里开始，后续第 3、4、5 章都会回到它。</p>
+
+<p data-page-node-id="AZYC0xwz8FsT2JkBLnH1gh">设一个 EP 组有 $R=4$ 个 rank，共 $\lvert\mathcal{E}\rvert=8$ 个逻辑专家，每个 rank 承载 2 个主专家、另有 $N_{\mathrm{slot}}=1$ 个冗余槽。主专家的归属固定：专家 $e_0,e_1$ 的 home rank 是 $r_0$，$e_2,e_3$ 在 $r_1$，$e_4,e_5$ 在 $r_2$，$e_6,e_7$ 在 $r_3$。负载单位取 1024 个 token，也就是让 $u_{\min}$ 恰好等于 1 个单位。</p>
+
+<p data-page-node-id="cvXVl9SoW6aPBPc8KNHVRx">gating 结束后得到全局负载矩阵 $\Lambda=\{\lambda_{r,e}\}$，其中 $\lambda_{r,e}$ 是源 rank $r$ 上被路由到逻辑专家 $e$ 的 token 数：</p>
+
+<div class="table-scroll" data-page-node-id="LHP8w70355wcnYHTqs5ZzK">
+<table data-page-node-id="AlomAPF8LuQv4boDXhvYGK">
+<thead data-page-node-id="yrexA4Y7reucGrr1isUXTs"><tr data-page-node-id="87XQWZ5KkDdai6qxrobrYw"><th data-page-node-id="6M6SfERlfZcTJpwfjQap8b">源 rank</th><th data-page-node-id="9qWl76wllVd1BsQv4w7p3Y">$e_0$</th><th data-page-node-id="WT3WAlciuKoFHVB6nNRaf4">$e_1$</th><th data-page-node-id="pq49o6veuA6mMLPbbXuOO4">$e_2$</th><th data-page-node-id="uyyYOgYNzDACKb80kyCwD1">$e_3$</th><th data-page-node-id="UuosuPnr8ggP9XqUDpsKCg">$e_4$</th><th data-page-node-id="9xBnIrEKPS8JRPCsje0HCM">$e_5$</th><th data-page-node-id="XgAnumgbf162w5sajizgNU">$e_6$</th><th data-page-node-id="RVXYAo6n3TrVCgsgKFxJAV">$e_7$</th></tr></thead>
+<tbody data-page-node-id="CGw6dbEhMHeIMPlD9FSpMM">
+<tr data-page-node-id="0B7YxfgHzKKim53wzJRBpL"><td data-page-node-id="NyBsON0XVOWDwOCjKcmUQz">$r_0$</td><td data-page-node-id="WuJlk1UebG8qb9Fr3nciOH">4</td><td data-page-node-id="cFFPXeDl5gKflGI46R0fQP">1</td><td data-page-node-id="odamJurzeIfWsCEnBqHQSm">1</td><td data-page-node-id="m5HaHqEgGMRTY17kVvZCGN">1</td><td data-page-node-id="ZaCRukvKHDFxscrYIHor0p">0</td><td data-page-node-id="ammSLeS4IVGXXDqqOBjQqM">1</td><td data-page-node-id="Gb6kx37maIxCUKIxnYwylV">0</td><td data-page-node-id="Lt2EArhon6UXBX2D5Enmh9">0</td></tr>
+<tr data-page-node-id="PsciwAQrbi5CU9NniHew1N"><td data-page-node-id="LifoiNQQsjNQJuIeTd6egn">$r_1$</td><td data-page-node-id="7M9554MThdxILOLinRRLp6">3</td><td data-page-node-id="QGHvU1dRQMHqjeSpj51EHd">0</td><td data-page-node-id="C6Vv7iD8AFxkO4LezIRsrd">1</td><td data-page-node-id="7edtIF3dinAr0twVQFA7Sb">1</td><td data-page-node-id="PBoYoQmqyjktshtq8liKaW">1</td><td data-page-node-id="ZX1clhmkbsBvDKldjYRhEF">0</td><td data-page-node-id="ohGt2W3ridcRJRUKDTt5Ip">0</td><td data-page-node-id="IIk2QBIEYBFWXuXEXBdFBC">0</td></tr>
+<tr data-page-node-id="TqkFzSuLtBuATtLenWce9i"><td data-page-node-id="HbIh5bPgJrmgGDLgFatoMI">$r_2$</td><td data-page-node-id="FCb2pYlRM0a1uAtG55mhm6">2</td><td data-page-node-id="l5mFO04m8HdqCravWl2pww">1</td><td data-page-node-id="1j5rCwpQBXVDh5x3AJD7uH">1</td><td data-page-node-id="U3EtCKN3tO7YV9nlfumStW">0</td><td data-page-node-id="6FEm5p0xmUTC8H2fRYj5cC">1</td><td data-page-node-id="1xAQgwOTIeIfGXe7WK1V7t">1</td><td data-page-node-id="wHX4Ej6tzw5P5SNrAT8mHV">0</td><td data-page-node-id="MmkEhFKS1DziKXiDux49UP">0</td></tr>
+<tr data-page-node-id="zfIERREHbsxV9pgDxILqg8"><td data-page-node-id="lhFxXn03JJSMyRmEWiGFkN">$r_3$</td><td data-page-node-id="0C2wJwvaO2FQ2JtxuALiPp">1</td><td data-page-node-id="wfEs8QPRp1zx4m2jZP5oMt">0</td><td data-page-node-id="ZGjYrNBIyVbmZk8AZLqtor">0</td><td data-page-node-id="P6mfuSlyBRDtQDv7T93VmS">1</td><td data-page-node-id="Kls20POcHcBSmSlu1gir6k">0</td><td data-page-node-id="Vs8c4zR36M0cy3ylzUK1JN">0</td><td data-page-node-id="VGruriKHsRMXuoI7AJiuUC">1</td><td data-page-node-id="yH7lW0kXCrpO2vjHAUvi4X">1</td></tr>
+<tr data-page-node-id="WrZg8eQHjcHmiwMmFeAhI6"><td data-page-node-id="wveYvSVzm61bvkb7jAv1of"><b data-page-node-id="1EzG2zwQUF7HkVKmibKhfI">专家总负载 $\lambda_e$</b></td><td data-page-node-id="lJPhFSmbeXoc9eDuT7mcfZ"><b data-page-node-id="jPWmm7ibnjWZm6MH0UHotQ">10</b></td><td data-page-node-id="2LRd994VRaV4mvqdGAGNIT">2</td><td data-page-node-id="HoUTH0pYMlGWyenJoaQ9qa">3</td><td data-page-node-id="y3u6twO14giUBJYQf3E5vM">3</td><td data-page-node-id="Mx6DaOigqEUkcbjYTszDbe">2</td><td data-page-node-id="uo5fTbV1hZneJy7aIVfzFf">2</td><td data-page-node-id="syb7iRXDdfDSshTHR6wAp2">1</td><td data-page-node-id="929rNJxwitRblhBLJ7SmE2">1</td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="d6wNoczNmBjbLUX4n4QGN6">把每个 rank 的主专家负载加起来，得到初始 rank 负载 $\ell_r=\sum_{e\in\mathcal{E}_r}\lambda_e$：$\ell_{r_0}=10+2=12$，$\ell_{r_1}=3+3=6$，$\ell_{r_2}=2+2=4$，$\ell_{r_3}=1+1=2$。总负载 24，平均 6，最大 12，因此 rank 级不均衡度是 $12/6=2.0$。</p>
+
+<div class="callout callout-blue" data-page-node-id="N1XwtXkKCPEueM68DEXnEr">
+<p data-page-node-id="Lt2FzcIrGP8dwZeM4zNkrj">不均衡度 2.0 的含义：所有 rank 都要等 $r_0$ 算完自己那 12 个单位，而理想情况下每个 rank 只需算 6 个。这一层的 MoE 计算时间被拉长到理想值的两倍。这是构造示例，用于说明机制；论文实测的初始 rank 级不均衡区间是 1.30 到 4.01。</p>
+</div>
+
+<p data-page-node-id="4DI6xa3727ny7DWbfL4Z7D">$e_0$ 是唯一的热专家（总负载 10，占全部 24 的四成），而 $r_3$ 只有 2 个单位的负载、还有大量空闲。接下来的问题就是：要不要给 $e_0$ 建副本、建几个、建在哪、每个副本接多少 token。第 4 章会用配额求解走完这个决策，先看论文为什么必须在这个时刻做决策。</p>
+
+<h2 id="nonstationary" data-page-node-id="mC2so3nctTQZ9XbsObUoE8">1. 专家热度在层与批次之间快速漂移，历史统计撑不住</h2>
+
+<p data-page-node-id="RiGHlqmXYWxcTMUUzzL1CF">论文的动机来自一组测量。在讨论测量结果之前，需要先确定一件事：均衡的目标到底是哪个阶段。</p>
+
+<h3 id="why-prefill" data-page-node-id="IIPH7SiGwnV3rsy4HHAyNC">1.1 为什么均衡目标是 prefill 而不是 decode</h3>
+
+<p data-page-node-id="B7OwtuFABvnctTgl5sNh4D">大模型推理分两个阶段。prefill 并行处理整段提示词、填充 KV cache，是计算受限的；decode 逐 token 生成，每步都要把大块模型权重与 KV cache 从显存读出来，而单 token 的计算量太小、盖不住这些搬运，因此是访存受限的。两个阶段分别决定用户可见的两个指标：首 token 延迟（time to first token，TTFT）主要由 prefill 决定，每输出 token 时间（time per output token，TPOT）反映稳态 decode 速度（§2.2）。</p>
+
+<p data-page-node-id="cY1qA16DSEmqOr93oskTHC">论文对 decode 的判断是：计算侧不均衡的影响被访存延迟大幅稀释。增大 batch 可以提高计算强度、让不均衡重新显现，但那与 decode TPOT 的严格服务等级目标冲突。因此实际可优化的均衡目标是 prefill，那里吞吐优先、目的是降低 TTFT（§3）。这也划定了整篇论文的范围：训练与 serving prefill，不含 decode。</p>
+
+<div class="callout callout-yellow" data-page-node-id="J9FkfAxZ8u5IlvGMZDPSil">
+<p data-page-node-id="NgrS5qJohQJ0LF6IElediE">常见误解：把 UltraEP 理解成对整条推理链路都加速。论文的摘要与 §3 都把范围限定在训练与 serving prefill；decode 阶段的均衡不在其列，原因是上一段的访存受限判断。</p>
+</div>
+
+<h3 id="drift-dimensions" data-page-node-id="y4GyITw9TCEwjw1JzDt6XM">1.2 prefill 与训练各自的漂移方式</h3>
+
+<p data-page-node-id="RFD0u9vurJgIXXZtyYTOoJ">serving prefill 侧，论文在 Qwen3-235B-A22B（128 个专家中激活 top-8，EP=64）上采样专家负载分布，观察到热度沿三个维度漂移：跨 forward step、跨数据域、跨层。专家热度随语义切换剧烈变化，science、coding 与混合流量各有自己的热专家；即便固定在单一数据域内，热专家也会从这一批漂到下一批；混合输入则把多种路由模式叠加起来，让不均衡更难预测（§3）。</p>
+
+<p data-page-node-id="nYPr7yrJ0KAgK6f8thBZkJ">训练侧的动态方式不同但同样棘手。训练早期，router 的专家特化尚未稳定，负载高度不稳；随训练推进，平均分布确实变得平滑，但强动态依然存在。跨 global batch 看，辅助损失的负反馈在持续重调专家利用率——即便是 DeepSeek 式那种主动均衡专家的 router 补偿，也不能消除这种振荡；跨 microbatch 看，采样随机性带来的抖动在更细的粒度上依然可见，在 DeepSeek-V3 的训练上更明显（§3）。论文这两组测量分别在 GLM4.5-106B-A12B（128 专家取 top-8，GShard 式辅助损失）与 DeepSeek-V3-671B-A37B（256 专家取 top-8，DeepSeek 式辅助损失）的 EP64 组内完成。辅助损失与路由 bias 补偿这两种算法侧均衡手段见 <a href="../aux-loss-free-routing/index.html" data-page-node-id="nKOwZCIVpCwxTGvLKVPdRx">辅助损失无关路由</a>。</p>
+
+<h3 id="large-ep-amplify" data-page-node-id="NHK6Wx8uwHu6r3leOPGaES">1.3 大 EP 如何把专家级抖动放大成 rank 级倾斜</h3>
+
+<p data-page-node-id="wXB7YQZNcnBkrrzJOaMufP">专家负载抖动本身并不新鲜，让它变成系统问题的是 EP 度数。论文的表述是：每个 EP rank 上的专家更少时，大 EP 直接把专家之间的路由动态转化成明显的 rank 间倾斜（§3）。</p>
+
+<p data-page-node-id="Xau8oduTdGQ9UsKUZVi5s3">这句话的机制是摊薄能力的消失。假设一层有 128 个专家，EP=8 时每个 rank 承载 16 个主专家，某一个专家变热两倍，它在本 rank 总负载中只占十六分之一，被同 rank 的其他 15 个专家摊薄；EP=64 时每 rank 只有 2 个主专家，同样的一个专家变热就直接把本 rank 负载抬起来。论文在 §4.1 提到，大 EP 下每 rank 的本地主专家常常只有两个或四个。</p>
+
+<p data-page-node-id="LLEldCIsx4fAKIWcShFuiu">而 rank 是同步单位——一层内所有 rank 要完成 all-to-all 与后续计算才能进下一层，整步耗时由最慢的那个决定。于是专家级的抖动经由「每 rank 专家数变少」这一环，变成直接计入端到端时间的倾斜。</p>
+
+<h3 id="eplb-fails" data-page-node-id="9J2KSHN0y7uDRqeRMAOGFf">1.4 历史式均衡的失准是双向的</h3>
+
+<p data-page-node-id="ZGhzAHmSLOWDQZu9owonFd">EPLB 本身与负载估计器无关，它按给定的负载算出一份布局。问题出在部署方式：常见部署用最近的路由历史做估计、周期性重均衡，以此摊薄规划与重排的开销（§1）。论文测量的重均衡间隔是 prefill 每 50 个 batch、训练每 3 个 global batch。</p>
+
+<p data-page-node-id="QfQmcpTrG8MaDoHic6OuKo">当实际负载偏离用来推导布局的统计时，论文观察到 EPLB 甚至会让不均衡变差、制造出新的尖峰与 straggler（§3）。失准是双向的：按旧热度建的副本这一轮收不到多少流量，白占了冗余槽；这一轮新变热的专家却没有副本可用，成为新的拖尾点。</p>
+
+<p data-page-node-id="ibvKcSPY7FMqqhmHbBYjk4">下图给出这一现象的原始数据，需要注意 EPLB 曲线是否有超过 no-balancing 的位置。</p>
+
+<img src="assets/img-03.webp" alt="两个折线图，左侧为 Qwen3-235B 第 68 层的 prefill、右侧为 DeepSeek-V3 第 57 层的训练，各自比较 no-balancing 与 EPLB 之后的 rank 级不均衡度随批次的变化" data-page-node-id="Y7rUwjEDDlbHSiO9ZoXG7a">
+
+<p data-page-node-id="3QgRaliH6esh2xvnJbV0QQ"><b data-page-node-id="PdKEEAEDOZauWnsuD2uXIc">图（原文 Figure 6）</b>：横轴是批次序号，纵轴是 rank 级不均衡度（最大 rank 负载比均值）。左图为 Qwen3-235B-A22B 第 68 层的 prefill、混合数据；右图为 DeepSeek-V3-671B-A37B 第 57 层的训练，取第 3510 个 global batch 附近。左图中 EPLB 曲线整体低于 no-balancing，说明它在 prefill 上确实起作用，但仍出现高于 no-balancing 的尖峰；右图中 EPLB 有相当长的区段稳定高于 no-balancing，即在该模型的训练上反而更差——这与 §8.2 对 DeepSeek-V3 的判断一致（EPLB 与 LPLB 表现与 Megatron-LM 相当甚至更差）。两图共同支撑论文的结论：历史统计与实际负载偏离时，按旧统计建的布局会制造新的 straggler。图中 EP=64，EPLB 重均衡间隔为 prefill 50 个 batch、训练 3 个 global batch。</p>
+
+<h3 id="algo-vs-system" data-page-node-id="OqxyUG72AIqEA5oS3CUa35">1.5 系统侧均衡不替代算法侧的路由正则</h3>
+
+<p data-page-node-id="lHmQCavnuCV0wvmnbTtuQA">MoE 训练里还有另一类「均衡」：辅助路由损失。GShard 用一个辅助损失让每个专家的平均 router 概率与它实际收到的 token 占比对齐；DeepSeekMoE 则从近期负载更新一个专家级的路由 bias，压低过载专家、抬高欠用专家，且不引入干扰梯度（§2.2）。</p>
+
+<p data-page-node-id="4xD978JhsYnHNnG4iR3Dc4">论文明确这两类是互补而非互换的。训练期的辅助路由损失主要目的是稳定优化、防止路由塌缩（routing collapse）、保留专家特化，它们促成的是「长期平均意义上的均衡」，无法保证逐 microbatch 的实现负载均衡——细粒度 MoE 加大 EP 的组合下尤其如此。系统侧技术纠正的是运行时的实际不均衡，同样不能替代路由损失，因为二者服务的建模目标不同（§2.2）。</p>
+
+<h3 id="nonstationary-questions" data-page-node-id="OrPS1RaDynlEtwpuuIcasI">本章问题</h3>
+<ol class="chapter-questions" data-page-node-id="dkU5zQkjuwRz1asdoOHfVr">
+  <li data-page-node-id="0H35T45zhDfJpJM1265oUR">
+    <p data-page-node-id="X6EEJSLavSDmwBQ8DJJIE7">为什么论文把均衡目标限定在训练与 serving prefill，不管 decode？</p>
+    <details data-page-node-id="HRuMQICPEowDtVNWKHM1zE">
+      <summary data-page-node-id="ITx9IqJhQ5oAPSIFRAlA2j">解答：decode 是访存受限的，计算侧不均衡的影响被访存延迟稀释，而靠增大 batch 让它显现会违反 TPOT 的服务等级目标</summary>
+      <p data-page-node-id="N3L2CBR1cYp7pvjQSPvE1I">decode 每一步都要把大块模型权重与 KV cache 从显存读出，单 token 的计算量太小、盖不住这些搬运，因此瓶颈在访存而不在计算。论文的观察是计算侧不均衡的影响在这种情形下被访存延迟大幅稀释。理论上增大 batch size 可以提高计算强度、让不均衡重新成为瓶颈，但那会拉长每个输出 token 的时间，与 decode TPOT 的严格服务等级目标冲突。相比之下 prefill 是计算受限的、追求吞吐以降低 TTFT，是实际可优化的对象。论文因此把实际均衡目标定为 prefill（§3）。</p>
+    </details>
+  </li>
+  <li data-page-node-id="iFbZbK85sUbp3RTbadpWEr">
+    <p data-page-node-id="WT8imMqMee0DJZhYFAHq8l">同样是「专家负载不均衡」，为什么 EP 从 8 路提到 64 路会让问题质变？</p>
+    <details data-page-node-id="0H49iENjw0qkwBjWas8H22">
+      <summary data-page-node-id="DcSp6CvdU4JqZWixDY6SwO">解答：每 rank 承载的主专家数随 EP 增大而变少，摊薄能力消失，专家级抖动直接成为 rank 级倾斜，而 rank 是同步单位</summary>
+      <p data-page-node-id="SgywwKdRpwnuTRYP4e4UJ7">一层 128 个专家时，EP=8 每 rank 有 16 个主专家，某个专家变热两倍只占本 rank 负载的十六分之一，被同 rank 的其他专家摊薄；EP=64 每 rank 只剩 2 个，同一个专家变热就直接把该 rank 的负载抬起来。论文在 §4.1 提到大 EP 下每 rank 的本地主专家常常只有两个或四个。关键在于 rank 是同步单位：一层内所有 rank 要完成 all-to-all 与后续计算才能进入下一层，整步耗时由最慢的 rank 决定。所以论文说大 EP 直接把专家之间的路由动态转成明显的 rank 间倾斜，并且随 EP 度数增大，计算拖尾、all-to-all 瓶颈与活跃内存尖峰这三个后果会复合放大（§1、§3）。</p>
+    </details>
+  </li>
+  <li data-page-node-id="scd22HZIQrlUAlColPErsp">
+    <p data-page-node-id="VGmXoUmEFbRcEAK440ILZS">EPLB 已经在复制热专家了，为什么还会出现「比不做均衡更差」的情况？</p>
+    <details data-page-node-id="lCtMMWZv63V0jl4t6f0UQ1">
+      <summary data-page-node-id="zuH6m9SJMKIL0OjGreUmBO">解答：失准是双向的——按旧热度建的副本收不到流量，本轮新变热的专家又没有副本</summary>
+      <p data-page-node-id="T6FN3Cj3nrcLl28Bnbpvno">EPLB 算法本身与负载估计无关，它按给定负载算布局。问题在部署方式：为了摊薄规划与重排开销，常见部署用最近路由历史来估计负载、每隔若干步（论文测量中 prefill 50 个 batch、训练 3 个 global batch）重均衡一次。当本轮实际负载偏离那份统计时，两个方向同时失准——按旧热度复制的副本占着冗余槽却收不到多少 token，而本轮真正变热的专家没有副本可分流，成为新的拖尾点。Figure 6 中 EPLB 曲线出现高于 no-balancing 的尖峰正是这个后果，论文的原话是 EPLB 在这种情况下会加剧不均衡、制造尖峰与新的 straggler（§3）。这一观察是全篇从「预测式」转向「精确负载」的动机。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="rsn-enables" data-page-node-id="CydGG2X2rSOWLXihAG3wYG">2. 精确负载只能在 gating 之后拿到，机架级节点让这件事第一次划得来</h2>
+
+<p data-page-node-id="COwCH0tHJXiPiQCROkYAHn">第 1 章说明了「必须用精确负载」。但精确负载有一个时序上的硬约束，它决定了这套方案的可行性边界。</p>
+
+<h3 id="timing-constraint" data-page-node-id="EqjIhPT1kAwGYfdZRNS79z">2.1 精确负载的时序代价</h3>
+
+<p data-page-node-id="skq7YxfbEGTuRV4xOYDJot">router 的 gating 计算完成，才知道本次每个 token 选中了哪些专家，也才拿到真实的负载矩阵 $\Lambda$。这意味着基于精确负载的一切决策都无法提前——规划与专家状态搬运必然落在关键路径上，暴露的开销包括在线求解与相当重的专家重排通信：前向要搬权重，训练的反向还要额外搬梯度或优化器状态（§1）。</p>
+
+<p data-page-node-id="sYEl4eXzULlckyJLFn0zWA">这正是历史式方案存在的理由。用历史统计可以在 gating 之前就把布局算好、把权重搬好，从而把开销挪出关键路径、并分摊到若干步。精确负载放弃了这份便利，换来的是零预测误差。这笔交易划不划算，取决于关键路径上的搬运有多贵。</p>
+
+<h3 id="rdma-limit" data-page-node-id="qcgbsgSFFCfdvIQ3tzmaJG">2.2 标准集群里这份搬运搬不完</h3>
+
+<p data-page-node-id="e5RtH9g3own8E3BmxBCGYo">GPU 集群的连接分两层。scale-up 是机内或机架内的高带宽直连域，提供每卡数百 GB/s 的带宽以及 load/store 式的内存语义；scale-out 是包交换网络，通常每张网卡只有数十 GB/s（§2.1）。两者的带宽与访问方式差别见 <a href="../gpu-communication/index.html" data-page-node-id="lUBQn0kC7NgCWvtsHHOSVI">GPU 通信</a>。</p>
+
+<p data-page-node-id="gQA4SelJdtN51BH7komtrs">标准 RDMA 集群的高带宽 scale-up 只覆盖单台 4 卡或 8 卡服务器，跨服务器的流量必须走较慢的 scale-out。EP64 意味着一个 EP 组横跨 8 到 16 台服务器（按 64/8 与 64/4 推算），专家状态搬运绝大部分是跨机的。论文的判断很直接：大 EP 下跨多机搬运大量专家状态代价过高，在热路径上不实用（§1）。</p>
+
+<h3 id="what-is-rsn" data-page-node-id="D7ohROxFirJ3H45GahhkNV">2.3 机架级节点改变了这个设计空间</h3>
+
+<p data-page-node-id="52XihkL3QpCE8QvAg1Yv72">机架级节点把 scale-up 域从单台 4/8 卡服务器扩展到整个机架，通常覆盖 64 张卡以上。RSN 内部仍由多台服务器组成，但跨服务器的 GPU 依然通过机架级的 scale-up fabric 直连（§2.1）。对 MoE 来说，这意味着一个 EP 组常常可以整体装进一个 RSN，token dispatch 留在快速的 scale-up fabric 上而不必走 scale-out。</p>
+
+<img src="assets/img-02.webp" alt="上下两栏对比图，上栏为标准 RDMA 集群、scale-up 域只框住单台服务器内的少数 GPU，下栏为机架级节点、scale-up 域框住整个机架的多台服务器" data-page-node-id="XBmtdjqZiogVRWj6NXcLFP">
+
+<p data-page-node-id="La8iDGxBroGqH4sO5u8qPM"><b data-page-node-id="ZIkkkdkyvDE4FWUzMT4C43">图（原文 Figure 2）</b>：两种形态下 scale-up 域覆盖范围的对比。标准 RDMA 集群中，虚线框出的 scale-up 域局限在单台服务器内部的 4 到 8 张卡，跨服务器要经由 scale-out 网络；机架级节点中，同一个 scale-up 域横跨机架内的多台服务器，把数十张卡纳入同一个高带宽域。这张图支撑论文的核心前提：EP 组整体留在 scale-up 域内，热路径上的专家状态搬运才物理可行。</p>
+
+<p data-page-node-id="h93odRDHUUg6DOGhE2Iv6I">相应地，UltraEP 的部署假设是每个 EP 组位于一个 RSN 的 scale-up 域内，跨机架的扩展交给流水线并行与数据并行（§4）。这些并行方式的切分维度与通信特征见 <a href="../model-parallelism/index.html" data-page-node-id="D0R6hK3avaCjMdryr70trt">模型并行</a>。</p>
+
+<h3 id="three-dimensions" data-page-node-id="eb3ltnyQ91aU06vKA8Igd0">2.4 与已有方案的三个维度差异</h3>
+
+<p data-page-node-id="ZLGbdLfU5fL4CzMuqF5yDe">论文用一张对照图概括自己与已有方案的区别，需要关注的是均衡决策发生在时间轴的哪个位置。</p>
+
+<img src="assets/img-01.webp" alt="上下两栏时间线对比，上栏 Existing 在 global batch 边界处做周期性均衡、使用过期负载，下栏 Ours 在每一层的 Gate 之后插入热路径均衡、使用精确负载" data-page-node-id="lf1hFFvS9H4fsoGXj2GwnV">
+
+<p data-page-node-id="wakmae1pGb2cemuI8SL2nS"><b data-page-node-id="JkEIXCAvE8bTpKNY5goX44">图（原文 Figure 1）</b>：上栏 Existing 的均衡动作发生在 global batch 边界，输入是过期负载（stale load），因此在一个 batch 内部所有层都沿用同一份布局；下栏 Ours 把均衡插进每一层的执行序列——Attention 之后 Gate 产生精确负载，紧接着完成均衡决策，再进入 all-to-all 与专家计算。图中标注热路径均衡的暴露开销在 0.3 ms 量级，第 6 章的延迟分解会把这个数字精确到 0.33 ms。三个维度的差异由此确定：负载保真度（过期统计对精确负载）、决策时机（batch 边界对层内热路径）、均衡频率（每若干 batch 一次对每层每 microbatch 一次）。</p>
+
+<h3 id="two-challenges" data-page-node-id="FDy5LzkxVGXgGmisy3dkwd">2.5 RSN 是必要不充分的</h3>
+
+<p data-page-node-id="HZ1aKIPl0FJXaXrTLJu2k1">论文强调 RSN 只是让热路径均衡在物理上成为可能，还剩两个必须解决的问题（§1、§4.4）。</p>
+
+<p data-page-node-id="lLitVzsqsC6Rn3Myw9TfhC">控制面的问题是决策窗口太小。可用时间只有 gating 结束到 token dispatch 开始这一段，而要在这段时间内解出高质量的均衡方案。难点还在于决策空间：已有系统把放置与重路由解耦，放置提前规划、有充足预算，在线的重路由则用 round-robin 分配或在严格副本数限制下修补预测偏差。用精确负载追求最优均衡时，复制必须为重路由预留容量、副本候选变得灵活，大 EP 下决策空间显著变大。此外求解器要在分布频繁变化时保持稳定与快速，而不是过拟合到某个瞬时模式。</p>
+
+<p data-page-node-id="BlEWWSpGsf55Q9RrLDHT9a">数据面的问题是带宽利用不足。RSN 提供高 scale-up 带宽，但均衡流量是不对称且高度动态的。已有通信栈为静态、可预测的集合通信优化，对这种不规则流量适应不好，瓶颈从链路带宽转移到控制路径开销——任务切分与流水、数据暂存、动态寻址，导致带宽吃不满；而盲目加大并行度既浪费，又会与被重叠的反向计算争抢同一批资源。另一个瓶颈是热专家的 fan-out：专家复制形成的是动态子组组播，大 EP 加倾斜负载下，副本很多的热主专家会带来可观的 fan-out 开销，抵消均衡收益。部分 RSN 支持把组播下放到交换机，但这类机制通常假定通信组与投递模式是预先确定的，而专家复制产生的组既稀疏又易变、逐层逐 microbatch 都在变。</p>
+
+<p data-page-node-id="RFxLDOL9H5dJGu4kAP2szD">论文的两个核心创新正对应这两面：配额式规划解决控制面（第 4 章），RSN 原生的专家状态通信解决数据面（第 5 章）。在此之前需要先交代专家在内存里怎么摆——这决定了搬运的量级。</p>
+
+<h3 id="rsn-enables-questions" data-page-node-id="eg8OqSIXBs6W9NujGFkP7s">本章问题</h3>
+<ol class="chapter-questions" data-page-node-id="OI4wCsYzuCojNS8VjRm1aU">
+  <li data-page-node-id="PhJC8V37kMzn6wEdHp6aWS">
+    <p data-page-node-id="GCMs1F8ZaepdvyeQ5ZCl3L">「精确负载」与「历史负载」的差别落在哪一个时间点上？</p>
+    <details data-page-node-id="VUSen2D5EAF7GofHO9CM54">
+      <summary data-page-node-id="sr6zOShY1DFo3wZ2KrhlOg">解答：落在 gating。gating 之后得到的是本次真实分布，gating 之前只能用统计做预测，两者的代价差别是均衡操作在不在关键路径上</summary>
+      <p data-page-node-id="iL37BGg69i3GdEujyI5EWE">router 的 gating 算完，才知道本次每个 token 选中了哪些专家，此时得到的负载矩阵是精确的、零预测误差的。代价是所有基于它的决策都无法提前：规划与专家状态搬运必然落在关键路径上，前向要搬权重，训练的反向还要搬梯度或优化器状态（§1）。历史负载的方向相反——用上几个批次的统计可以在 gating 之前把布局算好、权重搬好，从而把开销挪出关键路径并分摊到多步，代价是它对本次分布只是预测。所以这不是「谁的信息更多」的问题，而是「零预测误差」与「零热路径开销」之间的取舍；论文选前者，然后设法把后者的成本压到可接受。</p>
+    </details>
+  </li>
+  <li data-page-node-id="pGBJPD9p1nIz3VTJw5EOjp">
+    <p data-page-node-id="TyHsNdLQKL2bi7HUTO4ueE">为什么同一套算法在普通 8 卡机集群上不可行？</p>
+    <details data-page-node-id="NExL7R7EXuI3tWJfptIeRO">
+      <summary data-page-node-id="74tNguIVthS7Ek29Q9cmRa">解答：不是算法不可行，是搬运不可行——普通集群的 scale-up 只覆盖单机 4/8 卡，EP64 必然跨机走带宽低一个量级的 scale-out</summary>
+      <p data-page-node-id="G8VJsHgrwuyfBaMOi2qH9U">标准 RDMA 集群的高带宽 scale-up 只覆盖单台 4 卡或 8 卡服务器，跨服务器的流量走 scale-out 网络，后者通常每张网卡只有数十 GB/s，而 scale-up 是每卡数百 GB/s 并具备 load/store 内存语义（§2.1）。EP64 意味着一个 EP 组横跨 8 到 16 台服务器（按 64/8 与 64/4 推算），专家状态搬运绝大部分是跨机的。论文的判断是大 EP 下跨多机搬运大量专家状态代价过高、在热路径上不实用（§1）。机架级节点把 scale-up 域扩到整机架、通常 64 张卡以上，机架内跨服务器的 GPU 仍直连，一个 EP 组可以整体留在这个域内，热路径搬运才搬得完。这也是本方法最强的一条前提假设。</p>
+    </details>
+  </li>
+  <li data-page-node-id="VFVPSxZShHR3qQwCwnH33i">
+    <p data-page-node-id="twJfCDGZBOV2sXMd9CBNnZ">有了机架级节点就够了吗？</p>
+    <details data-page-node-id="fqYDRNcJ6SV7h0ItyHokOL">
+      <summary data-page-node-id="fjzSyWPL1Mem7IcTI76vow">解答：不够，论文明确 RSN 是必要不充分——控制面还有决策窗口问题，数据面还有不规则搬运吃不满带宽的问题</summary>
+      <p data-page-node-id="8TMDWasOdnARaevLRgPFby">控制面要在 gating 结束到 token dispatch 开始这一小段时间内解出高质量方案。难度不只是时间紧：已有系统把放置与重路由解耦，放置可以提前规划，在线重路由用 round-robin 或在严格副本数限制下修补偏差；而用精确负载追求最优均衡时，复制必须为重路由预留容量、副本候选变灵活，大 EP 下决策空间显著变大，同时求解器还要在分布频繁变化时保持稳定，不能过拟合瞬时模式。数据面要执行不规则、易变的专家状态搬运，这类流量静态集合通信支撑不好，瓶颈从链路带宽转到控制路径开销（任务切分与流水、数据暂存、动态寻址），盲目加并行度又会与重叠的反向计算争资源；此外副本多的热专家有 fan-out 瓶颈，而交换机组播通常假定通信组预先确定，与专家复制那种稀疏易变的组不匹配。论文的结论是缺乏协同设计时这些开销容易把均衡收益完全抹掉（§1、§4.4）。</p>
+    </details>
+  </li>
+</ol>
+<h2 id="layout-and-pipeline" data-page-node-id="KJB6Ab6ZdkLan4lAc0JsRN">3. 只复制不重排：把冗余槽做成跨层复用的临时缓冲</h2>
+
+<p data-page-node-id="NWSXeKWQOD632rKQGDMKwe">要判断「每层重新搬一遍权重」贵不贵，先要知道搬的是什么、有多少。这一章交代专家在内存里的摆法、一层内的执行顺序，以及论文把这个问题形式化成什么样的优化目标。</p>
+
+<h3 id="logical-physical" data-page-node-id="M1GT9h8CvEMtsHFcws8j8t">3.1 逻辑专家、物理专家与两类槽位</h3>
+
+<p data-page-node-id="oilxWWJCcyxyLrZbCmNXcB">论文区分两个概念：逻辑专家是模型定义的专家身份，物理专家是某个 rank 实体化出来的一份实例。每个 rank 预留相同数量的主槽（main slot）与冗余槽（redundant slot）。主槽承载某个逻辑专家的原始实例，冗余槽则要么放一份某逻辑专家的副本、要么留空。这个固定布局让运行时保持干净和确定性，并给出一个一对多的逻辑到物理映射：每个逻辑专家有一个固定的主实例，加上零个或多个冗余副本（§4.1）。</p>
+
+<img src="assets/img-04.webp" alt="专家布局示意图，四个 rank 各有两个主专家槽与一个冗余槽，下方标注主专家保留权重、梯度与优化器状态三类 buffer，冗余槽只有权重与梯度且跨层共享、无优化器状态" data-page-node-id="9Z2IW3VBON66GVNHqrIBPE">
+
+<p data-page-node-id="fVyini8ZAXDgDBIrpLGuD4"><b data-page-node-id="rpLEYWHweWvi8Ro6bH6zMU">图（原文 Figure 7）</b>：8 个逻辑专家、单层、EP=4、$N_{\mathrm{slot}}=1$ 的布局。每个 rank 有 2 个主专家槽与 1 个冗余槽，与本页贯穿示例的配置一致。图下部标注两类槽位的状态差异：主专家保留完整的权重、梯度与优化器状态，且每层各有一份；冗余槽只有权重与梯度 buffer、总量为 $1\times N_{\mathrm{slot}}$ 份而非每层一份，也没有优化器状态。这张图支撑本节的两个结论——固定槽位布局给出一对多映射，以及冗余槽的内存开销靠跨层复用被压到很小。</p>
+
+<h3 id="replication-only" data-page-node-id="jB9EeSH40YOiCWDWIwS9UG">3.2 为什么只复制、从不重排主专家</h3>
+
+<p data-page-node-id="DgsbipyL1xTf0M3xFuNeFA">EPLB 的做法包含重排：把专家在设备之间挪位置，让各设备负载更平均。UltraEP 明确采取只复制的策略，从不重排主专家（§4.1）。</p>
+
+<p data-page-node-id="e1xDknBtXg0zjODUdcKWLe">论文给的理由是大 EP 让重排变得不值得。大 EP 减少了每个 rank 上的本地主专家数量——常常只有两个或四个。在这个规模上，重排只能重洗一个很小的本地集合，边际收益递减；而它要付出的代价是可观的状态迁移、控制复杂度以及局部性破坏。相比之下，复制的成本效益更好：它扩展的是真正瓶颈处的服务容量（§4.1）。</p>
+
+<p data-page-node-id="GIRvTN5Ov35WOmD2641iEp">用贯穿示例看：$r_0$ 承载 $e_0$（负载 10）与 $e_1$（负载 2）。重排能做的只是把这两个专家换到别的 rank 去，但 $e_0$ 一个专家的负载 10 就已经超过平均值 6，无论换到哪个 rank，那个 rank 都会超载。真正需要的是把 $e_0$ 的负载拆开，这只能靠复制。</p>
+
+<h3 id="cross-layer-reuse" data-page-node-id="D9hK675pJvXQEzKIHp5FPa">3.3 跨层 buffer 复用：把冗余槽压到几十 MB</h3>
+
+<p data-page-node-id="dC8XSLnGC6LyOCIhWepDfu">对主专家，UltraEP 保持标准的训练或服务内存布局。对每个冗余槽，它不保存优化器状态（优化器更新只作用于主专家），并且让权重与梯度 buffer 跨层共享（§4.1）。</p>
+
+<p data-page-node-id="WLOurCemDyiJ1tJRJ1Mv0I">「跨层共享」的意思是：模型有 $N_{\mathrm{layers}}$ 个 MoE 层，但冗余槽的 buffer 只留一份，每层用完就被下一层复用。论文给的数字是 Qwen3-235B-A22B——94 个 MoE 层、128 个专家——单个冗余槽从 3.3 GB 权重加 6.6 GB 梯度，降到每 rank 36 MB 加 72 MB。这两个数字就是原值除以层数：$3.3\times1024/94\approx36$ MB，$6.6\times1024/94\approx72$ MB。</p>
+
+<p data-page-node-id="7CclgShqWzz87ER0GY5phU">代价写在同一句话里：前向关键路径上出现一条紧的、逐层的权重实体化期限（§4.1）。既然 buffer 只有一份，那么每一层都必须在该层的专家计算开始前把这一层需要的副本权重装载进去，而且必须在下一层开始前把它腾出来。这条期限是第 5 章通信优化要满足的硬约束。</p>
+
+<h3 id="forward-pipeline" data-page-node-id="YIA5AccMqucpgT7Y6Na7li">3.4 前向：规划与权重分发都在关键路径上</h3>
+
+<p data-page-node-id="Wk4KBncH6Jml5OfCIuKwMQ">一层 MoE 前向在启用 UltraEP 后的执行顺序如下。</p>
+
+<figure class="diagram" data-page-node-id="zI0paTMjDQOvj1fihSvrmZ">
+  <div class="dg-flow" data-page-node-id="GK1FNS9uKMcpnQpA3OrrMo">
+    <div class="dg-node" data-page-node-id="ntArghRpzUjMdtupWvrWfN">
+      <div class="dg-node-title" data-page-node-id="xOHVKw7rO2lk0Einuw9oAY">Gate</div>
+      <div class="dg-node-note" data-page-node-id="Wko63HLT06mluWlruojGj2">算出 token 到逻辑专家的路由，产生精确负载</div>
+    </div>
+    <div class="dg-arrow" data-page-node-id="07HVB3MXUBlWEiJ2suEIGk">&#8594;</div>
+    <div class="dg-node" data-page-node-id="vnUbY7CUKX0PJmO6tLzczA">
+      <div class="dg-node-title" data-page-node-id="QGuseLjIFBFdSBA7GhbDco">notify-dispatch</div>
+      <div class="dg-node-note" data-page-node-id="ETGV4CMWnWXLGSahKEjQkB">复用已有的路由元数据交换，收集全局负载矩阵</div>
+    </div>
+    <div class="dg-arrow" data-page-node-id="qw2QgQYACDiT5saWm92uQ5">&#8594;</div>
+    <div class="dg-node" data-page-node-id="1fH9Q5ZaBn8vC7UWNqKIv6">
+      <div class="dg-node-title" data-page-node-id="nc7Db2GPZwjhsaIzEF7xJb">规划求解</div>
+      <div class="dg-node-note" data-page-node-id="BN5IiVl7CpcRq3SgraYZKR">每个 rank 各自算出同一份复制与重路由计划</div>
+    </div>
+    <div class="dg-arrow" data-page-node-id="g11yTvyqLwkkoRVIqOMgA3">&#8594;</div>
+    <div class="dg-node" data-page-node-id="HvUBSpcdHq45zfcAUH04t4">
+      <div class="dg-node-title" data-page-node-id="6SYCtTxMKAiUUb4og8SsOO">重路由与权重分发</div>
+      <div class="dg-node-note" data-page-node-id="0tjCpU3rYYShWxhgEk1dcS">改写 token 目标；把主专家权重搬到远端副本，两者可重叠</div>
+    </div>
+    <div class="dg-arrow" data-page-node-id="rbj2KfQHbejtGBtCFDyUgB">&#8594;</div>
+    <div class="dg-node" data-page-node-id="mrQophacLvMU5go3xaohG9">
+      <div class="dg-node-title" data-page-node-id="F2APuXW1LSvcwsBC7q9r9b">token dispatch</div>
+      <div class="dg-node-note" data-page-node-id="BMbajbCR1GdIt2wkDPCf6k">all-to-all 把 token 送到目标物理专家，须等权重分发结束</div>
+    </div>
+    <div class="dg-arrow" data-page-node-id="VSZpiOYsnAOJogWdoqIQUB">&#8594;</div>
+    <div class="dg-node" data-page-node-id="e81XroZA9E7nBuGT1C2RVR">
+      <div class="dg-node-title" data-page-node-id="aOiHpXGlrtkLeTUJTKkxbM">专家计算与 combine</div>
+      <div class="dg-node-note" data-page-node-id="ZEKEyPTE3Tzy9YP1g0SWg8">grouped GEMM 算完后经 all-to-all 把结果送回</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption" data-page-node-id="UAs6DUtBuZUCOvKtnbc78G">图注：箭头表示执行的先后依赖。规划求解与权重分发都在 token dispatch 之前、无法被其他计算掩盖，因此都计入关键路径。重路由与权重分发之间的箭头表示两者可并行，但 token dispatch 必须等权重分发完成。这个序列每层执行一次，下一层从 Gate 重新开始，没有跨层的循环依赖。</figcaption>
+</figure>
+
+<p data-page-node-id="3t9zbAhzJvNWynOkfPzpWU">几个关键点。首先，UltraEP 复用已有的 notify-dispatch——即 token all-to-all 之前那次交换路由元数据、确定各对端收发规模与偏移的步骤——来收集全局路由信息，不额外增加一次通信（§4.2）。其次，拿到这份精确负载后，每个 rank 各自确定性地算出完全相同的复制与重路由计划，不需要额外同步；重路由把 router 输出从「token 到逻辑专家」改写成「token 到物理专家」；两者全在设备上完成，没有主机侧瓶颈（§4.2）。</p>
+
+<p data-page-node-id="BCFWd6ElxFkqMa7rOfu5z7">第三点是关键路径的来源。复制方案一确定，UltraEP 就把主专家权重分发到各 rank 上的远端副本。这次同步可以与重路由重叠，但 token dispatch 必须等它结束，否则两者会争抢带宽。结果是规划与权重复制都留在关键路径上，构成严格的时限要求（§4.2）。</p>
+
+<img src="assets/img-05.webp" alt="前向时间线图，分计算流与通信流两行，计算流为 Gate、Replication Planning、Reroute，通信流为 Notify Dispatch、Weight Distribution、Token Dispatch，标出相对标准 MoE 前向的额外开销区间" data-page-node-id="LYWg8B5V7tKngtnwlC7bca">
+
+<p data-page-node-id="bUTaWyAEbmOc4NT8UMzg2I"><b data-page-node-id="iC9dvxhbuV60fj9yENJBeb">图（原文 Figure 8）</b>：启用 UltraEP 的 MoE 前向时间线，分计算流与通信流两行。计算流上依次是 Gate、Replication Planning 与 Reroute；通信流上是 Notify Dispatch、Weight Distribution 与 Token Dispatch。图中标出了相对标准 MoE 前向新增的开销区间，位置正是规划与权重分发这一段。这张图支撑上一段的结论：Weight Distribution 与 Token Dispatch 在通信流上前后相接，说明后者必须等前者结束；而 Reroute 与 Weight Distribution 分处两流、时间上有重叠，对应论文所说的两者可并行。</p>
+
+<h3 id="backward-pipeline" data-page-node-id="gt7mVcr1lD3SLV3ydJFPFY">3.5 反向：梯度归约保证与无副本形式等价</h3>
+
+<p data-page-node-id="CG0hWp7bpZ9CZicTvHhyDj">训练还有反向。反向的第一件事是把冗余专家权重恢复到与前向相同的状态——因为 buffer 跨层复用，前向那一层的副本权重早已被后续层覆盖。这次通信可以与权重梯度（Wgrad）计算重叠，但到数据梯度（Dgrad）开始之前必须结束，以避免竞态（§4.2）。</p>
+
+<p data-page-node-id="zvH0aTC6sxDSC8y5q8RSer">MoE 反向结束后，每个主专家把它所有远端副本贡献的梯度聚合进自己的主梯度 buffer。论文明确这次归约保持与「没有副本」那种形式的等价性，并且必须在下一个 MoE 层开始前完成——因为冗余梯度 buffer 同样跨层复用（§4.2）。这一条加上「优化器更新只作用于主专家」，构成了训练语义不变的完整论证：副本只是临时的算力扩展，它们算出的梯度全部回流到主专家，优化器看到的东西与不做均衡时完全一样。</p>
+
+<p data-page-node-id="SK6NP0TAzo6KScQ46gP1kB">反向不重新求解复制方案，而是复用前向缓存的元数据；反向的重路由实际上是前向分配的 scatter-to-gather 逆操作，开销可忽略（§4.2）。</p>
+
+<h3 id="formulation" data-page-node-id="qobrtH39cOWUQ0BHrXPydQ">3.6 问题形式化：优化目标为什么写成对 rank 取最大</h3>
+
+<p data-page-node-id="mDFaMEZmdU3d2ED7S1XlDx">论文把每层的均衡决策形式化成一个在线优化问题，对每个 EP 组独立求解（§4.3）。输入是静态元数据 $(\mathcal{R},\mathcal{E},h,N_{\mathrm{slot}})$ 与运行时负载 $\Lambda$；输出是配额式复制方案 $U$ 与与之一致的重路由拆分 $q_{r,e,t}$。配额的第二个下标指承载该实例的 rank，本页在讨论「某 rank 的总负载」时写作 $u_{e,r}$、在讨论「某源发往某目标」时写作 $u_{e,t}$，两者是同一张表 $U$ 的元素，下标字母只反映该 rank 在当前语境中的角色（$r$ 为源、$t$ 为目标）。符号含义如下：$\mathcal{R}$ 是 EP 组内全部 rank、规模 $R:=\lvert\mathcal{R}\rvert$；$\mathcal{E}$ 是全部逻辑专家；$h(e)$ 是逻辑专家 $e$ 的 home rank，即承载其主实例的那个；$\mathcal{E}_r=\{e\in\mathcal{E}\mid h(e)=r\}$ 是 rank $r$ 上的主专家集合；$\mathcal{H}(e)$ 是承载 $e$ 各物理实例的 rank 集合。</p>
+
+<p data-page-node-id="cNw9TR9uAwFfkuVHejXHx6">前向的优化目标是把这一串延迟之和最小化：</p>
+
+<p data-page-node-id="pYcMrRaClR3PigyDi1SfVg">$$T_{\text{solve\_rep}}^{fwd}+\max\left(T_{\text{reroute}}^{fwd},T_{w\_\text{distr}}^{fwd}\right)+T_{\text{tok\_a2a}}^{fwd}+T_{\text{moe}}^{fwd}$$</p>
+
+<p data-page-node-id="6bLhDEBSuY61qsUHQW1VEv">各项依次是规划求解、重路由、权重分发、token all-to-all 与 MoE 计算的延迟（§4.3 Eq.(1)）。这个式子直接对应上一节的时间线：重路由与权重分发取 $\max$ 而不是相加，因为它们可以重叠；其余各项串行相加。</p>
+
+<p data-page-node-id="Q3MedJ6akTxDU1TtH9Ak24">反向的目标只剩两项：</p>
+
+<p data-page-node-id="GHbg1CA3SDniwEVMWYS0fJ">$$\min\quad T_{\text{tok\_a2a}}^{bwd}+T_{\text{moe}}^{bwd}$$</p>
+
+<p data-page-node-id="YbmBHn99s8h1a4F8VbV39e">反向复用前向的复制与重路由元数据，副本特有的通信被藏在计算之下，因此只有 token all-to-all 与 MoE 计算留在暴露路径上（§4.3 Eq.(2)）。</p>
+
+<p data-page-node-id="fdjDpA3SVGEcGqxQbTfcjr">接下来三个式子是代价模型。MoE 计算用重路由后最忙的那个 rank 来建模，其中 $T_{\text{moe}}^{bwd}\approx 2T_{\text{moe}}^{fwd}$ 以计入 Wgrad 与 Dgrad 两部分计算：</p>
+
+<p data-page-node-id="o4eRsW0Oo4PDDXZ6AXBOIF">$$T_{\text{moe}}^{fwd/bwd}\propto\max_{r\in\mathcal{R}}\sum_{e\in\mathcal{E}}u_{e,r}$$</p>
+
+<p data-page-node-id="17aPOX7VNPGGLJUnWfo3GF">token all-to-all 由最忙的发送端或接收端主导，反向在同一负载分布下遵循与前向相同的不均衡模式：</p>
+
+<p data-page-node-id="1ChavbCTTkztIVGWlTuFms">$$T_{\text{tok\_a2a}}^{fwd/bwd}\propto\max_{r\in\mathcal{R}}\max\left(\sum_{e\in\mathcal{E}}\lambda_{r,e},\sum_{e\in\mathcal{E}}u_{e,r}\right)$$</p>
+
+<p data-page-node-id="MdEgx08BsIDTSZHaWI2eRw">内层的 $\max$ 比较的是同一个 rank 的两个量：$\sum_e\lambda_{r,e}$ 是它作为源要发出的 token 总数，$\sum_e u_{e,r}$ 是它作为目标要接收的 token 总数。论文指出，训练中每个 rank 发出的 token 数由 microbatch 形状与并行配置固定，prefill 中则由切块预填充的块大小上界约束（§4.3）；切块预填充的机制与 token budget 见 <a href="../chunked-prefill/index.html" data-page-node-id="bzC2nkAClAYGiPk4XR0TC8">Chunked Prefill</a>。既然发送侧在给定配置下是固定的，可优化的就只有接收侧 $\sum_e u_{e,r}$——这与 MoE 计算的优化对象是同一个量。</p>
+
+<p data-page-node-id="ddRKt4kSHF9wsTFoNXe5bb">权重分发的延迟由承载最热主专家的 rank 主导：</p>
+
+<p data-page-node-id="oXxNwoXJOBxy0o1OIgc0Vx">$$T_{w\_\text{distr}}^{fwd}\propto\max_{r\in\mathcal{R}}\sum_{e\in\mathcal{E}_{r}}\left(\lvert\mathcal{H}(e)\rvert-1\right)$$</p>
+
+<p data-page-node-id="Fmg7HGJMYyqwdUu2eHL9OF">这里 $\lvert\mathcal{H}(e)\rvert-1$ 是专家 $e$ 需要发出的远端副本份数（总实例数减去自己的主实例），对该 rank 的所有主专家求和就是它要发出的总份数（§4.3 Eq.(5)）。这个式子解释了第 5 章要处理的 fan-out 瓶颈从哪来。</p>
+
+<p data-page-node-id="BHCUZh0pRoAeNsX4tq9jMw">三个代价模型都对 rank 取最大值，原因是同一个：EP 组内的 rank 每层都要同步，整步耗时由最慢的 rank 决定。</p>
+
+<details data-page-node-id="XLzSzHkWiNrCTZpiloEk3V">
+<summary data-page-node-id="3ZG6LINBHzpZnDIwmP2ABR">用贯穿示例检查三个代价模型的取值方向</summary>
+<p data-page-node-id="tBA9TnVix7FTRsMncTaNhJ">取本页开头的例子。均衡之前不存在任何副本，因此每个逻辑专家的全部负载都落在其 home rank 上，即 $u_{e,h(e)}=\lambda_e$。</p>
+<p data-page-node-id="g5hpL1V0gz0ClhHwpcWcPc">Eq.(3) 的 MoE 计算项：$\sum_e u_{e,r}$ 在四个 rank 上分别是 12、6、4、2，取最大得 12。第 4 章均衡后四个 rank 各为 6，取最大得 6。代价模型的取值从 12 降到 6，与「最慢 rank 的工作量减半」一致。</p>
+<p data-page-node-id="r0P17SdWXUoW2dKcOLlDN5">Eq.(4) 的 token all-to-all 项：发送侧 $\sum_e\lambda_{r,e}$ 在四个 rank 上分别是 8、6、6、4（按负载矩阵逐行求和），接收侧均衡前是 12、6、4、2。逐 rank 取内层 $\max$ 得 12、6、6、4，外层取最大得 12。均衡后接收侧变成 6、6、6、6，内层 $\max$ 得 8、6、6、6，外层取最大得 8。这个 8 来自 $r_0$ 的发送量——它已经由负载矩阵固定，均衡改不动。这正是论文所说「训练中每个 rank 发出的 token 数由 microbatch 形状与并行配置固定」的含义：all-to-all 项存在一个由发送侧决定的下界。</p>
+<p data-page-node-id="PY8LUrHiSdkAvSiPX89ved">Eq.(5) 的权重分发项：均衡前所有 $\lvert\mathcal{H}(e)\rvert=1$，求和为 0，没有权重要搬。第 4 章的方案给 $e_0$ 建了 2 个副本（$\lvert\mathcal{H}(e_0)\rvert=3$），其余专家不变，于是 $r_0$ 的求和是 $(3-1)+(1-1)=2$，其余 rank 为 0，取最大得 2。这说明均衡的代价确实由承载最热主专家的那个 rank 承担——$e_0$ 的 home rank 是 $r_0$，权重就得从 $r_0$ 发出去。</p>
+<p data-page-node-id="jg6WVmKzlBuwQpjYP05P7A">三项的方向一致：均衡把 Eq.(3) 从 12 压到 6、把 Eq.(4) 从 12 压到由发送侧决定的 8，代价是 Eq.(5) 从 0 涨到 2。这笔交易划不划算，取决于「搬 2 份权重」相对「少算 6 个单位」的时间成本，也就是第 5 章通信优化要解决的问题。这是构造示例，用于验证代价模型的取值方向，不是论文的实验数据。</p>
+</details>
+
+<p data-page-node-id="r04t5RpbEoS6t4BWLdvJe0">最后是四条约束（§4.3）。第一，主专家的放置不可变——这就是「只复制不重排」在形式化中的体现。第二，每个 rank 的冗余槽预算为 $N_{\mathrm{slot}}$，且同一个逻辑专家不得在同一 rank 上出现两次。第三，副本引入的反向通信必须被完全隐藏，以保证反向不产生可见开销。第四，每个新建副本至少要承载 $u_{\min}$ 的配额，论文取 $u_{\min}=1024$。</p>
+
+<h3 id="layout-and-pipeline-questions" data-page-node-id="kscFBqS6dlrKbNbNHTl1MK">本章问题</h3>
+<ol class="chapter-questions" data-page-node-id="VmB56Lg7mORp1FlrnCV33c">
+  <li data-page-node-id="FmHVSaOzPPMPUpFx91ZWrh">
+    <p data-page-node-id="i08i3sSpgUWKuWFF9CWdt5">为什么冗余槽敢不保存优化器状态？训练结果会不会因此改变？</p>
+    <details data-page-node-id="A8gJeWHijXIZY9gkcBVmQC">
+      <summary data-page-node-id="wIFbQJcsfrar71BlD3cb3w">解答：不会。优化器更新只作用于主专家，副本算出的梯度在反向结束后全部归约回主梯度 buffer，该归约保持与无副本形式的等价性</summary>
+      <p data-page-node-id="2ULWAlULCeqLBGEUGxtBDF">副本的角色是临时的算力扩展，不是独立的参数副本。论文的设计是：优化器更新只在主专家上进行，因此冗余槽不需要动量、二阶矩这类优化器状态（§4.1）。反向执行时，MoE 反向结束后每个主专家把它所有远端副本贡献的梯度聚合进自己的主梯度 buffer，论文明确这次归约保持与「没有副本」那种形式的等价性（§4.2）。两者相加的结果是：优化器看到的梯度与不做均衡时完全一样，参数更新轨迹不变。</p>
+      <p data-page-node-id="4HMG8mJtH8Dvg3OrxDV1fM">这条论证在生产训练中得到印证——§8.6 报告 loss 曲线符合预期的预训练轨迹，论文给的原因正是 UltraEP 只改变物理执行逻辑、保留训练语义。此外冗余专家还被排除在框架侧的参数与梯度桶、优化器状态与 checkpoint 之外（§7），所以它们也不会污染保存下来的模型。</p>
+    </details>
+  </li>
+  <li data-page-node-id="CrjeBiX7aNfMObuwcwo6h3">
+    <p data-page-node-id="eA8IlYph5et2CBawiCfce4">跨层复用省了多少内存，代价是什么？</p>
+    <details data-page-node-id="9NhonhidlUy8oSTWDtr8CQ">
+      <summary data-page-node-id="y7JpnN220aqoZ8vhhVUoB2">解答：把「每层一份」压成「总共一份」，Qwen3-235B-A22B 上单槽从 3.3 GB 加 6.6 GB 降到 36 MB 加 72 MB；代价是前向关键路径上多出逐层的权重实体化期限</summary>
+      <p data-page-node-id="hxA9Sn9zzrUhK3BstVQFC7">Qwen3-235B-A22B 有 94 个 MoE 层。若每层每个冗余槽都留一份权重与梯度 buffer，单个冗余槽需要 3.3 GB 权重与 6.6 GB 梯度。跨层共享后只留一份、每层用完由下一层复用，于是每 rank 降到 36 MB 与 72 MB，即原值除以层数：$3.3\times1024/94\approx36$ MB，$6.6\times1024/94\approx72$ MB（§4.1）。</p>
+      <p data-page-node-id="kiKxS32CTgpxEPlhWLuGTn">代价是论文在同一句里写明的：前向关键路径上出现一条紧的、逐层的权重实体化期限。既然 buffer 只有一份，每层都必须在该层专家计算开始前把这一层需要的副本权重装载好，并在下一层开始前腾出来。反向侧同理——冗余梯度 buffer 也跨层复用，所以梯度归约必须在下一个 MoE 层开始前完成（§4.2）。这条期限是第 5 章通信优化必须满足的硬约束，也是为什么论文要专门为这类不规则搬运做 tile 流水线与中继。</p>
+    </details>
+  </li>
+  <li data-page-node-id="HthaO2kKBhwuxEFO5dbhyc">
+    <p data-page-node-id="rW69WiiMLNsF3ZoZ7v1MmF">为什么 Eq.(3)、Eq.(4)、Eq.(5) 三个代价模型都是对 rank 取最大值？</p>
+    <details data-page-node-id="Dw0aaN2W8Vc9Un3jZUULlW">
+      <summary data-page-node-id="hZg5qAXybvJPIXRGgwDxE6">解答：因为 EP 组内的 rank 每层都要同步，整步耗时由最慢的 rank 决定，所以每一项的代价都取该项在各 rank 上的最大值</summary>
+      <p data-page-node-id="CbNFFJdcrZWwlqnnLTqNHA">一层 MoE 的执行里，所有 rank 要完成 token all-to-all、专家计算与 combine 才能进入下一层，这是一个同步点。任何一个 rank 慢，其余 rank 都在等它。因此建模某一项延迟时，起决定作用的不是平均值而是最大值。</p>
+      <p data-page-node-id="H4bAirhOIgJxbh1IfY2bYj">三项各自取最大的对象不同：Eq.(3) 的 MoE 计算取重路由后负载最大的 rank，即 $\max_r\sum_e u_{e,r}$；Eq.(4) 的 token all-to-all 先在每个 rank 内比较「要发出的 token 数」与「要接收的 token 数」取较大者，再在 rank 之间取最大——因为一次 all-to-all 的耗时由最忙的发送端或接收端决定；Eq.(5) 的权重分发取要发出副本份数最多的 rank，即 $\max_r\sum_{e\in\mathcal{E}_r}(\lvert\mathcal{H}(e)\rvert-1)$，这个量落在承载最热主专家的 rank 上。</p>
+      <p data-page-node-id="uak7C3NnR8EysiGfSsXS4s">Eq.(4) 还有一个推论：发送侧 $\sum_e\lambda_{r,e}$ 在训练中由 microbatch 形状与并行配置固定、在 prefill 中由切块预填充的块大小上界约束，均衡改不动它（§4.3）。所以 all-to-all 这一项存在一个由发送侧决定的下界，可优化的只是接收侧——而接收侧正是 Eq.(3) 的优化对象。两项共享同一个优化变量 $\sum_e u_{e,r}$，这也是配额求解直接瞄准它的原因。</p>
+    </details>
+  </li>
+</ol>
+<h2 id="quota-planning" data-page-node-id="PVhODgwVlXx3h5gtg0vp4r">4. 配额把「建不建副本」和「接多少 token」并成一个变量</h2>
+
+<p data-page-node-id="AwEmocU5NS4m8fxMGOtYdq">第 3 章确定了优化对象：重路由之后各 rank 的负载 $\sum_e u_{e,r}$。这一章讲 UltraEP 怎么在 gating 到 dispatch 之间的窗口里把它解出来。</p>
+
+<h3 id="decoupled-gap" data-page-node-id="CzH3USsq90q2lDfI3qgWX2">4.1 解耦放置与重路由留下的缺口</h3>
+
+<p data-page-node-id="A7qjsVpKy3qUGKJrE0WzF2">已有系统把两件事分开做：先决定副本放在哪些 rank 上（放置），再决定每个 token 去哪个实例（重路由）。放置可以提前规划、有充足的时间预算；在线的重路由则用简单启发式，比如把某专家的 token 在其各副本之间轮转均分（round-robin），或者在严格的副本数限制下修补预测偏差（§4.4）。</p>
+
+<p data-page-node-id="efefEnlQ50GBFcdAQUQuFM">问题在于优化目标错位。round-robin 让某个专家的 token 在其副本之间均分，但各副本所在的 rank 上还有别的专家。均分之后，各 rank 的总负载并不相等。论文对 EPLB 家族的判断是：它们优化的是重路由之前的热度，而不是重路由之后的负载上界（§8.5）。</p>
+
+<p data-page-node-id="5hvjfYx0AVukmIXxA69HUS">用贯穿示例可以看到这个差距。假设某个方案给热专家 $e_0$ 在 $r_2$ 与 $r_3$ 上各建了一个副本，于是 $e_0$ 有三个实例（$r_0$、$r_2$、$r_3$）。round-robin 把 $e_0$ 的 10 个单位在三个实例上轮转，得到 4、3、3。加上各 rank 原有的其他主专家负载，四个 rank 的总负载变成 6、6、7、5，rank 级不均衡度 $7/6\approx1.1667$。而如果直接以「各 rank 总负载相等」为目标去分，$e_0$ 的三个实例应该分到 4、2、4——因为 $r_2$ 本来就有 $e_4,e_5$ 共 4 个单位、只剩 2 个单位的空间，而 $r_3$ 只有 2 个单位、还能吃 4 个。这样四个 rank 各为 6，不均衡度 1.0。</p>
+
+<div class="callout callout-blue" data-page-node-id="dewpzUN69HSUyFn8PUL3PJ">
+<p data-page-node-id="loolZyNHGd7bGdHWOcgxRe">关键区别：round-robin 只看「这个专家的 token 怎么在它的副本间分」，看不到「每个副本所在的 rank 上还有多少别的负载」。配额求解的做法是反过来——先算出每个实例应该接多少才能让各 rank 总负载达标，再据此决定副本建在哪。</p>
+</div>
+
+<h3 id="quota-as-coupling" data-page-node-id="96voKQMWF88DkcX8o0HFkl">4.2 配额是什么，为什么它是耦合变量</h3>
+
+<p data-page-node-id="sEWgdcDHFIyc1E3wyVbWwD">UltraEP 不先定副本再补重路由，而是直接求解最终的每实例负载配额 $U=\{u_{e,r}\}$（§5）。配额的定义是：$u_{e,r}>0$ 当且仅当 rank $r$ 承载逻辑专家 $e$ 的一个物理实例，而这个数值就是该实例在重路由之后承接的 token 负载。</p>
+
+<p data-page-node-id="dFjnhCFk5d55HWqsoYVHaF">一个变量绑住了两件事。大于零意味着「这里要有一份实例」，数值本身则是「这份实例接多少流量」。论文把这个性质表述为：配额把副本创建与 token 重路由耦合起来——只有当一个副本能承载有用的负载时它才被实体化，而重路由随后按解出的配额拆分来实现，并带上局部性（§1）。</p>
+
+<p data-page-node-id="qI2udzR42nrtVL3sET5jEv">这个设计带来的直接好处是避开了组合爆炸。论文的说法是：用配额作为耦合变量，每次探测在选副本的同时就预留了重路由容量，因此不必枚举副本集合、也不必做 token 级路由；同时它避免产生那种「满足了放置启发式却收不到多少流量」的无效副本（§5.1）。</p>
+
+<h3 id="threshold-form" data-page-node-id="HF0hAfw3aoVO2SkXMSfndN">4.3 阈值形式化：超额与空闲</h3>
+
+<p data-page-node-id="IdVdET5pA3LGwKUh4bahwe">求解的入口是一个判定问题：给定一个负载阈值 $\tau$，能不能只靠复制就让每个 rank 的负载都降到 $\tau$ 以下？</p>
+
+<p data-page-node-id="dJrYHyVrCG7EOyioDpK6CT">先定义两个量。记 $\lambda_e=\sum_{r\in\mathcal{R}}\lambda_{r,e}$ 为专家 $e$ 的总负载，$\ell_r=\sum_{e\in\mathcal{E}_r}\lambda_e$ 为 rank $r$ 的初始负载。对候选阈值 $\tau$：</p>
+
+<p data-page-node-id="laqXE2Gbf4Wwf3w664CmwZ">$$\mathrm{exc}_r(\tau)=\max(\ell_r-\tau,0),\qquad\mathrm{slk}_r(\tau)=\max(\tau-\ell_r,0)$$</p>
+
+<p data-page-node-id="II6Q4EIa7GpEyYf9fnP8jE">$\mathrm{exc}_r(\tau)$ 是 rank $r$ 必须卸掉的超额负载，$\mathrm{slk}_r(\tau)$ 是它还能吸收的空闲（§5.1 Eq.(6)）。两者至多一个为正：负载超过阈值的 rank 有超额、低于阈值的有空闲。</p>
+
+<p data-page-node-id="lScEhYASZdVLsTp1frMvp9">论文对可行性的定义是：如果超额负载能从超载 rank 重新分配到合法的接收 rank，且不违反空闲、每 rank 的槽位预算与不重复约束，使每个 rank 最终负载不超过 $\tau$，那么 $\tau$ 是可行的（§5.1）。</p>
+
+<p data-page-node-id="0J7rtviz4ROir6eJXBrfDg">用贯穿示例代入 $\tau=6$：$\mathrm{exc}$ 在四个 rank 上是 6、0、0、0，$\mathrm{slk}$ 是 0、0、2、4。$r_0$ 要卸掉 6 个单位，可用的空闲总量是 $2+4=6$，刚好够——但够不够只是必要条件，还要看槽位约束与专家的可转移量允许不允许这么分。这就是可行性判定要做的事。</p>
+
+<h3 id="binary-search" data-page-node-id="Z38JXYsllHFxtptqz9QY43">4.4 二分搜索加贪心判定</h3>
+
+<p data-page-node-id="OWvGN4eaZJjDMdeeTfX4PA">UltraEP 在「目标 rank 负载」与「初始最大 rank 负载」之间二分 $\tau$，每次探测跑一遍贪心可行性判定（§5.1）。二分区间的初始化是：</p>
+
+<p data-page-node-id="1d5qx5w77n7bWADcjUNGq2">$$\tau_{\mathrm{lo}}\gets\beta\cdot\left\lceil\frac{1}{R}\sum_r\ell_r\right\rceil,\qquad\tau_{\mathrm{hi}}\gets\max_r\ell_r$$</p>
+
+<p data-page-node-id="qRVk1QdGlLAsDnkaRQrH5W">下界是平均负载乘以目标均衡系数 $\beta$（论文取 1.01），上界是当前最大 rank 负载——不做任何均衡时的取值。</p>
+
+<p data-page-node-id="D4kboy2n16CoeXk675IBl0">对候选 $\tau$，判定过程按残余超额降序访问超载 rank，对每个 rank 按 $\lambda_e$ 降序访问它的主专家。对当前专家，它把尽可能多的负载转给空闲最大的合法接收 rank，受配额下限 $u_{\min}$ 约束。单次转移量是三个量的最小值：</p>
+
+<p data-page-node-id="nm3CnwApAGM6ku2JilsLPr">$$\delta\gets\min(\mathrm{exc}_r,\mathrm{slk}_{t^\star},\mathrm{cap}_e)$$</p>
+
+<p data-page-node-id="kFWy54WycMblQsoTrIbQev">其中 $t^\star=\arg\max_{t\in\mathcal{T}}\mathrm{slk}_t$ 是空闲最大的合法目标，$\mathcal{T}$ 是同时满足空闲、槽位与不重复三个约束的 rank 集合，$\mathrm{cap}_e$ 是专家 $e$ 剩余可转移的负载。若 $\delta<u_{\min}$ 则不接受这次转移、跳出（§5.1，Algorithm 1）。</p>
+
+<p data-page-node-id="AnnRhjC4eagreHe3q8DtKT">被接受的转移同时做两件事：创建一个副本，并更新它在临时计划 $\tilde U$ 中的配额。论文强调这一点的意义在于放置本身已经编码了有效的重路由容量（§5.1）。全部残余超额被排空则这次探测可行，记录 $\tilde U$ 并转向更小的阈值；否则不可行，向上搜索。</p>
+
+<h3 id="worked-example" data-page-node-id="42ZGHOMh9jL0vd7bjHgAU8">4.5 用贯穿示例走完求解</h3>
+
+<p data-page-node-id="Ffz9rGO6Hsf7iGjRFO8QMH">回到本页开头的例子：$R=4$，8 个逻辑专家，$N_{\mathrm{slot}}=1$，$u_{\min}=1$ 个单位，$\beta=1.01$。初始 rank 负载 12、6、4、2，总负载 24。</p>
+
+<p data-page-node-id="nMSgwu4bJow9YYHzljQP91">二分区间：$\tau_{\mathrm{lo}}=1.01\times\lceil24/4\rceil=1.01\times6=6.06$，$\tau_{\mathrm{hi}}=12$。</p>
+
+<p data-page-node-id="jFZBrUm735W8anbJuv6Gp9"><b data-page-node-id="sCN7smCe9wbU9iccs2VzBJ">第一次探测 $\tau=\lfloor(6.06+12)/2\rfloor=9$。</b>$\mathrm{exc}=(3,0,0,0)$，$\mathrm{slk}=(0,3,5,7)$。只有 $r_0$ 超载、要卸 3 个单位。$r_0$ 的主专家按 $\lambda_e$ 降序是 $e_0$（10）、$e_1$（2）。合法目标里 $r_3$ 空闲最大（7），转移量 $\delta=\min(3,7,10)=3$。于是 $e_0$ 在 $r_3$ 上建副本、配额 3；$r_0$ 的超额清零。四个 rank 的重路由后负载变成 9、6、4、5，全部不超过 9，可行。记录方案，$\tau_{\mathrm{hi}}\gets9$。</p>
+
+<p data-page-node-id="zzOu0ZObcovwVHdKFYiepB"><b data-page-node-id="QP4wDJBmFgLoQzBWdygdGz">第二次探测 $\tau=\lfloor(6.06+9)/2\rfloor=7$。</b>$\mathrm{exc}=(5,0,0,0)$，$\mathrm{slk}=(0,1,3,5)$。$r_0$ 要卸 5 个单位。$e_0$ 先给空闲最大的 $r_3$：$\delta=\min(5,5,10)=5$，一次就卸完。负载变成 7、6、4、7，可行。$\tau_{\mathrm{hi}}\gets7$。</p>
+
+<p data-page-node-id="DuQE0SFU4cAgWHmTA3raqk"><b data-page-node-id="CbnuTAVyxQloxomv0rj29o">第三次探测 $\tau=\lfloor(6.06+7)/2\rfloor=6$。</b>$\mathrm{exc}=(6,0,0,0)$，$\mathrm{slk}=(0,0,2,4)$。$r_0$ 要卸 6 个单位。$e_0$ 先给 $r_3$（空闲 4）：$\delta=\min(6,4,10)=4$，建副本、配额 4；此时 $\mathrm{exc}_{r_0}=2$，$\mathrm{slk}_{r_3}=0$。再找合法目标，只剩 $r_2$（空闲 2）：$\delta=\min(2,2,6)=2$，建副本、配额 2；超额清零。$e_0$ 的三个实例配额是 $r_0$ 上 4、$r_2$ 上 2、$r_3$ 上 4，四个 rank 的负载各为 6，可行。$\tau_{\mathrm{hi}}\gets6$，此时 $\tau_{\mathrm{lo}}=6.06>\tau_{\mathrm{hi}}=6$，循环结束。</p>
+
+<p data-page-node-id="V9DMK6un7Drtu3BCoaV3CV">最终方案：$\tau=6$，四个 rank 的重路由后负载都是 6，rank 级不均衡度 $6/6=1.0$；只用了 2 个冗余槽（$r_2$ 与 $r_3$ 各一个），4 个可用槽位中还剩 2 个空着。初始不均衡度 2.0 被完全消掉。</p>
+
+<div class="callout callout-green" data-page-node-id="e0q3oAGBAAByik8eDCK3hK">
+<p data-page-node-id="PYu5LblucSYQgwctH8tl7t">注意第三次探测里 $u_{\min}$ 的作用：两次转移量分别是 4 和 2，都不小于 $u_{\min}=1$，所以都被接受。若把 $u_{\min}$ 调到 3，第二次转移的 $\delta=2$ 会被拒绝，$r_0$ 的超额排不空，$\tau=6$ 就变成不可行，最终阈值会停在 7。这正是 $u_{\min}$ 的设计意图——宁可容忍略高的阈值，也不建那种只承接零星流量、却要付出完整权重搬运代价的副本。</p>
+</div>
+
+<details class="code-details" data-page-node-id="FNtctcMZIzfbiuCezWUepK">
+<summary data-page-node-id="qVztThZ2sWEhMO0aWYBArP">Algorithm 1 的完整实现：验证二分过程、配额构造与两个对照</summary>
+<div class="code-block" data-page-node-id="PrLU9H6SY3chgZBpviMTLS">
+<pre data-page-node-id="U8qwgT7uWr0Kgk4btAGw0j"><code class="language-python" data-page-node-id="sLXd5WEqjJWFaVlDTvDcvV">import math
+
+R = 4                      # EP 组内 rank 数
+N_SLOT = 1                 # 每个 rank 的冗余槽数
+U_MIN = 1                  # 最小有用配额（1 单位 = 1024 token）
+BETA = 1.01                # 目标均衡系数
+
+home = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3}   # 逻辑专家 -> home rank
+E = sorted(home)
+mains = {r: [e for e in E if home[e] == r] for r in range(R)}
+
+# 全局负载矩阵 lambda[r][e]：源 rank r 上被路由到逻辑专家 e 的 token 数
+lam = [
+    [4, 1, 1, 1, 0, 1, 0, 0],   # rank 0 发出
+    [3, 0, 1, 1, 1, 0, 0, 0],   # rank 1 发出
+    [2, 1, 1, 0, 1, 1, 0, 0],   # rank 2 发出
+    [1, 0, 0, 1, 0, 0, 1, 1],   # rank 3 发出
+]
+lam_e = {e: sum(lam[r][e] for r in range(R)) for e in E}
+ell = {r: sum(lam_e[e] for e in mains[r]) for r in range(R)}
+
+
+def imbalance(loads):
+    return max(loads.values()) / (sum(loads.values()) / len(loads))
+
+
+def solve_replication():
+    """二分搜索最小可行阈值 tau，每次探测跑一遍贪心可行性判定。"""
+    tau_lo = BETA * math.ceil(sum(ell.values()) / R)
+    tau_hi = float(max(ell.values()))
+    best, trace = None, []
+    while tau_lo &lt; tau_hi:
+        tau = math.floor((tau_lo + tau_hi) / 2)
+        exc = {r: max(ell[r] - tau, 0) for r in range(R)}
+        slk = {r: max(tau - ell[r], 0) for r in range(R)}
+        u = {(e, r): 0 for e in E for r in range(R)}
+        for e in E:
+            u[(e, home[e])] = lam_e[e]
+        slots = {r: 0 for r in range(R)}
+        hosts = {e: {home[e]} for e in E}
+
+        for r in sorted(range(R), key=lambda x: -exc[x]):        # 超载 rank 按残余超额降序
+            if exc[r] &lt;= 0:
+                continue
+            for e in sorted(mains[r], key=lambda x: -lam_e[x]):  # 主专家按总负载降序
+                cap = u[(e, home[e])]
+                while exc[r] &gt; 0 and cap &gt; 0:
+                    adm = [t for t in range(R)                   # 空闲 / 槽位 / 不重复
+                           if slk[t] &gt; 0 and slots[t] &lt; N_SLOT and t not in hosts[e]]
+                    if not adm:
+                        break
+                    t_star = max(adm, key=lambda t: slk[t])      # 选空闲最大的
+                    delta = min(exc[r], slk[t_star], cap)
+                    if delta &lt; U_MIN:                            # 配额下限剪枝
+                        break
+                    u[(e, home[e])] -= delta
+                    u[(e, t_star)] += delta
+                    hosts[e].add(t_star)
+                    slots[t_star] += 1
+                    exc[r] -= delta
+                    slk[t_star] -= delta
+                    cap -= delta
+
+        feasible = sum(exc.values()) == 0
+        trace.append((tau, feasible, {r: sum(u[(e, r)] for e in E) for r in range(R)}))
+        if feasible:
+            best = (tau, dict(u), {e: set(v) for e, v in hosts.items()})
+            tau_hi = tau
+        else:
+            tau_lo = tau + 1
+    return best, trace
+
+
+def solve_reroute(u, hosts, locality=True):
+    """把配额 U 分解成源到实例的拆分 Q；locality=False 时跳过本地优先。
+
+    两个分支都保持双向守恒：按源看凑满该源需求，按目标看凑满该实例配额。
+    """
+    q = {}
+    for e in E:
+        H = sorted(hosts[e])
+        lam_hat = {r: lam[r][e] for r in range(R)}
+        u_hat = {t: u[(e, t)] for t in H}
+        if locality:
+            for t in H:                                   # 同 rank 的 token 先吃本地配额
+                take = min(lam_hat[t], u_hat[t])
+                if take:
+                    q[(t, e, t)] = take
+                lam_hat[t] -= take
+                u_hat[t] -= take
+        for r in range(R):                                # 残余需求按残余配额比例分摊
+            need = lam_hat[r]
+            if need &lt;= 0:
+                continue
+            residual = sum(u_hat.values())
+            for t in H:
+                if need &lt;= 0 or u_hat[t] &lt;= 0:
+                    continue
+                share = min(round(lam_hat[r] * u_hat[t] / residual), u_hat[t], need)
+                if share:
+                    q[(r, e, t)] = q.get((r, e, t), 0) + share
+                    u_hat[t] -= share
+                    need -= share
+            for t in H:                                   # 取整残差按剩余配额补齐
+                if need &lt;= 0:
+                    break
+                take = min(need, u_hat[t])
+                if take:
+                    q[(r, e, t)] = q.get((r, e, t), 0) + take
+                    u_hat[t] -= take
+                    need -= take
+    return q
+
+
+def round_robin_reroute(hosts):
+    """对照：副本集合不变，token 在实例间轮转均分。"""
+    loads = {r: 0 for r in range(R)}
+    for e in E:
+        H = sorted(hosts[e])
+        for i in range(lam_e[e]):
+            loads[H[i % len(H)]] += 1
+    return loads
+
+
+best, trace = solve_replication()
+tau, u, hosts = best
+
+print("专家总负载 lambda_e :", lam_e)
+print("初始 rank 负载 ell_r:", ell, "均值", sum(ell.values()) / R,
+      "初始不均衡", round(imbalance(ell), 3))
+print("\n二分搜索过程（阈值 tau / 可行性 / 该 tau 下重路由后各 rank 负载）")
+for t_, ok, loads in trace:
+    print(f"  tau={t_:2d}  {'可行' if ok else '不可行':4s}  {loads}")
+
+print("\n最终阈值 tau =", tau)
+print("非零配额 u[e,r] :", {f"e{e}@r{r}": v for (e, r), v in sorted(u.items()) if v})
+post = {r: sum(u[(e, r)] for e in E) for r in range(R)}
+print("重路由后 rank 负载:", post, " 不均衡 =", round(imbalance(post), 4))
+print("消耗冗余槽:", sum(1 for (e, r), v in u.items() if v and r != home[e]), "/", R * N_SLOT)
+
+rr = round_robin_reroute(hosts)
+print("\n对照：同一副本集合 + round-robin 重路由")
+print("  rank 负载:", rr, " 不均衡 =", round(imbalance(rr), 4))
+
+print("\n专家 e0 的重路由拆分 q[源, e0, 目标]（配额 4/2/4 分别在 r0/r2/r3）:")
+q = solve_reroute(u, hosts)
+for (r, e, t), v in sorted(q.items()):
+    if e == 0:
+        print(f"  源 r{r} -> 目标 r{t}: {v}  ({'本地' if r == t else '跨 rank'})")
+for tag, loc in (("本地优先", True), ("关闭本地优先", False)):
+    qq = solve_reroute(u, hosts, locality=loc)
+    for e in E:                                   # 断言双向守恒，两个分支都必须成立
+        for r in range(R):
+            assert sum(v for (a, b, _), v in qq.items() if a == r and b == e) == lam[r][e]
+        for t in sorted(hosts[e]):
+            assert sum(v for (_, b, c), v in qq.items() if b == e and c == t) == u[(e, t)]
+    tot = sum(qq.values())
+    cross = tot - sum(v for (r, _, t), v in qq.items() if r == t)
+    print(f"{tag}：双向守恒成立，跨 rank 在飞 token {cross}/{tot} = {round(100 * cross / tot, 1)}%")</code></pre>
+</div>
+<p data-page-node-id="pKO9QLfMM0wBOIJea62GIX"><b data-page-node-id="D3ejKPDDpCaitsr5PH1HCB">预期输出</b>：</p>
+<div class="code-block" data-page-node-id="StBUo6EqyyRPTP5sMgOHJm">
+<pre data-page-node-id="tPj80mBbqUTV2TnlXesgjs"><code class="language-text" data-page-node-id="Q38MKv35ZqtP1Xe5WcMjuO">专家总负载 lambda_e : {0: 10, 1: 2, 2: 3, 3: 3, 4: 2, 5: 2, 6: 1, 7: 1}
+初始 rank 负载 ell_r: {0: 12, 1: 6, 2: 4, 3: 2} 均值 6.0 初始不均衡 2.0
+
+二分搜索过程（阈值 tau / 可行性 / 该 tau 下重路由后各 rank 负载）
+  tau= 9  可行    {0: 9, 1: 6, 2: 4, 3: 5}
+  tau= 7  可行    {0: 7, 1: 6, 2: 4, 3: 7}
+  tau= 6  可行    {0: 6, 1: 6, 2: 6, 3: 6}
+
+最终阈值 tau = 6
+非零配额 u[e,r] : {'e0@r0': 4, 'e0@r2': 2, 'e0@r3': 4, 'e1@r0': 2, 'e2@r1': 3, 'e3@r1': 3, 'e4@r2': 2, 'e5@r2': 2, 'e6@r3': 1, 'e7@r3': 1}
+重路由后 rank 负载: {0: 6, 1: 6, 2: 6, 3: 6}  不均衡 = 1.0
+消耗冗余槽: 2 / 4
+
+对照：同一副本集合 + round-robin 重路由
+  rank 负载: {0: 6, 1: 6, 2: 7, 3: 5}  不均衡 = 1.1667
+
+专家 e0 的重路由拆分 q[源, e0, 目标]（配额 4/2/4 分别在 r0/r2/r3）:
+  源 r0 -&gt; 目标 r0: 4  (本地)
+  源 r1 -&gt; 目标 r3: 3  (跨 rank)
+  源 r2 -&gt; 目标 r2: 2  (本地)
+  源 r3 -&gt; 目标 r3: 1  (本地)
+本地优先：双向守恒成立，跨 rank 在飞 token 10/24 = 41.7%
+关闭本地优先：双向守恒成立，跨 rank 在飞 token 13/24 = 54.2%</code></pre>
+</div>
+<p data-page-node-id="FwwrYzGE0Y82LygRsbLGJ6"><b data-page-node-id="DknpRBoLRDE8NQwlXWfbZX">验证的机制</b>：<code data-page-node-id="MXyy63oKa2wbHBMXfWlzbU">solve_replication</code> 对应 Algorithm 1 的 SolveReplication，包含 Eq.(6) 的 <code data-page-node-id="8ibKcnPEQKJwzg4TE262Gb">exc</code> / <code data-page-node-id="vCNNMeQi3ohYfNeyF7w9rq">slk</code>、二分区间初始化、按残余超额与 $\lambda_e$ 双重降序的访问顺序、$\delta$ 的三重最小值与 $u_{\min}$ 剪枝；<code data-page-node-id="VLiz3Q2V4Z4wPLb7rznVTO">solve_reroute</code> 对应 SolveReroute，包含本地配额优先消费与按残余配额比例分摊。<code data-page-node-id="nbB96EEb5pkalL3uCisDDY">round_robin_reroute</code> 不在论文算法内，是为对照而构造的。</p>
+<p data-page-node-id="LtNORoadKuGLCKEVP6UIFC"><b data-page-node-id="6sP2A3WvVt6Y5BZXVHy5IX">观察重点</b>：三处对照。第一，二分过程的三行输出显示阈值从 9 收敛到 6，而 $\tau=6$ 时四个 rank 负载完全相等——这是配额直接以「各 rank 总负载达标」为目标的结果。第二，同一副本集合下 round-robin 得到 6/6/7/5、不均衡 1.1667，比配额求解的 1.0 差，差距来自它看不到各 rank 上其他专家的负载。第三，本地优先把跨 rank 在飞 token 从 54.2% 降到 41.7%；代码对两个分支都断言了双向守恒并通过，即各实例接到的总量都恰好等于配额（$e_0$ 为 4/2/4）、各源发出的总量都恰好等于其需求——这验证了论文所说「本地优先只改变哪个源消费配额，不改变配额本身」。</p>
+<p data-page-node-id="5KCo2AgM51iY150yEroGNC"><b data-page-node-id="pevlLPfnewNBUD71eUeQyv">简化条件</b>：这是构造示例，规模远小于论文实验（EP=4 对 EP64、8 个专家对 128 到 256 个）。负载单位取 1024 token 使 $u_{\min}$ 等于 1，便于手算。代码是 CPU 上的串行 Python 实现，论文的实现全在 GPU 上、用单个 SM 上的 cooperative thread block 跨 warp 并行评估多个阈值探测（§5.3）；本代码不复现 GPU 并行化，也不包含 token 级的累积配额前缀扫描与实际的 all-to-all 执行。</p>
+</details>
+
+<h3 id="reroute-locality" data-page-node-id="mnwQe9m6LAYvcDhe3ZbE18">4.6 重路由：本地优先为什么不破坏已解出的阈值</h3>
+
+<p data-page-node-id="LWHBaFGupGTzgrq3tKnFZw">$U$ 一旦确定，重路由不再回访均衡目标，它只负责把 $U$ 实体化成一个源侧拆分 $Q=\{q_{r,e,t}\}$，其中 $q_{r,e,t}$ 是从源 rank $r$ 发往 $e$ 在 rank $t$ 上物理实例的 token 数（§5.2）。$Q$ 必须满足双向守恒：</p>
+
+<p data-page-node-id="WHNy5Jt4wf0l2SvjEcnciw">$$\sum_{t\in\mathcal{H}(e)}q_{r,e,t}=\lambda_{r,e},\qquad\sum_{r\in\mathcal{R}}q_{r,e,t}=u_{e,t}$$</p>
+
+<p data-page-node-id="R2OKvMpvcQQxSRQ7lRdYrC">按源看要凑满该源对该专家的需求，按目标看要凑满该实例的配额（§4.3 Table 1）。</p>
+
+<p data-page-node-id="JRIokB2rQGaadqhsCVirsU">在这两个约束下还有自由度，UltraEP 用它换局部性：对每个专家，先让来自同一 host rank 的 token 消费该 host 的配额。论文对这一步的正确性给了一句关键论证——优先使用本地配额只改变哪个源 rank 消费某个已解出的配额，不改变配额本身；因此 token 局部性在不破坏已解阈值的前提下减少了跨 rank 流量（§5.2）。</p>
+
+<p data-page-node-id="VuQvI1NMfm2NiIopbjPT7m">这句话可以直接从守恒条件读出来。阈值由每个 rank 的重路由后负载 $\sum_e u_{e,r}$ 决定，而第二个守恒式说每个实例接到的总量恒等于 $u_{e,t}$。本地优先只是在满足这个等式的前提下重排「这些 token 分别来自哪些源」，因此各 rank 接到的总量一个字节都没变。</p>
+
+<p data-page-node-id="FxG5dJo3uNIeUgNl836ctO">本地配额消费完后，残余的源需求按剩余配额的比例分摊，用确定性取整来同时保持每源需求与每实例配额（§5.2）：</p>
+
+<p data-page-node-id="e1gSq8no4TTPyGq5luzVi7">$$q_{r,e,t}\gets\text{round}\left(\hat{\lambda}_{r,e}\times\frac{\hat{u}_{e,t}}{\sum_{t'}\hat{u}_{e,t'}}\right)$$</p>
+
+<p data-page-node-id="vTfhDnGHHuV0uSU7O0AmIF">其中 $\hat{\lambda}_{r,e}$ 与 $\hat{u}_{e,t}$ 分别是本地消费后的残余需求与残余配额。</p>
+
+<p data-page-node-id="DnSPyNRj0LAWNg7fZ6gg9n">用贯穿示例看 $e_0$：三个实例配额 4、2、4 分别在 $r_0$、$r_2$、$r_3$；四个源对 $e_0$ 的需求是 4、3、2、1。本地优先阶段，$r_0$ 的 4 个 token 全部留在本地（正好吃满 $r_0$ 的配额 4），$r_2$ 的 2 个留在本地（吃满 $r_2$ 的配额 2），$r_3$ 的 1 个留在本地。剩下 $r_1$ 的 3 个 token 没有本地实例，只能跨 rank，去唯一还有残余配额的 $r_3$（残余 3）。结果是 10 个单位里只有 3 个跨 rank。若关闭本地优先、全部按比例分摊，跨 rank 的量会上升——代码输出显示全部专家合计从 41.7% 升到 54.2%。</p>
+
+<h3 id="token-assignment" data-page-node-id="mB8jX6m1c3j9YNWbtXtJQN">4.7 从配额到每个 token 的目标</h3>
+
+<p data-page-node-id="uSCyNJ72RqUXmK5Y5KQCYc">配额给出的是聚合的「源到实例」计数，而 all-to-all dispatch 需要的是每个 token 的目标。UltraEP 的做法是：每个 rank 用一次轻量前缀扫描，把分解结果存成按某逻辑专家的各物理实例排序的累积配额；dispatch 时，$(r,e)$ 这一对的第 $j$ 个本地 token 被发往累积配额首次覆盖 $j$ 的那个物理实例（§5.2）。</p>
+
+<p data-page-node-id="KRjGpA3ItcFl1Z2HcfI50r">这样 token 分配就退化成一次 rank 本地的上界查找，与前面的优化过程完全无关。以 $e_0$ 的三个实例（配额 4、2、4）为例，累积配额是 4、6、10；某个源上第 5 个 token 落在区间 $(4,6]$，因此发往第二个实例。</p>
+
+<h3 id="gpu-native" data-page-node-id="RHWS9XTIh0NF5SODn08XCO">4.8 为什么这个求解能放进 GPU kernel</h3>
+
+<p data-page-node-id="nycDwAa5Lkg2VVnrphBzJm">UltraEP 把配额求解完全实现在设备上，避免热路径上的 CPU 同步与设备到主机的元数据搬运（§5.3）。</p>
+
+<p data-page-node-id="2q08OAZscJa3C5rs0XyKdD">论文指出的难点是这个算法不是简单的数据并行扫描：每次二分探测都会改动超额、空闲、槽位占用与每专家的副本集合，而可行性判定在已接受的转移之间存在顺序依赖——后一次转移能选哪个目标，取决于前一次转移消耗了多少空闲、占了哪个槽。</p>
+
+<p data-page-node-id="QiJfAsUMCNGrNysRCY3440">论文的做法是利用 warp 级并行与数据局部性：用单个流式多处理器（SM）上的一个 cooperative thread block，把负载矩阵与放置状态放进共享内存，跨 warp 评估多个阈值探测，并用 warp 级归约在槽位与不重复约束下寻找可行的高空闲目标。同一个 kernel 直接产出最终的槽位映射、配额与累积重路由元数据（§5.3）。SM、warp、共享内存与线程块的组织方式见 <a href="../gpu-execution-model/index.html" data-page-node-id="xtCKdTcZElOIVsm9s5tsfa">GPU 执行模型</a>。</p>
+
+<p data-page-node-id="TASFOXUnaQuZ2B07nA1Q5p">论文对这一设计的总结是：它把配额求解从 CPU 侧的组合搜索变成一个紧凑的、GPU 常驻的可行性问题（§5.3）。</p>
+
+<h3 id="solver-ablation" data-page-node-id="bbNIcLOZK87qSHqZiRws15">4.9 消融：配额求解相对强化基线的差距</h3>
+
+<p data-page-node-id="UE18DaGqyH7mBIDzrH2JwO">为了把配额求解本身的贡献隔离出来，论文构造了 EPLB$+$ 这个基线：喂给它精确负载、用标准 EPLB 加 round-robin 重路由，通信机制保持 UltraEP 的不变（§8.1）。两者的差别因此只在规划算法。</p>
+
+<div class="table-scroll" data-page-node-id="hIG4N4sL9zIDw2KPCEUzQa">
+<table data-page-node-id="cCSr16ooV4k4he7rvO4kOl">
+<thead data-page-node-id="RJ5oVnyI3WsaFv9IFBYAWu"><tr data-page-node-id="eBrLi3N4EOKb7Hg6X7TCfA"><th data-page-node-id="92IkdFt7BaVUo67oHxMkXX">指标（模拟均值）</th><th data-page-node-id="lnUZFWyUSBFpirW6JO2qpx">EPLB$+$</th><th data-page-node-id="9llNWn7Mgd4cOzAV4rcIla">UltraEP</th><th data-page-node-id="wFKsObeueDEW4A5Dzmo0XU">差距</th></tr></thead>
+<tbody data-page-node-id="rD5pD5zD0W5tgmtBFKLVPK">
+<tr data-page-node-id="KrtrrBMaqjJjNe8AhqcJWE"><td data-page-node-id="FcyGbvIMYRBD477dXJIE9U">结果不均衡度（rank 级）</td><td data-page-node-id="fjBqSuAfFAyNyz8TjR56ht">1.19</td><td data-page-node-id="FlgNSrv7lZXkBuC8hRz9z7"><b data-page-node-id="4BbN618TyqwCuFjrVIdqVQ">1.03</b></td><td data-page-node-id="guCeEs9uaWyV5AuEReD4FB">—</td></tr>
+<tr data-page-node-id="7D6pGUusTvMC5GOonkHgIm"><td data-page-node-id="FbLb41pRWjoCUoZoBzrrxJ">求解耗时</td><td data-page-node-id="UNSg2iDMxRl3mCYlwIS2pH">0.153 ms</td><td data-page-node-id="v6PrfA91z4NXUCvsQDWrCc"><b data-page-node-id="XYId2iya3sWBoRBd0ETzuu">0.111 ms</b></td><td data-page-node-id="0qZGBtJZVHVnVzyfYJhjr0">省 27.4%</td></tr>
+<tr data-page-node-id="KRzUGLBzauzpMElZvwWMhD"><td data-page-node-id="luRFHXiPwpKCefG2KT0eJC">$\sum_e\lvert\mathcal{H}(e)\rvert$（消耗的冗余槽数）</td><td data-page-node-id="tUbB1PaofflKeMwXGHLRSY">107</td><td data-page-node-id="P8XQb3vNWyikINHt90Nbnz"><b data-page-node-id="dza6eSLTlrfe2fJ3n3aiGx">45</b></td><td data-page-node-id="xoBAVzVD1HF5HXFbGQGt1p">少 57.9%</td></tr>
+<tr data-page-node-id="ZXtVwEee6sBP27SR6hDXlt"><td data-page-node-id="F7v6IeBa6bRD0QzhiA2XJs">$\max_e\lvert\mathcal{H}(e)\rvert$（最大 fan-out）</td><td data-page-node-id="Ydq87lszJr15KEYxAslxfn">8.5</td><td data-page-node-id="nWw6sJnr38NyFCURDHG496"><b data-page-node-id="adgZQg2APmaHC3XO89J8P9">6.8</b></td><td data-page-node-id="F3zhhfHukmR3aKeuvKLwzo">—</td></tr>
+<tr data-page-node-id="pzpesUzSwa49eplaTzNkFH"><td data-page-node-id="aBXfcM2J28vJqAZDzdvFeS">在飞 token 占比</td><td data-page-node-id="W9gTCuCCPmEzv2KPVadMRb">99.9%</td><td data-page-node-id="rjhYvrZ1u1jUWdpwaE5ndE"><b data-page-node-id="c12VINULWJia7CV66Kz04p">96.0%</b>（关闭本地优先为 98.4%）</td><td data-page-node-id="m3JsSJ1ldbfSGhxnkHApj2">降 3.9 个百分点</td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="4NZpWb6wVXqgy8DVxH3jKA">这是原文 Table 3，其中结果不均衡为 rank 级（最大 rank 负载比均值）；数值为 Figure 15 全部模拟场景的平均值，模拟中的初始负载用幂律分布合成以贴近真实 MoE 路由的倾斜程度。「在飞 token」指未被本地 rank 吸收、需要跨 rank 传输的 token 占比。</p>
+
+<p data-page-node-id="4F9HaavKoqjtz3gYA74iG6">下图给出更细的分布，需要关注冗余槽预算变紧时两者的退化速度差异。</p>
+
+<img src="assets/img-07.webp" alt="上排为箱线图，比较 EPLB 加与 UltraEP 在全部训练与预填充评测中的不均衡度分布；下排为柱状图，三组专家数、EP 度数与冗余槽配置下、五档初始不均衡对应的均衡结果" data-page-node-id="X3UUp37IefVUTndATfosuz">
+
+<p data-page-node-id="dDwdscObI9EmOBjYf4xKA7"><b data-page-node-id="QIYeEIWRm8avgAzQLDBL24">图（原文 Figure 15）</b>：上排是全部训练与 prefill 评测的 rank 级不均衡度分布，UltraEP 的分布更贴近理想值 1.0 且尾部明显更短。下排是模拟结果，横轴为初始不均衡度、分三组 (专家数, EP 度数, $N_{\mathrm{slot}}$) 配置。在最紧的预算配置下（$N_{\mathrm{slot}}=1$）且初始不均衡达 6.0 与 8.0 时，图中 EPLB$+$ 升到约 1.40，而 UltraEP 分别约 1.07 与 1.09（该图未逐柱标注，这三个值由本页读图得到）——论文正文的表述是 EPLB$+$ 高达 1.4 而 UltraEP 仍低于 1.1。这张图同时说明两点：配额求解在各种配置下都更好；但预算变紧、倾斜加剧时两者都会退化，只是 UltraEP 退化得慢。</p>
+
+<p data-page-node-id="fg4QI3jt0cnXopEeXHngCx">论文对这个差距的归因是：UltraEP 直接优化重路由后的负载上界，也就是均衡的真实目标，而不是 EPLB$+$ 关注的重路由前的不均衡。EPLB$+$ 按重路由前的热度盲目复制，UltraEP 只在副本能带来足够均衡收益时才实体化它；这解释了 UltraEP 的资源效率，并显著减少了专家复制流量（§8.5）。冗余槽消耗 45 对 107 这一项差距，主要就来自 $u_{\min}$ 剪掉的那些无效副本——这一步把归因落到 $u_{\min}$ 这一具体机制上，是本页的推断，论文原文只把差距归因于「只在有足够均衡收益时才实体化副本」的整体设计。</p>
+
+<div class="callout callout-gray" data-page-node-id="Y8gyqEQ5aK9QVV7T3HPy8T">
+<p data-page-node-id="ty8M8WEeGHs6GUyT398IqL">一处推断（非论文结论）：二分加贪心判定得到的 $\tau$ 不是全局最优。每次探测用的是贪心可行性判定——按残余超额降序取 rank、按 $\lambda_e$ 降序取专家、送给空闲最大的目标——贪心判定为不可行的阈值未必真的不可行。论文全篇（标题、摘要、§8）用的词是 near-optimal 而非 optimal，也未给出最优性或近似比证明。</p>
+</div>
+
+<h3 id="quota-planning-questions" data-page-node-id="S64QLpjjraJbKLk0Q5J4AX">本章问题</h3>
+<ol class="chapter-questions" data-page-node-id="n8aMP0lxOKKCuQQfpequfL">
+  <li data-page-node-id="I5Y06eSoAQEHycGSUcy61p">
+    <p data-page-node-id="ClEsTEe6rOYuRNIKGHYHPK">「先定副本、再用 round-robin 分流」到底差在哪里？</p>
+    <details data-page-node-id="qZRKtCFJ76tpYBlZjl5aep">
+      <summary data-page-node-id="6uhJiv0UHyIYVcC8yC5Bp9">解答：差在优化目标错位。round-robin 只让某专家的 token 在其副本间均分，看不到各副本所在 rank 上还有多少别的负载</summary>
+      <p data-page-node-id="m8Gjfl6WJCaRHVOcJyrYpQ">已有系统把放置与重路由解耦：放置提前规划，在线重路由用 round-robin 之类的简单启发式。问题是 round-robin 的均分对象是「某个专家的 token 在它的各副本之间」，而各副本所在的 rank 上还有别的专家在占用算力，均分之后各 rank 的总负载并不相等。</p>
+      <p data-page-node-id="uZnQCilQ3oteUVrDZGtjlK">本页的贯穿示例给出了具体差距。热专家 $e_0$ 有三个实例（在 $r_0$、$r_2$、$r_3$），总负载 10 个单位。round-robin 轮转均分得到 4、3、3，加上各 rank 原有的其他主专家负载后，四个 rank 总负载是 6、6、7、5，不均衡度 $7/6\approx1.1667$。配额求解则按「各 rank 总负载达标」反推，得到 4、2、4——因为 $r_2$ 本来就有 4 个单位、只剩 2 个空间，$r_3$ 只有 2 个、还能吃 4 个——四个 rank 各为 6，不均衡度 1.0。</p>
+      <p data-page-node-id="4R845VB9DAaF0yhy5Ht9pa">论文对这个差距的表述是：UltraEP 直接优化重路由后的负载上界（均衡的真实目标），而 EPLB$+$ 关注的是重路由前的不均衡（§8.5）。模拟均值上体现为结果不均衡 1.03 对 1.19。</p>
+    </details>
+  </li>
+  <li data-page-node-id="KGVNXO0sFuUFK6Sf6p5r9u">
+    <p data-page-node-id="7BdA4YxF67SV6Ht5sG5dZu">为什么要设 $u_{\min}=1024$ 这个配额下限？</p>
+    <details data-page-node-id="lzleOA4u4zJJJr7oBvVdB0">
+      <summary data-page-node-id="SQytKWtVSwT35R7xRV9mhd">解答：为了不建无效副本。建一个副本要付出前向权重搬运与反向梯度归约的完整代价，若它只承接零星流量，收益抵不上开销</summary>
+      <p data-page-node-id="zame6Ny1FNRcMoCtHp3tPd">一个副本的成本是固定的：前向要把主专家权重整份搬过去（Eq.(5) 里它贡献 1 份 fan-out），训练的反向还要把它的梯度归约回主专家。这份成本与它承接多少 token 无关。所以若某个副本只接几十个 token，这笔交易是亏的。</p>
+      <p data-page-node-id="ewiftG90LF1LOpWp1i27n6">算法里的体现是 $\delta<u_{\min}$ 时直接跳出、不接受这次转移（Algorithm 1 SolveReplication 中 $\delta$ 与 $u_{\min}$ 的比较一步）。代价是可能被迫接受略高的阈值：本页示例中若把 $u_{\min}$ 从 1 调到 3，第二次转移的 $\delta=2$ 会被拒绝，$r_0$ 的超额排不空，最终阈值从 6 退到 7。这是有意的取舍——宁可容忍略高的不均衡，也不建那种成本收益倒挂的副本。</p>
+      <p data-page-node-id="tibxFqdUWIRwyGcAqfnyxs">效果反映在资源消耗上：Table 3 中 UltraEP 消耗的冗余槽数是 45，EPLB$+$ 是 107，少 57.9%。论文把这一差距归因于 UltraEP 只在副本能带来足够均衡收益时才实体化它，而 EPLB$+$ 按重路由前的热度盲目复制（§8.5）。少建副本同时也意味着更少的权重分发流量。（论文把这项差距归因于「只在有足够收益时才实体化副本」这一整体设计；把它进一步落到 $u_{\min}$ 这一具体机制上，是本页的推断。）</p>
+    </details>
+  </li>
+  <li data-page-node-id="6C34OFX1cznjfROf6C25QJ">
+    <p data-page-node-id="9DoH448bBEBgSqE42o5aEE">本地优先为什么不会破坏已经解出的阈值？</p>
+    <details data-page-node-id="V8IOfeHA1f1u6lAsFv5HOL">
+      <summary data-page-node-id="T46PNmhEEn5iWb2uYUL7St">解答：因为它只改变「哪个源 rank 消费某个配额」，不改变配额本身；阈值由各 rank 接到的总量决定，而那个总量恒等于配额</summary>
+      <p data-page-node-id="SRwMqIp6Z6KE8y7Hmysi6b">重路由拆分 $Q$ 必须满足双向守恒：按源看 $\sum_{t\in\mathcal{H}(e)}q_{r,e,t}=\lambda_{r,e}$，按目标看 $\sum_{r\in\mathcal{R}}q_{r,e,t}=u_{e,t}$。阈值是由每个 rank 的重路由后负载 $\sum_e u_{e,r}$ 决定的，而第二个守恒式保证每个实例接到的总量恒等于它的配额 $u_{e,t}$。本地优先只是在满足这个等式的前提下重排「这些 token 分别来自哪些源」，各 rank 接到的总量一个字节都没变。论文的原话是：优先使用本地配额只改变哪个源 rank 消费某个已解出的配额，不改变配额本身，因此 token 局部性在不破坏已解阈值的前提下减少了跨 rank 流量（§5.2）。</p>
+      <p data-page-node-id="EnQfMYC0bWn6ZSFQXd8LBV">收益是跨 rank 流量下降。本页示例中，$e_0$ 的三个实例配额 4、2、4，本地优先让 $r_0$、$r_2$、$r_3$ 各自的 token 先留在本地，只有 $r_1$ 的 3 个 token 必须跨 rank；全部专家合计，跨 rank 在飞 token 从 54.2% 降到 41.7%。论文的模拟均值是 UltraEP 的在飞 token 占比 96.0%，相对 EPLB$+$ 的 99.9% 低 3.9 个百分点，正文表述为减少 3.9% 的 token 流量；同一表格还给出 UltraEP 关闭局部性时为 98.4%，即局部性本身贡献其中的 2.4 个百分点（Table 3）。</p>
+    </details>
+  </li>
+  <li data-page-node-id="Ftu7dgFJA0bX0fa9ejAGHx">
+    <p data-page-node-id="k36vu8fB92FqnTTT3ujAcD">二分搜索找到的 $\tau$ 是最优解吗？</p>
+    <details data-page-node-id="1UaCLnzPDAMZPT7iYMdRPM">
+      <summary data-page-node-id="7X81WSQFOxgYJESmxV8ftG">解答：不是全局最优。每次探测用的是贪心可行性判定，它判为不可行的阈值未必真的不可行；论文用词是 near-optimal 且未给最优性证明</summary>
+      <p data-page-node-id="Rm7jCnyZHVmSPlyBoM0ior">二分搜索本身只负责在「可行」与「不可行」之间找边界，边界的位置取决于判定函数的准确性。这里的判定是贪心的：按残余超额降序访问超载 rank，对每个 rank 按 $\lambda_e$ 降序访问主专家，把负载送给当前空闲最大的合法目标。贪心的选择顺序未必最优——比如某次把一个专家的负载送给了空闲最大的 rank，可能恰好占掉了另一个专家唯一可用的槽位，导致后续排不空超额、这个阈值被判为不可行；而换一种分配顺序它可能是可行的。</p>
+      <p data-page-node-id="LRCInFAsWuUf8IuwLHxtmD">论文的措辞与此一致：§5.1 明确写的是「runs a greedy feasibility oracle for each probe」，全篇（标题、摘要、§8）用的都是 near-optimal 而非 optimal，也没有给出最优性证明或近似比分析。所以正确的读法是：这套算法在极短的时间预算内（模拟均值 0.111 ms）拿到了实测上非常接近理想的均衡（1.01 到 1.04），但它是一个有效的启发式，不是最优算法。这一条判断属于本页的推断，不是论文的结论。</p>
+    </details>
+  </li>
+</ol>
+<h2 id="rsn-communication" data-page-node-id="0C9KVe0Fq1R5NX0sVBcKyu">5. 把不规则的专家搬运做成 tile 流水线与 chunk 中继</h2>
+
+<p data-page-node-id="gbnIKYF9uDtC3bUwD5Ve8A">第 4 章解出了方案，这一章处理执行。第 3 章已经指出，跨层复用给前向关键路径留下一条紧的逐层权重实体化期限，这一章就是要满足它。</p>
+
+<h3 id="traffic-nature" data-page-node-id="IHekWh8QagrG9gHbJZDEUu">5.1 均衡流量不是集合通信</h3>
+
+<p data-page-node-id="QBHG2Ewgbq9Rr93KRYpGR7">UltraEP 的均衡流量是 RSN scale-up fabric 上一张运行期自适应的稀疏传输图，而不是规则的集合通信。它服务两条路径：一是前向的权重分发与反向的权重重分发，方向都是从每个主专家到它的远端副本；二是反向的梯度归约，方向是从那些副本回到主专家。论文明确目标是在易变的逐层方案下取得高的有效带宽，而不只是达到峰值链路速率（§6）。</p>
+
+<figure class="diagram" data-page-node-id="zNSgwqG7beFfYhNGKFQnWw">
+  <div class="dg-stack" data-page-node-id="G2YL9DVLPiJq37nrT2xkrB">
+    <div class="dg-layer" data-page-node-id="vlBU4L8hGbveaHKTaRUIJE">
+      <span class="dg-layer-label" data-page-node-id="wiHsDhi4vAjMoHLJVT9Srx">均衡方案</span>
+      <span class="dg-layer-body" data-page-node-id="kt4kyDCpcNvCBtV5NKEe1g">第 4 章解出的槽位映射与配额，决定哪些专家要搬到哪些 rank</span>
+    </div>
+    <div class="dg-layer" data-page-node-id="IpsmIxOI6uVH9Hr0vmgeKI">
+      <span class="dg-layer-label" data-page-node-id="K5e2VAhBoIN44VM5xcmdMV">tile 任务流</span>
+      <span class="dg-layer-body" data-page-node-id="pnmegLYIszo5SKVe1FNSC4">权重与梯度切成固定大小 tile，方案编译成常驻设备的搬运任务描述符</span>
+    </div>
+    <div class="dg-layer" data-page-node-id="3dD5t8tJcFJ3FpLKOzQSgA">
+      <span class="dg-layer-label" data-page-node-id="3U0rKtpReZN5jgTLj5lMPC">persistent kernel</span>
+      <span class="dg-layer-body" data-page-node-id="z55f5V803tiZ9fGh3V6J2n">线程块反复取下一个 tile，共享内存双缓冲；热专家的 fan-out 走 chunk 中继树</span>
+    </div>
+    <div class="dg-layer" data-page-node-id="Jb5wz4qxOTtXr8u1d4EzI7">
+      <span class="dg-layer-label" data-page-node-id="Ap81YX4iipKcDt8gICbRB0">RSN 单侧访存</span>
+      <span class="dg-layer-body" data-page-node-id="8rB1iY7eYuv5iGeB4m0USc">GPU 发起的单侧 peer memory 访问，经常驻设备的地址表用 load/store 原语读写对端缓冲</span>
+    </div>
+  </div>
+  <figcaption class="diagram-caption" data-page-node-id="YFGb0MgnCROF9e6yTDlDUN">图注：自上而下是从决策到字节搬运的分层，上层的输出是下层的输入。方案每层重新产生一次，因此下面三层的任务描述符也逐层重建；不存在跨层的状态残留。</figcaption>
+</figure>
+
+<h3 id="tile-streaming" data-page-node-id="2QJn1aKu3qh5ohl4sCtfHs">5.2 persistent tile streaming：把控制开销折进流水线</h3>
+
+<p data-page-node-id="5osX0iWM5ogqBjutG748lI">论文识别的第一个瓶颈是非载荷开销被放大。对 RSN 上的不规则权重或梯度同步，瓶颈从链路带宽转移到控制路径开销——任务切分与流水、数据暂存、动态寻址，这些阻碍带宽被吃满；而盲目加大并行度既浪费，又会与被重叠的反向计算争抢同一批资源（§4.4）。</p>
+
+<p data-page-node-id="IsNmvdeQxrZNuVNKY0WIZC">权重分发与梯度归约用同一个执行单元：每个专家的权重或梯度被切成固定大小的 tile，解出的放置方案被编译成这些 tile 上的、常驻设备的搬运任务。关键在于不是每个副本发一次传输，而是跑一个 persistent kernel，它的线程块反复从全局任务流里取下一个 tile（§6.1）。persistent kernel 与共享内存、线程块的组织见 <a href="../gpu-execution-model/index.html" data-page-node-id="7RjTI6BRKIUSYAf7DucIEq">GPU 执行模型</a>。</p>
+
+<p data-page-node-id="w82SHYi0JMbq75iD6tZuCU">两条路径的 tile 处理方式不同。权重分发时，每个源 tile 只被暂存进共享内存一次，然后写出到所有远端副本目的地——一次读、多次写。梯度归约时，来自远端副本的梯度 tile 被载入并累加进主专家的本地梯度 buffer，然后就地清零以供后续层复用（§6.1）。这个「就地清零」正好对应第 3 章说的跨层复用：buffer 只有一份，用完必须还原。</p>
+
+<p data-page-node-id="yexv1Nxvyaq6jUzJMgCikG">kernel 对每个线程块内的共享内存 tile 做双缓冲：tile $i$ 正在被写出或归约时，同一个线程块已经取好了下一个 tile 索引并开始载入 tile $i+1$。论文对这一设计效果的表述是：方案相关的任务查表、地址翻译与同步开销被折进 tile 流水线、被数据搬运掩盖，而不是在每次副本传输时都暴露成独立的控制步骤（§6.1）。</p>
+
+<h3 id="overlap-footprint" data-page-node-id="gB4mFppGv3w01kKzM3vmhL">5.3 前向打满带宽，反向留出余量</h3>
+
+<p data-page-node-id="FLqXYR087auVUKD30mFBii">tile 流水线 kernel 把常驻线程块数量作为主要的资源旋钮，按重叠窗口来调整（§6.1）。</p>
+
+<p data-page-node-id="zTAEcTBTHP5nFsvJpstsa1">两条路径的取舍方向相反。前向关键路径上，权重分发启动足够多的线程块，以增加在飞的 tile 载入与远端写出——这里没有别的计算可以重叠，目标就是尽快搬完。被重叠的反向路径上，footprint 用可配置的 SM 占用显式加以限制，共享内存用量也被限制在活跃的流水线缓冲上，以减少与调度在同一 SM 上的其他计算密集反向 kernel 的争用（§6.1）。</p>
+
+<p data-page-node-id="QiueFxSVt2nTlfPAdo9br6">论文对这一权衡的总结是：UltraEP 可以在热路径上花更多占用去吃满 RSN scale-up 带宽，同时在反向为并发的重叠 kernel 保留足够余量（§6.1）。</p>
+
+<h3 id="fanout-bottleneck" data-page-node-id="fFuxuvTqGwNc4AV2B7dxbP">5.4 热专家的 fan-out 瓶颈在发送侧</h3>
+
+<p data-page-node-id="QDePb2DRqHzFOHOUpldHzE">第二个瓶颈是热专家的 fan-out。论文指出这个界是发送侧的：每个 rank 最多只有 $N_{\mathrm{slot}}$ 个入站副本，但它可能需要把好几个热专家推送给很多目的地（§6.2）。这与第 3 章 Eq.(5) 的形式是一致的——权重分发延迟正比于 $\max_r\sum_{e\in\mathcal{E}_r}(\lvert\mathcal{H}(e)\rvert-1)$，落在承载最热主专家的那个 rank 上。</p>
+
+<p data-page-node-id="xVEbJuJT4yfCHSiWgtbvaH">论文还排除了一条看似现成的出路。专家复制引出的是一种动态的子组组播模式；部分 RSN 支持把组播下放到交换机，但这类机制通常假定通信组与投递模式是预先确定的，而专家复制产生的组既稀疏又易变、逐层逐 microbatch 都在变（§4.4）。因此这条路走不通，只能在软件侧做。</p>
+
+<h3 id="chunk-relay" data-page-node-id="BEQoTEYI3GoA9ZfJsRR7hJ">5.5 chunk streaming relay：两级中继加流水线</h3>
+
+<p data-page-node-id="YyD4GUZmpsvu7j9aDZHv1c">对副本数超过中继阈值（论文设为 4）的专家，UltraEP 构建一个轻量的两级中继：源 rank 先播种一个小的中继集合，每个中继再转发给分配给它的叶子（§6.2）。</p>
+
+<p data-page-node-id="KaA9NCbFNmAotQ7bOdHtxz">中继集合的宽度取在这个值附近：</p>
+
+<p data-page-node-id="mWH6FA9guts9OisyaksYpH">$$\text{relay frontier}\approx\sqrt{\lvert\mathcal{H}(e)\rvert-1}$$</p>
+
+<p data-page-node-id="d1PH12B7PcNYnMio9WyFLe">论文的说明是它近似平衡了两级，并相应降低了源的关键 fan-out（§6.2）。这个取值的直观来源是：若一共有 $n=\lvert\mathcal{H}(e)\rvert-1$ 个目的地、选 $k$ 个作中继，第一级源要发 $k$ 份，第二级每个中继平均发 $n/k$ 份，两级宽度在 $k=\sqrt{n}$ 时相等，此时较大者取到最小值 $\sqrt{n}$。</p>
+
+<p data-page-node-id="rhcMSju8LKikcW35pUmN9I">但两级本身还不够，因为串行的两级意味着中继必须收完整个专家才能开始转发。UltraEP 的做法是让中继调度作用在 chunk（连续 tile 组成的块）上而不是整个专家，这样中继 rank 收到一个 chunk 就能立刻转发它。具体机制是：某个第一阶段 chunk 的全部 tile 到达中继 rank 后，kernel 写下该 chunk 的 ready flag；第二阶段等待对应的 flag，然后立刻把这个 chunk 从本地中继缓冲发给它的叶子（§6.2）。论文强调这种 chunk 级流式让两个阶段流水线化，既不用等整个专家、也不引入全局的跨阶段屏障。</p>
+
+<img src="assets/img-06.webp" alt="三种 fan-out 方案的时间线对比图，每个 rank 显示发送与接收通道的占用状态，方案 a 为源直发九个目的地，方案 b 为两级中继但中间有全局屏障，方案 c 为 chunk 流式两级中继无屏障" data-page-node-id="dVHYFbCWNo6UNyHwxsU7Fr">
+
+<p data-page-node-id="2Lsj4GcxYMyeeznEMpRReN"><b data-page-node-id="3giDVBSGDIsaAvAfJeZQLr">图（原文 Figure 10）</b>：设一个专家在 rank 0 上、要组播到副本 rank 1 至 9，其中 rank 2、5、8 被选为中继；为清晰起见图中省略了叶子 rank 与更细的 tile 划分，每个 rank 显示其发送与接收通道沿时间轴的状态。三种方案的差别在于：(a) 源直发时 rank 0 的发送通道被占满整个时长，成为唯一瓶颈；(b) 引入两级中继后源的负担下降，但中间有一个 Barrier，第二阶段必须等第一阶段全部完成；(c) chunk 流式中继下，中继 rank 收到一个 chunk 就开始向叶子转发，两阶段在时间上重叠、无屏障。这张图支撑上一段的结论——降低 fan-out 靠的是两级结构，而消除两级串行代价靠的是 chunk 级流式。</p>
+
+<h3 id="relay-scheduling" data-page-node-id="4pRkieXD9w5eR9ANZBgaJ3">5.6 中继树按已分配的发送量来选</h3>
+
+<p data-page-node-id="IVfNhWHGFhhGWjVssWeeNY">中继选谁不是任意的。kernel 构建的中继拓扑要平衡所有 rank 的出向流量：先按复制方案统计每个 rank 被分配的发送字节量，然后逐个处理可中继的热专家。对每个热专家，从它的副本 rank 中挑发送量最小的作为第一阶段中继；剩余副本则挂到「接收这个新叶子之后发送量仍然最小」的那个中继上。处理下一个热专家之前，源 rank 与各中继的发送量会按它们分别要发给中继和叶子的量更新（§6.2）。</p>
+
+<p data-page-node-id="nCj6yY0GZvfLRbfm7kJ1VN">论文说明这个调度只决定中继树，每条边仍采用 chunk 流式传输；这样热专家的 fan-out 就被摊到有空余发送能力的 rank 上（§6.2）。</p>
+
+<p data-page-node-id="AOcAbeq9rVbgAPotj1rmGw">回到贯穿示例：第 4 章的方案给 $e_0$ 建了 2 个副本，$\lvert\mathcal{H}(e_0)\rvert=3$，需要发出的远端份数是 2；无论按远端份数还是按含主实例的实例数 3 与阈值比较，都不超过中继阈值 4，因此不启用中继，$r_0$ 直接发给 $r_2$ 与 $r_3$。这与论文实测的一致——Figure 16 显示初始不均衡度为 1.5 与 2.0 时启用中继的主专家数为 0。</p>
+
+<h3 id="comm-results" data-page-node-id="2SFkk5IaoVbLm6pTwgvu0v">5.7 通信实测：随 fan-out 增长维持近乎恒定</h3>
+
+<p data-page-node-id="hsSsmlG6HX8LUJ41W4wFA6">为了隔离通信优化本身的效果，论文把主流通信后端适配到 RSN 上做专家复制，在完全相同的均衡方案下与 UltraEP 对比。DeepEP 是在它原有的 token dispatch 基础上被调优来做专家搬运的；torch.distributed 的批量 send/recv 作为更通用的基线（§8.5）。</p>
+
+<div class="table-scroll" data-page-node-id="JDc6VbDRl33taN0hdY0KRQ">
+<table data-page-node-id="MR5ZcrG9PsrJjqdQ7HDk81">
+<thead data-page-node-id="1dWsBmSqfHRGKQSkKRzzPe"><tr data-page-node-id="JTZojsBfLtUZudvvlwCRhI"><th data-page-node-id="1ITuvoEhrq8mxAUnrxKB8y">初始不均衡度</th><th data-page-node-id="HbmSa4cg1g9kdXoFjLuEPM">torch.distributed</th><th data-page-node-id="g5o9F5slbqKgOQCloMAlcq">DeepEP</th><th data-page-node-id="6YMELqSpi0q5jAFTvgmXEQ">UltraEP 无中继</th><th data-page-node-id="hxYdJ95DTDovrHrQVhayFc">UltraEP</th><th data-page-node-id="aEgkOj7UISACeJlniEH3JG">启用中继的主专家数</th></tr></thead>
+<tbody data-page-node-id="OPJ6s1VcWv2TJxIUMSK2Oy">
+<tr data-page-node-id="rBL7O1SdbyDO8PdPVFRZhG"><td data-page-node-id="ossxMpEjVoZAisV7Tax8BR">1.5</td><td data-page-node-id="jysHzgUbgLUOc2bfAfUwHp">0.92 ms</td><td data-page-node-id="AKwjDyu5VgB37hAaCSCYIE">0.73 ms</td><td data-page-node-id="Hz16ICDg4nCmdDcirqr9qB">0.22 ms</td><td data-page-node-id="uHLADNvIRI0VO57BvG9Vmg"><b data-page-node-id="2l59kuCEudsBIF7q1hs5mb">0.24 ms</b></td><td data-page-node-id="ixBYXlRpCoU4ONwnQ1oeru">0</td></tr>
+<tr data-page-node-id="PmM4G8DoW64HAZBzSnRvIJ"><td data-page-node-id="xaGNz8k6qaYbtyifKlGNdN">2.0</td><td data-page-node-id="RdI8QqOk7jY2I93J1BgW3d">1.17 ms</td><td data-page-node-id="QX2b8VLiBeXeNv2rFlK2Yv">0.86 ms</td><td data-page-node-id="BHNSjnJ0c3GWVuQhcClR97">0.27 ms</td><td data-page-node-id="FGlqmiyPrD6VGEheNbDgTV"><b data-page-node-id="c8PaTghqRAPvGaqM2jxCJT">0.28 ms</b></td><td data-page-node-id="8JBV1dmDGLNNxHrB9A0kqf">0</td></tr>
+<tr data-page-node-id="vw7VQCbBmGCdm1bWPH8Nwt"><td data-page-node-id="69tB96K749PetYTZIDg7US">4.0</td><td data-page-node-id="HaqCFxteJmCGVBeh2Sjn1p">1.01 ms</td><td data-page-node-id="2rU5yAWASHAI2pEHMOMh4i">1.02 ms</td><td data-page-node-id="K9uQKEKvJXQEgyYnAsuRz6">0.37 ms</td><td data-page-node-id="HMAy5XwRs58VOCVkL9QZ1C"><b data-page-node-id="vvfv2DFUkVk4z5cSqM1cQi">0.29 ms</b></td><td data-page-node-id="aqEPIPsNvenYEABWYiNgOe">1</td></tr>
+<tr data-page-node-id="Eejp5cmVQD243G6i4ogWvN"><td data-page-node-id="6EKs2UbmtP7m8ihq4ajm3l">6.0</td><td data-page-node-id="LhEzwuQvhZc92oH0dfAJB5">1.12 ms</td><td data-page-node-id="t04EtXYNSR8k0DIrFydg91">1.20 ms</td><td data-page-node-id="G0KSPaom28b4LZVXe1DE19">0.47 ms</td><td data-page-node-id="FUovtdi6CAeQqVgnrQQWN0"><b data-page-node-id="v48g1HcAYT2yy2rXBmFid9">0.28 ms</b></td><td data-page-node-id="Fg1XMv70nSQyZU1Hr5RuyD">2</td></tr>
+<tr data-page-node-id="gaQ9IwDtLeciGAIzMCGrB1"><td data-page-node-id="sj5b0yUfxIrlDW6BJe08gB">8.0</td><td data-page-node-id="X3KsWJSwAS3oiaFx49Fx51">1.53 ms</td><td data-page-node-id="ln53qh3aETIiMdAVcknTn9">1.27 ms</td><td data-page-node-id="n7ryiVaGOCnxJB4sZjY1DS">0.52 ms</td><td data-page-node-id="tcUGV036aOYA3faq30tJJ6"><b data-page-node-id="YMqdWnwkgvNgKXAngHNuS8">0.28 ms</b></td><td data-page-node-id="baI7hn3lSFk0OaCU7RLofC">3</td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="GIEtKDjcvfT8vDcKu87JGq">实验条件是 Qwen3-235B-A22B、EP64，测量对象是专家权重分发的通信延迟，五档初始不均衡度与 Figure 15 的模拟设置一致。原文 Figure 16 为柱状图、未逐柱标注数字，表中数值由本页从图中读取，用于呈现各方案的相对关系与趋势；论文正文给出的结论性区间见下文。</p>
+
+<img src="assets/img-08.webp" alt="柱状图，五档初始不均衡度下四种方案的专家权重分发延迟，横轴同时标出启用中继的主专家数量" data-page-node-id="tVGBjBfM6OId2QYEgw0EJk">
+
+<p data-page-node-id="pSPmHSEu5wc1uSeSEnlfYZ"><b data-page-node-id="DDqQbWiGi7xqMAGGzIp1Hz">图（原文 Figure 16）</b>：横轴是初始不均衡度、并标注该档下启用中继的主专家数，纵轴是专家权重分发延迟。三个读法值得注意：UltraEP 相对 torch.distributed 与 DeepEP 在所有档位都有 3.1$\times$ 到 5.5$\times$ 的加速；随着 fan-out 增长（对应更高的初始不均衡），UltraEP 维持在约 0.28 ms 近乎恒定，而无中继变体呈线性上升；最低两档下中继未激活，UltraEP 与无中继变体几乎相同，说明自适应策略在不需要中继时只付出可忽略的控制开销。论文对高倾斜、大 fan-out 场景下中继的额外增益给出的区间是 1.3$\times$ 到 1.8$\times$。</p>
+
+<details data-page-node-id="sG1iNYT1h3By8qCgrusRwq">
+<summary data-page-node-id="0yJjh1wX0xcvQ59fJBt0U3">实现层面：RSN 内存语义与端到端集成如何配合上述机制</summary>
+<p data-page-node-id="2V4rnZNhKRi3H4codXv0qA">这一段补充「设备侧一次搬运具体怎么发生」以及「反向如何找回前向的方案」，两者都是上述机制能落地的前提。</p>
+<p data-page-node-id="hzaY9L830I36oXFpnaOiIi"><b data-page-node-id="TPMQQHM2NCRYBD3NRQIBHM">RSN 内存语义</b>：UltraEP 在 RSN scale-up fabric 上采用 GPU 发起的、单侧的 peer memory 访问。初始化阶段，所有 rank 为冗余权重与梯度、放置与负载元数据以及各类 flag 分配对称缓冲，然后把 RSN 内的 peer handle 解析成常驻设备的地址表；传输 kernel 消费紧凑的任务描述符，通过 load/store 原语访问对端缓冲（§7）。「单侧」意味着发送方直接读写对端显存、不需要对端参与协调，这也是 chunk ready flag 这种轻量同步能成立的基础。</p>
+<p data-page-node-id="PwhymDenrBzNhNuOYCtd74"><b data-page-node-id="UTBuVK9c8M9aFacWwmYUYE">运行时定位</b>：UltraEP 被实现为与训练/服务框架、MoE token all-to-all 后端都解耦的独立运行时。核心库约 9.6K 行 C++（含设备 kernel）与 Python；集成进 Megatron-LM（训练）与 SGLang（服务）各低于 1K 行额外代码；token 的 dispatch 与 combine 用 DeepEP 的 hybrid-ep 分支（v1.2.1+7febc6e，该分支针对机架内通信优化）。因为全部在设备上执行，UltraEP 避免了主机与设备之间的传输，并保留了设备操作的 graph capture（§7）。</p>
+<p data-page-node-id="cWSYbBqZCqU46cOOmZXxQ7"><b data-page-node-id="ko2MCvnEBXWbzFTfO7N6CI">反向如何找回前向的方案</b>：冗余专家由 UltraEP 作为层间共享的内部缓冲维护，主专家的持久模型状态由外部框架承载；冗余专家被排除在框架侧的参数与梯度桶、优化器状态与 checkpoint 之外。反向时 UltraEP 给每个在飞的 MoE 调用分配一个 virtual layer ID，它把放置与重路由元数据同具体的（真实层, microbatch）在一个环形缓冲里做哈希。这个 ID 经 torch.autograd 传递，使反向的权重重实体化与梯度归约能取回匹配的前向均衡方案。把环形缓冲大小设为最大在飞 microbatch 数，就能容纳流水线并行与 virtual PP，同时让 UltraEP 不必关心跨 microbatch 与跨 stage 的 PP 调度细节。因为只在 EP 组内起作用，UltraEP 与 attention 侧 DP、TP 以及模型级 DP 正交（§7）。</p>
+</details>
+
+<h3 id="rsn-communication-questions" data-page-node-id="gvuKMqhBV1Qbt3fOgFtWJK">本章问题</h3>
+<ol class="chapter-questions" data-page-node-id="RdUbpRZREVl9Ij6qMgh3ob">
+  <li data-page-node-id="RUnFhjE6NJWBgEMQXifvsp">
+    <p data-page-node-id="8hrwBo4JF4T5VwCuf0GGgV">为什么用 persistent kernel，而不是「每个副本发一次传输」？</p>
+    <details data-page-node-id="lVGrUKaL3TFP9BkUCVN7vv">
+      <summary data-page-node-id="STW3hzK2wbQjN12Wp16v0d">解答：因为瓶颈不在链路带宽而在控制路径。每副本一次传输会把任务查表、地址翻译与同步暴露成独立步骤；persistent kernel 把它们折进 tile 流水线</summary>
+      <p data-page-node-id="YJbEZeChzh3DBZTi2PDOG3">论文识别的瓶颈是非载荷开销被放大：对 RSN 上的不规则权重或梯度同步，瓶颈从链路带宽转移到控制路径开销——任务切分与流水、数据暂存、动态寻址，这些阻碍带宽被吃满（§4.4）。每个副本发一次传输意味着每次都要重做这套控制动作，而副本数量随均衡方案逐层变化、数量可观。</p>
+      <p data-page-node-id="WdNulaATMC8FCC04BpHHAN">UltraEP 的做法是：权重与梯度切成固定大小 tile，方案编译成常驻设备的 tile 搬运任务；跑一个 persistent kernel，其线程块反复从全局任务流取下一个 tile，并对共享内存里的 tile 做双缓冲——tile $i$ 在被写出或归约时，同一线程块已取好下一个索引并开始载入 tile $i+1$（§6.1）。论文对效果的表述是：方案相关的任务查表、地址翻译与同步开销被折进 tile 流水线、被数据搬运掩盖，而不是每次副本传输都暴露成独立的控制步骤。</p>
+      <p data-page-node-id="Rrgtu67KmdXy249f3Is7N9">此外线程块数量是可调的资源旋钮：前向关键路径上多给以吃满带宽，被重叠的反向路径上用可配置的 SM 占用限制住，避免与同 SM 上的反向计算 kernel 争抢（§6.1）。</p>
+    </details>
+  </li>
+  <li data-page-node-id="4ZQzTbY822GptorNh4Yb3E">
+    <p data-page-node-id="fcmDT0NiFkHYgGGgATmK8E">两级中继为什么能降低瓶颈，代价是什么？</p>
+    <details data-page-node-id="JPWAIY776vvn477eYdjFQ7">
+      <summary data-page-node-id="cisEw2Ibw8Vii3IF8ld4RQ">解答：瓶颈是发送侧的 fan-out，两级把源的 $n$ 份发送降到约 $\sqrt{n}$ 份；代价是多一跳延迟，所以只对副本数超过 4 的专家启用</summary>
+      <p data-page-node-id="ZV7YmoBGi24jZZtkDtDeiE">fan-out 的界在发送侧：每个 rank 最多只有 $N_{\mathrm{slot}}$ 个入站副本，但它可能要把好几个热专家推给很多目的地（§6.2）。这与 Eq.(5) 一致——权重分发延迟正比于 $\max_r\sum_{e\in\mathcal{E}_r}(\lvert\mathcal{H}(e)\rvert-1)$。设某专家有 $n=\lvert\mathcal{H}(e)\rvert-1$ 个远端目的地，直发时源要发 $n$ 份；改成两级、选 $k$ 个中继后，源发 $k$ 份、每个中继平均发 $n/k$ 份，两级宽度在 $k=\sqrt{n}$ 时相等，此时较大者取到最小值 $\sqrt{n}$。论文的取值正是把中继前沿放在 $\sqrt{\lvert\mathcal{H}(e)\rvert-1}$ 附近，说明是它近似平衡两级并相应降低源的关键 fan-out。</p>
+      <p data-page-node-id="LajCmImdbPBAp5jOqwO7uI">代价是多出一跳。所以论文只对副本数超过中继阈值（设为 4）的专家启用中继。实测印证了这个自适应策略的价值：初始不均衡 1.5 与 2.0 时启用中继的主专家数为 0，UltraEP 与无中继变体的延迟几乎相同（0.24 对 0.22、0.28 对 0.27 ms），说明不需要时只付可忽略的控制开销；而在 4.0、6.0、8.0 三档下，无中继变体从 0.37 涨到 0.52 ms，UltraEP 维持在 0.28 到 0.29 ms（Figure 16）。论文给出的中继额外增益区间是 1.3$\times$ 到 1.8$\times$。</p>
+      <p data-page-node-id="imnNvMJpT6orY6lFnJaFLw">另外中继选谁也有讲究：按复制方案统计各 rank 已分配的发送字节量，从该专家的副本 rank 中挑发送量最小的作中继，剩余副本挂到「接收后发送量仍最小」的中继上，从而把 fan-out 摊到有空余发送能力的 rank 上（§6.2）。</p>
+    </details>
+  </li>
+  <li data-page-node-id="kTT5UgCABBVGlLS7CB2MP4">
+    <p data-page-node-id="CvAdEOviNSpSsUoffX5u4f">为什么中继要按 chunk 而不是按整个专家转发？</p>
+    <details data-page-node-id="u04nhonp2aXNGXFx7Eyrgm">
+      <summary data-page-node-id="PnEaPSdZM2gx4WQ7HdTEhX">解答：按整个专家转发会让两级串行、还需要全局屏障；按 chunk 转发让两级流水线化</summary>
+      <p data-page-node-id="8Lj9ii7VIscKW9FXo8fCdb">如果中继必须收完整个专家的全部 tile 才能开始向叶子转发，两个阶段就是串行的：总耗时约等于第一阶段加第二阶段，两级结构省下的 fan-off 收益被串行代价吃掉一部分。论文图中的同步两级方案还需要一个全局 Barrier 来分隔两个阶段。</p>
+      <p data-page-node-id="RcFOmEnvGqZJqDnUzMncU5">UltraEP 让中继调度作用在 chunk（连续 tile 组成的块）上：某个第一阶段 chunk 的全部 tile 到达中继 rank 后，kernel 写下该 chunk 的 ready flag；第二阶段等待对应的 flag，然后立刻把这个 chunk 从本地中继缓冲发给它的叶子（§6.2）。于是中继在继续接收后续 chunk 的同时已经在转发前面的 chunk，两个阶段在时间上重叠。论文的表述是这种 chunk 级流式让两阶段流水线化，既不用等整个专家、也不引入全局的跨阶段屏障。</p>
+      <p data-page-node-id="iAIFo8uOsEP6UH22vezzEj">Figure 10 的三种方案对照正是这个机制的直接呈现：(a) 源直发时源的发送通道被占满全程；(b) 两级中继降低了源的负担但中间有 Barrier；(c) chunk 流式下两阶段重叠、无屏障。这里能用 ready flag 做轻量同步，依赖的是 §7 的单侧 peer memory 访问——发送方直接读写对端显存，不需要对端参与协调。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="evaluation" data-page-node-id="AGcUiAkoKEGiJtH1L096o9">6. 实验结果：均衡后逼近强制均衡上界，剩余差距来自路由本身</h2>
+
+<p data-page-node-id="W2aVKKPZKSVXWDtnRKR0TF">前面几章说明了机制，这一章回答「实时均衡到底划不划算」。所有数字都附带实验条件。</p>
+
+<h3 id="setup" data-page-node-id="JG4h4hNCAnJtwO4kBuaiq4">6.1 实验设置与基线</h3>
+
+<p data-page-node-id="DZdVejXDNX9t62OjOdkoEc">测试床是一个公有云 RSN 集群，每个机架 64 张 GPU（16 台服务器），scale-up 链路带宽是 scale-out RDMA 网络的 8 到 10 倍。研究原型阶段，serving prefill 用一个机架，训练用两个或四个机架；论文另外做了跨多机架的生产级 MoE 训练（§8.1）。全部实验使用 bf16 精度。</p>
+
+<div class="table-scroll" data-page-node-id="EfjnPfSwSR39o1UzkwAr8G">
+<table data-page-node-id="DAIrDGilyClaGNAW0BOblT">
+<thead data-page-node-id="CsvDJZQx6C5hd8OpL86HHi"><tr data-page-node-id="uAcDQmXvJWasbdFsgVwvkh"><th data-page-node-id="pTTcaxY8nmakorwqAtHFdK">模型</th><th data-page-node-id="7oZmy7KU6UfzaZ6vdObUXa">专家数（top-$k$）</th><th data-page-node-id="URPyeHlJyPIAEMXLDfY45S">并行配置（训练 | 服务）</th><th data-page-node-id="DAmGUGRrvSTOWMG25bweU4">$N_{\mathrm{slot}}$</th></tr></thead>
+<tbody data-page-node-id="czcNPzHFwAW7CVOHiBQd4V">
+<tr data-page-node-id="TW9GZOzyADRGu9KRgKO3yb"><td data-page-node-id="gwzWt2RJR9rSgtsj4tLGwi">GLM4.5-106B-A12B</td><td data-page-node-id="0ho61YXif9587yCH7jApAT">128 (8)</td><td data-page-node-id="BsgnbjDRzBENSK9enb62we">EP64-DP2 | —</td><td data-page-node-id="k1XHsb2vDLHFPiIlcQV6uz">2</td></tr>
+<tr data-page-node-id="WRJUznDFLOzELsN8K7D7Dj"><td data-page-node-id="GpdPrRpknuPT9EoMIYljtv">Qwen3-235B-A22B</td><td data-page-node-id="ikTfxDzDa6eBFLNqfVCfe6">128 (8)</td><td data-page-node-id="0G8FIYMIhASUWyDQGNzv1L">EP64-DP4 | EP64</td><td data-page-node-id="uI1NFBK7zEi2iSmnwMMvpT">2</td></tr>
+<tr data-page-node-id="StgZDgOPXFJCx1NCgTGbgK"><td data-page-node-id="NfUDRGHtjDiSeM1LbI2rNl">GLM4.7-358B-A32B</td><td data-page-node-id="SqR8dmX9sZUD4XmVcGBNve">160 (8)</td><td data-page-node-id="rdm21HSQjf9JU4yXKGxkfh">— | EP40</td><td data-page-node-id="n9y8OephtssdW4qV0siVIE">4</td></tr>
+<tr data-page-node-id="5X9BaEDPy8SkoFDMxypeah"><td data-page-node-id="4bvOUbcqVnbXNqfArOyCOx">DeepSeek-V3-671B-A37B</td><td data-page-node-id="m14nCwARuR9c19kMcKEUlX">256 (8)</td><td data-page-node-id="yMkZuw1mBWfFl81Df8Wvyt">EP64-PP4 | —</td><td data-page-node-id="47qX77TsrSrOv6t5Jm4miJ">2</td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="hvMk6yIOIs8QBGrPUCJLX9">这是原文 Table 2。训练侧 GLM4.5-106B 用 128 张卡（2 机架），Qwen3-235B 与 DeepSeek-V3 用 256 张卡（4 机架）；serving 侧两个模型各在单机架内跑一个 prefill 服务，采用 EP64 或 EP40 配合 attention 侧 DP。生产环境训练的是一个内部模型 RefMoE-288B-A16B，EP32。训练用机架内 EP，跨机架靠 DP 或 PP 扩展（§8.1）。细粒度专家加共享专家这一 MoE 架构演进方向见 <a href="../deepseek-moe/index.html" data-page-node-id="IBDeFYBCzMJcwRWlP3gk7N">DeepSeekMoE</a>。</p>
+
+<p data-page-node-id="vqbgAqHsm3e17ixo5fHF4T">训练配方方面，三个开源模型用 Megatron-LM 训练、关闭系统侧均衡并保存中间 checkpoint 供评测使用；每次训练用内部语料的 200B token 子集，约 4500 个 global batch，batch size 从 1024 逐步升到 5120。GLM4.5-106B 与 Qwen3-235B 用 GShard 负载均衡损失、权重 $10^{-2}$；DeepSeek-V3 与 RefMoE 用 DeepSeek 配方，路由 bias 更新步长 $10^{-3}$、序列级损失权重 $10^{-4}$（§8.1）。</p>
+
+<p data-page-node-id="oO9GEsVrwE6OoitrJcN8gK">serving 负载由真实推理场景的查询构造：STEM 组包含代码（Codeforces、SWE-bench）、数学（DAPO-Math-17K）与科学（GPQA、OpenScience）；Mixed 组额外加入 LongBench 的多任务长上下文查询。输入长度从数百到数万 token，请求按泊松过程以不同速率到达（§8.1）。</p>
+
+<p data-page-node-id="AeYDXkffgUU1aSogsUtWUn">六个对照对象（§8.1）：<b data-page-node-id="HDUf9tZ86LAXuO2mAFs0Dt">Megatron-LM</b>（dev 分支，commit e93814b）与 <b data-page-node-id="yHIsWhbxe3jeJNoTsPZB0k">SGLang</b>（main 分支，v0.5.9+bbe9c7e）作为不做系统侧均衡的框架基线；<b data-page-node-id="qIxXie0AHGqCJd9iaCCEVz">EPLB</b>，论文把它在 RSN 上的集成做了优化以使均衡开销可忽略，重均衡频率为 serving 每 50 个 prefill 步、训练每 3 个 global batch；<b data-page-node-id="6aGijEucVXPi59FsIzu7na">LPLB</b>，线性规划求解器，为每个 microbatch 调整重路由、限制每专家至多一个副本，与 EPLB 配对用在 Megatron-LM 里；<b data-page-node-id="fcJdq96sbFu3QFaaQcVA2X">EPLB$+$</b>，喂精确负载、用标准 EPLB 加 round-robin 重路由、通信机制保持 UltraEP 的，用于隔离配额求解的贡献；<b data-page-node-id="fVOMwyCW7AxAyoHBgVPuE2">Ideal</b>，强制均衡的上界，通过改 router 让 token 均匀分到各专家来实现。</p>
+
+<p data-page-node-id="uK9JT0DaBHvY6dRCuxm7zU">指标方面，训练报告每卡实际达到的 TFLOPS——做法是恢复后期 checkpoint 再跑一段能代表整个训练过程的续跑窗口，以避免为每个均衡基线都做一次完整训练；serving 报告整体 prefill 延迟，即 TTFT 随每秒请求数（RPS）的变化。两者都报告按所有层与批次平均的每 rank 最大值比均值的不均衡度（§8.1）。</p>
+
+<h3 id="train-e2e" data-page-node-id="suhTRAIJwg9rBUpO6FW9pZ">6.2 训练端到端</h3>
+
+<p data-page-node-id="LiFLQhP5odiiMIWsGCREDi">每个基线都从第 3500 个 global batch 恢复同一个 checkpoint、再跑 20 个 batch，这个长度足以覆盖多个 EPLB 均衡周期、捕捉动态负载变化（§8.2）。</p>
+
+<div class="table-scroll" data-page-node-id="qc8kHqntT8oXsPMXj08qdD">
+<table data-page-node-id="alOv4uRKlfTCYaYcIo2qWK">
+<thead data-page-node-id="17GAN84MeXF1EgDXDDS8ot"><tr data-page-node-id="UZVt1QU58VoxgsLETNXfDT"><th data-page-node-id="Ir4jGM8w4SjyyKwnOF2SP7">方法</th><th data-page-node-id="i5HYhy2I6EzYwqDpxnQrUV">GLM4.5-106B<br data-page-node-id="i5tABRWphQ0cCCgAdlAUZ5">TFLOPS/GPU（不均衡度）</th><th data-page-node-id="svOQsW0N3C7ReIxfkQkwH5">Qwen3-235B<br data-page-node-id="ibXtOD8GTZ49CtZzVRt9bB">TFLOPS/GPU（不均衡度）</th><th data-page-node-id="VuuyK5t7je0RJoquszEnwp">DeepSeek-V3<br data-page-node-id="SXf4Yb0Dab1lmpZoBJLf7j">TFLOPS/GPU（不均衡度）</th><th data-page-node-id="FHvrolE3hIzTd1nUMMYboR">平均相对<br data-page-node-id="EESGk4wMEEkXx7YZ9zjnpP">Megatron-LM</th></tr></thead>
+<tbody data-page-node-id="THTMMQUBorQ8MCVcUoGGmF">
+<tr data-page-node-id="LlcFSNzBOvH52Dyqv0QLXf"><td data-page-node-id="AcDn0xZ60RIPr1sLie5T9R">Megatron-LM</td><td data-page-node-id="KCfdooZuFiLP9l7AHApagT">545（2.23）</td><td data-page-node-id="aQuWGVXeBHxEbTCdVyegHH">315（2.86）</td><td data-page-node-id="u32f8wiQ9vlW7VK51W8xrV">509（1.30）</td><td data-page-node-id="DJZ5hM4tIXAIjbX9yGKqBT">—</td></tr>
+<tr data-page-node-id="X6Z1FtNbaJTB9z5WZU6lhO"><td data-page-node-id="6DxQ4zoxkB62tPRjnqZs7Y">EPLB</td><td data-page-node-id="yDWr8b3GHFD43GxqBTEJ0r">646（1.34）</td><td data-page-node-id="McRSef1UdgR9NO2zkEd6zb">449（1.34）</td><td data-page-node-id="ncGQe6BmG2eZDlNGI7RALF">505（1.28）</td><td data-page-node-id="LVkvwh23zEwlJ98EDIAo6t">+20%</td></tr>
+<tr data-page-node-id="cvIasj720yXLPUBEIFYyYy"><td data-page-node-id="dGmSTIaWvI72sHfCwwOyTs">LPLB</td><td data-page-node-id="NO1i6BkHMzBeaRM54dfxyi">618（1.29）</td><td data-page-node-id="qezprn7oxBmXnkjGqc8EUj">385（1.58）</td><td data-page-node-id="76PY4hLOBtcsuH95DTHQ4a">516（1.09）</td><td data-page-node-id="5hCWLcscNUwFGGG4nIVIaw">+12%</td></tr>
+<tr data-page-node-id="INe9bIfblSu69AyOgBE07g"><td data-page-node-id="hmghsiUpMabFLJgSqolRHG">EPLB$+$</td><td data-page-node-id="isp6x7pV6GC4OlS4XsHios">695（1.10）</td><td data-page-node-id="BaCLYg3xfRJscCKmzhHaHu">474（1.17）</td><td data-page-node-id="NYoFfwcEVELMN6ikV1EXZC">553（1.18）</td><td data-page-node-id="HvJKdGfUY6HlACONgue85t">+29%</td></tr>
+<tr data-page-node-id="yDx21JAaiSAC60m69Zh1wz"><td data-page-node-id="oEgLXEDnYls5eReEpAKhfn"><b data-page-node-id="YsJpJmNoYHIDtnS6S9JGQD">UltraEP</b></td><td data-page-node-id="aS8HO6s1GkEkGexcXj5tMj"><b data-page-node-id="qSxtmnIgKOYWHpDBqDuA7h">757（1.02）</b></td><td data-page-node-id="ttY7EmwfCEUcwjyrMQLDmw"><b data-page-node-id="WEZ2u0izPGbJqlaW5BKGlV">524（1.03）</b></td><td data-page-node-id="3OAsHdFOUM0u2v9QgHZQAj"><b data-page-node-id="ZzUliZKFWmuZswBkTtCenL">613（1.01）</b></td><td data-page-node-id="gaB2pYVLDVjq6TaHZJTdhS"><b data-page-node-id="yLzbzG6IVjllFVGiYcjGeM">+42%</b></td></tr>
+<tr data-page-node-id="03g7rkAcTT02On7WZtjmSs"><td data-page-node-id="j5SKTX7D2Vthxs5Q9FULu9">Ideal（强制均衡）</td><td data-page-node-id="klaeoytziPMojU3RD8wNeM">785.4</td><td data-page-node-id="c0F3s3UJh5Nd6FuAgMigQM">574.7</td><td data-page-node-id="cvrr4ACyodGqpIpunSYCnA">637.6</td><td data-page-node-id="HUZRFpm30QKd3AwKodHKtH">—</td></tr>
+<tr data-page-node-id="s2ts5u8oWjMf2aSbwfaJVI"><td data-page-node-id="hLaE1qsxniZPS1EYMsdNu6">UltraEP 达到 Ideal 的比例</td><td data-page-node-id="nVhNdZcDt1hVCdpuEDDNXw">96.4%</td><td data-page-node-id="oo3VpJooI0geCGCGUDY0oq">91.2%</td><td data-page-node-id="ZUwNDcdYsZkoQjzndbJYLN">96.1%</td><td data-page-node-id="dJyrGHQOehtyMnxpYek28D">94.6%</td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="mGuTC0AwR8GfC0Y8GkWNvb">数值为原文 Figure 11 的标注值。不均衡度是均衡后按所有层与批次平均的 rank 级值（最大 rank 负载比均值）。</p>
+
+<p data-page-node-id="ue8HwMtcWSoBeUgic4sBVF">论文对这组结果的说明：三个模型上 UltraEP 均衡后的平均每 rank 不均衡度只有 1.01 到 1.03，吞吐在各 global batch 之间稳定；相比之下基线的吞吐可见地振荡，因为它们的均衡方案落后于实际的热专家、由此产生的 straggler 随时间变化（§8.2）。</p>
+
+<p data-page-node-id="IgZKXK7QW49NaI0qF24YAG">DeepSeek-V3 这一列值得单独看。论文的解释是：路由补偿降低了整体不均衡（该模型的 Megatron-LM 基线不均衡度只有 1.30，明显低于另两个模型），但放大了短期负载摆动；在这种情形下 EPLB 与 LPLB 的表现与 Megatron-LM 相当甚至更差（EPLB 的 505 低于 Megatron-LM 的 509），而 UltraEP 仍在 96% ideal 以上（§8.2）。LPLB 的整体劣势论文归因于它有限的副本预算与求解开销。</p>
+
+<img src="assets/img-09.webp" alt="三个模型各 20 个训练迭代的吞吐折线图，下方配平均 TFLOPS 与平均不均衡度的柱状图" data-page-node-id="HEiXJfy7b5cMDXlEhj06uD">
+
+<p data-page-node-id="Ws0KsoH1BABMDiLyHxhyUr"><b data-page-node-id="kmsJ3QgL3HKOAAqFICUssO">图（原文 Figure 11）</b>：上排是三个模型在 20 个训练迭代上的吞吐折线，下排是平均 TFLOPS/GPU 与平均不均衡度的柱状图。折线图里需要关注的是波动幅度而非绝对高度：UltraEP 的曲线平稳，各基线的曲线明显起伏——这对应论文的判断，基线的均衡方案落后于实际热专家、产生的 straggler 随时间变化。柱状图给出上表中的全部数值。</p>
+
+<div class="callout callout-yellow" data-page-node-id="kVOPKHMvGjkqAXexWLEK8Y">
+<p data-page-node-id="lRg221QD3EvS9FAJMEdIgg">读数注意：94.6% 是三个模型的平均值，不是逐配置的下界。单模型分别是 96.4%、91.2%、96.1%，Qwen3-235B 明显低于平均。同理摘要中的 94.3% 是训练（94.6%）与 serving prefill（93.9%）两项的总平均。</p>
+</div>
+
+<h3 id="serving-e2e" data-page-node-id="ma6wqykYN2lIcNAEnCwUMk">6.3 serving prefill 端到端</h3>
+
+<p data-page-node-id="K46rFOVRt1nVoPhA9oQRhz">prefill 的负载比训练更倾斜、更非平稳，因为请求的语义域、提示词长度、批次组成与到达时间都在剧烈变化。论文的观察是在这种更强的扰动下 UltraEP 的增益更大，仍能达到 ideal 吞吐的 90% 到 97%；相对 SGLang 与 EPLB 分别高 1.56$\times$ 与 1.29$\times$，相对 EPLB$+$ 有 5% 到 24% 的增益（§8.2）。</p>
+
+<div class="table-scroll" data-page-node-id="szmPTAuRqv88ubvqjfK2Of">
+<table data-page-node-id="bk7WSxzADZyFZIpEeGYZRS">
+<thead data-page-node-id="2wBzEOoHhV9mQ2iM1jT9HM"><tr data-page-node-id="yCrqPnVYtRl8ct0FaH3Vup"><th data-page-node-id="f45jgF873kJRex6K59hAeK">模型与数据域</th><th data-page-node-id="LTMKD5jcu5A8lZlHq3eYTJ">SGLang</th><th data-page-node-id="M8K3Oc4xANeFIdRvhOxNpi">EPLB</th><th data-page-node-id="hGAuod8r749xUHhyAENSnL">EPLB$+$</th><th data-page-node-id="7HvOLjHLWitvMEo1gDYoSl">UltraEP</th></tr></thead>
+<tbody data-page-node-id="PFOmjUpqLglxA7pTlo7FiK">
+<tr data-page-node-id="b5EudXKscr4A9mAsgGDGTI"><td data-page-node-id="dGmmfFlTZCZdklIhNhSPsR">Qwen3-235B · STEM</td><td data-page-node-id="r8cBjRFulLoWKgRCEGO1F2">3.68</td><td data-page-node-id="VYJGbzkN54J0eqmeIYA2Tm">2.59</td><td data-page-node-id="C1mhhTm8uSosMC5LV3aKV1">1.11</td><td data-page-node-id="veTsQULFe8SpozY5qTDJfK"><b data-page-node-id="VsMZYQJnonrQIykw2zBHWf">1.04</b></td></tr>
+<tr data-page-node-id="u0GWXukUbu17ra2Y8rn2GG"><td data-page-node-id="AeG8N37IDOi84sv3pjEPSP">Qwen3-235B · Mixed</td><td data-page-node-id="e1Ofq7NDScljQZSlOb6qSb">4.01</td><td data-page-node-id="QUuMgwPuLAnh4SYfHMEaEU">2.56</td><td data-page-node-id="PXwOEsmJIYTywmBIyR8eJU">1.11</td><td data-page-node-id="0lVYOB0bW3P1QypBGDAIC2"><b data-page-node-id="SndnHtoiUsMr6RpjTKQToH">1.03</b></td></tr>
+<tr data-page-node-id="P6ryUMCAEesGSpzWhsIIJo"><td data-page-node-id="NWrH7DzDHaeAR5X3Iyg7oJ">GLM4.7-358B · STEM</td><td data-page-node-id="OxbHHvSW3HougGGJhmkIaM">3.09</td><td data-page-node-id="TrGQb3Zsh48cbdAUJCQ1pJ">2.05</td><td data-page-node-id="AJoRyLqGz2v6aJYKhnR9UA">1.08</td><td data-page-node-id="4xpXEQ8MEgQCkdd1cdCLIm"><b data-page-node-id="OnSq3unRsQgDzmnBqT1kdI">1.01</b></td></tr>
+<tr data-page-node-id="3A2gRgWsBlyVSBd8VULo0m"><td data-page-node-id="WzDi2u6RLWRrAwnJix9XlL">GLM4.7-358B · Mixed</td><td data-page-node-id="hd4vCBgmgCz4ZnczEQ9hFr">2.06</td><td data-page-node-id="hyEEEWMVQN1KcCGKJ5jRUn">1.80</td><td data-page-node-id="aMneJDWTv6If3CGY4jpupW">1.06</td><td data-page-node-id="ffgpL5H0OBKBbD12GOkasy"><b data-page-node-id="vjlQqz4E1PhinMK39WabxC">1.01</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="kasV5JAM5bAZoP765FL9Ss">数值为原文 Figure 12 标注的平均 rank 级不均衡度。Qwen3-235B 为 EP64、GLM4.7-358B 为 EP40 且 $N_{\mathrm{slot}}=4$，均在单机架内。摘要中「从 1.30 到 4.01 降到 1.01 到 1.04」的上界 4.01 就来自这里的 Qwen3-235B · Mixed 一行。</p>
+
+<p data-page-node-id="XxquLg4Yvmcl58sRfAkbLm">为了保证均衡质量对照是在完全相同的负载条件下进行的，论文记录了 SGLang 在满载下的完整路由 trace，再把它回放给其他被评测的均衡算法（§8.2）。</p>
+
+<h3 id="latency-breakdown" data-page-node-id="nEEyZ91KhbfVJIxURM2Pjw">6.4 延迟分解：热路径开销到底多少</h3>
+
+<p data-page-node-id="JwumkhLLVZm4SJYVcijmKl">论文把 Qwen3-235B-A22B 训练的前向与反向延迟按 MoE 层平均分解，用来量化 UltraEP 的影响（§8.3）。</p>
+
+<div class="table-scroll" data-page-node-id="beUskVnUC5fPfn9vSLinRy">
+<table data-page-node-id="PfeoVFDvwEg3CSHDscvAdm">
+<thead data-page-node-id="EmdU54dOT4d37R0FvHdiZL"><tr data-page-node-id="P3MGSffaOupDmgKDH7XJvw"><th data-page-node-id="e41cnpPZpSLnSu9JBC4rVx">方向与项目</th><th data-page-node-id="MjKUIFGIvF3wqtu7Fz7lVW">Ideal</th><th data-page-node-id="OWDzkv8YTEBWDHEj1oWOuE">Megatron-LM</th><th data-page-node-id="UoT4yhXy36JWaIOA80i7FP">UltraEP</th><th data-page-node-id="HzcZghh2ODCiC13G7Pk0m1">UltraEP 相对 Ideal</th></tr></thead>
+<tbody data-page-node-id="H06BFiOI190viL0D3vbozI">
+<tr data-page-node-id="j4bbpc680ycxpkVzvOCNqu"><td data-page-node-id="HVrqZZFsHX70dgOgh66am5">前向 · MoE 计算</td><td data-page-node-id="YSjFCDwVmPY2mg7mlviC3T">1.89 ms</td><td data-page-node-id="CvhnSU6wz0KDWmeQ1Cvrsa">5.95 ms</td><td data-page-node-id="EPKTsehqCOvQZ0HI4lrYVe">2.11 ms</td><td data-page-node-id="LCjlgCfsODthPo5R2ndN5A">+0.22 ms</td></tr>
+<tr data-page-node-id="AkFAZABTL0XJCXzEZgKUV0"><td data-page-node-id="wKhZoaNMLHbsDXAYeogbCg">前向 · token all-to-all</td><td data-page-node-id="5SPfsNCbQyJCWxMSPHtOEB">1.68 ms</td><td data-page-node-id="U6SMcQWUiCUpgecTJq3HNf">6.94 ms</td><td data-page-node-id="Uw2rNcokYkGVDUVleCeK4b">2.24 ms</td><td data-page-node-id="GKqo0bqp8bblXQZ5fQdUaB">+33%</td></tr>
+<tr data-page-node-id="9WvQ1NhKN3mEDJMTtqGXtV"><td data-page-node-id="ZHDa3AO5kwjhfSmfTzgl45">前向 · 其余部分</td><td data-page-node-id="uhbPVZAkUPim1rbMCoEb9e">2.83 ms</td><td data-page-node-id="dIfJkE43fJFTkgzskRUGuk">2.88 ms</td><td data-page-node-id="T5g5XOKzUlsVhXGSVZgGnm">3.16 ms</td><td data-page-node-id="gpagRcqnDJGbv7Tnp6IFCE">+0.33 ms</td></tr>
+<tr data-page-node-id="5lIGLeCoXW9ijBiQqpzud0"><td data-page-node-id="OgyxbgJDAnklXg7wRDxhGK">反向 · MoE 计算</td><td data-page-node-id="FvvDggZM6nT6Kd1KoD6IDb">4.32 ms</td><td data-page-node-id="XyQPCZZMxfZtjwUwIR9MsJ">10.41 ms</td><td data-page-node-id="8L8gRPOGe5UFO0G9E6PhL2">4.43 ms</td><td data-page-node-id="nFbdowy5asV21SHyxxm2gE">+0.11 ms</td></tr>
+<tr data-page-node-id="opfZQjzzDd7NHPNVpQh4JW"><td data-page-node-id="QInCViomhQMPsPJiSLg7nV">反向 · token all-to-all</td><td data-page-node-id="6DsT7bGHXF2Ba9D1Ug1AZG">1.62 ms</td><td data-page-node-id="oDeDBm1IoBCnQW2BWs1Ao4">4.75 ms</td><td data-page-node-id="UazASqh9rF9mPQg8qAzzfa">1.79 ms</td><td data-page-node-id="Nb238my4cA0YejuvAzgHx9">+10%</td></tr>
+<tr data-page-node-id="H76D0I5kBTA4MFGZdHDtse"><td data-page-node-id="ToKdiB7qi8nEvYaZja4KCn">反向 · 其余部分</td><td data-page-node-id="DzGXKZ3TxMGbf54cz5RjFT">4.49 ms</td><td data-page-node-id="RWQ8xBqlWYXQzaWS4ekcNI">4.52 ms</td><td data-page-node-id="Z0HxHG5oq6QwQ2SGIQxnpp">4.58 ms</td><td data-page-node-id="LClrkXxfPAbUQ9LheJwBGv">+0.09 ms</td></tr>
+</tbody>
+</table>
+</div>
+
+<p data-page-node-id="b8bQAZVBNN5govHWFWX9mB">数值为原文 Figure 13 的标注值，单位为单个 MoE 层的平均延迟。</p>
+
+<p data-page-node-id="2hu1pGipH0XQroUDluyzDD">论文的逐项解读（§8.3）。不做均衡时，Megatron-LM 在 MoE 计算与 token all-to-all 两项上都有大幅膨胀——按上表数值计算，相对 ideal 其前向 MoE 计算是 3.15 倍、token all-to-all 是 4.13 倍（这两个倍数由本页从表中数值算出，论文只作定性表述）。启用 UltraEP 后，先看非 MoE 部分：相对 ideal 前向多 0.33 ms、反向可忽略，合计只占总延迟的 1.8%，论文据此判断热路径开销已被最小化、重叠是有效的。MoE 计算项已接近 ideal，只有冗余物理专家带来的轻微控制开销，这确认 rank 级负载不均衡已被基本消除。</p>
+
+<p data-page-node-id="IxEvyiVJ1MMrqJ4iCCU67T">剩下的 token all-to-all 项，UltraEP 相对 ideal 前向高 33%、反向高 10%。论文的归因是这来自现实中不均匀的 token 路由，与 ideal 里合成的均匀 dispatch 不同；对 DeepEP 而言，这种不规则性表现为其内部 token dispatch 流水线中的轻微 stall（§8.3）。</p>
+
+<img src="assets/img-10.webp" alt="堆叠柱状图，前向与反向各三组，分别为 Ideal、Megatron-LM 与 UltraEP，每组按 MoE 计算、token all-to-all 与其余部分堆叠" data-page-node-id="CvwvIG5lIjfFaSR6U8aXN6">
+
+<p data-page-node-id="mSONDwadF12JgAC3bDvgij"><b data-page-node-id="EMVIS3KErCA8WZdJReV4r7">图（原文 Figure 13）</b>：前向与反向的堆叠延迟分解，每组三根柱分别是 Ideal、Megatron-LM 与 UltraEP，堆叠成分为 MoE 计算、token all-to-all 与其余部分。需要关注的是 UltraEP 与 Ideal 两根柱的差异分布：差异几乎全部落在 token all-to-all 一段，而不是「其余部分」——后者才是热路径均衡开销所在。这张图支撑本节的两个结论：热路径开销只占总延迟 1.8%；剩余与 ideal 的差距主要在 all-to-all，来自真实路由的不均匀。</p>
+
+<div class="callout callout-yellow" data-page-node-id="bGLJVeeNB7NEeuyJ6hXDYr">
+<p data-page-node-id="dC9vYZ6yfxeuDjKnGxXCgK">常见误解：把不均衡度 1.01 到 1.04 线性映射成「吞吐只差 1% 到 4%」。论文在 §8.2 训练段末明确，剩余与强制均衡的差距主要来自真实 MoE 训练中不均匀的路由本身，而不是残余不均衡或热路径均衡开销。上表的分解就是证据：热路径开销 1.8%，而 token all-to-all 前向高出 33% 这一项才是主要来源，它的成因是 ideal 用了合成的均匀 dispatch、现实做不到。</p>
+</div>
+
+<h3 id="memory" data-page-node-id="AnklZ6RJDWQLcFt8zAkODF">6.5 活跃内存峰值</h3>
+
+<p data-page-node-id="WyE33RrRVtl29X9za9MxzX">均衡除了影响延迟，也重塑活跃内存峰值，尤其在最热的接收 rank 上。论文的测量结果是：不做均衡时，MoE 活跃内存峰值相对 ideal 在训练中高 2 倍、在 serving 中高 11 倍；UltraEP 通过压平接收侧热点，大幅降低了 MoE 活跃峰值并保持接近 ideal（§8.4）。</p>
+
+<p data-page-node-id="3rjUs2XayWrnHHGxEnqips">论文列出这一收益的三重意义：直接降低显存溢出风险、提升模型扩展余量，并且可以避免为省内存而启用活跃值重计算所付的额外性能代价（§8.4）。</p>
+
+<p data-page-node-id="yU96wIhwqmegyGEDkxU4js">实验条件需要注意。训练侧论文关闭了活跃值重计算，以暴露按层累积的活跃内存上界，且观测到的峰值出现在负载倾斜度高的训练初期；serving 侧前向只保留当前层的瞬时活跃值，因此两者的 2 倍与 11 倍不是同一口径下的数字（§8.4）。</p>
+
+<h3 id="production" data-page-node-id="cJfSYOjdXAChqGy0emHK1b">6.6 生产 MoE 训练</h3>
+
+<p data-page-node-id="XKWDraLRenExFH1AN8E3kq">论文在比原型规模更大的真实 MoE 训练中评估 UltraEP 的稳健性与可扩展性，训练对象是内部模型 RefMoE-288B-A16B，EP32，使用内部训练栈（§8.1、§8.6）。</p>
+
+<p data-page-node-id="NtxgvN8EA4USDb9GQwfuHD">结果是：尽管长期运行中存在硬件与网络的波动，UltraEP 维持了 ideal 吞吐的 92% 以上，稳定性有所提升，相对不做均衡平均增益 9.6%。loss 曲线符合预期的预训练轨迹，论文给出的原因是 UltraEP 只改变物理执行逻辑、保留了训练语义（§8.6）。</p>
+
+<img src="assets/img-11.webp" alt="两个子图，左为 RefMoE-288B 训练过程的 LM loss 曲线，右为稳定训练阶段的吞吐箱线图并标注 ideal 与无均衡的水平线" data-page-node-id="nNH6LdG0dEIX1F4s0o1ScT">
+
+<p data-page-node-id="ZMY4KL0qABVAj2IJjKAWDc"><b data-page-node-id="YnUIBrQkMVRC7qrypW8Yvi">图（原文 Figure 17）</b>：左侧是 RefMoE-288B-A16B 训练过程的 LM loss 曲线，形态是平滑下降的预训练轨迹，没有因启用均衡而出现异常。右侧是 batch size ramp-up 结束后稳定阶段的吞吐分布，标注 ideal 为 504 TFLOPS/GPU、无均衡的采样均值为 425.0。按 §8.6 的 9.6% 平均增益反推，UltraEP 的吞吐约为 466 TFLOPS/GPU，占 ideal 的 92.4%，与正文「92% 以上」一致。图注说明 ideal 取的是实测强制均衡吞吐的最好值以剔除环境波动，无均衡的数据从关闭 UltraEP 的续跑区间采样。</p>
+
+<h3 id="baseline-clarification" data-page-node-id="DoKD8teC7pb5GBbL3vOD0c">6.7 摘要数字的基线澄清</h3>
+
+<p data-page-node-id="jARTRPaCaTsbQIDJR1EReA">论文在摘要与正文里用了不同基线，混用会产生误读。三组数字的对应关系如下：</p>
+
+<div class="table-scroll" data-page-node-id="loH7yC3MG5xR6AGHtlhAym">
+<table data-page-node-id="JoHe0NvJamYwgVUkhEhwMG">
+<thead data-page-node-id="NwjP4mVHE9IbT7W8bP3R2Y"><tr data-page-node-id="sxRlR7HsrUJqpR71mR5DAA"><th data-page-node-id="iGA10PUCoph3eIe9eVHtGX">数字</th><th data-page-node-id="q1cUdCxqgS0DQR8OCpSsDI">基线</th><th data-page-node-id="ub5vHWKpw8Ek2VdXJ2B53L">覆盖范围</th><th data-page-node-id="FXjv4wBJtMHGT3KRaKfaA7">出处</th></tr></thead>
+<tbody data-page-node-id="FL2G2S8mFkGLNpQbiZOUDW">
+<tr data-page-node-id="j1bKd4UqsugYlqNxAEPLJT"><td data-page-node-id="UKJLghLBGvdtvygbH2z4gB">1.49$\times$</td><td data-page-node-id="TVUnHbofdZOxdh45tLFECV">不做任何均衡（no-balancing）</td><td data-page-node-id="qh1F22L9DmYc1xCGW6AC9S">训练与 serving prefill 的平均</td><td data-page-node-id="MgaLdkh2vOqlrvHhRL3hBk">摘要</td></tr>
+<tr data-page-node-id="DygDMl1DZAluvPQUVgBk68"><td data-page-node-id="YLYO8949n6r58T4SwBDzUo">1.42$\times$</td><td data-page-node-id="BWHyxvahxAf1g5Kc9BRHZu">Megatron-LM</td><td data-page-node-id="eVx5GwDtA33FivEdk0QdsI">训练，三模型平均</td><td data-page-node-id="MMxznUcv9eUkoMJHuc5bmY">§1</td></tr>
+<tr data-page-node-id="bB5DNxTOwCIX4ZchUAtUhe"><td data-page-node-id="U5YWngxOTtwgIL6t7vlUP1">1.56$\times$</td><td data-page-node-id="uE1pnUgCgDHjuOIYqhsbKq">SGLang</td><td data-page-node-id="aGVISDuDTtjr2HJR5swAB0">serving prefill</td><td data-page-node-id="VqxAxj6TKIfkcTuEqYmXiq">§1、§8.2</td></tr>
+<tr data-page-node-id="7YR3UCAixPsypQvJ5ZMqAe"><td data-page-node-id="qWR6eGkONyp8DE2MmX9JjT">1.29$\times$</td><td data-page-node-id="gYbU6bsSSR1KPkELVmYGJk">EPLB</td><td data-page-node-id="2K4H0i0xCYfV7W2AcIMDqC">serving prefill</td><td data-page-node-id="BXrhB3aAluPD43HaGNksBV">§8.2</td></tr>
+<tr data-page-node-id="u3ugqRVFA78abtU3WNBjEJ"><td data-page-node-id="6leDcu8CsWdTQU8Az4HU9o">94.3%</td><td data-page-node-id="4eAMNuqdv05FhQjOx669eS">强制均衡 ideal</td><td data-page-node-id="Zg5qqaqGFnpssE8wO1JajE">训练与 serving 的总平均</td><td data-page-node-id="EDCBWPGRAVYhT9qlDbQBJN">摘要</td></tr>
+<tr data-page-node-id="ukKR3URqvB09juoTOXWh2D"><td data-page-node-id="HGVMUutF1IvqePpAspcB3m">94.6% / 93.9%</td><td data-page-node-id="xziaLKxACJdE8R193JIBvZ">强制均衡 ideal</td><td data-page-node-id="dsS3PGeaNCtShwwAXMiVEX">分别为训练与 serving prefill</td><td data-page-node-id="lmbMFKaJpOXCqCfBhdIBpl">§1</td></tr>
+<tr data-page-node-id="G0MBkFdsLrAf1jduOK6rD9"><td data-page-node-id="uolBo6zg3rBzxXNIgW3fGE">9.6%</td><td data-page-node-id="c3GluCdDg2wm5e44nMcmsK">不做均衡</td><td data-page-node-id="0eSuHKxbqFepDWmJVsO5wr">生产训练 RefMoE-288B-A16B</td><td data-page-node-id="RxDaRcBkNTuVVG2E1HooAQ">§8.6</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="evaluation-questions" data-page-node-id="O4eDpQdbjomH6RJ1VPTU0r">本章问题</h3>
+<ol class="chapter-questions" data-page-node-id="7aUKPt3CWlu38FVetLwiUS">
+  <li data-page-node-id="D59bCUh0GHUEkRTL4mXI7M">
+    <p data-page-node-id="klfOHKxz9A1MCKETEnpLU7">摘要的 1.49$\times$ 与正文的 1.42$\times$、1.56$\times$ 是什么关系？</p>
+    <details data-page-node-id="GuNfXIZk1IbWRz3BELdoA0">
+      <summary data-page-node-id="4x73BhFggFS0nwMoBkSY9A">解答：基线不同。1.49$\times$ 相对「完全不做均衡」、是训练与 serving 的平均；1.42$\times$ 相对 Megatron-LM（训练）、1.56$\times$ 相对 SGLang（prefill）</summary>
+      <p data-page-node-id="Hsrj73h3Z09RWna4uEKuFz">三个数都出自论文，但对照对象不同。摘要的 1.49$\times$ 是训练与 serving prefill 平均后、相对 no-balancing 的提升。§1 给出的 1.42$\times$ 是训练三模型相对 Megatron-LM 的平均，1.56$\times$ 是 serving prefill 相对 SGLang；§8.2 另外给出相对 EPLB 的 1.29$\times$。</p>
+      <p data-page-node-id="M3P5X3JUZtvkl6HuzQcKX0">训练侧的完整对照可以从 Figure 11 反算验证：三模型平均相对 Megatron-LM，EPLB 提升 20%、LPLB 12%、EPLB$+$ 29%、UltraEP 42%（§8.2）。所以引用这些数字时必须带上基线，否则「1.49 倍」很容易被误读成相对生产系统的绝对提速。同理达标率也有两个口径：摘要的 94.3% 是训练与 serving 的总平均，§1 分开给出的是训练 94.6%、serving prefill 93.9%，而单模型区间是 91.2% 到 96.4%。</p>
+    </details>
+  </li>
+  <li data-page-node-id="s9B9OFgrqoRQrHQOq8IRLf">
+    <p data-page-node-id="w3u3JqJ0ZOOSdAAZCZR6V0">均衡后不均衡度已经是 1.01 到 1.03，为什么吞吐还差 ideal 约 5%？</p>
+    <details data-page-node-id="zHVUGESRt1AvgYUUPJyTLZ">
+      <summary data-page-node-id="f9s842lBg22fVIKWGw7eGD">解答：残余不均衡不是唯一损耗。主要来源是真实路由的不均匀让 token all-to-all 比 ideal 高 33%，而热路径开销只占 1.8%</summary>
+      <p data-page-node-id="YooANETFbyshKzCY3EOQD9">Figure 13 的分解给出了答案。相对 ideal，UltraEP 的非 MoE 部分前向多 0.33 ms、反向多 0.09 ms（可忽略），合计只占总延迟的 1.8%——这一项才是热路径均衡开销。MoE 计算项已接近 ideal（前向 2.11 对 1.89 ms），只有冗余物理专家带来的轻微控制开销，说明 rank 级不均衡确实基本被消除了。</p>
+      <p data-page-node-id="xYx1hbKw4fxQg2jGV6hFWT">差距主要在 token all-to-all：前向 2.24 对 1.68 ms（高 33%）、反向 1.79 对 1.62 ms（高 10%）。论文的归因是这来自现实中不均匀的 token 路由，与 ideal 里合成的均匀 dispatch 不同；对 DeepEP 而言表现为其内部 dispatch 流水线中的轻微 stall（§8.3）。换句话说，ideal 是把 router 改掉、强制均匀分发才达到的，那种均匀性在真实模型上做不到——即便各 rank 收到的 token 总数已经相等，这些 token 在专家之间的分布仍然不规则。</p>
+      <p data-page-node-id="AmatPH1whJxsvDYHcNsh6Q">论文在 §8.2 训练段末明确了这个结论：剩余与强制均衡的差距主要来自真实 MoE 训练中不均匀的路由，而不是残余不均衡或热路径均衡开销。所以不能把不均衡度线性映射成吞吐差距。</p>
+    </details>
+  </li>
+  <li data-page-node-id="zfSBlOJVvKAVFTJCnmJEJP">
+    <p data-page-node-id="8y3k1Xt5L5ovff1lpvPRoh">均衡除了提升吞吐还带来什么？</p>
+    <details data-page-node-id="YeNemHl3FLPvqMCwk2vfFD">
+      <summary data-page-node-id="WLqsJO5YIxfMhcZUmgELbj">解答：压平了接收侧的活跃内存热点。不做均衡时 MoE 活跃内存峰值是 ideal 的 2 倍（训练）与 11 倍（serving）</summary>
+      <p data-page-node-id="lxm874XxLexlhn07hvWX5S">负载不均衡的第三个后果是超载设备上的活跃内存尖峰（§1）。收到过多 token 的 rank 需要为这些 token 保存更多的中间激活值，峰值出现在最热的接收 rank 上。论文的测量是：不做均衡时 MoE 活跃内存峰值相对 ideal，训练中高 2 倍、serving 中高 11 倍；UltraEP 通过压平接收侧热点，把 MoE 活跃峰值大幅降低到接近 ideal（§8.4）。</p>
+      <p data-page-node-id="vXDYo3WRNhtpvEhuqHxrHN">论文列出三重意义：直接降低显存溢出风险、提升模型扩展余量、避免为省内存而启用活跃值重计算所付的额外计算代价。实验条件需要注意——训练侧关闭了活跃值重计算以暴露按层累积的上界，且峰值取自负载倾斜度高的训练初期；serving 侧前向只保留当前层的瞬时活跃值。因此 2 倍与 11 倍不是同一口径，serving 那个更大的倍数部分来自它只有单层活跃值这个基数更小的分母。</p>
+    </details>
+  </li>
+  <li data-page-node-id="FcPJoSO6QIi7ULoE9oIrEm">
+    <p data-page-node-id="BXDO8mCrgb1gMZcZ6y8ZRR">生产训练那组结果的证据强度如何？</p>
+    <details data-page-node-id="IeTe1srEnzN7bZ8b8Rq94d">
+      <summary data-page-node-id="gaj9vGBBQ78VRepUs9VJCk">解答：能支持「可稳定运行、不改变收敛」，但覆盖面窄——只有一个内部模型、一个并行配置，且 ideal 与 no-balancing 都是采样估计</summary>
+      <p data-page-node-id="1ebzwb58ITnECOWOHWFIj7">结果本身是：RefMoE-288B-A16B 在 EP32 下维持 ideal 吞吐的 92% 以上，相对 no-balancing 平均增益 9.6%，稳定性有提升；loss 曲线符合预期的预训练轨迹，论文给的原因是 UltraEP 只改物理执行逻辑、保留训练语义（§8.6）。按 Figure 17 标注的 ideal 504、no-balancing 均值 425.0 反推，UltraEP 约 466 TFLOPS/GPU，占 ideal 的 92.4%，与正文一致。</p>
+      <p data-page-node-id="qifAQHlhprmyULz27NL1EG">限制有三条。一是模型与配置单一：只有 RefMoE-288B-A16B 这一个内部模型、EP32 这一个配置，用的是内部训练栈而非公开可复现的 Megatron-LM 路径。二是两个参照点都是估计值：ideal 取的是实测强制均衡吞吐的最好值（以剔除环境波动），no-balancing 是从关闭 UltraEP 的续跑区间采样，都不是与 UltraEP 严格同时同环境的对照。三是 loss 曲线只能说明「没有破坏收敛」，不能说明均衡改善了收敛——按论文自己的等价性论证，正确的预期本来就是曲线不变。</p>
+      <p data-page-node-id="PB3TBtp63J8DYtW4VEU87X">所以这组结果的合理解读是稳健性与可扩展性的存在性证明，不是覆盖多种生产配置的性能保证。此外 serving 侧的实验全部在单机架内完成，跨机架的 prefill 部署论文未做（§8.1）。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="assessment" data-page-node-id="hSBFfykfoUHkZKwQfAlDlI">7. 方法评价：优化目标改对了，但硬件前提很强</h2>
+
+<div class="callout callout-gray" data-page-node-id="HZu1kO7G6mVq2tvnGhg1Ka">
+<p data-page-node-id="gpi3o6JelQQvWHRm8tH9gG">本章是分析性评价，内容属于分析性判断，不是论文的结论。</p>
+</div>
+
+<h3 id="strengths" data-page-node-id="IS8IfTMzrVPqJkdkwr5AtI">7.1 优点</h3>
+
+<p data-page-node-id="hbl6ARJev7QC0P13UOfUoW"><b data-page-node-id="TDVdg4nDUnuxNqdm9WWwSf">把优化目标改对了。</b>已有方案优化重路由之前的专家热度，而实际决定耗时的是重路由之后各 rank 的总负载。UltraEP 用配额作为耦合变量直接瞄准后者，效果是同一副本集合下就能拿到更好的均衡（页面示例：1.0 对 round-robin 的 1.1667），并且顺带更省资源（Table 3：冗余槽消耗 45 对 107）。这是一个目标函数层面的修正，不是参数调优。</p>
+
+<p data-page-node-id="nTARCErKVEkETlU9CdK92R"><b data-page-node-id="FYkt500jF81GyFAm7FcyyE">用配额避开了组合爆炸。</b>精确负载让「复制要为重路由预留容量」这件事变成必需，决策空间随之变大。配额的设计让每次阈值探测在选副本时就把容量定下来，因此不必枚举副本集合、也不必做 token 级路由。求解耗时压到 0.111 ms 量级（模拟均值），这是它能放上热路径的前提。</p>
+
+<p data-page-node-id="9jd8zCSEIZoZzewWc9ZnAH"><b data-page-node-id="QzjQ9w5w018DkiN9AotMwB">内存与通信必须同时成立。</b>值得注意的是三个机制之间的依赖关系：跨层复用把冗余槽压到 36 MB 与 72 MB 量级，才让「每层重搬」在显存预算上可行；但它同时制造了逐层权重实体化的紧期限，于是需要 tile 流水线与 chunk 中继把搬运压到亚毫秒才能满足这条期限。任何一环缺失，实时均衡都不成立。论文把这一点写成 co-design，从依赖链看确实如此。</p>
+
+<p data-page-node-id="Zt2GH9qdxImH2IFzqD0afD"><b data-page-node-id="kju6FkBZX81mEuCdEU3MPk">训练语义不变是可论证的。</b>梯度归约回主专家、优化器只更新主专家、冗余专家排除在 checkpoint 之外，加上 virtual layer ID 让反向取回匹配的前向方案，这套设计使等价性成为结构性质而不是经验观察。生产训练的 loss 曲线正常是这一论证的印证，而不是它的依据。</p>
+
+<h3 id="limitations" data-page-node-id="kBm51H8SUc9wJUR8ww7LPM">7.2 局限</h3>
+
+<p data-page-node-id="Ru5bM2HfiJFvmYyAQDEk10"><b data-page-node-id="BScCLBOcIQPvJGC30xyJAE">硬件前提很强。</b>全部结论建立在「EP 组装得进一个 RSN 的 scale-up 域」之上。论文自己指出跨多机架搬专家状态在热路径上不可行，因此这套方法在普通 4/8 卡服务器集群上不适用——不是效果差一些，是机制不成立。测试床的 scale-up 带宽是 scale-out 的 8 到 10 倍，这个比例是可行性的关键参数，论文未给出该比例下降到多少时方法失效。</p>
+
+<p data-page-node-id="kslA87a9OpmGQjHBZs3MHO"><b data-page-node-id="UBIIBiRlbd9Grm22wufxuH">覆盖面窄于「MoE 推理优化」。</b>不管 decode（论文给了理由，但这意味着 TPOT 侧的收益为零）、不管 token all-to-all 内核本身、不管专家内部的计算效率、不管跨机架的 EP。</p>
+
+<p data-page-node-id="xY8YvlDumIWr89goh7iRYX"><b data-page-node-id="LGzVXcmlDR21FhgV2BxX14">最优性只是经验的。</b>二分的每次探测用贪心可行性判定，贪心判为不可行的阈值未必真不可行。论文用 near-optimal 而非 optimal，也未给近似比。实测的 1.01 到 1.04 很接近理想，但这是在论文测试的负载分布上的结果，不是保证。</p>
+
+<p data-page-node-id="v4gGLHm231AHEGih6uHtJV"><b data-page-node-id="60tzyOaqL62etZRECAazUG">生产证据单薄。</b>只有 RefMoE-288B-A16B 一个内部模型、EP32 一个配置，且 ideal 与 no-balancing 两个参照点都是采样估计。serving 侧全部实验在单机架内完成。</p>
+
+<p data-page-node-id="Kd67oSmh7OKwc0u7KuKobk"><b data-page-node-id="hKEXfZF6rFYknsS5Qh8CgW">与冗余槽预算的关系需要注意。</b>Figure 15 显示 $N_{\mathrm{slot}}=1$ 且初始不均衡达 6.0、8.0 时，UltraEP 也升到约 1.07 与 1.09。预算变紧、倾斜加剧时两者都会退化，UltraEP 只是退化得慢。论文实验中的 $N_{\mathrm{slot}}$ 是 2 或 4，这份余量本身也是显存成本。</p>
+
+<h3 id="positioning" data-page-node-id="RpScg1KKkDrBsg04Mg6moe">7.3 适用场景与相邻工作</h3>
+
+<p data-page-node-id="1iZ7yE0NyicnS6pTFWifot"><b data-page-node-id="6iXaQlGssGqooHU7DnUqs5">适用条件</b>：机架级节点上的大 EP MoE 训练或 serving prefill，负载非平稳，且每 rank 有两个以上冗余槽的余量。若负载本身足够平稳（比如某些固定域的推理服务），历史式方案的预测误差小，实时均衡的边际收益会明显下降。</p>
+
+<p data-page-node-id="C2O1gzPoakuZWyCq0lNsi1"><b data-page-node-id="yYW8SvBzagLrAIabBg65im">与 EPLB 家族的位置关系</b>：三者解同一个问题，差别在决策时机与负载保真度。EPLB 是「历史负载 + 周期性重布局」；LPLB 在 EPLB 之上为每个 microbatch 微调重路由，但限制每专家至多一个副本以控制开销；UltraEP 是「精确负载 + 每层每 microbatch」。论文构造 EPLB$+$（喂精确负载、保留 EPLB 的规划与 round-robin 重路由、换上 UltraEP 的通信）来隔离规划算法本身的贡献，这个基线设计是干净的。</p>
+
+<p data-page-node-id="xpMZT2EIFMGHSkhgxBiBEH"><b data-page-node-id="9E9KIxPT9OJcymDLsfR75j">与 MoonEP 的关系</b>：两者都属于「用冗余专家在线纠正不均衡」这条路线，但目标函数不同。<a href="../moonep/index.html" data-page-node-id="JRoEe1qJm3smpBguwZi3Pc">MoonEP</a> 追求每个 rank 恰好收到 $S\times K$ 个 token 的完美均衡，靠固定大小 buffer 与静态形状消除主机同步；UltraEP 追求的是配额意义下的近最优，并把决策放上热路径。</p>
+
+<p data-page-node-id="70w5lVjeVdfwQUxrZsUMWp"><b data-page-node-id="UnVJscIGeRooEsLPcYc2QF">与 DeepEP 的关系</b>：不是竞品。UltraEP 用 DeepEP 做 token 的 dispatch 与 combine（§7），§8.5 中也把它适配来作专家权重搬运的通信基线。论文明确 MoE 通信库与计算优化（专用 all-to-all 内核、grouped-GEMM 的 kernel fusion、计算与通信的细粒度重叠调度）与 UltraEP 正交、可叠加以获得累积收益（§9）。</p>
+
+<p data-page-node-id="1oEiFFziOG1gkgULtRmTdM"><b data-page-node-id="fC9gSFmogHzd71a1KMOsh1">与算法侧路由正则的关系</b>：互补而非替代。论文在 §2.2 明确辅助路由损失服务的是稳定优化、防止路由塌缩、保留专家特化，无法保证逐 microbatch 的实现负载均衡；系统侧技术纠正运行时不均衡，同样不能替代路由损失。</p>
+
+<p data-page-node-id="U0W5FWNmBFJEsCl3AcAAam"><b data-page-node-id="T0cDFpG7xRJ0CsuuHGf6g1">论文展望</b>：因为 UltraEP 同时覆盖训练与推理，论文认为同一抽象可自然延伸到交替这两个过程的强化学习流水线（§10）。这是论文的展望，未做实验验证。</p>
+
+<h2 id="sources-and-scope-notes" data-page-node-id="K4H1mZRWAi6PddzBXAlB7S">来源与范围说明</h2>
+
+<h3 data-page-node-id="coJmu3S6DrtvQD4UGOUpkh">核心论断与原文定位</h3>
+
+<p data-page-node-id="XrxI9AHO5qIi0lEIjmfYhs">本页的论断编号与原文位置对应如下。§ 编号按 arXiv:2606.04101v3 编译顺序：§1 Introduction、§2 Background、§3 Expert Load Analysis、§4 UltraEP System Design、§5 Quota-Driven Planning、§6 RSN-Native Balancing Communication、§7 Implementation、§8 Evaluation、§9 Related Work、§10 Conclusion。</p>
+
+<p data-page-node-id="mvGMViWmKOCpZzGkexVHEm">C1 大 EP 放大不均衡为三个后果并随 EP 度数复合——§1 第 2 段。C2 EPLB 的冗余专家策略与周期性部署——§1 第 3 段。C3 prefill 热度随语义域与批次漂移——§3「Serving Prefill」。C4 训练侧辅助损失负反馈与 microbatch 抖动——§3「Training」。C5 大 EP 转专家抖动为 rank 倾斜、EPLB 可能加剧不均衡——§3「Limitations of History-Based Balancing」。C6 精确负载迫使均衡进入关键路径——§1 第 4 段。C7 标准 RDMA 集群跨机搬运不可行——§1 第 4 段。C8 RSN 的 scale-up 域与带宽语义——§2.1。C9 控制面与数据面两个挑战——§1 第 5 段、§4.4。C10 逻辑与物理专家、主槽与冗余槽——§4.1。C11 只复制不重排及其理由——§4.1「Replication Only」。C12 跨层 buffer 复用与紧期限——§4.1「Cross-Layer Buffer Reuse」。C13 前向流水线与关键路径——§4.2「Forward」。C14 反向权重重实体化、梯度归约的等价性——§4.2「Backward」。C15 四条约束——§4.3「Constraints」。C16 二分加贪心判定的完整流程——§5.1「Quota Construction」与 Algorithm 1。C17 配额作耦合变量避开枚举——§5.1「Why efficient」。C18 本地优先不改变配额、不破坏阈值——§5.2「Quota Decomposition with Locality」。C19 累积配额与上界查找——§5.2「Token Assignment」。C20 GPU 原生求解的难点与做法——§5.3。C21 均衡流量的性质与两条路径——§6 开头。C22 persistent tile streaming——§6.1。C23 overlap-aware footprint——§6.1「Overlap-Aware Footprint」。C24 fan-out 界在发送侧、chunk streaming relay——§6.2。C25 load-aware relay scheduling——§6.2「Load-Aware Relay Scheduling」。C26 运行时定位与集成规模——§7 第 1 段。C27 RSN 内存语义——§7「RSN Memory Semantics」。C28 virtual layer ID 与端到端集成——§7「End-to-End Integration」。C29 直接优化重路由后负载上界的归因——§8.5「Balancing Quality」。C30 剩余差距来自真实路由——§8.2 训练段末。C31 all-to-all 增幅的归因与 DeepEP stall——§8.3。C32 活跃内存峰值的 2 倍与 11 倍——§8.4。C33 loss 曲线正常的原因——§8.6。C34 算法侧与系统侧均衡互补——§2.2 末段。C35 预测式设计缺乏实用性——§9。C36 通信与计算优化正交可叠加——§9 末句。C37 延伸到 RL 流水线——§10 末句（论文展望）。C38 decode 不作为均衡目标的理由——§3「Serving Prefill」。</p>
+
+<h3 data-page-node-id="d3igZfSoGUSmfEZDcjC34l">核心公式与原文定位</h3>
+
+<p data-page-node-id="AL7mIv5GK58uRmImhHwH7P">前向目标 Eq.(1)、反向目标 Eq.(2)、MoE 计算代价 Eq.(3)、token all-to-all 代价 Eq.(4)、权重分发代价 Eq.(5)——均在 §4.3。超额与空闲定义 Eq.(6)——§5.1。二分区间初始化 $\tau_{\mathrm{lo}}=\beta\lceil\frac{1}{R}\sum_r\ell_r\rceil$、$\tau_{\mathrm{hi}}=\max_r\ell_r$ 与单次转移量 $\delta=\min(\mathrm{exc}_r,\mathrm{slk}_{t^\star},\mathrm{cap}_e)$——Algorithm 1 SolveReplication。比例分摊式 $q_{r,e,t}=\text{round}(\hat{\lambda}_{r,e}\hat{u}_{e,t}/\sum_{t'}\hat{u}_{e,t'})$——Algorithm 1 SolveReroute。重路由双向守恒 $\sum_{t\in\mathcal{H}(e)}q_{r,e,t}=\lambda_{r,e}$ 与 $\sum_{r\in\mathcal{R}}q_{r,e,t}=u_{e,t}$——§4.3 Table 1 的 $Q$ 行。中继前沿 $\sqrt{\lvert\mathcal{H}(e)\rvert-1}$——§6.2。本页对 $\sqrt{n}$ 使两级宽度相等的推导是由该式直接展开的中间步骤，不是论文原文。</p>
+
+<h3 data-page-node-id="GbvqhFksI779ZZfeSBeBjq">外部数字与实验条件</h3>
+
+<p data-page-node-id="rJlZUpRQLJJzS5n1XS8epr">主结果：训练与 serving 平均 94.3% ideal、相对 no-balancing 1.49$\times$、不均衡从 1.30–4.01 降到 1.01–1.04——摘要。训练 94.6%、serving prefill 93.9%、训练相对 Megatron-LM 1.42$\times$、prefill 相对 SGLang 1.56$\times$、专家复制相对主流后端 3.1$\times$–5.5$\times$——§1。prefill 相对 EPLB 1.29$\times$、相对 EPLB$+$ 增益 5%–24%、prefill 达 ideal 90%–97%——§8.2。生产训练 >92% ideal、相对 no-balancing 增益 9.6%——§8.6。</p>
+
+<p data-page-node-id="cywJBX2BzqkYFWhNnMZtpf">训练端到端逐模型数值（TFLOPS/GPU 与不均衡度）——Figure 11 标注值，实验条件为从第 3500 个 global batch 恢复、再跑 20 个 batch，GLM4.5-106B 用 128 卡 EP64-DP2、Qwen3-235B 用 256 卡 EP64-DP4、DeepSeek-V3 用 256 卡 EP64-PP4，$N_{\mathrm{slot}}$ 均为 2，bf16。三模型平均相对 Megatron-LM 提升 20%/12%/29%/42%——§8.2。</p>
+
+<p data-page-node-id="DHI37btCbqRAXX9xDiM4dJ">serving 逐模型逐数据域不均衡度——Figure 12 标注值，Qwen3-235B 为 EP64、GLM4.7-358B 为 EP40 且 $N_{\mathrm{slot}}=4$，单机架，负载为 STEM 与 Mixed 两组、泊松到达；均衡质量对照采用回放 SGLang 满载路由 trace 的方式（§8.2）。</p>
+
+<p data-page-node-id="n2urZcBLHUaEQwFUkgbeKO">延迟分解逐项数值——Figure 13 标注值，Qwen3-235B-A22B 训练、按 MoE 层平均。派生结论：非 MoE 前向额外 0.33 ms、占总延迟 1.8%，token all-to-all 前向 +33%、反向 +10%——§8.3。</p>
+
+<p data-page-node-id="mdyJJUah9bsYKt4rU6EYLB">活跃内存 2 倍与 11 倍——§8.4，训练侧关闭活跃值重计算并取初期高倾斜阶段峰值，serving 侧只含当前层瞬时活跃值。</p>
+
+<p data-page-node-id="swG5Ej0xTuEe6TIYLvtylT">消融五项指标（结果不均衡 1.19 对 1.03、求解耗时 0.153 对 0.111 ms、消耗的冗余槽数 107 对 45、最大 fan-out 8.5 对 6.8、在飞 token 99.9% 对 96.0%）——Table 3，为 Figure 15 全部模拟场景的平均值，初始负载用幂律分布合成。派生百分比 27.4%、57.9%、3.9 个百分点——§8.5。紧预算高倾斜下 EPLB$+$ 约 1.40、UltraEP 约 1.07 与 1.09——由本页从 Figure 15 下排柱状图读取（该图未逐柱标注）；论文正文的对应表述是 EPLB$+$ 高达 1.4 而 UltraEP 仍低于 1.1（§8.5）。</p>
+
+<p data-page-node-id="OPHfHIjoWCSVnBez051Fc0">通信延迟五档四方案数值——由本页从 Figure 16 柱状图读取（该图未逐柱标注），Qwen3-235B、EP64。加速区间 3.1$\times$–5.5$\times$、中继增益 1.3$\times$–1.8$\times$、UltraEP 约 0.28 ms 近乎恒定——§8.5。</p>
+
+<p data-page-node-id="FzEBi0yteDrcanFcoaqx60">生产训练 ideal 504、no-balancing 均值 425.0——Figure 17 标注值，RefMoE-288B-A16B、EP32、内部训练栈；ideal 取实测强制均衡的最好值以剔除环境波动，no-balancing 从关闭 UltraEP 的续跑区间采样。</p>
+
+<p data-page-node-id="rSYBkHSFOZsMEjSNZw1OVo">配置与内存：$u_{\min}=1024$、$\beta=1.01$——§4.3 Table 1；中继阈值 4——§6.2；Qwen3-235B-A22B 单冗余槽 3.3 GB 权重与 6.6 GB 梯度降到每 rank 36 MB 与 72 MB（94 个 MoE 层、128 专家）——§4.1。测试床每机架 64 卡（16 台服务器）、scale-up 是 scale-out 的 8–10 倍、prefill 用 1 机架、训练用 2 或 4 机架——§8.1。被测模型配置——Table 2。训练配方（200B token 子集、约 4500 global batch、batch size 1024 升至 5120、GShard 损失权重 $10^{-2}$、DeepSeek 配方 bias 步长 $10^{-3}$ 与序列级损失权重 $10^{-4}$）——§8.1。基线版本（Megatron-LM dev commit e93814b、SGLang v0.5.9+bbe9c7e、EPLB 重均衡频率 prefill 50 步与训练 3 个 global batch、LPLB 限每专家一个副本）——§8.1。运行时规模（核心库约 9.6K 行、框架集成各低于 1K 行、DeepEP hybrid-ep 分支 v1.2.1+7febc6e）——§7。</p>
+
+<h3 data-page-node-id="CTQ5gqhP3vElm5gnqZSnOQ">原图与原文对应</h3>
+
+<p data-page-node-id="I1Di6T5e7H2cc7eM3Xw98t">本页 11 张图片全部来自论文 v3 的 TeX 源码 <code data-page-node-id="btjpZgPMXhPw7AlMBO4xRB">figs/</code> 目录，用 <code data-page-node-id="cCK8tIuxu9zsj5PzqxXhea">pdftoppm</code> 渲染后转为 webp，未做裁剪或修改。对应关系：assets/img-01 为 Figure 1（intro-overview）、img-02 为 Figure 2（bg-rsn）、img-03 为 Figure 6（motive_eplb_imbalance）、img-04 为 Figure 7（tech-expert-layout）、img-05 为 Figure 8（tech-timeline-fwd）、img-06 为 Figure 10（tech-relay）、img-07 为 Figure 15（eval_solver_perf）、img-08 为 Figure 16（eval_comm_perf）、img-09 为 Figure 11（eval_train_e2e）、img-10 为 Figure 13（eval_latency_breakdown）、img-11 为 Figure 17（eval_prod）。Figure 编号经 arXiv HTML 版（v3）核对。</p>
+
+<p data-page-node-id="5VjMaNquEDR2AUAMZ5nxeA">论文的 Figure 3（bg-ep）、Figure 4（motive_serving_load）、Figure 5（motive_train_load）、Figure 9（tech-timeline-bwd）、Figure 12（eval_serving_e2e）、Figure 14（eval_mem_breakdown）未入页面：Figure 3 的内容由 <a href="../moe-serving/index.html" data-page-node-id="ejfyr6fJ7s9Y7KRVeWVChg">MoE 大模型推理与服务基础</a> 覆盖；Figure 4 与 5 的结论由 Figure 6 与正文数字支撑；Figure 9 的反向时间线由正文第 3.5 节文字说明；Figure 12 与 14 的结论由本页的数字表格给出。</p>
+
+<h3 data-page-node-id="7J7tLi2wN48rXdC2tx8kcM">论文事实与分析性判断</h3>
+
+<p data-page-node-id="FOhfT20ezUSD3pqt2SzH3i">第 1 至 6 章的机制描述、公式与实验数字均为论文事实，附有上述原文定位。第 7 章「方法评价」整章是分析性判断，不是论文结论，章首已用提示框标明。此外正文中另有四处随文标记的推断：第 4.9 节末尾关于「二分加贪心判定不保证全局最优」的判断（依据是 §5.1 用的是 greedy feasibility oracle、论文全篇用 near-optimal 而非 optimal 且未给最优性证明）；同节把 45 对 107 的冗余槽差距进一步归因到 $u_{\min}$ 这一具体机制（论文只归因于「有足够收益才实体化副本」的整体设计）；第 1.3 节中用 EP=8 对 EP=64 的专家数对比来解释摊薄能力消失的机制（论文只给结论「大 EP 直接把路由动态转成 rank 倾斜」与「每 rank 常 2 或 4 个主专家」，具体的十六分之一算例是本页构造的说明）；第 5.5 节中 $k=\sqrt{n}$ 使两级宽度相等的推导（由论文给出的中继前沿取值直接展开）。第 6.7 节的基线澄清表是对论文不同位置数字的整理，各行出处已在表内标明。</p>
+
+<h3 data-page-node-id="gUbLB2vzb0ZwaMNmzQInsx">构造示例</h3>
+
+<p data-page-node-id="02gs6Ju7HEjWQS3GAFNIvG">本页的贯穿示例（$R=4$、8 个逻辑专家、每 rank 2 个主专家、$N_{\mathrm{slot}}=1$、$u_{\min}=1$ 个单位、负载矩阵与初始 rank 负载 12/6/4/2）全部是构造的，不是论文的实验数据。构造目的是让二分搜索的三次探测、配额构造、本地优先重路由都能手算复核。由它得出的所有数值——最终阈值 6、四个 rank 各 6、不均衡 1.0、消耗 2 个冗余槽、round-robin 对照的 1.1667、跨 rank 在飞 token 41.7% 对 54.2%——都是这个构造示例的结果，与论文实验数字无关。示例规模远小于论文实验（EP=4 对 EP64、8 个专家对 128 至 256 个）。</p>
+
+<p data-page-node-id="ywMBfQL4GqLMxrfkzyPtPN">第 4 章折叠块中的代码是 Algorithm 1 的 CPU 串行 Python 实现，已实际运行，页面展示的是真实输出。<code data-page-node-id="sISs1J8R4zE262MIeO6yWp">round_robin_reroute</code> 与 <code data-page-node-id="NPQc6sYtaP5NE5SwFea7ll">solve_reroute</code> 的 <code data-page-node-id="ZBdGgcbSHIohAbE4ypBKuv">locality=False</code> 分支不属于论文算法，是为对照而构造的；后者按论文的比例分摊公式分配后，用剩余配额补齐取整残差，以保证它同样满足双向守恒、构成该形式化问题的一个合法解。代码不复现论文的 GPU 并行化（§5.3 的单 SM cooperative thread block 与跨 warp 多阈值探测），也不包含 token 级累积配额前缀扫描与实际的 all-to-all 执行。第 3 章折叠块中对三个代价模型的代入检查同样基于该构造示例。</p>
+
+<h3 data-page-node-id="yxx70l8lH3vJxU0yDQp8Na">辅助解释与类比边界</h3>
+
+<p data-page-node-id="NIE8BTNS7JKu89NbJ7MMEl">第 1.3 节把「摊薄能力」作为解释性说法，用于说明为何每 rank 专家数变少会放大不均衡；它解释的只是「单个专家变热对本 rank 总负载的相对影响随专家数减少而增大」这一局部关系，不用于定量预测某个 EP 度数下的不均衡度。第 4.2 节把配额称为「一个变量绑住两件事」，这是对 $u_{e,r}>0$ 当且仅当该 rank 承载实例、且数值即为该实例负载这一定义的复述，不是额外的机制。第 5.5 节对 $\sqrt{n}$ 的直观推导只说明两级宽度何时相等，未考虑链路争用、chunk 粒度与实际拓扑，因此不能用它预测中继的实际加速比——实际值见 Figure 16。</p>
+
+<h3 data-page-node-id="OUGYgo0ATJ0tEjrDPD75No">简化条件及其限制</h3>
+
+<p data-page-node-id="WBLDNVqFGUHCYEM3kHF5tA">本页对论文内容有以下简化。第一，Algorithm 1 的展示省略了 GPU 并行化细节，只保留算法逻辑；这足以说明配额如何耦合复制与重路由，但不能用来评估求解耗时——0.111 ms 那个数字属于论文的 GPU 实现。第二，Eq.(3) 至 Eq.(5) 在论文中是正比关系而非等式，本页的代入检查只验证取值方向与相对变化，不给出绝对时间。第三，前向与反向流水线的说明省略了与 attention、gate 等非 MoE 部分的具体重叠安排，只保留与均衡直接相关的依赖；这不影响关键路径的判断，但页面无法据此推断完整的单层时间线。第四，DeepEP 的 token dispatch 内核实现、Megatron-LM 与 SGLang 的框架内部结构、各被测模型的架构差异、训练语料构成、交换机内组播（SHARP 式）机制与活跃值重计算的机制均未展开，理由是它们属于其他独立工作或只影响工程规模，不改变本页四个核心问题的答案。</p>
+
+<p data-page-node-id="h0ze4d4cIcKVWg63vzYmF4">另有一处版本相关的说明：部分转述该论文的中文站点提到「2560 张 GPU 的生产训练验证」，但 arXiv v3 的 TeX 源码中 §8.6 只写「比原型规模更大」，摘要亦无此数字，无法在固定版本中定位，因此本页不引用。同理 §8.5 正文给出的加速区间是 3.1$\times$ 至 5.5$\times$，本页按论文表述引用，未使用由 Figure 16 读数反算的值。</p>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部" data-page-node-id="wkwDPHAComAH3U4YzDNt0I">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
