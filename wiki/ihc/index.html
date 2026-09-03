@@ -1,0 +1,1856 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Hy4-preview 残差通路 iHC（identity Hyper-Connections）机制解析：单一残差流扩成 4 条并行流，流间混合矩阵固定为单位阵，只保留逐 token 的 sigmoid 读门与写门；覆盖子块数据流、门控计算与初始化、选择 identity 的理由、Hy4 配置与参数量。">
+  <meta name="dojo:summary" content="Hy4-preview 的残差通路 iHC：单一残差流扩成 4 条，流间混合矩阵固定为 $I$，只留逐 token 读门 $H_{pre}$ 与写门 $H_{post}$（$\sigma$ 参数化、幅度 2）；初始门 $1/4$ 与 $1$ 让行为贴标准 Pre-Norm 残差，总参数 30.77M（占 770B 约 0.004%），代价是残差激活 4 份。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="残差结构">
+  <title>恒等超连接（iHC）：流间零混合、只留读写门的并行残差流</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    .diagram svg .dg-arrowhead { fill: var(--text-light); }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">恒等超连接 iHC</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">恒等超连接（iHC）：流间零混合、只留读写门的并行残差流</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：Hy4-preview 官方 README 与 config.json（Tencent-Hunyuan/Hy4-preview，2026-08-28 发布）；vLLM 官方实现 PR #54160（commit b2f685834a645，<code>vllm/models/hy_v4/nvidia/hc.py</code>，腾讯工程师提交）；checkpoint 张量实测（model.safetensors.index.json 与 shard 头，2026-09-03 本机拉取）。</p>
+</blockquote>
+
+<p>78 层、770B 参数的主干里，所有跨层传递的信息——任务目标、中间结果、异常信号——都要经过残差流。标准 Transformer 只有一条流，层数一深就成了独木桥。超连接（Hyper-Connections）把它加宽成 $n$ 条并行流，每层读入、混合、写回；mHC 又把混合矩阵约束为双随机矩阵来保住稳定性。加宽的收益换来两笔新开销：每层要做 Sinkhorn 迭代投影来满足约束，深层的混合矩阵连乘还有坍缩的倾向。这两条路线的完整机制见<a href="../../wiki/hyper-connections/index.html">超连接与 mHC</a>。</p>
+
+<p>Hy4-preview（腾讯混元 2026-08-28 发布的 770B MoE 模型）的残差通路给出第三条路：流加宽到 4 条，但流间不做任何混合——混合矩阵固定为单位阵。这就是 iHC（identity Hyper-Connections）：可学习的自由度只剩每个子块入口的读门和出口的写门，都是逐 token 动态算出的 sigmoid 门。</p>
+
+<p>这个设计的出发点可以用一个最小情形看清：入口把 embedding 复制 4 份，初始门控下 4 条流保持相等，每一步都退回标准 Pre-Norm 残差的行为——iHC 不是另起炉灶，而是从标准残差出发，把「读多少、写多少」留给训练。</p>
+
+<p>本页先在家族里定位 iHC 改了哪一刀，再走完一个子块的完整数据流，拆开门控计算与初始化，论证为什么把混合矩阵钉死在 $I$，最后落到 Hy4 的配置、权重与代价。</p>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>iHC 相对 mHC 拿掉了什么、留下了什么？</p>
+      <details>
+        <summary>解答：拿掉流间混合矩阵，留下逐 token 读写门</summary>
+        <p>拿掉的是流间混合——mHC 用 Sinkhorn 投影维持的双随机混合矩阵 $\mathbf{A_r}$，iHC 直接固定为单位阵 $\mathbf{I}$，旧流原样传递。留下的是逐 token 动态的读门 $H_{pre}$ 与写门 $H_{post}$（sigmoid 参数化），它们成为残差通路的全部可学习自由度。完整论证见「1. iHC 拿掉了混合矩阵」。</p>
+      </details>
+    </li>
+    <li>
+      <p>一个子块在 iHC 下怎么完整走一遍？</p>
+      <details>
+        <summary>解答：pre 合并、RMSNorm、子层算一次、post 写回</summary>
+        <p>入口把 embedding 复制 4 份成 4 条流；每个子块四步：pre 把 4 条流按读门加权合并成一份输入（顺手算出写门）、RMSNorm、子层计算一次、post 把输出按写门加回每条流（旧值原样保留）。78 层走完后 head 门控合并，再过 final RMSNorm 进 lm_head。残差内嵌在流里，没有独立张量。完整数据流见「2. 一个子块的完整路径」。</p>
+      </details>
+    </li>
+    <li>
+      <p>读写门从哪来？初始时是什么行为？</p>
+      <details>
+        <summary>解答：展平投影加 sigmoid；初始等权读、满幅写</summary>
+        <p>pre 块把 4 条流展平成 $nd$ 维向量，经整体 RMS 与 $[2n, nd]$ 线性投影得到 8 个 logits，前 4 个过 sigmoid 加 $\epsilon_{hc}$ 得读门，后 4 个过 sigmoid 乘幅度 $m$ 加 $\epsilon_{hc}$ 得写门。初始化让读门 $\approx\sigma(-\ln 3)=0.25$（等权平均）、写门 $\approx 2\sigma(0)=1$（满幅写回），初始行为贴标准 Pre-Norm 残差，与标准残差的差别只有 $\epsilon_{hc}$ 累乘出的 $10^{-5}$ 量级。见「3. 读写门从哪来、从哪里出发」。</p>
+      </details>
+    </li>
+    <li>
+      <p>为什么把混合矩阵钉死在 $I$ 效果反而更好？</p>
+      <details>
+        <summary>解答：学出的混合本就接近单位阵，连乘会坍缩，identity 还省掉开销</summary>
+        <p>四条依据：mHC 学出的单层混合矩阵本来就接近单位阵（对角约 0.96）；双随机正矩阵连乘坍缩到均匀矩阵，深层把流混匀；identity 保持流语义一致（$I^L=I$）；Sinkhorn 近似误差与专用 kernel 负担一并消失。注意：这些是 Hy4 README 引用的社区实验结论与实现注释，iHC 本身没有正式论文。见「4. 把混合矩阵钉死在 $I$ 的理由」。</p>
+      </details>
+    </li>
+    <li>
+      <p>Hy4 里 iHC 的配置和代价是什么？</p>
+      <details>
+        <summary>解答：4 流 78 层双站点；30.77M 参数，代价在激活显存</summary>
+        <p>4 条流、hidden 6144、78 层每层两个 HC 边界（注意力、MLP/MoE 各一，参数独立）、写门幅度 2.0、$\epsilon_{hc}=10^{-6}$；iHC 总参数 30,770,717（约占 770B 的 0.004%），门控权重 float32、不参与 FP8 量化；MTP 草稿层不用 iHC。代价主要在激活显存：残差状态从 1 份变 4 份，子层 FLOPs 不变。见「5. Hy4 里的 iHC：配置、权重与代价」。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>四条流等于计算量翻 4 倍——每个子层只对合并后的单份输入计算一次；变 4 倍的是残差状态的激活显存，不是子层 FLOPs。</li>
+    <li>四条流各过各的注意力或 MLP——复制只发生在模型入口；每个子块把 4 条流合并成一份输入、过同一个子层、再写回。流是状态通道，不是并行计算。</li>
+    <li>流间不混合等于四条流互不相干——读门把 4 条流加权合并（信息在子层计算里汇合），写门让每条流都吸收同一份子层输出；不混合的只是旧状态如何传递。</li>
+    <li>identity 指的就是残差连接那个恒等映射——$I$ 固定的是流间混合矩阵（mHC 记号 $\mathcal{H}^{res}$、GLM 实现称 comb）；残差通路的恒等性另由 post 里「加旧流」这一项保证。</li>
+    <li>iHC 被论文证明优于 mHC——iHC 没有正式论文；「Identity HC &gt; mHC」是 Hy4 README 引用的社区实验结论（Qwen3 1.7B/8B、150B tokens、从头训练），引用时必须带实验条件。</li>
+  </ul>
+</section>
+
+<h2 id="family">1. iHC 拿掉了混合矩阵</h2>
+
+<h3 id="family-cut">1.1 从三映射到一刀</h3>
+
+<p>标准残差的要点是恒等映射：旧状态不加修改地传向深层，梯度得以直达浅层——这是深层网络可训练的基础，见<a href="../../wiki/residual-connection/index.html">残差连接</a>。超连接在这条通道上加宽：把单一残差流扩成 $n$ 条，每个子块入口用读映射 $\mathbf{A_m}$ 把 $n$ 条流加权合并成子层输入，出口用写映射 $\mathbf{B}$ 把子层输出分发回流上，流之间再用混合矩阵 $\mathbf{A_r}$ 线性混合。单层传播为：</p>
+
+$$\hat{\mathbf{H}}=\mathbf{B}^{\intercal}\mathcal{T}\left((\mathbf{H}^{\intercal}\mathbf{A_{m}})^{\intercal}\right)+\mathbf{A_{r}}^{\intercal}\mathbf{H}$$
+
+<ul>
+  <li>$\mathbf{H}$：$n$ 条流拼成的残差状态，每条流 $d$ 维</li>
+  <li>$\mathcal{T}$：子层（注意力或 MLP），对合并后的单份输入计算一次</li>
+  <li>$\mathbf{A_m}$、$\mathbf{B}$：读、写权重——Hy4 实现里是逐 token 的门 $H_{pre}$、$H_{post}$</li>
+  <li>$\mathbf{A_r}$：流间混合矩阵——每条流的旧值按它的列权重漏进其他流</li>
+</ul>
+
+<p>无约束的 $\mathbf{A_r}$ 连乘会让信号爆炸或消失：多层 $\mathbf{A_r}$ 乘积的最大绝对行和/列和（Amax Gain Magnitude）峰值约 3000、理想值 1（27B 模型）<sup>[N8]</sup>。mHC 把 $\mathbf{A_r}$ 约束为双随机矩阵——行和列和都是 1 的非负矩阵——恢复稳定性，用 Sinkhorn-Knopp 交替行列归一化投影实现。这两步的完整推导见<a href="../../wiki/hyper-connections/index.html">超连接与 mHC</a>，本页只用结论。</p>
+
+<p>iHC 把刀砍在混合上：$\mathbf{A_r}=\mathbf{I}$，</p>
+
+$$\hat{\mathbf{H}}=\mathbf{B}^{\intercal}\mathcal{T}\left((\mathbf{H}^{\intercal}\mathbf{A_{m}})^{\intercal}\right)+\mathbf{H}$$
+
+<p>流间零混合，旧状态原样传递；$\mathbf{A_m}$ 与 $\mathbf{B}$ 保留为逐 token 动态门<sup>[F6]</sup>。Hy4 官方对残差通路的表述是「residual pathway uses iHC (identity Hyper-Connections) to expand inter-layer information flow」，规格为 4 条残差流<sup>[C1]</sup>；实现注释说得更直白：「Unlike mHC there is no comb matrix, so each output channel only needs its own residual channel and the whole thing is one fused multiply-add per element」<sup>[C3]</sup>。</p>
+
+<div class="callout callout-yellow">
+<p>命名注记：官方 README 与模型卡写 identity Hyper-Connections；vLLM 实现的 docstring 写 independent Hyper-Connections（hc.py 与 hpc_ihc.py 两处）。指同一机制——流间没有混合矩阵。本页按 README 用 identity，与 $\mathbf{A_r}=\mathbf{I}$ 的数学含义直接对应<sup>[C4]</sup>。</p>
+</div>
+
+<div class="callout callout-yellow">
+<p>这里的 identity 不是残差连接那个恒等映射。$I$ 固定的是流间混合矩阵（mHC 论文记 $\mathcal{H}^{res}$，GLM 实现称 comb）；「旧状态原样传到下一层」的恒等性由 post 块 $\hat{x}_i = H_{post,i}\cdot z + x_i$ 里的 $+x_i$ 保证。两个恒等不在同一层：一个说流怎么混合（取 $I$），一个说残差怎么保底（加旧值）。</p>
+</div>
+
+<h3 id="family-paths">1.2 三条路线怎么传旧状态</h3>
+
+<p>把三条路线放到「读—旧状态传递—写」三个位置上看，iHC 的改动性质一目了然。</p>
+
+<figure class="diagram">
+  <div class="dg-stack">
+    <div class="dg-layer">
+      <span class="dg-layer-label">标准残差</span>
+      <span class="dg-layer-body">读：无，直接用隐状态；旧状态：恒等直传；写：全量加回，系数 1</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">mHC</span>
+      <span class="dg-layer-body">读：逐 token 门；旧状态：双随机矩阵线性混合（Sinkhorn 投影保稳）；写：逐 token 门</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">iHC</span>
+      <span class="dg-layer-body">读：逐 token 读门 $H_{pre}$；旧状态：恒等直传（$\mathbf{A_r}=\mathbf{I}$）；写：逐 token 写门 $H_{post}$，带幅度 $m$</span>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">三条残差通路在「读—旧状态传递—写」三个位置上的取值；iHC 与 mHC 的差别集中在中间一档。</figcaption>
+</figure>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>位置</th><th>标准残差</th><th>mHC</th><th>iHC</th></tr></thead>
+<tbody>
+<tr><td>读（入口合并）</td><td>无：直接用隐状态</td><td>逐 token 动态读门</td><td>逐 token 动态读门 $H_{pre}$</td></tr>
+<tr><td>旧状态传递</td><td>恒等直传</td><td>双随机矩阵线性混合（Sinkhorn 投影）</td><td>恒等直传（$\mathbf{A_r}=\mathbf{I}$）</td></tr>
+<tr><td>写（出口分发）</td><td>全量加回，系数 1</td><td>逐 token 动态写门</td><td>逐 token 写门 $H_{post}$，带幅度 $m$</td></tr>
+<tr><td>额外机制</td><td>无</td><td>Sinkhorn 迭代与行列和约束</td><td>无：门控是唯一可学习自由度</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>mHC 与 iHC 的读写门形式接近，核心分歧只在中间一档：旧状态要不要在流间重新分配。iHC 的回答是不分配——每条流的旧值只属于自己，流间的一切交互都发生在「读时合并、写时吸收」里。</p>
+
+<h3 id="family-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>iHC 相对 mHC 改了哪一处？为什么说是最小改动？</p>
+    <details>
+      <summary>解答：只把混合矩阵从双随机约束改为固定单位阵</summary>
+      <p>mHC 在超连接的三映射（读 $\mathbf{A_m}$、混合 $\mathbf{A_r}$、写 $\mathbf{B}$）之上，把 $\mathbf{A_r}$ 约束为双随机矩阵，靠 Sinkhorn-Knopp 投影实现。iHC 只改这一处：$\mathbf{A_r}$ 固定为 $\mathbf{I}$，流间零混合、旧状态原样传递；读门写门保留为逐 token 的 sigmoid 门，成为全部可学习自由度。说它「最小」，是因为三条路线在读与写两端的形式是连续的（读写门从常数到动态），被改掉的只有混合这一档。命名上 README 称 identity、vLLM 注释称 independent，同一机制。</p>
+    </details>
+  </li>
+  <li>
+    <p>三类残差通路在「旧状态如何跨层传递」上的差别？</p>
+    <details>
+      <summary>解答：恒等直传、双随机混合后传递、恒等直传加门控读写</summary>
+      <p>标准残差——恒等直传，旧状态不加修改地加回；mHC——旧状态先经双随机矩阵线性混合再传递，任何一条流的旧值都会按权重漏进其他流；iHC——旧状态恒等直传，但每个子块读时按读门加权合并、写时让每条流按自己的写门吸收同一份子层输出。差别全部集中在「旧值是否在流间重新分配」这一件事上。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="path">2. 一个子块的完整路径</h2>
+
+<h3 id="path-flow">2.1 从入口复制到末端合并</h3>
+
+<p>iHC 的全部机制由三个计算块组成：pre（读门与合并）、post（写门与残差回加）、head（末端合并）<sup>[C2]</sup>。模型入口先做一次复制：embedding $[t, 6144]$ 广播成 $[t, 4, 6144]$，4 条流初值相同<sup>[C7]</sup>。之后每个子块走下面这条链：</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">4 条流</div>
+      <div class="dg-node-note">$x_1$ 至 $x_4$，入口复制得到</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">pre 读门合并</div>
+      <div class="dg-node-note">$y=\sum_i H_{pre,i}\,x_i$；顺手算出写门 $H_{post}$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">RMSNorm</div>
+      <div class="dg-node-note">子层自己的 input_layernorm</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">子层</div>
+      <div class="dg-node-note">注意力或 MLP/MoE，只算一次，输出 $z$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">post 写门回加</div>
+      <div class="dg-node-note">$\hat{x}_i = H_{post,i}\,z + x_i$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">4 条流（更新）</div>
+      <div class="dg-node-note">旧值 $x_i$ 原样保留在每条流里</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">一个子块的数据流。每个解码层走两遍这条链（注意力一遍、MLP 一遍），全程 78 层；对应实现的 pre → input_layernorm → self_attn → post 与 pre → post_attention_layernorm → mlp → post<sup>[C6]</sup>。</figcaption>
+</figure>
+
+<p>把一个子块自带的 pre 与 post 边界称为一个站点：Hy4 每层两个（注意力、MLP 各一），参数各自独立，第 1 层的 dense FFN 同样有<sup>[C5]</sup>。实现的前向顺序是：注意力站点 pre → input_layernorm → self_attn → post，接着 MLP 站点 pre → post_attention_layernorm → mlp → post。「Under iHC the residual is carried inside hidden_states」——残差不再有独立张量，就装在 4 条流里<sup>[C6]</sup>。</p>
+
+<p>RMSNorm 是子层自己的输入归一化，位于 pre 之后：它归一化的是合并后的单份输入，不是每条流各自归一化（机制见<a href="../../wiki/rmsnorm/index.html">RMSNorm</a>）。post 的回加对每条流用同一个 $z$、不同的系数：$\hat{x}_i = H_{post,i}\cdot z + x_i$，无参数<sup>[F2]</sup>。</p>
+
+<p>78 层走完，head 在最终输出 norm 之前把 4 条流门控合并回单一隐状态，随后过 final RMSNorm 进 lm_head<sup>[C7]</sup>。head 的门控与 pre 同构，但不产出写门——它是纯合并<sup>[F3]</sup>。</p>
+
+<p>两个容易看错的地方：复制只发生在入口，之后没有任何复制；每个子层只计算一次，输入是读门合并出的那一份。</p>
+
+<h3 id="path-act1">2.2 第一幕：初始化状态</h3>
+
+<p>构造示例：一个 4 流、$d=2$ 的迷你模型，两个子块（分别放在注意力位置与 MLP 位置，子层用简单线性映射代替——子层内部不是本页主题），末端一个 head。初始参数按官方初始化取值，hc_fn 置零让门精确停在偏置值上；权重与门值为教学构造，非 Hy4 checkpoint 数值。</p>
+
+<p>入口 4 条流相等，取 $[1.0, -0.5]$。初始读门 $\sigma(-\ln 3)+\epsilon_{hc}=0.250001$（4 个）、写门 $2\sigma(0)+\epsilon_{hc}=1.000001$（4 个），合并输入：</p>
+
+$$y=4\times 0.250001\times[1.0,\,-0.5]=[1.000004,\,-0.500002]$$
+
+<p>读门之和是 $1+4\epsilon_{hc}=1.000004$，合并输入比原值大 $4\times 10^{-6}$ 的相对量级——随后就被 RMSNorm 归一化掉。归一化、过子层、写回后，出口 4 条流完全相等（流间最大差 $0.0$）；第二个子块同理。head 以同样的 $0.250001$ 门合并，最终输出 $[2.602972, -1.739864]$。</p>
+
+<p>让标准 Pre-Norm 残差走同样的两个子层，结果 $[2.60296, -1.739856]$——两者之差的最大分量 $1.21\times 10^{-5}$，全部来自 $\epsilon_{hc}$ 的累乘。初始状态的 iHC 就是标准 Pre-Norm 残差加上一个 $10^{-5}$ 量级的扰动；流的分化要等门被训练移动之后才出现。</p>
+
+<details>
+<summary>展开：第一幕两个子块的完整手算</summary>
+<p>子块 1（注意力位置）。读门 $0.250001$（4 个），写门 $1.000001$（4 个）。</p>
+$$y=\sum_{i=1}^{4}0.250001\,x_i=4\times 0.250001\times[1.0,\,-0.5]=[1.000004,\,-0.500002]$$
+<p>归一化输入 $[1.264901, -0.63245]$，子层输出 $z=[1.011921, -0.12649]$。写回（4 条流相同）：</p>
+$$\hat{x}_i=1.000001\times z+x_i=[2.011922,\,-0.62649]$$
+<p>子块 2（MLP 位置）。门不变。合并输入 $y=[2.01193, -0.626493]$，归一化输入 $[1.350262, -0.420457]$，子层输出 $z=[0.59104, -1.113366]$，写回后 4 条流为 $[2.602962, -1.739857]$。</p>
+<p>head 门控合并：$4\times 0.250001\times[2.602962,\,-1.739857]=[2.602972,\,-1.739864]$。</p>
+</details>
+
+<h3 id="path-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>4 条流怎么进子层、怎么出来？</p>
+    <details>
+      <summary>解答：读门合并成一份进，写门按流加回出</summary>
+      <p>入口把 embedding 复制 4 份；每个子块四步：pre 按读门加权合并成一份输入并顺手算出写门，RMSNorm，子层计算一次，post 按写门把输出加回每条流——每条流加的是同一份输出的不同倍数，旧值原样保留。78 层后 head 门控合并、final RMSNorm、lm_head。残差没有独立张量，内嵌在 4 条流里；复制只在入口发生一次，子层只算一次，激活显存是标准残差的 4 倍而子层 FLOPs 不变。</p>
+    </details>
+  </li>
+  <li>
+    <p>初始状态下贯穿示例走两步会发生什么？</p>
+    <details>
+      <summary>解答：4 条流保持相等，精确退化为标准 Pre-Norm 残差</summary>
+      <p>4 条流初始相等、读门等权 $0.25+\epsilon_{hc}$、写门 $1+\epsilon_{hc}$：合并输入约为原值（相对偏差 $4\epsilon_{hc}$，且随后被 RMSNorm 归一化掉），写回后 4 条流仍完全相等（实测流间最大差 $0.0$），第二个子块同理。head 合并后与标准 Pre-Norm 残差的差别只有 $1.21\times 10^{-5}$，全部来自 $\epsilon_{hc}$ 的累乘。流分化要等训练把门从等权移开之后才出现。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="gates">3. 读写门从哪来、从哪里出发</h2>
+
+<h3 id="gates-compute">3.1 门控计算：从 4 条流到 8 个数</h3>
+
+<p>pre 块要从一个 token 的 4 条流算出 8 个数：4 个读门、4 个写门。路径分四步<sup>[F1]</sup>：先展平，再算整体 RMS 尺度因子，然后线性投影出 8 个 logits 并乘上尺度因子，最后过 sigmoid 成门：</p>
+
+$$x^{flat}=\mathrm{flatten}(x)\in\mathbb{R}^{nd},\qquad r=\frac{1}{\sqrt{\mathrm{mean}\left((x^{flat})^2\right)+\epsilon_{rms}}}$$
+
+$$\mathrm{mixes}=(x^{flat}W^{\intercal})\cdot r\in\mathbb{R}^{2n}$$
+
+$$H_{pre}=\sigma\left(\mathrm{mixes}_{[:n]}\cdot s_{0}+b_{[:n]}\right)+\epsilon_{hc},\qquad H_{post}=m\cdot\sigma\left(\mathrm{mixes}_{[n:]}\cdot s_{1}+b_{[n:]}\right)+\epsilon_{hc}$$
+
+<p>合并输入是读门加权和 $y=\sum_{i=1}^{n}H_{pre,i}\cdot x_{i}$。</p>
+
+<ul>
+  <li>$x$：当前 token 的 4 条流，形状 $[4, d]$，Hy4 里 $d=6144$</li>
+  <li>$W\in\mathbb{R}^{2n\times nd}$：门控投影权重（hc_fn），门控路径里唯一的矩阵</li>
+  <li>$s\in\mathbb{R}^{2}$、$b\in\mathbb{R}^{2n}$：每类门的缩放与偏置（hc_scale、hc_base）</li>
+  <li>$m$：写门幅度（hc_magnitude，Hy4 取 2.0），写门值域约 $(\epsilon_{hc},\, m+\epsilon_{hc})$</li>
+  <li>$\epsilon_{rms}=10^{-5}$：RMS 分母下限；$\epsilon_{hc}=10^{-6}$：加在门上、保证严格正的小量</li>
+  <li>$\sigma$：sigmoid，把任意实数压进 $(0,1)$ 的光滑函数</li>
+</ul>
+
+<p>RMS 因子 $r$ 在这里的作用与子层前的 RMSNorm 不同：它不改变流的值，只把投影输入整体归一到单位 RMS——mixes 的量级不随流的幅度漂移，门对输入尺度不敏感。门是逐 token 的：同一 batch 里不同 token 展平出的 $x^{flat}$ 不同，门就不同；每个站点有自己的一套 $W$、$s$、$b$，互不共享<sup>[C5]</sup>。</p>
+
+<div class="callout callout-purple">
+<p>源码里的门控精度：门控整条路径在 float32 中计算（实现里对展平与投影显式 <code>.float()</code>）；hc_* 权重为 float32，在 FP8 检查点中经 modules_to_not_convert 排除在量化外<sup>[C9]</sup>。</p>
+</div>
+
+<h3 id="gates-init">3.2 初始化：把起点放在标准残差上</h3>
+
+<p>初始化取值<sup>[C8, F4]</sup>：$s=(0.01, 0.01)$；$b$ 的前 $n$ 个分量（读门偏置）取 $-\ln(n-1)$，后 $n$ 个（写门偏置）取 $0$；head 同构，偏置全取 $-\ln(n-1)$。$n=4$ 时读门偏置是 $-\ln 3$。</p>
+
+<p>代入读门（scale 0.01 把 mixes 压到近零，构造示例里 hc_fn 置零则精确为零）：</p>
+
+$$H_{pre}\approx\sigma(-\ln 3)=\frac{1}{1+e^{\ln 3}}=\frac{1}{1+3}=\frac{1}{4}$$
+
+<p>4 条流等权平均。写门：</p>
+
+$$H_{post}\approx 2\,\sigma(0)=2\times\frac{1}{2}=1$$
+
+<p>满幅写回。「子层输入 = 四流平均、输出 = 全额写回」正是标准 Pre-Norm 残差的行为——训练从「等价于标准残差」出发，要学的只是门的偏移<sup>[F5]</sup>。</p>
+
+<p>$\epsilon_{hc}$ 是这套初始化里唯一的偏差来源：读门之和 $1+4\epsilon_{hc}$、写门 $1+\epsilon_{hc}$。块内读门的 $4\epsilon_{hc}$ 随后就被 RMSNorm 归一化掉，真正留下来的是每步写门的 $\epsilon_{hc}$ 与 head 合并的 $4\epsilon_{hc}$——合计约 $1.2\times 10^{-5}$，正是第一幕实测到的与标准残差的差。</p>
+
+<details>
+<summary>补充：一般 $n$ 的初始门推导</summary>
+<p>由 $\sigma(z)=\frac{1}{1+e^{-z}}$，取 $z=-\ln(n-1)$：</p>
+$$\sigma\left(-\ln(n-1)\right)=\frac{1}{1+e^{\ln(n-1)}}=\frac{1}{1+(n-1)}=\frac{1}{n}$$
+<p>即任意流数下读门的初始值都是 $\frac1n+\epsilon_{hc}$：$n$ 条流等权平均。写门初始值 $m\,\sigma(0)+\epsilon_{hc}=\frac{m}{2}+\epsilon_{hc}$，Hy4 取 $m=2$ 即 $1+\epsilon_{hc}$。head 的初始合并系数是 $n\cdot\left(\frac1n+\epsilon_{hc}\right)=1+n\epsilon_{hc}$。</p>
+</details>
+
+<h3 id="gates-act2">3.3 第二幕：训练后的门</h3>
+
+<p>训练后的门不再等权。第二幕构造一组分化门：读门 $[0.55,\, 0.20,\, 0.10,\, 0.15]$（偏向流 1），写门 $[1.8,\, 0.6,\, 1.2,\, 0.3]$（强弱不一，都在值域 $(\epsilon_{hc},\, m+\epsilon_{hc})$ 内）；出发点是一组已轻微分化的流（第 1 维极差 0.20、第 2 维 0.10）。</p>
+
+<p>读门先起作用：合并输入 $y_2=[0.9975, -0.502]$，最接近流 1 的值 $[1.00, -0.50]$——读门偏向哪条流，子层看到的输入就更像那条流。子层输出 $z_2=[1.012247, -0.129618]$，写门把同一份 $z_2$ 按不同倍数加回：流 1 吸收 $1.8\,z_2$，流 4 只吸收 $0.3\,z_2$。</p>
+
+<p>一个子块后，4 条流变为 $[2.822044, -0.733312]$、$[1.507348, -0.627771]$、$[2.314696, -0.605541]$、$[1.353674, -0.518885]$：第 1 维极差从 0.20 涨到 1.4684（约 7.3 倍），第 2 维从 0.10 涨到 0.2144。写门的强弱差让流间差距放大，4 条流逐渐走向不同位置、承担不同内容。</p>
+
+<details>
+<summary>展开：第二幕完整手算</summary>
+<p>读门 $[0.55,\, 0.20,\, 0.10,\, 0.15]$，写门 $[1.8,\, 0.6,\, 1.2,\, 0.3]$。合并输入：</p>
+$$y_2=0.55\,[1.00,\,-0.50]+0.20\,[0.90,\,-0.55]+0.10\,[1.10,\,-0.45]+0.15\,[1.05,\,-0.48]$$
+$$y_2=[0.9975,\,-0.502]$$
+<p>归一化并过子层得 $z_2=[1.012247,\,-0.129618]$。写回：</p>
+$$\hat{x}_1=1.8\,z_2+x_1=[2.822044,\,-0.733312]$$
+$$\hat{x}_2=0.6\,z_2+x_2=[1.507348,\,-0.627771]$$
+$$\hat{x}_3=1.2\,z_2+x_3=[2.314696,\,-0.605541]$$
+$$\hat{x}_4=0.3\,z_2+x_4=[1.353674,\,-0.518885]$$
+<p>流间每维极差：第 1 维 $0.20\to 1.4684$，第 2 维 $0.10\to 0.2144$。</p>
+</details>
+
+<p>两幕的数值可以用一段 numpy 完整复算。下面的代码按 pre、post、head 三块组织，对齐实现的计算路径（$W$ 对应 hc_fn，$s$ 对应 hc_scale，$b$ 对应 hc_base）：</p>
+
+<details class="code-details">
+<summary>代码：迷你 iHC 前向，复算第一幕与第二幕全部数值</summary>
+<div class="code-block">
+<pre><code class="language-python">"""迷你 iHC 前向：4 条流、d=2、两个子块、一个 head。
+
+复算页面贯穿示例的第一幕（初始化状态）与第二幕（训练后的门）。
+子层用简单线性映射代替——注意力 / MLP 内部不是本页主题。
+构造示例：权重与门值为教学构造，非 Hy4 checkpoint 数值。
+"""
+import numpy as np
+
+n, d = 4, 2                                # 4 条流，每条 2 维
+m, eps_hc, eps_rms = 2.0, 1e-6, 1e-5       # 幅度、门上的 epsilon、RMS 的 epsilon
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def rms_norm(x, eps=eps_rms):              # 逐 token、最后一维
+    return x / np.sqrt(np.mean(x**2, axis=-1, keepdims=True) + eps)
+
+def pre_block(x, W, scale, base):
+    """读门合并 + 顺手算出写门。x: [n, d] -&gt; y: [d]"""
+    x_flat = x.reshape(-1)                              # [n*d]
+    r = 1.0 / np.sqrt(np.mean(x_flat**2) + eps_rms)
+    mixes = (W @ x_flat) * r                            # [2n]
+    H_pre = sigmoid(mixes[:n] * scale[0] + base[:n]) + eps_hc
+    H_post = m * sigmoid(mixes[n:] * scale[1] + base[n:]) + eps_hc
+    y = np.sum(H_pre[:, None] * x, axis=0)              # [d]
+    return y, H_pre, H_post
+
+def post_block(x, z, H_post):
+    """写门回加：每条流加同一份子层输出的不同倍数。"""
+    return H_post[:, None] * z + x                      # [n, d]
+
+def head_block(x, W_h, scale_h, base_h):
+    """末端门控合并。"""
+    x_flat = x.reshape(-1)
+    r = 1.0 / np.sqrt(np.mean(x_flat**2) + eps_rms)
+    mixes = (W_h @ x_flat) * r                          # [n]
+    H_head = sigmoid(mixes * scale_h[0] + base_h) + eps_hc
+    return np.sum(H_head[:, None] * x, axis=0), H_head
+
+# 子层（线性映射代替注意力 / MLP）
+W_attn = np.array([[0.6, -0.4], [0.3, 0.8]])
+W_mlp = np.array([[0.5, 0.2], [-0.7, 0.4]])
+
+# 初始化参数：scale=0.01，读偏置 -ln(n-1)，写偏置 0
+scale = np.array([0.01, 0.01])
+base = np.concatenate([-np.log(n - 1) * np.ones(n), np.zeros(n)])
+scale_h = np.array([0.01])
+base_h = -np.log(n - 1) * np.ones(n)
+
+# ===== 第一幕：初始化状态（hc_fn 置零，门精确停在偏置值） =====
+W0 = np.zeros((2 * n, n * d))
+W_h0 = np.zeros((n, n * d))
+x0 = np.tile(np.array([1.0, -0.5]), (n, 1))    # 入口复制 4 份
+x = x0.copy()
+print("入口 4 条流:")
+print(x)
+for name, W_sub in [("子块 1（注意力位置）", W_attn), ("子块 2（MLP 位置）", W_mlp)]:
+    y, H_pre, H_post = pre_block(x, W0, scale, base)
+    ny = rms_norm(y)
+    z = W_sub @ ny
+    x = post_block(x, z, H_post)
+    print()
+    print(name)
+    print("  读门", np.round(H_pre, 6), " 写门", np.round(H_post, 6), " 读门之和 %.6f" % H_pre.sum())
+    print("  合并输入 y =", np.round(y, 6), " 归一化输入 =", np.round(ny, 6))
+    print("  子层输出 z =", np.round(z, 6))
+    print("  出口 4 条流（流间最大差 %.1e）:" % np.max(np.ptp(x, axis=0)))
+    print(np.round(x, 6))
+y_h, H_head = head_block(x, W_h0, scale_h, base_h)
+print()
+print("head 读门", np.round(H_head, 6), " 合并输出", np.round(y_h, 6))
+
+# 对照：标准 Pre-Norm 残差走同样的两个子层
+h = x0[0].copy()
+for W_sub in (W_attn, W_mlp):
+    h = W_sub @ rms_norm(h) + h
+print()
+print("标准 Pre-Norm 残差结果:", np.round(h, 6))
+print("两者之差的最大分量: %.2e" % np.max(np.abs(y_h - h)))
+
+# ===== 第二幕：训练后的门（构造值） =====
+H_pre2 = np.array([0.55, 0.20, 0.10, 0.15])    # 读门偏科
+H_post2 = np.array([1.8, 0.6, 1.2, 0.3])       # 写门强弱不一
+x2 = np.array([[1.00, -0.50],
+               [0.90, -0.55],
+               [1.10, -0.45],
+               [1.05, -0.48]])                 # 已轻微分化的 4 条流
+y2 = np.sum(H_pre2[:, None] * x2, axis=0)
+z2 = W_attn @ rms_norm(y2)
+x2_new = post_block(x2, z2, H_post2)
+print()
+print("第二幕：读门", H_pre2, " 写门", H_post2)
+print("合并输入 y2 =", np.round(y2, 6), "（读门偏向流 1，y2 最接近流 1 的值）")
+print("子层输出 z2 =", np.round(z2, 6))
+print("子块前 4 条流:")
+print(x2)
+print("子块后 4 条流:")
+print(np.round(x2_new, 6))
+print("流间每维极差（前）:", np.round(np.ptp(x2, axis=0), 4))
+print("流间每维极差（后）:", np.round(np.ptp(x2_new, axis=0), 4))</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">入口 4 条流:
+[[ 1.  -0.5]
+ [ 1.  -0.5]
+ [ 1.  -0.5]
+ [ 1.  -0.5]]
+
+子块 1（注意力位置）
+  读门 [0.250001 0.250001 0.250001 0.250001]  写门 [1.000001 1.000001 1.000001 1.000001]  读门之和 1.000004
+  合并输入 y = [ 1.000004 -0.500002]  归一化输入 = [ 1.264901 -0.63245 ]
+  子层输出 z = [ 1.011921 -0.12649 ]
+  出口 4 条流（流间最大差 0.0e+00）:
+[[ 2.011922 -0.62649 ]
+ [ 2.011922 -0.62649 ]
+ [ 2.011922 -0.62649 ]
+ [ 2.011922 -0.62649 ]]
+
+子块 2（MLP 位置）
+  读门 [0.250001 0.250001 0.250001 0.250001]  写门 [1.000001 1.000001 1.000001 1.000001]  读门之和 1.000004
+  合并输入 y = [ 2.01193  -0.626493]  归一化输入 = [ 1.350262 -0.420457]
+  子层输出 z = [ 0.59104  -1.113366]
+  出口 4 条流（流间最大差 0.0e+00）:
+[[ 2.602962 -1.739857]
+ [ 2.602962 -1.739857]
+ [ 2.602962 -1.739857]
+ [ 2.602962 -1.739857]]
+
+head 读门 [0.250001 0.250001 0.250001 0.250001]  合并输出 [ 2.602972 -1.739864]
+
+标准 Pre-Norm 残差结果: [ 2.60296  -1.739856]
+两者之差的最大分量: 1.21e-05
+
+第二幕：读门 [0.55 0.2  0.1  0.15]  写门 [1.8 0.6 1.2 0.3]
+合并输入 y2 = [ 0.9975 -0.502 ] （读门偏向流 1，y2 最接近流 1 的值）
+子层输出 z2 = [ 1.012247 -0.129618]
+子块前 4 条流:
+[[ 1.   -0.5 ]
+ [ 0.9  -0.55]
+ [ 1.1  -0.45]
+ [ 1.05 -0.48]]
+子块后 4 条流:
+[[ 2.822044 -0.733312]
+ [ 1.507348 -0.627771]
+ [ 2.314696 -0.605541]
+ [ 1.353674 -0.518885]]
+流间每维极差（前）: [0.2 0.1]
+流间每维极差（后）: [1.4684 0.2144]</code></pre>
+</div>
+<p><b>验证的机制</b>：pre_block 对应读门计算与合并（展平、整体 RMS、投影、sigmoid 门），post_block 对应写门回加，head_block 对应末端门控合并；第一幕验证初始化行为（门停在偏置值、流保持相等、退化为标准残差），第二幕验证分化门下流间差距放大。</p>
+<p><b>观察重点</b>：第一幕的「流间最大差 0.0e+00」逐步保持为零，head 输出与标准 Pre-Norm 残差之差停在 1.21e-05；第二幕极差从 $[0.2, 0.1]$ 到 $[1.4684, 0.2144]$。</p>
+<p><b>简化条件</b>：子层用线性映射代替；hc_fn 置零（真实初始化是非零小随机矩阵，门会在偏置值附近轻微偏移）；第二幕的门为构造定值（真实训练后的门逐 token 变化）；float64 代替实现的 float32。</p>
+</details>
+
+<h3 id="gates-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>门怎么从 4 条流的内容算出来？</p>
+    <details>
+      <summary>解答：展平、整体 RMS、线性投影、sigmoid</summary>
+      <p>把 4 条流展平成 $nd$ 维向量，算整体 RMS 得尺度因子 $r$；经 $[2n, nd]$ 线性投影得 8 个 logits 并乘 $r$；前 4 个过 $\sigma$ 加 $\epsilon_{hc}$ 得读门，后 4 个过 $\sigma$ 乘幅度 $m$ 加 $\epsilon_{hc}$ 得写门；合并输入是读门加权和 $y=\sum_i H_{pre,i}x_i$。RMS 因子让门的量级不随输入幅度漂移。门逐 token 不同；每个站点一套参数，互不共享。</p>
+    </details>
+  </li>
+  <li>
+    <p>初始化为什么能把起点放在标准残差上？</p>
+    <details>
+      <summary>解答：scale 压缩投影项，偏置定在等权读与满幅写</summary>
+      <p>scale 取 0.01，把投影项对门的贡献压到近零，门近似停在偏置值上：读偏置 $-\ln(n-1)$ 使 $\sigma(-\ln 3)=\frac14$，4 条流等权读；写偏置 0 使 $2\sigma(0)=1$，满幅写回。这样初始 iHC 的行为就是标准 Pre-Norm 残差（差别仅 $\epsilon_{hc}$ 累乘的 $10^{-5}$ 量级），训练从这一点出发只学门的偏移。</p>
+    </details>
+  </li>
+  <li>
+    <p>训练后的门会做什么？</p>
+    <details>
+      <summary>解答：读门选流，写门定吸收强度，流间差距逐层放大</summary>
+      <p>读门决定子层看到哪几条流的加权组合——偏向哪条流，合并输入就更像谁；写门决定每条流吸收子层输出的强度（值域约 $(\epsilon_{hc}, m+\epsilon_{hc})$）。两者配合让流间差距逐层放大：第二幕构造门下一个子块就把第 1 维极差从 0.20 放大到 1.4684。门控权重保持 float32、不参与 FP8 量化。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="why">4. 把混合矩阵钉死在 $I$ 的理由</h2>
+
+<div class="callout callout-yellow">
+<p>论证的性质：iHC 没有正式论文。本章的依据是两部分——Hy4 README 官方引用的社区研究（知乎文章《你的deepseek mHC可能不需要&quot;m&quot;》，其链接由 README 的「iHC」指向）与 vLLM 实现注释。引用处均标注实验条件，不写成官方论文结论。</p>
+</div>
+
+<h3 id="why-close">4.1 学出的混合本来就接近单位阵</h3>
+
+<p>第一条依据是「没损失什么」：该社区实验实测，mHC 训练后学出的单层混合矩阵对角约 0.96、非对角约 0.01，深度达到 10 层以上的累积乘积更是坍缩为全 0.25 的均匀混合矩阵（Qwen3 系列实验观测）<sup>[C14, N4]</sup>。也就是说，靠 Sinkhorn 代价维护的混合矩阵，学出来接近单位阵——混合本来就没学到多少，直接钉死在单位阵损失有限。</p>
+
+<h3 id="why-collapse">4.2 双随机矩阵连乘的坍缩</h3>
+
+<p>第二条依据是「留着反而有害」。双随机矩阵的连乘有内在的坍缩倾向：只要每层矩阵的元素有一个共同的正下界 $\delta$（一致正性；Sinkhorn 的输出通常严格正），Dobrushin 遍历系数就以不超过 $1-n\delta$ 的比率逐层几何衰减，行与行越来越像；行相同且行和为 1 的极限只有一个——均匀矩阵 $\frac{1}{n}\mathbf{1}\mathbf{1}^{\intercal}$<sup>[C15]</sup>。到那一步，4 条流在深层被完全混匀，多流失去意义。</p>
+
+<p>用构造实验复现这个现象：每个「层」生成一个随机正矩阵，经 20 步 Sinkhorn 投影到近似双随机，然后连乘 12 层，观察累积混合矩阵的第一行与它到均匀向量的距离。</p>
+
+<details class="code-details">
+<summary>代码：双随机矩阵连乘的坍缩构造实验</summary>
+<div class="code-block">
+<pre><code class="language-python">"""双随机矩阵连乘坍缩：构造实验。
+
+模拟 mHC 的做法——每个"层"产生一个正矩阵，经 Sinkhorn 投影到
+（近似）双随机矩阵，然后把各层的矩阵连乘，观察深层累积混合矩阵
+的行是否趋于均匀向量。构造示例：矩阵为随机生成，非训练产物。
+"""
+import numpy as np
+
+rng = np.random.default_rng(0)
+n, L, steps = 4, 12, 20
+
+def sinkhorn(A, steps):
+    """交替行、列归一化，把正矩阵投影到近似双随机矩阵。"""
+    for _ in range(steps):
+        A = A / A.sum(axis=1, keepdims=True)   # 行和归一
+        A = A / A.sum(axis=0, keepdims=True)   # 列和归一
+    return A
+
+# 每层一个独立的随机正矩阵，投影到双随机
+mats = [sinkhorn(rng.uniform(0.2, 1.0, size=(n, n)), steps) for _ in range(L)]
+
+print("第 1 层混合矩阵（Sinkhorn 20 步后）:")
+print(np.round(mats[0], 4))
+print("行和:", np.round(mats[0].sum(axis=1), 4))
+print("列和:", np.round(mats[0].sum(axis=0), 4))
+print("最小元素: %.4f" % mats[0].min())
+
+# 深层累积混合矩阵 = 逐层矩阵连乘
+P = np.eye(n)
+print()
+print("层  0   第 1 行 =", np.round(P[0], 4), " max|P-1/n| = %.4f" % np.max(np.abs(P - 1.0 / n)))
+for l, M in enumerate(mats, 1):
+    P = M @ P
+    print("层 %2d   第 1 行 = %s   max|P-1/n| = %.4f"
+          % (l, np.round(P[0], 4), np.max(np.abs(P - 1.0 / n))))</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">第 1 层混合矩阵（Sinkhorn 20 步后）:
+[[0.3445 0.2714 0.1482 0.2358]
+ [0.1777 0.2613 0.1879 0.3731]
+ [0.182  0.3654 0.3206 0.132 ]
+ [0.2958 0.1019 0.3433 0.2591]]
+行和: [1. 1. 1. 1.]
+列和: [1. 1. 1. 1.]
+最小元素: 0.1019
+
+层  0   第 1 行 = [1. 0. 0. 0.]  max|P-1/n| = 0.7500
+层  1   第 1 行 = [0.3445 0.2714 0.1482 0.2358]   max|P-1/n| = 0.1481
+层  2   第 1 行 = [0.2614 0.2498 0.2231 0.2657]   max|P-1/n| = 0.0319
+层  3   第 1 行 = [0.2488 0.2495 0.2539 0.2478]   max|P-1/n| = 0.0048
+层  4   第 1 行 = [0.2505 0.25   0.249  0.2505]   max|P-1/n| = 0.0010
+层  5   第 1 行 = [0.2499 0.25   0.25   0.25  ]   max|P-1/n| = 0.0001
+层  6   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000
+层  7   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000
+层  8   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000
+层  9   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000
+层 10   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000
+层 11   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000
+层 12   第 1 行 = [0.25 0.25 0.25 0.25]   max|P-1/n| = 0.0000</code></pre>
+</div>
+<p><b>验证的机制</b>：sinkhorn 函数实现交替行列归一化（每层矩阵投影到近似双随机）；连乘循环展示深层累积混合矩阵的演化。</p>
+<p><b>观察重点</b>：第 1 层矩阵的行和列和在 4 位小数下都回到 1，最小元素 0.1019——严格正，满足一致正性；连乘后行向量迅速贴近 $[0.25, 0.25, 0.25, 0.25]$，max 距离从层 0 的 0.7500 经 0.1481、0.0319、0.0048 几何式衰减，层 6 起在 4 位小数下为 0。</p>
+<p><b>简化条件</b>：矩阵由 rng(0) 均匀采样（元素范围 0.2 至 1.0），比训练学出的矩阵更「混」，坍缩更快；现象方向与论证一致，衰减速度不可与真实训练比。</p>
+</details>
+
+<p>边界：纯置换矩阵或可约矩阵的序列不满足一致正性，连乘不坍缩（置换矩阵的乘积仍是置换矩阵）；但 Sinkhorn 的输出通常严格正，落在会坍缩的一侧<sup>[C15]</sup>。</p>
+
+<details>
+<summary>补充：Dobrushin 遍历系数的论证细节</summary>
+<p>定义 $\tau(M)=\frac{1}{2}\max_{i,k}\sum_{j}|M_{ij}-M_{kj}|$——任意两行作为分布的总变差距离的上界。三条性质：</p>
+<ul>
+<li>次乘性：$\tau(MN)\le\tau(M)\,\tau(N)$，连乘的系数逐层相乘。</li>
+<li>元素都有正下界 $\delta$ 的双随机矩阵满足 $\tau(M)\le 1-n\delta$：任取两行，逐列差的总和被 $\delta$ 挤压。</li>
+<li>$L$ 层连乘后 $\tau\le(1-n\delta)^{L}\to 0$：行间距离趋于零，所有行趋于同一分布；行和恒为 1，极限行只能是 $\frac1n\mathbf{1}^{\intercal}$。</li>
+</ul>
+<p>构造实验里 $\delta\approx 0.10$，界给出每层衰减不超过 $1-4\times 0.10=0.6$，实测衰减约 0.2 每层，在界内。论证来自上述社区文章，本页用构造实验复现现象。</p>
+</details>
+
+<h3 id="why-gains">4.3 identity 还买到什么</h3>
+
+<p>第三条：流语义一致性。identity 相当于所有层用同一个恒等置换——流 $i$ 永远在位置 $i$，读写门不需要追踪「流被哪一层重排到哪里」；且 $I^L=I$，无论多深都不坍缩、不混乱<sup>[C18]</sup>。</p>
+
+<p>第四条：开销消失。Sinkhorn 是迭代近似——该文实测条件下 20 步迭代后行和标准差仍有 0.12 量级，还引 mHC-lite 的实测：输入的 relative range 达 $10^{13}$（占其实测输入的 27.9%）时，列和偏差可达 100%<sup>[C17, N5]</sup>。identity 下这些近似误差不存在，混合矩阵的投影与乘法、专用 kernel 的工程负担也一并消失——「每条输出通道只需要自己的残差通道，整体是每个元素一次融合乘加」<sup>[C3]</sup>。</p>
+
+<p>综合排序（社区实验：Qwen3 1.7B 与 8B dense、150B tokens、从头训练）：Identity HC &gt; mHC &gt; mHC lite &gt; mHC orthogonal<sup>[C16]</sup>。iHC 在这个序列里是损失最小、开销也最小的一端。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>视角</th><th>Sinkhorn 路线（mHC）</th><th>identity 路线（iHC）</th></tr></thead>
+<tbody>
+<tr><td>深层累积乘积</td><td>坍缩到均匀矩阵 $\frac{1}{n}\mathbf{1}\mathbf{1}^{\intercal}$</td><td>$I^L=I$，恒不坍缩</td></tr>
+<tr><td>约束近似误差</td><td>20 步后行和标准差 0.12 量级（社区实验实测条件）</td><td>无此误差源</td></tr>
+<tr><td>每层额外计算</td><td>comb 矩阵的 Sinkhorn 投影与乘法</td><td>无</td></tr>
+<tr><td>流定位</td><td>需追踪混合后的流位置</td><td>流 $i$ 恒在位置 $i$</td></tr>
+</tbody>
+</table>
+</div>
+
+<details>
+<summary>补充：社区实验的设置细节</summary>
+<p>模型为 Qwen3 1.7B 与 8B dense，训练 150B tokens，从头训练；对比对象为 Identity HC、mHC、mHC lite（削减 Sinkhorn 步数的变体）、mHC orthogonal（正交参数化）。该文作者自述文中部分表格文字由 AI 生成、实验数据为实测；本页只引用其数值结论与论证思路，不引用其叙述文字。</p>
+</details>
+
+<h3 id="why-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>去掉流间混合，证据说损失了什么？</p>
+    <details>
+      <summary>解答：学出的混合本来就接近单位阵，损失有限</summary>
+      <p>社区实验实测 mHC 学出的单层混合矩阵对角约 0.96、非对角约 0.01（Qwen3 系列实验观测）——混合本来就接近单位阵；深度 10 层以上的累积乘积更是已坍缩为全 0.25 的均匀矩阵。直接把混合钉死在单位阵，丢掉的是本来就快消失的自由度。该结论为社区实验，不是官方论文结果。</p>
+    </details>
+  </li>
+  <li>
+    <p>如果不钉死，双随机矩阵连乘会发生什么？</p>
+    <details>
+      <summary>解答：行间距离几何衰减，深层坍缩到均匀矩阵</summary>
+      <p>元素有正下界 $\delta$ 的双随机矩阵（Sinkhorn 输出通常如此）连乘时，Dobrushin 遍历系数以不超过 $1-n\delta$ 的比率逐层衰减，行趋于一致，极限是均匀矩阵——$n$ 条流在深层被完全混匀。本页构造实验（随机正矩阵、20 步 Sinkhorn、连乘 12 层）中，行到均匀向量的距离从层 0 的 0.7500 经 0.1481、0.0319 几何衰减，层 6 起在 4 位小数下为 0。边界：纯置换或可约序列不满足一致正性、不坍缩。</p>
+    </details>
+  </li>
+  <li>
+    <p>identity 还买到什么？</p>
+    <details>
+      <summary>解答：流语义一致、误差源与工程负担消失</summary>
+      <p>流语义一致性：流 $i$ 恒在位置 $i$，读写门无需追踪流的重排，$I^L=I$ 不坍缩。开销消失：Sinkhorn 的近似误差（该文实测条件下 20 步后行和标准差 0.12 量级）与混合矩阵投影、乘法、专用 kernel 的负担一并消失。社区实验排序 Identity HC &gt; mHC &gt; mHC lite &gt; mHC orthogonal（Qwen3 1.7B/8B、150B tokens、从头训练）。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="hy4">5. Hy4 里的 iHC：配置、权重与代价</h2>
+
+<h3 id="hy4-config">5.1 配置与架构位置</h3>
+
+<p>Hy4-preview 是腾讯混元 2026-08-28 开源的 770B MoE 模型（49B 激活、78 层、1M 上下文）<sup>[N7]</sup>。注意力用带门控的稀疏注意力（Gated DSA，见<a href="../../wiki/dsa/index.html">DSA</a>）；FFN 是 256 路由专家 top-8 加 1 共享专家的 MoE（见<a href="../../wiki/deepseek-moe/index.html">DeepSeek MoE</a>），第 1 层为 dense；另有一个用于投机解码的 MTP 层（见<a href="../../wiki/speculative-decoding/index.html">投机解码</a>）。iHC 是这个架构里的残差通路，贯穿全部 78 层：</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 470" role="img" aria-label="iHC 主干数据流示意">
+  <defs>
+    <marker id="ihc-arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="dg-arrowhead"/>
+    </marker>
+  </defs>
+  <rect x="250" y="8" width="180" height="46" class="dg-box"/>
+  <text x="340" y="26" font-size="13" text-anchor="middle">embedding</text>
+  <foreignObject x="300" y="30" width="80" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$[t,\,6144]$</div>
+  </foreignObject>
+  <line x1="340" y1="54" x2="340" y2="64" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <rect x="285" y="64" width="110" height="26" class="dg-box"/>
+  <text x="340" y="81" font-size="12" text-anchor="middle">复制 4 份</text>
+  <line x1="340" y1="90" x2="190" y2="112" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="340" y1="90" x2="290" y2="112" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="340" y1="90" x2="390" y2="112" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="340" y1="90" x2="490" y2="112" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="190" y1="112" x2="190" y2="170" class="dg-line"/>
+  <foreignObject x="144" y="120" width="40" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-right">$x_1$</div>
+  </foreignObject>
+  <line x1="290" y1="112" x2="290" y2="170" class="dg-line"/>
+  <foreignObject x="244" y="120" width="40" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-right">$x_2$</div>
+  </foreignObject>
+  <line x1="390" y1="112" x2="390" y2="170" class="dg-line"/>
+  <foreignObject x="344" y="120" width="40" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-right">$x_3$</div>
+  </foreignObject>
+  <line x1="490" y1="112" x2="490" y2="170" class="dg-line"/>
+  <foreignObject x="444" y="120" width="40" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-right">$x_4$</div>
+  </foreignObject>
+  <rect x="110" y="158" width="460" height="174" class="dg-line" stroke-dasharray="5 4"/>
+  <text x="116" y="168" font-size="11" text-anchor="start">一个站点</text>
+  <rect x="140" y="174" width="400" height="42" class="dg-box"/>
+  <text x="340" y="189" font-size="13" text-anchor="middle">pre：读门合并（顺手算出写门）</text>
+  <foreignObject x="240" y="192" width="200" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$y=\sum_i H_{pre,i}\,x_i$</div>
+  </foreignObject>
+  <line x1="340" y1="216" x2="340" y2="228" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <rect x="220" y="228" width="240" height="46" class="dg-box"/>
+  <text x="340" y="246" font-size="13" text-anchor="middle">RMSNorm 与子层</text>
+  <text x="340" y="263" font-size="11" text-anchor="middle">注意力或 MLP/MoE，只算一次</text>
+  <line x1="340" y1="274" x2="340" y2="286" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <rect x="140" y="286" width="400" height="46" class="dg-box"/>
+  <text x="340" y="304" font-size="13" text-anchor="middle">post：写门回加</text>
+  <foreignObject x="220" y="308" width="240" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$\hat{x}_i = H_{post,i}\,z + x_i$</div>
+  </foreignObject>
+  <line x1="190" y1="350" x2="280" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="290" y1="350" x2="320" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="390" y1="350" x2="360" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="490" y1="350" x2="400" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <rect x="240" y="370" width="200" height="46" class="dg-box"/>
+  <text x="340" y="388" font-size="13" text-anchor="middle">head：门控合并</text>
+  <foreignObject x="250" y="392" width="180" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$y=\sum_i H_{head,i}\,x_i$</div>
+  </foreignObject>
+  <line x1="340" y1="416" x2="340" y2="428" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <rect x="220" y="428" width="240" height="34" class="dg-box"/>
+  <foreignObject x="230" y="436" width="220" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">final RMSNorm，再进 lm_head</div>
+  </foreignObject>
+</svg>
+<figcaption class="diagram-caption">Hy4 主干里的 iHC：4 条流从入口复制出发全程并行；虚线框是一个站点，每个解码层两个（注意力、MLP/MoE 各一），全模型 78 层共 156 个，参数各自独立<sup>[C5]</sup>；head 合并后才过 final RMSNorm。</figcaption>
+</figure>
+
+<p>config.json 里与 iHC 相关的取值<sup>[C10, N1]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>配置项</th><th>值</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>enable_ihc</code></td><td><code>true</code></td><td>启用 iHC 残差通路</td></tr>
+<tr><td><code>hc_mult</code></td><td><code>4</code></td><td>流数 $n$</td></tr>
+<tr><td><code>hc_magnitude</code></td><td><code>2.0</code></td><td>写门幅度 $m$</td></tr>
+<tr><td><code>hc_eps</code></td><td><code>1e-06</code></td><td>门上的 $\epsilon_{hc}$</td></tr>
+<tr><td><code>hidden_size</code></td><td><code>6144</code></td><td>每条流的维度 $d$</td></tr>
+<tr><td><code>num_hidden_layers</code></td><td><code>78</code></td><td>层数，每层 2 个站点</td></tr>
+<tr><td><code>rms_norm_eps</code></td><td><code>1e-05</code></td><td>RMS 的 $\epsilon_{rms}$（含门控内的 RMS）</td></tr>
+<tr><td><code>mlp_layer_types</code></td><td><code>1 dense + 77 sparse</code></td><td>第 1 层 dense FFN，其余 MoE</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="hy4-ckpt">5.2 checkpoint 里的张量与参数量</h3>
+
+<p>checkpoint 实测（model.safetensors.index.json 与 shard 头）：每个站点一组 <code>hc_pre</code> 的三个张量，全局一个 <code>hc_head</code>，全部 float32<sup>[C11, N3]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>张量</th><th>形状</th><th>dtype</th><th>数量</th></tr></thead>
+<tbody>
+<tr><td><code>hc_pre.hc_fn</code></td><td>$[8, 24576]$（$2n\times nd$）</td><td>float32</td><td>156</td></tr>
+<tr><td><code>hc_pre.hc_scale</code></td><td>$[2]$</td><td>float32</td><td>156</td></tr>
+<tr><td><code>hc_pre.hc_base</code></td><td>$[8]$</td><td>float32</td><td>156</td></tr>
+<tr><td><code>hc_head.hc_head_fn</code></td><td>$[4, 24576]$（$n\times nd$）</td><td>float32</td><td>1</td></tr>
+<tr><td><code>hc_head.hc_head_scale</code></td><td>$[1]$</td><td>float32</td><td>1</td></tr>
+<tr><td><code>hc_head.hc_head_base</code></td><td>$[4]$</td><td>float32</td><td>1</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>共 $156\times 3+3=471$ 个张量。参数量可以从迷你例子外推：迷你站点（$n=4$、$d=2$）是 $8\times 8+2+8=74$；Hy4 站点把 $nd$ 从 8 换成 $4\times 6144=24576$，即 $8\times 24576+2+8=196{,}618$。全模型 156 个站点加 head（$4\times 24576+1+4=98{,}309$）：</p>
+
+$$30{,}770{,}717=156\times 196{,}618+98{,}309$$
+
+<p>占 770B 主干的约 0.004%<sup>[C12, N2]</sup>——读写门是整个残差通路唯一的可学习参数，量级不到主干的万分之一。</p>
+
+<p>MTP 草稿层不用 iHC：checkpoint 的 27 个 <code>model.mtp_layers.*</code> 张量里没有任何 hc 张量（结构为 eh_proj、hnorm、enorm 加单流 layer norm）<sup>[C13]</sup>。</p>
+
+<p>代价不在参数，在激活显存：残差状态从 1 份变 4 份（$[t, 4, 6144]$），每个 token 的残差激活是标准残差的 4 倍；子层 FLOPs 不变——每个子块仍只对合并后的单份输入计算一次。门控计算在 float32 中进行<sup>[C9]</sup>。</p>
+
+<details>
+<summary>补充：HPC 融合 kernel（工程扩展）</summary>
+<p>eager 路径的 pre、post、head 分别发出 20、5、15 个 kernel；HPC 实现各融合为 1 个。启用条件：VLLM_ENABLE_HPC_OPS=1、sm100/sm103 架构、hc_mult=4、hidden_size 属于 {4096, 6144}<sup>[C19, N6]</sup>。跨层 post+pre 融合（HpcIHCPostPre）在参考实现中存在，vLLM 尚未移植（源码注释留有待办标记）<sup>[C20]</sup>。</p>
+</details>
+
+<h3 id="hy4-glm">5.3 与 GLM-5.3-Flash 的 mHC 实现对照</h3>
+
+<p>GLM-5.3-Flash 是另一个把残差流扩到 4 条的已发布模型，走 mHC 路线。逐项对照（GLM 侧事实经超连接页核对）<sup>[C21]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>项</th><th>GLM-5.3-Flash（mHC）</th><th>Hy4-preview（iHC）</th></tr></thead>
+<tbody>
+<tr><td>流数</td><td>4</td><td>4</td></tr>
+<tr><td>每层站点</td><td>2（attn_hc / ffn_hc）</td><td>2（hc_attn_layer / hc_mlp_layer）</td></tr>
+<tr><td>门控投影</td><td>fn $[24, 16384]$：读 $n$ + 写 $n$ + 混合 $n^2$</td><td>hc_fn $[8, 24576]$：读 $n$ + 写 $n$</td></tr>
+<tr><td>读门</td><td>$\sigma(\cdot)+\epsilon_{hc}$</td><td>$\sigma(\cdot)+\epsilon_{hc}$</td></tr>
+<tr><td>写门</td><td>$2\sigma(\cdot)$</td><td>$m\,\sigma(\cdot)+\epsilon_{hc}$（$m=2$）</td></tr>
+<tr><td>混合矩阵</td><td>softmax 后 Sinkhorn 投影 20 步</td><td>无（$\mathbf{A_r}=\mathbf{I}$）</td></tr>
+<tr><td>末端合并</td><td>无权重均值</td><td>门控合并（$\sigma(\cdot)+\epsilon_{hc}$）</td></tr>
+<tr><td>残差通路参数</td><td>35,391,870（占 321B 的 0.011%）<sup>[C21, N9]</sup></td><td>30,770,717（占 770B 的约 0.004%）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>读门同形，写门差一个 $\epsilon_{hc}$；投影输出 24 对 8，差的 16 个正是混合矩阵的 $n^2$ 个 logits；末端一边取无权重均值、一边用门。两家的读写门形式接近，核心分歧就是混合矩阵——一边用 Sinkhorn 维护它，一边直接删掉它。</p>
+
+<h3 id="hy4-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>Hy4 实际用了什么配置？</p>
+    <details>
+      <summary>解答：4 流、6144 维、78 层双站点、幅度 2.0</summary>
+      <p>4 条流（hc_mult=4）、hidden 6144、78 层每层两个 HC 边界（注意力、MLP/MoE 各一，参数独立，第 1 层 dense FFN 同样有）、写门幅度 2.0（hc_magnitude）、门 $\epsilon_{hc}=10^{-6}$（hc_eps）、RMS $\epsilon_{rms}=10^{-5}$（rms_norm_eps，门控内的 RMS 也用它）。门控权重 float32、在 FP8 检查点中排除在量化外，门计算在 float32 中进行。</p>
+    </details>
+  </li>
+  <li>
+    <p>iHC 在 checkpoint 里长什么样、参数和代价是多少？</p>
+    <details>
+      <summary>解答：471 个 float32 张量，30.77M 参数，代价在激活显存</summary>
+      <p>每站点 hc_fn $[8, 24576]$ 加 hc_scale $[2]$、hc_base $[8]$，共 196,618 参数；全局一个 head（hc_head_fn $[4, 24576]$ 加 scale、base，98,309 参数）。156 站点加 head 合计 30,770,717 参数（约占 770B 的 0.004%）、471 个张量，全部 float32。代价主要在激活显存：残差状态 4 份（$[t, 4, 6144]$）；子层 FLOPs 不变。MTP 草稿层不含 iHC（checkpoint 无对应张量）。</p>
+    </details>
+  </li>
+  <li>
+    <p>与 GLM-5.3-Flash 的 mHC 实现比，差异在哪？</p>
+    <details>
+      <summary>解答：读写门接近，核心分歧是混合矩阵</summary>
+      <p>读门同形（$\sigma+\epsilon_{hc}$）；写门 GLM 为 $2\sigma$、Hy4 为 $m\sigma+\epsilon_{hc}$（$m=2$）。GLM 的门控投影输出 24 个 logits（含混合矩阵的 16 个），Hy4 只有 8 个；GLM 用 softmax 加 Sinkhorn 20 步维护混合矩阵、末端取无权重均值，Hy4 无混合矩阵、末端门控合并。残差通路参数 35.39M 对 30.77M。两家的核心分歧集中在混合矩阵：一边维护，一边删除。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<ul>
+<li>C1：Hy4 官方对残差通路的表述（「The residual pathway uses iHC (identity Hyper-Connections) to expand inter-layer information flow」）与规格 Residual Streams: 4——Tencent-Hunyuan/Hy4-preview 官方 README（GitHub main，仓库 pushed_at 2026-08-28、HF 模型卡 lastModified 2026-08-28，README 正文无日期字段）Model Introduction 与 Model Specifications。</li>
+<li>C2：iHC 三块职责（pre 收缩、post 散射、head 合并）——vLLM PR #54160（commit b2f685834a645）<code>vllm/models/hy_v4/nvidia/hc.py</code> 模块 docstring。</li>
+<li>C3：「Unlike mHC there is no comb matrix, so each output channel only needs its own residual channel and the whole thing is one fused multiply-add per element」——同 PR <code>vllm/model_executor/layers/hpc/hpc_ihc.py</code> HpcIHCPost docstring。</li>
+<li>C4：命名分歧（README 写 identity，vLLM docstring 写 independent，两处）——README 与 hc.py、hpc_ihc.py docstring 对照。</li>
+<li>C5：每个解码层两个 iHC 边界、参数独立、第 1 层 dense FFN 同样有——同 PR <code>vllm/models/hy_v4/nvidia/model.py</code> HYV4DecoderLayer.__init__；checkpoint 78 层乘 2 站点张量。</li>
+<li>C6：前向顺序与「Under iHC the residual is carried inside hidden_states」——同上 model.py _forward_ihc。</li>
+<li>C7：入口广播复制（unsqueeze + repeat）与 head 位于 final norm 之前——hc.py _prepare_input_to_3d、model.py HYV4Model。</li>
+<li>C8：初始化（hc_scale 置 0.01；hc_base 前 $n$ 个 $-\log(n-1)$、后 $n$ 个 0；head 偏置全 $-\log(n-1)$）——hc.py reset_parameters（Pre 与 Head 两处）。</li>
+<li>C9：门控 float32 计算（forward 内 .float()）与 hc_* 不参与 FP8 量化（modules_to_not_convert）——hc.py forward、hpc_ihc.py 模块 docstring。</li>
+<li>C10：Hy4 配置（enable_ihc、hc_mult=4、hc_magnitude=2.0、hc_eps=1e-6、hidden_size=6144、num_hidden_layers=78、rms_norm_eps=1e-5、mlp_layer_types）——tencent/Hy4-preview config.json。</li>
+<li>C11：checkpoint 张量结构（156 站点乘 hc_pre 三张量，加 hc_head 三张量，全 float32，共 471 个）——model.safetensors.index.json 与 shard 头（2026-09-03 本机拉取实测）。</li>
+<li>C12：iHC 总参数 30,770,717 的逐项计算——checkpoint 张量形状加算术（$156\times 196{,}618+98{,}309$）。</li>
+<li>C13：MTP 草稿层不含 iHC——checkpoint 27 个 model.mtp_layers.* 张量中无 hc 张量。</li>
+<li>C14：mHC 学出的单层混合矩阵对角约 0.96、非对角约 0.01，深度不小于 10 的累积乘积坍缩为全 0.25——知乎文章《你的deepseek mHC可能不需要&quot;m&quot;》（zhuanlan.zhihu.com/p/2010852389670908320，2026-02-28；Hy4 README 的「iHC」链接指向此文），Qwen3 系列实验观测，社区实验。</li>
+<li>C15：坍缩机理（一致正性条件下 Dobrushin 遍历系数不超过 $1-n\delta$、连乘几何衰减、极限为均匀矩阵；纯置换或可约序列不坍缩）——同上知乎文章（其论证；本页用构造实验复现现象）。</li>
+<li>C16：实验排序 Identity HC &gt; mHC &gt; mHC lite &gt; mHC orthogonal（Qwen3 1.7B 与 8B dense、150B tokens、从头训练）——同上知乎文章，社区实验。</li>
+<li>C17：Sinkhorn 20 步后行和标准差 0.12；mHC-lite 输入 relative range 达 $10^{13}$（占其实测输入的 27.9%）时列和偏差可达 100%——同上知乎文章，其实验条件。</li>
+<li>C18：流语义一致性（流 $i$ 恒在位置 $i$、$I^L=I$）——同上知乎文章（其论证）。</li>
+<li>C19：HPC 融合（eager 的 pre/post/head 分别 20/5/15 个 kernel 各融合为 1；VLLM_ENABLE_HPC_OPS=1、sm100/sm103、hc_mult=4、hidden 属于 {4096, 6144}）——hpc_ihc.py 模块 docstring 与 _SUPPORTED_* 常量。</li>
+<li>C20：跨层 post+pre 融合（HpcIHCPostPre）参考实现存在、vLLM 未移植——hpc_ihc.py 源码 NOTE。</li>
+<li>C21：GLM-5.3-Flash mHC 实现细节（hc_mult=4、每层两站点、fn $[24, 16384]$、pre $=\sigma+\epsilon_{hc}$、post $=2\sigma$、comb 为 softmax 加 Sinkhorn 20 步、head 无权重均值、残差通路参数 35,391,870 占 321B 的 0.011%）——mHC 模块实现见 transformers main <code>modeling_glm5_next.py</code> L219-302；层数等默认值见同仓库 <code>configuration_glm5_next.py</code>（默认 num_hidden_layers=45、hc_mult=4、hc_sinkhorn_iters=20）；总参数约 321B 见 zai-org/GLM-5.3-Flash Hugging Face 模型卡 Model size 栏；事实与汇总经超连接页核对一致。</li>
+</ul>
+
+<h3>公式与来源（F）</h3>
+<ul>
+<li>F1：pre 块前向（展平、整体 RMS、投影、双 sigmoid 门、读门加权合并）——hc.py HYV4HCPreLayer.forward，逐 token。</li>
+<li>F2：post 块前向 $\hat{x}_i=H_{post,i}\cdot z+x_i$——hc.py HYV4HCPostLayer.forward（docstring 公式 y[n,i,d] = post[n,i] * x[n,d] + residual[n,i,d]）。</li>
+<li>F3：head 块前向（与 F1 同构，投影输出 $n$ 个 logits、无写门）——hc.py HYV4HCHeadLayer.forward。</li>
+<li>F4：初始化取值（$s=0.01$、读偏置 $-\ln(n-1)$、写偏置 0、head 偏置全 $-\ln(n-1)$）——hc.py reset_parameters。</li>
+<li>F5：初始行为 $\sigma(-\ln 3)=\frac14$、$2\sigma(0)=1$——由 F1 与 F4 代入推导（本页推导）。</li>
+<li>F6：iHC 单层传播（$\mathbf{A_r}=\mathbf{I}$ 特化）——HC 论文记号（Zhu et al., Hyper-Connections, arXiv:2409.19606v3, Eq.(2)）。形式对应：实现的 $H_{pre}$、$H_{post}$ 对应论文的 $\mathbf{A_m}$、$\mathbf{B}$，实现无 $\mathbf{A_r}$ 项；本页不声称实现逐字复现论文公式。</li>
+</ul>
+
+<h3>外部数字与实验条件（N）</h3>
+<ul>
+<li>N1：4 流、hidden 6144、78 层、幅度 2.0、hc_eps 1e-6、rms_norm_eps 1e-5——config.json。</li>
+<li>N2：站点参数 196,618、head 参数 98,309、总 30,770,717、占 770B 约 0.004%——checkpoint 实测形状加算术。</li>
+<li>N3：hc_fn $[8, 24576]$、hc_head_fn $[4, 24576]$、全部 float32——checkpoint shard 头。</li>
+<li>N4：mHC 学出混合矩阵对角约 0.96、非对角约 0.01，累积乘积全 0.25——知乎文章（Qwen3 系列实验观测，社区实验条件）。</li>
+<li>N5：Sinkhorn 20 步后行和标准差 0.12——知乎文章（其复现条件）。</li>
+<li>N6：eager 路径 pre/post/head 的 kernel 数 20/5/15——hpc_ihc.py 模块 docstring。</li>
+<li>N7：Hy4 主干 770B 总参数、49B 激活、78 层、1M 上下文、64 注意力头、FFN 中间维 18432、MoE 中间维 2048、256 路由专家 top-8 加 1 共享、词表 120,832——README 规格表与 config.json（背景定位用）。</li>
+<li>N8：HC 复合映射增益峰值约 3000（理想值 1）——mHC 论文 arXiv:2512.24880v2 §3.1 Fig. 3(b) 与 §5.4，度量 Amax Gain Magnitude（最大绝对行和/列和），实验规模 27B 模型。</li>
+<li>N9：GLM-5.3-Flash 总参数约 321B——zai-org/GLM-5.3-Flash Hugging Face 模型卡 Model size 栏（Introduction 行写 320B）；层数等默认值（45 层、hc_mult=4、hc_sinkhorn_iters=20）——transformers main <code>configuration_glm5_next.py</code>。</li>
+</ul>
+
+<h3>构造示例</h3>
+<ul>
+<li>迷你模型（4 流、$d=2$、两个子块、线性子层、hc_fn 置零）：第一幕验证初始化行为（门停在偏置值、流保持相等、退化为标准残差），第二幕验证分化门的作用；第二幕的门值 $[0.55, 0.20, 0.10, 0.15]$、$[1.8, 0.6, 1.2, 0.3]$ 与初始流为教学构造，非 Hy4 checkpoint 数值。</li>
+<li>双随机坍缩实验：每层矩阵为 rng(0) 随机生成的正矩阵（元素范围 0.2 至 1.0）经 20 步 Sinkhorn，非训练产物；用于复现坍缩机理，不代表 mHC 训练后矩阵的实际分布。</li>
+<li>参数量外推中的迷你站点（74 参数）与迷你 head（37 参数）为教学对照。</li>
+</ul>
+
+<h3>辅助解释与类比边界</h3>
+<ul>
+<li>「读门偏向哪条流，子层看到的输入就更像那条流」——描述读门加权平均的局部性质，只在该语义内成立，不构成对流的内容语义的主张。</li>
+<li>「标准残差 / mHC / iHC 三条路线」的对照框架——为对比组织的视角；HC 论文自身的表述是一般形式与 $n=1$ 特例，与该框架不冲突。</li>
+<li>「流是状态通道，不是并行计算」——描述 iHC 的数据流事实，不外推到其他多流架构。</li>
+</ul>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>子层用线性映射代替：省略注意力与 MLP 的内部结构；不影响 pre、post、head 三块机制的验证，不能推出子层内部行为。</li>
+<li>hc_fn 置零：真实初始化为非零小随机矩阵，门会在偏置值附近轻微偏移；置零得到精确的 0.25 与 1.0，突出偏置的决定作用，不能代表真实初始化的方差。</li>
+<li>第二幕的门为固定构造值：真实训练后的门逐 token 动态变化；固定值只展示门的瞬时作用，不能推出训练动态。</li>
+<li>float64 代替 float32：所示数值在两种精度下一致到给出位数；不能据此推断实现里的浮点误差特性。</li>
+<li>坍缩实验用随机矩阵：比训练学出的矩阵更「混」，坍缩更快；现象方向与论证一致，衰减速度不可比。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

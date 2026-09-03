@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>恒等超连接（iHC）· 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 模型结构</span>
+      <h1>恒等超连接（iHC）</h1>
+      <p class="lead">把 Transformer 的单一残差流扩成 4 条并行流，流间不做任何混合，只保留每个子块入口与出口的逐 token 读写门——Hy4-preview 采用的残差通路。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <h2>问题背景</h2>
+    <p>深层主干里所有跨层传递的信息都要走残差流，标准 Transformer 只有一条。超连接把流加宽成多条并行，mHC 给流间加混合矩阵并用双随机约束保稳（机制见<a href="../hyper-connections/index.html">超连接与 mHC</a>），代价是每层的 Sinkhorn 投影与深层连乘的坍缩倾向。iHC 是 Hy4-preview（腾讯混元 2026-08-28 发布的 770B MoE 模型）的选择：加宽到 4 条，但流间混合矩阵固定为单位阵，混合彻底删除。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li><b>入口复制、末端合并</b>：embedding 广播成 4 条初值相同的流；主干末端 head 门控合并后才过 final RMSNorm。</li>
+      <li><b>每个子块四步</b>：pre 按读门把 4 条流加权合并成一份输入（顺手算出写门）、RMSNorm、子层计算一次、post 按写门把输出加回每条流——每条流加同一份输出的不同倍数，旧值原样保留。每层两个站点（注意力、MLP 各一），参数独立。</li>
+      <li><b>读写门逐 token 动态</b>：4 条流展平后经整体 RMS 与线性投影得 8 个数，过 sigmoid 得门；写门带幅度 2。门是残差通路唯一的可学习参数。</li>
+      <li><b>初始化贴标准残差</b>：读门初始约 $1/4$（等权读）、写门约 $1$（满幅写），初始行为就是标准 Pre-Norm 残差，与它的数值差只有 $10^{-5}$ 量级；训练从这一点出发学门的偏移。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>流间零混合不等于流互不相干：读时加权合并、写时全流吸收同一份输出；不混合的只是旧状态如何传递。子层 FLOPs 不变，变 4 倍的是残差激活显存。</li>
+      <li>「identity 优于 mHC」的依据是社区实验（Qwen3 1.7B/8B、150B tokens、从头训练，排序 Identity HC &gt; mHC）与实现注释：mHC 学出的混合矩阵本来就接近单位阵，双随机正矩阵连乘坍缩到均匀矩阵，Sinkhorn 自带近似误差。iHC 本身没有正式论文。</li>
+      <li>落地规格：4 流、hidden 6144、78 层双站点；残差通路总参数 30,770,717（占 770B 约 0.004%），门控权重 float32、不参与 FP8 量化；MTP 草稿层不用 iHC。</li>
+      <li>机制事实以 Hy4 官方实现（vLLM PR #54160）与 checkpoint 张量为准；「为什么 identity」的论证是社区研究性质，引用需带实验条件。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
