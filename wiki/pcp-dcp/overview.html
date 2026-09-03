@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PCP 与 DCP · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 上下文并行</span>
+      <h1>PCP 与 DCP</h1>
+      <p class="lead">vLLM 把上下文并行按推理阶段拆成的两个机制：prefill 阶段（PCP）把长序列的计算切到多张卡缩短首 token 时间，decode 阶段（DCP）把 KV cache 沿 token 维切到多张卡、消除重复副本释放显存换吞吐。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <h2>问题背景</h2>
+    <p>agent 级的长上下文请求（完整代码仓、几十轮对话历史，可达约一百万 token）让推理的两个阶段各自撞墙：prefill 要把全部输入算一遍，attention 计算量随长度平方增长，用户在等第一个字（TTFT）；decode 每步只算一个新 token，却要背着全部历史的 KV cache 走，显存先于算力被吃满，并发上限被容量钉死。</p>
+    <p>标准的张量并行（TP）沿注意力头这一维切 KV cache，而现代模型恰恰头少：GQA 只保留少量 KV 头（Qwen3-235B-A22B 为 4 个），MLA 把 K/V 压成跨全部 query 头共享的潜向量、有效 KV 头数为 1。卡数超过头数（$t > H$）后，每个头被复制到多张卡，KV cache 出现 $t/H$ 倍重复副本——同一份数据被写了好几遍，直接吃掉能装下的请求数。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li><b>DCP 切存储</b>：decode 阶段把 KV cache 沿 token 维分片，token $i$ 按交错规则存到 rank $i \bmod d$，每份数据只落一张卡；交错让逐 token 增长的 KV 轮流落位、各卡均匀增长。dcp 不增加启动的 GPU 数——DCP 组复用已有的 TP rank，命令行加一个 <code>-dcp</code> 即可。</li>
+      <li><b>DCP 的通信与合并</b>：每步 decode 三段节奏——AllGather 聚齐 query（单 token，开销可忽略）→ 各卡对本地 KV 切片算部分 attention → 部分输出按 LSE 加权合并、ReduceScatter 取回各自切片。LSE 合并是恒等式：$e^{l_r}$ 恰为该卡本地 softmax 分母，合并即全局分子分母的分组求和，分片计算与整卡计算精确相等。</li>
+      <li><b>PCP 切计算</b>：prefill 阶段把序列切成段分给多卡并行算，缩短 TTFT。全量 K/V 放得下时聚齐后各卡只算自己段的 query；放不下时用 ring attention 逐块收发。causal mask 使靠后的块计算量更重，切 $2N$ 块、首尾配对让每卡负载恒定。PCP 扩展设备数，用硬件买延迟。</li>
+      <li><b>选型</b>：官方建议先把 tp 加到性能满意，再取 dcp 消除重复；dcp 有效范围 $[1, t/H]$，取到 $t/H$ 时重复归一。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>官方实测（单节点 8×B200、Kimi K2.6 NVFP4）：基线 TP 在并发 64 时 KV 使用率 100% 撞墙、吞吐平台期约 1,863 tok/s/GPU；DCP 支撑到并发 512、6,091 tok/s/GPU、KV 82%。收益来自"容量 → 并发 → 吞吐"链路，不是单请求变快——单请求每步反而多出组内通信。</li>
+      <li>上下文短（无重复可消）、卡间互联带宽低、请求并发低的场景，DCP 可能负收益，直接用 TP 更简单。</li>
+      <li>PCP/DCP 与 PD 分离是两个维度：PD 分离决定 prefill/decode 放在哪些 GPU 池（部署），PCP/DCP 决定池内一条长请求怎么跨卡（执行），两者正交可组合。</li>
+      <li>PCP 的两种策略写作时均在活跃开发中；DCP 对 MLA 与 GQA 模型已支持约一年。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
