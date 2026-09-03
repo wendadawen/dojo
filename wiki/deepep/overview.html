@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepEP · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · MoE 专家并行通信</span>
+      <h1>DeepEP</h1>
+      <p class="lead">DeepSeek 开源的专家并行通信库：为 MoE 的 token 搬运（dispatch 与 combine）提供高吞吐与低延迟两套 all-to-all 内核，只做通信，不做路由、计算与调度。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <p>MoE 模型的每一层都要把 token 发给专家所在的 GPU（dispatch），算完再送回来加权合并（combine），形态是 <a href="../../wiki/moe-serving/index.html">all-to-all</a>。DeepSeek-V3 的 decode 部署在 320 块 GPU 上每块只放 1 个专家，每生成一个 token 都要完成一次全集群的来回搬运。</p>
+
+    <h2>问题背景</h2>
+    <p>通用集合通信库（如 NCCL）的 all-to-all 原语不适配这个场景的四个结构性要求：通信不能抢计算的 SM（V3 训练用 20/132 个 SM 专职通信）；接收数据要按专家分组排布、供 grouped GEMM 直接消费；dispatch 载荷要用 <a href="../../wiki/fp8-block-quant/index.html">FP8</a>；decode 的每步小 batch 通信要低延迟且兼容 <a href="../../wiki/vllm-cudagraph/index.html">CUDA graph</a>。跨节点专家并行的计算通信比约为 1:1，通信本身就是要正面优化的对象。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li>高吞吐内核（训练/prefill）：两段转发——token 先经 <a href="../../wiki/gpu-communication/index.html">IB</a> 到目标节点上与发送 rank 同 in-node index 的 GPU，落地后经 NVLink 转发给持有目标专家的 GPU，不被后到 token 阻塞，IB 与 NVLink 完全重叠；20 个 SM 分 10 个通道、warp 专职分工即可跑满两种网络。</li>
+      <li>低延迟内核（decode）：纯 RDMA——所有 rank（含节点内）经 RDMA 可见、NVLink 完全禁用，点对点直达去掉中转与同步；接收张量按最坏情况预留固定槽位，不做 CPU 接收计数同步从而兼容 CUDA graph；接收 hook 让 dispatch 只发请求不等待，等待期 GPU 计算另一个 micro-batch，不占任何 SM。</li>
+      <li>路由配合：node-limited routing 限制每 token 至多 4 个目标节点以省 IB 流量；平均 3.2 专家/节点、等效最多 13 个专家。</li>
+      <li>V2 重构：NCCL Gin 后端替换 NVSHMEM、ElasticBuffer 统一两套 API、SM/QP 数解析式计算取代 auto-tuning、支持到 EP2048、全 JIT 编译。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>实测带宽逼近硬件峰值：V1 节点内 153/158 GB/s（NVLink 峰值约 160）、跨节点 43-58 GB/s（RDMA 峰值约 50）；V2 对 V3 式训练把通信 SM 从 24 降到 4-6 且性能相当或更好，峰值最高 1.3 倍。</li>
+      <li>低延迟是用带宽换的：纯 RDMA 的折算带宽在 EP128 时只有 39 GB/s，明显低于高吞吐内核；固定槽位按最坏预留，显存消耗远大于 normal 模式。</li>
+      <li>DeepEP 只搬 token：路由决策、专家计算（grouped GEMM）、负载均衡（冗余专家、UltraEP/MoonEP 等系统）、重叠调度（DualPipe/TBO）都在库外。</li>
+      <li>硬性门槛：Hopper（SM90）及以上、节点内 NVLink、跨节点 RDMA 网络；IB 全测试、RoCE 理论兼容；V2 的 buffer 消耗大于 V1、0 SM RDMA 低延迟 EP 不再支持。</li>
+    </ul>
+
+    <p>机制细节、手算示例与可运行模拟见 <a href="index.html">完整说明页</a>。</p>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
