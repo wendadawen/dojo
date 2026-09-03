@@ -1,0 +1,1632 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="KV cache 的显存布局 NHD 与 HND：同一份缓存数据的两种排列方式。NHD 按 (token, 头, 维) 排列、与投影输出一致、写入零转置；HND 按 (头, token, 维) 排列、单头整页连续，服务低精度 kernel 与页级搬运。含 vLLM KVCacheLayout 枚举、布局协商与 SM100 强制 head-major 的实现细节。">
+  <meta name="dojo:summary" content="KV cache 布局指 $N/H/D$ 三个维度（token 数、KV 头数、每头维度）在显存中的排列顺序：NHD 为 $(p, H_{\mathrm{kv}}, d)$、同一 token 的所有头连续，与投影输出 $xW_K$ 一致、写入零转置；HND 为 $(H_{\mathrm{kv}}, p, d)$、同一头的整页 token 连续，单头取页的传输单元从 $d$ 个元素增至 $p \cdot d$ 个（fp16、$d=128$、$p=32$ 时 256 B 对 8 KB），服务低精度 kernel 与页级搬运。vLLM 用固定逻辑形状 $[L,B,H,N,C]$ 加 stride 置换在同一块显存表达两种布局；SM100 的 trtllm-gen kernel 只接受 head-major，Blackwell 上因此解析为 HND。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="内存与缓存, 推理系统">
+  <meta name="dojo:tag" content="kv-cache-layout">
+  <title>KV cache 布局（NHD/HND）：同一份缓存的两种显存排法</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">KV cache 布局（NHD/HND）</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">KV cache 布局（NHD/HND）：同一份缓存的两种显存排法</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<style>
+  /* 内存条带图的格子配色：跟随明暗主题，不写死颜色值 */
+  .kv-a { fill: var(--blue); fill-opacity: .12; stroke: var(--blue); stroke-opacity: .55; }
+  .kv-b { fill: var(--yellow); fill-opacity: .16; stroke: var(--yellow); stroke-opacity: .55; }
+  .kv-dim { fill: var(--bg-code); stroke: var(--border-light); }
+  .kv-hl { fill: var(--blue); fill-opacity: .30; stroke: var(--blue); }
+</style>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：FlashInfer 官方文档 "KV-Cache Layout in FlashInfer"；vLLM main 分支源码（<code>vllm/v1/kv_cache_layout.py</code> 等，拉取于 2026-09-03）；FreeKV（arXiv:2505.13109v2）§4.2。论断编号与文末来源说明对应。</p>
+</blockquote>
+
+<p>推理引擎的部署文档与源码注释里会出现这样的表述：KV cache 使用 HND 布局，或者环境变量 <code>VLLM_KV_CACHE_LAYOUT=HND</code>。布局（layout）描述的不是缓存里存了哪些数据，而是同一批数在显存里的排列顺序。KV cache 每层为每个 token 保存若干个注意力头的向量，token 数、头数、每头维度这三个维度在内存里谁排在外面、谁排在里面，就是布局回答的全部问题。两个主流答案分别叫 NHD 与 HND——它们不是两种数据格式，也不改变任何数值，只是同一份缓存的两种排法。</p>
+
+<p>写路径和读路径对"谁应该连续"的诉求正好相反，这是两种布局并存的全部原因。本文先讲清三个维度与两种排法（第 1 章），再看写入路径为什么偏好 NHD（第 2 章）、读取路径在哪些场景下偏好 HND（第 3 章），最后落到 vLLM 的实现：它如何用固定的逻辑形状加步长置换，在同一块显存上支持两种布局，以及 Blackwell（SM100）上为什么解析成 HND（第 4 章）。</p>
+
+<section class="learning-goals">
+<h2>核心问题</h2>
+<ol class="chapter-questions">
+<li>
+<p>KV cache 的三个维度 $N/H/D$ 各自统计什么？NHD 与 HND 分别把哪个维度排在外层，分页形式的完整形状是什么？</p>
+<details>
+<summary>解答：三个维度与两种排法的定义</summary>
+<p>$N$ 是 token 数（序列方向）、$H$ 是 KV 头数（GQA 下少于查询头数）、$d$ 是每头维度。布局名的字母顺序就是物理维度从外到内的顺序：NHD 为 $(p, H_{\mathrm{kv}}, d)$、同一 token 的所有头连续；HND 为 $(H_{\mathrm{kv}}, p, d)$、同一头的整页 token 连续。分页形式的完整形状在 NHD 下是 $(n_{\text{page}}, p, H_{\mathrm{kv}}, d)$、HND 下是 $(n_{\text{page}}, H_{\mathrm{kv}}, p, d)$。标准命名只有这两种，"HDN"是拼写串位。完整排布图示与贯穿示例见「一页 KV cache 的三个维度」。</p>
+</details>
+</li>
+<li>
+<p>为什么说 NHD 是写入路径的自然布局？</p>
+<details>
+<summary>解答：投影输出与 NHD 一致，写入零转置</summary>
+<p>一批 $N$ 个 token 的隐状态 $X$ 与投影矩阵 $W_K$ 相乘，输出形状为 $(N, H_{\mathrm{kv}} \cdot d)$：内存里每一行恰好是一个 token 的全部头数据，reshape 成 $(N, H_{\mathrm{kv}}, d)$ 即 NHD，不发生任何转置或搬运。decode 每步追加一个 token 时，NHD 下该 token 的数据落进一段连续槽位；HND 下则散成 $H_{\mathrm{kv}}$ 段，写入 kernel 需要按头计算地址。推导与贯穿示例见「写入路径：NHD 与投影输出一致」。</p>
+</details>
+</li>
+<li>
+<p>HND 把什么变连续了？这个连续性在哪些场景换来收益，哪些场景下没有差别？</p>
+<details>
+<summary>解答：单头整页连续，服务低精度 kernel 与页级搬运</summary>
+<p>attention 按（头，页）读取缓存：一个 KV 头要取整页 $p$ 个 token 的向量。NHD 下这批数碎成 $p$ 段、每段只有 $d$ 个元素；HND 下是一段 $p \cdot d$ 个元素。$d=128$、fp16、$p=32$ 时两者是 256 B 对 8 KB（32 倍差距）。收益集中在两类读路径：低精度（fp8/nvfp4）的 trtllm-gen kernel（TensorRT-LLM 系 kernel，默认且只对 HND 高效）与页级大块搬运（offload、换入换出）。fp16 常规推理下两者性能差异不显著，vLLM 的默认偏好仍是 NHD。复算与场景分析见「读取路径：HND 把单头整页变连续」。</p>
+</details>
+</li>
+<li>
+<p>vLLM 怎么在同一块显存上支持两种布局？SM100 上为什么解析成 HND？</p>
+<details>
+<summary>解答：逻辑形状固定加 stride 置换，SM100 的 trtllm-gen 只吃 head-major</summary>
+<p>布局只是同一块物理显存的不同视图：逻辑形状恒为 $[L, B, H, N, C]$（层数、页数、头槽、页内状态数、每格字节数），<code>KVCacheLayout</code> 枚举的值是一个 stride 置换——LBNHC 用 $(0,1,3,2,4)$ 表达 NHD、LBHNC 用 $(0,1,2,3,4)$ 表达 HND，切换不复制数据。布局在 engine core 解析一次：各注意力后端声明偏好的布局列表，取交集；环境变量 <code>VLLM_KV_CACHE_LAYOUT</code> 可显式指定但必须落在候选内。SM100（Blackwell）上 FlashInfer 后端只声明 head-major（头维排在外层，即 HND 类）布局，因为 trtllm-gen kernel 消费 head-major 的块内布局——SM100 上"HND"的解析结果即来源于此。枚举定义、协商流程与写入 kernel 的适配见「vLLM 实现：逻辑形状固定，stride 置换切换布局」。</p>
+</details>
+</li>
+</ol>
+</section>
+
+<h2 id="three-dims">1. 一页 KV cache 的三个维度</h2>
+
+<h3 id="what-is-stored">1.1 每个元素存的是什么</h3>
+
+<p>KV cache 为每个 token 缓存它在每一层前向计算时算出的注意力键值向量：$k = xW_K$ 与 $v = xW_V$，它们与查询无关、算一次可跨步复用，完整机制见 <a href="../../wiki/kv-cache/index.html">KV cache（键值缓存）</a>。使用 GQA 的模型把查询头分组、每组共享一套 KV 头，因此缓存侧的头数是 $H_{\mathrm{kv}}$ 而不是查询头数，见 <a href="../../wiki/mqa-gqa/index.html">MQA 与 GQA</a>。token 方向上，引擎按页（page，vLLM 源码称 block）组织缓存、按页分配显存，每页固定 $p$ 个 token，见 <a href="../../wiki/paged-attention/index.html">Paged Attention</a>。</p>
+
+<p>由此得到缓存的最小数据单位：<strong>某 token 在某 KV 头上的一个 $d$ 维向量</strong>。一页 K（或 V）的元素总量是</p>
+
+$$p \cdot H_{\mathrm{kv}} \cdot d,$$
+
+<ul>
+<li>$p$：页大小，一页内的 token 数；</li>
+<li>$H_{\mathrm{kv}}$：KV 头数，GQA 下小于查询头数；</li>
+<li>$d$：每个头的维度 head_dim。</li>
+</ul>
+
+<p>这批数写进显存时要排成一维的字节序列，三个维度谁在外面、谁在里面，就是接下来两小节的主题。</p>
+
+<h3 id="two-orders">1.2 两种排法：字母顺序就是物理顺序</h3>
+
+<p>NHD 与 HND 这两个名字本身就是布局的完整描述——<strong>字母顺序就是物理维度从外到内的顺序</strong>。NHD 把 token 排最外面：同一 token 的所有头连续。HND 把头排最外面：同一头的整页 token 连续。FlashInfer 官方文档对二者的定义即此：NHD 的最后三维组织为 $(\text{seq\_len}, \text{num\_heads}, \text{head\_dim})$，HND 为 $(\text{num\_heads}, \text{seq\_len}, \text{head\_dim})$<sup>[C1]</sup>。</p>
+
+<p>构造示例。 取 $p=4$、$H_{\mathrm{kv}}=2$、$d=2$：一页 K 共 16 个元素，按物理槽位 0 到 15 编号。两种布局下同一批数的排法如下图（参数取小值便于全文手算，不代表工程配置）。</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 234" role="img" aria-label="同一页 K 缓存在 NHD 与 HND 两种布局下的物理排布对比">
+  <text x="340" y="24" text-anchor="middle" style="font-size:14px;font-weight:500">同一页 K 缓存的两种排法（4 个 token、2 个 KV 头、每头 2 维）</text>
+  <rect class="kv-a" x="150" y="38" width="12" height="12" rx="2" stroke-width="0.5"/>
+  <text x="168" y="44" style="font-size:12px">KV 头 0</text>
+  <rect class="kv-b" x="246" y="38" width="12" height="12" rx="2" stroke-width="0.5"/>
+  <text x="264" y="44" style="font-size:12px">KV 头 1</text>
+  <text x="360" y="44" style="font-size:12px;fill:var(--text-light)">格内数字为 token 序号</text>
+  <text x="52" y="78" style="font-size:13px;font-weight:500">NHD：(token, head, dim)——同一 token 的所有头连续</text>
+    <rect class="kv-a" x="52" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="70.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-a" x="88" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="106.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-b" x="124" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="142.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-b" x="160" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="178.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-a" x="196" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="214.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-a" x="232" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="250.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-b" x="268" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="286.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-b" x="304" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="322.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-a" x="340" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="358.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-a" x="376" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="394.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-b" x="412" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="430.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-b" x="448" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="466.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-a" x="484" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="502.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <rect class="kv-a" x="520" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="538.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <rect class="kv-b" x="556" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="574.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <rect class="kv-b" x="592" y="88" width="36" height="26" stroke-width="0.5"/>
+    <text x="610.0" y="101.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <path class="dg-line" stroke-width="0.5" d="M52 114 l0 4 l144 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M196 114 l0 4 l144 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M340 114 l0 4 l144 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M484 114 l0 4 l144 0 l0 -4"/>
+    <text x="124" y="130" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">token t0</text>
+    <text x="268" y="130" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">token t1</text>
+    <text x="412" y="130" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">token t2</text>
+    <text x="556" y="130" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">token t3</text>
+  <text x="52" y="164" style="font-size:13px;font-weight:500">HND：(head, token, dim)——同一头的整页 token 连续</text>
+    <rect class="kv-a" x="52" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="70.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-a" x="88" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="106.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-a" x="124" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="142.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-a" x="160" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="178.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-a" x="196" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="214.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-a" x="232" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="250.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-a" x="268" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="286.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <rect class="kv-a" x="304" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="322.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <rect class="kv-b" x="340" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="358.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-b" x="376" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="394.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t0</text>
+    <rect class="kv-b" x="412" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="430.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-b" x="448" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="466.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t1</text>
+    <rect class="kv-b" x="484" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="502.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-b" x="520" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="538.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t2</text>
+    <rect class="kv-b" x="556" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="574.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <rect class="kv-b" x="592" y="174" width="36" height="26" stroke-width="0.5"/>
+    <text x="610.0" y="187.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px">t3</text>
+    <path class="dg-line" stroke-width="0.5" d="M52 200 l0 4 l288 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M340 200 l0 4 l288 0 l0 -4"/>
+  <text x="196" y="216" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">KV 头 0 的 4 个 token</text>
+  <text x="484" y="216" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">KV 头 1 的 4 个 token</text>
+</svg>
+<figcaption class="diagram-caption">每格为一个元素；颜色区分 KV 头（蓝为头 0、黄为头 1），格内数字为 token 序号；只画 K，V 同构。NHD 按 token 分组（每组 4 格 = 该 token 两个头的向量）；HND 按头分组（每段 8 格 = 该头 4 个 token 的向量）。</figcaption>
+</figure>
+
+<p>从图上直接读出两个事实，它们分别支撑后两章的结论：</p>
+
+<ul>
+<li>NHD 下，$t_2$ 的 K 是槽 8 到 11 一段；$h_0$ 的 K 是槽 0 到 1、4 到 5、8 到 9、12 到 13 共四段——<strong>写 token 方便，读单头碎片化</strong>。</li>
+<li>HND 下，$h_0$ 的 K 是槽 0 到 7 一段；$t_2$ 的 K 散在槽 4 到 5 与 12 到 13 两段——正好互换：<strong>读单头方便，写 token 碎片化</strong>。</li>
+</ul>
+
+<h3 id="paged-shapes">1.3 分页形式与命名澄清</h3>
+
+<p>加上页维度后，两种布局的完整张量形状是<sup>[C5, F1]</sup>：</p>
+
+<ul>
+<li>NHD：$(n_{\text{page}},\; p,\; H_{\mathrm{kv}},\; d)$</li>
+<li>HND：$(n_{\text{page}},\; H_{\mathrm{kv}},\; p,\; d)$</li>
+</ul>
+
+<p>其中 $n_{\text{page}}$ 是页总数。K 和 V 各按此形状存一份（或沿最内维拼接成一份，实现差异见第 4 章）。</p>
+
+<div class="callout callout-yellow">
+<p>命名澄清。 业界标准命名只有 NHD 与 HND 两种，字母顺序即维度顺序；"HDN"不是第三种布局，只是拼写串位。遇到写 HDN 的资料，它想说的几乎一定是 HND。</p>
+</div>
+
+<p>另一个容易混淆的说法是"布局解决 KV cache 碎片化"。碎片有两个层面：<strong>分配层面</strong>的碎片（外部碎片、按序列整块预留的浪费）由分页机制解决，与布局无关；<strong>访问层面</strong>的碎片（一次逻辑读取在物理上碎成多少段）才由布局决定——NHD 与 HND 的全部差异都在这一层。把两层混在一起，就会误以为 HND 能替代分页，或误以为分页之后不再有访问碎片。</p>
+
+<h3 id="ch1-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>$N/H/D$ 三个维度分别统计什么？为什么 GQA 模型的 $H_{\mathrm{kv}}$ 不等于查询头数？</p>
+<details>
+<summary>解答：三个维度的来源</summary>
+<p>$N$ 统计 token 数（序列方向），$d$ 是每个 KV 头向量的维度，两者由模型结构与配置决定；$H_{\mathrm{kv}}$ 统计 KV 头数。GQA 把查询头分组、每组共享同一套 KV 投影，所以缓存侧只需保存 $H_{\mathrm{kv}}$ 个头的向量，$H_{\mathrm{kv}}$ 小于查询头数；这是 KV cache 能省显存的机制之一，与布局无关——布局只决定这 $H_{\mathrm{kv}}$ 个头在页内怎么排。</p>
+</details>
+</li>
+<li>
+<p>同一页数据在 NHD 与 HND 下的物理顺序各是什么？"谁连续"分别指什么？</p>
+<details>
+<summary>解答：字母顺序即物理顺序</summary>
+<p>NHD 按 (token, 头, 维) 排：先按 token 分组、组内按头排列，同一 token 的 $H_{\mathrm{kv}}$ 个头向量连续；HND 按 (头, token, 维) 排：先按头分组、组内按 token 排列，同一头的 $p$ 个 token 向量连续。以 $p=4$、$H_{\mathrm{kv}}=2$、$d=2$ 的一页为例，NHD 的物理顺序是 $t_0$ 的两个头、$t_1$ 的两个头……HND 是 $h_0$ 的四个 token、$h_1$ 的四个 token。两者保存的是同一批数，只是排列不同。</p>
+</details>
+</li>
+<li>
+<p>分页形式下两种布局的完整形状是什么？"HDN"是什么？</p>
+<details>
+<summary>解答：页形状与命名</summary>
+<p>NHD 为 $(n_{\text{page}}, p, H_{\mathrm{kv}}, d)$，HND 为 $(n_{\text{page}}, H_{\mathrm{kv}}, p, d)$，其中 $n_{\text{page}}$ 是页数、$p$ 是页大小。"HDN"不是标准命名——业界只有 NHD 与 HND 两种写法，遇到 HDN 应理解为 HND 的笔误。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="write-path">2. 写入路径：NHD 与投影输出一致</h2>
+
+<p>第 1 章给出了两种排法，但还没回答"该用哪种"。选择的第一条判据是数据从哪里来：KV cache 的写入源头是注意力的投影输出，这一节说明它的形状天然就是 NHD。</p>
+
+<h3 id="projection-shape">2.1 投影输出的形状</h3>
+
+<p>设一批 $N$ 个 token 的隐状态为 $X \in \mathbb{R}^{N \times d_{\text{model}}}$，键投影矩阵为 $W_K \in \mathbb{R}^{d_{\text{model}} \times H_{\mathrm{kv}} d}$。矩阵乘法</p>
+
+$$X W_K \in \mathbb{R}^{N \times (H_{\mathrm{kv}} \cdot d)}$$
+
+<ul>
+<li>$X$：$N$ 行，每行一个 token 的隐状态；</li>
+<li>$W_K$：把 $d_{\text{model}}$ 维隐状态投影到 $H_{\mathrm{kv}} \cdot d$ 维，各头的 $d$ 维向量沿输出维拼接；</li>
+<li>$N$：本批 token 数（prefill 为整段提示词，decode 每步为 1）。</li>
+</ul>
+
+<p>行主序内存里，这个输出的每一行连续——恰好是一个 token 的全部头数据。把它 reshape 成 $(N, H_{\mathrm{kv}}, d)$ 就是 NHD 视图，reshape 只是改下标解释、不移动数据。FlashInfer 官方文档的表述是：NHD 更自然，因为它与 $xW_K$、$xW_V$ 的输出一致、无需转置<sup>[C2]</sup>。</p>
+
+<h3 id="decode-append">2.2 decode 每步的追加写</h3>
+
+<p>decode 阶段每生成一个 token，就要把它的 $H_{\mathrm{kv}} \cdot d$ 个 K 元素（V 同理）写进所在页。用第 1 章的贯穿示例看 $t_2$ 的落位：</p>
+
+<ul>
+<li><strong>NHD 物理</strong>：$t_2$ 的数据落在槽 8 到 11 一段。写入 kernel 收到投影输出的一行，按一段连续地址写入。</li>
+<li><strong>HND 物理</strong>：$h_0$ 的 2 个元素落在槽 4 到 5，$h_1$ 的落在槽 12 到 13，相隔 $p \cdot d = 8$。写入 kernel 需要按头计算地址、分两段写入。</li>
+</ul>
+
+<p>需要强调边界：这只是"自然与不自然"的差别，不是"能与不能"。HND 布局的缓存一样写得进去，代价是写入 kernel 多做按头寻址——第 4 章会看到 vLLM 的具体做法（视图层面的 transpose 适配）。同样，NHD 的写入优势在 prefill 批量写和 decode 追加写上都成立，因为两者源头都是投影输出的行。</p>
+
+<p>至此写路径的诉求已经清楚：按 token 整体写入，NHD 最顺。但第 1 章的图里还留着另一个事实——attention 读缓存时取的不是 token，是头。读取的单位变了，诉求也随之反转，这是下一章的主题。</p>
+
+<h3 id="ch2-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>为什么投影输出 $XW_K$ 的形状天然是 NHD？</p>
+<details>
+<summary>解答：行主序下每行恰为一个 token 的全部头数据</summary>
+<p>$X \in \mathbb{R}^{N \times d_{\text{model}}}$ 与 $W_K \in \mathbb{R}^{d_{\text{model}} \times H_{\mathrm{kv}} d}$ 相乘得 $(N, H_{\mathrm{kv}} \cdot d)$：第 $i$ 行是第 $i$ 个 token 的 $H_{\mathrm{kv}} \cdot d$ 个数、在行主序内存中连续，且各头的向量沿行内依次排列。reshape 成 $(N, H_{\mathrm{kv}}, d)$ 即 NHD，只改下标解释、不搬数据。FlashInfer 官方文档将此表述为"NHD 与 $xW_K$、$xW_V$ 输出一致、无需转置"。</p>
+</details>
+</li>
+<li>
+<p>decode 每步追加写一个 token 时，两种布局下写入 kernel 的寻址有什么差别？</p>
+<details>
+<summary>解答：NHD 一段连续，HND 按头分段</summary>
+<p>decode 每步写入 $H_{\mathrm{kv}} \cdot d$ 个 K 元素。NHD 下这批数落在页内一段连续槽位（贯穿示例中 $t_2$ 是槽 8 到 11），kernel 按单个起始地址顺序写。HND 下同一 token 的数据按头拆开、散在 $H_{\mathrm{kv}}$ 个相距 $p \cdot d$ 的位置（$t_2$ 是槽 4 到 5 与 12 到 13），kernel 要为每个头单独计算地址。数据都能写入，差别只在寻址复杂度。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="read-path">3. 读取路径：HND 把单头整页变连续</h2>
+
+<p>第 2 章结论是写入偏好 NHD；本章看读取为何常常偏好 HND。关键在于 attention 读缓存的单位不是 token，而是头。</p>
+
+<h3 id="read-by-head">3.1 attention 按（头，页）读取</h3>
+
+<p>GQA 下每个 KV 头服务一组查询头；一个查询头计算注意力时，要拿自己组的 KV 头的<strong>全部历史 token</strong>参与打分。分页缓存下这个读取表现为：逐页取出该头在该页的 $p$ 个 $d$ 维向量。现在对比两种布局给出的访问模式<sup>[C6]</sup>：</p>
+
+<ul>
+<li><strong>NHD</strong>：单头的一页碎成 $p$ 段，每段只有 $d$ 个元素——段与段之间隔着其他头的数据；</li>
+<li><strong>HND</strong>：单头的一页是一段 $p \cdot d$ 个元素。</li>
+</ul>
+
+<p>用贯穿示例（$p=4$、$H_{\mathrm{kv}}=2$、$d=2$）画出来<sup>[C6]</sup>：</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 252" role="img" aria-label="取 KV 头 0 的一整页时，NHD 与 HND 给出的访问段对比">
+  <text x="340" y="24" text-anchor="middle" style="font-size:14px;font-weight:500">取 KV 头 0 的一整页：两种布局给出的访问段</text>
+  <text x="52" y="62" style="font-size:13px;font-weight:500">NHD 下</text>
+    <rect class="kv-hl" x="52" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="70.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-hl" x="88" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="106.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-dim" x="124" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="142.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-dim" x="160" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="178.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-hl" x="196" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="214.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-hl" x="232" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="250.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-dim" x="268" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="286.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-dim" x="304" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="322.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-hl" x="340" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="358.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-hl" x="376" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="394.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-dim" x="412" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="430.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-dim" x="448" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="466.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-hl" x="484" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="502.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <rect class="kv-hl" x="520" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="538.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <rect class="kv-dim" x="556" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="574.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <rect class="kv-dim" x="592" y="70" width="36" height="26" stroke-width="0.5"/>
+    <text x="610.0" y="83.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <path class="dg-line" stroke-width="0.5" d="M52 96 l0 4 l72 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M196 96 l0 4 l72 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M340 96 l0 4 l72 0 l0 -4"/>
+    <path class="dg-line" stroke-width="0.5" d="M484 96 l0 4 l72 0 l0 -4"/>
+    <text x="88" y="112" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">2 个元素</text>
+    <text x="232" y="112" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">2 个元素</text>
+    <text x="376" y="112" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">2 个元素</text>
+    <text x="520" y="112" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">2 个元素</text>
+  <text x="52" y="134" style="font-size:13px">4 个不连续段，每段 2 个元素（每段只是一头的单 token 向量）</text>
+  <text x="52" y="168" style="font-size:13px;font-weight:500">HND 下</text>
+    <rect class="kv-hl" x="52" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="70.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-hl" x="88" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="106.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-hl" x="124" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="142.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-hl" x="160" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="178.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-hl" x="196" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="214.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-hl" x="232" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="250.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-hl" x="268" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="286.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <rect class="kv-hl" x="304" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="322.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <rect class="kv-dim" x="340" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="358.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-dim" x="376" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="394.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t0</text>
+    <rect class="kv-dim" x="412" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="430.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-dim" x="448" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="466.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t1</text>
+    <rect class="kv-dim" x="484" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="502.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-dim" x="520" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="538.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t2</text>
+    <rect class="kv-dim" x="556" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="574.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <rect class="kv-dim" x="592" y="176" width="36" height="26" stroke-width="0.5"/>
+    <text x="610.0" y="189.0" text-anchor="middle" dominant-baseline="central" style="font-family:var(--font-mono);font-size:12px;fill:var(--text-light)">t3</text>
+    <path class="dg-line" stroke-width="0.5" d="M52 202 l0 4 l288 0 l0 -4"/>
+  <text x="196" y="218" text-anchor="middle" style="font-size:12px;fill:var(--text-light)">1 个连续段</text>
+  <text x="52" y="240" style="font-size:13px">1 个连续段，共 8 个元素（一头的整页向量连成一片）</text>
+</svg>
+<figcaption class="diagram-caption">高亮格为取 KV 头 0 一整页时实际访问的元素，其余为同页其他数据。NHD 给出 4 个不连续段（每段 $d=2$ 个元素）；HND 给出 1 个连续段（$p \cdot d=8$ 个元素）。</figcaption>
+</figure>
+
+<p>复算真实规模下的差距。取 $d=128$、fp16（$b = 2$，每元素字节数）、$p=32$<sup>[F3]</sup>：</p>
+
+<ul>
+<li>NHD：每段 $d \cdot b = 128 \times 2 = 256$ 字节<sup>[N1]</sup>，一页要发起 $p = 32$ 次这样的小段访问；</li>
+<li>HND：一段 $p \cdot d \cdot b = 32 \times 128 \times 2 = 8192$ 字节 = 8 KB<sup>[N2]</sup>。</li>
+</ul>
+
+<p>单段访问量差 $p = 32$ 倍。这个数字刻画的场景是<strong>把一页当作搬运单位</strong>——从 CPU 内存取回被换出的页、offload、副本传输等；GPU 上 attention kernel 逐页读取同样受"碎片对整段"的差异影响，但收益是否兑现取决于 kernel 的具体实现（3.2 节给出来源依据，3.3 节给出系统实例）。</p>
+
+<h3 id="low-precision">3.2 低精度 kernel：trtllm-gen 以 HND 为默认</h3>
+
+<p>FlashInfer 官方文档在定义两种布局后给出一句话结论：当 KV cache 使用低精度数据类型（如 fp8）时，HND 对 GPU 实现更友好<sup>[C3]</sup>。FlashInfer 暴露的 trtllm-gen 后端 API 把这句话落成了默认值：参数 <code>kv_layout</code> 默认 <code>"HND"</code>；对 NVFP4 KV cache 使用 NHD 会触发自动 transpose 与 <code>.contiguous()</code> 拷贝——K/V 数据与 block scale 张量都会被复制一遍，产生额外的内存分配与拷贝开销，文档明确建议用 HND<sup>[C8]</sup>。</p>
+
+<p>为什么低精度让 NHD 变亏？一个直接的机制来自 trtllm-gen（TensorRT-LLM 系注意力 kernel，经 FlashInfer 暴露）的连续性要求。对 block scale 张量（<code>kv_cache_sf</code>，量化缩放因子），kernel 要求最后两维（page_size 与 head_dim 除以 16 的 scale 维）连续，因为内部要把它们 reshape 成特定形状以满足 TMA（Tensor Memory Accelerator，张量搬运单元）16 字节盒宽下限；KV 数据张量本身则要求最后一维 head_dim 连续（stride 为 1），同为 TMA 硬件约束<sup>[C9]</sup>。</p>
+
+<p>辅助解释（机制推断，来源只给了结论与 TMA 约束）。 低精度让每个元素更小：NHD 下同一头相邻 token 的物理间隔是 $H_{\mathrm{kv}} \cdot d \cdot b$ 字节，fp8/nvfp4 时 $b$ 变小、间隔变窄，跨步访问更难凑满宽向量加载与 TMA 的大块搬运；HND 下单头页内本来就是一整段连续字节，对齐要求天然满足。这一段解释了"为什么"，但应视为推断——上游来源只断言了结论与约束本身，正式判断以来源表述为准。</p>
+
+<h3 id="page-transfer">3.3 页级搬运与混合布局</h3>
+
+<p>3.1 节的传输单元差距在显存与内存之间搬运 KV cache 时最为直接。FreeKV 系统把两种布局用在了两侧：GPU 显存用 NHD——消除解码期每步的转置；CPU 内存用 HND——保证 CPU 与 GPU 之间按页传输时数据连续；两种布局之间的 NHD 到 HND 转置只在 offload 一页时做一次<sup>[C7]</sup>。</p>
+
+<p>这个设计说明布局选择没有全局最优：<strong>瓶颈在写，选 NHD；瓶颈在搬，搬运侧选 HND</strong>。两侧诉求不同时，可以在边界上付一次转置的代价，两边各拿各的好处。</p>
+
+<h3 id="which-one">3.4 什么时候选哪种</h3>
+
+<p>把来源结论汇总成选择依据：</p>
+
+<ul>
+<li><strong>fp16 常规推理</strong>：FlashInfer 的实践表述是两种布局没有显著性能差异，并因可读性优先 NHD<sup>[C4]</sup>；vLLM 的默认偏好也是 NHD（LBNHC）排第一位<sup>[C15]</sup>。</li>
+<li><strong>低精度（fp8/nvfp4）走 trtllm-gen kernel</strong>：HND 是默认且高效路径，NHD 会触发转置拷贝<sup>[C8]</sup>。</li>
+<li><strong>页级大块搬运频繁（offload、换入换出）</strong>：搬运侧用 HND 可把单头取页的传输单元从 $d$ 个元素提到 $p \cdot d$ 个<sup>[C6][C7]</sup>。</li>
+</ul>
+
+<div class="callout callout-yellow">
+<p>常见误解。 "HND 是更新的格式、性能更好，应该默认用 HND"——不成立。fp16 下两者性能差异不显著<sup>[C4]</sup>，NHD 与投影输出一致、写入零转置<sup>[C2]</sup>，vLLM 默认偏好仍是 NHD<sup>[C15]</sup>。HND 的收益集中在低精度 kernel 与页级搬运两类读路径，是被特定路径选中的排法，不是普遍升级。</p>
+</div>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>NHD</th><th>HND</th></tr></thead>
+<tbody>
+<tr><td>页形状</td><td>$(n_{\text{page}}, p, H_{\mathrm{kv}}, d)$</td><td>$(n_{\text{page}}, H_{\mathrm{kv}}, p, d)$</td></tr>
+<tr><td>连续对象</td><td>同一 token 的所有头</td><td>同一头的整页 token</td></tr>
+<tr><td>单头取一页</td><td>$p$ 段，每段 $d$ 个元素</td><td>1 段，$p \cdot d$ 个元素</td></tr>
+<tr><td>写入</td><td>与投影输出一致，零转置</td><td>按头寻址（kernel 内 transpose 适配）</td></tr>
+<tr><td>典型受益方</td><td>写路径；fp16 常规推理</td><td>低精度 trtllm-gen kernel；页级搬运</td></tr>
+<tr><td>vLLM 布局名</td><td>LBNHC（默认偏好首位）</td><td>LBHNC（SM100 上 FlashInfer 声明）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>前三章把概念讲完了：两种排法、写读各自的诉求、场景化的选择依据。剩下的工程问题是——一个引擎怎么同时支持两种布局，而不维护两份代码、两份缓存？vLLM 的答案是让布局退化为"同一块显存的一个视图属性"，这是第 4 章的内容。</p>
+
+<h3 id="ch3-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>attention 读取 KV cache 的访问单位是什么？为什么按头取整页？</p>
+<details>
+<summary>解答：一个 KV 头的全部历史 token</summary>
+<p>GQA 下一个 KV 头服务一组查询头。查询头计算注意力时要对该 KV 头的全部历史 token 打分，因此读取单位是（头， 全部历史）；分页缓存下表现为逐页取该头在该页的 $p$ 个 $d$ 维向量。读取方向沿 token 维扫、固定在某个头上，这正是 HND 把 (头, token) 排成外内两层的动机。</p>
+</details>
+</li>
+<li>
+<p>两种布局下"取一个 KV 头的一整页"的传输单元各是多少？代入 $d=128$、fp16、$p=32$ 复算。</p>
+<details>
+<summary>解答：$d$ 个元素对 $p \cdot d$ 个元素，256 B 对 8 KB</summary>
+<p>NHD 下单头一页碎成 $p$ 段、每段 $d$ 个元素：$128 \times 2 = 256$ 字节。HND 下是一段 $p \cdot d$ 个元素：$32 \times 128 \times 2 = 8192$ 字节即 8 KB。单段差 $p = 32$ 倍。该对比刻画页级搬运场景；GPU 上 kernel 读取同样存在碎片与连续的差异，但收益取决于 kernel 实现。</p>
+</details>
+</li>
+<li>
+<p>HND 的收益集中在哪些场景？为什么 fp16 下默认仍是 NHD？</p>
+<details>
+<summary>解答：低精度 kernel 与页级搬运；fp16 无显著差异</summary>
+<p>两类场景：一是低精度（fp8/nvfp4）的 trtllm-gen kernel，其 API 默认 kv_layout="HND"，NHD 会触发自动 transpose 与 .contiguous() 拷贝；二是页级大块搬运（offload、换入换出），单头取页的传输单元从 $d$ 个元素升至 $p \cdot d$ 个。fp16 常规推理下 FlashInfer 的实践表述是两种布局无显著性能差异，而 NHD 与投影输出一致、写入零转置，vLLM 默认偏好因此把 NHD（LBNHC）排在第一位。HND 不是普遍更优，而是特定读路径的选择。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="vllm-impl">4. vLLM 实现：逻辑形状固定，stride 置换切换布局</h2>
+
+<p>前三章的结论若要落地，引擎必须回答：布局切换会不会搬数据？多种注意力后端各有偏好时听谁的？本章按 stride 视图、枚举定义、布局协商、SM100、写入适配的顺序拆 vLLM 的答案（基于 2026-09-03 拉取的 main 分支）。</p>
+
+<h3 id="stride-view">4.1 stride：同一块内存的两种视图</h3>
+
+<p>stride（步长）指张量某一维的下标每加 1、物理位置前进的元素数。行主序的 $(p, H_{\mathrm{kv}}, d)$ 张量，三维 stride 依次是 $(H_{\mathrm{kv}} d,\; d,\; 1)$。同一块物理内存配上不同 stride，就得到不同布局的视图<sup>[F2]</sup>：</p>
+
+<ul>
+<li>NHD 视图：形状 $(p, H_{\mathrm{kv}}, d)$，stride $(H_{\mathrm{kv}} d, d, 1)$；</li>
+<li>HND 视图：形状 $(H_{\mathrm{kv}}, p, d)$，stride $(p d, d, 1)$。</li>
+</ul>
+
+<p>下面代码用贯穿示例同款参数（一页 16 个元素）在同一块内存上构造两个视图，验证"布局只是视图、切换不复制"<sup>[C20]</sup>：</p>
+
+<details class="code-details">
+<summary>代码：as_strided 在同一块内存上构造 NHD 与 HND 两个视图</summary>
+<div class="code-block">
+<pre><code class="language-python">import torch
+
+p, H, d = 4, 2, 2                       # 页内 token 数、KV 头数、每头维度
+flat = torch.arange(p * H * d, dtype=torch.float32)   # 一页 K 的 16 个元素
+
+nhd = flat.as_strided((p, H, d), (H * d, d, 1))       # NHD 视图：token 在外
+hnd = flat.as_strided((H, p, d), (p * d, d, 1))       # HND 视图：头在外
+
+print("物理顺序:", flat.tolist())
+print("NHD 下 token0 的全部头:", nhd[0].tolist())
+print("HND 下头0 的整页:", hnd[0].flatten().tolist())
+print("NHD stride:", nhd.stride(), " HND stride:", hnd.stride())</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">物理顺序: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+NHD 下 token0 的全部头: [[0.0, 1.0], [2.0, 3.0]]
+HND 下头0 的整页: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+NHD stride: (4, 2, 1)  HND stride: (8, 2, 1)</code></pre>
+</div>
+<p><b>验证的机制</b>：<code>nhd</code> 与 <code>hnd</code> 共享同一个 <code>flat</code>（同一块物理内存），stride 分别是 $(H \cdot d, d, 1) = (4, 2, 1)$ 与 $(p \cdot d, d, 1) = (8, 2, 1)$——正是 F2 的两个式子<sup>[C20, N4]</sup>。NHD 视图里 <code>token0</code> 的两个头是物理前 4 个元素（连续）；HND 视图里 <code>头0</code> 的整页是前 8 个元素（连续）。</p>
+<p><b>观察重点</b>：两个视图读出的是同一批数——<code>nhd[0]</code> 与 <code>hnd[0]</code> 覆盖的物理元素不同（前者槽 0 到 3，后者槽 0 到 7），但都来自同一 storage；构造第二个视图没有分配新内存。这就是"切换布局 = 换视图，不是复制数据"的直接证据，也回应了常见误解"切布局要搬运缓存"。</p>
+<p><b>简化条件</b>：只画一页、只用 K；真实缓存的完整形状见 4.2 节，K/V 拼接方式、页表寻址均未涉及（见 Paged Attention 页）。参数取 $p=4, H=2, d=2$ 便于与全文贯穿示例对照，工程值典型为 $p \in \{16, 32, 64\}$、$d = 128$。</p>
+</details>
+
+<h3 id="enum-def">4.2 KVCacheLayout 枚举与逻辑形状</h3>
+
+<p>vLLM main 分支把上述视图机制做成了正式抽象。KV cache 组的逻辑形状恒为五维 $[L, B, H, N, C]$（RFC #42082，vLLM 仓库的设计讨论稿）<sup>[C10]</sup>：</p>
+
+<ul>
+<li>$L$：层数（该 KV cache 组覆盖的注意力层数）；</li>
+<li>$B$：页数（num_blocks）；</li>
+<li>$H$：头槽数，标准注意力下等于 KV 头数 $H_{\mathrm{kv}}$<sup>[C12]</sup>；</li>
+<li>$N$：页内存储状态数，标准注意力一 token 一状态，$N = p$<sup>[C12]</sup>；</li>
+<li>$C$：每个（头槽， 状态）格的字节数，标准注意力为 K、V 两个 $d$ 维向量拼接的字节数<sup>[C12]</sup>。</li>
+</ul>
+
+<p><code>KVCacheLayout</code> 枚举的每个成员值是一个 stride 置换——把逻辑轴映射到物理顺序<sup>[C10]</sup>。与本文两个主角的对应关系：</p>
+
+<ul>
+<li><code>LBNHC = (0,1,3,2,4)</code>：物理顺序 $L, B, N, H, C$——N 被提到 H 外面，即 <strong>NHD</strong>；</li>
+<li><code>LBHNC = (0,1,2,3,4)</code>：恒等置换，物理顺序 $L, B, H, N, C$——H 在 N 外面，即 <strong>HND</strong>。</li>
+</ul>
+
+<p>旧名作为兼容别名保留：NHD 映射到 LBNHC、HND 映射到 LBHNC<sup>[C11]</sup>。置换的读法：物理第 $k$ 位放置换中第 $k$ 个编号的逻辑轴。</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">逻辑形状（恒定）</div>
+      <div class="dg-node-note">L, B, H, N, C：层数、页数、头槽、页内状态、每格字节</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">LBNHC 置换 (0,1,3,2,4)</div>
+      <div class="dg-node-note">N 与 H 两轴交换物理位置</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">物理顺序 L, B, N, H, C</div>
+      <div class="dg-node-note">即 NHD：token 在头外面</div>
+    </div>
+  </div>
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">逻辑形状（恒定）</div>
+      <div class="dg-node-note">L, B, H, N, C：层数、页数、头槽、页内状态、每格字节</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">LBHNC 置换 (0,1,2,3,4)</div>
+      <div class="dg-node-note">恒等置换，物理与逻辑同序</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">物理顺序 L, B, H, N, C</div>
+      <div class="dg-node-note">即 HND：头在 token 外面</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">同一逻辑形状经不同 stride 置换得到两种物理排布；上行为 NHD 路径、下行为 HND 路径。枚举还有 LHBNC、BLHNC、BLNHC、BHLNC 四个成员（L、B、H 的外层顺序变化），但 H 与 N 的相对物理顺序仍只有 head-major（头在外）与 token-major（token 在外）两类。</figcaption>
+</figure>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>本文叫法</th><th>vLLM 枚举</th><th>置换值</th><th>传给 FlashInfer 的名</th><th>页内物理顺序</th></tr></thead>
+<tbody>
+<tr><td>NHD</td><td>LBNHC</td><td>$(0,1,3,2,4)$</td><td>"NHD"</td><td>token 在外、头交错</td></tr>
+<tr><td>HND</td><td>LBHNC</td><td>$(0,1,2,3,4)$</td><td>"HND"</td><td>头在外、整页连续</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>调用 FlashInfer kernel 时，vLLM 把枚举翻译成 FlashInfer 的布局名传入（映射表：<code>LBNHC</code> 与 <code>BLNHC</code> 译为 "NHD"，<code>LBHNC</code>、<code>BLHNC</code>、<code>BHLNC</code> 译为 "HND"）<sup>[C17]</sup>。</p>
+
+<h3 id="negotiation">4.3 布局协商：后端声明与环境变量</h3>
+
+<p>布局不是逐层或逐请求决定的，整个引擎只解析一次。流程在 engine core（vLLM 的引擎核心进程）中运行<sup>[C14]</sup>：</p>
+
+<ol>
+<li>每个注意力后端用 <code>supported_kv_cache_layouts</code> 声明自己支持的布局列表（按偏好从前往后），返回 None 表示任何布局都行；</li>
+<li>引擎取所有后端声明列表的交集，得到候选集；</li>
+<li>若设置了环境变量 <code>VLLM_KV_CACHE_LAYOUT</code>（可取 LBNHC、LBHNC、LHBNC、NHD、HND、BLHNC、BLNHC、BHLNC，默认不设置）<sup>[C13]</sup>，其值必须落在候选集内，否则启动报错；</li>
+<li>解析结果记入 <code>cache_config.kv_cache_layout</code>，经 RPC 传给所有 worker，此后不可更改。</li>
+</ol>
+
+<p>没有任何后端声明偏好时，默认偏好序是 LBNHC、LBHNC、BLNHC、BLHNC、BHLNC、LHBNC——LBNHC（NHD）排第一位，与主线默认一致<sup>[C15]</sup>。环境变量是显式覆盖协商结果的入口：解析时优先读取它，值必须落在候选集内，否则启动失败<sup>[C14]</sup>。</p>
+
+<h3 id="sm100">4.4 SM100：trtllm-gen 只接受 head-major</h3>
+
+<p>第 3 章说低精度 trtllm-gen kernel 偏好 HND；这里看它如何变成 vLLM 里的硬约束。TRT-LLM 注意力 kernel 的可用性按硬件分档<sup>[C19]</sup>：SM90（Hopper）与 SM12x 只有 XQA（TRT-LLM 的 decode 阶段注意力 kernel）可用；SM100/SM103（Blackwell）prefill 与 decode 两阶段都有 TRT-LLM kernel（即 trtllm-gen 路径）；两者都要求 NVIDIA artifactory 可达（下载 cubins），且查询头数必须被 KV 头数整除（GQA 整组）。</p>
+
+<p>在 SM100 上，vLLM 的 FlashInfer 后端声明自己只支持 <code>(LBHNC, BLHNC)</code>——两个都是 head-major（头维排在外层）布局。源码注释给出的原因：<strong>trtllm-gen kernel 消费 head-major 的块内布局，L 与 B 在块外的嵌套顺序对它无关紧要</strong><sup>[C16]</sup>。由于候选集是各后端声明的交集，SM100 上走 FlashInfer 后端时布局必然解析为 head-major，即 HND 类——引擎侧看到"KV cache 使用 HND 布局"这一结果，机制链条就在这里。配套地，SM100 上 GQA 模型可用的 kernel 页大小扩展到 128 到 1024（其他平台为 16/32/64），大页同样只在 trtllm-gen 路径上提供<sup>[N3]</sup>。</p>
+
+<h3 id="write-adapt">4.5 写入 kernel 的适配与演进注记</h3>
+
+<p>布局解析为 head-major 后，写入路径怎么和"投影输出是 NHD"协调？vLLM 的 FlashInfer 写路径是现成例子<sup>[C18]</sup>：per-layer 缓存视图形状为 $(B, H, N, 2 \cdot \text{hs})$——head-major、K 与 V 沿最后一维拼接，hs 即 head_size、对应本文的 $d$；写入前先做一次视图层面的转换：</p>
+
+<div class="code-block">
+<pre><code class="language-python"># vllm/v1/attention/backends/flashinfer.py（节选，注释为源码原文）
+# (B, H, N, 2*hs) -&gt; ((B, N, H, hs), (B, N, H, hs))
+k_cache, v_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+torch.ops._C_cache_ops.reshape_and_cache_flash(
+    key, value, k_cache, v_cache, slot_mapping, ...)</code></pre>
+</div>
+
+<p><code>transpose</code> 与 <code>split</code> 都是 stride 层面的视图操作，不复制数据；转换后得到的 $(B, N, H, \text{hs})$ 正是 <code>reshape_and_cache_flash</code> 期望的 NHD 形状。写路径的"不自然"被限制在一次视图转换里，这就是第 2 章说"HND 一样写得进去"的具体形态。</p>
+
+<p>演进注记。 上述 $[L, B, H, N, C]$ 形状体系是 RFC #42082 引入的现行形态。更早的版本（以 v0.13.0 为例）里，KV cache 是每层独立的 buffer，形状为 $(\text{num\_blocks},\; 2,\; \text{block\_size},\; H_{\mathrm{kv}},\; d)$（"2"是 K/V 维），布局切换由 <code>get_kv_cache_stride_order</code> 给出置换、<code>kv_cache.permute(*stride_order)</code> 应用：NHD 是 $(0,1,2,3,4)$，HND 是 $(0,1,3,2,4)$——交换 block_size 与 num_kv_heads 两维<sup>[C21]</sup>。机制与现行版本同源（逻辑形状加步长置换），差别只在形状体系与协商机制的有无。</p>
+
+<h3 id="ch4-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>什么是张量 stride？为什么说 NHD 与 HND 是同一块显存的两个视图？</p>
+<details>
+<summary>解答：stride 定义与 as_strided 验证</summary>
+<p>stride 是某维下标每加 1、物理位置前进的元素数。行主序下 NHD 视图 $(p, H_{\mathrm{kv}}, d)$ 的 stride 是 $(H_{\mathrm{kv}} d, d, 1)$，HND 视图 $(H_{\mathrm{kv}}, p, d)$ 的是 $(p d, d, 1)$。用 as_strided 在同一块 16 元素内存上构造两个视图，两者读出的都是同一批数、构造第二个视图不分配新内存——布局切换是换视图（改 stride），不是复制数据。"切布局要搬缓存"是误解。</p>
+</details>
+</li>
+<li>
+<p>vLLM 的 KVCacheLayout 枚举怎么定义布局？NHD/HND 对应哪两个成员？</p>
+<details>
+<summary>解答：枚举值即 stride 置换</summary>
+<p>逻辑形状恒为 $[L, B, H, N, C]$（层数、页数、头槽、页内状态数、每格字节数；标准注意力下 $N = p$、$C$ 为 K、V 拼接的字节数）。枚举成员值是把逻辑轴映射到物理顺序的 stride 置换：LBNHC = (0,1,3,2,4)，物理顺序 L,B,N,H,C，即 NHD；LBHNC = (0,1,2,3,4)，恒等置换，物理顺序 L,B,H,N,C，即 HND。NHD/HND 是兼容别名。调用 FlashInfer kernel 时枚举被译为其布局名（LBNHC 译为 "NHD"、LBHNC 译为 "HND"）。</p>
+</details>
+</li>
+<li>
+<p>布局在 vLLM 引擎里如何解析？SM100 上为什么解析成 head-major？</p>
+<details>
+<summary>解答：后端声明取交集；trtllm-gen 只吃 head-major</summary>
+<p>布局在 engine core 解析一次：每个注意力后端用 supported_kv_cache_layouts 声明偏好列表（None 表示无偏好），引擎取交集得候选集；环境变量 VLLM_KV_CACHE_LAYOUT 显式指定时必须落在候选集内否则报错；无声明时默认偏好 LBNHC（NHD）排第一。SM100（Blackwell）上 FlashInfer 后端只声明 (LBHNC, BLHNC)，因为 trtllm-gen kernel 消费 head-major 的块内布局——所以 SM100 走 FlashInfer 时布局必然解析为 HND 类。</p>
+</details>
+</li>
+<li>
+<p>切换布局需要复制数据吗？写入 kernel 怎么适配 head-major 布局？</p>
+<details>
+<summary>解答：视图转换不复制；transpose 后喂 NHD kernel</summary>
+<p>不需要复制。布局是同一 storage 的视图属性，as_strided 验证了两个视图共享同一块内存。写入侧的实例：vLLM FlashInfer 写路径拿到 $(B, H, N, 2 \cdot \text{hs})$ 的 head-major 视图（K、V 沿最后一维拼接）后，先 transpose(1,2) 得到 $(B, N, H, \text{hs})$——stride 层面的视图操作、零拷贝——再 split 出 K、V 喂给期望 NHD 形状的 reshape_and_cache_flash。写路径的额外代价被限制在一次视图转换。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+<ul>
+<li><b>C1-C4</b>：FlashInfer 官方文档 "KV-Cache Layout in FlashInfer"（docs.flashinfer.ai/tutorials/kv_layout.html；GitHub 固定锚点为 flashinfer-ai/flashinfer commit 3d43dc9 的 docs/tutorials/kv_layout.rst）。NHD/HND 三维定义、NHD 与 $xW_K$/$xW_V$ 输出一致无需转置、HND 对低精度 GPU 实现更友好、fp16 下两者无显著性能差异且优先 NHD。</li>
+<li><b>C5-C7</b>：FreeKV，arXiv:2505.13109v2，§4.2 "Hybrid layouts and streamed recall"。分页形状 $(n_{\text{page}}, p, n_{\text{kv}}, d)$ 与 $(n_{\text{page}}, n_{\text{kv}}, p, d)$；NHD 单头一页不连续、最大传输单元 $d$ 个元素，HND 连续 $p \times d$ 个；混合布局（GPU 用 NHD、CPU 用 HND、offload 时转置一次）。</li>
+<li><b>C8-C9</b>：FlashInfer API 文档 flashinfer.prefill.trtllm_batch_context_with_kv_cache（docs.flashinfer.ai）。kv_layout 默认 "HND"；NVFP4 下 NHD 触发自动 transpose 与 .contiguous() 拷贝；TMA 16 字节盒宽对最后两维连续性的要求。</li>
+<li><b>C10-C12、C17</b>：vLLM main 分支（2026-09-03 拉取）vllm/v1/kv_cache_layout.py、vllm/config/cache.py、vllm/v1/kv_cache_interface.py、vllm/v1/attention/backends/utils.py。KVCacheLayout 枚举与 $[L,B,H,N,C]$ 逻辑形状（RFC #42082）、NHD/HND 别名、C 维字节构成、FlashInfer 布局名映射。</li>
+<li><b>C13-C15</b>：vLLM main 分支 vllm/envs.py（VLLM_KV_CACHE_LAYOUT 取值）、vllm/v1/attention/backends/utils.py（resolve_kv_cache_layout 协商流程、默认偏好序）。</li>
+<li><b>C16、C19、N3</b>：vLLM main 分支 vllm/v1/attention/backends/flashinfer.py、vllm/utils/flashinfer.py。SM100 上声明 (LBHNC, BLHNC) 及 trtllm-gen head-major 注释；supports_trtllm_attention 硬件分档；SM100 大页 128 到 1024。</li>
+<li><b>C18</b>：vLLM main 分支 vllm/v1/attention/backends/flashinfer.py 写入路径（$(B,H,N,2 \cdot \text{hs})$ 视图 transpose 后喂 reshape_and_cache_flash）。</li>
+<li><b>C20</b>：本地验证，PyTorch 2.13.0，2026-09-03 运行；脚本与输出存 research/verify_strided.py、research/verify_strided.out。</li>
+<li><b>C21</b>：vLLM tag v0.13.0（2026-09-03 拉取）vllm/v1/attention/backends/flashinfer.py。旧形状体系 (num_blocks, 2, block_size, H_kv, d) 与 stride_order 置换。</li>
+</ul>
+
+<h3>公式与来源（F）</h3>
+<ul>
+<li><b>F1</b>：分页形状，FreeKV §4.2（同 C5）。</li>
+<li><b>F2</b>：页内三维 stride $(H_{\mathrm{kv}} d, d, 1)$ 与 $(p d, d, 1)$，由行主序步长的通用规则与 vLLM compute_layout_strides（从最内维累乘）推出，经 C20 本地运行验证。</li>
+<li><b>F3</b>：传输单元 $d \cdot b$ 对 $p \cdot d \cdot b$ 字节，由 C6 的元素数结论代数化。</li>
+</ul>
+
+<h3>外部数字与实验条件（N）</h3>
+<ul>
+<li><b>N1</b>：256 字节——$d=128$、fp16 下 NHD 单头取一页的单段大小（FreeKV §4.2）。</li>
+<li><b>N2</b>：8 KB——$p=32$ 时 HND 单头取一页的单段大小（FreeKV §4.2）。</li>
+<li><b>N3</b>：SM100 + GQA + trtllm 可用时 kernel 页大小 128/256/512/1024，其他平台 16/32/64（vLLM main flashinfer.py get_supported_kernel_block_sizes）。</li>
+<li><b>N4</b>：本地验证参数——$p=4$、$H_{\mathrm{kv}}=2$、$d=2$ 的 16 元素页，NHD 视图 stride $(4, 2, 1)$、HND 视图 $(8, 2, 1)$；PyTorch 2.13.0，2026-09-03 运行（research/verify_strided.out）。</li>
+</ul>
+
+<h3>构造示例</h3>
+<ul>
+<li>贯穿示例：$p=4$、$H_{\mathrm{kv}}=2$、$d=2$ 的一页 16 个 K 元素（图 1、图 2 与 4.1 节代码共用），用于手算两种排布与访问段；取小值便于复算，不代表工程配置。</li>
+<li>4.1 节代码的参数同上；预期输出为 2026-09-03 的真实运行结果。</li>
+</ul>
+
+<h3>辅助解释与类比边界</h3>
+<ul>
+<li>3.2 节"低精度让 NHD 变亏"的机制解释（间隔 $H_{\mathrm{kv}} d b$ 随 $b$ 变窄、难凑满宽访问与 TMA 盒宽）是推断：来源只给出结论（C3）、API 默认与转置代价（C8）和 TMA 约束（C9），未给出该机制表述。</li>
+</ul>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>图示与代码只画一页、只画 K：省略页表寻址（见 Paged Attention 页）与 K/V 拼接细节；结论"谁连续"不受省略影响。</li>
+<li>分页形状采用 FreeKV 的记号 $(n_{\text{page}}, \cdot)$；vLLM main 的逻辑形状是 $[L,B,H,N,C]$ 五维，两者是同一页内三维的两种包装，页内相对关系一致。</li>
+<li>vLLM 细节基于 2026-09-03 的 main 分支（滚动分支）；TRT-LLM kernel 可用性还受 artifactory 可达性等运行时条件影响（C19），本文未展开。</li>
+</ul>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
