@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Mooncake 概览：以 KVCache 为中心的 PD 分离 LLM 服务架构。">
+  <meta name="dojo:summary" content="Mooncake 以 KVCache 为调度中心：prefill 与 decode 分离、KVCache 池扩展到全集群、Conductor 路由请求、过载下基于系统级预测早拒绝。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="推理系统,内存与缓存,并行与通信">
+  <meta name="dojo:tag" content="PD分离·KVCache中心·概览">
+<title>Mooncake · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 推理系统</span>
+      <h1>Mooncake</h1>
+      <p class="lead">Moonshot AI 为 Kimi 在线服务打造的分离式推理架构：把 prefill 与 decode 拆到不同集群，把 GPU 集群闲置的 CPU/DRAM/SSD/RDMA 组成全局 KVCache 池，由 Conductor 按缓存复用与负载同时最优路由请求。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <h2>问题背景</h2>
+<p>在线 LLM 服务需要同时满足两个延迟 SLO：TTFT（首字延迟，对应 prefill 阶段）与 TBT（连续 token 间延迟，对应 decode 阶段）。然而 prefill 是计算密集、超线性于输入长度；decode 是访存密集、次线性于 batch 大小。把两个阶段放在同一 GPU 集群里服务时，长 prefill 会抬高同 batch 中所有 decode 序列的延迟，超大 decode batch 又会拖慢新请求的 prefill——两个 SLO 同时被破坏。Mooncake 把两阶段彻底分离到不同集群来解决这一矛盾。</p>
+
+<h2>核心机制</h2>
+<ul>
+<li><b>PD 分离 + 分布式 KVCache 池</b>：GPU 集群里每节点的 CPU DRAM（必要时 SSD）共同组成全局 KVCache 池，跨节点由 Messenger（GPUDirect RDMA）传输。这把传统本地 KVCache 缓存（如 <a href="../../wiki/paged-attention/index.html">vLLM 的 PagedAttention</a>）从单节点扩展到全集群，并利用 GPU 服务器里长期闲置的邻居容量。</li>
+<li><b>Conductor + cache-aware 调度（Algorithm 1）</b>：对每请求按块哈希链（见 <a href="../../wiki/prefix-caching/index.html">Prefix caching</a>）算出在每个 prefill 实例可复用的前缀长度，估计 TTFT（本地够用则不传、否则从最佳实例拉差额并按传输后复用最佳前缀计算），选 TTFT 最短者；超过 SLO 直接 HTTP 429 拒绝；所选实例的 prefix 远低于全局最佳时，自动把热点缓存迁过来——这是 cache-aware + 负载均衡同时最优的解。</li>
+<li><b>CPP（chunked pipeline parallelism）</b>：长上下文 prefill 把每请求输入切成 $≤$ prefill_chunk 的块，不同块由不同节点流水线同时处理，跨节点通信只在 stage 边界传递 activation 且可与计算重叠。比跨节点 TP（每层 2 次 RDMA all-reduce）和 SP（每层至少 1 次跨节点通信）的 MFU（Model FLOPs Utilization）都高。</li>
+<li><b>Layer-wise prefill</b>：prefill 按层逐层进行，每层 KVCache 在该层 attention 算完后立即异步 store 到 CPU DRAM，下一层 KVCache 在上一层算时已异步载入。prefill 实例执行时间 $≈$ max(载入时间, 标准 prefill 时间)——调度只需考虑 DRAM 容量而无需考虑 VRAM。</li>
+<li><b>基于预测的早拒绝</b>：当 GPU 供给受限出现过载时，朴素早拒绝按当前 decode 负载调度会引发 prefill/decode 反相震荡的四阶段循环；Mooncake 用系统级预测——假设每请求 decode 时长均匀 $t_d$，预测请求完成 prefill 时的 decode 负载，再决定是否接受。</li>
+</ul>
+
+<h2>关键结论与边界</h2>
+<ul>
+<li><b>PD 分离对长上下文场景显著有益</b>：在 16k/32k/64k/128k 上下文模拟数据上，Mooncake 相比 vLLM 提升 50%–525% 吞吐；在真实 Kimi 回放负载下多处理约 75% 请求，且 TBT SLO 满足率 ~100%（vLLM 仅 57%）。该结论在 cache ratio &gt; 0% 的多轮/系统提示词场景下成立。</li>
+<li><b>cache-aware 调度的收益主要来自 cache 复用，不是单纯靠负载均衡</b>：8 prefill + 8 decode 实例重放实验中，KVCache-centric 调度把平均 TTFT从 random 92.07s 降到 6.26s，把 cache-aware（14.36s）和 load-balancing（60.41s）也都优于随机；cache-aware 与 KVCache-centric 均满足 SLO 线。</li>
+<li><b>该设计针对在线 MaaS（Model as a Service，模型即服务）场景优化</b>：长上下文为主、输入远超输出、多轮前缀复用、过载常态化。在短输入/低复用场景（如 ArXiv Summarization，cache ratio $≈$ 0%）Mooncake 仅比 vLLM 多 20% 吞吐——收益仍存在但不显著。所有实验基于回放 trace + dummy LLaMA2-70B 架构（论文保护商业信息）。</li>
+<li><b>本页面不展开</b>：Transfer Engine / Messenger 的内部实现（RDMA 编程、拓扑探测——论文 v4 仅描述接口与位置）、同名开源仓库的组件生态（论文 §1 仅声明 trace 仓库地址，组件扩展不在本文范围）、异构加速器/PIM 等未来方向（论文 §10 提及）。这些是相关但独立的内容。</li>
+</ul>
+
+<p>主要依据：Ruoyu Qin et al., <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>, FAST '25 / arXiv:2407.00079v4。</p>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
