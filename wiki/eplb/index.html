@@ -1,0 +1,1671 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="EPLB 是 DeepSeek 开源的专家并行负载均衡算法，也是 vLLM 的内置功能：复制高负载专家形成冗余副本，按估计负载把物理专家均衡打包到节点与 GPU，并随线上统计周期性重排，拉平专家并行的忙闲不均。">
+  <meta name="dojo:summary" content="专家并行的整层时间由负载最大的卡决定。EPLB 用冗余专家复制热专家，单副本打包负载为 $w_e/c_e$；经组到节点、节点内复制、物理到 GPU 三步均衡排布，并按线上统计周期性重排；vLLM 以 --enable-eplb 提供同源算法。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="并行与通信,推理系统">
+  <meta name="dojo:tag" content="MoE 专家并行负载均衡">
+  <title>EPLB 专家并行负载均衡：复制热专家、均衡摆放，拉平忙闲不均</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">EPLB</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">专家并行负载均衡（EPLB）：复制热专家、均衡摆放，拉平忙闲不均</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：deepseek-ai/EPLB 仓库（README 与 eplb.py，main 分支）；DeepSeek-V3 技术报告（arXiv:2412.19437）；vLLM 文档「Expert Parallel Deployment」与源码 vllm/distributed/eplb/policy/default.py。</p>
+</blockquote>
+
+<p>一个 8 卡的专家并行部署上放着 12 个逻辑专家。一段服务时间过后，统计给出每个专家收到的 token 数：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>专家</th><th>e0</th><th>e1</th><th>e2</th><th>e3</th><th>e4</th><th>e5</th><th>e6</th><th>e7</th><th>e8</th><th>e9</th><th>e10</th><th>e11</th><th>合计</th></tr></thead>
+<tbody>
+<tr><td>token 负载</td><td>90</td><td>132</td><td>40</td><td>61</td><td>104</td><td>165</td><td>39</td><td>4</td><td>73</td><td>56</td><td>183</td><td>86</td><td>1033</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>这组数字来自 EPLB 仓库 README 的示例，用来演示算法输入，不是线上实测。两个观察先摆在这里：第一，12 个专家的槽位没法均分到 8 张卡上；第二，最热的专家 e10 一家就吃掉 183 个 token，而 8 卡均摊的预算只有 $1033/8 = 129.125$。不做处理的话，e10 所在的卡必然超载，并拖慢整层计算。</p>
+
+<p>EPLB（Expert Parallelism Load Balancer，专家并行负载均衡器）是 DeepSeek 开源的排布算法，也是 vLLM 的内置功能：给定每个逻辑专家的估计负载，它计算一份「复制哪些专家、每个物理副本放在哪张卡」的方案，使各卡负载尽量均衡；线上部署再按统计周期性重算这份方案<sup>[C1, C2, C13]</sup>。本页用上面的示例把算法完整手算一遍，并对照 DeepSeek-V3 的部署事实与 vLLM 的集成方式。</p>
+
+<section class="learning-goals">
+<h2>核心问题</h2>
+<ol class="chapter-questions">
+<li>
+<p>专家并行下 GPU 负载为什么不均？代价如何量化？</p>
+<details>
+<summary>解答：负载由路由结果决定，整层时间由最慢的卡决定</summary>
+<p>专家并行把不同专家分到不同 GPU，一张卡的负载约等于发往它所持专家的 token 数；dispatch 之后各卡独立计算，整层在同步点等最慢的卡，层时间由负载最大的卡决定。理想均分下的利用率可以用「平均负载 ÷ 最大负载」量化——构造一个两卡 800/200 的例子，利用率只有 62.5%。训练期的 bias 均衡只在训练步末更新，推理期路由规则固定，而线上 token 分布随 workload 变化，所以推理部署需要独立于路由的均衡手段。完整论证见「1. 专家并行的木桶效应」。</p>
+</details>
+</li>
+<li>
+<p>冗余专家如何在不增加每 token 计算的前提下分摊热专家负载？为什么还顺带解决显存槽位对齐？</p>
+<details>
+<summary>解答：副本均摊单副本负载 $w_e/c_e$，多出的槽位补齐整除</summary>
+<p>逻辑专家可以拥有多个物理副本，发往它的 token 被各副本均摊，单副本负载为 $w_e/c_e$；每个 token 激活的专家数不变（仍是 top-k），代价是副本参数多占显存。物理专家总数必须被 GPU 数整除（每卡槽位固定），逻辑专家数不整除时，冗余副本恰好补齐槽位：12 个逻辑专家补 4 个冗余得 16 = 8 卡每卡 2 槽。复制谁由贪心决定：每次给 $w_e/c_e$ 最大的专家加一副本。完整论证见「2. 冗余专家」。</p>
+</details>
+</li>
+<li>
+<p>层次策略的三步各做什么？如何在官方示例上完整手算？</p>
+<details>
+<summary>解答：组进节点、节点内复制、再均衡装进 GPU，手算结果与官方输出逐槽一致</summary>
+<p>第一步把专家组均衡打包到节点（组不跨节点，减少跨节点流量）；第二步在每个节点内对本地专家贪心复制；第三步把物理专家（打包负载 = 逻辑负载 ÷ 副本数）均衡打包到节点内 GPU。官方示例上：组负载 262/330/116/325 打包成节点 446/587，节点内分别复制 e5、e4 与 e10、e1，最终 8 卡负载落在 86.5–156，输出映射与官方 tensor 逐槽一致。全局策略忽略分组，同例均衡度更好（max/mean 约 1.07 对 1.21）但失去组局部性。完整手算见「3. 三步排布」。</p>
+</details>
+</li>
+<li>
+<p>重平衡闭环如何在线上运转？DeepSeek-V3 与 vLLM 各怎么落地？</p>
+<details>
+<summary>解答：统计、重算、搬运、继续服务；V3 约每 10 分钟，vLLM 默认每 3000 步</summary>
+<p>每次前向收集负载统计，周期性重算排布（V3 线上约每 10 分钟；vLLM 默认每 3000 个引擎步、用最近 1000 步的窗口统计），然后搬运权重、更新物理映射与路由表。V3 prefill 用 4 节点 32 卡、每卡 8+1 个专家；decode 用 40 节点 320 卡、每卡 1 个专家、共享专家视为必选路由专家。vLLM 用 --enable-eplb 启用，每卡专家数按 (专家总数 + 冗余数) ÷ EP rank 数计算，内存开销有对应公式。完整论证见「4. 周期性重平衡」。</p>
+</details>
+</li>
+<li>
+<p>EPLB 不解决什么？</p>
+<details>
+<summary>解答：负载预测、路由层均衡、通信 kernel 效率、重排间隙的漂移都不在其范围</summary>
+<p>负载预测方法被官方明确划出范围（常见做法是历史统计的移动平均）；「token 选谁」的路由层均衡由训练期 bias 承担，与 EPLB 是互补的两层；贪心加整除约束不保证最优——构造例中层次策略 max/mean 约 1.21 而非 1.0；周期性重排跟不上实时漂移，UltraEP、MoonEP 是后续改进方向。完整论证见「5. 边界」。</p>
+</details>
+</li>
+</ol>
+</section>
+
+<section class="misconceptions">
+<h2>常见误解</h2>
+<ul>
+<li>EPLB 改变路由，让 token 换个选法——不改。EPLB 调节「专家放哪、复制几份」，路由规则原封不动；调节「token 选谁」的是训练期的 bias 均衡，两层互补。</li>
+<li>冗余专家让每个 token 多算几个专家——不多算。每 token 激活的专家数不变（仍是 top-k），副本只分摊发往同一逻辑专家的 token，代价是多占显存而非多算。</li>
+<li>一次排布就永久均衡——线上负载随 workload 漂移，方案要周期性重算（V3 线上约每 10 分钟，vLLM 默认每 3000 步）。</li>
+</ul>
+</section>
+
+<p>先弄清楚「为什么慢」：不均的代价有多大、训练期已经做过的均衡为什么到推理期会失效。</p>
+
+<h2 id="s1-bucket-effect">1. 专家并行的木桶效应——最慢的卡决定整层时间</h2>
+
+<h3 id="s1-gpu-load">1.1 一张卡的负载由什么决定</h3>
+
+<p>专家并行（EP）把 MoE 层的不同专家分片到不同 GPU，每张卡只持有部分专家。每个 token 由 router 选出 top-k 个专家后，它的激活被 dispatch（一次 all-to-all 通信）送到这些专家所在的卡；专家算完，输出再经 combine（又一次 all-to-all）送回原卡加权合并。这套数据流的细节见<a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。</p>
+
+<p>于是一张卡的负载约等于「发往它所持专家的 token 数」。这个量由两件事共同决定：token 的路由结果（选了哪些专家），以及专家摆在了哪些卡上。路由结果随 workload 变化——不同业务、不同时间段，热门专家不同<sup>[C1]</sup>；摆放如果固定不变，忙闲不均就只是时间问题。</p>
+
+<p>代价在同步点兑现。dispatch 之后各卡独立计算，但 combine 之前整层必须等所有卡到齐：快卡算完也得等慢卡。整层时间由负载最大的卡决定，其余卡的空闲都是浪费。构造一个最小的量化工具（本页构造，非来源公式）：层利用率 = 平均负载 ÷ 最大负载<sup>[F2]</sup>。两卡各承载 800 与 200 个 token 时，利用率 = $500/800 = 62.5\%$——一半算力在等。该比值越大越接近 1（完全均衡），实际中总是 $\le 1$。</p>
+
+<p>回到开头的 12 专家示例。总负载 1033，8 卡均值 129.125；而 e10 一家的负载就有 183，超出预算 42%。若不复制 e10：e10 独占一卡时该卡最大负载 183（最好情况；最大与均值之比至少 $183/129.125 \approx 1.42$，层利用率至多约 70.6%）；若 e10 与另一个专家共卡，最好的搭配是 e10 与最冷的 e7 共卡，该卡最大负载 187（max/mean 至少 $\approx 1.45$，层利用率至多约 69%）<sup>[N2]</sup>。不论哪种摆放，单 e10 一项就足以让最慢卡把整层时间拉到比理想均分高出 40% 以上。「12 个槽分给 8 张卡」这个整除问题，也会在「2. 冗余专家」一并解决。</p>
+
+<h3 id="s1-train-vs-infer">1.2 训练时已经均衡了，为什么推理还会不均</h3>
+
+<p>DeepSeek-V3 训练时用辅助损失无关策略做均衡：一个 bias 项加在专家亲和分数上，只影响 top-K 选择；每个训练步的末尾，过载专家的 bias 减 $\gamma$、欠载的加 $\gamma$，逐步把负载拉平。机制的完整拆解见<a href="../aux-loss-free-routing/index.html">辅助损失无关路由</a>。由于均衡策略有效，V3 训练全程不丢 token<sup>[C12]</sup>。</p>
+
+<p>问题在于这套更新挂在训练步上。报告原文写的是「每个训练步末」更新 bias<sup>[C12]</sup>；推理没有训练步，bias 不再更新，路由规则（含 bias）原封不动——这是从更新机制直接得出的推断（报告未逐字陈述推理期行为）。与此同时，线上 token 分布随 workload 变化<sup>[C1]</sup>：换个业务、换个时间段，热门专家就换一批。训练期学到的均衡只覆盖训练分布，推理期的漂移要靠部署层自己吸收。</p>
+
+<p>V3 还给了一个硬约束：推理也不丢 token<sup>[C12]</sup>。丢 token（溢出即丢弃）是路由层的暴力均衡手段，V3 不用；剩下的手段就是部署层的排布——这正是 EPLB 所在的层。两层均衡各管一件事：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>训练期 bias 均衡</th><th>推理期 EPLB</th></tr></thead>
+<tbody>
+<tr><td>作用层</td><td>路由层（token 选谁）</td><td>部署层（专家放哪、复制几份）</td></tr>
+<tr><td>调节对象</td><td>加在亲和分数上的 bias</td><td>物理专家的副本数与位置</td></tr>
+<tr><td>生效时机</td><td>每个训练步末更新</td><td>按统计周期性重算排布</td></tr>
+<tr><td>路由规则</td><td>随 bias 变化</td><td>原封不动</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s1-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>一张 GPU 的负载由什么决定？整层计算时间由什么决定？</p>
+<details>
+<summary>解答：负载约等于发往该卡所持专家的 token 数，层时间由负载最大的卡决定</summary>
+<p>负载 = 路由结果（token 选了哪些专家）与专家摆放（专家在哪些卡上）的乘积效应，约等于发往该卡所持专家的 token 数。dispatch 之后各卡独立计算，combine 之前整层在同步点等所有卡到齐，层时间由负载最大的卡决定，层利用率可用平均负载 $\div$ 最大负载量化。构造示例：12 专家总负载 1033、8 卡均值 129.125，e10 负载 183 已超预算；不复制 e10 时，e10 独占一卡最大负载 183（max/mean $\approx 1.42$、利用率 $\le 70.6\%$），与 e7 共卡最大负载 187（max/mean $\approx 1.45$、利用率 $\le 69\%$）。</p>
+</details>
+</li>
+<li>
+<p>训练时已经用 bias 均衡了，为什么推理部署还会不均？</p>
+<details>
+<summary>解答：bias 更新挂在训练步末，推理期路由固定而 token 分布仍在漂移</summary>
+<p>V3 报告写明 bias 的增减发生在每个训练步末；推理没有训练步，bias 固定、路由规则不变（由更新机制直接推出的推断，报告未逐字陈述）。线上 token 分布随 workload 变化，训练期的均衡不覆盖推理期的分布。V3 承诺训练与推理都不丢 token——丢 token 是路由层的暴力均衡手段，不用它，就用部署层排布（EPLB）：调「专家放哪、复制几份」，路由规则不动。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="s2-redundant-experts">2. 冗余专家——用参数副本分摊计算，顺带对齐显存槽位</h2>
+
+<h3 id="s2-logical-physical">2.1 逻辑专家与物理专家</h3>
+
+<p>把两个词分开：逻辑专家是模型定义中的专家，router 的候选单位，数量记为 num_log；物理专家是显存里实际存放的一份专家参数，总数记为 num_phy。一个逻辑专家 $e$ 可以拥有 $c_e$ 个物理副本——它们参数相同、各占一份显存，对路由来说仍是同一个候选。</p>
+
+<p>副本的作用是分摊。设逻辑专家 $e$ 的估计负载为 $w_e$（一段时间内发往它的 token 数），副本数为 $c_e$，则每个副本承载的打包负载为：</p>
+
+<p>$$\ell_e = \frac{w_e}{c_e}$$</p>
+
+<ul>
+<li>$w_e$：逻辑专家 $e$ 的估计负载，单位为一段时间内发往它的 token 数。</li>
+<li>$c_e$：逻辑专家 $e$ 的物理副本数。</li>
+<li>$\ell_e$：每个物理副本承载的打包负载（用于后续均衡打包计算）。</li>
+</ul>
+
+<p>这个式子背后是一个显式假设：发往同一逻辑专家的 token 被各副本均摊<sup>[C8, F1]</sup>。EPLB 的打包计算建立在该假设上，把它变成现实是分发层的职责——dispatch 时需要在各副本之间分散发往该逻辑专家的 token。具体的分发机制不在 EPLB 仓库范围内（README 只对负载预测点过「移动平均」一种常见做法），本页亦无法验证「轮流分发」是否就是常见实现，故此处的具体表述仅为辅助解释，与 EPLB 自身的约束保持独立；若分发不均，实际负载会偏离计算值。</p>
+
+<p>注意每 token 的计算量没有变：token 仍按 top-k 选逻辑专家，每个被选中的逻辑专家在其中一份副本上算一次。副本改变的是「谁来算」，不是「算多少」；代价是显存——多一个副本就是多一份完整的专家参数，量化公式放在「4. 周期性重平衡」的 4.3 节。</p>
+
+<h3 id="s2-divisibility">2.2 槽位整除——冗余的第二个作用</h3>
+
+<p>显存均匀地分配给每张卡，每卡的专家槽位数固定，因此物理专家总数必须被 GPU 数整除——这是 EPLB 接口的硬约束（num_replicas 必须是 num_gpus 的倍数<sup>[C9]</sup>）。12 个逻辑专家放进 8 张卡，12 不被 8 整除，怎么摆都不齐。</p>
+
+<p>冗余专家把两个问题一起解决：12 个逻辑专家补 4 个冗余副本，得 16 个物理专家，$16 = 8 \times 2$，每卡恰好 2 槽。从补齐整除的角度看，多出来的 4 个槽放谁都行——复制最冷的专家也能凑数；但对均衡无益，因为热门专家的负载没有被分摊。对照：若 4 个名额给了冷专家（如 e7，负载 4），槽位齐了，最大单副本负载仍是 e10 的 183。放热专家的副本，才能同时分摊计算<sup>[C2]</sup>。这就是「复制高负载专家」策略的完整动机。</p>
+
+<p>层次策略路径上还有一条整除链：逻辑专家数要整除组数、组数要整除节点数、GPU 数要整除节点数<sup>[C9]</sup>。「组」是什么、为什么要整除，第 3 章展开。</p>
+
+<h3 id="s2-greedy">2.3 复制哪些专家——贪心规则</h3>
+
+<p>复制谁由一个贪心决定：目标是使「所有副本的最大负载」尽量小，实现为每次给 $w_e/c_e$ 最大的逻辑专家增加一个副本<sup>[C6]</sup>。直觉很直接：每一步都把当前最高的单副本负载压到 $w_e/(c_e+1)$，冷专家永远不会成为最大值，名额不会被浪费。</p>
+
+<p>在示例上从全局视角手算（12 → 16，4 个冗余名额，暂不管节点与分组）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>步</th><th>加副本给</th><th>加之前 $w_e/c_e$</th><th>加之后 $w_e/c_e$</th><th>当前最大单副本负载</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>e10</td><td>183</td><td>91.5</td><td>165（e5）</td></tr>
+<tr><td>2</td><td>e5</td><td>165</td><td>82.5</td><td>132（e1）</td></tr>
+<tr><td>3</td><td>e1</td><td>132</td><td>66</td><td>104（e4）</td></tr>
+<tr><td>4</td><td>e4</td><td>104</td><td>52</td><td>91.5（e10）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>四步之后，最大单副本负载是 91.5（e10 的两份副本），已低于 129.125 的预算；对照不复制时 e10 所在卡的至少 187，热专家的负载被切实分摊了。贪心每一步都选当前最大，这保证了名额永远花在刀刃上。</p>
+
+<details>
+<summary>展开：贪心复制 12→16 的逐步验证</summary>
+<p>逐步列出每次加副本后全部专家的 $w_e/c_e$（只写变化项与最大值）。初始（全部 $c_e = 1$）：最大值 = e10 的 183。</p>
+<p>第 1 步后：e10 = 91.5；其余不变。最大值 = e5 的 165。第 2 步后：e5 = 82.5。最大值 = e1 的 132。第 3 步后：e1 = 66。此时剩余候选中的最大值：e4 = 104（e10 = 91.5、e0 = 90、e11 = 86 都更小）。第 4 步后：e4 = 52。最终各专家 $w_e/c_e$：e0=90、e1=66、e2=40、e3=61、e4=52、e5=82.5、e6=39、e7=4、e8=73、e9=56、e10=91.5、e11=86；最大值 91.5。若还有第 5 个名额，会再次给 e10（91.5 最大，压到 61）——名额用完即停。</p>
+</details>
+
+<p>这一节的手算是「全局视角」：只回答复制谁，不管放哪。真实算法里，层次策略的复制发生在每个节点内部（「3. 三步排布」的 3.2 节第二步），节点内有哪些专家取决于组先装到了哪个节点；全局策略则直接采用本节视角。两种策略的差异见 3.3 节「全局策略——何时启用、得失如何」。</p>
+
+<h3 id="s2-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>逻辑专家和物理专家是什么关系？副本如何分摊负载？</p>
+<details>
+<summary>解答：物理专家是逻辑专家在显存中的参数副本，各副本均摊 $w_e/c_e$</summary>
+<p>逻辑专家是模型定义的路由候选单位（num_log 个）；物理专家是显存里的一份参数副本（共 num_phy 个）。逻辑专家 $e$ 有 $c_e$ 个副本时，每个副本承载 $w_e/c_e$——前提是分发层把发往 $e$ 的 token 均摊到各副本（EPLB 打包计算的显式假设）。每 token 激活的专家数不变（仍 top-k，每个被选中的逻辑专家算一次），代价是副本参数多占显存。</p>
+</details>
+</li>
+<li>
+<p>为什么冗余专家同时解决了「槽位数不整除」的问题？</p>
+<details>
+<summary>解答：每卡槽位固定要求物理专家数被 GPU 数整除，冗余副本补齐缺口</summary>
+<p>显存均匀分配给每张卡、每卡槽位数固定，物理专家总数必须被 GPU 数整除（接口硬约束）。12 个逻辑专家补 4 个冗余得 16 = 8×2，每卡恰好 2 槽。凑数的槽放谁都行，但放热专家的副本才能同时分摊计算：复制冷专家（如负载 4 的 e7）只凑数，最大单副本负载仍是 e10 的 183。</p>
+</details>
+</li>
+<li>
+<p>复制哪些专家？贪心规则是什么、为什么有效？</p>
+<details>
+<summary>解答：每次给 $w_e/c_e$ 最大的专家加一副本，逐步压低最大单副本负载</summary>
+<p>贪心规则：每一步给 $w_e/c_e$ 最大的逻辑专家加一个副本，把它压到 $w_e/(c_e+1)$。示例的 4 个名额依次给 e10（183→91.5）、e5（165→82.5）、e1（132→66）、e4（104→52），结果最大单副本负载 91.5，低于预算 129.125。有效的原因：每一步都作用于当前最大值，冷专家永远不会成为 $w_e/c_e$ 的最大者，名额不会浪费在无助于均衡的复制上。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="s3-three-steps">3. 三步排布——组进节点、节点内复制、再均衡装进 GPU</h2>
+
+<h3 id="s3-groups">3.1 组与节点受限路由</h3>
+
+<p>「组」是逻辑专家按连续编号划分的固定分组，数量由 EPLB 的 num_groups 参数指定。示例的 12 个专家分 4 组：G0 = {e0, e1, e2}、G1 = {e3, e4, e5}、G2 = {e6, e7, e8}、G3 = {e9, e10, e11}。</p>
+
+<p>按组组织排布，是为了配合 DeepSeek-V3 的节点受限路由：每个 token 至多发给 $M$ 个节点，节点按「该节点上专家的最高 $K_r/M$ 个亲和分数之和」选出<sup>[C3]</sup>。EPLB 的 README 把这一机制称为 group-limited expert routing。若一个组的专家全部落在同一节点上，发往该组的 token 就不必出节点。</p>
+
+<p>组局部性值钱的原因是带宽差：节点内 NVLink 带宽 160 GB/s，跨节点 InfiniBand 50 GB/s，约 3.2 倍<sup>[C19]</sup>。V3 正是靠限制每 token 至多 4 个节点来压住 IB 流量<sup>[C19]</sup>。所以 EPLB 在打包时「尽量把同组专家放进同一节点」<sup>[C2]</sup>——层次策略的第一步由此而来。</p>
+
+<h3 id="s3-hierarchical">3.2 层次策略的三步</h3>
+
+<p>当节点数整除组数时，EPLB 走层次策略（示例：4 组、2 节点，组数恰为节点数的两倍）<sup>[C5]</sup>。三步依次是：组打包到节点、节点内复制、物理专家打包到 GPU。</p>
+
+<p><b>第一步：组均衡打包到节点。</b>先算组负载：G0 = 90+132+40 = 262，G1 = 61+104+165 = 330，G2 = 39+4+73 = 116，G3 = 56+183+86 = 325。用均衡打包贪心（负载降序遍历，每个对象放进仍有容量且当前最轻的包，每包恰好装 2 组<sup>[C7]</sup>）：G1（330）进节点 0，G3（325）进节点 1，G0（262）进当时更轻的节点 1，G2（116）进更轻的节点 0。结果：节点 0 = {G1, G2}，负载 446；节点 1 = {G0, G3}，负载 587。</p>
+
+<p><b>第二步：节点内贪心复制。</b>每个节点分到 6 个逻辑专家，要扩成 8 个物理专家（2 个冗余名额），复制只在节点内部进行。节点 0 持有 {e3, e4, e5, e6, e7, e8}（负载 61, 104, 165, 39, 4, 73），按第 2 章的贪心：名额给 e5（165→82.5）、再给 e4（104→52）。节点 1 持有 {e0, e1, e2, e9, e10, e11}（负载 90, 132, 40, 56, 183, 86），名额给 e10（183→91.5）、再给 e1（132→66）。注意复制结果依赖于第一步：e10 在节点 1，所以节点 1 的名额给了 e10；若分组换了方向，复制对象就不同。</p>
+
+<p><b>第三步：物理专家均衡打包到 GPU。</b>每个物理槽位的打包负载 = 所持逻辑专家负载 ÷ 该专家副本数——每一份副本（包括未标「副本」的那份）都记均摊值<sup>[C8]</sup>。节点 0 的 8 个物理负载为 82.5（e5）、82.5（e5 副本）、73（e8）、61（e3）、52（e4）、52（e4 副本）、39（e6）、4（e7），降序打包进 4 张卡（每卡 2 槽），得到四卡负载 121.5 / 86.5 / 125 / 113；节点 1 同法得 147.5 / 131.5 / 156 / 152。</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 316" role="img" aria-label="层次策略排布结果：两个节点各含 4 张 GPU，每张 GPU 两个专家槽，冗余副本用蓝色描边">
+  <rect class="dg-box" x="8" y="34" width="664" height="118" rx="8"/>
+  <text x="20" y="53" font-size="13" font-weight="600">节点 0 · 组 G1 + G2 · 总负载 446</text>
+  <rect class="dg-box" x="22" y="64" width="152" height="74" rx="6"/>
+  <text x="30" y="80" font-size="12" font-weight="600">GPU 0</text>
+  <text x="166" y="80" font-size="11" text-anchor="end" opacity="0.75">负载 121.5</text>
+  <rect class="dg-box" x="30" y="86" width="62" height="46" rx="4"/>
+  <text x="61.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e5</text>
+  <text x="61.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">82.5</text>
+  <rect class="dg-box" x="102" y="86" width="62" height="46" rx="4"/>
+  <text x="133.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e6</text>
+  <text x="133.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">39</text>
+  <rect class="dg-box" x="188" y="64" width="152" height="74" rx="6"/>
+  <text x="196" y="80" font-size="12" font-weight="600">GPU 1</text>
+  <text x="332" y="80" font-size="11" text-anchor="end" opacity="0.75">负载 86.5</text>
+  <rect class="dg-box" x="196" y="86" width="62" height="46" rx="4"/>
+  <rect class="dg-accent" x="196" y="86" width="62" height="46" rx="4" stroke-width="2"/>
+  <text x="227.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e5·副本</text>
+  <text x="227.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">82.5</text>
+  <rect class="dg-box" x="268" y="86" width="62" height="46" rx="4"/>
+  <text x="299.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e7</text>
+  <text x="299.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">4</text>
+  <rect class="dg-box" x="354" y="64" width="152" height="74" rx="6"/>
+  <text x="362" y="80" font-size="12" font-weight="600">GPU 2</text>
+  <text x="498" y="80" font-size="11" text-anchor="end" opacity="0.75">负载 125</text>
+  <rect class="dg-box" x="362" y="86" width="62" height="46" rx="4"/>
+  <text x="393.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e8</text>
+  <text x="393.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">73</text>
+  <rect class="dg-box" x="434" y="86" width="62" height="46" rx="4"/>
+  <rect class="dg-accent" x="434" y="86" width="62" height="46" rx="4" stroke-width="2"/>
+  <text x="465.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e4·副本</text>
+  <text x="465.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">52</text>
+  <rect class="dg-box" x="520" y="64" width="152" height="74" rx="6"/>
+  <text x="528" y="80" font-size="12" font-weight="600">GPU 3</text>
+  <text x="664" y="80" font-size="11" text-anchor="end" opacity="0.75">负载 113</text>
+  <rect class="dg-box" x="528" y="86" width="62" height="46" rx="4"/>
+  <text x="559.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e3</text>
+  <text x="559.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">61</text>
+  <rect class="dg-box" x="600" y="86" width="62" height="46" rx="4"/>
+  <text x="631.0" y="105" font-size="12" font-weight="600" text-anchor="middle">e4</text>
+  <text x="631.0" y="122" font-size="11" text-anchor="middle" opacity="0.75">52</text>
+  <rect class="dg-box" x="8" y="178" width="664" height="118" rx="8"/>
+  <text x="20" y="197" font-size="13" font-weight="600">节点 1 · 组 G0 + G3 · 总负载 587</text>
+  <rect class="dg-box" x="22" y="208" width="152" height="74" rx="6"/>
+  <text x="30" y="224" font-size="12" font-weight="600">GPU 4</text>
+  <text x="166" y="224" font-size="11" text-anchor="end" opacity="0.75">负载 147.5</text>
+  <rect class="dg-box" x="30" y="230" width="62" height="46" rx="4"/>
+  <text x="61.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e10</text>
+  <text x="61.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">91.5</text>
+  <rect class="dg-box" x="102" y="230" width="62" height="46" rx="4"/>
+  <text x="133.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e9</text>
+  <text x="133.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">56</text>
+  <rect class="dg-box" x="188" y="208" width="152" height="74" rx="6"/>
+  <text x="196" y="224" font-size="12" font-weight="600">GPU 5</text>
+  <text x="332" y="224" font-size="11" text-anchor="end" opacity="0.75">负载 131.5</text>
+  <rect class="dg-box" x="196" y="230" width="62" height="46" rx="4"/>
+  <rect class="dg-accent" x="196" y="230" width="62" height="46" rx="4" stroke-width="2"/>
+  <text x="227.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e10·副本</text>
+  <text x="227.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">91.5</text>
+  <rect class="dg-box" x="268" y="230" width="62" height="46" rx="4"/>
+  <text x="299.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e2</text>
+  <text x="299.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">40</text>
+  <rect class="dg-box" x="354" y="208" width="152" height="74" rx="6"/>
+  <text x="362" y="224" font-size="12" font-weight="600">GPU 6</text>
+  <text x="498" y="224" font-size="11" text-anchor="end" opacity="0.75">负载 156</text>
+  <rect class="dg-box" x="362" y="230" width="62" height="46" rx="4"/>
+  <text x="393.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e0</text>
+  <text x="393.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">90</text>
+  <rect class="dg-box" x="434" y="230" width="62" height="46" rx="4"/>
+  <rect class="dg-accent" x="434" y="230" width="62" height="46" rx="4" stroke-width="2"/>
+  <text x="465.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e1·副本</text>
+  <text x="465.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">66</text>
+  <rect class="dg-box" x="520" y="208" width="152" height="74" rx="6"/>
+  <text x="528" y="224" font-size="12" font-weight="600">GPU 7</text>
+  <text x="664" y="224" font-size="11" text-anchor="end" opacity="0.75">负载 152</text>
+  <rect class="dg-box" x="528" y="230" width="62" height="46" rx="4"/>
+  <text x="559.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e11</text>
+  <text x="559.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">86</text>
+  <rect class="dg-box" x="600" y="230" width="62" height="46" rx="4"/>
+  <text x="631.0" y="249" font-size="12" font-weight="600" text-anchor="middle">e1</text>
+  <text x="631.0" y="266" font-size="11" text-anchor="middle" opacity="0.75">66</text>
+</svg>
+<figcaption class="diagram-caption">层次策略在示例上的最终排布。每个专家块标注该槽位的均摊负载（逻辑负载 ÷ 副本数），蓝框描边为冗余副本；GPU 右上角为该卡总负载。槽位顺序对应输出的 phy2log 映射：每张卡的两个槽即映射中相邻的两项。</figcaption>
+</figure>
+
+<p>最终 8 卡负载落在 86.5–156 之间，最大值与均值之比 $156/129.125 \approx 1.21$——不是绝对均衡（贪心加上组、节点约束只能「尽量」），但对比不复制 e10 时的至少 1.45 已经实质改善。输出映射 phy2log = [5, 6, 5, 7, 8, 4, 3, 4, 10, 9, 10, 2, 0, 1, 11, 1]，与官方 README 的输出 tensor 逐槽一致<sup>[N1, N2]</sup>；上图中每张卡的两个槽位，就是该数组中相邻的两项。</p>
+
+<details>
+<summary>展开：第三步节点 0 的完整手算</summary>
+<p>节点 0 的 8 个物理槽位及其打包负载：e3 = 61、e4 = 52、e4 副本 = 52、e5 = 82.5、e5 副本 = 82.5、e6 = 39、e7 = 4、e8 = 73。降序遍历：82.5（e5）→ 卡 0；82.5（e5 副本）→ 卡 1；73（e8）→ 卡 2；61（e3）→ 卡 3；52（e4）→ 当前最轻且有空位的是卡 3（61），放进去后卡 3 = 113 满；52（e4 副本）→ 最轻有空位的是卡 2（73），卡 2 = 125 满；39（e6）→ 卡 0 与卡 1 同为 82.5，取先遍历的卡 0，卡 0 = 121.5 满；4（e7）→ 只剩卡 1，卡 1 = 86.5 满。四卡负载 121.5 / 86.5 / 125 / 113，与图一致。节点 1 同法：91.5（e10）→ 卡 4；91.5（e10 副本）→ 卡 5；90（e0）→ 卡 6；86（e11）→ 卡 7；66（e1）→ 卡 7（86 最轻）= 152 满；66（e1 副本）→ 卡 6（90）= 156 满；56（e9）→ 卡 4（91.5 先被遍历）= 147.5 满；40（e2）→ 卡 5 = 131.5 满。</p>
+</details>
+
+<details class="code-details">
+<summary>代码：三步算法的伪代码</summary>
+<div class="code-block">
+<pre><code class="language-text">输入：每逻辑专家负载 w[e]（num_log 个）、物理专家数 num_phy、
+     组数 num_groups、节点数 num_nodes、GPU 数 num_gpus
+约束：num_phy 是 num_gpus 的倍数；层次路径还要求
+     num_log 整除 num_groups、num_groups 整除 num_nodes、
+     num_gpus 整除 num_nodes
+
+均衡打包(weight, num_packs)：          # 把 n 个对象装进 m 个包
+    按负载降序遍历每个对象
+    放入「仍有容量（每包恰 n/m 个）且当前总负载最小」的包
+
+贪心复制(weight, num_phy)：            # num_log 扩到 num_phy
+    每份新副本给 w[e]/c[e] 最大的逻辑专家 e，c[e] 加一
+
+若 num_nodes 整除 num_groups（层次策略）：
+    步骤一：算组负载；均衡打包组到节点
+    步骤二：对每个节点内的本地专家，贪心复制到
+            num_phy/num_nodes 个物理专家
+    步骤三：对每个节点，物理负载取 逻辑负载/副本数，
+            均衡打包到节点内 GPU
+否则（全局策略）：
+    对全部逻辑专家贪心复制到 num_phy 个物理专家
+    物理负载取 逻辑负载/副本数，均衡打包到全部 GPU
+
+输出：phy2log —— 每个物理槽位放置的逻辑专家编号</code></pre>
+</div>
+</details>
+
+<details class="code-details">
+<summary>代码：单层层次策略的纯 Python 复刻，输出与官方 tensor 逐槽一致</summary>
+<div class="code-block">
+<pre><code class="language-python">"""EPLB page runnable code: single-layer hierarchical rebalancing.
+
+Pure Python reimplementation of the core path of deepseek-ai/EPLB eplb.py
+(rebalance_experts_hierarchical) for one layer of the official README example.
+Run: python3 eplb_page_demo.py
+"""
+
+WEIGHT = [90, 132, 40, 61, 104, 165, 39, 4, 73, 56, 183, 86]  # e0..e11 loads
+NUM_LOG, NUM_PHY = 12, 16
+NUM_GROUPS, NUM_NODES, NUM_GPUS = 4, 2, 8
+
+
+def balanced_packing(weight, num_packs):
+    """Greedy: descending load; each item into the lightest pack with capacity."""
+    n = len(weight)
+    per_pack = n // num_packs
+    order = sorted(range(n), key=lambda i: -weight[i])
+    pack_index, rank_in_pack = [-1] * n, [-1] * n
+    pack_load = [0.0] * num_packs
+    pack_count = [0] * num_packs
+    for i in order:
+        p = min((q for q in range(num_packs) if pack_count[q] < per_pack),
+                key=lambda q: pack_load[q])
+        pack_index[i], rank_in_pack[i] = p, pack_count[p]
+        pack_load[p] += weight[i]
+        pack_count[p] += 1
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(weight, num_phy):
+    """Greedy: each new replica goes to the expert with max load per replica."""
+    num_log = len(weight)
+    phy2log = list(range(num_phy))
+    logcnt = [1] * num_log
+    for i in range(num_log, num_phy):
+        best = max(range(num_log), key=lambda e: weight[e] / logcnt[e])
+        phy2log[i] = best
+        logcnt[best] += 1
+    return phy2log, logcnt
+
+
+group_size = NUM_LOG // NUM_GROUPS
+groups_per_node = NUM_GROUPS // NUM_NODES
+gpus_per_node = NUM_GPUS // NUM_NODES
+phy_per_gpu = NUM_PHY // NUM_GPUS
+phy_per_node = NUM_PHY // NUM_NODES
+
+# Step 1: pack expert groups to nodes
+group_load = [sum(WEIGHT[g * group_size:(g + 1) * group_size]) for g in range(NUM_GROUPS)]
+group_pack, _ = balanced_packing(group_load, NUM_NODES)
+print("组负载:", group_load)
+print("组 -> 节点:", group_pack)
+
+# node -> list of global logical expert ids
+node_experts = [[] for _ in range(NUM_NODES)]
+for g in range(NUM_GROUPS):
+    node_experts[group_pack[g]].extend(range(g * group_size, (g + 1) * group_size))
+
+phy2log = []
+for node in range(NUM_NODES):
+    experts = node_experts[node]                       # global ids on this node
+    w = [WEIGHT[e] for e in experts]                   # their loads
+    phy2mlog, logcnt = replicate_experts(w, phy_per_node)
+    print(f"节点{node} 专家:", experts, "副本数:", logcnt)
+    # physical load = logical load / replica count
+    phy_load = [w[phy2mlog[p]] / logcnt[phy2mlog[p]] for p in range(phy_per_node)]
+    pack, rank = balanced_packing(phy_load, gpus_per_node)
+    for p in range(phy_per_node):
+        gpu = node * gpus_per_node + pack[p]
+        slot = gpu * phy_per_gpu + rank[p]
+        while len(phy2log) <= slot:
+            phy2log.append(-1)
+        phy2log[slot] = experts[phy2mlog[p]]
+    loads = [sum(phy_load[p] for p in range(phy_per_node)
+                 if pack[p] == gg) for gg in range(gpus_per_node)]
+    print(f"节点{node} 各GPU负载:", loads)
+
+print("phy2log:", phy2log)
+official = [5, 6, 5, 7, 8, 4, 3, 4, 10, 9, 10, 2, 0, 1, 11, 1]
+print("与官方输出一致:", phy2log == official)
+</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">组负载: [262, 330, 116, 325]
+组 -> 节点: [1, 0, 0, 1]
+节点0 专家: [3, 4, 5, 6, 7, 8] 副本数: [1, 2, 2, 1, 1, 1]
+节点0 各GPU负载: [121.5, 86.5, 125.0, 113.0]
+节点1 专家: [0, 1, 2, 9, 10, 11] 副本数: [1, 2, 1, 1, 2, 1]
+节点1 各GPU负载: [147.5, 131.5, 156.0, 152.0]
+phy2log: [5, 6, 5, 7, 8, 4, 3, 4, 10, 9, 10, 2, 0, 1, 11, 1]
+与官方输出一致: True
+</code></pre>
+</div>
+<p><b>验证的机制</b>：balanced_packing 对应第一步与第三步的均衡打包贪心（含「每包恰好 n/m 个」约束）；replicate_experts 对应第二步的贪心复制；物理负载行对应均摊公式 $\ell_e = w_e/c_e$；最后一行与官方 README 输出 tensor 逐槽一致，即三步整体被复现。</p>
+<p><b>观察重点</b>：节点 0 与节点 1 各自的副本数向量——节点 0 给 e4、e5 加了副本而节点 1 给 e1、e10 加副本，验证「复制谁」取决于第一步组打包把哪些专家放进了本节点；「组到节点」映射 [1, 0, 0, 1] 表示 G0、G3 在节点 1，G1、G2 在节点 0。</p>
+<p><b>简化条件</b>：单层、纯 Python 列表实现，无分布式与并发；负载直接用 token 数（假定专家同构）；未实现多层接口、全局策略分支与部署侧的权重搬运——生产实现（vLLM 的 EPLB 模块）包含统计收集、通信后端与槽位保持，此处只复现排布算法本身。</p>
+</details>
+
+<h3 id="s3-global">3.3 全局策略——何时启用、得失如何</h3>
+
+<p>当组数不被节点数整除时，EPLB 改走全局策略：忽略分组，全局贪心复制、全局打包到 GPU<sup>[C5]</sup>。README 对应的使用建议是：层次策略适用于 prefill 阶段较小的 EP，全局策略适用于 decode 阶段较大的 EP<sup>[C5]</sup>（两类部署的实际差别见「4. 周期性重平衡」）。</p>
+
+<p>同一个示例用全局策略重算：复制采用第 2 章的全局视角手算（名额给 e10、e5、e1、e4），再把 16 个物理负载直接打包进 8 张卡。8 卡负载变为 130.5 / 95.5 / 130 / 138 / 138.5 / 134.5 / 134 / 132，落在 95.5–138.5 之间，最大值与均值之比约 1.07——均衡度好于层次策略的 1.21<sup>[N2]</sup>。原因不难理解：全局打包的搜索空间不受「组不跨节点、节点内复制」约束，负载配对的自由度更大。</p>
+
+<p>代价是组局部性。全局打包后同组专家可能散到不同节点：本例中 G0 = {e0, e1, e2} 的专家分别落在 GPU 2 与 GPU 7 上——若这两张卡分属不同节点，发往 G0 的 token 就要跨节点。还有一个值得注意的细节：贪心只以负载为目标，全局打包甚至会把同一专家的两个副本放进同一张卡（本例 GPU 7 的两个槽都是 e1，合计 132）。对负载无害，但这份副本没有起到分散的作用——「复制几份、放在哪」全由负载贪心决定，算法没有「副本必须分散」的约束。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>层次策略</th><th>全局策略</th></tr></thead>
+<tbody>
+<tr><td>触发条件</td><td>节点数整除组数</td><td>其余情况</td></tr>
+<tr><td>复制范围</td><td>节点内（每节点 6 逻辑扩到 8 物理）</td><td>全局（12 逻辑直接扩到 16 物理）</td></tr>
+<tr><td>组局部性</td><td>组不跨节点</td><td>不保证，同组专家可能跨节点</td></tr>
+<tr><td>构造例 8 卡负载</td><td>86.5–156，max/mean $\approx 1.21$</td><td>95.5–138.5，max/mean $\approx 1.07$</td></tr>
+<tr><td>README 建议用途</td><td>prefill 阶段较小 EP</td><td>decode 阶段较大 EP</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s3-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>为什么要先把「组」装进节点？组是什么？</p>
+<details>
+<summary>解答：组是逻辑专家的固定分组，组不跨节点能让组内 token 不出节点</summary>
+<p>组是逻辑专家按连续编号的固定分组（num_groups 参数；示例 12 专家分 4 组，每组 3 个）。V3 的节点受限路由按「节点上专家的最高 $K_r/M$ 亲和分数之和」选至多 $M$ 个节点；组不跨节点时，发往该组的 token 不必出节点。节点内 NVLink 160 GB/s 约为跨节点 IB 50 GB/s 的 3.2 倍，组局部性直接省跨节点流量，所以层次策略第一步就把组均衡打包进节点。约束链：组数整除逻辑专家数、节点数整除组数、节点数整除 GPU 数<sup>[C9]</sup>。</p>
+</details>
+</li>
+<li>
+<p>三步各自做什么？如何在官方示例上完整手算？</p>
+<details>
+<summary>解答：组进节点（446/587）、节点内复制（e5,e4 与 e10,e1）、物理均衡装卡</summary>
+<p>第一步把组均衡打包到节点：组负载 G0–G3 = 262/330/116/325，降序贪心得节点 0 = {G1, G2}（446）、节点 1 = {G0, G3}（587）。第二步节点内贪心复制：节点 0 的名额给 e5、e4，节点 1 的给 e10、e1。第三步物理专家（打包负载 = 逻辑负载 ÷ 副本数）均衡打包进节点内 GPU：节点 0 四卡 121.5/86.5/125/113，节点 1 四卡 147.5/131.5/156/152。输出 phy2log = [5, 6, 5, 7, 8, 4, 3, 4, 10, 9, 10, 2, 0, 1, 11, 1]，与官方输出逐槽一致。</p>
+</details>
+</li>
+<li>
+<p>全局策略何时启用？与层次策略相比得失如何？</p>
+<details>
+<summary>解答：组数不被节点数整除时启用；更均衡但失去组局部性</summary>
+<p>触发条件是组数不被节点数整除（eplb.py 的分支判断）；README 建议 decode 大 EP 用全局、prefill 小 EP 用层次。同一示例下全局策略复制 e10、e5、e1、e4，8 卡负载 95.5–138.5，max/mean 约 1.07，优于层次的 1.21——全局打包不受组与节点约束，配对自由度更大。代价：同组专家（如 G0 = {e0, e1, e2}）可能散到不同节点（例中 e0、e2 落在 GPU 2、e1 两副本落在 GPU 7），跨节点流量回来；且贪心只管负载，可能把同一专家的两副本放进同一张卡（GPU 7 = e1 + e1），副本没有起到分散作用。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="s4-periodic-rebalance">4. 周期性重平衡——从线上统计到权重搬运</h2>
+
+<h3 id="s4-loop">4.1 重平衡闭环</h3>
+
+<p>排布方案不是一次性的。「1. 专家并行的木桶效应」已经看到，线上 token 分布随 workload 漂移，今天的均衡摆放明天就可能失衡，所以方案要周期性重算。完整闭环是：</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">收集负载统计</div>
+      <div class="dg-node-note">每次前向记录各专家收到的 token 数</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">重算复制与排布</div>
+      <div class="dg-node-note">按估计负载跑三步贪心，得到新 phy2log</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">搬运权重、更新映射</div>
+      <div class="dg-node-note">专家参数在 GPU 间拷贝，路由表切换</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">继续服务</div>
+      <div class="dg-node-note">新统计随之产生，进入下一轮</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">重平衡闭环。箭头为时间顺序；「继续服务」产生新的统计，构成回到第一环节的循环。周期由部署决定：DeepSeek-V3 线上约每 10 分钟<sup>[C10]</sup>，vLLM 默认每 3000 个引擎步、用最近 1000 步的窗口统计<sup>[C14]</sup>。</figcaption>
+</figure>
+
+<p>两个环节值得展开。其一是「估计负载从哪来」：EPLB 算法吃的是估计值，怎么从统计得到估计不在它的范围内——README 明示这是使用方的职责，常见做法是历史统计的移动平均<sup>[C4]</sup>。vLLM 把这部分做成了现成能力：按窗口聚合最近若干步的统计，窗口与步数都可配置<sup>[C14]</sup>。</p>
+
+<p>其二是应用方案的成本。重算部分是排序与贪心打包，开销远小于搬运；贵的是搬运权重：整份专家参数在 GPU 间拷贝。vLLM 用 preserve_intragpu_slots 压这部分开销：GPU 数与每卡槽位数不变时，重排后让留在本卡的专家保持原槽位、新来的专家填空槽，避免不必要的权重拷贝<sup>[C16]</sup>。</p>
+
+<h3 id="s4-v3">4.2 DeepSeek-V3 的 prefill 与 decode 部署</h3>
+
+<p>V3 报告给出了两个阶段各自怎么用冗余专家。prefill 的最小部署单元是 4 节点 32 GPU：attention 部分用 TP4+SP、DP8（术语见<a href="../model-parallelism/index.html">模型并行</a>页），MoE 部分用 EP32；引入 32 个冗余专家，每张 GPU 除原有 8 个专家外多持有 1 个（8+1）。高负载专家由线上部署收集的统计检测、周期性调整（如每 10 分钟）；确定冗余集合后，在节点内 GPU 间精心重排——不增加跨节点 all-toall 通信开销的前提下尽量均衡<sup>[C10, N4]</sup>。8+1 的数字可以用第 4.3 节的公式验证：$(256 + 32)/32 = 9$<sup>[C15, C17]</sup>。</p>
+
+<p>decode 的做法更极端，先改了语义：把共享专家当作路由专家对待——每 token 路由时选 9 个专家，共享专家被视为始终被选中的高负载专家<sup>[C11]</sup>。最小部署单元 40 节点 320 GPU：attention TP4+SP、DP80，MoE EP320；每张 GPU 只持有 1 个专家，64 张 GPU 承载冗余专家与共享专家。因为每卡只有 1 个专家，重排无从谈起——冗余集合换了，只是换哪些卡放冗余副本，不存在「卡内重新摆放」<sup>[C11, N5]</sup>。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>prefill 部署</th><th>decode 部署</th></tr></thead>
+<tbody>
+<tr><td>最小单元</td><td>4 节点 32 GPU</td><td>40 节点 320 GPU</td></tr>
+<tr><td>attention</td><td>TP4 + SP，DP8</td><td>TP4 + SP，DP80</td></tr>
+<tr><td>MoE 并行</td><td>EP32</td><td>EP320</td></tr>
+<tr><td>每卡专家数</td><td>8 原有 + 1 冗余</td><td>1</td></tr>
+<tr><td>冗余专家数</td><td>32</td><td>64 卡承载冗余与共享专家</td></tr>
+<tr><td>重排方式</td><td>节点内 GPU 间重排，不增加跨节点 all-toall</td><td>无需重排（每卡单专家）</td></tr>
+<tr><td>每 token 激活</td><td>8 路由专家</td><td>9 专家（共享专家视为必选路由专家）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>报告还描述了一种探索中的动态冗余方案（仍待论文后续披露，此处仅作预告），与 EPLB 的周期性重排是两种不同节奏：</p>
+
+<details>
+<summary>补充：V3 探索中的动态冗余策略</summary>
+<p>报告还描述了一个探索方向：每张 GPU 持有更多专家（如 16 个），但每个推理步只激活其中 9 个；每层 all-toall 开始前在线计算全局最优的路由方案。prefill 计算量大，算路由的开销几乎可以忽略<sup>[C18]</sup>。这与 EPLB 的周期性重排是两种节奏：EPLB 以分钟为周期改「放哪」，动态冗余在每个推理步改「激活谁」。</p>
+</details>
+
+<h3 id="s4-vllm">4.3 vLLM 中的 EPLB</h3>
+
+<p>vLLM 内置了同名的 EPLB 功能，用 --enable-eplb 启用；启用后每次前向收集负载统计并周期性重排专家分布，默认策略的重排算法改编自 DeepSeek EPLB<sup>[C13]</sup>。文档示例用 Qwen/Qwen3-30B-A3B 与 deepseek-ai/DeepSeek-V3-0324 演示启用 EPLB 的 serving 配置<sup>[N6]</sup>。</p>
+
+<p>主要参数<sup>[C14]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>参数</th><th>默认</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>window_size</td><td>1000</td><td>重平衡决策追踪的最近引擎步数</td></tr>
+<tr><td>step_interval</td><td>3000</td><td>每 N 个引擎步执行一次重排；大于窗口时只用最近窗口的统计</td></tr>
+<tr><td>num_redundant_experts</td><td>0</td><td>冗余专家数</td></tr>
+<tr><td>log_balancedness</td><td>关</td><td>记录均衡度指标：平均每专家 token 数 ÷ 最大每专家 token 数</td></tr>
+<tr><td>policy</td><td>default</td><td>重排策略（default 即改编自 DeepSeek EPLB 的算法）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两个公式决定部署形态<sup>[C15]</sup>。每 rank 专家数：</p>
+
+<p>$$\text{每 rank 专家数} = \frac{\text{专家总数} + \text{冗余专家数}}{\text{EP rank 数}}$$</p>
+
+<p>不带冗余时退化为专家总数除以 rank 数。用 V3 prefill 验证：$(256 + 32)/32 = 9$，即报告所说的每卡 8+1<sup>[C15, C17]</sup>。文档字面给出的「内存开销」公式为：</p>
+
+<p>$$\text{每 rank 总专家存储} = \frac{\text{MoE 层数} \times \text{每专家字节数} \times (\text{专家总数} + \text{冗余专家数})}{\text{EP rank 数}}$$</p>
+
+<p>DeepSeek-V3 在每 rank 1 个冗余专家的设置下，由冗余带来的增量开销约 2.4 GB（用上述公式减去无冗余时的项，等价于 $\text{MoE 层数} \times \text{每专家字节数} \times \text{冗余专家数} / \text{EP rank 数}$）；文档建议大规模部署把 num_redundant_experts 设为 32<sup>[C15, N6]</sup>。另外，vLLM 的配置里还有不依赖统计的静态摆放（expert_placement_strategy，如 linear、round_robin<sup>[C18a]</sup>），那是初始摆放选项，与按统计动态重排的 EPLB 是两回事。</p>
+
+<h3 id="s4-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>重平衡的完整闭环是什么？各环节多久一次？</p>
+<details>
+<summary>解答：统计、重算、搬运、继续服务四环节循环；V3 约每 10 分钟，vLLM 默认每 3000 步</summary>
+<p>每次前向收集负载统计；周期性重算复制与排布方案（V3 线上约每 10 分钟；vLLM 默认每 3000 个引擎步，用最近 1000 步的窗口统计）；然后搬运专家权重、更新物理映射与路由表；继续服务产生新统计，进入下一轮。负载预测本身不在 EPLB 范围内（README 明示），常见做法是历史统计的移动平均；vLLM 把窗口统计做成了内置参数。</p>
+</details>
+</li>
+<li>
+<p>V3 的 prefill 与 decode 分别怎么用冗余专家？</p>
+<details>
+<summary>解答：prefill 每卡 8+1、节点内重排；decode 每卡 1 个专家、无需重排</summary>
+<p>prefill 最小单元 4 节点 32 GPU、EP32，设 32 个冗余专家，每卡 8 原有 + 1 冗余；确定冗余集合后在节点内 GPU 间重排，不增加跨节点 all-toall 开销；周期约每 10 分钟。decode 最小单元 40 节点 320 GPU、EP320，共享专家被当作路由专家（每 token 选 9 个专家），每卡只持 1 个专家，64 张卡承载冗余与共享专家；每卡单专家所以无需重排。</p>
+</details>
+</li>
+<li>
+<p>vLLM 里怎么启用 EPLB？每卡专家数与内存开销怎么算？</p>
+<details>
+<summary>解答：--enable-eplb；每卡专家数 = (总数+冗余)/EP rank 数，内存按层数均摊</summary>
+<p>用 --enable-eplb 启用，可配 window_size（默认 1000）、step_interval（默认 3000）、num_redundant_experts（默认 0）等。每 rank 专家数 = (专家总数 + 冗余专家数) ÷ EP rank 数——V3 prefill 验证：(256+32)/32 = 9 = 8+1。内存开销 = MoE 层数 × 每专家字节数 × 冗余专家数 ÷ EP rank 数；V3 每 rank 1 个冗余约 2.4 GB。preserve_intragpu_slots 让留在本卡的专家保持原槽位、新专家填空槽，减少权重搬运。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="s5-boundaries">5. 边界——EPLB 不解决什么</h2>
+
+<p>四条边界，每条给出「不解决什么、谁来管」。</p>
+
+<p><b>负载预测。</b>算法吃的是估计负载，估计怎么来不在范围内——README 明示 out of scope，只提到移动平均是常见做法<sup>[C4]</sup>。这一环节由部署方的统计管线承担；vLLM 把窗口统计（window_size）做成了现成能力，算是给了个默认答案。</p>
+
+<p><b>路由层均衡。</b>「token 选谁」的均衡是训练期 bias 的职责（见<a href="../aux-loss-free-routing/index.html">辅助损失无关路由</a>），EPLB 调「放哪、复制几份」，两层互补不互相替代。V3 两层都用：训练期 bias 拉平，推理期部署排布兜住漂移，且全程不丢 token<sup>[C12]</sup>。</p>
+
+<p><b>通信 kernel 效率。</b>dispatch/combine 的 all-toall 怎么跑得快是另一题（DeepEP 等通信库的领域）。EPLB 只保证「要送的数据尽量不出节点」（组局部性），不优化「怎么送」。</p>
+
+<p><b>最优性与实时性。</b>贪心不保证最优——构造例中层次策略 max/mean 约 1.21、全局约 1.07，全局也不是最优解；整除约束限制了可用配置（物理专家数被 GPU 数整除、层次路径还有组数链<sup>[C9]</sup>）；冗余副本占显存（内存公式见「4. 周期性重平衡」的 4.3 节<sup>[C15]</sup>）；周期性重排有滞后，两次重排之间的漂移无人处理。后续工作正是冲着这些来的：<a href="../ultraep/index.html">UltraEP</a> 把「建不建副本」与「接多少 token」并成配额、实时规划，改进周期性重排跟不上漂移的问题；<a href="../moonep/index.html">MoonEP</a> 追求每个 EP rank 恰好收到固定数量 token 的完美均衡。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>问题</th><th>EPLB 是否管</th><th>谁管</th></tr></thead>
+<tbody>
+<tr><td>负载怎么预测</td><td>不管（官方明确划出范围）</td><td>部署方统计管线；vLLM 的窗口统计</td></tr>
+<tr><td>token 选谁（路由均衡）</td><td>不管</td><td>训练期 bias（辅助损失无关路由）</td></tr>
+<tr><td>all-toall kernel 效率</td><td>不管</td><td>通信库（DeepEP 等）</td></tr>
+<tr><td>重排间隙的负载漂移</td><td>不管（周期性重排有滞后）</td><td>UltraEP（推理期配额实时规划）、MoonEP（训练期 EP 完美均衡方案）</td></tr>
+<tr><td>排布是否最优</td><td>不保证（贪心 + 整除与分组约束）</td><td>换策略或加大冗余预算的搜索</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s5-questions">本章问题</h3>
+<ol class="chapter-questions">
+<li>
+<p>哪些问题被官方明确划出范围？</p>
+<details>
+<summary>解答：负载预测；路由层均衡与通信 kernel 也各属其他层</summary>
+<p>负载预测被 README 明确划出（out of scope，移动平均是常见做法）——算法只吃估计值。路由层的「token 选谁」均衡由训练期 bias 承担，与 EPLB 的「放哪、复制几份」是互补两层，V3 两个都用且都不丢 token。通信 kernel 效率属于通信库（DeepEP 等）的领域，EPLB 只通过组局部性减少「要跨节点送的数据量」。</p>
+</details>
+</li>
+<li>
+<p>EPLB 的贪心与约束意味着什么做不到的事？后续工作往哪走？</p>
+<details>
+<summary>解答：非最优、受整除约束、占显存、重排有滞后；UltraEP 与 MoonEP 是改进方向</summary>
+<p>贪心非最优：构造例中层次策略 max/mean 约 1.21、全局约 1.07，全局也非最优解。整除约束限制配置：GPU 数须整除物理专家数，层次路径还要求节点数整除组数、节点数整除 GPU 数<sup>[C9]</sup>。冗余副本占显存，开销按 MoE 层数 × 每专家字节数 × 冗余数 ÷ EP rank 数累积。周期性重排有滞后，两次重排之间的漂移无人处理。后续工作：UltraEP 用配额实时规划，MoonEP 追求每个 EP rank 恰好收到固定数量 token 的完美均衡<sup>[C5]</sup>。</p>
+</details>
+</li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>论断与来源（C）</h3>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>编号</th><th>论断</th><th>来源与定位</th></tr></thead>
+<tbody>
+<tr><td>C1</td><td>专家并行下专家负载随 workload 变化，需保持各 GPU 负载均衡</td><td>[repo] README 首段</td></tr>
+<tr><td>C2</td><td>冗余专家策略：复制高负载专家，启发式打包到 GPU，同组专家尽量同节点</td><td>[repo] README</td></tr>
+<tr><td>C3</td><td>V3 节点受限路由：每 token 至多 $M$ 个节点，按最高 $K_r/M$ 亲和分数和选节点</td><td>[v3] §2.1.2；[repo] README 称 group-limited expert routing</td></tr>
+<tr><td>C4</td><td>算法基于估计负载；负载预测方法不在范围，常见做法为移动平均</td><td>[repo] README</td></tr>
+<tr><td>C5</td><td>层次策略（节点数整除组数：组进节点、节点内复制、物理进 GPU，适用 prefill 小 EP）；全局策略（其余情况，适用 decode 大 EP）</td><td>[repo] README The Algorithm 节；eplb.py rebalance_experts 分支</td></tr>
+<tr><td>C6</td><td>贪心复制：每次给 weight/logcnt 最大的专家加一副本，最小化最大副本负载</td><td>[repo] eplb.py replicate_experts docstring 与实现</td></tr>
+<tr><td>C7</td><td>均衡打包：降序遍历、放入仍有容量的最轻包、每包恰好 n/m 个</td><td>[repo] eplb.py balanced_packing docstring 与实现</td></tr>
+<tr><td>C8</td><td>物理专家打包负载 = 逻辑负载 ÷ 副本数（均摊为显式假设）</td><td>[repo] eplb.py tokens_per_phy 计算</td></tr>
+<tr><td>C9</td><td>接口约束：num_replicas 是 num_gpus 的倍数；层次路径还要求 num_logical_experts % num_groups == 0、num_groups % num_nodes == 0、num_gpus % num_nodes == 0（即组数整除逻辑专家数、节点数整除组数、节点数整除 GPU 数）</td><td>[repo] eplb.py rebalance_experts docstring 与四个 assert</td></tr>
+<tr><td>C10</td><td>V3 prefill：4 节点 32 GPU、TP4+SP+DP8、EP32、32 冗余专家、每卡 8+1、约每 10 分钟调整、节点内重排不加跨节点 all-toall</td><td>[v3] §3.4.1</td></tr>
+<tr><td>C11</td><td>V3 decode：共享专家视为路由专家（每 token 9 专家）、40 节点 320 GPU、TP4+SP+DP80、EP320、每卡 1 专家、64 卡承载冗余与共享、无需重排</td><td>[v3] §3.4.2</td></tr>
+<tr><td>C12</td><td>V3 训练期 bias 在每训练步末按过载/欠载 $\pm\gamma$ 更新；训练与推理都不丢 token。其中「推理期 bias 不再更新」为推断（由更新机制直接得出）</td><td>[v3] §2.1.2；推断部分已在正文标注</td></tr>
+<tr><td>C13</td><td>vLLM 内置 EPLB：--enable-eplb 启用，每次前向收集统计并周期性重排；default 策略改编自 DeepSeek EPLB</td><td>[vllm-doc] EPLB 节；[vllm-src] 模块 docstring</td></tr>
+<tr><td>C14</td><td>vLLM 参数：window_size 默认 1000、step_interval 默认 3000、num_redundant_experts 默认 0、log_balancedness 默认关、policy 默认 default</td><td>[vllm-doc] EPLB Parameters 表；vllm/config/parallel.py EPLBConfig</td></tr>
+<tr><td>C15</td><td>每 rank 专家数 = (专家总数+冗余数)/EP rank 数；每 rank 总专家存储 = MoE 层数 × 每专家字节 × (专家总数+冗余数)/EP rank 数；V3 每 rank 1 冗余带来的增量开销约 2.4 GB；大规模建议 32</td><td>[vllm-doc] Expert Distribution Formula 与 Memory Footprint Overhead 节</td></tr>
+<tr><td>C16</td><td>preserve_intragpu_slots：留在本卡的专家保持原槽位、新专家填空槽，减少权重拷贝</td><td>[vllm-src] preserve_intragpu_slots docstring</td></tr>
+<tr><td>C17</td><td>V3 配置：61 层（前 3 层 dense）、每 MoE 层 1 共享 + 256 路由专家、每 token 激活 8 路由专家、至多 4 节点</td><td>[v3] §4.2 Model Hyper-Parameters</td></tr>
+<tr><td>C18</td><td>V3 探索中的动态冗余：每卡持 16 专家、每步激活 9、每层 all-toall 前在线算最优路由</td><td>[v3] §3.4.1（探索性描述）</td></tr>
+<tr><td>C18a</td><td>vLLM 静态摆放选项 expert_placement_strategy（如 linear、round_robin）：不依赖负载统计的初始摆放，与 EPLB（动态、带冗余）是不同选项</td><td>[vllm-src] vllm/config/parallel.py 中 ExpertPlacementStrategy 类型别名（=Literal["linear","round_robin"]，非枚举）</td></tr>
+<tr><td>C19</td><td>节点内 NVLink 160 GB/s，约为跨节点 IB 50 GB/s 的 3.2 倍；限制每 token 至多 4 节点减少 IB 流量</td><td>[v3] §3.2.2</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>来源缩写：[repo] deepseek-ai/EPLB 仓库 main 分支（https://github.com/deepseek-ai/EPLB）；[v3] DeepSeek-V3 Technical Report（arXiv:2412.19437）；[vllm-doc] vLLM 文档 docs/serving/expert_parallel_deployment.md（main 分支）；[vllm-src] vLLM 源码 vllm/distributed/eplb/policy/default.py（main 分支）。</p>
+
+<h3>公式与来源（F）</h3>
+
+<p>F1（副本均摊 $\ell_e = w_e/c_e$）：来源为 [repo] eplb.py 的 tokens_per_phy 计算的直接形式化；适用条件是分发层把发往同一逻辑专家的 token 均摊到各副本。F2（层利用率 = 平均负载 ÷ 最大负载）：本页构造的量化工具，非来源公式；构造条件是「整层时间由最大负载卡决定、理想均分时间为平均负载」，用于量化忙闲不均的代价；该比值 $\in (0, 1]$，越大越接近 1 表示越均衡，未考虑流水线或 all-toall 重叠等更细的执行模型。</p>
+
+<h3>外部数字与实验条件（N）</h3>
+
+<p>N1：官方示例（[repo] README Interface and Example）——2 层 MoE、每层 12 逻辑专家、4 冗余、16 物理副本、2 节点 8 GPU；层 0 负载 [90, 132, 40, 61, 104, 165, 39, 4, 73, 56, 183, 86]；官方输出 phy2log 层 0 = [5,6,5,7,8,4,3,4,10,9,10,2,0,1,11,1]、层 1 = [7,10,6,8,6,11,8,9,2,4,5,1,5,0,3,1]；本页复刻输出与官方逐槽一致。N2：构造例中间量（由 N1 输入按算法计算）——组负载 262/330/116/325、节点负载 446/587、层次 GPU 负载 121.5/86.5/125/113 与 147.5/131.5/156/152（max/mean $\approx 1.21$）、全局 GPU 负载 130.5/95.5/130/138/138.5/134.5/134/132（max/mean $\approx 1.07$）、总负载 1033、每卡均值 129.125、不复制 e10 时最大负载 183（独占）至 187（与 e7 共卡）。N4：V3 prefill 部署数字（prefill 4 节点 32 卡 EP32 每卡 8+1 约 10 分钟），来源 [v3] §3.4.1。N5：V3 decode 部署数字（decode 40 节点 320 卡 EP320 每卡 1 专家 64 卡冗余+共享每 token 9 专家），来源 [v3] §3.4.2。N6：vLLM 默认参数与示例模型（window_size=1000、step_interval=3000、num_redundant_experts=0；示例 Qwen/Qwen3-30B-A3B 与 deepseek-ai/DeepSeek-V3-0324；DeepSeek-V3 每 rank 1 个冗余专家的增量开销约 2.4 GB；大规模建议 num_redundant_experts=32），来源 [vllm-doc]。</p>
+
+<h3>构造示例</h3>
+
+<p>页面贯穿示例的输入（12 专家负载表）来自官方 README（N1），但围绕它展开的全部中间量——两卡 800/200 的利用率、冷专家对照（复制 e7 后最大负载仍 183）、贪心每步的 $w_e/c_e$、组/节点/GPU 各级负载、全局策略的 8 卡负载与 GPU 7 = [e1, e1] 现象——均为按算法对示例输入的计算结果，已用独立编写的纯 Python 复刻运行核对（输出与官方 tensor 一致），不是实测数据。构造目的是让每一步贪心都可手工验证。</p>
+
+<h3>辅助解释与类比边界</h3>
+
+<p>「补位/凑数」的类比只用于解释槽位整除（冗余副本补齐物理专家数对 GPU 数的整除缺口）；失效边界：副本同时承担分摊计算的职责，不只是占位——放进冷专家同样能凑数但无益于均衡。「木桶效应」描述 dispatch/combine 同步点上的等待现象，不涉及流水线重叠等更细的执行模型。</p>
+
+<h3>简化条件及其限制</h3>
+
+<p>单层视角：多层 MoE 各自独立计算排布（官方接口本就逐层输入负载），页面只手算层 0。负载即 token 数：假定专家同构（V3 细粒度专家满足此条件），忽略专家参数量与计算强度差异；专家不同构时负载应加权。可运行代码为算法复刻而非生产实现：无分布式、无并发、单层数据，不含统计收集、权重搬运与槽位保持；这些属于部署侧（vLLM 模块）的工程内容。忽略 attention 部分的并行与负载：EPLB 只作用于 MoE 专家。
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

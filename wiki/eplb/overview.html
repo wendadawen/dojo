@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EPLB · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · MoE 专家并行负载均衡</span>
+      <h1>EPLB</h1>
+      <p class="lead">Expert Parallelism Load Balancer：复制热专家、均衡摆放，拉平专家并行的忙闲不均</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <!-- 概览正文：定义、问题背景、主要机制、关键结论与边界；不展开公式推导与计算示例。 -->
+
+    <h2>是什么</h2>
+    <p>EPLB（Expert Parallelism Load Balancer，专家并行负载均衡器）是 DeepSeek 开源的排布算法，也是 vLLM 的内置功能。给定每个逻辑专家的估计负载，它输出一份「复制哪些专家、每个物理副本放在哪张 GPU」的方案，使各卡负载尽量均衡；线上部署按统计周期性重算这份方案。</p>
+
+    <h2>解决什么问题</h2>
+    <p>专家并行（EP）把 MoE 层的不同专家分片到不同 GPU，一张卡的负载约等于发往它所持专家的 token 数。dispatch 之后各卡独立计算，combine 之前整层必须等最慢的卡——层时间由负载最大的卡决定。训练期的 bias 均衡只在训练步末更新，推理期路由规则固定，而线上 token 分布随 workload 漂移，忙闲不均随之出现。DeepSeek-V3 承诺推理不丢 token，于是把均衡交给部署层排布，这就是 EPLB 的位置。</p>
+
+    <h2>怎么做</h2>
+    <ul>
+      <li><b>冗余专家</b>：热专家可拥有多个参数副本，发往它的 token 被各副本均摊，单副本负载为 $w_e/c_e$；每 token 激活的专家数不变，代价是显存。补齐的副本同时解决「物理专家数须被 GPU 数整除」的槽位对齐问题。</li>
+      <li><b>贪心</b>：复制时每次给单副本负载最大的专家加一副本；打包时按负载降序、放入仍有容量且当前最轻的包、每包数量固定。</li>
+      <li><b>层次策略三步</b>（节点数整除组数时，prefill 小 EP）：组均衡打包到节点（组不跨节点，省跨节点流量）、节点内贪心复制、物理专家均衡打包到 GPU。全局策略（decode 大 EP）忽略分组全局复制再全局打包，均衡度更好但失去组局部性。</li>
+      <li><b>周期性重平衡</b>：每次前向收集负载统计，周期性重算排布（V3 线上约每 10 分钟；vLLM 默认每 3000 个引擎步、用最近 1000 步窗口），然后搬运权重、更新映射。</li>
+    </ul>
+
+    <h2>关键事实</h2>
+    <ul>
+      <li>DeepSeek-V3 prefill：4 节点 32 卡、EP32、32 个冗余专家、每卡 8+1 个专家，节点内重排不增加跨节点 all-toall 通信。</li>
+      <li>DeepSeek-V3 decode：40 节点 320 卡、EP320、每卡 1 个专家，共享专家视为必选路由专家（每 token 9 专家），无需重排。</li>
+      <li>vLLM 用 <code>--enable-eplb</code> 启用；每卡专家数等于专家总数与冗余数之和除以 EP rank 数，V3 prefill 即每卡 9 个；冗余的内存开销按 MoE 层数累积，V3 每 rank 1 个冗余的增量开销约 2.4 GB。</li>
+    </ul>
+
+    <h2>边界</h2>
+    <p>负载预测不在范围内（常见做法是历史统计的移动平均）；「token 选谁」的路由层均衡由训练期 bias 承担，与 EPLB 互补；贪心加整除约束不保证最优；周期性重排有滞后，两次重排之间的漂移无人处理——UltraEP、MoonEP 是后续改进方向。</p>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
