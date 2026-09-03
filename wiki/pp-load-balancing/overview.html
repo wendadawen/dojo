@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PP 负载均衡 · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · load-balancing</span>
+      <h1>PP 负载均衡</h1>
+      <p class="lead">让流水线各 stage 环环等长：推理 PP 的忙闲不均从哪来，token 切分与 batch 配平怎么做。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+<h2>它是什么</h2>
+<p>PP 负载均衡是推理系统中让流水线各 stage 的执行时间保持相近、减少气泡的切分与调度机制。<a href="../../wiki/model-parallelism/index.html">流水线并行</a>把模型按层切给不同节点、只在 stage 边界通信；代价是后级要等前级、流水线填不满时产生气泡，而一次迭代的节拍由最慢的 stage 决定。</p>
+
+<h2>问题从哪来</h2>
+<p>推理场景有两个放大器。一是单条长请求整体进入流水线：128K 到 1M token 的 prompt 让下游 GPU 长时间空等。二是注意力的增量特性：位置越靠后要交互的历史越多，同样大小的 chunk 越跑越慢，各 stage 的步长随进度漂移。高并发下还有第三层：每个调度步的 micro-batch 计算量忽大忽小。</p>
+
+<h2>核心机制</h2>
+<ul>
+<li>token 维度切分：因果注意力保证位置只依赖历史，因此同一条请求的不同 token 段可以同时在不同 stage 上计算。切点前长后短——前面交互少多装 token、后面交互多少装，让各片段成本接近相等。</li>
+<li>动态时间对齐：把累计运行时间拟合为前缀长度的二次函数，解增量时间方程确定下一个 chunk 的大小，后段 chunk 逐步缩小，对齐各 stage 的节拍。</li>
+<li>batch 维度配平：解耦 prefill 与 decode 的调度——decode token 均摊到全部在飞 micro-batch；prefill 按积压量与 KV cache 空闲率动态定 batch 大小，水位过低时暂停 prefill 防止 decode 被抢占重算。</li>
+<li>两个维度可组合：联合优化先按每个候选 batch size 求序列切分，再解背包问题定 batch 切分。</li>
+</ul>
+
+<h2>关键结论与边界</h2>
+<ul>
+<li>均衡的对象是执行时间，不是元素个数：均分 token 数或请求数都不等于均衡，优化目标是压最慢片段。</li>
+<li>切分不是越细越好：片段太小吃不满 GPU（单 token 与 256 token 的前向时间可以相同），chunk 尺寸有利用率下限。</li>
+<li>token 维切分依赖因果注意力，双向注意力模型不适用；短上下文下无显著额外开销，收益场景是长上下文。</li>
+<li>性能数字都绑定条件：本页引用的加速比（如 prefill 吞吐 3.31 倍、吞吐提升 11% 到 398%）各自对应特定的模型、硬件与基线配置，见完整说明页的来源与范围说明。</li>
+</ul>
+
+<p>代表系统：TeraPipe（机制源头，训练场景）、Mooncake CPP（推理 prefill 落地）、SGLang 动态 chunk（时间对齐）、gLLM token throttling（batch 配平）。机制细节、手算示例与来源定位见<a href="index.html">完整说明页</a>。</p>
+
+    <!-- 概览正文：定义、问题背景、主要机制、关键结论与边界；不展开公式推导与计算示例。 -->
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
