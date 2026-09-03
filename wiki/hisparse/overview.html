@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HiSparse · 概览 · Dojo</title>
+  <meta name="description" content="HiSparse 论文概览：把 top-k 稀疏注意力解码的 KV cache 全量放 host 内存、GPU 只留固定大小 LRU 缓存，输出逐位不变，长上下文峰值吞吐最高 4.7 倍。">
+  <meta name="dojo:summary" content="top-$k$ 稀疏注意力解码的精确、indexer 无关分层 KV cache：完整 KV 放 host pinned 内存，GPU 每请求每层只留 $B$ 格 LRU 缓存（$B{=}2k$ 时约 87% 命中），单个融合 kernel 在 decode CUDA graph 内解析 miss，共享选择的模型用 plan-then-IO 精确预取隐藏约一半 IO；长上下文峰值吞吐最高 4.7 倍，已并入上游 SGLang。">
+  <meta name="dojo:type" content="paper">
+  <meta name="dojo:topics" content="推理系统,内存与缓存,注意力机制">
+  <meta name="dojo:tag" content="hisparse,稀疏注意力,KV-cache,分层缓存,SGLang,长上下文">
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">$\leftarrow$ 返回 Dojo</a>
+      <a href="index.html">完整解析 $\to$</a>
+    </nav>
+    <header>
+      <span class="eyebrow">论文概览 · 推理系统</span>
+      <h1>HiSparse: Scaling Sparse-Attention Decoding with Hierarchical KV Cache Management</h1>
+      <p class="lead">top-$k$ 稀疏注意力让每步注意力只读 $k$ 条 KV，但 serving 系统仍须把完整 KV 常驻 HBM，解码先撞容量墙。HiSparse 把完整 KV 放进 host pinned 内存、GPU 每层只留固定大小的 LRU 缓存，用融合 kernel 解析 miss、用精确预取隐藏 IO，输出逐位不变，长上下文峰值吞吐最高 4.7 倍。</p>
+      <p class="meta"><a href="https://arxiv.org/abs/2608.07009">arXiv:2608.07009v1</a> · Zhiqiang Xie 等（Stanford、Meta、Alibaba 等） · NeurIPS 2026 投稿预印本 · 更新于 2026-09-03</p>
+    </header>
+
+    <h2>解决的问题</h2>
+<p>top-$k$ 稀疏注意力把每步读的 KV 降到 $k$ 条，但选择集随步与层漂移：这一步跳过的位置，下一步可能被选中。serving 系统因此不敢丢任何 KV，完整 KV 仍须常驻 HBM——decode batch 的准入卡在「$N_{\text{batch}} \times L_{\text{ctx}}$ 条 KV」上，算力还没用满，显存先撞墙，上下文越长、并发越高吞吐越早走平。朴素的解法是把 KV 全放 host、每步按选择取回，但论文估算 GLM-5.1 这样每 token 需移动约 200 MB KV，十几路并发就打满 PCIe Gen5 $\times$16——解耦本身不够，必须利用选择的局部性。</p>
+
+<h2>主要贡献</h2>
+<ul>
+<li><b>把瓶颈从读带宽改判为驻留容量</b>：模型侧的稀疏注意力工作解决「读什么」，不解决「什么必须驻留」；论文量化指出 top-$k$ 解码的 serving 瓶颈是防备未来任意选择的全量驻留，并用 naive offload 的带宽反设论证「必须靠局部性」。</li>
+<li><b>indexer 无关且精确</b>：相对并发的 ESS（DeepSeek-V3.2 专用、仿真评估）与 ECHO（NSA 专用、以预测式预取为中心），HiSparse 用统一接口消费任意选择器的逻辑位置（DSA、NSA、Quest 均接入），只改 KV 的驻留位置，输出与全驻留逐位相同。</li>
+<li><b>局部性优先的融合解析</b>：LRU 管理的 GPU cache 让多数选择驻留、把 IO 负载本身降下来而非只靠重叠隐藏；hit 检测、victim 选择、host 拷贝、页表更新压进单个融合 kernel，并被捕获进 decode CUDA graph，不付逐层 launch 与中间态落 HBM 的代价。</li>
+<li><b>选择可先知时的精确预取</b>：对显式共享选择的模型（IndexShare：少数 anchor 层跑 indexer、多数 shared 层复用其选择），anchor 层的 miss 计划被重放进 shared 层缓存，传输与计算重叠；推测式预取实测无端到端收益，被论文否定。</li>
+</ul>
+
+<h2>方法概述</h2>
+<p>HiSparse 解耦「逻辑可用」与「物理驻留」：host pinned DRAM 维护每请求完整 KV 的权威副本；GPU 侧每请求每层预留固定 $B$ 格缓存（$B \ge k$，实用范围 $[2k, 4k]$），页表记录逻辑位置到槽位（或 host-only 哨兵），每层独立 LRU 决定谁留下。解码 KV footprint 从随上下文线性增长的 $N_{\text{batch}} N_{\ell} L_{\text{ctx}} W_{\text{KV}} s$ 变为常数 $N_{\text{batch}} N_{\ell} B W_{\text{KV}} s$；模型选择状态（indexer key 等）始终留在 GPU 不分页。</p>
+<p>解码每步每层先跑 Resolve kernel：选择集装进共享内存哈希表，并行探测 $B$ 个槽位标记 hit 与可逐出者，scan 压缩后更新 LRU 并选出 victim，负责 miss 的线程用 GPU-assisted IO 从 pinned host 内存直接向量化拷贝，最后发布与逻辑位置对齐的物理槽位表；此后注意力只读 GPU 槽位。新产生的 KV 写入预留槽位并异步写回 host。实现合并进上游 SGLang，约 2200 行 Python 加一个 CUDA kernel 头文件（Resolve 的两种布局变体与 copy-only kernel），<code>--enable-hisparse</code> 启用。</p>
+
+<h2>关键结论</h2>
+<ul>
+<li><b>长上下文峰值吞吐最高 4.7 倍</b>：Qwen3+Quest 在 GH200 上 200K 输入从 111 提到 520 tokens/s；GLM-5.1（DSA）32K 为 3.1 倍；短上下文（4K）与基线相当（GLM-5.1：2288$\to$2280）。条件：未修改 SGLang v0.5.11 全 KV 基线、峰值吞吐口径、$k = 2048$。</li>
+<li><b>容量与上下文长度解耦</b>：GLM-5.1 一个 128K 请求的 KV 从约 13 GB 降到 $B = 4096$ 时约 0.4 GB（约 30 倍）；约 60 请求 batch 的解码 KV 预算从约 240 GB 降到约 25 GB，容量红利可兑换为更高并发或更便宜的部件。</li>
+<li><b>LRU 把选择局部性变成约 87% 命中</b>：$B = 2k$ 时 miss 13.4%，对比只存 top-$k$ 的 30% 与 Bélady 理想下界 8.2%。条件：GLM-5.1 服务 100K token prompt 的单 trace 前 1000 步统计。</li>
+<li><b>精确预取隐藏约一半 IO，代价可控</b>：GLM-5.2（IndexShare，78 层 = 21 anchor + 57 shared）上 TPOT 的 IO 暴露从 7.7 降到 3.0 ms/token（并发 8），预取吞吐达 no-IO oracle 的 85%。剩余代价：TPOT 仍高于全 KV 基线，容量上限从 HBM 换成 host DRAM（Grace 平台 LPDRAM 约 480 GB，与 HBM 相当时优势缩小），$B$ 为部署时静态配置。</li>
+</ul>
+
+<p>容量墙的完整论证、贯穿示例与 Resolve 五阶段手算、预取时间线、miss 率实验细节见<a href="index.html">完整解析页</a>。</p>
+
+    <footer>Dojo · 概览 · 机制细节见完整解析页</footer>
+  </main>
+</body>
+</html>
