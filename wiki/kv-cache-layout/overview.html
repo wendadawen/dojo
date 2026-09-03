@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KV cache 布局（NHD/HND）· 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 内存与缓存 / 推理系统</span>
+      <h1>KV cache 布局（NHD/HND）</h1>
+      <p class="lead">同一份 KV cache 的两种显存排法：NHD 让写入零转置，HND 让单头整页连续——写读诉求相反，布局选择跟随瓶颈。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <h2>定位摘要</h2>
+    <p>KV cache 布局（NHD 与 HND）描述的是同一份缓存数据在显存里的排列顺序，不是新的数据格式。KV cache 的三个维度——token 数、KV 头数、每头维度——谁排在外层、谁排在内层，就是布局的全部内容：NHD 按 (token, 头, 维) 排，同一 token 的所有头连续；HND 按 (头, token, 维) 排，同一头的整页 token 连续。</p>
+
+    <h2>问题背景</h2>
+    <p>写路径和读路径对“谁应该连续”的诉求相反：注意力的投影输出天然是 NHD（写入零转置），而 attention 读取时按（头， 全部历史 token）取数——HND 让单头整页连成一段。两种布局因此并存，选择跟随瓶颈在哪一侧。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li><strong>三个维度</strong>：$N$（token 数）、$H_{\mathrm{kv}}$（KV 头数，GQA 下少于查询头数）、$d$（每头维度）。分页形式下 NHD 形状为 $(n_{\text{page}}, p, H_{\mathrm{kv}}, d)$，HND 为 $(n_{\text{page}}, H_{\mathrm{kv}}, p, d)$。</li>
+      <li><strong>写入偏好 NHD</strong>：投影输出 $XW_K$ 的形状是 $(N, H_{\mathrm{kv}} \cdot d)$，行主序下每行恰为一个 token 的全部头数据，reshape 即 NHD、零转置；decode 追加写落进一段连续槽位。</li>
+      <li><strong>读取偏好 HND（特定场景）</strong>：单头取一页的传输单元从 NHD 的 $d$ 个元素（fp16、$d=128$ 时 256 B）变成 HND 的一整段 $p \cdot d$ 个元素（$p=32$ 时 8 KB）。收益集中在低精度（fp8/nvfp4）的 trtllm-gen kernel——其 API 默认 kv_layout="HND"、NHD 会触发转置拷贝——以及页级大块搬运（offload、换入换出）。FreeKV 甚至两侧各用一种：GPU 用 NHD、CPU 用 HND，只在 offload 一页时转置一次。</li>
+      <li><strong>vLLM 的实现</strong>：布局是同一块显存的视图属性——逻辑形状恒为 $[L, B, H, N, C]$，<code>KVCacheLayout</code> 枚举值是 stride 置换（LBNHC 即 NHD、LBHNC 即 HND），切换不复制数据。布局在 engine core 解析一次：各注意力后端声明偏好列表取交集，环境变量 <code>VLLM_KV_CACHE_LAYOUT</code> 可显式指定；默认偏好 NHD 排第一。</li>
+      <li><strong>SM100（Blackwell）强制 head-major</strong>：trtllm-gen kernel 只消费 head-major（头维排在外层，即 HND 类）的块内布局，FlashInfer 后端因此只声明 (LBHNC, BLHNC)——SM100 上布局必然解析为 HND 类即来源于此。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>fp16 常规推理下两种布局性能差异不显著（FlashInfer 实践表述），默认选择仍是 NHD；HND 不是普遍升级，是被低精度 kernel 与页级搬运选中的排法。</li>
+      <li>切换布局不复制数据：它只是同一 storage 配不同 stride 的两个视图，写入 kernel 内部用视图 transpose 适配。</li>
+      <li>“HDN”不是标准命名，业界只有 NHD 与 HND，字母顺序即维度顺序。</li>
+      <li>碎片要分两层：分配碎片由分页解决，布局只决定页内访问的碎片；vLLM 细节基于 2026-09-03 的 main 分支（RFC #42082 形状体系），更早版本（如 v0.13.0）用每层独立 buffer 加 permute 置换，机制同源。</li>
+    </ul>
+
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
