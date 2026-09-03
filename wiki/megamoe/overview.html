@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MegaMoE · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 推理系统 / 并行与通信</span>
+      <h1>MegaMoE</h1>
+      <p class="lead">DeepSeek 开源在 DeepGEMM 中的融合 MoE kernel：把专家并行下 MoE 一层的五段执行塞进一个占满全部 SM 的持久 kernel，让 NVLink 通信与 Tensor Core 计算同时进行。</p>
+      <p class="meta">更新于 2026-09-03 · 核对版本 DeepGEMM main @ 559d79f</p>
+    </header>
+
+
+    <h2>问题背景</h2>
+    <p>MoE 模型把前馈网络拆成许多小专家，由路由网络为每个 token 只选几个；专家分布在多块 GPU 上（专家并行，EP）时，token 必须在 rank 之间旅行。传统实现把这一层拆成五个独立 kernel 串行执行——dispatch（发往专家所在 rank）、Linear-1、SwiGLU、Linear-2、combine（加权结果送回源 rank）。串行的代价是双向空闲：通信段运行时计算单元停着，计算段运行时互联线路闲着，且 kernel 之间中间结果还要落回显存。通信量删不掉，唯一出路是让它与计算同时发生——这要求"发数据的人"与"算数的人"住在同一个 kernel 里。MoE 路由与共享专家的背景见<a href="../../wiki/deepseek-moe/index.html">DeepSeekMoE</a>，EP 下的服务形态见<a href="../../wiki/moe-serving/index.html">MoE serving</a>，通信原语与 NVLink 见<a href="../../wiki/gpu-communication/index.html">GPU 通信</a>。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li><b>单持久 kernel 融合五段。</b>dispatch、Linear-1、SwiGLU、Linear-2、combine 不再各自启动 kernel；grid 恰好等于 SM 数、从头跑到层结束，中间结果在片上与环形缓冲之间流转，任务由 kernel 内部调度器分发。</li>
+      <li><b>warp 专用化分工。</b>一个 block 内三组线程各司其职：dispatch 线程组负责通信输入侧（计数、源索引、分块拉取），TMA/MMA warp 负责矩阵计算，epilogue 线程组负责 SwiGLU、量化、远程写回与归约。通信分散在两组线程上，与计算并行推进。</li>
+      <li><b>对称内存支撑跨 rank 读写。</b>所有进程以相同布局分配缓冲区，地址差为固定偏移；kernel 里的线程用一次加法就能把本地地址翻译成远端等价地址，在计算中途直接发起跨 rank 读写，不需要框架在 kernel 之间编排 all-to-all。跨 rank 时序由 kernel 内的 NVLink barrier 协调。</li>
+      <li><b>不对称的通信方向。</b>dispatch 侧元数据先行（每专家计数、源索引直接写远端）、数据由接收侧按消费节奏分块拉取；combine 侧由专家侧把已乘路由权重的结果直接远程写入源 rank 的槽位，源 rank 对 top-$k$ 槽浮点累加后写出。</li>
+      <li><b>任务调度贴合负载。</b>计算被切成带相位（Linear1/Linear2/共享专家）的 task，L1 预热后交替发布、各 SM 原子认领；tile 大小按每专家期望 token 数自动分档，小 batch 用小 tile，覆盖从单 token 延迟敏感到大批 prefill 的负载谱。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>官方基准（DeepSeek-V4-Flash/V4-Pro 规格、EP8、batch 为每 rank token 数）下，相对 DeepEP 通信 + 分组 GEMM + SwiGLU 的非重叠基线加速 1.50–1.96 倍；batch 为 1 时收益最大，大 batch 收敛到约 1.5 倍。正确性以与基线逐位一致（无共享专家）验证。</li>
+      <li>通信量没有减少——加速全部来自把通信藏进计算的空闲里；衡量这类系统的关键指标是重叠效率，不是通信体积。</li>
+      <li>成立条件较硬：仅 Blackwell（sm100）实现并依赖 TMEM/tcgen05，发布版仅 FP8xFP4 精度组合，要求 PyTorch 2.9+ 与多进程对称内存，top-$k$ 不超过 32；官方基准为单节点 EP8，跨机无数据。Hopper 上无官方收益数据（第三方评论称无 TMEM 时不显著）。</li>
+      <li>官方声明仍在开发优化中；它是计算 kernel 而非通信库，与 DeepEP 层级不同（后者恰好是其基准基线的通信部分）。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,1701 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Mega MoE 是 DeepSeek 开源在 DeepGEMM 中的融合 MoE kernel：把专家并行下 MoE 一层的 dispatch、Linear-1、SwiGLU、Linear-2、combine 五段执行融合为一个持久 kernel，靠 warp 专用化与对称内存让 NVLink 通信与 Tensor Core 计算重叠。">
+  <meta name="dojo:summary" content="DeepSeek 开源在 DeepGEMM 里的融合 MoE kernel：把 EP 下 MoE 层的五段执行（dispatch、Linear-1、SwiGLU、Linear-2、combine）塞进一个占满全部 SM 的持久 kernel，用对称内存支撑 kernel 内跨 rank 读写，让 NVLink 传输与 Tensor Core 计算重叠；EP8 基准下相对非重叠基线加速 1.50–1.96 倍，仅支持 Blackwell（sm100）。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="推理系统,并行与通信">
+  <meta name="dojo:tag" content="moe-kernel,deepgemm,communication-overlap">
+  <title>MegaMoE：把 MoE 一层塞进一个持久 kernel，让通信与计算同时进行</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">MegaMoE</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">MegaMoE：把 MoE 一层塞进一个持久 kernel，让通信与计算同时进行</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：DeepGEMM 官方仓库（GitHub deepseek-ai/DeepGEMM，main 分支 commit 559d79f，2026-07-15）的 README、PR #304（2026-04-17 引入 Mega MoE）、PR #316（2026-04-24 基准数据）与 kernel 源码 <code>sm100_fp8_fp4_mega_moe.cuh</code> 等；机制描述另引第三方论文 X-Stage（arXiv:2607.23264）。来源均存档于本页 <code>research/sources/</code>。</p>
+</blockquote>
+
+<p>一块 GPU 在跑 MoE 模型的一层时，token 要发给别的卡上的专家去算，算完还要送回来。传统做法把这件事拆成五个独立 kernel 依次执行：先发数据、等着，再算、等着，最后收回结果、等着。发送和收回的时候，负责计算的单元停着；计算的时候，负责传输的互联线路闲着。Mega MoE 是 DeepSeek 开源在 DeepGEMM 里的 kernel 家族（官方写法 Mega MoE，2026 年 4 月随 PR #304 公开<sup>[C1, N6]</sup>），它把这五段工作融合成一个占满整块 GPU、从头跑到尾的持久 kernel，让 NVLink 传输与 Tensor Core 计算同时进行——通信量没有减少，但通信造成的空闲被计算填满了。后文约定几个用词：一块 GPU 上参与通信的一个进程称为一个 rank；SM 是 GPU 的计算单元；warp 是 32 线程为一组的执行单位；TMA 是异步批量搬运数据的单元。它们在首次正式使用的章节还有更完整的说明与概念页链接。</p>
+
+<p>本文按以下问题展开：先看清楚传统执行到底慢在哪（第 1 章），再看融合后的 kernel 如何分工（第 2 章）、支撑跨 rank 读写的地基是什么（第 3 章）、一个 token 在 kernel 里走完整条路的每个站点（第 4 章），最后核对官方基准数字与适用边界（第 5 章）。阅读需要 MoE 路由、专家并行（EP）、SwiGLU 与 GPU 执行模型的背景，相关概念页在首次依赖处给出。</p>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>MoE 一层在专家并行下要执行哪五段工作，为什么通信会让计算单元空转？</p>
+      <details>
+      <summary>解答：五段是 dispatch、Linear-1、SwiGLU、Linear-2、combine，串行执行时通信与计算互相等待</summary>
+      <p>token 先按路由结果被送往各专家所在的 rank（dispatch），每个专家做两层线性变换夹一个 SwiGLU 激活（Linear-1 把 hidden 维升到中间维的 gate/up 两半，SwiGLU 相乘后减半，Linear-2 投回 hidden 维），最后各专家输出按路由权重加权求和送回源 rank（combine）。传统实现里五段是独立 kernel 串行：dispatch/combine 期间 Tensor Core 没有有效计算，GEMM 期间 NVLink 没有流量，且每段之间数据要落回显存。完整论证见「MoE 一层的五段执行」一章。</p>      </details>
+    </li>
+    <li>
+      <p>Mega MoE 把五段融合成一个持久 kernel 后，靠什么让 NVLink 传输与 Tensor Core 计算同时进行？</p>
+      <details>
+        <summary>解答：持久 kernel 占满全部 SM，warp 专用化让不同线程组同时推进通信与计算</summary>
+        <p>kernel 以 grid 恰好等于 SM 数的方式启动并一直运行到整层结束，任务由 kernel 内部调度器分发。block 内的线程分成三组：dispatch 线程组负责跨 rank 的计数、源索引与数据拉取，TMA 生产者 warp 负责加载矩阵分块，MMA warp 发射 Tensor Core 指令，epilogue 线程组做激活、量化与结果写回。通信动作由 dispatch 组与 epilogue 组发起，与 GEMM 计算在不同 warp 上并行推进。完整论证见「一个持久 kernel 里的分工」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>对称内存为什么是单 kernel 跨 rank 读写的前提？它是怎么工作的？</p>
+      <details>
+        <summary>解答：所有 rank 以相同布局分配缓冲，地址差为固定偏移，一次加法即可定位远端地址</summary>
+        <p>多进程以相同布局在各自 GPU 上分配缓冲区后，任意 rank 内的地址加上固定偏移就是目标 rank 的对应地址。kernel 侧的 SymBuffer 保存本 rank 基址与全部 rank 的偏移表，<code>map(ptr, dst_rank) = ptr + offsets[dst_rank]</code> 一步完成翻译，线程因此能在 kernel 执行中途直接对远端发起读写。独立通信库由框架在 kernel 之间编排 all-to-all、kernel 本身只见本地指针，不需要这个约束。完整论证见「对称内存」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>一个 token 的数据在融合 kernel 里走完整条路要经过哪些站点？各站点如何衔接？</p>
+      <details>
+        <summary>解答：元数据先行、数据分块拉取进环形缓冲，两层 GEMM 后按源元数据远程写回，最后归约</summary>
+        <p>dispatch 线程组先把每专家计数与源索引发往专家所在 rank（元数据小、先行推送），接收侧再按专家分组、轮转选源，用 TMA 把 token 数据按不超过 4096 字节的块拉进本地环形缓冲。调度器把两层 GEMM 切成 task（Linear1/Linear2/共享专家四相），L1 预热后交替发布，环形缓冲的 full/empty 计数器衔接生产与消费。L1 epilogue 在片上完成 SwiGLU 并量化回 FP8，L2 epilogue 按源元数据把 BF16 结果远程写入源 rank 的 combine 缓冲对应槽位；全部写回后源 rank 对 top-k 槽做浮点累加、写出结果。完整论证见「一个 token 的完整旅程」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>Mega MoE 实测收益是多少，在什么条件下成立、什么条件下用不了？</p>
+      <details>
+        <summary>解答：EP8 下相对非重叠基线 1.50–1.96 倍，但仅限 Blackwell（sm100）与 FP8xFP4 等条件</summary>
+        <p>官方基准在 DeepSeek-V4-Flash 与 V4-Pro 两档规格、8 路专家并行下测得相对非重叠基线（DeepEP 通信 + 分组 GEMM + SwiGLU）加速 1.50–1.96 倍，batch 为每 rank 1 个 token 时收益最大。边界：发布版仅 sm100（Blackwell）实现并依赖 TMEM/tcgen05，发布声明仅支持 FP8xFP4，要求 PyTorch 不低于 2.9 与多进程对称内存，top-k 不超过 32；Hopper 上官方无收益数据（第三方评论称无 TMEM 时不显著）。正确性以与基线逐位一致（无共享专家）验证。完整论证见「收益与边界」一章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>「融合 kernel 把通信消掉了」——通信的数据量一点没少：dispatch 仍要把每 token 的激活送到各专家所在 rank，combine 仍要把结果送回；Mega MoE 消除的是通信造成的<b>空闲时间</b>，方式是让传输与计算同时进行，而不是删除传输本身。</li>
+    <li>「Mega MoE 是新通信库，用来替代 DeepEP」——它是 DeepGEMM 里的<b>计算 kernel</b> 家族，只是把通信动作融合了进来；DeepEP 是独立通信库，两者层级不同。官方基准的对照基线恰好是用 DeepEP 做通信的非重叠流水线。</li>
+  </ul>
+</section>
+
+<h2 id="five-stages">1. MoE 一层的五段执行——通信为什么让 GPU 空转</h2>
+
+<p>MoE 模型把一个大的前馈网络拆成许多小专家，路由网络为每个 token 只选其中几个<sup>[C1]</sup>。专家数一多，一块 GPU 放不下全部专家权重，于是把不同专家放到不同 GPU 上——这就是专家并行（EP），一块 GPU（一个进程、一个 rank）持有全部专家中的一小部分。路由结果与专家摆放一旦不同 rank，token 就必须在 rank 之间旅行：这是 MoE 与稠密模型推理最本质的执行差异。专家切分与共享专家的背景见<a href="../../wiki/deepseek-moe/index.html">DeepSeekMoE</a>，EP 下的服务形态见<a href="../../wiki/moe-serving/index.html">MoE serving 基础</a>。</p>
+
+<p>先约定一个小到可以手算的贯穿示例，后文各章反复使用、逐层加深。</p>
+
+<p>构造示例。两个 rank（rank0、rank1），各持 2 个专家：$E_0$、$E_1$ 在 rank0，$E_2$、$E_3$ 在 rank1；每个 token 路由到 $k=2$ 个专家；每 rank 有 2 个 token（$t_0$、$t_1$ 在 rank0，$t_2$、$t_3$ 在 rank1）。路由表如下：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>token</th><th>所在 rank</th><th>路由到的专家</th><th>专家所在 rank</th></tr></thead>
+<tbody>
+<tr><td>$t_0$</td><td>rank0</td><td>$E_0$、$E_3$</td><td>rank0、rank1</td></tr>
+<tr><td>$t_1$</td><td>rank0</td><td>$E_2$、$E_3$</td><td>rank1、rank1</td></tr>
+<tr><td>$t_2$</td><td>rank1</td><td>$E_1$、$E_2$</td><td>rank0、rank1</td></tr>
+<tr><td>$t_3$</td><td>rank1</td><td>$E_0$、$E_1$</td><td>rank0、rank0</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="five-stages-what">1.1 五段各自做什么</h3>
+
+<p>一个 token 穿过 EP 下的 MoE 层，要经过五段执行<sup>[C1]</sup>：</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">dispatch</div>
+      <div class="dg-node-note">token 按路由发往专家所在的 rank</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">Linear-1</div>
+      <div class="dg-node-note">每个专家算 $W_1 x$：hidden 升到 $2\times$中间维（gate/up 两半拼接）</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">SwiGLU</div>
+      <div class="dg-node-note">silu(gate) $\times$ up，宽度减半到中间维</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">Linear-2</div>
+      <div class="dg-node-note">每个专家算 $W_2(\cdot)$：中间维投回 hidden 维</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">combine</div>
+      <div class="dg-node-note">各专家输出按路由权重加权求和，送回源 rank</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">五段执行的方向；dispatch 与 combine 是跨 rank 通信段，中间三段是每个专家本地的计算段。</figcaption>
+</figure>
+
+<p>用公式写一层的输出。设 token 的输入为 $x\in\mathbb{R}^{h}$（$h$ 为 hidden 维），路由选中专家集合为 $\mathcal{S}$（$|\mathcal{S}|=k$），每个专家 $e\in\mathcal{S}$ 的路由权重为 $g_{e}$、两层变换为 $W_1^{(e)}$、$W_2^{(e)}$，则</p>
+
+$$y=\sum_{e\in\mathcal{S}} g_{e}\cdot W_2^{(e)}\,\mathrm{SwiGLU}\!\left(W_1^{(e)}x\right),\qquad \mathrm{SwiGLU}(u,v)=\mathrm{silu}(u)\odot v.$$
+
+<p>其中 $W_1^{(e)}\in\mathbb{R}^{2d\times h}$ 的两半分别是 gate 与 up（$d$ 为中间维），$\mathrm{silu}(u)=u\cdot\sigma(u)$，$\odot$ 为逐元素乘；combine 段完成的就是这个按 $g_{e}$ 的加权求和<sup>[F1]</sup>。SwiGLU 的完整讲解见<a href="../../wiki/swiglu/index.html">SwiGLU</a>，这里只需要它的形状事实：输出宽度是输入 gate/up 拼接宽度的一半。</p>
+
+<p>在贯穿示例里走一遍 $t_0$ 的路径：$t_0$ 在 rank0，被路由到 $E_0$（rank0）和 $E_3$（rank1）。dispatch 段，$t_0$ 的一份副本留在 rank0 给 $E_0$，另一份发往 rank1 给 $E_3$。计算段，rank0 上 $E_0$ 对 $t_0$ 做 Linear-1 → SwiGLU → Linear-2，同时 rank1 上 $E_3$ 也对 $t_0$ 的副本做同样三段。combine 段，$E_3$ 的输出要送回 rank0，与 $E_0$ 的输出按各自路由权重相加，得到 $t_0$ 的层输出。注意两件事：$t_0$ 一共被两个专家处理，dispatch 要发出 $k=2$ 份副本；其中一份根本不出本 rank（$E_0$ 也在 rank0），另一份要跨 rank 往返。四个 token 的全部 8 个专家-路由对里，6 个（$t_0$→$E_3$、$t_1$→$E_2$ 与 $t_1$→$E_3$、$t_2$→$E_1$、$t_3$→$E_0$ 与 $t_3$→$E_1$）需要跨 rank 传输，只有 $t_0$→$E_0$ 与 $t_2$→$E_2$ 留在本地——四分之三的专家计算要等远端数据。</p>
+
+<p>dispatch 与 combine 这两个方向合起来就是 all-to-all 通信的形态——每个 rank 都既向别的 rank 发数据、也从别的 rank 收数据，这种集合通信的背景见<a href="../../wiki/gpu-communication/index.html">GPU 通信</a>。DeepSeek 的专用通信库 DeepEP 提供的就是这两段的高吞吐/低延迟实现（其概念页见<a href="../../wiki/deepep/index.html">DeepEP</a>）；本文只需要 dispatch/combine 的方向语义。</p>
+
+<h3 id="five-stages-idle">1.2 串行执行的两种空闲</h3>
+
+<p>传统实现里，五段由独立 kernel 依次完成<sup>[C1]</sup>：框架先调用通信库的 dispatch kernel，等它返回；再调用分组 GEMM kernel 算 Linear-1，等它返回；然后 SwiGLU kernel、第二个分组 GEMM kernel，最后 combine kernel。串行带来两种浪费：dispatch/combine 运行时，SM 上没有有效计算，Tensor Core 空转；GEMM 运行时，互联线路上没有数据流，NVLink 空转。每段结束到下一段开始之间，中间结果还要写回显存再读出。SM、kernel 启动与占用的背景见<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型</a>。</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 412" role="img" aria-label="传统串行执行与 Mega MoE 重叠执行的时间线对比">
+  <!-- 上面板：传统串行 -->
+  <text x="110" y="28" font-size="13" font-weight="600">传统实现：五个独立 kernel 依次执行</text>
+  <text x="100" y="68" font-size="12" text-anchor="end">NVLink</text>
+  <rect x="110" y="48" width="100" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <text x="160" y="68" font-size="11" text-anchor="middle">dispatch</text>
+  <rect x="502" y="48" width="100" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <text x="552" y="68" font-size="11" text-anchor="middle">combine</text>
+  <rect x="218" y="48" width="276" height="32" fill="none" stroke-dasharray="4 4" style="stroke: var(--border)"/>
+  <text x="356" y="68" font-size="11" text-anchor="middle" opacity="0.55">互联空闲</text>
+  <text x="100" y="128" font-size="12" text-anchor="end">SM</text>
+  <rect x="218" y="108" width="100" height="32" class="dg-box"/>
+  <text x="268" y="128" font-size="11" text-anchor="middle">Linear-1</text>
+  <rect x="326" y="108" width="60" height="32" class="dg-box"/>
+  <text x="356" y="128" font-size="11" text-anchor="middle">SwiGLU</text>
+  <rect x="394" y="108" width="100" height="32" class="dg-box"/>
+  <text x="444" y="128" font-size="11" text-anchor="middle">Linear-2</text>
+  <rect x="110" y="108" width="100" height="32" fill="none" stroke-dasharray="4 4" style="stroke: var(--border)"/>
+  <text x="160" y="128" font-size="11" text-anchor="middle" opacity="0.55">计算空闲</text>
+  <rect x="502" y="108" width="100" height="32" fill="none" stroke-dasharray="4 4" style="stroke: var(--border)"/>
+  <text x="552" y="128" font-size="11" text-anchor="middle" opacity="0.55">计算空闲</text>
+  <line x1="110" y1="155" x2="618" y2="155" class="dg-line"/>
+  <path d="M626,155 l-10,-5 v10 z" style="fill: var(--text-light)"/>
+  <text x="632" y="159" font-size="11">时间</text>
+
+  <!-- 下面板：Mega MoE 重叠 -->
+  <text x="110" y="225" font-size="13" font-weight="600">Mega MoE：一个持久 kernel，通信与计算重叠</text>
+  <text x="100" y="263" font-size="12" text-anchor="end">NVLink</text>
+  <rect x="110" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <rect x="162" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <rect x="214" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <rect x="266" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <text x="210" y="290" font-size="11" text-anchor="middle">dispatch（分块拉取）</text>
+  <rect x="326" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <rect x="378" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <rect x="430" y="243" width="44" height="32" class="dg-box" style="stroke: var(--blue)"/>
+  <text x="426" y="290" font-size="11" text-anchor="middle">combine（分块写回）</text>
+  <text x="100" y="333" font-size="12" text-anchor="end">SM</text>
+  <rect x="122" y="313" width="90" height="32" class="dg-box"/>
+  <text x="167" y="333" font-size="11" text-anchor="middle">Linear-1</text>
+  <rect x="220" y="313" width="56" height="32" class="dg-box"/>
+  <text x="248" y="333" font-size="11" text-anchor="middle">SwiGLU</text>
+  <rect x="284" y="313" width="90" height="32" class="dg-box"/>
+  <text x="329" y="333" font-size="11" text-anchor="middle">Linear-2</text>
+  <rect x="382" y="313" width="46" height="32" class="dg-box"/>
+  <text x="405" y="333" font-size="11" text-anchor="middle">L1</text>
+  <rect x="436" y="313" width="46" height="32" class="dg-box"/>
+  <text x="459" y="333" font-size="11" text-anchor="middle">L2</text>
+  <line x1="110" y1="360" x2="530" y2="360" class="dg-line"/>
+  <path d="M538,360 l-10,-5 v10 z" style="fill: var(--text-light)"/>
+  <text x="544" y="364" font-size="11">时间</text>
+  <text x="110" y="395" font-size="11" opacity="0.7">同一时间刻度下，重叠执行在更短时间内完成全部五段工作；SM 泳道右端的 L1/L2 表示后续专家的计算接续（示意图，非实测 trace）。</text>
+</svg>
+<figcaption class="diagram-caption">上：传统串行——dispatch/combine 时 SM 空闲，GEMM 时互联空闲。下：Mega MoE——dispatch 组分块拉取、epilogue 组分块写回与 Tensor Core 计算在不同线程组上同时推进，两条泳道同时被填满。</figcaption>
+</figure>
+
+<p>通信本身也不是小数目。用基准里的 DeepSeek-V4-Pro 规格（hidden $h=7168$、top-$k=6$）<sup>[N3]</sup>算一笔账：激活按 FP8 存储时每元素 1 字节，一个 token 的 dispatch 发送量约为 $k\times h\times 1\,\mathrm{B}=6\times 7168=43008\,\mathrm{B}\approx 43\,\mathrm{KB}$；combine 回传的是 BF16 结果，约 $86\,\mathrm{KB}$。每 rank 512 个 token 时，仅 dispatch 方向就要发出约 $22\,\mathrm{MB}$（$43008\times 512=22{,}020{,}096$ 字节，十进制口径）——这还是每层、每 rank 反复发生的量。这笔账只算数据本体，是按公式 $k\times h\times b_{\mathrm{act}}$ 直接推出的量级估算<sup>[F3]</sup>，不是实测流量；官方基准表中互联带宽一列（batch 512 时 266/182 GB/s<sup>[N2, N4]</sup>）就是这些流量的实测体现。</p>
+
+<p>既然通信量删不掉，唯一出路就是让它与计算同时发生。这要求"发数据的人"和"算数的人"住在同一个 kernel 里——这正是 Mega MoE 的做法，下一章看它如何组织。</p>
+
+<h3 id="five-stages-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>专家并行下，一个 token 穿过 MoE 层要经过哪五段？每段数据在哪里？</p>
+    <details>
+      <summary>解答：dispatch、Linear-1、SwiGLU、Linear-2、combine；数据在源 rank、专家 rank 与源 rank 之间往返</summary>
+      <p>五段依次是：dispatch（token 副本按路由从源 rank 发往各专家所在 rank）、Linear-1（每个专家把 token 从 $h$ 维投影到 $2d$ 维的 gate/up 拼接）、SwiGLU（silu(gate) 乘 up，宽度减半为 $d$ 维）、Linear-2（投回 $h$ 维）、combine（各专家输出按路由权重 $g_{e}$ 加权求和送回源 rank）。以贯穿示例的 $t_0$ 为例：数据从 rank0 出发，一份留在 rank0 给 $E_0$、一份到 rank1 给 $E_3$，两边各自完成三段计算后，$E_3$ 的结果回传 rank0 与 $E_0$ 的结果相加。计算段在专家所在的 rank 上本地完成，通信段只在 dispatch 前向与 combine 回向发生。成立条件：专家分布在多个 rank 上（EP）；若全部专家在同一 rank，退化为纯本地计算。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么说传统实现里"通信时计算空闲、计算时互联空闲"？</p>
+    <details>
+      <summary>解答：五段由独立 kernel 串行执行，任一时刻只有通信或只有计算在推进</summary>
+      <p>传统实现按 dispatch kernel → 分组 GEMM → SwiGLU kernel → 分组 GEMM → combine kernel 的顺序串行调用，每段都要等前一段完全结束。dispatch/combine 运行期间 SM 没有可做的计算，Tensor Core 空转；三段计算运行期间互联上没有数据流，NVLink 空闲。此外 kernel 之间中间结果要落回显存再读出，带来额外访存。在 V4-Pro 规格、每 rank 512 token 的量级下，仅 dispatch 方向每 rank 每层就要发出约 22 MB（$6\times 7168\times 512\approx 2.2\times 10^{7}$ 字节，FP8、top-$k$ 6、hidden 7168 的构造估算），这些传输在串行时间里全部是纯开销。要消除空闲，需要通信与计算同时推进——这正是 Mega MoE 改变的执行方式。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="persistent-kernel">2. 一个持久 kernel 里的分工——融合与重叠如何成立</h2>
+
+<p>官方对 Mega MoE 的一句话定义拆开是两件事<sup>[C1]</sup>：<b>融合</b>（fuse）——dispatch、Linear-1、SwiGLU、Linear-2、combine 五段不再各自启动 kernel，中间状态不回到框架手里；<b>重叠</b>（overlap）——通信动作与 Tensor Core 计算同时推进。融合是重叠的前提：只有当发数据的人和算数的人住在同一个 kernel 里，一方的等待才能被另一方的工作填满。这也回应了开头的误解澄清——通信量没有变少，变的是它发生的时间安排。</p>
+
+<h3 id="persistent-kernel-form">2.1 持久 kernel：一个启动，跑到整层结束</h3>
+
+<p>Mega MoE 的启动形态是持久 kernel（persistent kernel）：grid 维度恰好等于 SM 数量，每 SM 一个 block，kernel 从 MoE 层开始一直运行到层内全部工作完成才退出<sup>[C8]</sup>。这和常规 kernel 形成对照——常规做法是把工作切成许多小块、每块启动一次 kernel，由 GPU 的硬件调度器把 block 摊到 SM 上。持久形态的好处是：全部工作在 kernel 内部自组织，可以按数据就绪情况安排顺序，通信与计算的交错不再受 kernel 边界约束；代价则是 kernel 必须自己完成调度——谁先算哪块、谁等谁，都由 kernel 内的调度器决定（见第 4 章）。</p>
+
+<p>启动时每个 block 里居住着三组线程，共 384–512 线程：dispatch 线程组 128 线程、非 epilogue 组 128 线程、epilogue 组 128–256 线程（按负载分档选择）<sup>[C9]</sup>。三组线程之间还有一次寄存器再分配：dispatch 组与非 epilogue 组主动释放寄存器，epilogue 组领取更多（最多每线程 208 个），因为 SwiGLU、量化与写回的中间值都在寄存器里<sup>[C30]</sup>。</p>
+
+<h3 id="persistent-kernel-roles">2.2 warp 专用化：谁在通信、谁在计算</h3>
+
+<p>三组线程内部按 warp（32 线程的执行单位）进一步分工，这就是 warp 专用化——不同 warp 固定承担不同角色，各自跑各自的循环，靠共享内存屏障交换数据<sup>[C9]</sup>：</p>
+
+<figure class="diagram">
+  <div class="dg-stack">
+    <div class="dg-layer">
+      <span class="dg-layer-label">dispatch 组 · 4 warp</span>
+      <span class="dg-layer-body">读本地路由、统计每专家 token 数并写往远端、写源索引、按块从远端拉取 token 数据——专司通信的输入侧</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">非 epilogue 组 · 4 warp</span>
+      <span class="dg-layer-body">TMA A warp 加载激活分块、TMA B warp 加载权重分块、MMA warp 发射 Tensor Core 指令（仅 leader CTA）、调度 warp 发布计算任务（仅 leader CTA 运行）</span>
+    </div>
+    <div class="dg-layer">
+      <span class="dg-layer-label">epilogue 组 · 4–8 warp</span>
+      <span class="dg-layer-body">SwiGLU 激活、FP8 重量化、按源元数据把结果远程写回源 rank、combine 归约——通信的输出侧也在这里</span>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">一个 block（占一个 SM）内的三组线程与各自职责；通信分散在 dispatch 组（输入侧）与 epilogue 组（输出侧），与中间的计算 warp 并行推进。</figcaption>
+</figure>
+
+<p>重叠就发生在这张分工表里：dispatch 组在从远端拉取第 $n+1$ 批 token 时，MMA warp 正在对已就位的第 $n$ 批做 GEMM，epilogue 组同时在把更早完成的结果写回源 rank——第 1 章时间线图下泳道里的"同时被填满"，对应的正是这三组线程的并发。Mega MoE 的矩阵计算用两两配对的 2-SM cluster 协作执行（相邻两个 block 组成一个 cluster，配对中 0 号是 leader CTA，矩阵乘加指令 UMMA——Unified Matrix-Multiply-Accumulate，Blackwell tcgen05 架构的指令族——只由它发射），累加器与缩放因子放在 Blackwell 新增的片上 Tensor Memory（TMEM）里<sup>[C6]</sup>——这些硬件细节影响第 5 章的适用边界，计算流程本身在第 4 章展开。</p>
+
+<p>分工表里所有跨 rank 的动作——写计数、写源索引、拉取数据、远程写回——都要落到一个共同前提上：kernel 里的普通线程必须能直接定位远端 rank 的内存。这个前提由对称内存提供，下一章专门讲它。</p>
+
+<h3 id="persistent-kernel-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>"融合成一个 kernel"和"重叠通信与计算"分别指什么？持久 kernel 是什么形态？</p>
+    <details>
+      <summary>解答：融合指五段不再各自启动 kernel，重叠指通信与计算同时推进；持久 kernel 是 grid 等于 SM 数、跑到整层结束的单次启动</summary>
+      <p>融合是结构变化：dispatch、Linear-1、SwiGLU、Linear-2、combine 五段在同一个 kernel 里完成，中间结果在片上与环形缓冲之间流转，不回到框架；重叠是时间安排变化：通信动作（远端读写、数据拉取）由 dispatch 线程组与 epilogue 线程组发起，与 MMA warp 的 Tensor Core 计算在不同 warp 上同时推进。持久 kernel 指 grid 维度恰好等于 SM 数量、每 SM 一个 block、kernel 从层开始运行到全部工作完成才退出的启动形态（源码中以 <code>__launch_bounds__(kNumThreads, 1)</code> 与 grid=num_sms 启动）。任务分配由 kernel 内部调度器完成而非硬件调度器。成立条件：单层的工作量足以占满全部 SM；收益来自消除 kernel 间的等待与通信空闲，不是来自减少任何一方的总量。</p>
+    </details>
+  </li>
+  <li>
+    <p>kernel 内部有哪些角色，各自负责什么？</p>
+    <details>
+      <summary>解答：三组线程六个角色——dispatch 组管通信输入侧，TMA A/B、MMA、调度 warp 管计算，epilogue 组管激活、量化与通信输出侧</summary>
+      <p>一个 block 内三组线程：dispatch 线程组（4 warp、128 线程）读本地路由、统计每专家 token 数、把计数与源索引写往专家所在 rank、按块拉取 token 数据；非 epilogue 组（4 warp、128 线程）中 TMA A warp 加载激活分块（含缩放因子）、TMA B warp 加载权重分块、MMA warp 发射 Tensor Core 指令（仅 leader CTA）、调度 warp 发布计算任务；epilogue 线程组（4–8 warp、128–256 线程）做 SwiGLU、FP8 重量化、远程写回与 combine 归约。三组之间有一次寄存器再分配（epilogue 组最多每线程 208 个寄存器）。计算以 2-SM cluster 配对执行，累加器在 TMEM。通信分散在 dispatch 组（输入侧）与 epilogue 组（输出侧），因此与计算天然并行。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="symmetric-memory">3. 对称内存——kernel 内跨 rank 读写的地基</h2>
+
+<p>分工表里的每个跨 rank 动作，最终都变成一次普通的内存读写——只是地址在别的 rank 上。让这件事成为可能的机制是对称内存：多进程在各自 GPU 上以<b>完全相同的布局</b>分配各自的缓冲区，于是同一逻辑位置在两个 rank 的地址差是一个固定常数。Mega MoE 要求多进程启动与对称内存，PyTorch 版本不低于 2.9<sup>[C1, C3]</sup>。</p>
+
+<h3 id="symmetric-memory-map">3.1 布局约定与地址翻译</h3>
+
+<p>kernel 侧的视图叫 SymBuffer：保存本 rank 缓冲区基址，以及一张覆盖全部 rank 的偏移表（最多 72 个 rank）<sup>[C10]</sup>。把本 rank 地址 $a$ 翻译成目标 rank $r_1$ 的等价地址只需一次加法：</p>
+
+$$\mathrm{map}(a,\,r_1) = a + \Delta_{r_1},\qquad \Delta_{r_1} = B_{r_1} - B_{r_0},$$
+
+<p>其中 $B_{r_0}$、$B_{r_1}$ 分别是两个 rank 缓冲区的基址<sup>[C10]</sup>。源码实现就是一张偏移数组加一次指针加法，没有任何运行时查找。</p>
+
+<p>构造示例（沿用贯穿配置）。rank0 与 rank1 各分配一块同布局缓冲：rank0 基址 $B_0$、rank1 基址 $B_1$，$\Delta = B_1 - B_0$。看 dispatch 拉取的一个瞬间：rank0 上的专家 $E_1$ 需要 $t_2$，而 $t_2$ 存放在 rank1 的 input 缓冲里、恰好与 rank0 本地 0 号槽（存放 $t_0$ 的那个位置）是同一逻辑槽位。rank0 的线程手里有这个槽位在本地视角下的地址 $a$，访问 $a + \Delta$ 就直接落到 rank1 上存放 $t_2$ 的槽——一次加法完成跨 rank 定位。</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 310" role="img" aria-label="对称内存：两个 rank 的同布局缓冲与地址平移">
+  <text x="200" y="34" font-size="13" font-weight="600" text-anchor="middle">rank0 的缓冲</text>
+  <text x="520" y="34" font-size="13" font-weight="600" text-anchor="middle">rank1 的缓冲</text>
+  <rect x="70" y="46" width="260" height="180" class="dg-box"/>
+  <rect x="390" y="46" width="260" height="180" class="dg-box"/>
+  <rect x="90" y="62" width="220" height="46" class="dg-box"/>
+  <text x="200" y="80" font-size="11" text-anchor="middle">input token 缓冲</text>
+  <rect x="98" y="86" width="48" height="18" class="dg-box" style="stroke: var(--blue)"/>
+  <foreignObject x="98" y="86" width="48" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_0$</div>
+  </foreignObject>
+  <rect x="150" y="86" width="48" height="18" class="dg-box"/>
+  <foreignObject x="150" y="86" width="48" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_1$</div>
+  </foreignObject>
+  <rect x="410" y="62" width="220" height="46" class="dg-box"/>
+  <text x="520" y="80" font-size="11" text-anchor="middle">input token 缓冲</text>
+  <rect x="418" y="86" width="48" height="18" class="dg-box"/>
+  <foreignObject x="418" y="86" width="48" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_2$</div>
+  </foreignObject>
+  <rect x="470" y="86" width="48" height="18" class="dg-box"/>
+  <foreignObject x="470" y="86" width="48" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_3$</div>
+  </foreignObject>
+  <rect x="90" y="118" width="220" height="42" class="dg-box"/>
+  <text x="200" y="143" font-size="11" text-anchor="middle">workspace（计数、源索引）</text>
+  <rect x="410" y="118" width="220" height="42" class="dg-box"/>
+  <text x="520" y="143" font-size="11" text-anchor="middle">workspace（计数、源索引）</text>
+  <rect x="90" y="172" width="220" height="42" class="dg-box"/>
+  <text x="200" y="197" font-size="11" text-anchor="middle">combine 缓冲</text>
+  <rect x="410" y="172" width="220" height="42" class="dg-box"/>
+  <text x="520" y="197" font-size="11" text-anchor="middle">combine 缓冲</text>
+  <foreignObject x="150" y="236" width="80" height="26">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$B_0$</div>
+  </foreignObject>
+  <foreignObject x="470" y="236" width="80" height="26">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$B_1$</div>
+  </foreignObject>
+  <path d="M 122,58 Q 280,-14 442,58" class="dg-accent"/>
+  <path d="M 442,58 l -11,-6 l 3,10 z" style="fill: var(--blue)"/>
+  <foreignObject x="240" y="0" width="200" height="26">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">读 $t_2$（为 $E_1$ 拉取）：$\mathrm{map}(a,\,r_1)=a+\Delta$</div>
+  </foreignObject>
+  <line x1="335" y1="249" x2="385" y2="249" class="dg-line"/>
+  <path d="M385,249 l-9,-4 v8 z" style="fill: var(--text-light)"/>
+  <path d="M335,249 l9,-4 v8 z" style="fill: var(--text-light)"/>
+  <foreignObject x="288" y="256" width="150" height="26">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">固定偏移 $\Delta = B_1 - B_0$</div>
+  </foreignObject>
+  <text x="70" y="296" font-size="11" opacity="0.7">两个 rank 以相同布局各自分配；同一逻辑槽位的地址差恒为固定偏移，一次加法即可定位远端。</text>
+</svg>
+<figcaption class="diagram-caption">同布局缓冲与地址平移：rank0 的线程为 $E_1$ 拉取 $t_2$ 时，本地视角的同布局槽地址 $a$ 加上 $\Delta$ 即定位到 rank1 上 $t_2$ 的槽位；combine 缓冲为每个 token 留 $k$ 个槽位，供第 4 章的写回与归约使用。</figcaption>
+</figure>
+
+<h3 id="symmetric-memory-why">3.2 为什么融合 kernel 必须要它</h3>
+
+<p>独立通信库不需要这个约束：框架在 kernel 之间调用它的 dispatch/combine，每个通信 kernel 启动时框架已经把源和目的缓冲的指针都准备好了，kernel 只管搬数据。融合 kernel 相反——它在执行计算的中途就要发起跨 rank 读写，而 kernel 参数里不可能为每次读写都预先传好远端指针；唯一可行的办法是让每个线程都能自己算出远端地址，这正是"同布局 + 固定偏移"提供的能力<sup>[C10]</sup>。</p>
+
+<p>跨 rank 读写还带来顺序问题：dispatch 侧必须确认所有 rank 的计数都已写好，才能开始拉数据；combine 侧必须确认所有结果都已写回，才能开始归约。这些确认由 kernel 内的 NVLink barrier 完成——本质上是一组放在对称内存里的跨 rank 计数信号，配合 grid 内同步构成屏障；kernel 在拉取前、归约前、收尾清理后各用它同步一次<sup>[C29]</sup>。</p>
+
+<p>使用形态上，这一切被封装成三步：先为进程组分配对称缓冲，再把权重变换到所需布局，然后拷入输入、调用 kernel<sup>[C22]</sup>。多进程一侧，官方测试默认为每个 rank 启动一个进程（8 进程）<sup>[C23]</sup>。完整调用序列来自官方 README：</p>
+
+<details class="code-details">
+<summary>代码：官方 API 的三步调用（来自 DeepGEMM README，需 sm100 GPU 与多进程环境，本页不运行）</summary>
+<div class="code-block">
+<pre><code class="language-python"># 第一步：分配对称内存缓冲区（要求 PyTorch &gt;= 2.9）
+buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk,
+    hidden, intermediate_hidden
+)
+
+# 第二步：把权重（FP4 + UE8M0 缩放因子）变换为 kernel 所需布局
+transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(
+    l1_weights, l2_weights
+)
+
+# 第三步：每次调用前把输入拷进缓冲区（可融合进上游 kernel），
+# 然后运行融合 kernel，输出 y 为 BF16
+buffer.x[:num_tokens].copy_(x_fp8)
+buffer.x_sf[:num_tokens].copy_(x_sf)
+buffer.topk_idx[:num_tokens].copy_(topk_idx)
+buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)</code></pre>
+</div>
+<p>输入 $x$ 与 top-k 索引、权重进的是本 rank 的对称缓冲区——kernel 启动后，其余 rank 的 dispatch 线程组正是通过对称地址直接读到这里。多进程的完整示例与基准脚本在官方仓库 <code>tests/test_mega_moe.py</code>。</p>
+</details>
+
+<p>地基就位。下一章跟着贯穿示例的 token，把这层缓冲上发生的每一步走完整。</p>
+
+<h3 id="symmetric-memory-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>对称内存的布局约定是什么？地址是怎么"翻译"到远端的？</p>
+    <details>
+      <summary>解答：所有 rank 以相同布局分配缓冲，SymBuffer 存基址与偏移表，map 就是一次加法</summary>
+      <p>约定：参与通信的每个进程在各自 GPU 上按完全相同的布局分配缓冲区（PyTorch 2.9 起的对称内存机制，多进程启动）。kernel 侧的 SymBuffer 结构保存本 rank 基址 $B_{r_0}$ 与一张全部 rank 的偏移表；对任意本 rank 地址 $a$ 与目标 rank $r_1$，$\mathrm{map}(a, r_1) = a + \Delta_{r_1}$，其中 $\Delta_{r_1} = B_{r_1} - B_{r_0}$ 为固定常数。偏移表最多覆盖 72 个 rank，rank 数直接内嵌在缓冲地址表的长度里。实现上没有查找表或运行时服务，就是数组索引加指针加法。成立条件：所有 rank 的缓冲布局严格一致——这正是官方 API 要求先统一分配对称缓冲、再把输入拷进去的原因。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么融合 kernel 必须要对称内存，而独立通信库不需要？</p>
+    <details>
+      <summary>解答：融合 kernel 在执行中途发起远端读写，每个线程必须能自己算出远端地址</summary>
+      <p>独立通信库的 dispatch/combine 由框架在 kernel 之间调用，每次通信 kernel 启动时框架已经传好源与目的缓冲的指针，kernel 本身只见本地指针，因此不需要跨 rank 的地址约定。融合 kernel 把通信动作散布在计算过程中：dispatch 线程组要写远端计数、读远端 token；epilogue 线程组要把结果写到远端 combine 缓冲——这些读写发生在 kernel 执行中途，不可能由参数表预先提供全部远端指针，唯一可行方案是让每个线程按"同布局 + 固定偏移"自行换算地址。此外 kernel 内的跨 rank 时序（拉取前确认计数就绪、归约前确认写回完成）由 NVLink barrier——放在对称内存里的跨 rank 计数信号——完成，共在拉取前、归约前、清理后三处使用。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="token-journey">4. 一个 token 的完整旅程——拉取、两层 GEMM、远程写回与归约</h2>
+
+<p>本章把第 2 章的角色和第 3 章的地址翻译拼成一条完整数据流。先声明精度方案：路由专家的激活是 FP8 E4M3、权重是 FP4 E2M1（缩放因子粒度 32、格式 UE8M0），共享专家权重是 FP8，combine 回传与最终输出是 BF16<sup>[C7]</sup>。格式本身见<a href="../../wiki/fp8-block-quant/index.html">FP8 块量化</a>与<a href="../../wiki/mxfp4-qat/index.html">MXFP4 量化</a>，本章只需要"激活 1 字节、权重半字节、输出 2 字节"这个事实。</p>
+
+<h3 id="dispatch-pull">4.1 dispatch 侧：元数据先行，数据分块拉取</h3>
+
+<p>dispatch 线程组的工作分三步<sup>[C11]</sup>。第一步，每个 rank 读自己 token 的路由结果，统计每个专家分到多少 token，并通过 NVLink 把计数原子累加到专家所属 rank 的 workspace 里。第二步，把每个"token-专家"对的源索引（哪个 rank 的哪个 token 的第几个 top-k 槽）也写往专家所在 rank。这两步传的元数据非常小——每专家一个 8 字节计数、每个 token-专家对一个 4 字节源索引——先于大数据出发。第三步，经 NVLink barrier 确认所有 rank 的元数据就位后，接收侧开始拉数据：按专家分组遍历本 rank 的专家，对每个槽位用轮转策略（按各源 rank 的计数逐轮取最小值交错选取）决定从哪个源 rank 拉，然后用 TMA 把 token 数据从远端对称缓冲搬进本地的 L1 环形缓冲——一个 token 的 hidden 维被切成若干块，每块不超过 4096 字节<sup>[C12]</sup>。</p>
+
+<p>为什么元数据用推送、数据用拉取？元数据小、且发送方天然知道全部内容，直接写过去最快；数据大，而"什么时候有空闲缓冲来接"只有接收侧知道——接收侧按自己的消费节奏分块拉取，正好把传输塞进计算的空隙里。</p>
+
+<div class="callout callout-yellow">
+<p>注意方向的不对称：dispatch 侧是"元数据推送 + 数据拉取"（接收侧主动来拉），combine 侧是"远程写入"（专家侧把结果直接 push 到源 rank 的槽位）。两个方向并不对称，把两者都理解成"把数据推过去"会错判缓冲压力的承担方——dispatch 的接收节奏由本 rank 控制，combine 的写入节奏由对端控制<sup>[C11, C15]</sup>。</p>
+</div>
+
+<p>在贯穿示例里代入：rank1 的 dispatch 线程组统计后发现，本 rank 的 $E_2$ 要处理 $t_1$（在 rank0）和 $t_2$（本地），$E_3$ 要处理 $t_0$、$t_1$（都在 rank0）。前两步它把"来自 rank0 的 token 计数"写进自己 workspace 的同时，rank0 也把"我贡献了哪些 token-专家对"的源索引写了过来；第三步 rank1 从 rank0 的 input 缓冲里把 $t_0$、$t_1$ 的数据拉进自己的 L1 缓冲，按 $E_2$、$E_3$ 分组摆放——$t_2$ 本来就在本地，直接归组。</p>
+
+<h3 id="gemm-schedule">4.2 两层 GEMM：task 调度与环形缓冲</h3>
+
+<p>拉进来的数据由调度器安排计算。调度单元叫 task：一个 task 说明"哪个专家的第几个 M 块（行块）、在第几个 N 簇（列块）上、处于哪个相位"——相位有四个值：Linear1、Linear2、SharedLinear1、SharedLinear2<sup>[C18]</sup>。调度 warp 先发布若干批 Linear-1 任务作为预热（保证后续 Linear-2 依赖的数据已经开动，避免死锁），之后 L1 与 L2 任务交替发布；每个 2-SM cluster 的 leader CTA 上运行一个调度 warp，通过 workspace 里的原子计数器动态认领 task 并发布给 cluster 内的两个 CTA，快的 cluster 多干活<sup>[C18]</sup>。共享专家的任务不依赖 dispatch，可以在等路由统计的同时先行<sup>[C17]</sup>。</p>
+
+<p>数据缓冲是环形的：L1/L2 的输入输出都在一个固定容量的缓冲里循环复用，每块配一对 full/empty 计数器——生产者写完加 full，消费者用完加 empty，下一轮使用者自旋等待计数到位<sup>[C19]</sup>。一个值得注意的省内存设计：L1 的输出缓冲和 L2 的输入缓冲是同一块内存——SwiGLU 把宽度从 $2d$ 减半到 $d$，正好原地容纳<sup>[C13]</sup>。</p>
+
+<p>tile 大小不是拍脑袋定的。配置启发式按"每专家期望 token 数"分档选择 block_m：</p>
+
+$$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}{E},$$
+
+<p>其中 $n_{\mathrm{tokens}}$ 是本 rank 的 token 数、$E$ 是全局专家数<sup>[F2]</sup>。代入官方基准的 V4-Pro 规格手算：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>场景（V4-Pro：$E=384$，$k=6$，EP8）</th><th>计算</th><th>$N_{\mathrm{exp}}$</th><th>落入档位与 block_m</th></tr></thead>
+<tbody>
+<tr><td>batch 512 / rank</td><td>$512\times 8\times 6/384$</td><td>$64$</td><td>大批解码档，block_m = 96</td></tr>
+<tr><td>batch 8192 / rank</td><td>$8192\times 8\times 6/384$</td><td>$1024$</td><td>prefill / 大 EP 档，block_m = 192</td></tr>
+<tr><td>batch 1 / rank</td><td>$1\times 8\times 6/384$</td><td>$0.125$</td><td>RL 长尾档，block_m = 16</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>batch 越小、每专家的 token 越少，tile 就切得越小——batch 为 1 时一个专家平均连一个 token 都摊不到，小 tile 才不至于浪费算力，这正是延迟敏感场景（如强化学习采样）的形态<sup>[C24]</sup>。</p>
+
+<h3 id="epilogue-combine">4.3 epilogue：SwiGLU 重量化、远程写回与归约</h3>
+
+<p>GEMM 的两端各有一段收尾工作，都由 epilogue 线程组完成。L1 相位：从 TMEM 读出 Linear-1 输出的 gate 与 up 两半，gate 只按上限截断、up 上下限都截断（防止激活爆炸），算 $\mathrm{silu}(\mathrm{gate})\times\mathrm{up}$，乘上该 token-专家对的路由权重 $g_{e}$，统计绝对值最大值后量化回 FP8 E4M3（缩放因子 UE8M0），写进 L2 的输入缓冲<sup>[C14]</sup>。这里出现了一个容易忽视的事实：F1 公式里 combine 段的加权求和，权重 $g_{e}$ 的乘法其实在这里就完成了——写回源 rank 的是<b>已经乘过权重</b>的专家输出，最后的归约是纯加法<sup>[F1]</sup>。</p>
+
+<p>L2 相位：结果从 TMEM 读出转成 BF16 后，每个 token 行查一下 dispatch 阶段记录的源元数据——它来自哪个 rank、是哪个 token 的第几个 top-k 槽——然后通过对称地址直接远程写入源 rank 的 combine 缓冲对应槽位<sup>[C15]</sup>。全部写回经 NVLink barrier 确认后，combine 阶段开始：源 rank 的 epilogue 线程按 token 遍历自己的 $k$ 个槽（有共享专家时再加第 $k+1$ 个槽，共享专家结果不经 dispatch、本地算完直接入槽），在浮点寄存器里累加，转 BF16 写出 $y$<sup>[C16, C17]</sup>。</p>
+
+<p>把贯穿示例的 $t_0$ 走完整条路：</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 600" role="img" aria-label="一个 token 在融合 kernel 内的完整数据流">
+  <text x="180" y="22" font-size="13" font-weight="600" text-anchor="middle">rank0</text>
+  <text x="500" y="22" font-size="13" font-weight="600" text-anchor="middle">rank1</text>
+  <rect x="60" y="32" width="240" height="50" class="dg-box"/>
+  <text x="180" y="52" font-size="11" text-anchor="middle">input 缓冲（对称内存）</text>
+  <foreignObject x="70" y="58" width="220" height="20">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">本 rank 的 $t_0$、$t_1$ 与路由表</div>
+  </foreignObject>
+  <rect x="380" y="32" width="240" height="50" class="dg-box"/>
+  <text x="500" y="52" font-size="11" text-anchor="middle">input 缓冲（对称内存）</text>
+  <foreignObject x="390" y="58" width="220" height="20">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">本 rank 的 $t_2$、$t_3$ 与路由表</div>
+  </foreignObject>
+  <line x1="300" y1="110" x2="366" y2="110" style="stroke: var(--blue); fill: none;"/>
+  <path d="M374,110 l-10,-5 v10 z" style="fill: var(--blue)"/>
+  <text x="335" y="103" font-size="10.5" text-anchor="middle">元数据 push：每专家计数、源索引</text>
+  <line x1="300" y1="140" x2="366" y2="140" style="stroke: var(--blue); fill: none;"/>
+  <path d="M374,140 l-10,-5 v10 z" style="fill: var(--blue)"/>
+  <foreignObject x="225" y="126" width="220" height="20">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">数据 pull：$t_0$、$t_1$ 的副本（分块）</div>
+  </foreignObject>
+  <rect x="60" y="170" width="240" height="44" class="dg-box"/>
+  <text x="180" y="187" font-size="11" text-anchor="middle">L1 环形缓冲</text>
+  <foreignObject x="70" y="192" width="220" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$E_0$: $t_0, t_3$&#12288;$E_1$: $t_2, t_3$</div>
+  </foreignObject>
+  <rect x="380" y="170" width="240" height="44" class="dg-box"/>
+  <text x="500" y="187" font-size="11" text-anchor="middle">L1 环形缓冲</text>
+  <foreignObject x="390" y="192" width="220" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$E_2$: $t_1, t_2$&#12288;$E_3$: $t_0, t_1$</div>
+  </foreignObject>
+  <rect x="60" y="232" width="240" height="64" class="dg-box"/>
+  <text x="180" y="252" font-size="11" text-anchor="middle">Linear-1 &#8594; SwiGLU &#8594; Linear-2</text>
+  <text x="180" y="270" font-size="10.5" text-anchor="middle">TMA 分块加载 · UMMA 于 TMEM 累加</text>
+  <text x="180" y="284" font-size="10.5" text-anchor="middle">L1 / L2 任务交替调度</text>
+  <rect x="380" y="232" width="240" height="64" class="dg-box"/>
+  <text x="500" y="252" font-size="11" text-anchor="middle">Linear-1 &#8594; SwiGLU &#8594; Linear-2</text>
+  <text x="500" y="270" font-size="10.5" text-anchor="middle">TMA 分块加载 · UMMA 于 TMEM 累加</text>
+  <text x="500" y="284" font-size="10.5" text-anchor="middle">L1 / L2 任务交替调度</text>
+  <line x1="380" y1="316" x2="314" y2="316" style="stroke: var(--blue); fill: none;"/>
+  <path d="M306,316 l10,-5 v10 z" style="fill: var(--blue)"/>
+  <foreignObject x="210" y="302" width="260" height="20">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">remote store：$E_3$ 对 $t_0$、$t_1$ 的结果</div>
+  </foreignObject>
+  <rect x="60" y="340" width="240" height="64" class="dg-box"/>
+  <text x="180" y="360" font-size="11" text-anchor="middle">combine 缓冲</text>
+  <foreignObject x="70" y="368" width="220" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_0$ 槽：$E_0$ 与 $E_3$ 的已加权结果</div>
+  </foreignObject>
+  <foreignObject x="70" y="386" width="220" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_1$ 槽：$E_2$ 与 $E_3$ 的已加权结果</div>
+  </foreignObject>
+  <rect x="380" y="340" width="240" height="64" class="dg-box"/>
+  <text x="500" y="360" font-size="11" text-anchor="middle">combine 缓冲</text>
+  <foreignObject x="390" y="368" width="220" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_2$ 槽：$E_1$ 与 $E_2$ 的已加权结果</div>
+  </foreignObject>
+  <foreignObject x="390" y="386" width="220" height="18">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$t_3$ 槽：$E_0$ 与 $E_1$ 的已加权结果</div>
+  </foreignObject>
+  <rect x="60" y="424" width="240" height="54" class="dg-box"/>
+  <text x="180" y="444" font-size="11" text-anchor="middle">combine 归约</text>
+  <text x="180" y="462" font-size="10.5" text-anchor="middle">各槽浮点累加，转 BF16 写出</text>
+  <rect x="380" y="424" width="240" height="54" class="dg-box"/>
+  <text x="500" y="444" font-size="11" text-anchor="middle">combine 归约</text>
+  <text x="500" y="462" font-size="10.5" text-anchor="middle">各槽浮点累加，转 BF16 写出</text>
+  <line x1="180" y1="478" x2="180" y2="494" class="dg-line"/>
+  <path d="M180,502 l-5,-10 h10 z" style="fill: var(--text-light)"/>
+  <line x1="500" y1="478" x2="500" y2="494" class="dg-line"/>
+  <path d="M500,502 l-5,-10 h10 z" style="fill: var(--text-light)"/>
+  <rect x="120" y="504" width="120" height="34" class="dg-box"/>
+  <foreignObject x="120" y="510" width="120" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输出 $y$</div>
+  </foreignObject>
+  <rect x="440" y="504" width="120" height="34" class="dg-box"/>
+  <foreignObject x="440" y="510" width="120" height="22">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输出 $y$</div>
+  </foreignObject>
+  <text x="60" y="566" font-size="11" opacity="0.7">dispatch 侧元数据先行、数据由接收侧分块拉取；combine 侧专家结果直接远程写入源 rank 的槽位。</text>
+  <text x="60" y="584" font-size="11" opacity="0.7">图中以 rank1 对 rank0 的读写为例，反向的 rank0 到 rank1 对称发生；两条蓝色箭头为跨 rank 通信。</text>
+</svg>
+<figcaption class="diagram-caption">$t_0$ 的完整旅程：从 rank0 的 input 缓冲出发，数据被 rank1 拉去给 $E_3$ 计算；$E_3$ 的已加权结果远程写回 rank0 的 combine 缓冲，与 $E_0$（本地计算）的结果在同一组槽位会合，归约后成为 $t_0$ 的输出。dispatch 与 combine 的所有跨 rank 通信都发生在同一个 kernel 内部。</figcaption>
+</figure>
+
+<p>整条路上各角色的并发关系用一份伪代码骨架概括（省略缩放因子布局与屏障细节）：</p>
+
+<details class="code-details">
+<summary>代码：融合 kernel 的角色协作伪代码（依据源码整理，非可运行代码）</summary>
+<div class="code-block">
+<pre><code class="language-text">输入：本 rank 的 token 与路由（对称缓冲）、专家权重（FP4 布局）、各 rank 对称缓冲地址表
+状态：L1/L2 环形缓冲与 full/empty 计数器、每专家接收计数、源索引区、task 队列
+
+并发角色（同一 kernel 内同时运行）：
+  dispatch 组（4 warp）：
+      读本地路由，统计每专家 token 数
+      把计数原子累加到专家所在 rank 的 workspace（远端写）
+      把每个 (token, topk) 的源索引写往专家所在 rank
+      NVLink barrier 等全部 rank 元数据就绪
+      按专家分组、轮转选源 rank，TMA 分块拉取 token 进 L1 环形缓冲
+      每个块到位即累加 l1_full 计数
+  调度 warp：
+      先发布若干 L1 预热任务，之后 L1 / L2 任务交替发布
+      leader CTA 的调度 warp 用原子计数器动态认领，发布给 cluster 内两个 CTA
+  TMA A / TMA B warp：
+      按 task 取激活分块（等 full 计数到位）与权重分块，装入多级流水
+  MMA warp（仅 leader CTA）：
+      对每个 task 发射 2-CTA UMMA，累加器在 TMEM
+  epilogue 组（4–8 warp）：
+      L1 相位：读 TMEM → 截断 → silu(gate)*up → 乘路由权重 → 量化 FP8 → 写 L2 输入
+      L2 相位：读 TMEM → 转 BF16 → 查源元数据 → remote store 到源 rank 的 combine 槽
+
+汇合：NVLink barrier 确认全部写回
+  epilogue 组按 token 遍历 k 个槽（含共享专家槽）→ 浮点累加 → 转 BF16 → 写出 y
+
+输出：y（每个 token 的层输出，BF16）</code></pre>
+</div>
+<p>伪代码依据 kernel 源码 <code>sm100_fp8_fp4_mega_moe.cuh</code> 的角色分支整理，只保留主线；省略的部分（SF 的 UTCCP 布局、各屏障的精确语义、workspace 清理）不影响数据流理解。</p>
+</details>
+
+<details>
+<summary>补充：X-Stage 论文对调度的再分析与"expert wave"术语</summary>
+<p>第三方论文 X-Stage（arXiv:2607.23264）分析 Mega MoE 时把"本地专家按组分批执行"的组织方式称为 expert wave（专家波）：一个波先做它的 Linear-1，再做激活与 Linear-2，然后进入下一波；不同波的 Linear-1 之间没有神经网络依赖，理论上前一波的远程写回没完成时，后一波的 Linear-1 就可以开始<sup>[C20, C25]</sup>。需要说明：官方源码里没有"expert wave"这个词，调度单元是 task（四相 BlockPhase）与 L1 预热/交替发布，"wave"是论文对这种分批结构的描述用语<sup>[C20]</sup>。该论文还发现：把发布的时间线当作"Combine 是一段完整通信"会低估加速（保守估计上限约 1.5 倍，低于实测 1.56 倍），因为发出远程写后发送方可以继续干活；据此它提出跨波交错 Linear-1 与 Linear-2 的改法，在自己的 84 组配置上比原调度再快 1.18 倍（几何均值）、最高 1.62 倍<sup>[C25]</sup>——这是论文实验修改版的结果，未进入 DeepGEMM 主线。</p>
+</details>
+
+<h3 id="token-journey-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>dispatch 侧怎么把 token 集合到专家手里？</p>
+    <details>
+      <summary>解答：元数据（计数、源索引）先推送，数据由接收侧按专家分组、轮转选源、分块拉取</summary>
+      <p>三步：① 每个 rank 读本地路由并统计每专家 token 数，通过 NVLink 把计数原子累加到专家所属 rank 的 workspace；② 把每个 (token, topk) 的源索引写往专家所在 rank；③ 经 NVLink barrier 确认后，接收侧按本 rank 专家分组、用轮转策略（按各源 rank 计数逐轮取最小值交错）为每个槽位选定源 rank，用 TMA 把 token 数据按不超过 4096 字节的块从远端对称缓冲拉进本地 L1 环形缓冲。元数据小且发送方全知，直接推送；数据大且接收时机只有接收侧知道，由接收侧按消费节奏拉取。在贯穿示例中，rank1 为 $E_2$ 从 rank0 拉 $t_1$、为 $E_3$ 拉 $t_0$ 与 $t_1$，本地 token $t_2$ 直接归组。</p>
+    </details>
+  </li>
+  <li>
+    <p>两层 GEMM 的任务怎么组织？环形缓冲怎么衔接生产与消费？</p>
+    <details>
+      <summary>解答：task 为单元、四相 BlockPhase、L1 预热后交替发布、原子认领；环形缓冲配 full/empty 计数器</summary>
+      <p>调度单元是 task（相位取值 $\{$Linear1、Linear2、SharedLinear1、SharedLinear2$\}$ 四种，加上专家号、M 块、N 簇）。调度 warp 先发布若干 L1 预热波避免依赖死锁，之后 L1/L2 交替发布；每个 cluster 的 leader CTA 上的调度 warp 通过原子计数器认领任务并发布给 cluster 内两个 CTA，负载不均时快的 cluster 多做。数据缓冲按固定容量循环复用，每块配 full/empty 计数器，生产者写完加 full、消费者用完加 empty、下轮使用者自旋等到位。L1 输出与 L2 输入共用同一缓冲（SwiGLU 后宽度减半，原地容纳）。共享专家任务不依赖 dispatch，可先行。tile 大小按每专家期望 token 数 $N_{\mathrm{exp}} = n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k / E$ 分六档选 block_m（16–192）：V4-Pro batch 512/rank 时 $N_{\mathrm{exp}}=64$，选 block_m=96。</p>
+    </details>
+  </li>
+  <li>
+    <p>L1 epilogue 做了什么？L2 结果怎么回到源 rank、最后怎么归约成 y？</p>
+    <details>
+      <summary>解答：SwiGLU 后乘路由权重并量化 FP8；L2 结果查源元数据远程写回；源 rank 对 k 个槽浮点累加</summary>
+      <p>L1 epilogue 从 TMEM 读出 Linear-1 输出的 gate 与 up 两半，按界限截断（gate 上限、up 上下限）后算 $\mathrm{silu}(\mathrm{gate})\times\mathrm{up}$，乘上路由权重 $g_e$，按绝对值最大值量化回 FP8 E4M3（SF 为 UE8M0），写入 L2 输入缓冲——注意 F1 公式里 combine 的加权，乘法在这一步就完成了。L2 epilogue 把结果转 BF16，逐 token 行查 dispatch 阶段记录的源元数据（源 rank、token 号、top-k 槽位），通过对称地址直接远程写入源 rank 的 combine 缓冲。全部写回经 NVLink barrier 确认后，源 rank 遍历每个 token 的 $k$ 个槽（共享专家占第 $k+1$ 槽），浮点累加、转 BF16 写出 $y$。贯穿示例里 $E_3$（rank1）对 $t_0$ 的已加权结果写进 rank0 的 $t_0$ 槽位之一，与本地 $E_0$ 的结果相加即为 $t_0$ 的输出。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="results-bounds">5. 收益与边界——基准数字、正确性与适用条件</h2>
+
+<p>机制说完，回到最实际的问题：值多少、什么时候用得上。DeepGEMM 把自己定位为统一的高性能 Tensor Core kernel 库，Mega MoE 是其中"带通信重叠的融合 MoE"组件<sup>[C2]</sup>；它由 DeepSeek 的八位贡献者开发，官方声明仍在持续优化中，且发布与内部模型无关<sup>[C27, C28]</sup>。</p>
+
+<h3 id="benchmarks">5.1 官方基准：测了什么、快了多少</h3>
+
+<p>官方基准（PR #316）在 DeepSeek-V4 两档规格上测试：V4-Flash（256 专家、top-$k$ 6、hidden 4096、中间维 2048）与 V4-Pro（384 专家、top-$k$ 6、hidden 7168、中间维 3072），均为 8 路专家并行（EP8）、单节点，batch size 指<b>每 rank 的 token 数</b>（官方在评论中确认口径，EP8 下 512/rank 即全节点 4096），全部数值为 8 个 rank 的平均<sup>[N1, N3, N5]</sup>。加速的对照对象（"legacy"）是 DeepEP dispatch/combine + DeepGEMM 分组 GEMM + TileLang SwiGLU 的<b>非重叠</b>流水线——即第 1 章描述的传统执行方式的具体实现<sup>[C21]</sup>。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>规格</th><th>batch / rank</th><th>耗时（us）</th><th>计算（TFLOPS）</th><th>显存（GB/s）</th><th>互联（GB/s）</th><th>加速 vs 非重叠基线</th></tr></thead>
+<tbody>
+<tr><td rowspan="4">V4-Flash<br>256 专家 · hidden 4096</td><td>1</td><td>56.5</td><td>5</td><td>1311</td><td>1</td><td>1.96x</td></tr>
+<tr><td>512</td><td>146.5</td><td>1056</td><td>3192</td><td>266</td><td>1.73x</td></tr>
+<tr><td>8192</td><td>1283.1</td><td>1928</td><td>998</td><td>499</td><td>1.56x</td></tr>
+<tr><td>32768</td><td>4855.5</td><td>2038</td><td>794</td><td>529</td><td>1.62x</td></tr>
+<tr><td rowspan="4">V4-Pro<br>384 专家 · hidden 7168</td><td>1</td><td>108.1</td><td>7</td><td>1758</td><td>1</td><td>1.61x</td></tr>
+<tr><td>512</td><td>369.6</td><td>1098</td><td>4619</td><td>182</td><td>1.54x</td></tr>
+<tr><td>8192</td><td>2818.5</td><td>2304</td><td>1094</td><td>393</td><td>1.50x</td></tr>
+<tr><td>32768</td><td>10655.2</td><td>2438</td><td>692</td><td>417</td><td>1.54x</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>三个读数值得停下来看。第一，batch 为 1 时加速最大（V4-Flash 1.96 倍、V4-Pro 1.61 倍）<sup>[N2, N4]</sup>：token 越少、每段工作越薄，串行执行的启动与等待占比越高，融合的相对收益就越大——这正是延迟敏感场景（低并发推理、强化学习采样）的形态。第二，大 batch 下收益收敛到约 1.5 倍：计算本身已经很满，可挤的空闲变少。第三，互联带宽一列在 batch 512 时达到 266/182 GB/s——通信流量真实且可观，Mega MoE 是把它藏进了计算里，而不是让它消失。</p>
+
+<h3 id="correctness">5.2 正确性验证</h3>
+
+<p>融合 kernel 的输出靠与基线逐字对比验证：无共享专家时，融合实现与 DeepEP 基线的输出<b>逐位一致</b>（<code>torch.equal</code>）；有共享专家时数值差异小于 $10^{-8}$；每专家的接收统计同样逐位一致<sup>[C21]</sup>。官方测试还支持随机化 token 数与路由掩码，在多组随机输入下重复这一对比<sup>[N7]</sup>。</p>
+
+<h3 id="bounds">5.3 适用边界</h3>
+
+<p>把这些条件列全，任何一条不满足都要重新评估：</p>
+
+<ul>
+<li><b>硬件</b>：发布版仅 sm100（Blackwell）实现——代码以 <code>__CUDA_ARCH__ &gt;= 1000</code> 守卫，其他架构上直接断言不支持；矩阵计算依赖 TMEM 与 2-SM cluster 的 tcgen05 指令<sup>[C5, C6]</sup>。Hopper（sm90）上官方没有收益数据；第三方评论（非官方声明）称没有 TMEM 时性能提升不显著，Hopper 上可用"FP4 EP v2 + FP8 DeepGEMM + PDL（Programmatic Dependent Launch，程序化依赖启动——让后一个 kernel 在前一个结束前就开始的调度机制）"的组合替代，sm90 移植在推进中<sup>[N9]</sup>。</li>
+<li><b>精度</b>：PR #304 发布时仅支持 FP8xFP4 组合（激活 FP8 E4M3、权重 FP4 E2M1）<sup>[C3]</sup>；当前主线的源码与测试中已出现 bf16 变体（<code>sm100_bf16_mega_moe</code>、<code>--mma-type bf16xbf16</code>）<sup>[C4]</sup>，属于后续加入的路径。</li>
+<li><b>软件与形态</b>：要求 PyTorch 不低于 2.9、多进程启动与对称内存；FP8 路径要求 hidden 与中间维被 128 整除<sup>[C1, C3, N7]</sup>。测试覆盖的默认配置是 384 专家、top-$k$ 6、hidden 7168、1 个共享专家、每 rank 最多 8192 token<sup>[N7]</sup>。</li>
+<li><b>结构约束</b>：top-$k$ 不超过 32；有共享专家时 top-$k$ 加共享专家数不超过 32（combine 归约由单个 warp 逐槽遍历的约束）；专家数必须被 rank 数整除<sup>[N8]</sup>。</li>
+<li><b>拓扑</b>：官方基准为单节点 EP8；跨机（RDMA 域）行为没有公布数据。SymBuffer 偏移表最多 72 个 rank<sup>[N11]</sup>。</li>
+<li><b>成熟度</b>：官方声明仍在开发与优化中（"still under development and optimizations"）<sup>[C27]</sup>。调试上提供环境变量 <code>DG_COMM_KERNEL_DEBUG</code>，每次调用前清零对称缓冲以定位问题<sup>[C26]</sup>。</li>
+</ul>
+
+<div class="callout callout-yellow">
+<p>「融合 kernel 在任何 GPU 上都更快」不成立。加速的成立条件是：Blackwell 硬件（TMEM/tcgen05）、匹配的精度组合（FP8xFP4，或后续的 bf16 路径）、多进程对称内存环境、单节点 NVLink 域。条件不满足时（如 Hopper），收益没有官方数据支撑，替代方案是传统流水线或官方后续的移植版本。</p>
+</div>
+
+<p>回看全文的五问：MoE 一层的五段执行与通信空转是问题（第 1 章）；融合进一个持久 kernel、warp 专用化分工是方案（第 2 章）；对称内存的地址平移是地基（第 3 章）；元数据先行、分块拉取、交替调度、远程写回与归约是数据流（第 4 章）；1.50–1.96 倍的加速与一列硬边界是它今天的样子（本章）。Mega MoE 的价值不在发明新的通信算法，而在于把已有的一段执行重新安排了时间与空间——让通信与计算在同一个 kernel 里互为对方的填充物。</p>
+
+<h3 id="results-bounds-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>官方基准测了什么、加速多少？对照的基线是什么？</p>
+    <details>
+      <summary>解答：V4-Flash 与 V4-Pro 规格、EP8、四档 batch，加速 1.50–1.96 倍；基线是 DeepEP+分组 GEMM+SwiGLU 非重叠流水线</summary>
+      <p>两组配置：V4-Flash（256 专家、top-$k$ 6、hidden 4096、中间维 2048）与 V4-Pro（384 专家、top-$k$ 6、hidden 7168、中间维 3072），EP8 单节点，batch 为每 rank token 数（1/512/8192/32768），数值为 8 rank 平均。加速相对"legacy"基线——DeepEP dispatch/combine + DeepGEMM 分组 GEMM + TileLang SwiGLU 的非重叠流水线。结果：V4-Flash 加速 1.96/1.73/1.56/1.62 倍，V4-Pro 加速 1.61/1.54/1.50/1.54 倍（按 batch 从小到大）。规律：batch=1 时收益最大（通信占比最高），大 batch 收敛到约 1.5 倍。正确性以与基线逐位一致（无共享专家）或差异小于 $10^{-8}$（有共享专家）验证。</p>
+    </details>
+  </li>
+  <li>
+    <p>哪些条件下 Mega MoE 用不了或收益存疑？</p>
+    <details>
+      <summary>解答：非 Blackwell 硬件、精度不符、缺对称内存环境、top-k 超限、跨机场景，均不适用或无数据</summary>
+      <p>硬件上仅 sm100（Blackwell）实现，代码以 <code>__CUDA_ARCH__ &gt;= 1000</code> 守卫并依赖 TMEM/tcgen05；Hopper 无官方收益数据，第三方评论称无 TMEM 时不显著（可改用 FP4 EP v2 + FP8 DeepGEMM + PDL）。精度上发布版仅 FP8xFP4（后续主线加入 bf16 变体）。软件上要求 PyTorch 2.9 以上、多进程对称内存，FP8 路径要求 hidden 与中间维被 128 整除。结构上 top-$k\le 32$、top-$k$ 加共享专家数 $\le 32$、专家数被 rank 数整除。拓扑上官方仅发布单节点 EP8 数据，跨机行为未公布。成熟度上官方声明仍在开发中。任何一条不满足时，应退回传统流水线或等待官方对应支持。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<p>同名项目说明：AMD ROCm 的 Primus 项目中也有一个名为 MegaMoE 的融合 MoE 层（FlyDSL 实现，面向训练的 EP-only + bf16 路径；见 AMD ROCm Primus 官方文档 rocm.docs.amd.com/projects/primus 的 "MegaMoE" 技术指南页，2026-09-03 访问，摘录存档于 sources/primus-extracts.md），与本文所述 DeepSeek DeepGEMM 的 Mega MoE 是不同项目；本文全部内容只针对后者。本页核对的源码版本为 DeepGEMM main 分支 commit 559d79f（2026-07-15），关键文件已拷贝存档于 <code>research/sources/</code>（仓库内 scheduler 与 layout 各有一个 mega_moe.cuh，同名不同文件，存档分别命名为 scheduler_mega_moe.cuh 与 layout_mega_moe.cuh），下列定位均可在存档中复核。</p>
+
+<h3>论断与来源（C）</h3>
+<div class="table-scroll">
+<table>
+<thead><tr><th>编号</th><th>论断</th><th>来源定位</th></tr></thead>
+<tbody>
+<tr><td>C1</td><td>五段融合为单 mega-kernel、重叠 NVLink 通信与 Tensor Core 计算、要求多进程与对称内存</td><td>DeepGEMM README "Mega MoE" 节；PR #304 New features（pr304-extracts.md）</td></tr>
+<tr><td>C2</td><td>DeepGEMM 定位为统一 Tensor Core kernel 库，Mega MoE 为其中融合 MoE 组件；2026-04-16 News 宣布</td><td>README 首段与 News 节</td></tr>
+<tr><td>C3</td><td>发布时仅支持 FP8xFP4、要求 PyTorch 2.9+</td><td>PR #304（"Only FP8 x FP4 MoE is supported"、"Requires PyTorch &gt;= 2.9"）</td></tr>
+<tr><td>C4</td><td>主线存在 bf16 变体</td><td>sm100_bf16_mega_moe.hpp（存档）；test_mega_moe.py 行 197、425（bf16_mega_moe 分派与 --mma-type bf16xbf16）</td></tr>
+<tr><td>C5</td><td>仅 sm100 实现，架构守卫 + 断言</td><td>sm100_fp8_fp4_mega_moe.cuh 行 78、行 1454-1457</td></tr>
+<tr><td>C6</td><td>TMEM、2-SM cluster、2-CTA UMMA（tcgen05）</td><td>同上文件行 80、216-222、848、899</td></tr>
+<tr><td>C7</td><td>激活 FP8 E4M3、权重 FP4 E2M1、共享专家 FP8、输出 BF16</td><td>同上文件行 142-146；README API 示例</td></tr>
+<tr><td>C8</td><td>持久 kernel：grid=num_sms，三组线程之和为 block 大小</td><td>sm100_fp8_fp4_mega_moe.hpp（LaunchArgs(num_sms, …)）；.cuh 行 55</td></tr>
+<tr><td>C9</td><td>warp 专用化六类角色分工</td><td>.cuh 行 329-599（dispatch）、669-734（TMA A）、735-793（TMA B）、794-919（MMA）、920-926（调度）、927-1453（epilogue）；heuristics/mega_moe.hpp 线程常量</td></tr>
+<tr><td>C10</td><td>SymBuffer 同布局 + 偏移表 + map 一次加法；最多 72 rank</td><td>layout/sym_buffer.cuh 行 7-42；启动器 num_ranks 推导</td></tr>
+<tr><td>C11</td><td>dispatch 三步：计数远端原子累加、源索引写远端、分块拉取（轮转选源）</td><td>.cuh 行 336-409、414-555（"Round-robin rank selection via iterative min-peeling"）</td></tr>
+<tr><td>C12</td><td>pull 块上限 4096 字节（kPullThreshold）</td><td>heuristics/mega_moe.hpp（"Pull: divide token bytes by 2 until &lt;= kPullThreshold"）</td></tr>
+<tr><td>C13</td><td>L1 输出与 L2 输入同一缓冲，SwiGLU 后宽度减半</td><td>启动器原始注释 "NOTES: L1 output and L2 activations are essentially the same tensor…"</td></tr>
+<tr><td>C14</td><td>L1 epilogue：截断、SwiGLU、乘路由权重、amax、FP8 E4M3 + UE8M0</td><td>.cuh 行 995-1172（行 1045 注释 "Apply SwiGLU: silu(gate) * up"）</td></tr>
+<tr><td>C15</td><td>L2 epilogue 查源元数据 remote store 到源 rank combine 缓冲</td><td>.cuh 行 1205 注释 "write GEMM output to remote combine buffer via NVLink"、行 1274-1299</td></tr>
+<tr><td>C16</td><td>combine 归约：top-k 槽浮点累加、BF16 写出</td><td>.cuh 行 1313-1452（行 1323 注释 "Combine: reduce top-k results and write back"）</td></tr>
+<tr><td>C17</td><td>共享专家不经 dispatch，占第 k+1 槽；任务可先行</td><td>scheduler_mega_moe.cuh 行 386-390（"Shared expert L1 tasks do not depend on dispatch"）；sm100_fp8_fp4_mega_moe.cuh 行 1278、1370；layout_mega_moe.cuh 行 433-435（combine 缓冲 top-k+1 槽）</td></tr>
+<tr><td>C18</td><td>task 调度：BlockPhase 四相、L1 预热、L1/L2 交替、原子认领</td><td>scheduler_mega_moe.cuh 行 83-134（BlockPhase/TaskInfo）、15-45（"ensure no L1 -&gt; L2 deadlock"）、316-350（L1/L2 交替）、309-314（atomic_add 认领）</td></tr>
+<tr><td>C19</td><td>环形缓冲 + full/empty 计数衔接；workspace 含拉取/推送两索引区</td><td>.cuh 行 525-531、692-704；layout/mega_moe.cuh 行 113-117 注释</td></tr>
+<tr><td>C20</td><td>官方源码无 "expert wave" 术语；该词为 X-Stage 论文描述</td><td>scheduler_mega_moe.cuh 全文（无 expert wave 用语，仅 L1 warmup waves 指 CTA 波次）；xstage-extracts.md §2.2 与使用注意</td></tr>
+<tr><td>C21</td><td>正确性：无共享专家逐位一致、有共享 &lt;1e-8、统计一致；基线为 DeepEP+分组 GEMM+TileLang</td><td>test_mega_moe.py 断言代码与基线流程</td></tr>
+<tr><td>C22</td><td>API 三步：分配对称缓冲、变换权重、调用</td><td>README Usage 代码块；test_mega_moe.py 完整调用</td></tr>
+<tr><td>C23</td><td>多进程形态：spawn 每 rank 一进程（默认 8）</td><td>test_mega_moe.py __main__ 与 init 逻辑</td></tr>
+<tr><td>C24</td><td>block 配置按每专家期望 token 数六档分选；block_n=128；SF 粒度 32</td><td>heuristics/mega_moe.hpp get_block_config_for_mega_moe</td></tr>
+<tr><td>C25</td><td>X-Stage：completion-coupled 估计约 1.5x 低于实测 1.56x；交错改法 1.18x/1.62x（84 组配置）</td><td>xstage-extracts.md §1、§2.2（arXiv:2607.23264，第三方）</td></tr>
+<tr><td>C26</td><td>DG_COMM_KERNEL_DEBUG 调试开关清零对称缓冲</td><td>README Utilities 节</td></tr>
+<tr><td>C27</td><td>仍在开发声明；发布与内部模型无关</td><td>PR #304 Additional notes</td></tr>
+<tr><td>C28</td><td>八位贡献者（LyricZhao/Chenggang Zhao 等）</td><td>PR #304 Contributors</td></tr>
+<tr><td>C29</td><td>NVLink barrier 三处：拉取前、归约前、清理后</td><td>.cuh 行 308-311、403-409、1313-1318；layout/mega_moe.cuh 行 129-156</td></tr>
+<tr><td>C30</td><td>寄存器再分配（三组 48/40/208 或 96/88/160，上限 64512）</td><td>.cuh 行 313-322</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>公式与来源（F）</h3>
+<div class="table-scroll">
+<table>
+<thead><tr><th>编号</th><th>公式</th><th>来源定位</th></tr></thead>
+<tbody>
+<tr><td>F1</td><td>$y=\sum_{e\in\mathcal{S}} g_{e}\cdot W_2^{(e)}\,\mathrm{SwiGLU}(W_1^{(e)}x)$</td><td>X-Stage §2.2（"Combine … aggregates the top-k results using the router weights"）；权重乘法位置在 L1 epilogue（.cuh 行 1071）为源码事实</td></tr>
+<tr><td>F2</td><td>$N_{\mathrm{exp}} = n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k / E$</td><td>heuristics/mega_moe.hpp get_block_config_for_mega_moe 首行</td></tr>
+<tr><td>F3</td><td>单 token dispatch 发送量 $\approx k\times h\times b_{\mathrm{act}}$</td><td>本页由 EP dispatch 语义推出的量级估算（推导，非官方公式）；规格代入用 N1/N3</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>外部数字与实验条件（N）</h3>
+<div class="table-scroll">
+<table>
+<thead><tr><th>编号</th><th>数字</th><th>来源与条件</th></tr></thead>
+<tbody>
+<tr><td>N1</td><td>V4-Flash 规格与全部结果（256 专家、top-$k$ 6、hidden 4096、中间维 2048；四档 batch 的耗时/TFLOPS/带宽/加速）</td><td>PR #316 表一（pr316-extracts.md）；EP8、8 rank 平均</td></tr>
+<tr><td>N2</td><td>V4-Flash 加速与互联带宽读数（1.96/1.73/1.56/1.62x；batch 512 时互联 266 GB/s）</td><td>同上</td></tr>
+<tr><td>N3</td><td>V4-Pro 规格与全部结果（384 专家、top-$k$ 6、hidden 7168、中间维 3072；四档 batch）</td><td>PR #316 表二（pr316-extracts.md）；EP8、8 rank 平均</td></tr>
+<tr><td>N4</td><td>V4-Pro 加速与互联带宽读数（1.61/1.54/1.50/1.54x；batch 512 时互联 182 GB/s）</td><td>同上</td></tr>
+<tr><td>N5</td><td>batch size 为每 rank token 数（EP8 下 512/rank = 全节点 4096）</td><td>PR #316 评论，zheanxu 2026-04-27 官方确认</td></tr>
+<tr><td>N6</td><td>时间线：2026-04-16 News；PR #304 04-17 合并；PR #316 04-24 合并</td><td>README News、两 PR 页面</td></tr>
+<tr><td>N7</td><td>测试默认参数（384 专家、top-k 6、hidden 7168、中间维 3072、共享专家 1、8192 token/rank）；FP8 路径 128 整除约束</td><td>test_mega_moe.py argparse 默认值与约束注释</td></tr>
+<tr><td>N8</td><td>top-k 32 上限；top-k+共享 32 上限；专家数被 rank 数整除</td><td>.cuh 行 334、1345、86 静态断言</td></tr>
+<tr><td>N9</td><td>Hopper 状况（无官方数据；第三方称无 TMEM 不显著、可用 FP4 EP v2 + FP8 DeepGEMM + PDL 替代）</td><td>PR #316 评论，yiakwy 2026-08-12——第三方陈述；其中架构守卫已由 C5 独立核实</td></tr>
+<tr><td>N11</td><td>SymBuffer 最大 72 rank</td><td>layout/sym_buffer.cuh 行 7</td></tr>
+<tr><td>N12</td><td>代码注释耗时参考（取计数约 6.5 us、源索引约 2 us@512 token、NVLink barrier 约 4 us、combine 约 3 us/token/topk）</td><td>.cuh 行 361、370、1313、1325 注释（本页正文未引用，备考）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>构造示例</h3>
+<p>贯穿示例（EP2、4 专家、top-$k$ 2、每 rank 2 token、路由表见第 1 章）：全部数字人为构造，用于让每一步可手算追踪，不代表任何真实模型或实测；$t_0$ 的旅程（第 4 章图）为同一示例的机制走查。第 1 章通信量估算（V4-Pro、43 KB/token dispatch、22 MB/rank@512，十进制）为 F3 的量级代入，非实测流量。第 4 章 $N_{\mathrm{exp}}$ 手算表使用官方规格代入官方公式，档位结论引自源码注释。</p>
+
+<h3>辅助解释与类比边界</h3>
+<p>第 1 章时间线图为示意图，展示串行空闲与重叠占满的定性对比，不是实测 trace；面板间"总时长更短"为定性表达，比例无实测含义。第 4 章伪代码为源码角色分支的骨架整理，省略 SF 布局、屏障精确语义与 workspace 清理，不能作为实现依据；完整实现以官方源码为准。</p>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>mini 示例把 hidden 维抽象掉（未代入具体数）：便于手算路由与槽位，但不能由此推出访存或通信的字节量——字节量估算必须代入真实规格（如 V4-Pro 的 7168）。</li>
+<li>第 2 章线程布局图只画单侧 block：实际计算以 2-SM cluster 配对进行、MMA 仅 leader CTA 发射，图未表达 cluster 内协作，不影响角色职责结论。</li>
+<li>机制描述以 FP8xFP4 主路径为准：bf16 变体的 epilogue 无量化步骤，细节未展开。</li>
+<li>对称内存只讲了 kernel 侧的地址模型：CUDA/PyTorch 层面的分配 API 与生命周期管理未涉及，不能据此直接编写分配代码。</li>
+</ul>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
