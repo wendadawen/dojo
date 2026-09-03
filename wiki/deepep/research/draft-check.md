@@ -1,0 +1,27 @@
+# DeepEP 初稿检查
+
+- 输入版本：scope.md（完成状态：已裁定，5 个学习目标带完成答案）、evidence.md（C1-C32、F1-F4、N1-N7，含 C12 增补 IBGDA 源码释义）、outline.md（5 章结构定稿）、glossary.md（约 50 条术语）；写作中补充：来源快照新增 deepep-src-extracts.md 第 5 节（V1 buffer.py 初始化代码的 IBGDA 注释，用于 C12 的"no package forwarding"释义），evidence.md C12 相应扩充。
+- 大纲落实：
+  - 页面开头：场景引入（EP320 每层 all-to-all）、四个不适配引出、DeepEP 简要回答、前置知识链接（deepseek-moe/moe-serving/gpu-communication/vllm-cudagraph/fp8-block-quant）、学习目标 5 条——均已写入。
+  - 章节与顺序：1 卡在哪 / 2 高吞吐两段转发 / 3 低延迟纯 RDMA 与固定槽位 / 4 V2 重构 / 5 责任边界——与 outline 一致，h2 编号 1-5，h3 编号 x.y。
+  - 前置知识引用位置：开篇集中一段（write.md 4.2 形式）；第 5 章相邻概念链接 ultraep/moonep/aux-loss-free-routing。
+  - 贯穿示例推进：第 1 章定义系统与 rank 0 发送计划表 → 第 2 章追踪 $t_0$ 的 E5 副本两段路径（SVG 图 + 手算折叠块）→ 第 3 章切 decode（每 rank 2 token，槽位占用表 + 可运行模拟）→ 第 5 章改路由 6 token 涌向 E5。与 outline 一致；偏差：第 3 章路由从"公式生成"改为显式路由表（避免公式产生的 rank 3/rank 7 自路由边角情况，来源无法核实同 rank 副本的处理），构造原则（rank 0 双路径、每专家 4 token、无自路由）已在来源章节的"构造示例"小节说明。
+  - 表达材料：dg-flow 链路图（第 1 章）、手算发送计划表（第 1 章）、SVG 两段转发图（第 2 章）、手算流量折叠块（第 2 章）、V1 normal 带宽表（第 2 章）、槽位占用表（第 3 章）、TBO 时间线 dg-flow（第 3 章）、可运行 Python 模拟（第 3 章）、LL 延迟表（第 3 章）、V2 性能表与 V1/V2 对照表（第 4 章）、责任分工表（第 5 章）——全部落实。
+  - 误解与边界：误解 4 在 1.2（callout）、误解 2 在 3.2（callout）、误解 5 在 4.4（callout）、误解 1 与 3 在第 5 章（5.2 callout 与 5.1 正文）——与 outline 的章节归属一致；页面开头未放 misconceptions 组件（outline 未安排）。
+  - 过渡：每章末尾一至两句衔接（1→2 隐含于 1.2 末尾与 1.3 预览；2→3 写在 2.5 末；3→4 写在 3.5 末；4→5 写在 4.4 末）。
+- 目标覆盖检查：
+  - Q1（四个不适配）：1.1-1.3 完整回答，核心问题块答案与 scope 一致。
+  - Q2（两段转发）：2.1-2.5 完整回答（含 in-node index 落点、两网重叠、node-limited、20 SM/10 通道、带宽表）。
+  - Q3（纯 RDMA/固定槽位/hook）：3.1-3.5 完整回答（含形状公式、recv_count、CUDA graph 兼容、hook 语义、代价数字）。
+  - Q4（V2）：4.1-4.4 完整回答（Gin、ElasticBuffer、解析式 SM、收益代价、对照表）。
+  - Q5（边界）：5.1-5.3 完整回答（责任分工表、三层均衡、门槛）。
+  - 问题块：页面级核心问题 5 条、章节级 3+5+5+4+3=20 条，每条均有"解答："折叠块，答案独立成段。
+- 代码运行：页面内 1 个可运行代码块。从页面 HTML 正则提取（html.unescape 后）运行：`python3 <提取的代码>`，退出码 0，stdout 与页面"预期输出"块逐字符一致（EXACT MATCH；首检发现预期输出缺末尾换行，已补齐后复验通过）。开发用脚本在 /tmp/deepep-research/ll_slot_sim.py（与页面代码逻辑一致，路由表相同）。
+- 机械检查：`python3 .dojo/scripts/validate.py wiki/deepep/index.html` → validation ok；`python3 .dojo/scripts/validate.py wiki/deepep/overview.html` → validation ok。
+- 公式渲染与交互（headless Chrome 探针，--virtual-time-budget=8000，探针注入页面副本后已删除）：
+  - KaTeX 节点 133 个，katex-error 0 个，正文残留 `$` 文本节点 0 个。
+  - details 折叠块 29 个；目录链接 36 个（5 章 + 来源 + 20 个小节 + 5 个本章问题 + 5 个来源小节）。
+  - SVG：foreignObject 公式标签 9 个全部渲染出 KaTeX（8 个 GPU 标签 + 1 个 $t_0$ 标记）；纯文本 text 5 个（节点 A/B、NVLink×2、IB）；14 个标签 getBoundingClientRect 两两重叠检测：无重叠。
+- 来源编号双向对应：正文 sup 引用 43 个编号（C1-C32、F1-F4、N1-N7），来源章节登记 43 个，"引用未登记"与"登记未引用"两个差集均为空；evidence.md 全集无遗漏。
+- 写作偏差：① 第 3 章路由改为显式表（见上，已在构造示例小节说明理由）；② outline 中"E5 的槽位来自 rank 0 与 rank 6"的草图数字，实际构造为槽 0（rank 0）、4（rank 2）、8（rank 4）、12（rank 6），含 rank 0 与 rank 6，机制展示不受影响；③ 增补 IBGDA 源码释义（C12 扩充，来源快照同步）。均为局部补充，未改变结构与论断范围。
+- 第 3 轮审查后修订：路由表两处更正（消除 rank 2 自路由，保持每专家 4 token 均衡）；槽位规则改为与 V1 源码一致的"段基址 + 段内到达序号"语义（原"token 序号"为简化，rank 4 的 $t_1$ 由槽 9 更正为槽 8），代码与预期输出同步替换并复验逐字符一致。
