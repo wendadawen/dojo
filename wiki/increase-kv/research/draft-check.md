@@ -1,0 +1,21 @@
+# 增量 KV 传输初稿检查
+
+- 输入版本：scope.md / evidence.md / outline.md / glossary.md 均为 2026-09-03 主题重裁定后的版本（机制来源：任务发起人工程描述）
+- 大纲落实：
+  - 章节：1 命中却全量重传 / 2 把命中信息传回去 / 3 传输账与成立条件 / 来源与范围说明——与 outline.md 一致
+  - 学习目标：Q1→第 1 章、Q2→第 2 章、Q3→第 2 章 2.4、Q4→第 3 章，全部由正文完整回答
+  - 前置知识：prefix-caching（1.2、2.2、3.2 引用）、paged-attention（1.2 引用）、kv-cache（1.3、3.1、3.2 引用）、hetero-pd 与 beyond-buzz-disaggregation（1.1 延伸阅读）——均在首次依赖处给出链接
+  - 贯穿示例：8192 token / 512 块 / 命中 256 块——第 1 章图 1、第 2 章图 2 与图 3、第 3 章手算与扫描表，逐章推进
+  - 误解与边界：开头 3 条误解 + 2.4/3.2/3.3 的标注推理与边界
+  - 过渡：每章开头有承接句
+- 目标覆盖检查：Q1（1.1–1.3）、Q2（2.1–2.3）、Q3（2.4）、Q4（3.1–3.3）逐题核对，正文均可完整作答；折叠块收起时正文结论完整
+- 代码运行：无可运行代码（本页机制为协议行为，无本地可执行部分；传输账全部手算，2 的幂可复算）
+- 机械检查：
+  - `python3 .dojo/scripts/validate.py wiki/increase-kv/index.html` → validation ok
+  - `python3 .dojo/scripts/validate.py wiki/increase-kv/overview.html` → validation ok
+  - 占位符与组件标记残留：grep 无命中
+- 公式渲染与交互（headless Chrome 探针实测，2026-09-03）：
+  - KaTeX 节点 44 个，公式全部渲染
+  - SVG 文本标签 12 个（图 1 三个行标签 + 段标签 + 覆写标注；图 3 头部标注 + 两行标签 + 偏移标签 + 保留标注），两两矩形重叠检测：无重叠
+  - 图内 <text> 全部为纯文字（无数学符号、无 ASCII 数学近似），无需 foreignObject
+- 写作偏差：无——正文按 outline.md 落实；evidence.md 中 C7（配对必要性）为标注推理的性质在正文 2.4 以 callout 标明，3.2 条件三方向推理在正文标明，C10 区分性陈述在 3.3 落实
