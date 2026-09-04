@@ -1,0 +1,120 @@
+# Kimi K3 数据流实测输出（2026-09-03，官方 config + modeling 源码 + 本机实测）
+
+===== probe1_vision.py =====
+
+== 1. patch_embed (Conv2d, kernel=stride=14, 无 bias) ==
+  PASS  proj 是 Conv2d kernel=(14, 14) stride=(14, 14) bias=False
+  PASS  proj 权重形状 (1024, 3, 14, 14)
+  INFO  patch_embed 权重参数 602,112 = 3*14*14*1024
+  PASS  patch+位置嵌入输出形状 (4, 1024)
+== 2. 位置嵌入 divided_fixed（64x64 可学习 + 时间 sincos 冻结） ==
+  PASS  可学习 2D 表 (64, 64, 1024)
+  PASS  time_weight 是 buffer 
+  PASS  时间表形状 (4, 1, 1024)
+  PASS  64x64 -> (28,40) 插值 (1120, 1024)
+  PASS  t=3 = 2D 重复 3 份 + time_weight[0:3] max diff 2.80e-06
+  PASS  t>4 报错 assert t <= num_frames 生效（时间表仅 4 帧）
+== 3. 2D RoPE（Rope2DPosEmbRepeated，x/y 交错频率） ==
+  PASS  dim 必须被 4 整除 head_dim=128
+  PASS  freqs_cis 返回展平形状 (15, 64) (complex64=torch.complex64)
+  PASS  内部网格形状 (512, 512, 64)
+  PASS  展平返回与网格一致 
+  PASS  偶数槽只依赖 w 代码 x_pos=flat%W(宽) 进偶数槽：freqs_cis[h,w,2i] 与 h 无关
+  PASS  奇数槽只依赖 h 代码 y_pos=flat//W(高) 进奇数槽：freqs_cis[h,w,2i+1] 与 w 无关
+  PASS  偶数槽随 w 变 
+  PASS  奇数槽随 h 变 
+  INFO  源码 docstring 写 ret[h,w,2i]=cis(h*theta)，但实现里偶数槽是 x_pos=flat%W（宽），与 docstring 相反；本表按代码实际行为记录
+  PASS  旋转保范数(q) 33.935440 -> 33.935440
+  PASS  旋转保范数(k) 
+  PASS  h>512 报错 max_height=max_width=512 硬上限
+== 4. 27 层 block（RMSNorm + GELU-MLP2 + 双向注意力，无 bias） ==
+  PASS  wqkv 形状无 bias (4608, 1024)
+  PASS  wo 形状无 bias 
+  PASS  norm0/norm1 是 RMSNorm 
+  PASS  mlp fc0/fc1 无 bias 
+  PASS  头维 128 != hidden/heads head_dim=128, hidden/heads=85.33
+== 5. 变长打包：两图互不可见 ==
+  PASS  encoder 层数 27
+  PASS  final_layernorm 是 RMSNorm 
+  PASS  拼接跑 == 分开跑（图A） max diff 8.87e-06
+  PASS  拼接跑 == 分开跑（图B） max diff 9.54e-06
+  INFO  两图各自输出与拼在一起逐元素一致 => 跨图注意力为 0（cu_seqlens 块对角掩码）
+== 6. tpool_patch_merger（时间全池化 + 2x2 空间合并） ==
+  PASS  输出段数 
+  PASS  输出形状 (20, 4, 1024) = (40 token, 4 patch, 1024)
+  PASS  时间池化是均值 第 1/2/3 帧填 1/2/3，合并后处处 = 2.0
+  PASS  t=1 与 t=3 输出 token 数相同 t=1 -> (20, 4, 1024)；输出 token 数与帧数 t 无关
+  PASS  t=4 同样 20 token 
+== 7. PatchMergerMLPV2（4096->4096->7168 + RMSNorm，无 bias） ==
+  PASS  proj[0] Linear(4096,4096) 无 bias 
+  PASS  proj[2] Linear(4096,7168) 无 bias 
+  PASS  post_norm RMSNorm(7168) 
+  PASS  V2 无 pre_norm V1 才有 pre_norm(LayerNorm@1024)；V2 直接 proj 后接 RMSNorm
+  PASS  forward 未使用 LayerNorm 前置 
+  PASS  merger 输出形状 (40, 7168)
+== 8. 视觉 token 数与参数量 ==
+  INFO  448x448: patch grid 32x32 -> 视觉 token 256（与帧数无关）
+  INFO  896x896: patch grid 64x64 -> 视觉 token 1024（与帧数无关）
+  INFO  1344x1344: patch grid 96x96 -> 视觉 token 2304（与帧数无关）
+  INFO  1820x1008: patch grid 72x130 -> 视觉 token 2340（与帧数无关）
+  INFO  4 帧 448x448 视频: t=4 -> 时间池化后仍 256 token（init_pos_emb_time=4 限制 t<=4）
+  INFO  单层参数 14,682,112
+  INFO  视觉塔参数 = 27层 396,417,024 + final_norm 1024 + patch_embed 602,112 + pos_emb 4,194,304 = 401,214,464 (401.2M)
+  INFO  merger 参数 = 46,144,512 (46.1M)
+  INFO  视觉侧合计 447,358,976 (447.4M)；技术报告称 MoonViT-V2 401M -> 塔本体 401.2M 吻合
+
+== 汇总: PASS 40 / FAIL 0 ==
+
+===== probe2_fusion.py =====
+
+== 1. 单占位符扩展（1 个占位符 -> N 个视觉 token） ==
+  PASS  输出序列长度 = 原长 - 占位符 + 视觉token (1, 10, 7168) = 6 - 1 + 5
+  PASS  attention_mask 同长 
+  PASS  labels 同长 
+  PASS  前 3 文本位 = token 11/12/13 
+  PASS  后 2 文本位 = token 14/15 
+  PASS  视觉特征按序落在 3..7 [0.0, 1.0, 2.0, 3.0, 4.0]
+  PASS  position_ids 连续 0..9 
+  INFO  labels 变换: [-100, 11, 12, -100, -100, -100, -100, -100, 14, 15]（占位符原位 labels=13 被视觉段吞掉，视觉段填 ignore_index）
+== 2. 两个占位符、两张不同大小的图 ==
+  PASS  长度 = 5 - 2 + 3 + 2 (1, 8, 7168)
+  PASS  交错落位正确 [22.0, 100.0, 101.0, 102.0, 23.0, 200.0, 201.0, 24.0]
+  PASS  position_ids 连续 
+== 3. 占位符个数与特征段数不匹配时报错 ==
+  PASS  不匹配报错 段数>占位符数: RuntimeError（occupation 表 broadcast 即失败）
+  PASS  占位符多于段也报错 ValueError: The input provided to the model are wrong. The number of ima
+== 4. 纯文本（无占位符）不进融合 ==
+  PASS  官方 forward 有守卫 pixel_values 非空且非 decode 单步才调用 _merge...
+  PASS  空列表直调报错 torch.cat([]) IndexError => 纯文本路径不经过融合函数
+  PASS  序列含占位符才算多模态输入 
+== 5. decode 阶段（input_ids.shape[1]==1 + past_kv）不重融合 ==
+  PASS  官方含 decode 分支 len(ids)==1 且有 past_key_values 时仅修补 attention_mask，不重跑融合
+== 6. 与逐 token 等价的静态描述 ==
+  INFO  occupation cumsum -> 新位置映射: [0, 1, 2, 7, 8, 9]（占位符位被推开 5 格）
+
+== 汇总: PASS 16 / FAIL 0 ==
+
+===== probe3_memcost.py =====
+
+MLA 参考实现口径: 61,440 B/token/层 = 60.0 KiB/token/层 (96*(192+128)*2B)
+MLA 潜压缩口径:   1,152 B/token/层 = 1.125 KiB/token/层 ((512+64)*2B)
+KDA 固定状态/层:  递归 3072.0 KiB + 卷积 216.0 KiB = 3288.0 KiB
+KDA 69 层合计: 221.6 MiB = 0.216 GiB（与序列长度无关）
+
+     上下文 |       MLA KV×24层(参考实现) |      MLA KV×24层(潜压缩) |     KDA 状态×69层 |       合计(参考口径)
+      4K |              5.625 GiB |            0.105 GiB |      0.216 GiB |      5.841 GiB
+     32K |             45.000 GiB |            0.844 GiB |      0.216 GiB |     45.216 GiB
+    128K |            180.000 GiB |            3.375 GiB |      0.216 GiB |    180.216 GiB
+    256K |            360.000 GiB |            6.750 GiB |      0.216 GiB |    360.216 GiB
+      1M |           1440.000 GiB |           27.000 GiB |      0.216 GiB |   1440.216 GiB
+
+== 层型比例的意义（若 93 层全为 MLA 参考实现口径，1M 上下文） ==
+93 层全 MLA: 5580.0 GiB = 5.45 TiB
+实际 24 层 MLA: 1440.0 GiB -> 降到 25.8%（KDA 69 层只贡献固定 0.216 GiB）
+
+== 潜压缩口径下 1M 上下文（生产部署 MLA 吸收后） ==
+24 层潜压缩 KV: 27.00 GiB + KDA 0.216 GiB = 27.22 GiB
+
+== 每层 token 开支对照 ==
+一个视觉 token(7168 宽 bf16 embedding) = 14.0 KiB；一张 448x448 图 256 视觉 token 进入主干后，MLA 参考口径新增 KV 360.0 MiB（prefill 一次性）
+
