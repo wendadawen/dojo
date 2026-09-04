@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="K3 的视觉编码器，27 层 ViT 约 0.4B 参数。关键创新：完全从零用 next-token prediction 训练，不用 SigLIP 对比预训练初始化——因为 SigLIP init 梯度不稳定。图像/视频共享参数，pixel-shuffle 下采样。基于 K3 报告 §2.4 + config.json 核对。">
-  <meta name="dojo:summary" content="K3 的 27 层视觉编码器，约 0.4B 参数。它完全从零用 next-token prediction 训练，不依赖 SigLIP 对比预训练初始化；图像和视频共享参数，并通过 pixel-shuffle 下采样。">
+  <meta name="description" content="K3 的视觉编码器，27 层 ViT 约 0.4B 参数。关键创新：完全从零用 next-token prediction 训练，不用 SigLIP 对比预训练初始化——因为 SigLIP init 梯度不稳定。训练从预训练第一步起与 LLM 联合优化，图文 token 在单一目标下交织。图像/视频共享参数，pixel-shuffle 下采样。基于 K3 报告 §2.4/§3.1/§3.3/§5.2.3 + config.json 核对。">
+  <meta name="dojo:summary" content="K3 的 27 层视觉编码器，约 0.4B 参数。它完全从零用 next-token prediction 训练，从预训练第一步起与 LLM 联合优化，不依赖 SigLIP 对比预训练初始化；图像和视频共享参数，并通过 pixel-shuffle 下采样。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="多模态">
   <meta name="dojo:tag" content="视觉编码器">
@@ -705,7 +705,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Kimi K3 技术报告 §2.4 Native Vision；HuggingFace 官方 config.json（moonshotai/Kimi-K3，vision_config 字段）。所有可核对数字均与 config.json 逐一对照。</p>
+<p><b>主要依据</b>：Kimi K3 技术报告 §2.4 Native Vision（方案与架构）、§3.1 预训练数据、§3.3 训练配方、§5.2.3 多模态编码器优化；HuggingFace 官方 config.json（moonshotai/Kimi-K3，vision_config 字段）。可核对数字均与 config.json 与报告 Table 1 逐一对照。</p>
 </blockquote>
 
 <p>MoonViT-V2 是 Kimi K3 的视觉编码器，负责把图像和视频的像素变成 LLM 能读的视觉 token<sup>[C8]</sup>。它的核心选择是：不用 SigLIP 这类对比预训练模型做初始化，而是完全从零、用与 LLM 相同的 next-token prediction 目标训练<sup>[C1]</sup>。K3 报告显示，这样训练的编码器梯度更稳<sup>[C2]</sup>，且在视觉评测上匹配 SigLIP 初始化的对照——说明对比预训练作为多模态大模型视觉编码器的初始化，在规模上并非必要<sup>[C7]</sup>。</p>
@@ -725,6 +725,13 @@
       <details>
         <summary>解答：27 层 ViT 配置，RMSNorm 与去 bias 是稳定性配套设计</summary>
         <p>架构是 27 层 ViT：隐藏维 1024、Q/K/V 投影维 1536、MLP 中间维 4096、patch 14，核心 27 层参数约 0.4B（可由 config.json 手算核对）。报告明确把 RMSNorm 与去除所有 bias 定位为"进一步稳定从零优化"的配套设计，不是独立风格选择。见「服务稳定性的架构」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>MoonViT-V2 的训练具体是怎么进行的——是先单独训好编码器再接入，还是与 LLM 一起训练？</p>
+      <details>
+        <summary>解答：从预训练第一步起接入 LLM 联合优化，无事后对齐阶段</summary>
+        <p>K3 的训练策略是语言与视觉从一开始就联合优化：视觉与文本 token 交织在同一条序列里，共享单一的 next-token prediction 损失；从零初始化的 MoonViT-V2 经 MLP 投影器接在 LLM 前端，与主干一起更新。预训练视觉语料覆盖图注、图文交织文档、OCR、感知、视频、视觉编程六类数据。见「训练是怎么进行的」一章。</p>
       </details>
     </li>
     <li>
@@ -836,9 +843,9 @@
 </table>
 </div>
 
-<p>方案定了，但"从零训练"本身容易不稳——没有预训练权重兜底，架构如果不当，从零起步更可能发散。什么样的架构能把从零训练稳住？</p>
+<p>方案定了，但还差一环：训练本身怎么进行——在哪个阶段训、跟谁一起训、用什么数据？</p>
 
-<p>本章给出了从零训练的方案与两个动机。但方案需要架构支撑才能稳——下一章讲服务从零训练稳定性的架构设计。</p>
+<p>本章给出了从零训练的方案与两个动机。方案如何落进训练流程——下一章讲接入 LLM 的联合预训练。</p>
 
 <h3 id="from-scratch-ntp-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -858,7 +865,155 @@
   </li>
 </ol>
 
-<h2 id="architecture-stability">3. 服务稳定性的架构——27 层 ViT、RMSNorm、去 bias</h2>
+<h2 id="joint-pretraining">3. 训练是怎么进行的——接入 LLM 的联合预训练</h2>
+
+<p>"从零训练 + next-token prediction"是方案，还不是训练流程。落到流程上，关键事实是：MoonViT-V2 不是先单独训好、再接入 LLM 的独立模型。K3 采用原生多模态训练策略——语言和视觉从训练一开始就联合优化，不存在"先把 LLM 训完、再把视觉编码器嫁接上去对齐"的事后阶段<sup>[C9]</sup>。</p>
+
+<p>这个形态可以分三层说清。数据层面，视觉与文本 token 交织排列在同一条序列里；目标层面，整条通路共享同一个 next-token prediction 损失；参数层面，从零初始化的 MoonViT-V2 经轻量 MLP 投影器接在 LLM 前端，与 LLM 主干在同一个优化循环里更新<sup>[C9, C8]</sup>。下图给出这条训练通路：</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 640 390" role="img" aria-label="视觉与文本 token 交织进同一条序列，从零初始化的 MoonViT-V2 经 MLP 投影器接入 LLM，整条通路由同一个 next-token prediction 损失联合更新">
+  <g font-size="13">
+    <text x="40" y="26">训练样本：视觉与文本 token 交织</text>
+  </g>
+  <g font-size="12">
+    <rect class="dg-box" x="445" y="16" width="14" height="10" stroke-width="1"></rect>
+    <text x="464" y="25">文本 token</text>
+    <rect class="dg-box" x="528" y="16" width="14" height="10" stroke-width="1" style="stroke: var(--blue)"></rect>
+    <text x="547" y="25">图像 token</text>
+  </g>
+  <g class="dg-box" stroke-width="1">
+    <rect x="70" y="36" width="24" height="26"></rect>
+    <rect x="100" y="36" width="24" height="26"></rect>
+    <rect x="130" y="36" width="24" height="26"></rect>
+    <rect x="160" y="36" width="24" height="26"></rect>
+    <rect x="190" y="36" width="24" height="26"></rect>
+    <rect x="370" y="36" width="24" height="26"></rect>
+    <rect x="400" y="36" width="24" height="26"></rect>
+    <rect x="430" y="36" width="24" height="26"></rect>
+    <rect x="460" y="36" width="24" height="26"></rect>
+    <rect x="490" y="36" width="24" height="26"></rect>
+    <rect x="520" y="36" width="24" height="26"></rect>
+    <rect x="550" y="36" width="24" height="26"></rect>
+  </g>
+  <g class="dg-box" stroke-width="1.5" style="stroke: var(--blue)">
+    <rect x="220" y="36" width="24" height="26"></rect>
+    <rect x="250" y="36" width="24" height="26"></rect>
+    <rect x="280" y="36" width="24" height="26"></rect>
+    <rect x="310" y="36" width="24" height="26"></rect>
+    <rect x="340" y="36" width="24" height="26"></rect>
+  </g>
+  <g class="dg-line" stroke-width="1.5">
+    <line x1="292" y1="62" x2="292" y2="96"></line>
+    <polyline points="286,88 292,98 298,88"></polyline>
+  </g>
+  <g class="dg-box" stroke-width="1">
+    <rect x="212" y="104" width="160" height="50"></rect>
+    <rect x="222" y="184" width="140" height="40"></rect>
+    <rect x="400" y="210" width="200" height="76"></rect>
+  </g>
+  <g font-size="13">
+    <text x="292" y="124" text-anchor="middle">MoonViT-V2</text>
+    <text x="292" y="209" text-anchor="middle">MLP 投影器</text>
+    <text x="500" y="240" text-anchor="middle">LLM 主干</text>
+  </g>
+  <g font-size="12" fill="var(--text-light)">
+    <text x="292" y="145" text-anchor="middle">从零初始化</text>
+    <text x="500" y="262" text-anchor="middle">处理整条交织序列</text>
+  </g>
+  <g class="dg-line" stroke-width="1.5">
+    <line x1="292" y1="154" x2="292" y2="180"></line>
+    <polyline points="286,172 292,182 298,172"></polyline>
+    <path d="M292,226 L292,252 L394,252"></path>
+    <polyline points="384,246 394,252 384,258"></polyline>
+    <line x1="472" y1="62" x2="472" y2="204"></line>
+    <polyline points="466,196 472,206 478,196"></polyline>
+    <line x1="500" y1="286" x2="500" y2="320"></line>
+    <polyline points="494,312 500,322 506,312"></polyline>
+  </g>
+  <g font-size="12">
+    <text x="302" y="244">视觉 token</text>
+    <text x="482" y="136">文本 token</text>
+    <text x="500" y="341" text-anchor="middle">单一 next-token prediction 损失</text>
+    <text x="40" y="308">虚线：梯度反传</text>
+    <text x="40" y="326">更新整条通路（含视觉编码器）</text>
+  </g>
+  <foreignObject x="360" y="348" width="280" height="32">
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$\mathcal{L}=-\log p(x_{t+1}\mid x_{\le t})$</div>
+  </foreignObject>
+  <g class="dg-accent" stroke-width="1.5">
+    <path d="M355,378 L28,378 L28,129 L206,129" stroke-dasharray="5 4"></path>
+    <polyline points="196,123 206,129 196,135"></polyline>
+  </g>
+</svg>
+<figcaption class="diagram-caption">K3 预训练数据流（依据报告 §2.4 与 §3.3 构造）：视觉与文本 token 交织进同一条序列，从零初始化的 MoonViT-V2 经 MLP 投影器接入 LLM，整条通路由同一个 next-token prediction 损失联合更新。</figcaption>
+</figure>
+
+<p>这个形态直接解释了第 1 章 Fig.6 的实验设定：梯度对照发生在 K3 的预训练消融里——SigLIP 初始化的 MoonViT-3D 与从零的 MoonViT-V2 在同一种联合预训练下训练，监控的是 vision-tower 的梯度范数<sup>[C2, N1]</sup>。对照比较的是同一训练过程里的两种初始化，不是两种孤立的训练方案。</p>
+
+<h4>训练用什么数据</h4>
+
+<p>K3 的预训练语料由四大文本域——网页文本、代码、数学、知识——加一个大规模视觉语料构成<sup>[C10]</sup>。视觉语料沿用 Kimi K2.5 的数据分类体系，结合开源集合与内部流水线完成过滤、合成与去重，覆盖六类数据：</p>
+
+<ul>
+  <li>图注（captions）</li>
+  <li>图文交织文档（interleaved image–text documents）</li>
+  <li>OCR（图中文字识别）</li>
+  <li>感知（perception）</li>
+  <li>视频（video）</li>
+  <li>视觉编程数据（visual coding data）</li>
+</ul>
+
+<p>数据构造上有两个细节值得点出。其一是坐标监督：定位类标注同时提供绝对坐标与归一化 $[0,1]$ 两种格式，让定位对分辨率变化更鲁棒<sup>[C10]</sup>。其二是程序化多模态数据（programmatic multimodal data）的扩展：把代码片段与它们的渲染结果配对，格式覆盖 SVG、3D 资产、网页、游戏与 CAD 图纸——"代码与渲染结果同处一个 token 流"正是 K3 原生多模态的输入形态<sup>[C10, C9]</sup>。</p>
+
+<h4>训练配置：整个模型统一一套</h4>
+
+<p>优化配置是整个模型统一的：Per-Head Muon 优化器（K3 的矩阵参数优化器，对注意力投影沿头维切分、逐头做正交化）配合 Kimi K2 引入的权重裁剪（对权重幅度设上限的稳定化机制），MoE（mixture-of-experts，混合专家）负载均衡用分位数均衡（把各专家的路由偏差直接设到目标负载对应的分数分位点），学习率为带 1% 线性预热的余弦调度，权重衰减全程 0.1<sup>[N3]</sup>。这套配置作用于整个 K3 模型；vision tower 是否另有单独超参，报告未披露。</p>
+
+<h4>系统层面怎么跑得动</h4>
+
+<p>从零联合训练意味着视觉编码器全程参与预训练，而大图与长视频会显著拉长 vision encoder 的计算时间，并造成跨设备负载不均<sup>[C11]</sup>。K3 用两个训练基础设施设计应对：</p>
+
+<ul>
+  <li><strong>动态上下文并行</strong>（context parallelism，把序列切分段分布到多设备并行处理）：单张大图沿 patch 维切分到多个设备，注意力通过跨设备聚合 KV（gather-KV）计算；每个 CP 组再分成若干子组，多张大图在子组间负载均衡分布，控制通信占比不随规模增长<sup>[C11]</sup>。</li>
+  <li><strong>把 ViT 计算藏进流水线气泡</strong>（pipeline parallelism，把模型按层切分到多设备流水执行；"气泡"指流水线中设备等待上下游时的空闲时段）：在 Kimi K2.5 解耦编码器进程（DEP，把 ViT 与文本训练切分为不同阶段）的基础上，K3 把 ViT 计算进一步分解——第一个流水线微批的 ViT 前向提前同步执行，其余前向与反向调度进流水线气泡；大部分 ViT 计算被隐藏，视觉编码器的有效开销大幅消除<sup>[C11]</sup>。</li>
+</ul>
+
+<p>至此，训练流程的三个问题都有了着落：在哪个阶段训——从预训练第一步起；跟谁一起训——接入 LLM、与主干联合优化；用什么数据——六类视觉语料与四大文本域交织。但"从零训练"没有预训练权重兜底，架构不当更容易发散——下一章讲服务从零训练稳定性的架构设计。</p>
+
+<h3 id="joint-pretraining-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>MoonViT-V2 是先单独训练好、再接入 LLM 的吗？训练从什么时候开始？</p>
+    <details>
+      <summary>解答：不是——从预训练第一步起接入 LLM 联合优化</summary>
+      <p>K3 采用原生多模态训练策略：语言和视觉从训练一开始就联合优化，不存在"先训 LLM、再嫁接视觉编码器对齐"的事后阶段。视觉与文本 token 交织在同一条序列里，共享单一的 next-token prediction 损失；从零初始化的 MoonViT-V2 经 MLP 投影器接在 LLM 前端，与主干一起更新<sup>[C9]</sup>。</p>
+    </details>
+  </li>
+  <li>
+    <p>预训练的视觉语料覆盖哪六类数据？程序化多模态数据配对的是什么？</p>
+    <details>
+      <summary>解答：图注、图文交织、OCR、感知、视频、视觉编程；代码与渲染视觉配对</summary>
+      <p>六类：图注（captions）、图文交织文档、OCR、感知（perception）、视频、视觉编程数据；语料沿用 Kimi K2.5 分类体系，结合开源集合与内部过滤/合成/去重流水线<sup>[C10]</sup>。程序化多模态数据把代码片段与它们的渲染结果配对，格式覆盖 SVG、3D 资产、网页、游戏、CAD 图纸<sup>[C10]</sup>。</p>
+    </details>
+  </li>
+  <li>
+    <p>第 1 章 Fig.6 的梯度对照是在什么实验条件下做的？这说明它比较的是什么？</p>
+    <details>
+      <summary>解答：预训练消融——同一联合训练下的两种初始化</summary>
+      <p>Fig.6 来自 K3 的预训练消融：SigLIP 初始化的 MoonViT-3D 与从零的 MoonViT-V2 在同一种联合预训练下训练，监控 vision-tower 梯度范数<sup>[C2, N1]</sup>。所以对照比较的是同一训练过程里的两种初始化，不是两种孤立的训练方案。</p>
+    </details>
+  </li>
+  <li>
+    <p>大图和长视频为什么给训练系统带来压力？两个对应设计分别是什么？</p>
+    <details>
+      <summary>解答：编码器计算时间大增且跨设备负载不均；动态 CP 与流水线气泡</summary>
+      <p>大图与长视频显著拉长 vision encoder 的计算时间，并造成跨设备负载不均<sup>[C11]</sup>。设计一：动态上下文并行——大图沿 patch 维切分到多设备、跨设备聚合 KV 算注意力、CP 组分子组均衡分布多张大图；设计二：把 ViT 前向与反向调度进流水线气泡，大部分编码器计算被隐藏，有效开销大幅消除<sup>[C11]</sup>。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="architecture-stability">4. 服务稳定性的架构——27 层 ViT、RMSNorm、去 bias</h2>
 
 <p>MoonViT-V2 的架构基础是 <a href="../vit/index.html"><strong>ViT</strong>（Vision Transformer）</a>：把图像切成 patch、每个 patch 线性投影成一个向量、送入 transformer 层堆叠。MoonViT-V2 是 ViT 家族的一个具体实例，下面每个数字都来自 HuggingFace 官方 config.json 的 vision_config 字段，可逐项核对<sup>[C4]</sup>。</p>
 
@@ -895,7 +1050,7 @@ $$\text{per layer} = 6{,}291{,}456 + 8{,}388{,}608 + 2{,}048 = 14{,}682{,}112$$
 <p>27 层总计：</p>
 $$27 \times 14{,}682{,}112 = 396{,}417{,}024 \approx 0.40\text{B}$$
 
-<p>与报告"roughly 0.4B"一致<sup>[F1]</sup>。这里只计了核心 27 层；patch embedding、位置嵌入、投影器是额外的小量，不影响"约 0.4B"的量级。</p>
+<p>与报告"roughly 0.4B"一致<sup>[F1]</sup>。报告 Table 1 给出的 ViT 总参数是 401M，与核心 27 层手算的 396,417,024 相符。401M 的确切构成报告未披露：与手算的差值约 4.6M，和 patch embedding、位置嵌入这类核心层外小量同量级；MLP 投影器不小——pixel-shuffle 后通道维为 $1024	imes 4=4096$，仅一层到 LLM 隐藏维 7168 的映射就要约 $29\mathrm{M}$ 参数，是否计入 401M 报告未说明。这些都不影响"核心 27 层约 0.4B"的结论。</p>
 
 <details>
 <summary>补充：用 config.json 数值运行核对参数量与 token 数</summary>
@@ -956,7 +1111,7 @@ total 27L  = 396,417,024  (~0.40B)
 3584x3584 / patch 14 -> 65536 tokens
 pixel-shuffle 2x2 -> 16384 tokens</code></pre>
 </div>
-<p><b>验证的机制</b>：attn/layer、mlp/layer、norms/layer 三项相加得 per_layer，×27 得 total；patches_per_side 平方得 tokens，÷4 得 after_shuffle。对应正文 F1 与 F2 两个手算。</p>
+<p><b>验证的机制</b>：attn/layer、mlp/layer、norms/layer 三项相加得 per_layer，$\times 27$ 得 total；patches_per_side 平方得 tokens，$\div 4$ 得 after_shuffle。对应正文 F1 与 F2 两个手算。</p>
 <p><b>观察重点</b>：total 的 0.40B 与报告"roughly 0.4B"一致；after_shuffle 的 16384 远小于 1M 上下文，这是下一章高分辨率可行的前提。</p>
 <p><b>简化说明</b>：只计核心 27 层（Q/K/V/O + 2 层 MLP + 2 RMSNorm），未计 patch embedding、位置嵌入（divided_fixed，按 height/width/time 分解）、MLP 投影器（patchmergerv2）与最终归一化；这些是额外小量，不计入"约 0.4B"核心量级。真实工程实现还含 flash-attention 等优化，不影响参数计数。</p>
 </details>
@@ -996,7 +1151,7 @@ pixel-shuffle 2x2 -> 16384 tokens</code></pre>
   </li>
 </ol>
 
-<h2 id="shared-video-hires">4. 图像/视频共享与高分辨率——分解注意力、时间池化、pixel-shuffle</h2>
+<h2 id="shared-video-hires">5. 图像/视频共享与高分辨率——分解注意力、时间池化、pixel-shuffle</h2>
 
 <p>架构稳了，但 K3 要的是"原生多模态 + 长上下文"——一套参数同时吃图像和视频，还要在 1M token 上下文内塞下高分辨率。MoonViT-V2 用三个机制回答这个问题。</p>
 
@@ -1072,7 +1227,7 @@ pixel-shuffle 2x2 -> 16384 tokens</code></pre>
 </svg>
 </figure>
 
-<p>把空间和时间拆开，避免了"所有帧所有 patch 两两 attend"那种 $O(T^2 \cdot H^2 \cdot W^2)$ 的爆炸式开销。<strong>时间池化</strong>进一步沿时间维压缩 token，把多帧信息压成更短的序列<sup>[C5]</sup>。</p>
+<p>把空间和时间拆开，避免了"所有帧所有 patch 两两 attend"那种 $O(T^2 \cdot H^2 \cdot W^2)$（$T$ 为帧数，$H\times W$ 为每帧的 patch 网格）的爆炸式开销。<strong>时间池化</strong>进一步沿时间维压缩 token，把多帧信息压成更短的序列<sup>[C5]</sup>。</p>
 
 <p><strong>机制三：pixel-shuffle 2×2 下采样。</strong>投影前，把 2×2 的空间邻域搬进通道维：</p>
 
@@ -1147,7 +1302,7 @@ $$\frac{65{,}536}{4} = 16{,}384 \text{ 个 token}$$
   </li>
 </ol>
 
-<h2 id="results-conclusion">5. 结果与结论——对比预训练初始化是否必要</h2>
+<h2 id="results-conclusion">6. 结果与结论——对比预训练初始化是否必要</h2>
 
 <p>方案、架构、token 预算都讲了，最后一个问题：从零训练到底够不够用？</p>
 
@@ -1205,6 +1360,9 @@ $$\frac{65{,}536}{4} = 16{,}384 \text{ 个 token}$$
   <li><b>C6（pixel-shuffle 2×2、3584、1M 上下文）</b>：K3 报告 §2.4——"Before projection, a pixel-shuffle operation with 2 × 2 downsampling reduces the number of visual tokens by a factor of four, keeping inputs of up to 3584 × 3584 pixels affordable within the 1M-token context"；config.json vision_config：merge_kernel_size=[2,2], merge_type=sd2_tpool, patch_size=14。</li>
   <li><b>C7（匹配 baseline、对比预训练 init 非必要）</b>：K3 报告 §2.4——"we find MoonViT-V2 matches the SigLIP-initialized baseline across vision evaluations, indicating that contrastive pre-training is unnecessary as an initialization for multimodal language models at scale"。</li>
   <li><b>C8（视觉通路沿用 K2.5）</b>：K3 报告 §2.4——"This training recipe builds on a vision pathway that follows the overall design of Kimi K2.5: visual inputs are first encoded by MoonViT-V2 and then mapped by a lightweight MLP projector into the LLM"。</li>
+  <li><b>C9（原生多模态联合训练）</b>：K3 报告 §3.3——"Kimi K3 adopts a native multimodal training strategy in which language and vision are jointly optimized from the start of training, rather than grafting a vision encoder onto a pre-trained language model through a post-hoc alignment stage. Under this paradigm, visual and textual tokens are interleaved within a single next-token prediction objective"；§2.4——"Kimi K3 is natively multimodal: text, images, and videos are processed by a single shared backbone within one context, with no post-hoc modality-alignment stage"。</li>
+  <li><b>C10（预训练视觉语料）</b>：K3 报告 §3.1——"Kimi K3 is pre-trained on a curated corpus spanning four primary text domains—Web Text, Code, Mathematics, and Knowledge—together with a large-scale vision corpus. The vision data covers captions, interleaved image–text documents, OCR, perception, video, and visual coding data"；"The vision corpus follows the taxonomy of Kimi K2.5, combining open-source collections with in-house pipelines for filtering, synthesis, and deduplication. During training, coordinate supervision is provided in both absolute and normalized ([0,1]) formats"；"we substantially scale up programmatic multimodal data, coupling code snippets with their rendered visuals across domain-specific formats including SVG, 3D assets, Webpage, Game, and CAD schematics"。</li>
+  <li><b>C11（多模态编码器训练系统）</b>：K3 报告 §5.2.3——"In long-context multimodal training, large images and long videos substantially increase the computation time of the vision encoder and cause significant load imbalance across devices. To address this, we extend context parallelism to such large samples. A single large image is partitioned along the patch dimension across multiple devices, and attention is computed by gathering key–value pairs (gather-KV) across CP ranks. In addition, we divide each CP group into several sub-CP groups and distribute multiple large images across them in a load-balanced manner"；"In Kimi K2.5, we introduced the Decoupled Encoder Process (DEP), which splits ViT and text training into separate stages"；"The ViT forward passes of the first PP micro-batches are executed synchronously upfront, the remaining forward passes are scheduled into pipeline bubbles, and the backward passes are handled analogously. As a result, most of the ViT computation is hidden within pipeline bubbles"。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
@@ -1218,12 +1376,14 @@ $$\frac{65{,}536}{4} = 16{,}384 \text{ 个 token}$$
 <ul>
   <li><b>N1（梯度范数对照）</b>：K3 报告 Fig.6（§2.4）。实验条件：K3 预训练消融，SigLIP 初始化的对照视觉编码器 MoonViT-3D vs 从零训练的 MoonViT-V2 对照；横轴训练步 $\times 10^3$，纵轴 vision-tower 梯度范数。MoonViT-3D 峰值约 0.6、全程更高且尖峰频繁；MoonViT-V2 全程更低更平。本文只引定性结论与量级，不引精确小数。（注：报告未明确二者为同一架构，"同架构"属页面推断，本页不采用。）</li>
   <li><b>N2（匹配 baseline）</b>：K3 报告 §2.4——定性结论"matches across vision evaluations"，报告未给逐项分数表。本文不构造具体分数数字。</li>
+  <li><b>N3（整模训练配置）</b>：K3 报告 §3.3——"We optimize the model using the Per-Head Muon optimizer (§2.5) together with the weight-clipping mechanism introduced in Kimi K2, while adopting QB (§2.3.3) for MoE load balancing. We use a cosine learning rate schedule with a 1% linear warmup. Weight decay is set to 0.1 throughout."。这是整个模型（含视觉通路）的统一配置；vision tower 单独超参报告未披露。</li>
 </ul>
 
 <h3>构造示例</h3>
 <ul>
   <li>参数量手算（F1）与 token 数手算（F2）为构造示例，数字来自 config.json 与报告，构造目的是让"0.4B"和"16384"可被读者独立复算，不代表训练推荐配置。</li>
   <li>Fig.6 的简化对照图为构造示意，展示两条曲线的相对形态，不保留图中原有的精确刻度。</li>
+  <li>训练通路图为构造示意：组件（MoonViT-V2、MLP 投影器、LLM）与数据流（图文交织、单一 NTP 损失、梯度反传）有报告 §2.4/§3.3 原文依据，布局为本文构造。</li>
   <li>可运行代码（已实际运行）输入为 config.json 数值，验证 F1 与 F2。</li>
 </ul>
 
@@ -1235,12 +1395,13 @@ $$\frac{65{,}536}{4} = 16{,}384 \text{ 个 token}$$
 
 <h3>简化条件及其限制</h3>
 <ul>
-  <li>参数量只计核心 27 层（Q/K/V/O + 2 层 MLP + 2 RMSNorm/层），未计 patch embedding、divided_fixed 位置嵌入（按 height/width/time 分解）、MLP 投影器（patchmergerv2）与最终归一化。可推出：报告"约 0.4B"与核心层计算一致。不可推出：MoonViT-V2 的总参数精确等于 396,417,024。</li>
+  <li>参数量只计核心 27 层（Q/K/V/O + 2 层 MLP + 2 RMSNorm/层），未计 patch embedding、divided_fixed 位置嵌入（按 height/width/time 分解）、MLP 投影器（patchmergerv2）与最终归一化。可推出：报告"约 0.4B"与核心层计算一致，且与 Table 1 的 ViT 总参数 401M 相符（401M 的确切构成报告未披露）。不可推出：MoonViT-V2 的总参数精确等于 396,417,024。</li>
   <li>SigLIP 只取"对比预训练、图文对齐、偏向全局语义"这一核心特征，不展开 sigmoid 损失推导与 batch 构造。可推出：为何它是"全局语义偏向"的初始化来源。不可推出：SigLIP 的完整训练机制。</li>
   <li>分解注意力只讲"拆成帧内空间 + 帧间时间两趟"，不展开两趟的注意力掩码、实现顺序与计算复杂度推导。可推出：为何能避免全对全开销。不可推出：精确的 FLOPs 节省量。</li>
+  <li>训练流程只讲"联合优化形态 + 视觉语料构成 + 两个系统设计"，不展开上下文并行的通信细节、1F1B 流水线调度、DEP 完整机制与训练数据配比数字（配比报告未披露）。可推出：训练在哪个阶段进行、跟谁一起、用什么数据、系统瓶颈如何应对。不可推出：vision tower 的单独超参与视觉 token 在语料中的占比。</li>
 </ul>
 
-<p>全文总结：MoonViT-V2 选择从零训练而非 SigLIP 初始化，原因是对比预训练权重在接入 LLM 联合优化时梯度不稳定（Fig.6 对照），且对比损失偏向全局语义、与 LM 目标不对齐。架构上采用 27 层 ViT、RMSNorm、全去 bias，这些设计被报告明确定位为服务从零训练稳定性。图像与视频共享全部参数，通过分解注意力、时间池化、pixel-shuffle 2×2 压缩 token，使 3584×3584 输入在 1M 上下文内可负担。结果上，MoonViT-V2 在视觉评测匹配 SigLIP 初始化 baseline，说明对比预训练作为视觉编码器初始化在规模上并非必要——但这一结论限定于多模态 LM 编码器初始化场景与 K3 规模。回扣开篇的核心问题：为什么从零训练、架构如何服务稳定、如何共享参数与压缩 token、结果与边界——四个问题至此全部回答。</p>
+<p>全文总结：MoonViT-V2 选择从零训练而非 SigLIP 初始化，原因是对比预训练权重在接入 LLM 联合优化时梯度不稳定（Fig.6 对照），且对比损失偏向全局语义、与 LM 目标不对齐。训练上，它从预训练第一步起接入 LLM 联合优化——视觉与文本 token 交织在同一条序列、共享单一的 next-token prediction 损失，训练语料覆盖六类视觉数据，大图与长视频的系统压力由动态上下文并行与流水线气泡调度应对。架构上采用 27 层 ViT、RMSNorm、全去 bias，这些设计被报告明确定位为服务从零训练稳定性。图像与视频共享全部参数，通过分解注意力、时间池化、pixel-shuffle 2×2 压缩 token，使 3584×3584 输入在 1M 上下文内可负担。结果上，MoonViT-V2 在视觉评测匹配 SigLIP 初始化 baseline，说明对比预训练作为视觉编码器初始化在规模上并非必要——但这一结论限定于多模态 LM 编码器初始化场景与 K3 规模。回扣开篇的核心问题：为什么从零训练、训练如何进行、架构如何服务稳定、如何共享参数与压缩 token、结果与边界——五个问题至此全部回答。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
