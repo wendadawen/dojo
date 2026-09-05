@@ -1,0 +1,1654 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="vLLM 融合 MoE 算子：先把 token 槽位按专家排序并填充到块边界（sorted_token_ids、expert_ids、num_tokens_post_padded 三个数组），再用一次 Triton 分块 GEMM 内核算完所有专家的矩阵乘；经门控激活、第二次 GEMM 与沿 top-k 求和还原每个 token 的输出。以 v0.28.0 源码逐条核对。">
+  <meta name="dojo:summary" content="MoE 层的专家计算不再逐专家启动小 GEMM：先把 $M\cdot k$ 个 (token, 专家) 槽位按专家排序、填充到块边界，得到 sorted_token_ids、expert_ids、num_tokens_post_padded；fused_moe_kernel 以 tile 为单位，槽位除以 $k$ 还原 token 行、按 expert_ids 偏移专家权重，一次调用算完全部专家；随后门控激活、第二次 GEMM 内乘路由权重、沿 top-k 求和，得到 $y_t=\sum_j g_{t,j}\,W_2^{(e_{t,j})}\big(\operatorname{silu}(a_{t,j})\odot u_{t,j}\big)$。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="推理系统">
+  <meta name="dojo:tag" content="vLLM MoE 内核">
+  <title>FusedMoE：把全部专家的 GEMM 合并进一次内核调用</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">FusedMoE</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">FusedMoE：把全部专家的 GEMM 合并进一次内核调用</h1>
+<p class="reading-time" id="readingTime"></p>
+
+<blockquote class="meta">
+<p><b>主要依据</b>：vLLM v0.28.0 源码（commit 2cf0a69，vllm/model_executor/layers/fused_moe/）；MegaBlocks 论文（Gale 等，arXiv:2211.15841）。</p>
+</blockquote>
+
+<p>设想一张有 256 个专家的 MoE 模型正在做 decode：批里只有 8 个 token，每个 token 由 router 挑出 8 个专家，一共 64 次"token 乘专家权重"的矩阵计算，散布在 256 份专家权重上，平均每份摊不到一行。如果按直觉把这一层写成"每个专家收集自己的 token、做一次矩阵乘、再把结果放回去"，这 64 次计算会变成上百个只处理一两行的小内核调用，GPU 的大量计算单元在等活。FusedMoE 是 vLLM 对这个问题的回答：先把 token 按专家排好队、对齐到块边界，再让一次分块 GEMM 内核调用覆盖所有专家的份额——w13 与 w2 两份权重各调用一次（每次内核都把全部专家的对应权重切片读进来），调用次数固定为个位数、不再随专家数增长。本文的学习目标包括：说明逐专家循环的浪费来源；手算分块对齐产生的三个数组；说明内核如何用这三个数组完成索引；走通一个 token 的完整前向；划清 FusedMoE 层的职责边界。</p>
+
+<p>本文讨论 vLLM 的融合 MoE 算子。它依赖两个前置概念：MoE 层的 router、top-k 路由与专家并行见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>；GEMM 的 tile 划分与 GPU 内核执行模型见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型与 kernel 调度</a>。本文只使用这两个概念的结论，不重复推导。</p>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>MoE 层的专家计算为什么不能靠"每个专家一次普通 GEMM"的循环来做？</p>
+      <details>
+        <summary>解答：三重浪费——小 GEMM 铺不满、调度边界多、数据搬运多</summary>
+        <p>逐专家循环把本该一起调度的计算切成 $E$ 份独立的小 GEMM：每份的 token 行数极少，tile 的行维利用率低、单个专家的 tile 数常常少于 SM 数；专家之间的活被内核边界隔开，启动次数随专家数线性增长；gather 与 scatter 还带来额外的数据搬运。decode 批量越小、专家数越多，三重浪费越大。融合路径把全部专家的 tile 放进同一个网格，三个来源同时消除。完整论证见「1. 朴素实现的问题」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>moe_align_block_size 如何把"哪个槽位归哪个专家"编码成三个数组？</p>
+      <details>
+        <summary>解答：排序、按段填充到块边界、逐块登记专家号</summary>
+        <p>把 $M\cdot k$ 个 (token, 选择) 槽位按所属专家分段排序得到 sorted_token_ids；每个专家的段补齐到 block_size 的倍数，填充槽的值等于有效槽位数；每个块登记一个专家号得到 expert_ids；填充后的总长记入 num_tokens_post_padded。给定 topk_ids 与 block_size，三个数组可以逐步手算。机制与手算见「2. 按专家分块对齐」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>fused_moe_kernel 如何用这三个数组算出正确的"token 乘对应专家权重"？</p>
+      <details>
+        <summary>解答：槽位除以 $k$ 还原 token 行，按块号偏移专家权重</summary>
+        <p>网格沿填充后的槽位维和输出维划分，每个 program 负责一个 tile；tile 的块号 $b$ 决定专家（expert_ids[$b$]，据此偏移 B 矩阵到该专家的权重切片），槽位编号除以 $k$ 还原 token 在输入矩阵中的行；填充槽与越界块用掩码和提前返回跳过。索引公式与手算见「3. 一次内核调用算完所有专家」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>一个 token 从进入 MoE 层到输出，完整经过哪些计算？</p>
+      <details>
+        <summary>解答：路由、对齐、两次 GEMM、门控激活、加权求和</summary>
+        <p>router 打分后经 topk_softmax 得到专家与路由权重（即门控权重，对应 topk_weights）；对齐产生三个索引数组；第一次 GEMM（gate 与 up 拼接的 w13）输出 $2I$ 维；门控激活 silu 乘 up 收缩到 $I$ 维；第二次 GEMM（w2）投影回 $H$ 维并在内核内乘路由权重；最后沿 top-k 求和。合成公式为 $y_t=\sum_j g_{t,j}\,W_2^{(e_{t,j})}(\operatorname{silu}(a_{t,j})\odot u_{t,j})$，其中 $g_{t,j}$ 为路由权重，$(a_{t,j},u_{t,j})$ 为 $W_{13}^{(e_{t,j})}x_t$ 的前后两半。数据流、张量形状与手算见「4. 一个 token 的完整路径」一章。</p>
+      </details>
+    </li>
+    <li>
+      <p>FusedMoE 层在 vLLM 中管什么、不管什么？</p>
+      <details>
+        <summary>解答：管单 rank 内的专家计算组织，不管通信与负载均衡</summary>
+        <p>它承担路由执行、按 TP 切分存放专家权重（w13 列切、w2 行切）、组织融合内核计算；专家并行的 dispatch/combine 通信由独立组件承担（内核只对非本 rank 专家写零兜底），负载均衡属于 EPLB，权重量化由量化方法在同一个内核框架内扩展。批量极小时还有跳过对齐的低延迟路径。边界与依据见「5. FusedMoE 层的职责边界」一章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>"FusedMoE 把 router、GEMM 和求和全部融进一个内核"——融合的对象是"全部专家的 GEMM 合并为一次调用"：整层仍由路由、对齐、两次 GEMM、激活、求和多个内核接力完成，调用次数固定为个位数但不是 1。</li>
+    <li>"不丢 token 是因为没有填充"——每个专家段都补齐到 block_size 的倍数，填充槽位用掩码跳过；"不丢"指每个 (token, 专家) 对都被计算，与按容量截断丢弃 token 的路由方式相对。</li>
+    <li>"FusedMoE 包含专家并行的 all-to-all 通信"——它只负责本 rank 内的计算组织；跨 rank 的 dispatch/combine 通信由独立组件承担，内核对非本 rank 的专家写零兜底。</li>
+    <li>"BLOCK_SIZE_M 越小越好，可以少填充"——tile 尺寸影响张量核效率与 SM 占用，由调优配置按批量选取；填充浪费有上界 $E\times(B_M-1)$ 且被掩码，不进入输出。</li>
+  </ul>
+</section>
+
+<h2 id="naive-loop-problem">1. 朴素实现的问题——逐专家小 GEMM 喂不饱 GPU</h2>
+
+<p>MoE 层把 Transformer 的前馈网络换成一组专家：router 为每个 token 对全体专家打分，选出 $k$ 个并给出路由权重（即 topk_weights，本页也称门控权重），token 的输出是这 $k$ 个专家输出的加权和；层结构、路由与稀疏激活的完整讲解见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>。本页从路由结果出发：每个 token 已经拿到 $k$ 个 (专家, 权重) 对，剩下的问题是，这些"token 乘专家权重"的矩阵计算在 GPU 上怎么组织。</p>
+
+<p>最直接的写法是一个按专家的循环。以下伪代码展示其结构（展开本节要讨论的机制，省略数值细节）：</p>
+
+<details class="code-details">
+<summary>代码：朴素逐专家循环的伪代码</summary>
+<div class="code-block">
+<pre><code class="language-text">输入：M 个 token 的隐藏态 x（每行 H 维）、topk_ids（M×k）、topk_weights（M×k）、
+     专家权重 w13（E 份，每份 2I×H）、w2（E 份，每份 H×I）
+输出：M 个 token 的层输出 y（每行 H 维）
+对每个专家 e 依次取 0 到 E-1：
+    rows ← 收集 topk_ids 中等于 e 的全部 (token, 槽位)
+    若 rows 为空：继续下一个专家
+    X_e ← 按 rows 取出对应 token 的行                # gather：一次数据搬运
+    G_e ← X_e × w13[e]                              # GEMM 1
+    A_e ← silu(G_e 前半) 逐元素乘 G_e 后半           # 门控激活
+    Y_e ← A_e × w2[e]                               # GEMM 2
+    把 Y_e 乘门控权重后按行累加回 y                  # scatter：一次数据搬运</code></pre>
+</div>
+</details>
+
+<p>这个循环在数学上完全正确，问题出在它交给 GPU 的任务形状上。浪费来自三个相互叠加的来源。</p>
+
+<p><b>第一个来源：小 GEMM 喂不满计算单元。</b>GEMM 把输出矩阵切成 tile，由 SM 并行计算，tile 的行数（BLOCK_SIZE_M）是任务并行度与张量核效率的来源之一，见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型与 kernel 调度</a>。逐专家循环把 $M\cdot k$ 行切到 $E$ 个专家头上：开头场景里 64 行摊给 256 个专家，多数专家拿到零或一行。行数为一两行的矩阵乘退化成 GEMV，一个按 16 行设计的 tile 只装着 2 行有效数据，其余行的算力被白白烧掉；而且单个专家的那份 GEMM 的 tile 总数常常不足 SM 数量，调用期间部分 SM 从头到尾空闲——它们本可以去算别的专家的活，但那些活在下一个内核里。</p>
+
+<p><b>第二个来源：调度边界随专家数线性增多。</b>循环体里每个专家要经历 gather、两次 GEMM、激活、scatter 多次内核启动，次数随 $E$ 线性增长；$E$ 为 256 时一个 MoE 层一次前向就要发起上千次调用。每次启动有固定的提交与同步开销，decode 每个 step、每层都要重复一遍。融合路径把这些步骤收敛为固定个位数次调用：路由一次、对齐一次、两次 GEMM、激活一次、求和一次，不再随专家数变化<sup>[C5, C13]</sup>。</p>
+
+<p><b>第三个来源：数据搬运。</b>gather 先把散落的 token 行复制成每个专家自己的连续输入，scatter 再把各专家的结果写回原位；每个专家的中间结果也要先落到自己的缓冲再被读出。融合路径里 token 行不搬家——内核通过索引数组直接定位到原始 hidden_states 的行；中间结果按槽位写入一块统一缓冲，紧接着被第二次 GEMM 按同样的槽位读走。</p>
+
+<p>三个来源在 decode 批量小时同时出现：批量越小，行被专家切得越稀，浪费越明显；prefill 大批量时每个专家能分到成片的行，朴素实现的形状问题会缓解，调度与搬运开销仍在。这正是 MoE 推理"存得多、算得少"特性的另一面：激活的行数天生就少，组织方式必须适应稀疏。历史上，把 MoE 计算重新表述为分块/块稀疏运算、用定制 GPU 内核处理动态分组的思路由 MegaBlocks 系统化提出——当时的框架为迁就硬件约束，被迫在"丢弃 token"与"为填充浪费计算和内存"之间取舍，MegaBlocks 用块稀疏内核做到不丢 token<sup>[C16]</sup>，其训练端到端加速最高 40%（对比 Tutel）<sup>[N4]</sup>。vLLM 的融合算子走的是同一条路：按专家分组、以块为单位组织 GEMM，但用"块内掩码"而不是"容量截断"来处理不均匀。</p>
+
+<p>本章已经说明了浪费的来源：问题不在 GEMM 本身，而在组织方式。要消除它，需要先回答一个前置问题——分块 GEMM 的一个 tile 里，所有行必须乘同一个专家的权重切片，而 token 到专家的归属是动态的。下一章说明 vLLM 如何把这个动态归属预先编码成三个数组。</p>
+
+<h3 id="naive-loop-problem-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>朴素逐专家循环的三个浪费来源分别是什么？各自与 GPU 执行模型的哪个事实相关？</p>
+    <details>
+      <summary>解答：形状退化、调度边界、数据搬运</summary>
+      <p>来源一是形状退化：行数被切到每个专家头上后极少，tile 行维利用率低，且单个专家 GEMM 的 tile 数常少于 SM 数，调用期间部分 SM 空闲——对应"GEMM 按 tile 由 SM 并行计算"的事实。来源二是调度边界：每个专家多次内核启动，次数随 $E$ 线性增长，启动开销串行累积——对应"内核启动有固定开销"的事实。来源三是数据搬运：gather/scatter 与逐专家中间缓冲带来额外访存——token 行本可以直接由索引定位。三者叠加，decode 批量越小浪费越大。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么 decode 批量小时浪费被放大，prefill 大批量时相对不严重？</p>
+    <details>
+      <summary>解答：行的稀疏程度由"行数除以专家数"决定</summary>
+      <p>每个专家平均分到 $M\cdot k/E$ 行。decode 时 $M$ 小（如 8），$M\cdot k/E$ 远小于 1，多数专家拿到零或一行，tile 严重空转；prefill 时 $M$ 可达数千，每专家分到成片行，单个 GEMM 形状恢复正常，形状退化基本消失。但调度边界与数据搬运两个来源只与组织方式相关，批量再大也仍在——所以融合在两种阶段都受益，只是 decode 收益更极端。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="align-three-arrays">2. 按专家分块对齐——moe_align_block_size 的三个数组</h2>
+
+<p>先明确"槽位"：把 topk_ids 按行展开，得到 $M\cdot k$ 个条目，第 $s=t\cdot k+j$ 个槽位表示"token $t$ 的第 $j$ 个选择"。融合内核以槽位为单位组织计算，token 的行号、路由权重都能从槽位换算回来。moe_align_block_size 做的事，是把这 $M\cdot k$ 个槽位按归属重排成三份索引数据<sup>[C3]</sup>：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>数组</th><th>内容</th><th>有效长度</th><th>分配长度</th></tr></thead>
+<tbody>
+<tr><td>sorted_token_ids</td><td>槽位编号按所属专家分段排序；段内补齐到 block_size 的倍数，填充槽的值等于有效槽位数</td><td>num_tokens_post_padded</td><td>F1 上界 $M\cdot k+E\times(B_M-1)$（示例分别为 10 与 12）</td></tr>
+<tr><td>expert_ids</td><td>每个块（block_size 个槽位）的专家编号</td><td>有效块数 $\lceil\text{post}/B_M\rceil$（示例 5）</td><td>总块数 $\lceil\text{分配长度}/B_M\rceil$（示例 6，末尾块提前返回）</td></tr>
+<tr><td>num_tokens_post_padded</td><td>填充后的有效总槽位数</td><td>1</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>构造示例贯穿全文。为便于手算，本文构造一个 4 token、4 专家的小模型（本段与后文所有示例数字均为构造值，不代表任何真实模型）：$M=4$，$E=4$，$k=2$，块大小 $B_M=2$，隐藏维 $H=2$，中间维 $I=2$。路由结果如下：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>token</th><th>选中的专家与门控权重</th></tr></thead>
+<tbody>
+<tr><td>$t_0$</td><td>($e_0$, 0.6)、($e_1$, 0.4)</td></tr>
+<tr><td>$t_1$</td><td>($e_1$, 0.5)、($e_3$, 0.5)</td></tr>
+<tr><td>$t_2$</td><td>($e_0$, 0.7)、($e_3$, 0.3)</td></tr>
+<tr><td>$t_3$</td><td>($e_1$, 0.8)、($e_2$, 0.2)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>softmax 打分与 top-k 选择的机制属于路由话题，见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>；本页从这份结果出发。手算三个数组分三步：</p>
+
+<p>第一步，展开槽位并数出每个专家的段长。槽位 $s=t\cdot k+j$ 依次为：$s_0$($t_0$,$e_0$)、$s_1$($t_0$,$e_1$)、$s_2$($t_1$,$e_1$)、$s_3$($t_1$,$e_3$)、$s_4$($t_2$,$e_0$)、$s_5$($t_2$,$e_3$)、$s_6$($t_3$,$e_1$)、$s_7$($t_3$,$e_2$)。按专家归堆：$e_0$ 得 $s_0,s_4$（2 个），$e_1$ 得 $s_1,s_2,s_6$（3 个），$e_2$ 得 $s_7$（1 个），$e_3$ 得 $s_3,s_5$（2 个）。</p>
+
+<p>第二步，每段补齐到 $B_M=2$ 的倍数：$e_1$ 补 1 个槽、$e_2$ 补 1 个槽，总长从 8 变为 10。填充槽的值一律用有效槽位数 8——任何不小于 8 的编号都不对应真实槽位，内核据此识别并屏蔽<sup>[C3]</sup>。</p>
+
+<p>第三步，按专家序拼接并逐块登记专家号。排序后的槽位序列是</p>
+
+<p>sorted_token_ids $=[\,0,\,4\,|\,1,\,2,\,6,\,\text{pad}\,|\,7,\,\text{pad}\,|\,3,\,5\,]$，共 10 个有效槽；5 个块的专家号依次为 expert_ids $=[0,1,1,2,3]$；num_tokens_post_padded $=10$。</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 760 158" xmlns="http://www.w3.org/2000/svg" role="img">
+    <text x="108" y="38" text-anchor="end" font-size="12" opacity="0.65">块序号</text>
+    <text x="164" y="38" text-anchor="middle" font-size="12">0</text>
+    <text x="266" y="38" text-anchor="middle" font-size="12">1</text>
+    <text x="368" y="38" text-anchor="middle" font-size="12">2</text>
+    <text x="470" y="38" text-anchor="middle" font-size="12">3</text>
+    <text x="572" y="38" text-anchor="middle" font-size="12">4</text>
+    <text x="674" y="38" text-anchor="middle" font-size="12" opacity="0.65">—</text>
+    <rect class="dg-box" x="120" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="166" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="222" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="268" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="324" y="44" width="42" height="50"/>
+    <rect class="dg-accent" x="370" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="426" y="44" width="42" height="50"/>
+    <rect class="dg-accent" x="472" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="528" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="574" y="44" width="42" height="50"/>
+    <rect class="dg-box" x="630" y="44" width="42" height="50" stroke-dasharray="4 3" opacity="0.55"/>
+    <rect class="dg-box" x="676" y="44" width="42" height="50" stroke-dasharray="4 3" opacity="0.55"/>
+    <text x="141" y="74" text-anchor="middle" font-size="15">0</text>
+    <text x="187" y="74" text-anchor="middle" font-size="15">4</text>
+    <text x="243" y="74" text-anchor="middle" font-size="15">1</text>
+    <text x="289" y="74" text-anchor="middle" font-size="15">2</text>
+    <text x="345" y="74" text-anchor="middle" font-size="15">6</text>
+    <text x="391" y="68" text-anchor="middle" font-size="15">8</text>
+    <text x="391" y="88" text-anchor="middle" font-size="10" opacity="0.65">填充</text>
+    <text x="447" y="74" text-anchor="middle" font-size="15">7</text>
+    <text x="493" y="68" text-anchor="middle" font-size="15">8</text>
+    <text x="493" y="88" text-anchor="middle" font-size="10" opacity="0.65">填充</text>
+    <text x="549" y="74" text-anchor="middle" font-size="15">3</text>
+    <text x="595" y="74" text-anchor="middle" font-size="15">5</text>
+    <text x="108" y="112" text-anchor="end" font-size="12" opacity="0.65">专家</text>
+    <text x="164" y="112" text-anchor="middle" font-size="13">0</text>
+    <text x="266" y="112" text-anchor="middle" font-size="13">1</text>
+    <text x="368" y="112" text-anchor="middle" font-size="13">1</text>
+    <text x="470" y="112" text-anchor="middle" font-size="13">2</text>
+    <text x="572" y="112" text-anchor="middle" font-size="13">3</text>
+    <text x="674" y="112" text-anchor="middle" font-size="12" opacity="0.65">未读取</text>
+    <line class="dg-line" x1="120" y1="128" x2="616" y2="128"/>
+    <line class="dg-line" x1="120" y1="124" x2="120" y2="132"/>
+    <line class="dg-line" x1="616" y1="124" x2="616" y2="132"/>
+    <text x="368" y="150" text-anchor="middle" font-size="12">有效长度 10</text>
+  </svg>
+  <figcaption class="diagram-caption">构造示例 A 的 sorted_token_ids 分段布局（块大小为 2）。蓝框槽位值为 8，等于有效槽位数，是填充占位，内核用掩码跳过；下行为每个块的 expert_ids；右侧两个虚线槽在分配上界内，但对应块因超出有效长度提前返回，不被读取。</figcaption>
+</figure>
+
+<p>为什么必须填充？分块 GEMM 里，一个 tile 的 B 矩阵地址按块号一次性给出：内核读一次 expert_ids[$b$]，把 B 偏移到该专家的权重切片，整个 tile 都用这一份权重<sup>[C8]</sup>。如果某个块横跨两个专家的段，后一段的行就会乘错权重。排序让同专家的槽位连续，填充把每段长度补成 block_size 的倍数，块边界于是永远不会切开一个专家段——这正是内核文档对"排序与填充保证可被 BLOCK_SIZE_M 整除"的表述<sup>[C4]</sup>。</p>
+
+<p>填充的规模有上界。分配 sorted_token_ids 时按最坏情况预留：</p>
+
+$$\text{max\_num\_tokens\_padded} \;=\; M\cdot k \;+\; E\times(B_M-1)$$
+
+<p>其中 $B_M$ 是 block_size<sup>[F1]</sup>。每个专家的段长向上取整到 $B_M$ 的倍数，最坏时每段多出 $B_M-1$ 个槽。当槽位总数小于专家数时，实现会把分配长度截断到 $M\cdot k	imes B_M$ 与该上界的较小值，以省下空段占用的空间；两种情形下有效内容的语义不变。</p>
+
+<details>
+<summary>补充：为什么每个专家最多只多补 $B_M-1$ 个槽</summary>
+<p>设某专家分到 $c$ 个槽，补齐后的段长是 $\lceil c/B_M\rceil\cdot B_M$。把 $c$ 写成 $c=q\cdot B_M+r$（$0\le r&lt;B_M$）：$r=0$ 时不需要补；$r&gt;0$ 时补 $B_M-r$ 个，最多 $B_M-1$ 个。$E$ 个专家的填充量逐个不超过 $B_M-1$，相加得到上界。构造示例 A 里 $e_1$ 补 1 个、$e_2$ 补 1 个，共 2 个，小于上界 $4\times(2-1)=4$。</p>
+</details>
+
+<p>三个数组就是第 1 章想要的"预编码的分组信息"：动态的归属变成静态的布局。但数组只是索引，真正的计算发生在 GEMM 内核里——下一章说明内核如何拿这三个数组，把"正确的 token 行"乘上"正确的专家权重"。</p>
+
+<h3 id="align-three-arrays-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>三个数组各存什么？分别被谁消费？</p>
+    <details>
+      <summary>解答：槽位布局、块到专家的映射、有效长度</summary>
+      <p>sorted_token_ids 存按专家分段排序并填充后的槽位序列，内核用它定位 A 的行与输出的写入位置；expert_ids 存每个块的专家编号，内核用它把 B 偏移到对应专家的权重切片；num_tokens_post_padded 存填充后的有效总槽数，内核用它让越界块提前返回。三者都由 moe_align_block_size 产生、由 fused_moe_kernel 消费。</p>
+    </details>
+  </li>
+  <li>
+    <p>给定 topk_ids 与 block_size，如何手算三个数组？</p>
+    <details>
+      <summary>解答：数段长、补齐到块边界、拼接登记</summary>
+      <p>三步：把 topk_ids 展开成 $M\cdot k$ 个槽位并按专家归堆，得到每段的槽位集合；把每段长度向上取整到 block_size 的倍数，不足处补入值为"有效槽位数"的填充槽；按专家序拼接得到 sorted_token_ids，每 block_size 个槽为一组登记专家号得到 expert_ids，总长记入 num_tokens_post_padded。以构造示例 A（$M=4$、$E=4$、$k=2$、$B_M=2$）为例，结果为 $[0,4,1,2,6,8,7,8,3,5]$、$[0,1,1,2,3]$、$10$。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么每个专家的段必须填充到 block_size 的倍数？</p>
+    <details>
+      <summary>解答：块的权重偏移是整块共享的常数</summary>
+      <p>内核为每个块读一次 expert_ids[$b$] 并据此偏移 B，块内所有行共用这一份权重切片。若块边界切开两个专家的段，段尾的行会乘上错误专家的权重。填充把每段长度变成 block_size 的倍数，保证任何完整的块都落在单一专家的段内；代价是最多 $E\times(B_M-1)$ 个填充槽，它们被掩码跳过，不影响输出。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="kernel-indexing">3. 一次内核调用算完所有专家——fused_moe_kernel 的索引方式</h2>
+
+<p>vLLM 的融合 MoE 计算由 Triton 内核 fused_moe_kernel 完成<sup>[C1]</sup>。它的矩阵语义：输入 $A$ 是形状 $(*, K)$ 的 token 矩阵，$B$ 是形状 $(E, N, K)$ 的堆叠专家权重，输出 $C$ 形状 $(M, k, N)$；一次调用覆盖全部专家<sup>[C2]</sup>。理解它只需要"一个 program 负责一个 tile"的执行模型（见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型与 kernel 调度</a>）。</p>
+
+<p>网格沿两个维度展开：$\lceil EM/B_M\rceil\times\lceil N/B_N\rceil$，其中 $EM$ 取 sorted_token_ids 的分配长度（按 F1 上界预留，示例 A 为 12），$N$ 是本次 GEMM 的输出宽度<sup>[C7]</sup>。每个 program 负责一个 $(B_M, B_N)$ 的输出 tile；网格里相邻的 M 块按 GROUP_SIZE_M 分组排列，让同组的 program 尽量同时在跑，以提高权重 tile 在 L2 中的复用<sup>[C7]</sup>。$B_M$ 的取值由配置决定，默认随批量增大从 16 到 128<sup>[N1]</sup>。请注意 $EM$ 是分配长度而非 num_tokens_post_padded：构造示例 A 中前者 12、后者 10，网格据此覆盖 6 个 M 块，末尾块因超出有效长度被前序检查直接返回。</p>
+
+<p>program 内部的索引是本页的核心机制。对第 $b$ 个块（专家 $e=\text{expert\_ids}[b]$）中的第 $r$ 行，令槽位 $s=\text{sorted\_token\_ids}[b\cdot B_M+r]$，该 program 计算的输出元素是</p>
+
+$$C[s,\,n]\;=\;\sum_{q=0}^{K-1} A\big[\,\lfloor s/k\rfloor,\;q\,\big]\cdot B[e,\,n,\,q]$$
+
+<p>各符号与职责<sup>[C8, F2]</sup>：</p>
+<ul>
+<li>$s$：槽位编号，来自 sorted_token_ids；它同时是 $C$ 的写入位置（按槽位展开的 $(M\cdot k, N)$ 视图）。</li>
+<li>$\lfloor s/k\rfloor$：槽位整除 $k$ 还原 token 行号。第一次 GEMM 中 $A$ 是 $M\times H$ 的 hidden_states，必须除回原行；第二次 GEMM 中 $A$ 换成 $M\cdot k$ 行的中间缓存、$k$ 参数传 1，$s$ 直接就是行号。</li>
+<li>$e$：块号查 expert_ids 得到的专家编号；$B$ 的地址加上 $e\times\text{stride}_{be}$ 就偏移到该专家的权重切片，整块共用。</li>
+<li>$B[e,n,q]$：专家 $e$ 权重第 $n$ 行第 $q$ 列；$K$ 是本次 GEMM 的输入宽度（第一次为 $H$，第二次为 $I$）。</li>
+</ul>
+
+<p>用构造示例 A 手算一个块。取块 1：$b=1$，$e=\text{expert\_ids}[1]=1$，块内槽位 $s_1, s_2$，对应 token $\lfloor 1/2\rfloor=t_0$、$\lfloor 2/2\rfloor=t_1$。第一次 GEMM 里这个 program 要算的是 $t_0$、$t_1$ 两行各乘 $w_{13}[e_1]$。输入取 $t_0=(1,0)$、$t_1=(0,1)$（构造值，下一章给出完整权重），$w_{13}[e_1]$ 的 gate 行为 $(1,0)$、$(0,1)$，up 行为 $(1,1)$、$(1,0)$，于是</p>
+
+<p>$$C[s_1] = t_0\times w_{13}[e_1] = (1,\,0,\,1,\,1),\qquad C[s_2] = t_1\times w_{13}[e_1] = (0,\,1,\,1,\,0),$$</p>
+
+<p>两行乘的是同一个专家的权重，块号 $b=1$ 决定了这一点；槽位 $s_1,s_2$ 决定了结果写回哪里、输入行从哪里取。</p>
+
+<p>内核对无效位置有三处防御<sup>[C9]</sup>。其一，整块越界：块的起始位置不小于 num_tokens_post_padded 时 program 直接返回——构造示例 A 的分配长度是 12、有效长度是 10，网格会覆盖 6 个块，第 5 号块（槽位 10、11）启动后立即退出，右侧两个虚线槽从不被读取。其二，读掩码：填充槽的编号是 8，不小于有效槽位数 8，掩码 $s&lt;8$ 为假，$A$ 的该行读入 0。其三，写掩码：输出只写掩码内的槽位，填充槽不产生写入。三处合起来，填充只浪费一点行宽，不会算错任何值。</p>
+
+<p>两次 GEMM 复用同一个内核，索引方式只有输入与参数不同：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>$A$（输入矩阵）</th><th>$k$ 参数</th><th>$B$（权重）</th><th>输出</th><th>乘路由权重</th></tr></thead>
+<tbody>
+<tr><td>第一次</td><td>hidden_states，$(M, H)$</td><td>$k$</td><td>w13，$(E, 2I, H)$</td><td>cache1，$(M\cdot k, 2I)$</td><td>否</td></tr>
+<tr><td>第二次</td><td>cache2（激活结果），$(M\cdot k, I)$</td><td>1</td><td>w2，$(E, H, I)$</td><td>cache3，$(M\cdot k, H)$</td><td>是，fp32</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两栏"乘路由权重"的取舍由参数 <code>apply_router_weight_on_input</code> 决定：默认 False 时权重在 GEMM2 乘入；某些模型置 True，把权重乘到 hidden_states 的输入侧再传入，两栏对调<sup>[C6]</sup>。</p>
+
+<p>专家并行时还有一个配合动作：对齐阶段会先按全局专家数对齐所有槽位，返回前把不在当前 rank 的专家在 expert_ids 里标成 $-1$；内核遇到 $-1$ 时不做乘法，直接把该块输出写零<sup>[C10]</sup>。这样每张卡都能独立跑完整个对齐序列，非本 rank 的块贡献零值，通信与合并由上层组件另行处理——边界细节见「5. FusedMoE 层的职责边界」一章。</p>
+
+<p>索引机制已经就位：块号选权重、槽位选行、掩码挡填充。但一个 token 的输出要经过两次 GEMM、一次激活、一次加权求和才最终成形。下一章把全部步骤串起来，并用构造示例 A 算出真实数值。</p>
+
+<h3 id="kernel-indexing-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>网格如何划分？一个 program 负责哪块输出？</p>
+    <details>
+      <summary>解答：块维与输出维两个方向上取整相乘</summary>
+      <p>网格大小为 $\lceil EM/B_M\rceil\times\lceil N/B_N\rceil$：$EM$ 取 sorted_token_ids 的分配长度（按 F1 上界预留，示例 A 为 12），沿它切出的每个 M 块由 expert_ids 指定专家；$N$ 是本次 GEMM 的输出宽度，沿它切成若干列块。一个 program 负责一个 $(B_M,B_N)$ 的输出 tile。相邻 M 块按 GROUP_SIZE_M 分组排列以提高 L2 复用。越界的块（起始位置不小于 num_tokens_post_padded）启动后直接返回。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么第一次 GEMM 要把槽位除以 $k$，第二次不用？</p>
+    <details>
+      <summary>解答：两次的 $A$ 行含义不同</summary>
+      <p>第一次的 $A$ 是 hidden_states，只有 $M$ 行，槽位必须整除 $k$ 才能还原 token 行号；第二次的 $A$ 是激活后的中间缓存，本身就是 $M\cdot k$ 行、按槽位排列，$k$ 参数传 1 后 $s\div 1=s$，槽位就是行号。输出侧两次都按槽位写入（cache1 与 cache3 都按 $(M\cdot k, \cdot)$ 组织），所以两次 GEMM 可以共用同一套 sorted_token_ids 与 expert_ids。</p>
+    </details>
+  </li>
+  <li>
+    <p>填充槽与越界块如何保证不产生错误输出？</p>
+    <details>
+      <summary>解答：掩码读零、掩码不写、整块提前返回</summary>
+      <p>填充槽的值等于有效槽位数，掩码 $s&lt;\text{num\_valid}$ 为假：读 $A$ 时该行取 0，写 $C$ 时该槽被屏蔽，即使参与乘法也只影响被丢弃的结果。越界块的起始位置不小于 num_tokens_post_padded，program 在读取任何数据前直接返回。因此填充最多浪费行宽，不会污染任何有效槽位的输出。</p>
+    </details>
+  </li>
+</ol>
+<h2 id="full-dataflow">4. 一个 token 的完整路径——从 router 到加权求和</h2>
+
+<p>把前两章的机制接进完整前向。融合算子的入口 fused_experts 接收 hidden_states、两份权重与路由结果（topk_weights、topk_ids）——路由在入口之前已经完成，其结果作为入参传入；入口内部按固定顺序执行五步<sup>[C5]</sup>。下图从路由开始展示整层数据流，共六个节点，后五个方块对应入口内的五步：</p>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">路由打分与 top-k</div>
+      <div class="dg-node-note">gate 线性层 + topk_softmax 融合内核，得 $k$ 个专家与门控权重</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">分块对齐</div>
+      <div class="dg-node-note">moe_align_block_size：排序 + 填充，得三个索引数组</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">GEMM1</div>
+      <div class="dg-node-note">fused_moe_kernel 乘 w13，输出 $(M\cdot k,\ 2I)$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">门控激活</div>
+      <div class="dg-node-note">silu_and_mul：$\operatorname{silu}(g)\odot u$，输出 $(M\cdot k,\ I)$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">GEMM2 与权重</div>
+      <div class="dg-node-note">fused_moe_kernel 乘 w2，内核内乘 $g_{t,j}$，输出 $(M\cdot k,\ H)$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">加权求和</div>
+      <div class="dg-node-note">moe_sum 沿 $k$ 维相加，得 $(M,\ H)$</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">箭头为前向数据流。两次 GEMM 是同一个 fused_moe_kernel 的两次调用，输入输出形状不同；路由打分与 top-k 由融合内核 topk_softmax 完成，改编自 TensorRT-LLM 的同类内核。</figcaption>
+</figure>
+
+<p>路由这一步：gate 线性层输出每个 token 对 $E$ 个专家的分数，融合内核 topk_softmax 一次完成 softmax 与 top-k 选择，产出 topk_weights 与 topk_ids，不再分开调用 softmax、排序、取前 $k$<sup>[C13]</sup>。专家分配对齐即第 2 章的三个数组。</p>
+
+<p>两份权重的形状与命名沿自 Mixtral 的 w1/w2/w3 约定：w13 是 gate 与 up 两份投影沿输出维拼接的结果，形状 $(E,\,2I,\,H)$，gate 在前、up 在后；w2 是 down 投影，形状 $(E,\,H,\,I)$<sup>[C12]</sup>。因此 GEMM1 的输出是 $2I$ 维（gate 半与 up 半各 $I$ 维），门控激活 silu_and_mul 把 gate 半过 silu 后与 up 半逐元素相乘，$(\cdot, 2I)$ 收缩为 $(\cdot, I)$；这一步的激活语义即 SwiGLU 家族的门控乘，见 <a href="../../wiki/swiglu/index.html">SwiGLU 门控激活</a>。GEMM2 把 $I$ 维投影回 $H$ 维，并在内核内、以 fp32 精度乘上路由权重<sup>[C6]</sup>；最后 moe_sum 把 $(M, k, H)$ 沿 $k$ 维相加，得到每个 token 的输出。实现上 cache1 与 cache3 共享同一块缓冲——用到 cache3 时 cache1 已消费完毕<sup>[C15]</sup>。</p>
+
+<p>整条路径对单个 token 的语义可以合成一个公式。设 token $t$ 的输入为 $x_t$，其第 $j$ 个选择的专家为 $e_{t,j}$、路由权重为 $g_{t,j}$，则</p>
+
+$$y_t\;=\;\sum_{j=1}^{k}\; g_{t,j}\cdot W_2^{(e_{t,j})}\Big(\operatorname{silu}(a_{t,j})\odot u_{t,j}\Big),\qquad (a_{t,j},\,u_{t,j})\,=\,W_{13}^{(e_{t,j})}x_t\text{ 拆为前 }I\text{ 维与后 }I\text{ 维}$$
+
+<p>其中 $W_{13}^{(e)}$ 取专家 $e$ 的 gate+up 权重（输出 $2I$ 维，$a$ 为 gate 半、$u$ 为 up 半），$W_2^{(e)}$ 取其 down 权重，$\odot$ 为逐元素乘<sup>[C6, F3]</sup>。这就是"加权求和的 MoE 输出"在融合路径里的落点：加权和不是先算完再乘权重，而是权重在 GEMM2 内乘进每个槽位、求和只做纯加法。</p>
+
+<p>用构造示例 A 走通 $t_0$。输入 $x_{t_0}=(1,0)$，路由给 ($e_0$, 0.6) 与 ($e_1$, 0.4)，权重取下表构造值：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>专家</th><th>w13（gate 两行、up 两行）</th><th>w2</th></tr></thead>
+<tbody>
+<tr><td>$e_0$</td><td>gate $(2,1),(0,1)$；up $(1,1),(1,0)$</td><td>$(1,0),(0,1)$</td></tr>
+<tr><td>$e_1$</td><td>gate $(1,0),(0,1)$；up $(1,1),(1,0)$</td><td>$(1,1),(0,1)$</td></tr>
+<tr><td>$e_2$</td><td>gate $(1,2),(1,1)$；up $(0,1),(1,1)$</td><td>$(1,0),(1,1)$</td></tr>
+<tr><td>$e_3$</td><td>gate $(0,1),(2,0)$；up $(1,1),(0,2)$</td><td>$(0,1),(1,0)$</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>$t_0$ 的两个槽位是 $s_0$（$e_0$）与 $s_1$（$e_1$）。逐级计算：</p>
+
+<ul>
+<li>GEMM1：$C[s_0]=x_{t_0}\times w_{13}[e_0]=(2,\,0,\,1,\,1)$，即 gate 半 $(2,0)$、up 半 $(1,1)$；$C[s_1]=x_{t_0}\times w_{13}[e_1]=(1,\,0,\,1,\,1)$，gate 半 $(1,0)$、up 半 $(1,1)$。</li>
+<li>门控激活：$\operatorname{silu}(2)\approx 1.7616$、$\operatorname{silu}(1)\approx 0.7311$、$\operatorname{silu}(0)=0$，得 cache2$[s_0]=(1.7616,\,0)$、cache2$[s_1]=(0.7311,\,0)$。</li>
+<li>GEMM2 与权重：$w_2[e_0]$ 是单位阵，cache3$[s_0]=(1.7616,\,0)\times 0.6=(1.0570,\,0)$；$w_2[e_1]$ 给出 $(0.7311,\,0)$，乘 0.4 得 cache3$[s_1]=(0.2924,\,0)$。</li>
+<li>加权求和：$y_{t_0}=(1.0570+0.2924,\ 0)=(1.3494,\ 0)$。</li>
+</ul>
+
+<p>四个 token 的全部中间量与最终输出如下（数值由下文代码实际运行得出）：</p>
+
+<details>
+<summary>展开：构造示例 A 全部槽位的中间量与输出</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>槽位</th><th>(token, 专家, 权重)</th><th>cache1（gate 半与 up 半）</th><th>cache2</th><th>cache3</th></tr></thead>
+<tbody>
+<tr><td>$s_0$</td><td>($t_0$, $e_0$, 0.6)</td><td>$(2,0,1,1)$</td><td>$(1.7616,0)$</td><td>$(1.0570,0)$</td></tr>
+<tr><td>$s_1$</td><td>($t_0$, $e_1$, 0.4)</td><td>$(1,0,1,1)$</td><td>$(0.7311,0)$</td><td>$(0.2924,0)$</td></tr>
+<tr><td>$s_2$</td><td>($t_1$, $e_1$, 0.5)</td><td>$(0,1,1,0)$</td><td>$(0,0)$</td><td>$(0,0)$</td></tr>
+<tr><td>$s_3$</td><td>($t_1$, $e_3$, 0.5)</td><td>$(1,0,1,2)$</td><td>$(0.7311,0)$</td><td>$(0,0.3655)$</td></tr>
+<tr><td>$s_4$</td><td>($t_2$, $e_0$, 0.7)</td><td>$(3,1,2,1)$</td><td>$(5.7154,0.7311)$</td><td>$(4.0008,0.5117)$</td></tr>
+<tr><td>$s_5$</td><td>($t_2$, $e_3$, 0.3)</td><td>$(1,2,2,2)$</td><td>$(1.4621,3.5232)$</td><td>$(1.0570,0.4386)$</td></tr>
+<tr><td>$s_6$</td><td>($t_3$, $e_1$, 0.8)</td><td>$(2,0,2,2)$</td><td>$(3.5232,0)$</td><td>$(2.8186,0)$</td></tr>
+<tr><td>$s_7$</td><td>($t_3$, $e_2$, 0.2)</td><td>$(2,2,0,2)$</td><td>$(0,3.5232)$</td><td>$(0,0.7046)$</td></tr>
+</tbody>
+</table>
+</div>
+<p>沿 top-k 求和得最终输出：$y_{t_0}=(1.3494,0)$、$y_{t_1}=(0,0.3655)$、$y_{t_2}=(5.0578,0.9504)$、$y_{t_3}=(2.8186,0.7046)$。以 $t_2$ 为例核对一次合并：两条支路 $0.7\times(5.7154,0.7311)$ 通道经 $w_2[e_0]$（单位阵）直接缩放，$0.3\times w_2[e_3](1.4621,3.5232)$ 由 $(0,1),(1,0)$ 行交换坐标后缩放，两支相加即 $(5.0578, 0.9504)$。</p>
+</details>
+
+<p>以下代码把两条路径写成可运行程序：moe_naive 是第 1 章的逐专家循环（按合成公式直接累加），moe_fused 复刻融合路径——先构造三个数组，再按块循环、逐槽掩码、在 GEMM2 内乘权重、最后沿 top-k 求和。两条路径的输出应逐元素一致，这正是"融合只是重组计算、不改变数学"的机械验证：</p>
+
+<details class="code-details">
+<summary>代码：朴素实现与融合实现的等价性验证（纯 Python，无第三方依赖）</summary>
+<div class="code-block">
+<pre><code class="language-python">import math
+
+# ---- 构造输入：4 个 token、4 个专家、top-2、块大小 2（全部数字为构造值） ----
+M, E, TOPK, BLOCK = 4, 4, 2, 2
+H, I = 2, 2                                    # 隐藏维 H，中间维 I
+x = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 0.0]]      # token 输入
+w13 = [                                        # (E, 2I, H)：前 I 行 gate，后 I 行 up
+    [[2, 1], [0, 1], [1, 1], [1, 0]],
+    [[1, 0], [0, 1], [1, 1], [1, 0]],
+    [[1, 2], [1, 1], [0, 1], [1, 1]],
+    [[0, 1], [2, 0], [1, 1], [0, 2]],
+]
+w2 = [                                         # (E, H, I)：down 投影
+    [[1, 0], [0, 1]],
+    [[1, 1], [0, 1]],
+    [[1, 0], [1, 1]],
+    [[0, 1], [1, 0]],
+]
+topk_ids     = [[0, 1], [1, 3], [0, 3], [1, 2]]
+topk_weights = [[0.6, 0.4], [0.5, 0.5], [0.7, 0.3], [0.8, 0.2]]
+NUM_VALID = M * TOPK                           # 有效槽位数 = 8
+
+
+def silu(v):
+    return v / (1.0 + math.exp(-v))
+
+
+def matvec(W, v):                              # W: (out, in)
+    return [sum(W[n][k] * v[k] for k in range(len(v))) for n in range(len(W))]
+
+
+# ---- 朴素参考实现：逐 token 逐选择，gather-GEMM-加回 ----
+def moe_naive():
+    out = [[0.0] * H for _ in range(M)]
+    for t in range(M):
+        for j in range(TOPK):
+            e = topk_ids[t][j]
+            gu = matvec(w13[e], x[t])                          # gate+up
+            inter = [silu(gu[d]) * gu[I + d] for d in range(I)]  # 门控激活
+            y_e = matvec(w2[e], inter)                         # down 投影
+            for h in range(H):
+                out[t][h] += topk_weights[t][j] * y_e[h]       # 加权累加
+    return out
+
+
+# ---- 对齐：构造 sorted_token_ids / expert_ids / num_tokens_post_padded ----
+def moe_align(topk_ids, block, E):
+    counts = [0] * E
+    for row in topk_ids:
+        for e in row:
+            counts[e] += 1
+    seg, acc = [0] * E, 0                      # 各专家段的起始偏移（对齐后）
+    for e in range(E):
+        seg[e] = acc
+        acc += (counts[e] + block - 1) // block * block
+    max_len = NUM_VALID + E * (block - 1)      # 分配上界
+    sorted_ids = [NUM_VALID] * max_len         # 填充值 = num_valid
+    fill = seg[:]
+    for s in range(NUM_VALID):                 # 槽位按专家归位
+        t, j = divmod(s, TOPK)
+        e = topk_ids[t][j]
+        sorted_ids[fill[e]] = s
+        fill[e] += 1
+    post = 0                                   # 填充后有效总长
+    for e in range(E):
+        if counts[e]:
+            post = seg[e] + (counts[e] + block - 1) // block * block
+    expert_ids = []
+    for b in range((max_len + block - 1) // block):
+        if b * block &gt;= post:                  # 越界块：内核提前返回
+            break
+        base = b * block
+        for e in range(E):
+            end = seg[e] + (counts[e] + block - 1) // block * block
+            if seg[e] &lt;= base &lt; end:
+                expert_ids.append(e)
+                break
+    return sorted_ids, expert_ids, post, max_len
+
+
+# ---- 融合路径：按块复刻 fused_moe_kernel 的索引方式 ----
+def moe_fused():
+    N1 = 2 * I
+    cache1 = [[0.0] * N1 for _ in range(NUM_VALID)]   # (M*topk, 2I)
+    cache2 = [[0.0] * I for _ in range(NUM_VALID)]    # (M*topk, I)
+    cache3 = [[0.0] * H for _ in range(NUM_VALID)]    # (M*topk, H)
+    sorted_ids, expert_ids, post, max_len = moe_align(topk_ids, BLOCK, E)
+
+    # GEMM1：A 行 = 槽位 // TOPK 还原 token，B = w13[expert_ids[b]]，不乘权重
+    for b, e in enumerate(expert_ids):
+        for r in range(BLOCK):
+            s = sorted_ids[b * BLOCK + r]
+            if s &gt;= NUM_VALID:                 # 填充槽：掩码跳过
+                continue
+            cache1[s] = matvec(w13[e], x[s // TOPK])
+
+    # 激活：silu(gate) 逐元素乘 up
+    for s in range(NUM_VALID):
+        g, u = cache1[s][:I], cache1[s][I:]
+        cache2[s] = [silu(g[d]) * u[d] for d in range(I)]
+
+    # GEMM2：A 行 = 槽位本身（top_k=1），乘路由权重
+    for b, e in enumerate(expert_ids):
+        for r in range(BLOCK):
+            s = sorted_ids[b * BLOCK + r]
+            if s &gt;= NUM_VALID:
+                continue
+            t, j = divmod(s, TOPK)
+            y_e = matvec(w2[e], cache2[s])
+            cache3[s] = [topk_weights[t][j] * v for v in y_e]
+
+    # moe_sum：沿 topk 维求和
+    out = [[0.0] * H for _ in range(M)]
+    for s in range(NUM_VALID):
+        t, _ = divmod(s, TOPK)
+        for h in range(H):
+            out[t][h] += cache3[s][h]
+    return out, sorted_ids, expert_ids, post, max_len, cache1, cache2, cache3
+
+
+out_n = moe_naive()
+out_f, sorted_ids, expert_ids, post, max_len, c1, c2, c3 = moe_fused()
+
+print("sorted_token_ids =", sorted_ids[:post], "(分配长度 %d)" % max_len)
+print("expert_ids       =", expert_ids)
+print("num_tokens_post_padded =", post)
+for s in range(NUM_VALID):
+    t, j = divmod(s, TOPK)
+    print("s%d (t%d,e%d,w=%.1f): cache1=%s cache2=%s cache3=%s" % (
+        s, t, topk_ids[t][j], topk_weights[t][j],
+        [round(v, 4) for v in c1[s]],
+        [round(v, 4) for v in c2[s]],
+        [round(v, 4) for v in c3[s]]))
+for t in range(M):
+    print("y_t%d  fused=%s  naive=%s" % (
+        t, [round(v, 4) for v in out_f[t]], [round(v, 4) for v in out_n[t]]))
+assert all(abs(a - b) &lt; 1e-9
+           for ft, nt in zip(out_f, out_n) for a, b in zip(ft, nt))
+print("两条路径输出逐元素一致（误差 &lt; 1e-9）")</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">sorted_token_ids = [0, 4, 1, 2, 6, 8, 7, 8, 3, 5] (分配长度 12)
+expert_ids       = [0, 1, 1, 2, 3]
+num_tokens_post_padded = 10
+s0 (t0,e0,w=0.6): cache1=[2.0, 0.0, 1.0, 1.0] cache2=[1.7616, 0.0] cache3=[1.057, 0.0]
+s1 (t0,e1,w=0.4): cache1=[1.0, 0.0, 1.0, 1.0] cache2=[0.7311, 0.0] cache3=[0.2924, 0.0]
+s2 (t1,e1,w=0.5): cache1=[0.0, 1.0, 1.0, 0.0] cache2=[0.0, 0.0] cache3=[0.0, 0.0]
+s3 (t1,e3,w=0.5): cache1=[1.0, 0.0, 1.0, 2.0] cache2=[0.7311, 0.0] cache3=[0.0, 0.3655]
+s4 (t2,e0,w=0.7): cache1=[3.0, 1.0, 2.0, 1.0] cache2=[5.7154, 0.7311] cache3=[4.0008, 0.5117]
+s5 (t2,e3,w=0.3): cache1=[1.0, 2.0, 2.0, 2.0] cache2=[1.4621, 3.5232] cache3=[1.057, 0.4386]
+s6 (t3,e1,w=0.8): cache1=[2.0, 0.0, 2.0, 2.0] cache2=[3.5232, 0.0] cache3=[2.8186, 0.0]
+s7 (t3,e2,w=0.2): cache1=[2.0, 2.0, 0.0, 2.0] cache2=[0.0, 3.5232] cache3=[0.0, 0.7046]
+y_t0  fused=[1.3494, 0.0]  naive=[1.3494, 0.0]
+y_t1  fused=[0.0, 0.3655]  naive=[0.0, 0.3655]
+y_t2  fused=[5.0578, 0.9504]  naive=[5.0578, 0.9504]
+y_t3  fused=[2.8186, 0.7046]  naive=[2.8186, 0.7046]
+两条路径输出逐元素一致（误差 &lt; 1e-9）</code></pre>
+</div>
+<p><b>验证的机制</b>：moe_align 对应第 2 章三数组的手算；两个 GEMM 循环对应第 3 章的索引公式（块号选权重、槽位定行、掩码跳填充）；GEMM2 内乘权重与最终求和对应本章的合成公式。matvec 的循环变量 k 对应公式的求和下标 $q$。</p>
+<p><b>观察重点</b>：expert_ids 中块 1 与块 2 同为专家 1——3 个槽位被填充拆成两个完整块；sorted_ids 中的两个 8 是填充槽，两处 continue 使它们不产生任何写入；输出行 fused 与 naive 逐元素相同。</p>
+<p><b>简化条件</b>：示例只在 CPU 上按语义复刻，维度取到最小可手算规模；真实的 fused_moe_kernel 是 Triton GPU 内核，按 $(B_M, B_N)$ tile 并行、在 K 维分块累加、支持多种量化格式，且 moe_align_block_size 是 CUDA 自定义算子。此处省略 tile 划分与量化，不影响索引与加权语义。</p>
+</details>
+
+<p>至此，一个 token 从进层到输出的每一步都有了着落。剩下的问题是边界：这套机制在 vLLM 的层结构里占多大位置，和专家并行、负载均衡、量化这些相邻系统如何分工。</p>
+
+<h3 id="full-dataflow-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>五步数据流中各步的张量形状如何变化？为什么 GEMM1 输出 $2I$ 维、激活后变 $I$ 维？</p>
+    <details>
+      <summary>解答：$2I$ 是 gate 与 up 拼接，门控乘把两半收缩成一半</summary>
+      <p>形状序列：hidden_states $(M, H) \to$ 路由结果 $(M, k)$ 与三数组 $\to$ cache1 $(M\cdot k, 2I) \to$ cache2 $(M\cdot k, I) \to$ cache3 $(M\cdot k, H) \to$ 输出 $(M, H)$。GEMM1 乘的 w13 是 gate 与 up 两份投影沿输出维的拼接（gate 在前 up 在后），所以输出 $2I$ 维；门控激活 silu_and_mul 对 gate 半过 silu 后与 up 半逐元素相乘，两半合成一份 $I$ 维；GEMM2 乘 w2 把 $I$ 维投影回 $H$ 维。</p>
+    </details>
+  </li>
+  <li>
+    <p>用构造示例 A 的数字，$t_0$ 的输出怎么一步步算出来？</p>
+    <details>
+      <summary>解答：两条支路各自过三步，再相加</summary>
+      <p>$x_{t_0}=(1,0)$，槽位 $s_0$（$e_0$, 0.6）与 $s_1$（$e_1$, 0.4）。支路 $s_0$：GEMM1 得 $(2,0,1,1)$（gate $(2,0)$、up $(1,1)$）；激活得 $(\operatorname{silu}(2)\cdot 1,\ \operatorname{silu}(0)\cdot 1)=(1.7616, 0)$；GEMM2 过单位阵 $w_2[e_0]$ 后乘 0.6 得 $(1.0570, 0)$。支路 $s_1$ 同法得 $(0.2924, 0)$。求和得 $y_{t_0}=(1.3494, 0)$。其余 token 见展开折叠块或运行代码复算。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="layer-boundary">5. FusedMoE 层的职责边界——它管什么、不管什么</h2>
+
+<p>机制之上是工程组织。在 vLLM 中，模型代码不直接调用内核，而是使用 MoE 层：早期版本（如 v0.10.2）是一个 FusedMoE 模块类；v0.28.0 改为由 FusedMoEFactory 组装三件套——Router 负责 token 到专家的分配（含 topk_softmax 等路由内核）、RoutedExperts 持有全部专家权重、MoERunner 编排前向<sup>[C12]</sup>。权重的并行切分沿用张量并行的标准做法：w13 是列切（MergedColumnParallel，各 rank 持有输出维的一段），w2 是行切（RowParallelLinear，各 rank 持有输入维的一段），两者配合使每层只需一次归约，见 <a href="../../wiki/model-parallelism/index.html">模型并行</a>。</p>
+
+<p>把本章的问题列成一张职责表：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>职责</th><th>归属</th><th>与融合算子的关系</th></tr></thead>
+<tbody>
+<tr><td>单 rank 内专家计算的组织</td><td>FusedMoE（本文主题）</td><td>对齐 + 两次 GEMM + 激活 + 求和</td></tr>
+<tr><td>路由打分与 top-k 选择</td><td>Router（层内）</td><td>产出 topk_ids 与 topk_weights；分组 top-k、sigmoid 打分等变体属模型结构话题</td></tr>
+<tr><td>TP 下专家权重切分</td><td>RoutedExperts</td><td>w13 列切、w2 行切，切分后各 rank 独立跑融合内核</td></tr>
+<tr><td>EP 的 dispatch/combine 通信</td><td>独立通信组件</td><td>不属于 FusedMoE；内核只对非本 rank 专家写零兜底<sup>[C10]</sup></td></tr>
+<tr><td>专家负载均衡</td><td>EPLB</td><td>调整专家摆放与冗余复制，见 <a href="../../wiki/eplb/index.html">EPLB 专家并行负载均衡</a></td></tr>
+<tr><td>权重量化与反量化</td><td>量化方法层</td><td>fp8、int4 等路径复用同一内核框架，在内核内做反量化；细节超出本页</td></tr>
+<tr><td>内核参数调优</td><td>调优配置</td><td>按 (专家数, 输出宽, 设备, 精度) 查 JSON 取 BLOCK_SIZE 等参数，未命中用默认阶梯<sup>[C11]</sup></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>专家并行值得单独说清。EP 模式下不同专家放在不同 rank，token 需要被送往持有其专家的卡、算完再送回——dispatch 与 combine 通信由独立的组件承担，其机制见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>。融合算子在其中的角色是"每张卡各自把自己的那份算完"：对齐阶段按全局专家数对齐，expert_ids 里非本 rank 的专家标 $-1$，内核对这类块写零输出<sup>[C10]</sup>——零值不干扰后续合并。也就是说，第 2、3 章的机制在 EP 下原样运转，只是有效计算集中在属于本 rank 的块上。</p>
+
+<p>两个工程细节补全边界。其一，tile 参数不是写死的：内核启动前按专家数、输出宽度、设备与精度查找调优 JSON，取最接近当前批量的档位；查不到时用默认阶梯（如 bf16 路径 $B_M$ 从 16 到 128 随批量增大）并告警<sup>[C11, N1]</sup>。其二，极小批量有专门路径：在未启用专家并行（expert_map 为空）且 $M\cdot k\times 4$ 不超过全局专家数时，排序填充本身的开销都不划算，vLLM 跳过 moe_align_block_size，让每个块只装一个有效槽位直通计算<sup>[C14, N3]</sup>——decode 单请求场景（$M=1$）正落在这一档。</p>
+
+<p>最后是版本与生态边界。本页全部机制以 vLLM v0.28.0 的 Triton 未量化路径为基准描述；量化路径与 DeepGEMM、CUTLASS 等其他后端复用或替代同一套数据流，但内核内部实现不同，本页结论不直接迁移。SGLang 等系统有机制相近的融合 MoE 实现，亦不在本页核对范围内。</p>
+
+<h3 id="layer-boundary-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>FusedMoE 层由什么组成？TP 下专家权重怎么切？</p>
+    <details>
+      <summary>解答：Router、RoutedExperts、MoERunner 三件套；w13 列切 w2 行切</summary>
+      <p>v0.28.0 中 FusedMoEFactory 组装 Router（token 到专家分配，含路由内核）、RoutedExperts（专家权重）与 MoERunner（前向编排）；早期版本是单个 FusedMoE 模块类。TP 下 w13 沿输出维列切、w2 沿输入维行切，各 rank 对本地分片独立执行融合内核，配合标准的列切加行切归约结构。</p>
+    </details>
+  </li>
+  <li>
+    <p>EP 通信为什么不属于 FusedMoE？内核如何配合 EP？</p>
+    <details>
+      <summary>解答：通信由独立组件承担，内核写零兜底</summary>
+      <p>FusedMoE 的语义边界是单 rank 内的计算组织：把本 rank 持有的 (token, 专家) 对算成分块 GEMM。跨 rank 的 dispatch/combine 由独立的通信组件承担。配合方式是对齐阶段按全局专家数处理所有槽位、把非本 rank 的专家在 expert_ids 标为 $-1$，内核对 $-1$ 块写零输出，零值不干扰上层合并。</p>
+    </details>
+  </li>
+  <li>
+    <p>批量极小时走什么特殊路径？为什么合理？</p>
+    <details>
+      <summary>解答：$M\cdot k\times 4\le E$ 时跳过对齐，逐槽直通</summary>
+      <p>当槽位数远小于专家数（vLLM 取四倍裕量判断）时，绝大多数专家一个槽都没有，排序与填充的准备工作比计算本身还重。此路径跳过 moe_align_block_size，sorted_token_ids 传空、每个块只装一个有效槽位，其余位置屏蔽。GEMM 语义不变，省掉的是对齐内核的启动与执行。decode 单请求（$M=1$）正落在这档。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>核心论断与来源</h3>
+<ul>
+<li>C1–C2（模块命名、内核矩阵语义）：vLLM v0.28.0（commit 2cf0a69，N2）vllm/model_executor/layers/fused_moe/fused_moe.py L3、L298–299、L356–375（内核 docstring）。</li>
+<li>C3–C4（三数组语义与排序填充目的）：同文件 L421；moe_align_block_size.py L48–72（Returns 与 Example）、L54–57；fused_moe.py L379–383。</li>
+<li>C5（五步流程）：fused_moe.py L1772–1851；activation.py L22–24、L230–236。</li>
+<li>C6（权重作用位置与求和）：fused_moe.py L1785–1846（两次调用的参数）、L593–599（fp32 乘权重）、L1848–1851（moe_sum）。</li>
+<li>C7–C9（网格、索引、掩码）：fused_moe.py L836–839、L385–396、L404–410、L421、L472–479、L531–537、L607–610。</li>
+<li>C10（EP 写零）：fused_moe.py L423–440；moe_align_block_size.py L23–27。</li>
+<li>C11（调优配置查找）：fused_moe.py L1089–1166、L1159–1166。</li>
+<li>C12（层组成与 TP 切分）：v0.28.0 layer.py L149–161；v0.10.2 layer.py L741。</li>
+<li>C13（topk_softmax）：v0.28.0 router/fused_topk_router.py L31–44；CUDA 内核在 v0.28.0 位于 csrc/libtorch_stable/moe/topk_softmax_kernels.cu（v0.10.2 位于 csrc/moe/topk_softmax_kernels.cu），文件头 L1–2 "Adapted from TensorRT-LLM v0.7.1"、L531–560（张量形状注释）。</li>
+<li>C14（跳过对齐路径）：fused_moe.py L1552–1584。</li>
+<li>C15（缓存复用）：fused_moe.py L1733–1741。</li>
+<li>C16（MegaBlocks 动机）：Gale 等，MegaBlocks: Efficient Sparse Training with Mixture-of-Experts，arXiv:2211.15841 摘要。</li>
+</ul>
+
+<h3>核心公式与来源</h3>
+<ul>
+<li>F1（填充上界）：moe_align_block_size.py L74，默认分支。</li>
+<li>F2（tile 索引公式）：由 fused_moe.py L408–479 指针运算与 L1740–1751 缓存形状推导；正文可运行代码逐元素验证。</li>
+<li>F3（输出合成公式）：由 C5、C6 与 activation.py 的门控激活定义组合；正文可运行代码对照朴素实现验证等价。</li>
+</ul>
+
+<h3>外部数字与实验条件</h3>
+<ul>
+<li>N1（默认 $B_M$ 阶梯 16/32/64/128）：fused_moe.py L1366–1380，bf16/fp16 通用路径、无调优命中时的启发式。</li>
+<li>N2（版本标识）：vLLM v0.28.0，commit 2cf0a6915ce544dc493a0990f2ea38d81601128a；对照版本 v0.10.2。</li>
+<li>N3（跳过对齐阈值 $M\cdot k\times 4\le E$）：fused_moe.py L1552–1558，SPARSITY_FACTOR 为 4。</li>
+<li>N4（MegaBlocks 训练加速最高 40%、2.4 倍）：arXiv:2211.15841 摘要——40% 对比 Tutel 训练的 MoE，2.4 倍对比 Megatron-LM 训练的稠密 DNN；训练场景数字，仅作历史动机旁证，不代表 vLLM 推理性能。</li>
+</ul>
+
+<h3>构造示例</h3>
+<p>开头的"256 专家、批 8、top-8"场景与贯穿全文的构造示例 A（$M=4$、$E=4$、$k=2$、$B_M=2$、$H=2$、$I=2$，含全部权重、输入与路由结果）均为人为构造，用于手算与代码验证，不代表任何真实模型的配置或实测数据。silu 数值（$\operatorname{silu}(1)\approx 0.7311$ 等）由代码按定义计算。</p>
+
+<h3>辅助解释与类比边界</h3>
+<p>"排队/归堆"的叙述是对排序填充的语言化描述，只解释槽位重排这一局部机制，不涉及并发或顺序语义；"喂不饱"是对 tile 行数不足导致 SM 空闲的直观说法，量化判断以 tile 数与 SM 数的对照为准。第 1 章的浪费分析基于 GEMM tile 与内核启动的一般性质（见 GPU 执行模型页），未引用具体利用率实测数字。</p>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>正文机制以未量化 bf16 的 Triton 路径为基准；量化路径在内核内多做反量化与 scale 索引，数据流骨架相同，但本页未展开，不能据此推断量化路径的性能结论。</li>
+<li>可运行代码按语义复刻内核索引，省略 tile 的 N、K 维划分与 GPU 并行；它验证索引与加权的数学等价性，不能作为性能或精度的证据。</li>
+<li>代码中 matvec 的求和变量与公式下标一一对应，但真实内核在 K 维按 BLOCK_SIZE_K 分块累加并使用 fp32 累加器；数值精度行为以真实实现为准。</li>
+<li>路由一步只引用 topk_softmax 的输入输出语义；分组 top-k、sigmoid 打分、偏置修正等变体不在本页范围。</li>
+</ul>
+
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

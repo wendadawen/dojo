@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FusedMoE · 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · vLLM MoE 内核</span>
+      <h1>FusedMoE</h1>
+      <p class="lead">vLLM 的融合 MoE 算子：把一层里全部专家参与的矩阵乘合并成分块 GEMM 内核调用，调用次数不再随专家数增长。</p>
+      <p class="meta">更新于 2026-09-03</p>
+    </header>
+
+    <h2>这是什么</h2>
+    <p>MoE 层的 router 为每个 token 选出少数专家，剩下的计算是若干次"token 乘专家权重"的矩阵乘。朴素做法按专家循环，每个专家一次小 GEMM；FusedMoE 把这些矩阵乘组织成统一的分块 GEMM：先按专家把 token 槽位排序、填充到块边界，再一次内核调用算完全部专家的份额。本文以 vLLM v0.28.0 源码为参考实现。</p>
+
+    <h2>为什么需要它</h2>
+    <p>decode 批量小时，token 行被大量专家切得极稀：每个专家只分到零星一两行，小 GEMM 铺不满 GPU 的计算单元；内核启动次数随专家数线性增长；逐专家 gather/scatter 还带来额外数据搬运。把全部专家的 tile 放进同一个网格，三个来源同时消除。这一"按块组织 MoE 计算"的思路由 <a href="../../wiki/moe-serving/index.html">MoE 层与路由</a>的稀疏性决定，思想先例是 MegaBlocks 的块稀疏表述。</p>
+
+    <h2>核心机制</h2>
+    <ul>
+      <li>槽位展开：把 $M\cdot k$ 个 (token, 专家选择) 对展开成槽位序列，作为计算的组织单位。</li>
+      <li>分块对齐：moe_align_block_size 把槽位按专家排序、每段填充到 block_size 的倍数，产出 sorted_token_ids、expert_ids（每个块的专家号）与 num_tokens_post_padded（有效总长）三个数组；填充槽用掩码跳过，不会算错值。</li>
+      <li>融合内核：fused_moe_kernel 的网格覆盖全部专家的 tile；每个 tile 由块号选定专家权重切片、由槽位编号定位 token 行（第一次 GEMM 中槽位除以 $k$ 还原 token 行，第二次直接作行号）。</li>
+      <li>两次 GEMM 与激活：先乘 gate+up 拼接的 w13 得 $2I$ 维，门控激活收缩到 $I$ 维，再乘 w2 投影回 $H$ 维并在内核内乘路由权重，最后沿 top-k 求和。</li>
+    </ul>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>融合是重组计算而不是新算子语义：对同一输入，融合路径与逐专家循环的输出逐元素一致（完整说明页附纯 Python 双实现验证）。</li>
+      <li>"融合"的对象是全部专家的 GEMM；整层仍是路由、对齐、两次 GEMM、激活、求和多个内核接力，调用次数固定为个位数。</li>
+      <li>它只负责单 rank 内的计算组织：专家并行的 dispatch/combine 通信由独立组件承担（内核对非本 rank 专家写零兜底），负载均衡属于 <a href="../../wiki/eplb/index.html">EPLB</a>，量化路径复用同一内核框架。</li>
+      <li>批量极小时（未启用专家并行且 $M\cdot k\times 4\le E$）跳过对齐直通计算，decode 单请求正落在这一档；tile 参数按形状从调优配置查找，不写死。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>
