@@ -1,0 +1,57 @@
+[setup] mini forward ok: logits (1, 24, 1000), nan=False
+
+[A] iHC hyper-connections (official HYV4HyperConnection vs manual recompute)
+    collision L1.attn_hc mixed output (pre-gated sum): max_abs_diff = 0.000e+00
+    collision L1.attn_hc post gates: max_abs_diff = 0.000e+00
+    pre gates: min=0.2491 max=0.2511 mean=0.2500
+    post gates: min=0.9975 max=1.0029 mean=0.9999
+    collision L1.ffn_hc mixed output (pre-gated sum): max_abs_diff = 0.000e+00
+    collision L1.ffn_hc post gates: max_abs_diff = 0.000e+00
+    collision hc_head merged output: max_abs_diff = 0.000e+00
+    hc_head gates: min=0.2490 max=0.2519 mean=0.2499
+    initial 4 streams identical to embeddings at layer0 input: True
+
+[B] DSA lightning indexer (layer 1, full) — manual recompute with hand-written RoPE
+    manual top-k sets == official: True (topk=16, index_n_heads=4, index_head_dim=64, softmax_scale=0.125000=64**-0.5)
+    manual index scores: >0 fraction=0.234, max=0.0235
+    per-head ReLU exact-zero fraction (head scores): 0.478
+    shared-layer top-k reuse (official DecoderLayer outputs):
+    layers 2,3,4 reuse layer1; 6,7,8 reuse layer5; (mini 10-layer): True
+    layer0 own indexer: True; layer2 indexer is None: True
+
+[C] MLA attention with sink + sigmoid gate (manual recompute vs official)
+    collision attention block output (after o_proj): max_abs_diff = 0.000e+00
+    collision attention probs (sink-dropped, eager return): max_abs_diff = 0.000e+00
+    sink absorbed prob mass: min=5.865e-02 mean=1.213e-01 max=5.023e-01 (per head/query)
+    sink parameter values: min=0.0000 max=0.0000 (init=0.0)
+    sigmoid gate values: min=0.3892 max=0.6152 mean=0.5003
+    scaling = qk_head_dim**-0.5 = 48**-0.5 = 0.144338
+
+[D] MoE routing + experts (manual recompute vs official)
+    collision MoE output (routed + shared): max_abs_diff = 7.276e-10
+    token 5: top-8 experts = [3, 7, 10, 11, 12, 13, 14, 15]
+    token 5: normalized weights (pre-scaling) sum = 1.000000
+    token 5: weights after *routed_scaling_factor(2.827) = [0.3697, 0.3561, 0.3538, 0.3709, 0.3377, 0.3321, 0.3704, 0.3362]
+    e_score_correction_bias: min=-0.0400 max=0.0500 (nonzero in this test: True)
+    swiglu clamp unit: input gate=[20,-20,7] up=[-7,0.5,-0.5] -> gate_clamped=[[10.0, -20.0, 7.0]] up_clamped=[[-7.0, 0.5, -0.5]] out=['-69.9968', '-0.0000', '-3.4968']
+    collision dense layer0 MLP output: max_abs_diff = 0.000e+00
+    layer0 mlp type: HYV4MLP (intermediate_size=140); layer1: HYV4MoE
+
+[E] KV cache: mini measured shapes + real-config arithmetic
+    mini HF-eager cache: K=(1, 8, 24, 48) V=(1, 8, 24, 48) (B,H,T,D; D_k=qk_nope+rope=32+16, D_v=v_head=48)
+    mini indexer cache (full layers only): (1, 24, 64) (B,T,index_head_dim=64); cached layers = [0, 1, 5, 9]
+    real config: HF eager per-token-per-layer = 64*(192+64) + 64*256 = 32768 elems = 65536 B (bf16)
+    real config: vLLM latent MQA per-token-per-layer = 512+64 = 576 elems = 1152 B (bf16) + per-head sinks 64 params (once, fp32)
+    main-cache expansion ratio = 32768/576 = 56.89x
+    per token over 78 layers (main cache, bf16): HF 4.88 MB vs vLLM 87.8 KB
+    indexer cache: 21 full layers x 128 dims/token (vLLM fp8: ~2772 B/token; HF eager bf16: 5376 B/token)
+
+[F] MTP draft layer (vLLM semantics: enorm/hnorm/eh_proj -> no-iHC block -> final_ln -> shared lm_head)
+    trunk last_hidden (MTP input 'previous_hidden_states'): (1, 24, 512)
+    eh_proj input: cat([enorm(embeds), hnorm(prev_hidden)]) -> 1024 -> output 512
+    MTP block output hidden: (1, 24, 512); draft logits: (1, 24, 1000)
+    MTP block own indexer (full): True, topk shape=(1, 24, 16)
+    MTP top-k differs from trunk layer1 top-k (own selection): True
+    draft lm_head IS trunk lm_head (shared weight): True
+
+[done] all collisions above are between official exec'd code and independent manual recompute
