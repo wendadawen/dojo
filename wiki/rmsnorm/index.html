@@ -747,10 +747,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Zhang &amp; Sennrich, <i>Root Mean Square Layer Normalization</i>, arXiv:1910.07467（NeurIPS 2019）；GLM-5.3-Flash 官方实现（transformers <code>models/glm5_next</code>）。</p>
+<p><b>主要依据</b>：Zhang &amp; Sennrich, <i>Root Mean Square Layer Normalization</i>, arXiv:1910.07467（NeurIPS 2019）；GLM 系列实现（transformers <code>models/glm4_moe/modeling_glm4_moe.py</code> L275-289）与 PyTorch <code>nn.RMSNorm</code>。</p>
 </blockquote>
 
-<p>Transformer 每层入口都要归一化一次，这个操作本身也占训练时间。2019 年的一个工作提出：LayerNorm 公式里的「减均值」这一步可以直接删掉——只除以均方根，输出照样有效，运行时间在一系列任务上下降 7% 到 64%<sup>[N1]</sup>。这个删减版就是 RMSNorm，今天主流大模型（包括 GLM-5.3-Flash）的归一化层用的都是它。本文讲清它删了什么、为什么敢删、省了多少，以及实现里两处与论文公式不同的细节。</p>
+<p>Transformer 每层入口都要归一化一次，这个操作本身也占训练时间。2019 年的一个工作提出：LayerNorm 公式里的「减均值」这一步可以直接删掉——只除以均方根，输出照样有效，运行时间在一系列任务上下降 7% 到 64%<sup>[N1]</sup>。这个删减版就是 RMSNorm，已被 GLM 系列模型的官方实现采用<sup>[C9]</sup>。本文讲清它删了什么、为什么敢删、省了多少，以及实现里两处与论文公式不同的细节。</p>
 
 <p>结构：先拆解 LayerNorm 做的两件事，再看 RMSNorm 保留了哪件，然后是「为什么敢删」的论证与证据，最后算清计算账并核对 GLM 的实现。</p>
 
@@ -775,14 +775,14 @@
       <p>为什么去掉中心化仍然有效？</p>
       <details>
         <summary>解答：论文假设 re-scaling 才是成功原因，证据链支持</summary>
-        <p>论文的核心假设是 LayerNorm 的成功来自 re-scaling 不变性而非 re-centering。支持证据：零均值时两者精确相等；RMSNorm 完整保留各类 re-scaling 不变性（只放弃 re-centering 类性质）；实验中 RMSNorm 的激活均值与 LayerNorm 同样稳定；异常初始化下甚至更鲁棒。注意这是「假设+证据」而非定理。见「为什么敢去掉中心化」一章。</p>
+        <p>论文的核心假设是 LayerNorm 的成功来自 re-scaling 不变性而非 re-centering。支持证据：零均值时两者精确相等；RMSNorm 完整保留各类 re-scaling 不变性（只放弃 re-centering 类性质）；实验中 RMSNorm 的激活均值比不归一化的基线更稳定；异常初始化下甚至更鲁棒。注意这是「假设+证据」而非定理。见「为什么敢去掉中心化」一章。</p>
       </details>
     </li>
     <li>
       <p>省了多少计算？实现上要注意什么？</p>
       <details>
         <summary>解答：每维省约 3 次标量运算；实现普遍加 $\varepsilon$ 并在 fp32 里算</summary>
-        <p>按公式清点，对 $n$ 维输入 LayerNorm 比 RMSNorm 多约 $3n$ 次标量运算（求均值 $n$ 次加法、方差 $n$ 次减法、归一化 $n$ 次减法）；论文实测各任务运行时间下降 7%~64%（Transformer 上 6.9%），幅度依框架、硬件与架构而定。实现细节：论文公式没有 $\varepsilon$，工程实现普遍在分母加小常数防除零；GLM 实现先转到 fp32 计算再转回。见「计算与实现」一章。</p>
+        <p>按公式清点，对 $n$ 维输入 LayerNorm 比 RMSNorm 多约 $3n$ 次标量运算（求均值 $n$ 次加法、方差 $n$ 次减法、归一化 $n$ 次减法）；论文实测各任务运行时间下降 7%~64%（Transformer 上 6.9%），幅度依框架、硬件与架构而定。实现细节：论文公式没有 $\varepsilon$，工程实现普遍在分母侧加小常数防除零<sup>[C9, C10]</sup>；GLM 实现先转到 fp32 计算再转回。见「计算与实现」一章。</p>
       </details>
     </li>
   </ol>
@@ -793,7 +793,7 @@
   <ul>
     <li>「RMSNorm 是 LayerNorm 的近似」——它是精确的不同算子：零均值输入下两者相等，一般输入下输出不同（LayerNorm 输出零均值，RMSNorm 不）。</li>
     <li>「去掉中心化会掉精度」——论文各任务质量与 LayerNorm 相当（Transformer 翻译 BLEU 26.8/27.7 对 26.6/27.7）；这是论文实验结论，引用时注明来源。</li>
-    <li>「论文公式里有 $\varepsilon$」——v1 原文的式 (3)(4) 均无 $\varepsilon$；$\varepsilon$ 是工程实现加的（PyTorch 与 GLM 都加）。</li>
+    <li>「论文公式里有 $\varepsilon$」——v1 原文的式 (3)(4) 均无 $\varepsilon$；$\varepsilon$ 是工程实现加的（PyTorch 与 GLM 都加）<sup>[C9, C10]</sup>。</li>
     <li>「7%~64% 的加速可以照搬到任何硬件」——该区间来自 2019 年的 TITAN X / V100 / 2080 Ti 与 TensorFlow/Theano/PyTorch 组合，量级取决于框架与硬件。</li>
   </ul>
 </section>
@@ -931,7 +931,7 @@ RMSNorm:   RMS = 2.7386
 
 <p><strong>证据二：不变性的完整保留</strong>。论文系统对比了两种方法的不变性集合（其 Table 1）：RMSNorm 完整保留 LayerNorm 对权重矩阵缩放、数据集缩放、单样本缩放的不变性，放弃的只有 re-centering 相关的性质。按假设，被放弃的恰好是不重要的那部分。</p>
 
-<p><strong>证据三：均值的实际稳定性</strong>。一个自然的质疑是「不归一化均值，均值会不会失控」。论文在机器翻译模型的解码器里实测（其 Table 5）：RMSNorm 的激活均值波动范围是 $-0.40$ 到 $-0.74$，比不归一化的基线（$-2.60$ 到 $-1.19$）稳定得多，与 LayerNorm 相当<sup>[C6][N2]</sup>——不显式中心化，均值实际上也被缩放操作间接稳住了。</p>
+<p><strong>证据三：均值的实际稳定性</strong>。一个自然的质疑是「不归一化均值，均值会不会失控」。论文在机器翻译模型的解码器里实测（其 Table 5）：RMSNorm 的激活均值随 token 位置从 $-0.40$ 漂移到 $-0.74$，比不归一化的基线（$-2.60$ 到 $-1.19$）稳定得多，原文的结论是「RMSNorm 的均值虽未归一化，但实践中比基线的均值更稳定」；论文同时指出，RMSNorm 与 LayerNorm 都稳定了标准差。论文的文字只把 RMSNorm 的均值与基线对比，未对 LayerNorm 的均值作相当性判断<sup>[C6, N2]</sup>。</p>
 
 <p><strong>证据四：质量与鲁棒性</strong>。各任务上 RMSNorm 的质量与 LayerNorm 相当（论文的 Transformer 翻译实验：BLEU 26.8/27.7 对 LayerNorm 的 26.6/27.7；不归一化的 Transformer 完全训不动）<sup>[C8]</sup>。异常初始化（中心改为 0.2）下 RMSNorm 表现不差于 LayerNorm 甚至更稳<sup>[C7]</sup>。</p>
 
@@ -946,7 +946,7 @@ RMSNorm:   RMS = 2.7386
     <p>「删掉中心化有效」的论证结构是什么？它是定理吗？</p>
     <details>
       <summary>解答：假设加四路证据，不是定理</summary>
-      <p>结构是：先提出「re-scaling 才是成功原因」的假设，再用四路证据支持——零均值等价、不变性集合只减不改、激活均值实测同样稳定、质量与鲁棒性相当。论文没有证明「任何网络删掉中心化都不掉精度」，证据也都是具体任务上的实验；所以正确表述是「有假设与实验支持，未构成定理」，引用时保持这个分寸。</p>
+      <p>结构是：先提出「re-scaling 才是成功原因」的假设，再用四路证据支持——零均值等价、不变性集合只减不改、激活均值实测稳定（比不归一化的基线）、质量与鲁棒性相当。论文没有证明「任何网络删掉中心化都不掉精度」，证据也都是具体任务上的实验；所以正确表述是「有假设与实验支持，未构成定理」，引用时保持这个分寸。</p>
     </details>
   </li>
 </ol>
@@ -974,7 +974,7 @@ RMSNorm:   RMS = 2.7386
 
 <p>同一个算子在不同组合下加速 6.9% 到 40.8%（摘要汇总的全部实验连同变体 pRMSNorm 计为 7%~64%）——量级取决于框架、硬件与架构，表中数字不可直接搬到当代硬件。</p>
 
-<p><strong>实现的两处细节</strong>。其一，论文 v1 的式 (3)(4) 里<strong>没有</strong> $\varepsilon$，直接除以 $\sigma$ 或 RMS；工程实现普遍在分母（或根号内）加一个小常数防除零——PyTorch 的 <code>nn.RMSNorm</code> 与 GLM 都这么做，位置与默认值各不相同。其二，GLM 的实现先把输入转到 fp32 计算（归一化对精度敏感），完成后再转回原 dtype，可学习的权重乘在转回之后<sup>[C9]</sup>。</p>
+<p><strong>实现的两处细节</strong>。其一，论文 v1 的式 (3)(4) 里<strong>没有</strong> $\varepsilon$，直接除以 $\sigma$ 或 RMS；工程实现普遍加一个小常数防除零——PyTorch 的 <code>nn.RMSNorm</code> 与 GLM 都把它加在根号内（即 $\sqrt{\varepsilon+\frac{1}{n}\sum_{i=1}^{n}x_i^2}$），仅默认值不同：PyTorch 取 <code>torch.finfo(x.dtype).eps</code>，GLM 的 rms_norm_eps 取 $10^{-5}$<sup>[C9, C10]</sup>。其二，GLM 的实现先把输入转到 fp32 计算（归一化对精度敏感），完成后再转回原 dtype，可学习的权重乘在转回之后<sup>[C9]</sup>。</p>
 
 <details class="code-details">
   <summary>代码：与 torch 官方实现对齐，并复现 GLM 式实现</summary>
@@ -1004,7 +1004,7 @@ print("GLM 式（fp32 + eps=1e-5）输出:",
 GLM 式（fp32 + eps=1e-5）输出: [0.365148, 0.730296, 1.095444, 1.460593]</code></pre>
   </div>
   <p><b>验证的机制</b>：<code>torch.nn.RMSNorm</code>（eps 取 0、权重取 1）与手写公式输出一致（差 $1.2\times10^{-7}$，浮点舍入级别）；GLM 式实现多了 fp32 转换与 $\varepsilon=10^{-5}$，与论文公式的差为 $9.5\times10^{-7}$<sup>[F5]</sup>。</p>
-  <p><b>观察重点</b>：$\varepsilon$ 的影响在 $10^{-7}$ 量级（输入尺度为 1 时）；工程上加它不是为了精度而是为了除零安全。GLM 配置的 rms_norm_eps 为 $10^{-5}$。</p>
+  <p><b>观察重点</b>：$\varepsilon$ 的影响在 $10^{-7}$ 量级（输入尺度为 1 时）；工程上加它不是为了精度而是为了除零安全。GLM 配置的 rms_norm_eps 为 $10^{-5}$<sup>[C9]</sup>。</p>
   <p><b>简化条件</b>：fp32 转换在 float32 输入上是恒等操作，此处只为展示结构；真实模型输入常为 bf16，转换的作用才显现。</p>
 </details>
 
@@ -1021,7 +1021,7 @@ GLM 式（fp32 + eps=1e-5）输出: [0.365148, 0.730296, 1.095444, 1.460593]</co
     <p>论文公式与工程实现有哪些已知出入？</p>
     <details>
       <summary>解答：$\varepsilon$ 的有无与计算精度</summary>
-      <p>论文 v1 的式 (3)(4) 不含 $\varepsilon$；PyTorch 与 GLM 的实现都在分母侧加了小常数（GLM 取 $10^{-5}$），目的是数值安全而非改变定义。GLM 另外把统计量计算放进 fp32、完成后转回原精度、可学习权重乘在转回之后——这三点是实现选择，论文未规定。把「论文公式」与「实现行为」分开陈述可以避免把实现细节误当成定义的一部分。</p>
+      <p>论文 v1 的式 (3)(4) 不含 $\varepsilon$；PyTorch 与 GLM 的实现都在根号内加了小常数（PyTorch 默认取 <code>torch.finfo(x.dtype).eps</code>，GLM 取 $10^{-5}$），目的是数值安全而非改变定义<sup>[C9, C10]</sup>。GLM 另外把统计量计算放进 fp32、完成后转回原精度、可学习权重乘在转回之后——这三点是实现选择，论文未规定。把「论文公式」与「实现行为」分开陈述可以避免把实现细节误当成定义的一部分。</p>
     </details>
   </li>
 </ol>
@@ -1033,10 +1033,11 @@ GLM 式（fp32 + eps=1e-5）输出: [0.365148, 0.730296, 1.095444, 1.460593]</co
 <li><strong>[C2]</strong> 核心假设（re-scaling 才是成功原因；均值归一化不降方差）。RMSNorm 论文 §1 与 §4。</li>
 <li><strong>[C3]</strong> 零均值时 RMSNorm 与 LayerNorm 完全相等。论文 §4 原句。</li>
 <li><strong>[C5]</strong> 梯度分析（$g$ 的梯度正比于归一化后输入；权重梯度的隐式学习率自适应；援引 Santurkar et al.）。论文 §4.2。</li>
-<li><strong>[C6]</strong> 激活均值实测同样稳定（Table 5）。论文 §6.1。</li>
+<li><strong>[C6]</strong> RMSNorm 激活均值比基线更稳定、两者都稳定标准差（Table 5）。论文 §6.1。</li>
 <li><strong>[C7]</strong> 异常初始化下的鲁棒性（Figure 4）。论文 §6.1。</li>
 <li><strong>[C8]</strong> 质量与 LayerNorm 相当（BLEU 26.8/27.7 对 26.6/27.7；无归一化训练失败）。论文 §6.1 实验，Table 4（WMT14 En-De 翻译 newstest2014/2017 BLEU）。</li>
-<li><strong>[C9]</strong> GLM 实现：fp32 计算、$\varepsilon$（rms_norm_eps=1e-5）、权重乘在转回原 dtype 之后。transformers <code>models/glm5_next/modeling_glm5_next.py</code> L66-83 与 config。</li>
+<li><strong>[C9]</strong> GLM 系列实现：统计量在 fp32 中计算、$\varepsilon$ 加在根号内（rms_norm_eps 默认 $10^{-5}$）、可学习权重乘在转回原 dtype 之后。transformers <code>models/glm4_moe/modeling_glm4_moe.py</code> L275-289（<code>class Glm4MoeRMSNorm</code>）与 <code>models/glm4_moe/configuration_glm4_moe.py</code> L182（<code>rms_norm_eps=1e-5</code>）。</li>
+<li><strong>[C10]</strong> PyTorch <code>nn.RMSNorm</code>：$\mathrm{RMS}(x)=\sqrt{\varepsilon+\frac{1}{n}\sum_{i=1}^{n}x_i^2}$，$\varepsilon$ 加在根号内，默认取 <code>torch.finfo(x.dtype).eps</code>。本机 torch 2.8.0 <code>torch/nn/modules/normalization.py</code>（<code>class RMSNorm</code>）。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
@@ -1069,7 +1070,7 @@ GLM 式（fp32 + eps=1e-5）输出: [0.365148, 0.730296, 1.095444, 1.460593]</co
 <ul>
 <li>对照代码省略增益 $g$ 与偏置 $b$（取 1 与 0）：不影响两式的关系结论，但不能用于讨论 $g$ 的学习动力学。</li>
 <li>速度表来自 2019 年环境，当代 GPU 与融合内核下绝对值不可比；「RMSNorm 的统计量计算少于 LayerNorm」这一结构性结论不受环境影响。</li>
-<li>论文证据覆盖机器翻译、阅读理解、图文检索与 CIFAR-10 等任务；大语言模型场景的「质量相当」由后续广泛采用间接支持，本页只引用论文实验与 GLM 实现事实，不自行外推训练结论。</li>
+<li>论文证据覆盖机器翻译、阅读理解、图文检索与 CIFAR-10 等任务；大语言模型场景的「质量相当」由后续广泛采用间接支持，本页只引用论文实验与可定位的 GLM 实现源码，不自行外推训练结论。</li>
 </ul>
 
 

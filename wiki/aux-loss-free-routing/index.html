@@ -678,7 +678,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts（Wang et al., 2024, arXiv:2408.15664）；DeepSeek-V3 Technical Report（arXiv:2412.19437 §2.1.2, Eq.12-17）。本页所用 $\gamma$ 取值与调度、$\alpha$ 取值、专家数与 top-k 均来自这两份原文。</p>
+<p><b>主要依据</b>：Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts（Wang et al., 2024, arXiv:2408.15664）；DeepSeek-V3 Technical Report（arXiv:2412.19437 §2.1.2、§4.2）。本页所用 $\gamma$ 取值与调度、$\alpha$ 取值、专家数与 top-k 均来自这两份原文。</p>
 </blockquote>
 
 <p>MoE 训练里路由器看到 4 个专家、每次让 token 自己选 top-2。训几万步后发现专家 0 被选中 90% 的次数、专家 3 一次都没被选中——它根本没在训。传统做法是给损失函数加一个"鼓励均衡"的项，但项的权重 $\alpha$ 是个玄学：太大压住专家特化、损害主任务；太小压不住坍塌。DeepSeek 团队 2024 年 8 月在 arXiv:2408.15664 上提了个绕开损失函数的方案：给每个专家加一个 bias，加到路由分数上只参与"选谁"，不进入"权重多少"，再用"过载就减、欠载就增"的固定小步规则在每步训练后更新 bias。这就是辅助损失无关路由（Auxiliary-Loss-Free Routing）。</p>
@@ -777,15 +777,15 @@ $$L_{bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,$$
 
 <p>先列出本页要用的符号。令 $u_t$ 是 token $t$ 的输入向量，$e_i$ 是 router 权重的第 $i$ 行（也叫专家 $i$ 的中心向量），$\sigma$ 是 sigmoid 函数 $\sigma(x)=1/(1+e^{-x})$。DeepSeek-V3 把 router 的打分定义为</p>
 
-$$s_{i,t}=\sigma(u_t^\top e_i).\qquad\text{(F1)}$$
+$$s_{i,t}=\sigma(u_t^\top e_i).$$
 
-<p>$s_{i,t}\in(0,1)$ 是 token $t$ 对专家 $i$ 的<strong>路由分数</strong>。给每个专家再加一个数 $b_i$ 叫 <strong>bias</strong>，初始 $b_i=0$。bias 加到分数上一起做 top-k 选择：</p>
+<p>$s_{i,t}\in(0,1)$ 是 token $t$ 对专家 $i$ 的<strong>路由分数</strong><sup>[F1]</sup>。给每个专家再加一个数 $b_i$ 叫 <strong>bias</strong>，初始 $b_i=0$。bias 加到分数上一起做 top-k 选择<sup>[F2]</sup>：</p>
 
-$$g'_{i,t}=\begin{cases}s_{i,t}, & s_{i,t}+b_i\in\mathrm{Topk}(\{s_{j,t}+b_j\mid 1\leq j\leq N_r\},K_r)\\[4pt] 0, & \text{otherwise.}\end{cases}\qquad\text{(F2)}$$
+$$g'_{i,t}=\begin{cases}s_{i,t}, & s_{i,t}+b_i\in\mathrm{Topk}(\{s_{j,t}+b_j\mid 1\leq j\leq N_r\},K_r)\\[4pt] 0, & \text{otherwise.}\end{cases}$$
 
-<p>然后对被选中的 $K_r$ 个专家做归一化，得到最终 <strong>门控权重</strong>：</p>
+<p>然后对被选中的 $K_r$ 个专家做归一化，得到最终 <strong>门控权重</strong><sup>[F3]</sup>：</p>
 
-$$g_{i,t}=\frac{g'_{i,t}}{\sum_{j=1}^{N_r}g'_{j,t}}.\qquad\text{(F3)}$$
+$$g_{i,t}=\frac{g'_{i,t}}{\sum_{j=1}^{N_r}g'_{j,t}}.$$
 
 <p>这里有两件事必须看清楚<sup>[C3]</sup>：</p>
 
@@ -794,9 +794,9 @@ $$g_{i,t}=\frac{g'_{i,t}}{\sum_{j=1}^{N_r}g'_{j,t}}.\qquad\text{(F3)}$$
   <li><strong>门控权重取原始 $s_{i,t}$</strong>：被选中后 $g'_{i,t}=s_{i,t}$，<em>不含 bias</em>；归一化分母 $\sum_j g'_{j,t}$ 也只对被选中的 $K_r$ 个原始分数求和，<em>不含 bias</em>。</li>
 </ol>
 
-<p>最后这层 MoE 的输出（沿用 DeepSeekMoE 基本结构，DeepSeek-V3 报告 Eq.12）写作</p>
+<p>最后这层 MoE 的输出（沿用 DeepSeekMoE 基本结构，DeepSeek-V3 报告 Eq.12）写作<sup>[F5]</sup></p>
 
-$$h_t'=u_t+\sum_{i=1}^{N_s}\mathrm{FFN}_i^{(s)}(u_t)+\sum_{i=1}^{N_r}g_{i,t}\,\mathrm{FFN}_i^{(r)}(u_t),\qquad\text{(F5)}$$
+$$h_t'=u_t+\sum_{i=1}^{N_s}\mathrm{FFN}_i^{(s)}(u_t)+\sum_{i=1}^{N_r}g_{i,t}\,\mathrm{FFN}_i^{(r)}(u_t)$$
 
 <p>其中 $\mathrm{FFN}_i^{(s)}$ 是 $N_s$ 个 <strong>shared expert</strong>（所有 token 都激活），$\mathrm{FFN}_i^{(r)}$ 是 $N_r$ 个 routed expert（只激活 $K_r$ 个，按 $g_{i,t}$ 加权）。shared expert 的角色见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。</p>
 
@@ -851,9 +851,9 @@ $$\bar c_i=\frac{1}{N_r}\sum_{j=1}^{N_r}c_j.$$
   <li>$e_i=0$ 表示恰好平均。</li>
 </ul>
 
-<p>更新规则写作</p>
+<p>更新规则写作<sup>[F4]</sup></p>
 
-$$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i),\qquad\text{(F4)}$$
+$$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i).$$
 
 <p>其中 $\mathrm{sign}(x)=+1$ 若 $x>0$，$-1$ 若 $x&lt;0$，$0$ 若 $x=0$；$\gamma$ 是固定步长超参（原始论文记为 $u$，DeepSeek-V3 报告统一记为 $\gamma$，叫 <strong>bias update speed</strong>）。也就是说：</p>
 
@@ -865,16 +865,16 @@ $$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i),\qquad\text{(F4)}$$
 
 <p>这里要强调三件事。</p>
 
-<p><strong>第一，这是规则式更新，不进反向传播。</strong> bias 不在计算图里，$\partial L/\partial b_i$ 不存在。每步训练的反向传播结束后，单独按 F4 用上一批的负载统计调一次 bias。论文里特别强调：用历史 batch 的负载更新，避免用到当前序列的 future token 信息（<em>因果约束</em>，arXiv:2408.15664 §3.2）。</p>
+<p><strong>第一，这是规则式更新，不进反向传播。</strong> bias 不在计算图里，$\partial L/\partial b_i$ 不存在。每步训练的反向传播结束后，单独按 F4 用上一批的负载统计调一次 bias。论文里特别强调：用历史 batch 的负载更新，避免用到当前序列的 future token 信息（<em>因果约束</em>，arXiv:2408.15664 §3）<sup>[C4]</sup>。</p>
 
-<p><strong>第二，为什么用 sign 而不是用误差幅度 $e_i$？</strong> 原始论文实验了两种变体：sign 版本 $b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(e_i)$ 和连续幅度版本 $b_i\leftarrow b_i+\gamma\cdot e_i$。Table 3 报告两者 perplexity 几乎相同（9.50 vs 9.51），MaxVio 也接近（0.044 vs 0.036）。作者最终采用更简单的 sign 版本。sign 的好处是<strong>每步走固定小步</strong>，单步稳定，不会因一个 batch 偏差大就猛跳；代价是<strong>丢失幅度信息</strong>——差 1 个 token 和差 50 个 token 走的步长完全一样<sup>[C5]</sup>。</p>
+<p><strong>第二，为什么用 sign 而不是用误差幅度 $e_i$？</strong> 原始论文实验了两种变体：sign 版本 $b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(e_i)$ 和连续幅度版本 $b_i\leftarrow b_i+\gamma\cdot e_i$。Table 3 报告两者 perplexity 几乎相同（9.50 vs 9.51），MaxVio 也接近（0.044 vs 0.036）。作者最终采用更简单的 sign 版本。sign 的好处是<strong>每步走固定小步</strong>，单步稳定，不会因一个 batch 偏差大就猛跳；代价是<strong>丢失幅度信息</strong>——差 1 个 token 和差 50 个 token 走的步长完全一样<sup>[C5, N5]</sup>。</p>
 
 <details>
 <summary>补充：原始论文的变体实验对照（Table 3）</summary>
 <p>arXiv:2408.15664 Table 3 在 1B 模型上对照加法 sign 与加法幅度两种 bias 设计（幅度版本再扫描三个 $\gamma$）：</p>
 <div class="table-scroll">
 <table>
-<thead><tr><th>bias 更新规则</th><th>$\gamma$（论文记 $u$）</th><th>验证 PPL ↓</th><th>MaxVio_global ↓</th></tr></thead>
+<thead><tr><th>bias 更新规则</th><th>$\gamma$（论文记 $u$）</th><th>验证 PPL ↓</th><th>$\text{MaxVio}_{\text{global}}$ ↓</th></tr></thead>
 <tbody>
 <tr><td>加法 + sign（采用）</td><td>0.001</td><td>9.50</td><td>0.044</td></tr>
 <tr><td>加法 + 幅度</td><td>0.01</td><td>9.53</td><td>0.028</td></tr>
@@ -883,13 +883,11 @@ $$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i),\qquad\text{(F4)}$$
 </tbody>
 </table>
 </div>
-<p>幅度版本在 MaxVio 上略优（最低 0.028），但 PPL 不优于 sign 版本（最差 9.53、最佳 9.51 与 sign 持平）。作者认为幅度版本需要再调一个 $\gamma$、收益不明显，故采用更简单的 sign。乘法 bias 变体在 Table 4 单独讨论，性能略差，本表不展开。</p>
+<p>幅度版本在 MaxVio 上略优（最低 0.028），但 PPL 不优于 sign 版本（最差 9.53、最佳 9.51 与 sign 持平）。论文给出的理由是「未带来更好性能」（原文：does not lead to better performance）；幅度版本另需扫描 $\gamma$（Table 3 试了 0.01／0.001／0.0001 三个值）为本页观察，非论文结论。乘法 bias 变体在 Table 4 单独讨论，性能略差，本表不展开。</p>
 </details>
 
 <p><strong>第三，初始化 $b_i=0$，靠训练逐步逼近均衡。</strong> 由于每步只走 $\gamma$，本方法不保证单步完美均衡——它只是在训练过程中把负载逐步往均衡方向推。这是它的边界，下一章会展开。</p>
 
-<details>
-<summary>代码：每步训练结束后的 bias 更新</summary>
 <details class="code-details">
 <summary>代码：Algorithm 1 bias 更新（伪代码）</summary>
 <div class="code-block">
@@ -927,14 +925,14 @@ $$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i),\qquad\text{(F4)}$$
     <p>sign 版本和连续幅度版本各有什么优劣，原始论文最终采用哪个。</p>
     <details>
       <summary>解答：sign 简单纯粹、幅度版 MaxVio 略优；最终用 sign</summary>
-      <p>sign 每步走固定小步、单步稳定、实现更简单，但丢失幅度信息（差 1 个 token 与差 50 个 token 步长相同）；连续幅度版本保留幅度、MaxVio 略优（最低 0.028 对 0.044），但需要再调一个 $\gamma$ 且 perplexity 不优于 sign（9.51/9.53 对 9.50）。原始论文最终采用更简单的 sign 版本。</p>
+      <p>sign 每步走固定小步、单步稳定、实现更简单，但丢失幅度信息（差 1 个 token 与差 50 个 token 步长相同）；连续幅度版本保留幅度、MaxVio 略优（最低 0.028 对 0.044），但论文以「未带来更好性能」为由维持 sign（perplexity 9.51/9.53 对 9.50）。原始论文最终采用更简单的 sign 版本。</p>
     </details>
   </li>
   <li>
     <p>bias 的更新依据是当前序列还是历史 batch 的负载，为什么。</p>
     <details>
       <summary>解答：历史 batch，满足因果约束</summary>
-      <p>依据历史 batch 的负载统计。论文特别强调用上一批的负载更新 bias，避免用到当前序列的 future token 信息（因果约束，arXiv:2408.15664 §3.2）。更新发生在每步训练的反向传播结束之后，独立于梯度。</p>
+      <p>依据历史 batch 的负载统计。论文特别强调用上一批的负载更新 bias，避免用到当前序列的 future token 信息（因果约束，arXiv:2408.15664 §3）。更新发生在每步训练的反向传播结束之后，独立于梯度。</p>
     </details>
   </li>
 </ol>
@@ -1059,11 +1057,11 @@ $$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i),\qquad\text{(F4)}$$
   <li><strong>bias 的作用范围</strong>：bias 仅用于路由选择（top-k 判定），门控权重取原始分数 $s_{i,t}$，不含 bias。</li>
 </ul>
 
-<p>关于 $\gamma$ 调度<sup>[C5, N2]</sup>：训练前 14.3T token 用 $\gamma=0.001$ 让 bias 在大量数据上逐步逼近均衡；最后 500B token 把 $\gamma$ 设为 0 冻结 bias。这一调度反映一个事实——<strong>训练后期路由已基本稳定，继续更新 bias 反而会干扰最后收敛</strong>。$\gamma=0.001$ 这个值在原始 1B / 3B 实验上就被选为最佳（arXiv:2408.15664 §4.3），V3 直接继承。</p>
+<p>关于 $\gamma$ 调度<sup>[N2]</sup>：DeepSeek-V3 报告只给出取值——训练前 14.3T token 用 $\gamma=0.001$，最后 500B token 把 $\gamma$ 设为 0 冻结 bias——未说明理由；一种可能是训练后期路由已趋稳、继续更新会扰动最后收敛（本页推断，非报告结论）。$\gamma=0.001$ 这个值在原始 1B 实验上调参得到最佳 $u=0.001$（arXiv:2408.15664 §4.3 Figure 4），3B 实验直接继承该值（§4.1）<sup>[N4]</sup>。</p>
 
 <p>关于互补损失<sup>[C6, N3, F6]</sup>：aux-loss-free 只看批级 $c_i$，但可能出现"一个序列内每个 token 都激活同一组专家"——批级负载看起来均衡，但序列维度并不均衡。DeepSeek-V3 另加一个 sequence-wise balance loss</p>
 
-$$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T\mathbb{1}(s_{i,t}\in\mathrm{Topk}),\quad P_i=\frac{1}{T}\sum_{t=1}^T s'_{i,t},\qquad\text{(F6)}$$
+$$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T\mathbb{1}(s_{i,t}\in\mathrm{Topk}),\quad P_i=\frac{1}{T}\sum_{t=1}^T s'_{i,t}$$
 
 <p>其中 $T$ 是序列长度，$f_i$ 是序列内专家 $i$ 被选中的频率，$P_i$ 是序列内平均归一化分数，$s'_{i,t}=\frac{s_{i,t}}{\sum_j s_{j,t}}$ 为归一化路由分数（$\sum_j$ 对该序列内全部 routed 专家求和）。$\alpha=0.0001$ 是个小权重——它不是 aux-loss-free 的替代，而是它的补充：aux-loss-free 解决批级，sequence-wise 解决序列内。<strong>本页不展开 F6 的推导</strong>，只点明它解决什么。</p>
 
@@ -1073,7 +1071,7 @@ $$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T
   <li><strong>只解决批级负载均衡</strong>。序列内均衡由 sequence-wise loss 处理；二者各管一摊。</li>
   <li><strong>不保证单步完美均衡</strong>。sign 走固定小步 $\gamma=0.001$，需要训练步数积累才能逼近均衡。上一章的手算例子已经显示单步 bias 调整通常不足以改变选择。</li>
   <li><strong>bias 仅用于路由选择，不进入门控权重</strong>。报告强调 bias 只影响 top-k 选择，门控权重取原始分数 $s_{i,t}$ 不含 bias（DeepSeek-V3 报告 §2.1.2）。</li>
-  <li><strong>专家数极多时 sign 收敛过慢</strong>。Kimi K3 把 routed expert 池扩大到 896（top-16）后，sign 丢失幅度信息的缺陷被放大：差 1 个 token 和差 100 个 token 走相同步长，部分专家长期训练不足。Kimi K3 用 <strong>Quantile Balancing</strong> 替代 sign——它从一次前向的路由分数分位数直接算出下一个 bias，仍属 aux-loss-free 家族（不引入损失项），只换 bias 的更新规则。详见 <a href="../quantile-balancing/index.html">Quantile Balancing</a>。</li>
+  <li><strong>专家数极多时 sign 收敛过慢</strong>。Kimi K3 把 routed expert 池扩大到 896（top-16）后，sign 丢失幅度信息的缺陷被放大：差 1 个 token 和差 100 个 token 走相同步长，部分专家长期训练不足。Kimi K3 用 <strong>Quantile Balancing</strong> 替代 sign——它从一次前向的路由分数分位数直接算出下一个 bias，仍属 aux-loss-free 家族（不引入损失项），只换 bias 的更新规则<sup>[C7]</sup>。详见 <a href="../quantile-balancing/index.html">Quantile Balancing</a>。</li>
 </ul>
 
 <h3 id="s5-questions">本章问题</h3>
@@ -1081,8 +1079,8 @@ $$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T
   <li>
     <p>用一句话说明为什么最后 500B token 要把 $\gamma$ 设为 0。</p>
     <details>
-      <summary>解答：训练后期路由已稳定，冻结利于收敛</summary>
-      <p>训练后期路由已基本稳定，继续更新 bias 反而会扰动最后阶段的收敛；把 $\gamma$ 设为 0 冻结 bias，让模型在固定路由规则下完成最终收敛。</p>
+      <summary>解答：报告未给理由；冻结利于末段收敛为本页推断</summary>
+      <p>DeepSeek-V3 报告只给出取值（最后 500B token 设 $\gamma=0$），未说明理由。一种推断是：训练后期路由已基本稳定，继续更新 bias 会扰动最后收敛；冻结 bias 让模型在固定路由规则下完成最终收敛（本页推断，非报告结论）。</p>
     </details>
   </li>
   <li>
@@ -1096,7 +1094,7 @@ $$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T
     <p>Kimi K3 为什么要把 sign 换成 Quantile Balancing，sign 在 896 专家时失效的具体原因是什么。</p>
     <details>
       <summary>解答：固定步长在近千专家下收敛过慢</summary>
-      <p>专家池扩到 896（top-16）后，sign 丢失幅度信息的缺陷被放大：差 1 个 token 和差 100 个 token 走相同步长，偏差大的专家无法更快回正，部分专家长期训练不足。Quantile Balancing 从一次前向的路由分数分位数直接算出下一个 bias，仍不引入损失项（属 aux-loss-free 家族），只换 bias 的更新规则。</p>
+      <p>专家池扩到 896（top-16）后，sign 丢失幅度信息的缺陷被放大：差 1 个 token 和差 100 个 token 走相同步长，偏差大的专家无法更快回正，部分专家长期训练不足。Quantile Balancing 从一次前向的路由分数分位数直接算出下一个 bias，仍不引入损失项（属 aux-loss-free 家族），只换 bias 的更新规则<sup>[C7]</sup>。</p>
     </details>
   </li>
 </ol>
@@ -1108,19 +1106,20 @@ $$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T
 <h3>论断与来源（C）</h3>
 <ul>
   <li>C1（路由坍塌）：arXiv:2408.15664 §1，引用 Shazeer et al. 2017（Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer）。</li>
-  <li>C2（辅助损失方案两难）：arXiv:2408.15664 §1、Table 2（baseline $\alpha=0.001$ 的对照）。</li>
-  <li>C3（bias 只做选择不进权重）：DeepSeek-V3 报告 §2.1.2 Eq.16；arXiv:2408.15664 §3.1 Eq.1-2。</li>
-  <li>C4（sign 规则式更新）：arXiv:2408.15664 Algorithm 1、§3.2；DeepSeek-V3 报告 §2.1.2 文字描述。</li>
+  <li>C2（辅助损失方案两难）：arXiv:2408.15664 §1、§4.1 Baseline（$\alpha=0.001$）、§4.2 Table 2（对照数值）。</li>
+  <li>C3（bias 只做选择不进权重）：DeepSeek-V3 报告 §2.1.2 Eq.16 与「Note that the bias term is only used for routing. The gating value, which will be multiplied with the FFN output, is still derived from the original affinity score $s_{i,t}$.」；arXiv:2408.15664 §3 Eq.3。</li>
+  <li>C4（sign 规则式更新）：arXiv:2408.15664 Algorithm 1、§3；DeepSeek-V3 报告 §2.1.2 文字描述。</li>
   <li>C5（sign 与变体对比、采用 sign 的理由）：arXiv:2408.15664 Table 3、§4.3。</li>
   <li>C6（互补 sequence-wise loss）：DeepSeek-V3 报告 §2.1.2 Eq.17。</li>
+  <li>C7（Kimi K3 的 896 专家与 Quantile Balancing）：Kimi K3 Technical Report §2.3.3（Eq.13–14）；HuggingFace <code>moonshotai/Kimi-K3/config.json</code>（<code>num_experts: 896</code>、<code>num_experts_per_token: 16</code>）。Kimi K3 以 Quantile Balancing 替代固定步长 sign 更新 bias，仍不引入损失项。详见 <a href="../quantile-balancing/index.html">Quantile Balancing</a>。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
 <ul>
   <li>F1（$s_{i,t}=\sigma(u_t^\top e_i)$）：DeepSeek-V3 报告 §2.1.2 Eq.15。原始论文记为 $s_{i,t}=G(u_t^\top e_i)$，$G$ 为非线性门控；DeepSeek-V3 上线版本用 sigmoid。</li>
-  <li>F2（$g'_{i,t}$ 选择规则）：DeepSeek-V3 报告 §2.1.2 Eq.16；原始论文 Eq.1-2。</li>
+  <li>F2（$g'_{i,t}$ 选择规则）：DeepSeek-V3 报告 §2.1.2 Eq.16；原始论文 §3 Eq.3。</li>
   <li>F3（$g_{i,t}$ 归一化）：DeepSeek-V3 报告 §2.1 Eq.13（DeepSeekMoE 基本结构）。</li>
-  <li>F4（$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i)$）：原始论文 Algorithm 1 与 §3.2；DeepSeek-V3 报告 §2.1.2 文字描述（"decrease by $\gamma$ if overloaded, increase by $\gamma$ if underloaded"）。本文统一用 $c_i$、$\bar c_i$、$\gamma$ 与原始论文符号一致；原始论文记步长为 $u$（bias update rate），DeepSeek-V3 报告统一记为 $\gamma$（bias update speed）；DeepSeek-V3 报告里把负载写为 $\mathrm{Load}_i$。</li>
+  <li>F4（$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i)$）：原始论文 Algorithm 1 与 §3；DeepSeek-V3 报告 §2.1.2 文字描述（"decrease by $\gamma$ if overloaded, increase by $\gamma$ if underloaded"）。本文统一用 $c_i$、$\bar c_i$、$\gamma$ 与原始论文符号一致；原始论文记步长为 $u$（bias update rate），DeepSeek-V3 报告统一记为 $\gamma$（bias update speed）；DeepSeek-V3 报告里把负载写为 $\mathrm{Load}_i$。</li>
   <li>F5（$h_t'$ MoE 层输出）：DeepSeek-V3 报告 §2.1 Eq.12（DeepSeekMoE 基本结构）。</li>
   <li>F6（$L_{Bal}$）：DeepSeek-V3 报告 §2.1.2 Eq.17。</li>
 </ul>
@@ -1149,10 +1148,10 @@ $$L_{Bal}=\alpha\sum_{i=1}^{N_r}f_i P_i,\qquad f_i=\frac{N_r}{K_r T}\sum_{t=1}^T
   <li>把专家数设为 4、top-k 设为 2、batch 设为 4 token。可推出：F2/F3/F4 的逐步手算。不可推出：真实 256 选 8 规模下的数值行为。</li>
   <li>F6 只点出公式不展开推导。可推出：aux-loss-free 与 sequence-wise loss 是互补但独立的两件事。不可推出：F6 的完整推导与各项符号的精确含义。</li>
   <li>bias 更新那章的变体实验对照只列 Table 3 关键数据。可推出：sign 与幅度版本的性能对比结论。不可推出：Table 3 的其他实验设置细节。</li>
-  <li>配置章中 Kimi K3 的 Quantile Balancing 只引用对比。可推出：sign 在 896 专家时失效、需换更新规则。不可推出：Quantile Balancing 的完整推导。</li>
+  <li>配置章中 Kimi K3 的 Quantile Balancing 只引用对比。可推出：sign 在 896 专家时失效、需换更新规则<sup>[C7]</sup>。不可推出：Quantile Balancing 的完整推导。</li>
 </ul>
 
-<p>回到开篇的五个问题。负载均衡是 MoE 训练的正反馈陷阱，传统辅助损失用 $\alpha$ 调梯度、两难。bias 加在路由分数上只管选谁、不进门控权重，因而不产生干扰梯度。训练时用 sign 走固定小步，单步稳定但丢幅度信息。4 专家 top-2 的手算例子验证了 sign 的慢速特征。DeepSeek-V3 用 $\gamma=0.001$ 训练 14.3T token 后冻结 bias，另加 sequence-wise loss 补序列内均衡；Kimi K3 在 896 专家规模改用 Quantile Balancing。这就是辅助损失无关路由的全貌。</p>
+<p>回到开篇的五个问题。负载均衡是 MoE 训练的正反馈陷阱，传统辅助损失用 $\alpha$ 调梯度、两难。bias 加在路由分数上只管选谁、不进门控权重，因而不产生干扰梯度。训练时用 sign 走固定小步，单步稳定但丢幅度信息。4 专家 top-2 的手算例子验证了 sign 的慢速特征。DeepSeek-V3 用 $\gamma=0.001$ 训练 14.3T token 后冻结 bias，另加 sequence-wise loss 补序列内均衡；Kimi K3 在 896 专家规模改用 Quantile Balancing<sup>[C7]</sup>。这就是辅助损失无关路由的全貌。</p>
 
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

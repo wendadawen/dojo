@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="把每个专家分成 m 个小专家（组合更灵活）+ 共享专家隔离（承载通用能力）。K3 的 Stable LatentMoE 继承 shared+routed 组织。基于 Dai 2024 论文核对。">
-  <meta name="dojo:summary" content="把每个专家拆成多个小专家以增加组合灵活性，再用共享专家承载通用能力、隔离路由专家。K3 的 Stable LatentMoE 延续了 shared + routed 的组织方式。">
+  <meta name="description" content="把每个专家分成更小的多个小专家（组合更灵活）+ 共享专家隔离（承载通用能力）。Stable LatentMoE 继承 shared+routed 组织。基于 Dai 2024 论文核对。">
+  <meta name="dojo:summary" content="把每个专家拆成多个小专家以增加组合灵活性，再用共享专家承载通用能力、隔离路由专家。Stable LatentMoE 延续了 shared + routed 的组织方式。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="模型结构">
   <meta name="dojo:tag" content="MoE 架构">
@@ -701,7 +701,7 @@
 
 <p>一个 MoE 层有 16 个专家、每 token 选 2 个，能组合出 120 种搭配；把每个专家切成 4 份、变成 64 个小专家、每 token 选 8 个，组合数跳到 44 亿种——而每个 token 的计算量一分没涨。这是怎么做到的，又为什么有用？</p>
 
-<p>本页讲清 DeepSeekMoE 的两项策略——<strong>细粒度专家分割</strong>（每个专家切 m 份、激活数也 ×m，计算量守恒但组合更灵活）与<strong>共享专家隔离</strong>（$K_s$ 个对所有 token 恒激活的专家承载通用知识，路由专家不再重复学），它们要解决传统 top-K MoE 的两个毛病：<strong>知识混合</strong>与<strong>知识冗余</strong>。三架构（标准 top-K、细粒度、完整 DeepSeekMoE）的专家参数与每 token 计算成本保持恒定。读者应已了解 top-K MoE 基本概念（router、top-k、专家加权和），否则先读《<a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>》。本页不讲服务部署、负载均衡损失完整推导与 DeepSeek-V3 路由打分细节；它是 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 等后续架构的源头之一。</p>
+<p>本页讲清 DeepSeekMoE 的两项策略——<strong>细粒度专家分割</strong>（每个专家切 $m$ 份、激活数也增至 $m$ 倍，计算量守恒但组合更灵活）与<strong>共享专家隔离</strong>（$K_s$ 个对所有 token 恒激活的专家承载通用知识，路由专家不再重复学），它们要解决传统 top-K MoE 的两个毛病：<strong>知识混合</strong>与<strong>知识冗余</strong>。三架构（标准 top-K、细粒度、完整 DeepSeekMoE）的专家参数与每 token 计算成本保持恒定。读者应已了解 top-K MoE 基本概念（router、top-k、专家加权和），否则先读《<a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>》。本页不讲服务部署、负载均衡损失完整推导与 DeepSeek-V3 路由打分细节；它是 <a href="../stable-latent-moe/index.html">Stable LatentMoE</a> 等后续架构的源头之一。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -731,7 +731,7 @@
       <p>在相同计算预算下，DeepSeekMoE 相对 GShard 的性能优势体现在哪些数字上？</p>
       <details>
         <summary>解答：三组规模实验均为"更少计算、性能相当"</summary>
-        <p>前提是三架构（标准 top-K、细粒度分割、完整 DeepSeekMoE）专家参数与计算成本恒定。2B 实验：DeepSeekMoE 2B（2.0B 总参/0.3B 激活）与计算多 1.5× 的 GShard 2.9B 性能相当（Pile Loss 均 1.808），仅用对手约 2/3 的计算；16B 实验以约 39.6% 的计算与 LLaMA2 7B 性能相当；145B 实验以约 28.5%（可能 18.2%）的计算与 DeepSeek 67B 性能相当。数字与实验条件见「相同算力下真的更好」一章。</p>
+        <p>前提是三架构（标准 top-K、细粒度分割、完整 DeepSeekMoE）专家参数与计算成本恒定。2B 实验：DeepSeekMoE 2B（2.0B 总参/0.3B 激活）与计算量多 1.5 倍的 GShard 2.9B 性能相当（Pile Loss 均 1.808），仅用对手约 2/3 的计算；16B 实验以约 39.6% 的计算与 LLaMA2 7B 性能相当；145B 实验以约 28.5%（可能 18.2%）的计算与 DeepSeek 67B 性能相当。数字与实验条件见「相同算力下真的更好」一章。</p>
       </details>
     </li>
   </ol>
@@ -739,7 +739,7 @@
 
 <h2 id="s1-two-flaws">1. 传统 MoE 的两个毛病——知识混合与知识冗余</h2>
 
-<p>DeepSeekMoE 要改进的对象是 top-K MoE。它的基本结构是：一层里放 $N$ 个专家（每个是一个小 FFN），每来一个 token，router 给所有专家打分，只让得分最高的 $K$ 个专家真正计算，最后按权重加起来（见<a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>的公式 $y(x)=\sum_{i\in S_k} g_i\,E_i(x)$）。DeepSeekMoE 论文指出，这种做法在专家数量有限时有两个毛病。</p>
+<p>DeepSeekMoE 要改进的对象是 top-K MoE。它的基本结构是：一层里放 $N$ 个专家（每个是一个小 FFN），每来一个 token，router 给所有专家打分，只让得分最高的 $K$ 个专家真正计算，最后按权重加起来（见<a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>的公式 $y(x)=\sum_{i\in S_k} g_i\,E_i(x)$）<sup>[F1, F2]</sup>。DeepSeekMoE 论文指出，这种做法在专家数量有限时有两个毛病。</p>
 
 <p><strong>毛病一：知识混合（knowledge hybridity）。</strong> 专家数量有限，分配给某个专家的 token 会涵盖多种不同的知识。于是这个专家被迫把截然不同的知识塞进同一份参数，而这些知识很难被同时利用<sup>[C2]</sup>。</p>
 
@@ -814,7 +814,7 @@
 
 <p>组合数从 4 涨到 28：分割前一个 token 只能从 4 种"选哪个专家"里挑，分割后能从 28 种"选哪两个小专家"里挑。组合更灵活，意味着 token 可以从更多更专注的小专家那里各取所需，而不是被迫塞进一个大而杂的专家——这正是缓解知识混合的机制。</p>
 
-<p>论文的真实数字更夸张<sup>[N8]</sup>：$N=16, K=2, m=4$ 时，组合数从 $\binom{16}{2}=120$ 涨到 $\binom{64}{8}=4{,}426{,}165{,}368$（约 44 亿种）。</p>
+<p>论文的真实数字更夸张<sup>[C5, N8]</sup>：$N=16, K=2, m=4$ 时，组合数从 $\binom{16}{2}=120$ 涨到 $\binom{64}{8}=4{,}426{,}165{,}368$（约 44 亿种）。</p>
 
 <details class="code-details">
 <summary>代码：验证组合数变化与计算量守恒（构造示例 + 论文例子）</summary>
@@ -889,8 +889,8 @@ print(f"计算量守恒: {f}==1.0 -> {f == 1.0}")</code></pre>
 计算量守恒: 1.0==1.0 -> True</code></pre>
 </div>
 <p><b>验证的机制</b>：<code>segment</code> 对应正文细粒度分割公式 F3/F4，<code>params_after = mN*(1/m)</code> 和 <code>flops_after = mK*(1/m)</code> 正是计算量守恒 F7 的代入；<code>math.comb</code> 对应组合数 C(mN,mK)。</p>
-<p><b>观察重点</b>：两个例子下参数量和每 token 计算量在分割前后都严格相等（守恒为 True），而组合数分别从 4→28、120→44 亿——"不涨计算量、组合更灵活"同时成立。</p>
-<p><b>教学简化</b>：代码只数参数与计算量的"单位"，不涉及真实 FFN 矩阵乘法；<code>1.0</code> 单位代表原 FFN 大小，真实参数量取决于隐藏维度 $d$ 与 $d_{ff}$。组合数假设 router 无约束地选任意 mK 个，实际还受负载均衡影响。</p>
+<p><b>观察重点</b>：两个例子下参数量和每 token 计算量在分割前后都严格相等（守恒为 True），而组合数分别从 4 增到 28、从 120 增到约 44 亿——"不涨计算量、组合更灵活"同时成立。</p>
+<p><b>教学简化</b>：代码只数参数与计算量的"单位"，不涉及真实 FFN 矩阵乘法；<code>1.0</code> 单位代表原 FFN 大小，真实参数量取决于隐藏维度 $d$ 与 $d_{ff}$。组合数假设 router 无约束地选任意 $mK$ 个，实际还受负载均衡影响。</p>
 </details>
 
 <h3 id="s2-questions">本章问题</h3>
@@ -941,18 +941,18 @@ print(f"计算量守恒: {f}==1.0 -> {f == 1.0}")</code></pre>
   <div class="fd-row">
     <span class="fd-box">token $u_t^l$</span>
   </div>
-  <div class="fd-arrow">↓ 分两路</div>
+  <div class="fd-arrow">$\downarrow$ 分两路</div>
   <div class="fd-row">
     <div class="fd-col">
       <span class="fd-box">共享专家 1<br>恒激活，无门控</span>
     </div>
     <div class="fd-col">
       <span class="fd-box">router 给 7 个路由专家打分<br>选 top-$(mK-K_s)$，即 top-1</span>
-      <div class="fd-arrow">↓</div>
+      <div class="fd-arrow">$\downarrow$</div>
       <span class="fd-box">被选中的 1 个路由专家</span>
     </div>
   </div>
-  <div class="fd-arrow">↓ 两路汇合</div>
+  <div class="fd-arrow">$\downarrow$ 两路汇合</div>
   <div class="fd-row">
     <span class="fd-box">共享输出 + 路由输出 + 残差 $u_t^l\;=\;h_t^l$</span>
   </div>
@@ -1006,14 +1006,14 @@ print(f"计算量守恒: {f}==1.0 -> {f == 1.0}")</code></pre>
 <table>
 <thead><tr><th>对比</th><th>DeepSeekMoE</th><th>对手</th><th>计算比例</th><th>性能结论</th></tr></thead>
 <tbody>
-<tr><td>2B 实验</td><td>DeepSeekMoE 2B（2.0B 总参/0.3B 激活）</td><td>GShard 2.9B（2.9B 总参/0.35B 激活，1.5× 专家参数与计算）</td><td>DeepSeekMoE 仅用对手约 2/3 的计算</td><td>性能相当（Pile Loss 均 1.808）</td></tr>
+<tr><td>2B 实验</td><td>DeepSeekMoE 2B（2.0B 总参/0.3B 激活）</td><td>GShard 2.9B（专家参数 2.83B/激活 0.35B，1.5 倍专家参数与计算）</td><td>DeepSeekMoE 仅用对手约 2/3 的计算</td><td>性能相当（Pile Loss 均 1.808）</td></tr>
 <tr><td>16B 实验</td><td>DeepSeekMoE 16B（16.4B 总参/2.8B 激活）</td><td>LLaMA2 7B（6.7B 全稠密）</td><td>DeepSeekMoE 约 39.6%（74.4T vs 187.9T FLOPs/4K tokens）</td><td>性能相当</td></tr>
 <tr><td>145B 实验</td><td>DeepSeekMoE 145B</td><td>DeepSeek 67B（全稠密）</td><td>约 28.5%（可能低至 18.2%）</td><td>性能相当</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>2B 实验还多一层意义<sup>[N2]</sup>：DeepSeekMoE 2B 不仅打赢了计算更贵的 GShard 2.9B，还接近了同总参数的稠密模型（Dense×16）的性能——而稠密模型是 MoE 模型的理论上界（每个 token 用全部参数，计算量最大）。这意味着 DeepSeekMoE 几乎榨干了 MoE 架构的潜力。16B 实验还有个部署红利<sup>[N6]</sup>：它能在 40GB 显存的单 GPU 上部署，推理速度约为 7B 稠密模型的 2.5 倍。</p>
+<p>2B 实验还多一层意义<sup>[N2]</sup>：DeepSeekMoE 2B 与计算更贵的 GShard 2.9B 性能相当（Pile Loss 均 1.808），还接近了同总参数的稠密模型（Dense$\times$16）的性能——而稠密模型是 MoE 模型的理论上界（每个 token 用全部参数，计算量最大）。这意味着 DeepSeekMoE 已接近 MoE 架构在模型容量上的上界。16B 实验还有个部署红利<sup>[N6]</sup>：它能在 40GB 显存的单 GPU 上部署，推理速度约为 7B 稠密模型的 2.5 倍。</p>
 
 <div class="callout callout-yellow">
 <p><b>注意边界：</b>性能结论依赖论文的实验配置（2B/16B/145B，特定训练数据量与超参），不可外推到任意规模。"组合数变多"是机制层面的潜力，性能提升需要这组实验来验证，不能单从机制直接断言。</p>
@@ -1025,7 +1025,7 @@ print(f"计算量守恒: {f}==1.0 -> {f == 1.0}")</code></pre>
     <p>说出三组对比各自的"谁 vs 谁、计算比例、性能结论"。</p>
     <details>
       <summary>解答：2B/16B/145B 三组均为更少计算、性能相当</summary>
-      <p>2B：DeepSeekMoE 2B（2.0B 总参/0.3B 激活）vs GShard 2.9B（1.5× 专家参数与计算），DeepSeekMoE 仅用对手约 2/3 计算，性能相当（Pile Loss 均 1.808）。16B：DeepSeekMoE 16B vs LLaMA2 7B，约 39.6% 计算（74.4T vs 187.9T FLOPs/4K tokens），性能相当。145B：DeepSeekMoE 145B vs DeepSeek 67B 稠密，约 28.5%（可能 18.2%）计算，性能相当。</p>
+      <p>2B：DeepSeekMoE 2B（2.0B 总参/0.3B 激活）vs GShard 2.9B（1.5 倍专家参数与计算），DeepSeekMoE 仅用对手约 2/3 计算，性能相当（Pile Loss 均 1.808）。16B：DeepSeekMoE 16B vs LLaMA2 7B，约 39.6% 计算（74.4T vs 187.9T FLOPs/4K tokens），性能相当。145B：DeepSeekMoE 145B vs DeepSeek 67B 稠密，约 28.5%（可能 18.2%）计算，性能相当。</p>
     </details>
   </li>
   <li>
@@ -1077,23 +1077,23 @@ print(f"计算量守恒: {f}==1.0 -> {f == 1.0}")</code></pre>
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（传统 top-K MoE 存在知识混合与知识冗余，妨碍专家专门化；专门化 = non-overlapping and focused knowledge）：Dai et al. 2024 §1 引言与摘要，arXiv:2401.06066。C2（知识混合成因：专家少→token 涵盖多种知识→专家塞杂）：§1。C3（知识冗余成因：不同专家各自学通用知识）：§1。C4（细粒度专家分割：中间维度 1/m、mN 专家、mK 激活、参数与计算守恒）：§3.1，Figure 2(b)。C5（组合数 C(N,K)→C(mN,mK)；16/2/4 例子 120→4,426,165,368）：§3.1 正文。C6（共享专家隔离：K_s 恒激活、不路由、路由专家与激活各减 K_s）：§3.2，Figure 2(c)。C7（三架构专家参数与计算成本恒定）：Figure 2 caption；§3.1（"while maintaining a consistent number of expert parameters and computational cost"）；§3.2（"In order to maintain a constant computational cost, the number of activated experts among the other routed experts will be decreased by K_s"）。C8（DeepSeek-V3 继承 shared+routed 组织但改路由为 sigmoid + 偏置、aux-loss-free 均衡）：DeepSeekMoE §2–§3（softmax 亲和度 Eq.5/8/11）；DeepSeek-V3 Technical Report arXiv:2412.19437 §2.1.2。</p>
+<p>C1（传统 top-K MoE 存在知识混合与知识冗余，妨碍专家专门化；专门化 = non-overlapping and focused knowledge）：Dai et al. 2024 §1 引言与摘要，arXiv:2401.06066。C2（知识混合成因：专家少，token 涵盖多种知识，专家塞杂）：§1。C3（知识冗余成因：不同专家各自学通用知识）：§1。C4（细粒度专家分割：中间维度 1/m、mN 专家、mK 激活、参数与计算守恒）：§3.1，Figure 2(b)。C5（组合数从 C(N,K) 增到 C(mN,mK)；16/2/4 例子从 120 增到 4,426,165,368）：§3.1 正文。C6（共享专家隔离：K_s 恒激活、不路由、路由专家与激活各减 K_s）：§3.2，Figure 2(c)。C7（三架构专家参数与计算成本恒定）：Figure 2 caption；§3.1（"while maintaining a consistent number of expert parameters and computational cost"）；§3.2（"In order to maintain a constant computational cost, the number of activated experts among the other routed experts will be decreased by K_s"）。C8（DeepSeek-V3 继承 shared+routed 组织但改路由为 sigmoid + 偏置、aux-loss-free 均衡）：DeepSeekMoE §2–§3（softmax 亲和度 Eq.5/8/11）；DeepSeek-V3 Technical Report arXiv:2412.19437 §2.1.2（sigmoid 亲和度、偏置项、aux-loss-free 均衡）、§4.2（1 共享 + 256 路由、激活 8）。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1（通用 top-K MoE 层 $h = \sum g\cdot\operatorname{FFN} + u$）：论文 Eq.(3)。F2（通用门控 $g = s$ 若在 TopK 内否则 $0$；$s = \operatorname{Softmax}(u^T e)$）：Eq.(4)(5)。F3（细粒度 MoE 层 $h = \sum_{1..mN} g\cdot\operatorname{FFN} + u$）：Eq.(6)。F4（细粒度门控，TopK 范围 $1..mN$、选 $mK$）：Eq.(7)(8)。F5（完整 DeepSeekMoE 层 $h = \sum_{1..K_s} \operatorname{FFN} + \sum_{K_s+1..mN} g\cdot\operatorname{FFN} + u$）：Eq.(9)。F6（完整门控，TopK 范围 $K_s{+}1..mN$、选 $mK-K_s$）：Eq.(10)(11)。F7（计算量守恒推导：$mK\cdot(1/m) = K$；$K_s\cdot(1/m) + (mK-K_s)\cdot(1/m) = K$）：由 C7 与 F3/F5 直接推出，论文 §3.1/§3.2 的守恒声明是其依据。FFN 参数量正比于中间隐藏维度：由标准 FFN 结构（两个矩阵，参数 $\approx 2\cdot d\cdot d_{ff}$）直接推出，前置页第 1 章已述。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>N1（DeepSeekMoE 2B vs GShard 2.9B，1.5× 专家参数与计算，性能相当；Pile Loss 均 1.808）：摘要；§4.3；Table 2。N2（DeepSeekMoE 2B 接近 Dense×16 上界）：§4.3。N3（2B 配置：9 层，隐藏维度 1280，1 shared + 63 routed，每专家 0.25× 标准 FFN 即 m=4，激活 1+7=8，总参 2.0B/激活 0.3B）：§4.1.3。N4（DeepSeekMoE 16B vs LLaMA2 7B，39.6% 计算 74.4T vs 187.9T FLOPs/4K tokens，性能相当）：摘要；§5.2.2；Table 4。N5（16B 配置：28 层，隐藏维度 2048，2 shared + 64 routed，每专家 0.25× 即 m=4，激活 2+6=8，总参 16.4B/激活 2.8B，训练 2T tokens）：§5.1.2。N6（16B 可在 40GB 显存单卡部署，推理约 2.5× 7B 稠密速度）：§5.2.1。N7（DeepSeekMoE 145B vs DeepSeek 67B，28.5% 可能 18.2% 计算，性能相当）：摘要；§7（preliminary effort）。N8（组合数 120→4,426,165,368）：§3.1 正文。</p>
+<p>N1（DeepSeekMoE 2B vs GShard 2.9B，1.5 倍专家参数与计算，性能相当；Pile Loss 均 1.808）：摘要；§4.3；Table 2。N2（DeepSeekMoE 2B 接近 Dense$\times$16 上界）：§4.3。N3（2B 配置：9 层，隐藏维度 1280，1 shared + 63 routed，每专家 0.25 倍标准 FFN 即 m=4，激活 1+7=8，总参 2.0B/激活 0.3B）：§4.1.3、§4.2、§4.5；Table 1、Table 2。N4（DeepSeekMoE 16B vs LLaMA2 7B，39.6% 计算 74.4T vs 187.9T FLOPs/4K tokens，性能相当）：摘要；§5.2.2；Table 4。N5（16B 配置：28 层，隐藏维度 2048，2 shared + 64 routed，每专家 0.25 倍即 m=4，激活 2+6=8，总参 16.4B/激活 2.8B，训练 2T tokens）：§5.1.2。N6（16B 可在 40GB 显存单卡部署，推理约 2.5 倍 7B 稠密速度）：§5.2.1。N7（DeepSeekMoE 145B vs DeepSeek 67B，28.5% 可能 18.2% 计算，性能相当）：摘要；§7（preliminary effort）。N8（组合数从 120 增到 4,426,165,368）：§3.1 正文。</p>
 
 <h3>构造示例</h3>
-<p>E1（传统 MoE 的两个毛病章，8 专家 top-2 中某专家收代码+散文的 token）：构造数字，展示知识混合，不代表真实路由分布。E2（细粒度专家分割章，4 专家 top-1、$m=2$ → 8 小专家 top-2）：构造数字，便于手算参数量/计算量/组合数；配套可运行代码已实际执行，输出与页面一致。E3（共享专家隔离章，在 E2 基础上加 $K_s=1$）：构造数字，展示共享专家引入后路由专家数、激活数、参数量、计算量的连带变化。论文真实配置（2B 的 1+63、16B 的 2+64）作为对照，非构造示例。</p>
+<p>E1（传统 MoE 的两个毛病章，8 专家 top-2 中某专家收代码+散文的 token）：构造数字，展示知识混合，不代表真实路由分布。E2（细粒度专家分割章，4 专家 top-1、$m=2$ 变 8 小专家 top-2）：构造数字，便于手算参数量/计算量/组合数；配套可运行代码已实际执行，输出与页面一致。E3（共享专家隔离章，在 E2 基础上加 $K_s=1$）：构造数字，展示共享专家引入后路由专家数、激活数、参数量、计算量的连带变化。论文真实配置（2B 的 1+63、16B 的 2+64）作为对照，非构造示例。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>"把通用知识拎出来"只描述共享专家承载通用知识这一职能，不断言通用知识具体是哪些内容。"基本语法/常见搭配"仅作为冗余的直观例子，不作为对通用知识范围的穷举。共享专家"恒激活"指门控值恒为 1、不参与 router 打分，不意味其参数不更新——训练时共享专家参数与其他参数一起更新。</p>
 
 <h3>简化条件及其限制</h3>
 <p>（1）FFN 参数量用"1 单位 = 原 FFN 大小"度量。可推出：参数量与计算量的守恒关系（$mN \times 1/m = N$，$mK \times 1/m = K$）。不可推出：真实参数量数值（取决于隐藏维度 $d$ 与 $d_{ff}$，前置页给出 $2\cdot d\cdot d_{ff}$ 近似）；"中间维度 $1/m$"假设 $d_{ff}$ 能被 $m$ 整除，真实工程有取整处理。</p>
-<p>（2）组合数 $\binom{mN}{mK}$ 假设 router 无约束地选任意 $mK$ 个。可推出：组合潜力的量级变化（如 120 → 44 亿）。不可推出：真实可达组合数（实际还受负载均衡损失约束，论文 §3.3），也不等于"每次训练都用满"。</p>
+<p>（2）组合数 $\binom{mN}{mK}$ 假设 router 无约束地选任意 $mK$ 个。可推出：组合潜力的量级变化（如从 120 增到约 44 亿）。不可推出：真实可达组合数（实际还受负载均衡损失约束，论文 §3.3），也不等于"每次训练都用满"。</p>
 <p>（3）负载均衡损失 $L_{\text{ExpBal}}$/$L_{\text{DevBal}}$ 的完整公式不展开，仅在共享专家隔离章折叠块点一句。可推出：两策略本身的机制。不可推出：训练稳定性的完整分析（负载均衡如何影响路由收敛）。</p>
 <p>（4）DeepSeek-V3 的 sigmoid + 偏置路由与 aux-loss-free 均衡只点明差异，不展开公式。可推出：DeepSeekMoE 与 DeepSeek-V3 在路由打分上的差异。不可推出：DeepSeek-V3 路由的工程细节（见 DeepSeek-V3 技术报告 §2.1.2 与前置页）。</p>
 <p>（5）性能结论依赖论文实验配置（2B/16B/145B，特定训练数据量）。可推出：在这三组实验配置下，DeepSeekMoE 相对 GShard/LLaMA2/DeepSeek 稠密模型的性能优势。不可推出：任意规模下的性能（145B 为 preliminary effort，不可外推）。</p>

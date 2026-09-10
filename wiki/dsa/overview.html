@@ -54,13 +54,13 @@
       <li>稠密注意力要求每个查询与全部在前位置比对一次，配对数随序列长度平方增长。128K 上下文下这成为主要成本。</li>
       <li>生成阶段每产出一个 token 都要把整个 KV cache 读一遍，瓶颈往往在数据搬运而非算力。</li>
       <li>滑动窗口这类固定模式稀疏虽然便宜，但窗口外的信息被彻底丢弃，关键信息在远处时失效。</li>
-      <li><a href="../linear-attention/index.html">线性注意力</a>换掉了注意力的形式、用固定大小状态替代 KV cache，代价是精确检索能力，属于另一条路线。</li>
+      <li><a href="../linear-attention/index.html">线性注意力</a>换掉了注意力的形式、用固定大小状态替代 KV cache，代价是精确检索能力（这一比较是本页据其机制推出的），属于另一条路线。</li>
     </ul>
 
     <h2>核心直觉</h2>
     <ul>
       <li><b>打分与读取分离。</b>lightning indexer 只负责给出"谁比谁更值得读"的排序，不参与最终输出的加权。排序对数值误差的容忍度远高于加权求和，因此打分器可以做得比主注意力粗糙得多——头数少（64 对 128）、每头维度低、用 ReLU 而非 softmax、可在 <a href="../quantization-basics/index.html">FP8</a> 下计算，且每对 token 只产出一个标量分数、不需要再去加权聚合 value。</li>
-      <li><b>选择由内容决定，不由位置决定。</b>被选中的可以是很远的位置，这是 DSA 与滑动窗口的分界线。选中的位置照旧做完整的 softmax 注意力，因此精确检索能力保留。</li>
+      <li><b>选择由内容决定，不由位置决定。</b>被选中的可以是很远的位置，这是 DSA 与滑动窗口的分界线。选中的位置照旧按完整的 softmax 注意力计算（这一点可从机制直接核对）。</li>
       <li><b>所有注意力头读同一批位置。</b>候选集跨 query 头共享，原因是 kernel 效率：每个 key-value 条目必须被多个 query 共享，逐头独立选择会产生多套不规则访存模式。DSA 因此实例化在 <a href="../mla/index.html">MLA</a> 的 <a href="../mqa-gqa/index.html">MQA</a> 模式上。</li>
       <li><b>打分能力是训出来的，不是装上去的。</b>indexer 是新增参数模块，随机初始化时打分无意义。DeepSeek 用两阶段续训：先保持稠密注意力、冻结其他参数，让 indexer 用 KL 散度去拟合主注意力的分布（2.1B token）；再引入 top-k、放开全部参数做稀疏训练（943.7B token）。</li>
       <li><b>省的是计算，不是显存。</b>每个查询选中的位置各不相同，后续 token 可能选到任何历史位置，因此全部 KV 条目仍须保留；indexer 还额外需要自己的一份 key cache。</li>
@@ -71,7 +71,7 @@
       <li><b>主注意力从 $O(L^2)$ 降到 $O(Lk)$，但整体不是线性。</b>lightning indexer 仍要扫过全部历史位置，复杂度依旧是 $O(L^2)$。论文的论证是 indexer 的单价远低于 V3.1-Terminus 中的 MLA，而不是消掉这个平方项。</li>
       <li><b>DSA 不减少 KV cache，反而略有增加。</b>成立条件是把 DSA 单独看待——V3.2 确实省 KV cache，但那是 MLA 低秩压缩的功劳。此结论从两套官方与社区实现推出，论文未以否定句形式声称。</li>
       <li><b>序列长度不超过 $k$ 时 DSA 不产生收益。</b>此时 top-k 选中全部位置、不产生裁剪，indexer 的计算成为纯开销。真实模型中 $k = 2048$。官方为短序列 prefill 专门实现了 masked MHA 模式；vLLM 中当该批 prefill 请求的最大序列长度不超过 <code>index_topk</code>、且未强制走 MQA 时改走稠密路径。</li>
-      <li><b>引入 DSA 后未观察到明显性能回退。</b>论文给出三组证据：标准 benchmark（2025 年 9 月，对比 V3.1-Terminus，训练设置严格对齐——正是这种对齐使"差异来自稀疏注意力"的归因成立）、ChatbotArena Elo（2025 年 11 月 10 日，两者相近）、发布后的独立长上下文评测（AA-LCR、Fiction.liveBench）。</li>
+      <li><b>引入 DSA 后未观察到明显性能回退。</b>论文给出三组证据：标准 benchmark（2025 年 9 月，对比 V3.1-Terminus）、ChatbotArena Elo（按两两对战胜负累计的相对评分；2025 年 11 月 10 日两者分数相近）、发布后的独立长上下文评测（AA-LCR、Fiction.liveBench）。前述归因依赖两条对照条件：两者后训练策略相同，且两阶段续训的训练数据分布与 V3.1-Terminus 的 128K 长上下文扩展数据完全对齐。</li>
       <li><b>DSA 不能直接加到未经续训的稠密模型上。</b>943.7B token 的稀疏续训不是可省略的步骤。</li>
     </ul>
 
