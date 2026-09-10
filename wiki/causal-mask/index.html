@@ -666,7 +666,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Vaswani et al. 2017《Attention Is All You Need》§3.1（自回归）、§3.2.1（缩放点积注意力 Eq.(1)）、§3.2.3（掩码 decoder 自注意力，含 set to $-\infty$ 脚注）。NoPE 结构前提见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
+<p><b>主要依据</b>：Vaswani et al. 2017《Attention Is All You Need》§3（自回归语义）、§3.1（decoder 掩码约束）、§3.2.1（缩放点积注意力 Eq.(1)）、§3.2.3（掩码 decoder 自注意力，正文含 set to $-\infty$ 说明）。NoPE 结构前提见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
 </blockquote>
 
 <div class="callout callout-blue">
@@ -733,7 +733,9 @@
 
 <p>但 <a href="../../wiki/standard-attention/index.html">标准注意力</a>本身只做"内容匹配"——query 和每个 key 算相似度，按相似度对 value 加权求和。它不关心位置先后。如果把标准注意力直接用在 decoder 上，位置 $t$ 的 query 会和位置 $t+1,t+2,\dots$ 的 key 算出非零分数——未来 token 的信息就泄漏进了位置 $t$ 的表示。<sup>[C1]</sup></p>
 
-<p>后果很直接：训练时位置 $t$ 的预测本应只依赖 $1..t$，实际却依赖了 $t+1,t+2,\dots$，模型在"抄答案"，学不到合理的逐 token 预测。论文 §3.2.3 把这一约束表述为"the predictions for position $i$ can depend only on the known outputs at positions less than $i$"。<sup>[C1, C4]</sup></p>
+<p>后果很直接：训练时位置 $t$ 的预测本应只依赖 $1..t$，实际却依赖了 $t+1,t+2,\dots$，模型在"抄答案"，学不到合理的逐 token 预测。论文 §3.1 把这一约束表述为"the predictions for position $i$ can depend only on the known outputs at positions less than $i$"。<sup>[C1, C4]</sup></p>
+
+<p>引文里还有半句需要解释——"the output embeddings are offset by one position"。<sup>[C1]</sup>decoder 的输入不是原目标序列，而是把它右移一位得到的序列（论文 Figure 1 图内把 decoder 输入标注为 "Outputs (shifted right)"；"开头补一个起始符号"是工程实现惯例）：输入位置 $i$ 承载的是目标序列第 $i-1$ 个 token。因此"输入位置 $i$ 可 attend 到 $1..i$"与"预测位置 $i$ 只依赖小于 $i$ 的已知输出"是同一件事——可见的输入位置 $1..i$ 承载目标序列第 $0..i-1$ 个 token（其中第 $0$ 个是起始符号），真正的已生成输出是第 $1..i-1$ 个，正好是"小于 $i$"的那些。"训练时并行、推理时 KV-cache 隐含"一章的"一次喂入整条目标序列"喂入的正是这条右移一位的输入序列，掩码保证每个输入位置只看到自己的前缀。</p>
 
 <p>因果掩码的规则一句话：<strong>位置 $t$ 只能 attend 到位置 $1..t$，看不到未来 token</strong>。它通过在注意力分数上施加一个掩码矩阵实现，下一章讲机制。</p>
 
@@ -756,7 +758,7 @@
     <p>decoder 的自回归生成为什么要求注意力挡住未来 token？</p>
     <details>
     <summary>解答：防止未来信息泄漏破坏逐 token 预测</summary>
-    <p>自回归生成逐 token 预测下一个 token，每步只依赖已生成的前缀。标准注意力只按内容相似度加权、不关心位置先后，直接用在 decoder 上时，位置 $t$ 的 query 会与位置 $t+1,t+2,\dots$ 的 key 算出非零分数，未来信息泄漏进位置 $t$ 的表示；训练时位置 $t$ 的预测本应只依赖 $1..t$，实际却依赖了未来 token，模型在"抄答案"，学不到合理的逐 token 预测。论文 §3.2.3 将该约束表述为 predictions for position $i$ 只依赖小于 $i$ 的已知输出。<sup>[C1, C4]</sup></p>
+    <p>自回归生成逐 token 预测下一个 token，每步只依赖已生成的前缀。标准注意力只按内容相似度加权、不关心位置先后，直接用在 decoder 上时，位置 $t$ 的 query 会与位置 $t+1,t+2,\dots$ 的 key 算出非零分数，未来信息泄漏进位置 $t$ 的表示；训练时位置 $t$ 的预测本应只依赖 $1..t$，实际却依赖了未来 token，模型在"抄答案"，学不到合理的逐 token 预测。论文 §3.1 将该约束表述为 predictions for position $i$ 只依赖小于 $i$ 的已知输出。<sup>[C1, C4]</sup></p>
     </details>
   </li>
   <li>
@@ -772,7 +774,7 @@
 
 <p>规则"位置 $t\to1..t$"要变成注意力计算里的一个具体操作。做法是构造一个 $n\times n$ 的掩码矩阵 $M$（$n$ 为序列长度）：<sup>[C3]</sup></p>
 
-$$M_{ij}=\begin{cases}-\infty & j>i\quad(\text{严格上三角，未来位置})\\[2pt]0 & j\le i\quad(\text{对角线及以下，可见位置})\end{cases}$$
+$$M_{tj}=\begin{cases}-\infty & j>t\quad(\text{严格上三角，未来位置})\\[2pt]0 & j\le t\quad(\text{对角线及以下，可见位置})\end{cases}$$
 
 <p>把它加到标准注意力的分数上，就得到带因果掩码的注意力：<sup>[F1]</sup></p>
 
@@ -780,20 +782,20 @@ $$\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^\top}{\
 
 <p>逐项说明：</p>
 <ul>
-  <li>$Q,K,V\in\mathbb{R}^{n\times d}$：标准注意力的 query、key、value 矩阵（见<a href="../../wiki/standard-attention/index.html">标准注意力</a>），因果掩码不改变它们。</li>
-  <li>$QK^\top/\sqrt{d_k}$：标准注意力的分数矩阵，$n\times n$，第 $(t,j)$ 项是位置 $t$ 对位置 $j$ 的相似度。$\sqrt{d_k}$ 缩放稳定 softmax 数值。</li>
-  <li>$M$：因果掩码矩阵，与分数同形。$+M$ 把未来位置（$j>t$）的分数置 $-\infty$，可见位置（$j\le t$）的分数不变。</li>
+  <li>$Q,K\in\mathbb{R}^{n\times d_k}$、$V\in\mathbb{R}^{n\times d_v}$：标准注意力的 query、key、value 矩阵（见<a href="../../wiki/standard-attention/index.html">标准注意力</a>），$n$ 为序列长度，$d_k$、$d_v$ 分别为 key、value 的维度；因果掩码不改变它们。</li>
+  <li>$QK^\top/\sqrt{d_k}$：标准注意力的分数矩阵，$n\times n$，第 $(t,j)$ 项是位置 $t$ 对位置 $j$ 的相似度；$d_k$ 为 key 的维度。$\sqrt{d_k}$ 缩放稳定 softmax 数值。</li>
+  <li>$M$：因果掩码矩阵，与分数同形，第 $(t,j)$ 项由上面的分段式给出。$+M$ 把未来位置（$j>t$）的分数置 $-\infty$，可见位置（$j\le t$）的分数不变。</li>
 </ul>
 
-<p>关键问题是为什么用 $-\infty$。softmax 把分数 $s_j$ 归一化为权重 $\alpha_j=e^{s_j}/\sum_i e^{s_i}$。被掩位置的分数为 $-\infty$，则 $e^{-\infty}=0$，该位置权重为 $0$；而 softmax 的分母只对未归零（可见）项求和，于是可见位置的权重重新归一化到和为 $1$。<sup>[C2]</sup></p>
+<p>关键问题是为什么用 $-\infty$。softmax 把分数 $s_j$ 归一化为权重 $\alpha_j=e^{s_j}/\sum_k e^{s_k}$。被掩位置的分数为 $-\infty$，则 $e^{-\infty}=0$，该位置权重为 $0$；而 softmax 的分母只对未归零（可见）项求和，于是可见位置的权重重新归一化到和为 $1$。<sup>[C2]</sup></p>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th>$M$（$n=3$）</th><th>$j=1$</th><th>$j=2$</th><th>$j=3$</th></tr></thead>
 <tbody>
-<tr><td>$i=1$</td><td>$0$</td><td>$-\infty$</td><td>$-\infty$</td></tr>
-<tr><td>$i=2$</td><td>$0$</td><td>$0$</td><td>$-\infty$</td></tr>
-<tr><td>$i=3$</td><td>$0$</td><td>$0$</td><td>$0$</td></tr>
+<tr><td>$t=1$</td><td>$0$</td><td>$-\infty$</td><td>$-\infty$</td></tr>
+<tr><td>$t=2$</td><td>$0$</td><td>$0$</td><td>$-\infty$</td></tr>
+<tr><td>$t=3$</td><td>$0$</td><td>$0$</td><td>$0$</td></tr>
 </tbody>
 </table>
 </div>
@@ -802,7 +804,7 @@ $$\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^\top}{\
 
 <p>这里有一条容易看错的细节：掩码施加在 softmax 的<strong>输入</strong>（分数）上，不是施加在 softmax 的<strong>输出</strong>（权重）上。如果直接把权重某些位置置 $0$，剩余权重之和会小于 $1$，输出尺度会塌缩；而在分数上加 $-\infty$，softmax 会自动重归一化，保证可见权重和为 $1$。</p>
 
-<p>实现上，精确 $-\infty$ 是数学极限。工程中可用足够大的负数（如 $-10^5$）或框架提供的 <code>-inf</code> 达到同样效果——在浮点精度下被掩位置的 $e^{s_j}$ 也恰好下溢为 $0$，权重为 $0$。本文手算用 $-\infty$ 表达数学含义。这一节是辅助说明，不影响机制结论。</p>
+<p>实现上，精确 $-\infty$ 是数学极限。以下是<strong>工程惯例示例</strong>（非论文原文）：工程中可用足够大的负数（如 $-10^5$）或框架提供的 <code>-inf</code> 达到同样效果——在浮点精度下被掩位置的 $e^{s_j}$ 恰好下溢为 $0$，权重为 $0$。成立条件是未掩分数在 $\mathcal{O}(1)$ 量级、远小于该负数示例的绝对值；否则把 $-10^5$ 加到一个同量级的未掩分数上并不构成足够大的负数，掩码会失效。本文手算用 $-\infty$ 表达数学含义。这一节是辅助说明，不影响机制结论。</p>
 
 <h3 id="questions-mechanism">本章问题</h3>
 <ol class="chapter-questions">
@@ -810,7 +812,7 @@ $$\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^\top}{\
     <p>掩码矩阵 $M$ 如何构造、施加在哪里？</p>
     <details>
     <summary>解答：上三角 $-\infty$ 加到分数上</summary>
-    <p>$M$ 为 $n\times n$ 矩阵（$n$ 为序列长度）：$j>i$ 的严格上三角（未来位置）为 $-\infty$，$j\le i$ 的对角线及以下（可见位置）为 $0$。它加到标准注意力的分数上，得到 $\operatorname{softmax}(QK^\top/\sqrt{d_k}+M)V$，不改变 $Q,K,V$ 本身。<sup>[C3, F1]</sup></p>
+    <p>$M$ 为 $n\times n$ 矩阵（$n$ 为序列长度），第 $(t,j)$ 项：$j>t$ 的严格上三角（未来位置）为 $-\infty$，$j\le t$ 的对角线及以下（可见位置）为 $0$。它加到标准注意力的分数上，得到 $\operatorname{softmax}(QK^\top/\sqrt{d_k}+M)V$，不改变 $Q,K,V$ 本身。<sup>[C3, F1]</sup></p>
     </details>
   </li>
   <li>
@@ -824,7 +826,7 @@ $$\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^\top}{\
     <p>工程实现中如何代替精确 $-\infty$？</p>
     <details>
     <summary>解答：足够大的负数即可</summary>
-    <p>精确 $-\infty$ 是数学极限，工程中可用足够大的负数（如 $-10^5$）或框架提供的 <code>-inf</code>：浮点精度下被掩位置的 $e^{s_j}$ 下溢为 $0$、权重为 $0$，效果与 $-\infty$ 相同。</p>
+    <p>精确 $-\infty$ 是数学极限，工程中可用足够大的负数（如 $-10^5$）或框架提供的 <code>-inf</code>：浮点精度下被掩位置的 $e^{s_j}$ 下溢为 $0$、权重为 $0$，效果与 $-\infty$ 相同。这是工程惯例示例，成立条件是未掩分数在 $\mathcal{O}(1)$ 量级、远小于该负数示例的绝对值。</p>
     </details>
   </li>
 </ol>
@@ -859,7 +861,7 @@ $$\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^\top}{\
 <p>三位置输出 $1,1.5,2$ 各不相同；未来位置（位置 1 的 $j=2,3$、位置 2 的 $j=3$）权重均为 $0$；可见位置权重和均为 $1$（$[1]$、$[1/2,1/2]$、$[1/3,1/3,1/3]$）。</p>
 </details>
 
-<p>对比两种情形：不掩时三位置输出均为 $2$（相同）；掩码后输出 $1,1.5,2$（不同）。因果掩码让不同位置看到不同的 token 子集，从而产生不同的输出——这一点会在"边界与 NoPE 结构前提"一章用到。</p>
+<p>对比两种情形：不掩时三位置输出均为 $2$（相同）；掩码后输出 $1,1.5,2$（不同）。因果掩码让不同位置看到不同的 token 子集，从而产生不同的输出——这一点会在"边界与 NoPE 的结构前提"一章用到。</p>
 
 <details class="code-details">
 <summary>代码：3-token 因果掩码 softmax 的可运行验证</summary>
@@ -1008,25 +1010,25 @@ pos 3: weights = ['0.3333', '0.3333', '0.3333']  output = 2.0000
 
 <p><strong>边界一：encoder vs decoder</strong>。encoder 用双向注意力不加因果掩码，每个位置看全部输入以构建完整上下文；decoder 用因果注意力加掩码，保留自回归。在 encoder 加掩码会破坏双向上下文建模；在 decoder 不加掩码会信息泄漏。<sup>[C7]</sup></p>
 
-<p><strong>边界二：与填充掩码正交</strong>。填充掩码屏蔽"填充 token"（如 batch 中短句末尾的 <code>&lt;pad&gt;</code>），与是否为有效 token 有关；因果掩码屏蔽"未来位置"，与位置先后有关。两者目的不同，在 PyTorch <code>nn.MultiheadAttention</code> 等接口里可叠加为同一 <code>attn_mask</code> 张量。</p>
+<p><strong>边界二：与填充掩码正交</strong>。填充掩码屏蔽"填充 token"（如 batch 中短句末尾的 <code>&lt;pad&gt;</code>），与是否为有效 token 有关；因果掩码屏蔽"未来位置"，与位置先后有关。两者目的不同，在 PyTorch <code>nn.MultiheadAttention</code> 等接口里可合并进同一 <code>attn_mask</code> 张量（浮点掩码相加、布尔掩码按位或）。<sup>[C3]</sup></p>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th></th><th>因果掩码</th><th>填充掩码</th></tr></thead>
 <tbody>
-<tr><td>屏蔽对象</td><td>未来位置（$j>i$）</td><td>填充 token（如 <code>&lt;pad&gt;</code>）</td></tr>
+<tr><td>屏蔽对象</td><td>未来位置（$j>t$）</td><td>填充 token（如 <code>&lt;pad&gt;</code>）</td></tr>
 <tr><td>与什么有关</td><td>位置先后</td><td>是否为有效 token</td></tr>
 <tr><td>用在哪里</td><td>decoder 自注意力</td><td>encoder / decoder（凡有 padding 处）</td></tr>
-<tr><td>能否叠加</td><td colspan="2">可以，同一 <code>attn_mask</code> 张量中相加</td></tr>
+<tr><td>能否叠加</td><td colspan="2">可以，按同一 <code>attn_mask</code> 传入（浮点掩码相加、布尔掩码按位或）<sup>[C3]</sup></td></tr>
 </tbody>
 </table>
 </div>
 
-<p><strong>深层作用：NoPE 的结构前提</strong>。在没有位置编码的双向注意力中，交换输入顺序会让每个位置的输出也作同样交换，而每个位置上的输出值不变——这叫<strong>排列等变</strong>（交换输入顺序时每个位置的输出不变）。模型对"谁先谁后"没有真正的区分能力，无法区分"甲乙"和"乙甲"。</p>
+<p><strong>深层作用：NoPE 的结构前提</strong>。在没有位置编码的双向注意力中，交换输入顺序时输出序列作同样的交换（$f(PX)=Pf(X)$），输出集合不变，因此模型无法区分输入顺序——这叫<strong>排列等变</strong>。模型对"谁先谁后"没有真正的区分能力，无法区分"甲乙"和"乙甲"。</p>
 
-<p>因果掩码改变了这件事。它使位置 $t$ 的可见 token 集合恰为 $\{1,\dots,t\}$，不同位置可见集合不同：位置 1 看 $\{1\}$，位置 2 看 $\{1,2\}$，位置 3 看 $\{1,2,3\}$。即使不加任何显式位置编码，不同位置的注意力输出也会不同——位置被结构隐式提供。<sup>[C6]</sup></p>
+<p>因果掩码改变了这件事。它使位置 $t$ 的可见 token 集合恰为 $\{1,\dots,t\}$，不同位置可见集合不同：位置 1 看 $\{1\}$，位置 2 看 $\{1,2\}$，位置 3 看 $\{1,2,3\}$。该注意力函数不再是排列等变的，模型由此获得区分词序的能力（具体输出是否不同取决于输入）——位置被结构隐式提供。<sup>[C6]</sup></p>
 
-<p>本章开头的 $3$-token 例子正是这一点的可手算验证：不掩（双向）时三位置输出均为 $2$（相同，排列等变，无法区分位置）；掩码（因果）后输出 $1,1.5,2$（不同，位置可区分）。这正是 <a href="../../wiki/nope/index.html">NoPE</a>（不施加任何显式位置编码）仍能区分词序的结构原因——因果掩码已经打破了排列对称性。</p>
+<p>"手算 $3$-token 例子"一章中的 $3$-token 例子正是这一点的可手算验证：不掩（双向）时三位置输出均为 $2$（相同，排列等变，无法区分位置）；掩码（因果）后输出 $1,1.5,2$（不同，位置可区分）。这正是 <a href="../../wiki/nope/index.html">NoPE</a>（不施加任何显式位置编码）仍能区分词序的结构原因——因果掩码已经打破了排列对称性。</p>
 
 <p>这里要澄清一个容易混的关联：因果掩码是注意力分数上的遮挡规则；NoPE 是"不施加任何显式位置编码"的选择。因果掩码是 NoPE 能工作的结构前提之一，但两者不是一回事——因果掩码在加显式位置编码的 decoder 里也照常使用。NoPE 的完整论证（它为何能表示位置、在长度泛化上表现如何、在 Kimi K3 中怎么用）见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
 
@@ -1036,14 +1038,14 @@ pos 3: weights = ['0.3333', '0.3333', '0.3333']  output = 2.0000
     <p>因果掩码与填充掩码有何区别？</p>
     <details>
     <summary>解答：屏蔽对象与目的不同，可叠加</summary>
-    <p>因果掩码屏蔽"未来位置"，与位置先后有关；填充掩码屏蔽"填充 token"（如 batch 中短句末尾的 <code>&lt;pad&gt;</code>），与是否为有效 token 有关。两者目的不同，在 PyTorch <code>nn.MultiheadAttention</code> 等接口里可叠加为同一 <code>attn_mask</code> 张量。</p>
+    <p>因果掩码屏蔽"未来位置"，与位置先后有关；填充掩码屏蔽"填充 token"（如 batch 中短句末尾的 <code>&lt;pad&gt;</code>），与是否为有效 token 有关。两者目的不同，在 PyTorch <code>nn.MultiheadAttention</code> 等接口里可合并进同一 <code>attn_mask</code> 张量（浮点掩码相加、布尔掩码按位或）。<sup>[C3]</sup></p>
     </details>
   </li>
   <li>
     <p>为什么说因果掩码是 NoPE 的结构前提？</p>
     <details>
     <summary>解答：打破排列对称性，位置被结构隐式提供</summary>
-    <p>无位置编码的双向注意力是排列等变的：交换输入顺序，每个位置的输出值不变，模型无法区分"谁先谁后"。因果掩码使位置 $t$ 的可见集合恰为 $\{1,\dots,t\}$，不同位置可见集合不同——即使不加任何显式位置编码，不同位置的注意力输出也不同，位置由结构隐式提供，排列对称性被打破。本章的 $3$-token 例子正是可手算的验证：双向输出均为 $2$，因果输出 $1,1.5,2$。<sup>[C6]</sup></p>
+    <p>无位置编码的双向注意力是排列等变的：交换输入顺序时输出序列作同样的交换（$f(PX)=Pf(X)$），输出集合不变，因此模型无法区分输入顺序。因果掩码使位置 $t$ 的可见集合恰为 $\{1,\dots,t\}$，不同位置可见集合不同——该注意力函数不再是排列等变的，模型由此获得区分词序的能力（具体输出是否不同取决于输入），排列对称性被打破。"手算 $3$-token 例子"一章中的 $3$-token 例子正是可手算的验证：双向输出均为 $2$，因果输出 $1,1.5,2$。<sup>[C6]</sup></p>
     </details>
   </li>
   <li>
@@ -1058,13 +1060,13 @@ pos 3: weights = ['0.3333', '0.3333', '0.3333']  output = 2.0000
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p><sup>[C1]</sup> 因果掩码规则（位置 $t$ 只 attend 到 $1..t$，防止未来泄漏）：Vaswani et al. 2017《Attention Is All You Need》§3.2.3——"We need to modify the self-attention sub-layer in the decoder stack to prevent positions from attending to subsequent positions. This masking, combined with fact that the output embeddings are offset by one position, ensures that the predictions for position $i$ can depend only on the known outputs at positions less than $i$."；同节"self-attention layers in the decoder allow each position in the decoder to attend to all positions in the decoder up to and including that position."。</p>
-<p><sup>[C2]</sup> 实现方式（softmax 输入处置 $-\infty$，softmax 后权重为 $0$）：Vaswani et al. 2017 §3.2.3 脚注——"we also mask out (set to $-\infty$) all entries in the input to the softmax which correspond to illegal connections."；Figure 2 左图 "Mask (opt.)" 方框。</p>
-<p><sup>[C3]</sup> 掩码矩阵 $M$ 的上三角形式：§3.2.3（C2 引用）的等价标准实现；PyTorch <code>nn.Transformer</code>、Hugging Face、fairseq 等主流实现一致。</p>
-<p><sup>[C4]</sup> 因果掩码是自回归生成与训练并行的基础：§3.1——"At each step the model is auto-regressive, consuming the previously generated symbols as additional input when generating the next."；§3.2.4 自注意力顺序操作 $O(1)$ vs RNN $O(n)$。</p>
-<p><sup>[C5]</sup> 推理时 KV-cache 隐含掩码：§3.1 自回归生成语义（C4 引用）的推理侧推论；KV-cache 为自回归 Transformer 推理的标准实现。</p>
-<p><sup>[C6]</sup> 因果掩码打破排列对称性、是 NoPE 结构前提：§3.2.3 因果掩码可见集合性质（C1）的推论；NoPE 论文（Kazemnejad et al., NeurIPS 2023, arXiv:2305.19466）摘要——"explicit position embeddings are not essential for decoder-only Transformers to generalize well to longer sequences"。NoPE 完整论证见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
-<p><sup>[C7]</sup> encoder 双向无掩码 vs decoder 因果有掩码：§3.2.3（decoder 因果，C1 引用）；§3.2——"Each position in the encoder can attend to all positions in the previous layer of the encoder."</p>
+<p><sup>[C1]</sup> 因果掩码规则（位置 $t$ 只 attend 到 $1..t$，防止未来泄漏）：Vaswani et al. 2017《Attention Is All You Need》§3.1——"We also modify the self-attention sub-layer in the decoder stack to prevent positions from attending to subsequent positions. This masking, combined with fact that the output embeddings are offset by one position, ensures that the predictions for position $i$ can depend only on the known outputs at positions less than $i$."；§3.2.3——"self-attention layers in the decoder allow each position in the decoder to attend to all positions in the decoder up to and including that position."；Figure 1 图内 decoder 输入标注 "Outputs (shifted right)"（即"output embeddings are offset by one position"的图示）。</p>
+<p><sup>[C2]</sup> 实现方式（softmax 输入处置 $-\infty$，softmax 后权重为 $0$）：Vaswani et al. 2017 §3.2.3 正文——"We implement this inside of scaled dot-product attention by masking out (setting to $-\infty$) all values in the input of the softmax which correspond to illegal connections."；Figure 2 左图 "Mask (opt.)" 方框。</p>
+<p><sup>[C3]</sup> 掩码矩阵 $M$ 的上三角形式与掩码叠加语义：§3.2.3（C2 引用）的等价标准实现；PyTorch <code>nn.Transformer.generate_square_subsequent_mask</code>（源码 <code>torch/nn/modules/transformer.py</code>）——"The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0)."；PyTorch <code>nn.MultiheadAttention</code> 文档（<code>torch/nn/modules/activation.py</code>）——attn_mask 支持布尔与浮点两种掩码，"For a float mask, the mask values will be added to the attention weight"，两类掩码在 <code>merge_masks</code> 中"combined with logical <code>or</code>"。</p>
+<p><sup>[C4]</sup> 因果掩码是自回归生成与训练并行的基础：§3——"At each step the model is auto-regressive [10], consuming the previously generated symbols as additional input when generating the next."；§4（Why Self-Attention）与 Table 1——自注意力顺序操作 $O(1)$ vs RNN $O(n)$。</p>
+<p><sup>[C5]</sup> 推理时 KV-cache 隐含掩码：§3 自回归生成语义（C4 引用）的推理侧推论，属本文的工程推断，非论文原文。</p>
+<p><sup>[C6]</sup> 因果掩码打破排列对称性、是 NoPE 结构前提：§3.2.3 因果掩码可见集合性质（C1）的推论。"NoPE 无需显式位置编码也能有效并泛化到更长序列"由 NoPE 论文（Kazemnejad et al., NeurIPS 2023, arXiv:2305.19466）摘要末句支持——"explicit position embeddings are not essential for decoder-only Transformers to generalize well to longer sequences"。而"decoder-only Transformer 因因果掩码而非排列不变、因而无需显式位置信息"这一机制陈述见该论文 §2 Background——"decoder-only Transformers with causal attention mask are not permutation invariant and can model sequences even without explicit position information (Tsai et al., 2019)"；§8 Related Work——"Decoder-only Transformers, due to their causal attention mask, are not order-agnostic and can operate without explicit positional information"；附录 C.1——"relies on the causal attention mask in the decoder-only Transformer and the softmax function to recover absolute positions"。NoPE 完整论证见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
+<p><sup>[C7]</sup> encoder 双向无掩码 vs decoder 因果有掩码：§3.2.3（decoder 因果，C1 引用）；§3.2.3——"Each position in the encoder can attend to all positions in the previous layer of the encoder."</p>
 
 <h3>公式与来源（F）</h3>
 <p><sup>[F1]</sup> $\operatorname{softmax}(QK^\top/\sqrt{d_k}+M)V$：§3.2.1 Eq.(1) 缩放点积注意力 + §3.2.3 掩码（C2/C3）的合并。$M$ 的形式由 C3 给出。</p>
@@ -1074,7 +1076,7 @@ pos 3: weights = ['0.3333', '0.3333', '0.3333']  output = 2.0000
 <p>$3$-token 手算与代码示例：注意力分数全为 $0$（构造，使 softmax 在可见项上均匀、便于手算），值 $v_1=1,v_2=2,v_3=3$（构造，便于看出"不同位置输出不同"）。构造目的：验证"$-\infty$ 让未来权重为 $0$、可见重归一化、不同位置输出不同"的机制。不代表真实模型的分数或值。代码已实际运行，预期输出为真实运行结果。</p>
 
 <h3>辅助解释与类比边界</h3>
-<p>"decoder 抄答案"的表述只帮助理解"未来信息泄漏"这一局部问题，不覆盖训练动力学或梯度行为；正式判断以 §3.2.3 的"predictions for position $i$ can depend only on positions less than $i$"为准。“排列等变 = 交换顺序时每个位置输出不变”这一定义只服务“边界与 NoPE 结构前提”一章的对称性讨论，不展开群论含义。</p>
+<p>"decoder 抄答案"的表述只帮助理解"未来信息泄漏"这一局部问题，不覆盖训练动力学或梯度行为；正式判断以 §3.1 的"predictions for position $i$ can depend only on positions less than $i$"为准。“排列等变 = 交换输入顺序时输出序列作同样的交换（$f(PX)=Pf(X)$），输出集合不变”这一定义只服务“边界与 NoPE 的结构前提”一章的对称性讨论，不展开群论含义。"因果掩码如何机械地实现"一章的"工程中可用足够大的负数（如 $-10^5$）或 <code>-inf</code> 代替 $-\infty$"是工程惯例示例（非论文原文），成立条件是未掩分数在 $\mathcal{O}(1)$ 量级、远小于该负数示例的绝对值。正文"开头补一个起始符号"同属工程实现惯例（非论文原文），论文 Figure 1 仅把 decoder 输入标注为 "Outputs (shifted right)"。</p>
 
 <h3>简化条件及其限制</h3>
 <p>分数全 $0$ 的构造：让 softmax 在可见项上均匀，便于手算。真实模型的分数由 $QK^\top/\sqrt{d_k}$ 给出、非均匀，但"$-\infty$ 让未来权重为 $0$、可见项重归一化"的机制完全相同——简化只影响数值，不影响机制。单头、$n=3$：便于手算与代码演示，真实工程为多头、批量、大 $n$，掩码机制不变。代码用纯 Python <code>math</code> 与列表实现，不依赖张量框架，真实实现用张量运算以发挥并行；数值稳定处理（减最大值）与框架实现一致。</p>
