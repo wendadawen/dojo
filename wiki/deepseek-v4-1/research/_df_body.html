@@ -1,0 +1,108 @@
+<h1 class="title">DeepSeek-V4.1-Flash 前向数据流</h1>
+<p class="page-lead">DeepSeek-V4.1-Flash 是 552B 主干加 196B Engram 参数、原生支持 1M 上下文的多模态 <a href="../deepseek-moe/index.html">MoE</a> 模型。40 层主干按 Causal Encoder–Decoder 切成两半：前 20 层是因果编码器，后 20 层是解码器，解码器的全局 KV 不由本层隐状态产生，而由编码器末层隐状态投影而来——配合解码器滑动窗口的有界重放，prefill 阶段因此可以止于半栈。全局 KV 由 <a href="../cross-layer-kv-sharing/index.html">CSA2</a>（Compressed Sparse Attention 2，压缩稀疏注意力第 2 版）管理：每 $r$ 个 token 池化成一条压缩条目、同压缩比的层跨层共享、再由索引器从至多 512 个条目里稀疏选择；主 KV 以 FP4 存储（每条目 288 字节），窗口 KV 保持 FP8。每 token 全局 KV 缓存 890 字节。另有两个不改变缓存账的模块：<a href="../ngram/index.html">Engram</a> 哈希查表（插在层 1、14）与 <a href="../speculative-decoding/index.html">DSpark</a> 块式推测解码（3 个 MTP 块）。</p>
+<p class="page-meta">生成于 2026-09-10 · 依据官方推理实现 <code>model.py</code>/<code>kernel.py</code> + <code>inference/config.json</code> + 真实 checkpoint 张量头（48 个分片、96085 个张量）+ 本机实测</p>
+<p class="reading-time" id="readingTime"></p>
+
+<h2 id="specs">1. 关键规格</h2>
+<p>下表每一行都可回溯到具体依据。「依据」列给出配置字段名、源码位置或实测脚本，「核对」列说明该数字如何被独立验证。</p>
+<table>
+  <tr><th>项目</th><th>取值</th><th>依据 / 核对方式</th></tr>
+  <tr><td>总参数量</td><td>552B 主干 + 196B Engram</td><td>官方称「552B backbone parameters and 196B Engram parameters」（报告行 320）；<code>count_params.py</code> 按 96085 个张量头独立算得 551.57B + 196.93B</td></tr>
+  <tr><td>主干层数</td><td>40 层 = 20 层编码器 + 20 层解码器</td><td><code>n_layers=40</code>；报告行 314–317 的结构描述；<code>verify_csa2_modes.py</code> 的层表</td></tr>
+  <tr><td>每 token 激活</td><td>8B（prefill）/ 16B（decode）</td><td><code>verify_active_params.py</code>：编码器半栈 7.8929B、解码器半栈 7.5758B（均不含嵌入层与输出头）；decode 为两半之和 15.4687B，8B 与 16B 是报告宣称的取整值</td></tr>
+  <tr><td>每 token 全局 KV 缓存</td><td>890 B</td><td><code>verify_cache_size.py</code>：主 KV 720 + 索引器 K 170，按配置与源码常量逐项推出</td></tr>
+  <tr><td>隐藏维</td><td>5120</td><td><code>dim</code>；<code>attn_norm.weight</code> 形状 <code>[5120]</code></td></tr>
+  <tr><td>注意力头配置</td><td>64 个查询头、1 个 KV 头，头维 512</td><td><code>n_heads</code>/<code>head_dim</code>；<code>wq_b.weight</code> 形状 <code>[32768, 1280]</code> $=64\times512$，<code>wkv.weight</code> 形状 <code>[512, 5120]</code></td></tr>
+  <tr><td>查询低秩维</td><td>1280</td><td><code>q_lora_rank</code>；<code>wq_a.weight</code> 形状 <code>[1280, 5120]</code>、<code>q_norm.weight</code> 形状 <code>[1280]</code></td></tr>
+  <tr><td>输出投影分组</td><td>8 组，组内低秩 1024</td><td><code>o_groups=8</code>/<code>o_lora_rank=1024</code>；<code>wo_a.weight</code> 形状 <code>[8192, 4096]</code> $=(8\times1024)\times(8\times512)$、<code>wo_b.weight</code> 形状 <code>[5120, 8192]</code></td></tr>
+  <tr><td><a href="../rope/index.html">位置编码</a></td><td>仅旋转头维<b>末尾</b> 64 维；频率表按<b>层</b>选择</td><td><code>rope_head_dim=64</code>；<code>model.py</code> L680–687 按层分支：<code>compress_ratio=0</code> 的层 0、1 用 <code>rope_theta=10000</code> 且关 YaRN，<code>compress_ratio&gt;0</code> 的层 2–39 用 <code>compress_rope_theta=160000</code> 且开 YaRN（<code>original_seq_len=65536</code> 乘 <code>rope_factor=16</code> 得 1M 上下文）；<code>verify_rope_yarn.py</code> 复现该频率表（base 160000 时 low=15、high=25）</td></tr>
+  <tr><td><a href="../sliding-window-attention/index.html">滑动窗口</a></td><td>128</td><td><code>window_size=128</code>；<code>verify_sparse_attn_window.py</code> 的环形缓冲对照（$W=8$、序列长 20 全一致）</td></tr>
+  <tr><td>压缩比分布</td><td>层 2–19 为 2；层 20–39 为 1；层 0、1 无全局 KV</td><td><code>compress_ratios</code>；<code>Compressor.__init__</code> 按 <code>compress_ratios[layer_id]</code> 取比值</td></tr>
+  <tr><td><a href="../cross-layer-kv-sharing/index.html">跨层共享</a></td><td>source 层 2/8/14/20；分组 2–7、8–13、14–19、20–39</td><td><code>kv_source_layers</code>；<code>verify_csa2_modes.py</code> 运行期回溯每层读到的缓存属主</td></tr>
+  <tr><td>层模式</td><td>Full = 2/8/14/20；Reindex = 24/28/32/36；其余 30 个压缩层为 Reuse</td><td><code>index_source_layers</code>；同上脚本的实测层表</td></tr>
+  <tr><td>索引器</td><td>32 个头、头维 128，每 query 保留 Top-512</td><td><code>index_n_heads=32</code>/<code>index_head_dim=128</code>/<code>index_topk=512</code></td></tr>
+  <tr><td>候选池</td><td>$2048 \times 8 = 16384$ 个候选位置</td><td><code>candidate_source_layer=20</code>、<code>candidate_topk_blocks=2048</code>、<code>candidate_block_size=8</code>；报告行 565–570</td></tr>
+  <tr><td>MoE</td><td>384 个路由专家取 top-6，另 1 个共享专家；中间维 2304</td><td><code>n_routed_experts</code>/<code>n_activated_experts</code>/<code>n_shared_experts</code>/<code>moe_inter_dim</code>；<code>verify_gate_formula.py</code> 独立重实现 indices 完全一致</td></tr>
+  <tr><td>路由打分与偏置</td><td>$\sqrt{\mathrm{softplus}}$ 打分，偏置只影响选择；权重乘 1.5</td><td><code>score_func="sqrtsoftplus"</code>、<code>route_scale=1.5</code>；<code>gate.weight</code> 形状 <code>[384, 5120]</code>，<code>gate.bias</code> 与 <code>gate.bias_vl</code> 各 <code>[384]</code></td></tr>
+  <tr><td>超连接</td><td>4 份残差流，Sinkhorn 20 轮，末步列方向</td><td><code>hc_mult=4</code>/<code>hc_sinkhorn_iters=20</code>；<code>hc_attn_fn</code> 形状 <code>[24, 20480]</code> $=24\times(4\times5120)$；<code>verify_sinkhorn.py</code> 行、列各 20 次</td></tr>
+  <tr><td>Engram</td><td>层 1、14；阶数 2/3/4 每阶 $8$ 头 = 每 token 24 行</td><td><code>engram_layer_ids=[1,14]</code>、<code>engram_max_ngram_size=4</code>、<code>engram_n_heads=8</code>、<code>engram_head_dim=256</code>；<code>probe_engram_layout.py</code> 实测层分布</td></tr>
+  <tr><td>DSpark</td><td>3 个 MTP 块，每块 5 个草稿位置，目标层 37/38/39</td><td><code>n_mtp_layers=3</code>/<code>dspark_block_size=5</code>/<code>dspark_target_layer_ids</code>；<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> $=5120\times(3\times5120)$</td></tr>
+  <tr><td>词表与上下文</td><td>词表 129280，上下文 1M</td><td><code>vocab_size</code>；<code>embed.weight</code> 与 <code>head.weight</code> 形状均为 <code>[129280, 5120]</code></td></tr>
+  <tr><td>视觉侧</td><td>32 层 ViT，宽 1024，patch 14，下采样 3</td><td><code>vision_n_layers</code>/<code>vision_dim</code>/<code>vision_patch_size</code>/<code>vision_downsample_ratio</code></td></tr>
+</table>
+
+<h2 id="flow">2. 交互式数据流</h2>
+<p>下图是实际前向路径。六个标签页切换粒度：整体总览之外，可下钻到注意力内部、压缩与稀疏选择、MoE 内部、Engram 注入与 DSpark 草稿链。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。形状与维度取自官方配置与真实 checkpoint 张量头。</p>
+
+<div class="viz">
+  <div class="viz-head">
+    <div class="tabs" id="tabs"></div>
+    <div class="crumb" id="crumb"></div>
+  </div>
+  <div id="cy"></div>
+  <div class="legend" id="legend"></div>
+</div>
+<div id="tip"></div>
+
+<h2 id="points">3. 要点</h2>
+
+<h3>整体结构：两半 + 四个缓存生产者</h3>
+<ul>
+  <li><b>沿深度</b>：40 层被切成前 20 层编码器（层 0–19）与后 20 层解码器（层 20–39）。解码器的全局 KV 不由各自隐状态产生，而由编码器末层隐状态 $H_{L/2}$ 投影得到；与跨层共享结合后只有层 20（解码器的 Full 层）执行这次投影。因此 prefill 跑完编码器就已拿到解码器所需的全局 KV。</li>
+  <li><b>沿缓存</b>：全模型只有 4 个层生产主 KV——层 2、8、14、20，对应压缩比 2、2、2、1。其余压缩层读同组 source 层的缓存，因此主 KV 的份数是 4 而非 40。这一项与压缩比、FP4 一起把每 token 缓存压到 890 字节。</li>
+  <li><b>前两层只有窗口</b>：层 0、1 的压缩比为 0（<code>compress_ratios</code> 前两位），不复用也不生产全局 KV，只有滑动窗口注意力。</li>
+  <li><b>沿宽度</b>：每层 384 个路由专家取 top-6，另加 1 个共享专家恒激活；专家中间维 2304。路由专家占层参数量的绝大部分，但每 token 只动用其中 6 个。</li>
+  <li><b>两条附加路径</b>：<a href="../ngram/index.html">Engram</a> 在层 1、14 把 n-gram 哈希查表结果写进残差流（不产生缓存）；<a href="../speculative-decoding/index.html">DSpark</a> 用层 37、38、39 的注意力输入驱动 3 个草稿块（不改变主干缓存）。</li>
+</ul>
+
+<h3>注意力：单 KV 头 + 低秩投影 + 8 组输出</h3>
+<ul>
+  <li><b>查询侧</b>：<code>wq_a</code> 把 5120 维压到 1280 维低秩，<code>q_norm</code> 归一化后再由 <code>wq_b</code> 展开成 $64 \times 512$ 维（64 个头、头维 512）。</li>
+  <li><b>键值侧</b>：只有 1 个 KV 头、头维 512，由 <code>wkv</code> 一次投影得到，经 <code>kv_norm</code> 归一化。多头查询共享同一份键值——这是把 KV 宽度压到 512 维的关键。</li>
+  <li><b>输出侧</b>：$64 \times 512 = 32768$ 维，先按 8 组各降到 1024 维（<code>wo_a</code>），再拼回 5120 维（<code>wo_b</code>）。<code>o_groups=8</code> 与 <code>o_lora_rank=1024</code> 是官方配置取值；分组的设计动机未在来源中说明，此处只陈述分组这一事实与其形状。</li>
+  <li><b>位置</b>：只旋转头维的<b>末尾</b> 64 维（源码用 <code>x[..., -rd:]</code> 切片，<code>rd = rope_head_dim = 64</code>）。频率表按<b>层</b>选择，不是按路径分：层 0、1（<code>compress_ratio=0</code>）用 base 10000 且关闭 YaRN；层 2–39（<code>compress_ratio&gt;0</code>）用 base 160000 且开启 YaRN，该层的查询、窗口 KV 与压缩条目共用同一份频率表（<code>model.py</code> L680–687 按层分支，L706、L758、L772 三处调用同一个 <code>freqs_cis</code>）。</li>
+</ul>
+
+<h3>可见集：窗口 128 个位置 + Top-512 压缩条目</h3>
+<ul>
+  <li>每个 query 能看到本层窗口内最多 128 个原始位置（FP8 存储），加上该层所属压缩比组中由索引器选出的至多 512 个压缩条目。</li>
+  <li>压缩条目按组编号，组 $j$ 覆盖 token $[jr,(j+1)r)$，位置取 $j\cdot r$；只有整组出现后条目才可达，可达条数是 $\lfloor(i+1)/r\rfloor$。</li>
+  <li>解码器还有一级候选池：建池层（层 20）按块打分选出 2048 个块、每块 8 个位置，共 16384 个候选；后续 Reindex 层只在这个池内选 Top-512。</li>
+</ul>
+
+<h2 id="ced">4. CED：解码器的全局 KV 从哪里来</h2>
+<p>报告对这一段给出的形式是 $C_l = H_{L/2}W_l^{KV}$、$Z_l = H_{L/2}W_l^{Z}$（$l > L/2$）：解码器各层的键值条目由编码器末层隐状态投影得到，投影权重逐层不同。共享的是<b>输入</b> $H_{L/2}$，不是投影结果。</p>
+<p>与跨层共享结合后还有一层收窄：真正执行这次投影的只有被指派为 Full 模式的解码器层。本模型的配置里这个层是层 20，参考实现中的表现是「层 20 的压缩器读取它自己的注意力输入」，而第 20 层的注意力输入正是第 19 层的输出，与公式里的 $H_{L/2}$ 对上。</p>
+<p><b>滑动窗口 KV 不能一起省</b>。窗口 KV 是最近位置的原始精度副本，必须由本层经过完整计算后的隐状态生成；第 $l$ 层的窗口 KV 需要第 $l$ 层的隐状态，而后者要等第 $l-1$ 层算完，这条依赖链无法用「读编码器输出」替代。服务端的替代办法是有界重放：只重算最后 $n_{\text{win}}$ 个位置，因为更早的位置已滑出可见集。参考实现中不含该分支，它属服务实现。</p>
+
+<h2 id="sparse">5. 稀疏选择：从打分到槽位</h2>
+<p>选择的输入是「全部因果可见的压缩条目」，输出是每个 query 的 Top-512 下标。三步：</p>
+<ul>
+  <li><b>打分</b>：索引器用 32 个头对条目打分，每头的贡献是 $\mathrm{ReLU}(q_h\cdot k_j)$ 再乘该头权重，按头求和。</li>
+  <li><b>块级筛选</b>：把位置切成大小 8 的块，块分取块内最大索引分，从建池层（层 20）选出 2048 个块。最新块只填了一部分，会被钉住以免被更早的完整块压过。</li>
+  <li><b>位置级选择</b>：候选池内的 16384 个位置按索引分取前 512，与窗口槽位拼进同一次稀疏注意力调用。</li>
+</ul>
+<p>不可达的条目（编号不小于 $\lfloor(i+1)/r\rfloor$）在打分阶段就被置为 $-\infty$。注意力本身对选中槽位做加权求和，并把每头一个可学习的汇聚点标量加在分母上——汇聚点只进分母、不参与取最大值，也不携带值向量。</p>
+<p>三种层模式决定了「谁算、谁复用」：Full 层自算主 KV、索引器 K 与 Top-K；Reindex 层复用最近的主 KV 与索引器 K，但自己重算 Top-K（在候选池内）；Reuse 层连 Top-K 一起复用，不算索引分。模式由配置静态决定。</p>
+
+<h2 id="extra">6. Engram 与 DSpark</h2>
+<p><b>Engram</b> 插在层 1 与层 14。它从当前位置往前取长度 2、3、4 的连续片段，各用 8 个哈希函数映射到嵌入表下标，共 24 个下标（每 token 取回 $24\times256=6144$ 个表元素）；取回的向量经一个稠密投影写回残差流，写入强度由「流与查表结果的归一化点积取绝对值开方、保留符号后过 sigmoid」的门控决定。两层嵌入表合计约 196B 参数，但每 token 只取回六千多个元素；真正计入激活的是那个稠密投影，每层 157.33M。</p>
+<p><b>DSpark</b> 是块式推测解码的草稿头：3 个 MTP 块，每块一次前向产出 5 个草稿位置。输入取主干层 37、38、39 的注意力输入，先在超连接副本维取均值，再把三层结果沿特征维拼接（<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> 即此）。草稿块自身是 MoE 结构，128 个专家取 top-3；末块另带 Markov 头（秩 256）与置信头，用于决定接受几个草稿。它不产生主干缓存，只提高 decode 吞吐。</p>
+
+<h2 id="verify">7. 核对方式</h2>
+<p><b>结构与形状</b>：用 HTTP Range 请求读取全部 48 个 safetensors 分片的 JSON 头（未下载权重本体），得到 96085 个张量的名称、形状与 dtype。以此交叉验证配置与源码推断：层数、专家数、各模块形状、MTP 张量数。</p>
+<p><b>公式与数值行为</b>：按官方实现逐行语义复现各算子，用官方配置的真实维度在随机张量上实跑。已完成对照包括压缩器池化（与独立重实现逐位一致）、Sinkhorn 迭代（float64 最大差 8.9e-08）、路由打分（indices 完全一致、权重最大差 0）、RoPE 频率、稀疏注意力（与解析解逐元素差 0）、FP4 量化误差。</p>
+<p><b>缓存与激活账</b>：<code>verify_cache_size.py</code> 按配置与源码常量推出每 token 890 字节；<code>verify_active_params.py</code> 用真实张量头加配置专家数算得半栈 7.8929B / 7.5758B，并由 <code>verify_halfstack_diff.py</code> 分解两者差额。</p>
+<p><b>端到端数据流</b>：构造等比缩小但保留全部结构特征的模型（dim 64、7 层），跑通 prefill 与逐 token decode。由此复现并定位了参考实现的一处行为：压缩比大于 1 的层在解码步的组未填满时读到其他层发布的索引键。</p>
+<p>实测脚本与原始输出存档于 <code>wiki/deepseek-v4-1/research/</code>；形状明细见 <code>ckpt/verify_dataflow_shapes.out</code>。</p>
+
+<h2 id="sources">来源与范围说明</h2>
+<table>
+  <tr><th>项目</th><th>依据</th></tr>
+  <tr><td>全部 config 数值</td><td>官方推理配置 <code>official/inference/config.json</code>（<code>generate.py</code> 中 <code>ModelArgs(**json.load(f))</code> 实际读取的文件）</td></tr>
+  <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方推理实现 <code>official/inference/model.py</code> 与 <code>kernel.py</code>（机制对应位置：压缩器池化见 <code>model.py</code> L458–485，频率表按层分支见 L680–687，超连接读出与写回见 L982–994，稀疏注意力内核见 <code>kernel.py</code> L310–403）</td></tr>
+  <tr><td>张量形状与 dtype、参数量、层分布</td><td>真实 checkpoint 的 48 个 safetensors 分片头（HTTP Range 读取，共 96085 个张量，存档 <code>ckpt/headers.json</code>）</td></tr>
+  <tr><td>设计动机与对外宣称</td><td>DeepSeek-V4.1-Flash 技术报告（<code>research/official/tech_report.txt</code>，页面标注的「行 N」即该文件行号）</td></tr>
+  <tr><td>池化、Sinkhorn、路由、RoPE、稀疏注意力、FP4 误差、缓存账、激活账、端到端一致性</td><td>本机实测，脚本与存档见 <code>research/*.py</code> 与 <code>research/ckpt/*.out</code></td></tr>
+</table>
+<p style="color:var(--text-light);font-size:14px">核对说明：本页只描述官方参考实现与配置的实际行为，并把报告的宣称（1/4、1/437、1/8 三个倍数、prefill 减半、有界重放）与服务实现的优化分开陈述。训练流程、服务端 KV 分层调度、视觉编码器内部结构与量化 kernel 实现不在本页范围。形状与维度取自官方配置与真实张量头；机制数值结论由本机脚本实算。</p>

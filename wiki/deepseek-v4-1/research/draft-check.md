@@ -1,0 +1,27 @@
+# DeepSeek-V4.1-Flash 初稿检查
+
+- 输入版本：`research/scope.md`（含 5 条学习目标 Q1–Q5、前置概念映射、排除项）、`research/evidence.md`（C1–C11 / F1–F9 / N1–N9）、`research/outline.md`（页面开头 + 5 章 + 贯穿示例）、`research/glossary.md`（术语与符号表）——四份规划产物在写作前均已就位，写作期间未返回修改。
+- 大纲落实：
+  - 页面开头：`blockquote.meta`（主要依据）→ `callout-blue`（范围与口径说明）→ `learning-goals`（核心问题 5 条，每条带解答折叠块）→ `misconceptions`（5 条常见误解）——逐项落实。
+  - 章节：第 1 章 890 字节的账（1.1 压缩条目 / 1.2 条目 288 字节 / 1.3 四个 source 层的份数账）、第 2 章 CED 与 prefill 半栈（2.1 编码器与解码器 / 2.2 全局 KV 由 $H_{L/2}$ 投影 / 2.3 窗口 KV 不能一起省）、第 3 章 可见集与两级筛选（3.1 可见集两部分 / 3.2 可达条目数 / 3.3 候选池 / 3.4 三模式 / 3.5 稀疏注意力 / 3.6 复算代码）、第 4 章 激活参数（4.1 单层 377M / 4.2 半栈加总）、第 5 章 Engram 与 DSpark——章节标题、顺序与职责与大纲一致。
+  - 学习目标：Q1–Q5 分别由第 1、2、3、4、5 章承担，核心问题块末句均指明完整论证所在章节。
+  - 前置知识：15 个前置概念页链接全部落在正文首次依赖处（kv-cache、mla、rmsnorm、mxfp4-qat、mixed-precision-quant、residual-connection、sliding-window-attention、cross-layer-kv-sharing、attention-sink、rope、dsa、hyper-connections、deepseek-moe、aux-loss-free-routing、ngram、speculative-decoding）；其中滑动窗口、注意力汇聚点、跨层 KV 复用三页由本轮递归生成。
+  - 贯穿示例：位置 4999 的 query 在层 2 / 层 20 上的字节贡献（第 1 章）、KV 来源（第 2 章）、可达条目 2500 与 5000（第 3 章）逐章推进。
+  - 误解与边界：5 条常见误解置于页面开头；报告设计与参考实现的边界在第 2.2 节折叠块、第 3.4 节折叠块与文末「简化条件及其限制」三处分别说明。
+  - 过渡：第 1 章末句从「存多少」转「谁来产生」（第 2 章开篇承此），第 2 章末句从「缓存里有什么」转「query 能拿到什么」（第 3 章开篇承此），第 4 章开篇说明它是一笔独立账。
+- 目标覆盖检查（逐题核对）：
+  - Q1「890 字节怎么算出来的」→ 第 1 章 1.2、1.3 节完整回答，含 720+170 的加总与 8352 的反事实。
+  - Q2「CED 为什么让 prefill 只跑一半」→ 第 2 章 2.1–2.3 节完整回答，含公式 F7、参考实现对应位置与窗口 KV 的例外。
+  - Q3「一个 query 能看到哪些位置」→ 第 3 章 3.1–3.5 节完整回答，含可达性公式、候选池与三模式。
+  - Q4「8B/16B 怎么加出来的」→ 第 4 章 4.1、4.2 节完整回答，含单层构成表、半栈差额分解表与口径说明。
+  - Q5「Engram 与 DSpark 各补什么」→ 第 5 章 5.1、5.2 节完整回答。
+  - 无目标被折叠块独占：890 的加总、8B/16B 的加总、可达性枚举、超连接参数量四项的**结论**均在正文，折叠块只承载完整算式与细节。
+- 代码运行：
+  - 第 3.6 节代码块（可达条目数与 Top-K 选择语义复算）。运行命令 `/usr/bin/python3 research/verify_reach_topk.py`，退出码 0。实际输出与页面「预期输出」逐行一致：比对 0 处不符、`i=4999 r=2` 得 2500 条、`i=4 r=2` 得 2 条、未屏蔽时前 4 名为 `[0, 2, 6, 7]`、屏蔽后为 `[0, 2, 3, 4]`、`全在可达范围内: True`。存档 `research/ckpt/verify_reach_topk.out`。
+  - 页面引用的其他实测脚本（`verify_cache_size.py`、`verify_active_params.py`、`verify_halfstack_diff.py` 等）在写作前已跑过，输出存档于 `research/ckpt/`；本页正文数字取自这些存档，未在本次写作中重跑。
+- 机械检查：`/usr/bin/python3 .dojo/scripts/validate.py wiki/deepseek-v4-1/index.html` → `validation ok`。另用脚本核对：正文引用 28 项与来源章节定义 28 项双向闭合（两个差集均为空）、无相邻双上标、TAB 字符 0、占位符 0、`@content` 注释已清除。
+- 公式渲染与交互：headless Chrome（`--headless=new --virtual-time-budget=20000 --dump-dom`）实测——`.katex` 节点 237 个、页面无残留 `【` 占位符、无 `.dg-label` 重叠（0 对）、`<details>` 与 `<summary>` 各 26 个、`ol.chapter-questions` 6 块共 16 个问题且 16 个解答折叠块齐全。资源错误事件 1 个，来自模板自带的空 `<img id="lightboxImg" src="">`，非本页内容问题。
+- 写作偏差：
+  - 第 4.2 节的半栈差额分解表为写作时新增的核对手段（大纲只要求「半栈合计」，未要求差额分解）。为落实「数字必须实际运行得出」，新增脚本 `research/verify_halfstack_diff.py` 计算差额来源，脚本输出与正文表格一致。属局部补充，未改变大纲结构。
+  - 大纲 4.5 节列出的「结构图（DSpark 数据流）」改为文字描述加顺序流程图（Engram 部分），DSpark 未单独配图——大纲把两张结构图分别指定给「20+20 层与全局 KV 来源」与「两级筛选」，两者均已落实；Engram 的查表流程图属新增，DSpark 的草稿链以正文文字说明。未改变大纲要求的两张图。
+  - 第 3.6 节的可运行代码同时验证「可达性公式」与「Top-K 语义」两件事（大纲要求「验证可达性规则与 Top-K 语义可复算」），合并为一个脚本以便对照观察。
