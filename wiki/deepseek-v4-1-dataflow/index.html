@@ -1,0 +1,1376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="552B 主干加 196B Engram 参数、原生 1M 上下文：40 层按 Causal Encoder-Decoder 切成两半，解码器全局 KV 由编码器末层投影；全局 KV 用 CSA2 管理（每 r 个 token 池化一条、同压缩比跨层共享、Top-512 稀疏选择），主 KV 存 FP4、窗口 KV 存 FP8，每 token 缓存 890 字节；prefill 激活 8B、decode 16B。全部数字由官方配置、参考实现、真实 checkpoint 张量头与本机实测核对。">
+  <meta name="dojo:summary" content="552B 主干 + 196B Engram；40 层 = 20 层编码器 + 20 层解码器，解码器全局 KV 由 $H_{L/2}$ 投影而来；主 KV 以 FP4 存储，每条目 288 字节，压缩比 2 的三个 source 层折合 144 B/token、压缩比 1 的层折合 288 B/token，加索引器 K 170 B 得每 token 890 字节；可见集 = 窗口 128 个位置 + 索引器选出的 Top-512 压缩条目，候选池 $2048 \times 8 = 16384$；MoE 384 专家取 top-6 加 1 个共享专家；Engram 插在层 1、14，DSpark 为 3 个草稿块。">
+  <meta name="dojo:type" content="note">
+  <meta name="dojo:topics" content="模型结构,内存与缓存">
+  <meta name="dojo:tag" content="数据流速查">
+  <title>DeepSeek-V4.1-Flash 前向数据流 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
+  <script src="../../libs/cytoscape.min.js"></script>
+<script src="../../libs/dagre.min.js"></script>
+<script src="../../libs/cytoscape-dagre.min.js"></script>
+<script defer src="../../libs/prism.min.js"></script>
+  <script defer src="../../libs/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <style>
+    /* ============ 设计令牌 ============ */
+    :root {
+      /* 排版 */
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, Menlo, Consolas, 'Courier New', monospace;
+
+      /* 字号 */
+      --fs-title: 40px;
+      --fs-h1: 28px;
+      --fs-h2: 22px;
+      --fs-h3: 18px;
+      --fs-body: 18px;
+      --fs-small: 14px;
+      --fs-caption: 13px;
+
+      /* 行高 */
+      --lh-tight: 1.25;
+      --lh-body: 1.7;
+      --lh-loose: 1.85;
+
+      /* 间距 */
+      --space-section: 4rem;
+      --space-paragraph: 1.5rem;
+
+      /* 宽度 */
+      --max-width: 1200px;
+    }
+    html[data-theme="light"] {
+      --text: rgba(0, 0, 0, 0.88); --text-light: rgba(0, 0, 0, 0.6); --text-muted: rgba(0, 0, 0, 0.4);
+      --bg: #f7f5ef; --bg-soft: #fafafa; --bg-code: #f6f8fa;
+      --border: rgba(0, 0, 0, 0.1); --border-light: rgba(0, 0, 0, 0.05);
+      --blue: #0969da; --red: #cf222e; --green: #1a7f37; --yellow: #9a6700; --purple: #8250df;
+    }
+    html[data-theme="dark"] {
+      --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+      --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+      --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+      --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) {
+        --text: rgba(255, 255, 255, 0.88); --text-light: rgba(255, 255, 255, 0.6); --text-muted: rgba(255, 255, 255, 0.4);
+        --bg: #0d1117; --bg-soft: #161b22; --bg-code: #1c2128;
+        --border: rgba(255, 255, 255, 0.12); --border-light: rgba(255, 255, 255, 0.06);
+        --blue: #58a6ff; --red: #f85149; --green: #3fb950; --yellow: #d29922; --purple: #bc8cff;
+      }
+    }
+
+    /* ============ 基础重置 ============ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+    body {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 4rem 1.5rem 6rem;
+      font-family: var(--font-body);
+      font-size: var(--fs-body);
+      line-height: var(--lh-body);
+      color: var(--text);
+      background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg);
+      background-size: 100% 36px;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ============ 顶部进度条 ============ */
+    .progress-bar {
+      position: fixed; top: 0; left: 0;
+      height: 2px; width: 0;
+      background: var(--blue);
+      z-index: 1000; transition: width 0.05s linear;
+    }
+
+    /* ============ 顶部导航 ============ */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-light);
+      padding: 0.7em 1.5em;
+    }
+    @media (prefers-color-scheme: dark) {
+      html:not([data-theme]) .nav { background: rgba(13, 17, 23, 0.72); }
+    }
+    html[data-theme="light"] .nav { background: rgba(255, 255, 255, 0.72); }
+    html[data-theme="dark"] .nav { background: rgba(13, 17, 23, 0.72); }
+    .nav-inner {
+      max-width: var(--max-width); margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .nav-brand {
+      color: var(--text); text-decoration: none;
+      font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    /* ============ 导语与元信息 ============ */
+    .page-lead {
+      font-size: 1.06rem;
+      color: var(--text-light);
+      margin: -0.6rem 0 0.6rem;
+    }
+    .page-meta {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: 0 0 0.5rem;
+    }
+    .nav-links { display: flex; gap: 1.5em; align-items: center; }
+    .nav-links a {
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--blue); }
+
+    /* ============ 标题 ============ */
+    h1.title {
+      font-family: var(--font-ui);
+      font-size: var(--fs-title);
+      font-weight: 700;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.02em;
+      margin: 0 0 1.5rem;
+      color: var(--text);
+    }
+
+    body > h2 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h1);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      letter-spacing: -0.01em;
+      margin: var(--space-section) 0 1.5rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    body > h3 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h2);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2.5rem 0 1rem;
+      color: var(--text);
+    }
+
+    h4 {
+      font-family: var(--font-ui);
+      font-size: var(--fs-h3);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      margin: 2rem 0 0.8rem;
+      color: var(--text);
+    }
+
+    /* 锚点跳转时避开顶部固定导航 */
+    h2, h3 { scroll-margin-top: 90px; }
+
+    /* ============ 段落与文本 ============ */
+    p {
+      margin: 0 0 var(--space-paragraph);
+      hanging-punctuation: first;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    strong, b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    em, i { font-style: italic; }
+
+    a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    a:hover { border-bottom-color: var(--text); }
+
+    /* ============ 列表 ============ */
+    ul, ol { padding-left: 1.5rem; margin: 0 0 var(--space-paragraph); }
+    li { margin-bottom: 0.5rem; }
+    li:last-child { margin-bottom: 0; }
+
+    /* ============ callout（更克制） ============ */
+    .callout {
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      border-left: 3px solid var(--blue);
+      background: transparent;
+      color: var(--text-light);
+    }
+    .callout p:first-child { margin-top: 0; }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout b, .callout strong { color: var(--text); }
+
+    .callout-blue { border-left-color: var(--blue); }
+    .callout-red { border-left-color: var(--red); }
+    .callout-green { border-left-color: var(--green); }
+    .callout-yellow { border-left-color: var(--yellow); }
+    .callout-purple { border-left-color: var(--purple); }
+    .callout-gray { border-left-color: var(--text-muted); }
+
+    .text-red { color: var(--red); }
+    .text-green { color: var(--green); }
+    .text-blue { color: var(--blue); }
+    .text-yellow { color: var(--yellow); }
+    .text-purple { color: var(--purple); }
+    .text-gray { color: var(--text-muted); }
+
+    /* ============ 元信息 blockquote ============ */
+    blockquote {
+      border-left: 2px solid var(--border);
+      padding: 0.5rem 0 0.5rem 1.5rem;
+      margin: 2rem 0;
+      color: var(--text-light);
+      font-style: normal;
+    }
+    blockquote.meta p { margin: 0.3rem 0; }
+    blockquote.meta p b { color: var(--text); font-weight: 600; }
+
+    /* ============ 表格（distill 风格） ============ */
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 2rem 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: var(--fs-small);
+      font-family: var(--font-ui);
+    }
+    thead { border-bottom: 1px solid var(--border); }
+    th {
+      text-align: left;
+      font-weight: 600;
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    td {
+      padding: 0.5rem 0.8rem 0.5rem 0;
+      border-bottom: 1px solid var(--border-light);
+      color: var(--text);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr.highlight-row td { background: rgba(154, 103, 0, 0.06); }
+
+    /* ============ 公式 ============ */
+    .katex-display {
+      margin: 1.5rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0.5rem 0;
+    }
+
+    /* ============ 代码 ============ */
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+      background: var(--bg-code);
+      padding: 0.15em 0.4em;
+      border-radius: 3px;
+      color: var(--text);
+    }
+    pre { margin: 0; }
+    /* Prism 主题已经接管代码块样式，见 prism-primer-light.css */
+
+    /* ============ 分隔线 ============ */
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 4rem 0;
+    }
+
+    /* ============ Grid ============ */
+    .grid { display: grid; gap: 1.5rem; margin: 2rem 0; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 600px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+
+    /* ============ 图片 ============ */
+    img {
+      max-width: 100%; height: auto;
+      display: block;
+      margin: 2rem auto;
+    }
+
+    /* ============ chapter-summary ============ */
+    .chapter-summary {
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      margin: -0.5rem 0 1.5rem;
+      padding: 0;
+      font-style: normal;
+      line-height: 1.5;
+    }
+
+    /* ============ details 折叠 ============ */
+    details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    /* ============ 本章问题（问题 + 解答折叠块） ============ */
+    .chapter-questions {
+      margin: 1.25rem 0 2rem;
+      padding-left: 1.5rem;
+    }
+    .chapter-questions > li {
+      margin-bottom: 1.25rem;
+      padding-left: 0.25rem;
+    }
+    .chapter-questions > li > p {
+      margin: 0 0 0.5rem;
+      color: var(--text);
+    }
+    .chapter-questions > li > details {
+      margin: 0;
+      border-left-color: var(--border-light);
+      padding-left: 1rem;
+    }
+    details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details[open] summary { margin-bottom: 1rem; }
+
+    /* ============ 首字下沉（可选） ============ */
+    .drop-cap::first-letter {
+      float: left;
+      font-family: var(--font-ui);
+      font-size: 3.5em;
+      line-height: 0.85;
+      padding: 0.1em 0.1em 0 0;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    /* ============ 返回顶部 ============ */
+    .back-to-top {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      width: 38px; height: 38px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 50%;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.2s;
+      font-family: var(--font-ui);
+      font-size: 1.1em;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .back-to-top.visible { opacity: 1; pointer-events: auto; }
+    .back-to-top:hover { transform: translateY(-2px); border-color: var(--text); }
+
+    /* ============ 暗/亮模式切换 ============ */
+    .theme-toggle {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-light);
+      width: 32px; height: 32px;
+      border-radius: 50%; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all 0.2s; font-size: 1em; line-height: 1;
+      padding: 0;
+    }
+    .theme-toggle:hover { color: var(--text); border-color: var(--text); }
+    /* 返回首页按钮（与主题切换同形） */
+    .home-link {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border: 1px solid var(--border); border-radius: 50%;
+      color: var(--text-light); text-decoration: none;
+      font-size: 1em; line-height: 1;
+      transition: all 0.2s;
+    }
+    .home-link:hover { color: var(--text); border-color: var(--text); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+    html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+    /* ============ 侧边目录 ============ */
+    .toc {
+      position: fixed;
+      top: 80px;
+      left: calc(50% - var(--max-width) / 2 - 220px);
+      width: 200px;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      padding: 0 1rem 0 0;
+      line-height: 1.5;
+    }
+    .toc-title {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); margin: 0 0 0.8rem;
+    }
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 0; }
+    .toc a {
+      display: block; padding: 0.25rem 0 0.25rem 0.8rem;
+      color: var(--text-light); text-decoration: none;
+      border-bottom: none; border-left: 2px solid transparent;
+      transition: all 0.2s;
+      font-size: 13px; line-height: 1.4;
+    }
+    .toc a:hover { color: var(--text); border-left-color: var(--border); }
+    .toc a.active {
+      color: var(--blue); border-left-color: var(--blue); font-weight: 500;
+    }
+    .toc a.sub { padding-left: 1.6rem; font-size: 12px; color: var(--text-muted); }
+    .toc a.sub:hover { color: var(--text-light); }
+    @media (max-width: 1400px) { .toc { display: none; } }
+
+    /* ============ 图片点击放大（lightbox） ============ */
+    .lightbox {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 2000; cursor: zoom-out; padding: 2rem;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img {
+      max-width: 95%; max-height: 95vh;
+      margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border-radius: 4px;
+    }
+    .lightbox-caption {
+      position: absolute; bottom: 1.5rem; left: 0; right: 0;
+      text-align: center; color: rgba(255,255,255,0.8);
+      font-family: var(--font-ui); font-size: 14px;
+      padding: 0 1rem;
+    }
+    /* 让文章里的图片有"可点击"提示 */
+    .article-image {
+      cursor: zoom-in; transition: opacity 0.2s;
+    }
+    .article-image:hover { opacity: 0.92; }
+
+    /* ============ 代码块复制按钮 ============ */
+    .code-block {
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute; top: 0.6rem; right: 0.6rem;
+      background: var(--bg); color: var(--text-light);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.6rem;
+      font-family: var(--font-ui); font-size: 11px;
+      cursor: pointer; opacity: 0;
+      transition: opacity 0.2s, color 0.2s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text); }
+    .copy-btn.copied {
+      color: var(--green); border-color: var(--green); opacity: 1;
+    }
+
+    /* ============ 代码块折叠（details 包 pre） ============ */
+    details.code-details {
+      margin: 1.5rem 0;
+      padding: 0;
+      border-left: 2px solid var(--border);
+      padding-left: 1.5rem;
+    }
+    details.code-details summary {
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-weight: 500;
+      font-size: var(--fs-small);
+      color: var(--text-light);
+      list-style: none;
+      display: inline-block;
+      border-bottom: 1px dashed var(--border);
+      padding-bottom: 0.1em;
+      margin-bottom: 0.5rem;
+    }
+    details.code-details summary::-webkit-details-marker { display: none; }
+    details.code-details summary:hover { color: var(--text); border-bottom-color: var(--text); }
+    details.code-details[open] summary { margin-bottom: 1rem; }
+    /* details 内的 pre 去掉外边距，和 summary 紧贴 */
+    details.code-details pre { margin: 0; }
+    details.code-details pre[class*="language-"] { margin: 0; }
+
+    /* ============ 章节折叠按钮 ============ */
+    h2 .collapse-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+      font-weight: 400;
+      vertical-align: middle;
+      transition: all 0.2s;
+      font-family: var(--font-ui);
+    }
+    h2 .collapse-btn:hover { color: var(--text); border-color: var(--text); }
+    h2.collapsed .collapse-btn { transform: rotate(-90deg); }
+
+    /* ============ 阅读时间估计 ============ */
+    .reading-time {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: -0.5rem 0 2rem;
+    }
+
+
+
+    /* ============ 概念学习：上下文与目标模块 ============ */
+    .context-box {
+      margin: 2rem 0;
+      padding: 1.2rem 1.5rem;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      background: var(--bg-soft);
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .context-box-title {
+      font-weight: 600;
+      margin: 0 0 0.8rem;
+      color: var(--text);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: 9em 1fr;
+      gap: 0.55rem 1rem;
+      align-items: start;
+    }
+    .context-label { color: var(--text-muted); font-weight: 500; }
+    .context-value { color: var(--text); }
+    .learning-goals,
+    .misconceptions {
+      margin: 2rem 0;
+      padding: 1rem 1.25rem;
+      border-left: 3px solid var(--green);
+      background: transparent;
+    }
+    .misconceptions { border-left-color: var(--red); }
+    .learning-goals h2,
+    .misconceptions h2 {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      line-height: var(--lh-tight);
+      color: var(--text);
+      font-size: var(--fs-h3);
+      margin: 0 0 0.8rem;
+      padding: 0;
+      border: none;
+    }
+    .learning-goals ul,
+    .learning-goals ol,
+    .misconceptions ul { margin-bottom: 0; }
+    /* ============ 图示（HTML/SVG，禁用 ASCII 字符画） ============ */
+    .diagram {
+      margin: 1.5rem 0;
+      padding: 1.25rem;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: var(--font-ui);
+      font-size: var(--fs-small);
+    }
+    .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+    .diagram svg text { fill: var(--text); font-family: var(--font-ui); }
+    .diagram svg .dg-line { stroke: var(--text-light); fill: none; }
+    .diagram svg .dg-box { fill: var(--bg); stroke: var(--border); }
+    .diagram svg .dg-accent { stroke: var(--blue); fill: none; }
+    /* SVG 内的公式标签：用 foreignObject 承载 HTML，KaTeX 可正常渲染 */
+    .diagram svg foreignObject { overflow: visible; }
+    .diagram svg .dg-label {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: nowrap;
+    }
+    .diagram svg .dg-label .katex { font-size: 1em; }
+    .diagram svg .dg-label-center { text-align: center; }
+    .diagram svg .dg-label-right { text-align: right; }
+    .diagram-caption {
+      margin: 0.75rem 0 0;
+      color: var(--text-light);
+      font-size: var(--fs-caption);
+      line-height: 1.5;
+      text-align: center;
+    }
+    /* 流程链：横向节点 + 箭头，窄屏自动换行 */
+    .dg-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; }
+    .dg-node {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      line-height: 1.45;
+    }
+    .dg-node-title { color: var(--text); font-weight: 600; }
+    .dg-node-note { color: var(--text-light); font-size: var(--fs-caption); }
+    .dg-arrow {
+      flex: 0 0 auto;
+      align-self: center;
+      color: var(--text-muted);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+    /* 分层结构：纵向堆叠，从上到下表示层级或阶段 */
+    .dg-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+    .dg-layer {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--blue);
+    }
+    .dg-layer-label {
+      flex: 0 0 auto;
+      color: var(--blue);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+    .dg-layer-body { flex: 1 1 auto; color: var(--text); line-height: 1.45; }
+    @media (max-width: 600px) {
+      .dg-flow { flex-direction: column; }
+      .dg-arrow { align-self: flex-start; transform: rotate(90deg); }
+    }
+    @media (max-width: 600px) {
+      .context-grid { grid-template-columns: 1fr; gap: 0.25rem; }
+      .context-label { margin-top: 0.4rem; }
+    }
+
+    /* ============ 移动端 ============ */
+    @media (max-width: 768px) {
+      :root {
+        --fs-title: 32px;
+        --fs-h1: 24px;
+        --fs-h2: 19px;
+        --fs-h3: 16px;
+        --fs-body: 17px;
+      }
+      body { padding: 3.5rem 1.2rem 4rem; }
+      .nav-inner { font-size: 13px; }
+      .nav-brand { max-width: 40%; }
+      .nav-links { gap: 0.5em; }
+      .nav-links a, .nav-links button { font-size: 12px; }
+      blockquote { padding-left: 1rem; }
+      .callout { padding: 1rem 1.2rem; }
+      details { padding-left: 1rem; }
+      .copy-btn { opacity: 1; }
+    }
+
+    /* ============ 打印 ============ */
+    @media print {
+      .nav, .back-to-top, .progress-bar { display: none; }
+      body { padding: 0; max-width: none; font-size: 11pt; }
+      a { color: var(--text); border-bottom: none; }
+    }
+
+    /* ============ KaTeX 微调 ============ */
+    .katex { font-size: 1.05em; }
+  </style>
+<style>
+/* ---------- 页面自定义 ---------- */
+
+  
+  * { box-sizing: border-box; }
+  body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--font-body); }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  nav { font: 14px/1.4 var(--font-ui); margin-bottom: 2rem; }
+  nav a { color: var(--text-light); text-decoration: none; }
+  nav a:hover { color: var(--blue); }
+  header { padding-bottom: 1.8rem; border-bottom: 1px solid var(--border); }
+  .eyebrow { color: var(--blue); font: 13px/1.4 var(--font-mono); }
+  h1, h2, h3 { font-family: var(--font-body); line-height: 1.3; }
+  h1 { margin: .5rem 0 .8rem; font-size: 2.1rem; }
+  h2 { margin: 2.6rem 0 1rem; font-size: 1.5rem; }
+  h3 { margin: 1.6rem 0 .5rem; font-size: 1.1rem; }
+  .lead { margin: 0; color: var(--text-light); font-size: 1.05rem; }
+  .meta { margin-top: .8rem; color: var(--text-muted); font: 13px/1.5 var(--font-mono); }
+  p { margin: 1rem 0; }
+  a { color: var(--blue); }
+  code { font: .84em/1.5 var(--font-mono); background: var(--bg-soft); padding: .12em .35em; border-radius: 4px; }
+  table { width: 100%; border-collapse: collapse; font: 14px/1.55 var(--font-ui); }
+  th, td { padding: .55rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+  th { background: var(--bg-soft); white-space: nowrap; }
+  pre { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font: 12.5px/1.6 var(--font-mono); }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--text-muted); font: 13px/1.5 var(--font-ui); }
+  .note { background: var(--bg-soft); border-left: 3px solid var(--blue); padding: .8rem 1rem; margin: 1.2rem 0; font-size: 15px; }
+
+  /* ---------- 可视化区 ---------- */
+  .viz { margin-top: 1.6rem; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .viz-head { padding: 12px 18px 4px; background: var(--bg-soft); border-bottom: 1px solid var(--border); }
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+  .tab { padding: 5px 13px; border: 1px solid var(--border); border-radius: 20px; background: var(--bg); font-size: 12.5px; cursor: pointer; color: var(--text-light); transition: .15s; font-family: var(--font-ui); }
+  .tab:hover { border-color: var(--blue); color: var(--blue); }
+  .tab.on { background: var(--blue); color: #fff; border-color: var(--blue); font-weight: 600; }
+  .crumb { font-size: 12px; color: var(--text-muted); margin: 8px 0 0; font-family: var(--font-ui); }
+  .crumb b { color: var(--blue); }
+  #cy { width: 100%; height: 600px; background: radial-gradient(#e8edf5 1px, transparent 1px); background-size: 22px 22px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 18px; border-top: 1px solid var(--border); font: 12px/1.6 var(--font-ui); color: var(--text-light); background: var(--bg); }
+  .legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  #tip { position: fixed; z-index: 9; max-width: 440px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 34px rgba(20,40,80,.22); padding: 12px 15px; font-size: 13px; line-height: 1.55; pointer-events: none; opacity: 0; transition: opacity .12s; font-family: var(--font-ui); }
+  #tip.show { opacity: 1; }
+  #tip h4 { margin: 0 0 6px; font-size: 13.5px; }
+  #tip .k { color: var(--text-muted); font-size: 11px; letter-spacing: .4px; margin-top: 8px; font-weight: 700; }
+  #tip .io { font-family: var(--font-mono); font-size: 12px; background: var(--bg-soft); border-radius: 5px; padding: 4px 7px; margin-top: 3px; white-space: pre-wrap; word-break: break-word; }
+  #tip .b { color: #0b64c4; font-weight: 700; }
+  #tip .fx { background: #f6f3fc; border-radius: 5px; padding: 6px 8px; margin-top: 3px; overflow-x: auto; }
+  #tip .katex-display { margin: .2em 0; text-align: left; }
+  #tip .hint { color: #c25b1e; font-size: 11.5px; margin-top: 8px; }
+
+  @media (max-width: 640px) { body { font-size: 16px; } .wrap { padding-top: 1.5rem; } h1 { font-size: 1.7rem; } #cy { height: 470px; } }
+
+</style>
+
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">DeepSeek-V4.1-Flash 前向数据流</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">DeepSeek-V4.1-Flash 前向数据流</h1>
+<p class="page-lead">DeepSeek-V4.1-Flash 是 552B 主干加 196B Engram 参数、原生支持 1M 上下文的多模态 <a href="../deepseek-moe/index.html">MoE</a> 模型。40 层主干按 Causal Encoder–Decoder 切成两半：前 20 层是因果编码器，后 20 层是解码器，解码器的全局 KV 不由本层隐状态产生，而由编码器末层隐状态投影而来——配合解码器滑动窗口的有界重放，prefill 阶段因此可以止于半栈。全局 KV 由 <a href="../cross-layer-kv-sharing/index.html">CSA2</a>（Compressed Sparse Attention 2，压缩稀疏注意力第 2 版）管理：每 $r$ 个 token 池化成一条压缩条目、同压缩比的层跨层共享、再由索引器从至多 512 个条目里稀疏选择；主 KV 以 FP4 存储（每条目 288 字节），窗口 KV 保持 FP8。每 token 全局 KV 缓存 890 字节。另有两个不改变缓存账的模块：<a href="../ngram/index.html">Engram</a> 哈希查表（插在层 1、14）与 <a href="../speculative-decoding/index.html">DSpark</a> 块式推测解码（3 个 MTP 块）。</p>
+<p class="page-meta">生成于 2026-09-10 · 依据官方推理实现 <code>model.py</code>/<code>kernel.py</code> + <code>inference/config.json</code> + 真实 checkpoint 张量头（48 个分片、96085 个张量）+ 本机实测</p>
+<p class="reading-time" id="readingTime"></p>
+
+<h2 id="specs">1. 关键规格</h2>
+<p>下表每一行都可回溯到具体依据。「依据」列给出配置字段名、源码位置或实测脚本，「核对」列说明该数字如何被独立验证。</p>
+<table>
+  <tr><th>项目</th><th>取值</th><th>依据 / 核对方式</th></tr>
+  <tr><td>总参数量</td><td>552B 主干 + 196B Engram</td><td>官方称「552B backbone parameters and 196B Engram parameters」（报告行 320）；<code>count_params.py</code> 按 96085 个张量头独立算得 551.57B + 196.93B</td></tr>
+  <tr><td>主干层数</td><td>40 层 = 20 层编码器 + 20 层解码器</td><td><code>n_layers=40</code>；报告行 314–317 的结构描述；<code>verify_csa2_modes.py</code> 的层表</td></tr>
+  <tr><td>每 token 激活</td><td>8B（prefill）/ 16B（decode）</td><td><code>verify_active_params.py</code>：编码器半栈 7.8929B、解码器半栈 7.5758B（均不含嵌入层与输出头）；decode 为两半之和 15.4687B，8B 与 16B 是报告宣称的取整值</td></tr>
+  <tr><td>每 token 全局 KV 缓存</td><td>890 B</td><td><code>verify_cache_size.py</code>：主 KV 720 + 索引器 K 170，按配置与源码常量逐项推出</td></tr>
+  <tr><td>隐藏维</td><td>5120</td><td><code>dim</code>；<code>attn_norm.weight</code> 形状 <code>[5120]</code></td></tr>
+  <tr><td>注意力头配置</td><td>64 个查询头、1 个 KV 头，头维 512</td><td><code>n_heads</code>/<code>head_dim</code>；<code>wq_b.weight</code> 形状 <code>[32768, 1280]</code> $=64\times512$，<code>wkv.weight</code> 形状 <code>[512, 5120]</code></td></tr>
+  <tr><td>查询低秩维</td><td>1280</td><td><code>q_lora_rank</code>；<code>wq_a.weight</code> 形状 <code>[1280, 5120]</code>、<code>q_norm.weight</code> 形状 <code>[1280]</code></td></tr>
+  <tr><td>输出投影分组</td><td>8 组，组内低秩 1024</td><td><code>o_groups=8</code>/<code>o_lora_rank=1024</code>；<code>wo_a.weight</code> 形状 <code>[8192, 4096]</code> $=(8\times1024)\times(8\times512)$、<code>wo_b.weight</code> 形状 <code>[5120, 8192]</code></td></tr>
+  <tr><td><a href="../rope/index.html">位置编码</a></td><td>仅旋转头维<b>末尾</b> 64 维；频率表按<b>层</b>选择</td><td><code>rope_head_dim=64</code>；<code>model.py</code> L680–687 按层分支：<code>compress_ratio=0</code> 的层 0、1 用 <code>rope_theta=10000</code> 且关 YaRN，<code>compress_ratio&gt;0</code> 的层 2–39 用 <code>compress_rope_theta=160000</code> 且开 YaRN（<code>original_seq_len=65536</code> 乘 <code>rope_factor=16</code> 得 1M 上下文）；<code>verify_rope_yarn.py</code> 复现该频率表（base 160000 时 low=15、high=25）</td></tr>
+  <tr><td><a href="../sliding-window-attention/index.html">滑动窗口</a></td><td>128</td><td><code>window_size=128</code>；<code>verify_sparse_attn_window.py</code> 的环形缓冲对照（$W=8$、序列长 20 全一致）</td></tr>
+  <tr><td>压缩比分布</td><td>层 2–19 为 2；层 20–39 为 1；层 0、1 无全局 KV</td><td><code>compress_ratios</code>；<code>Compressor.__init__</code> 按 <code>compress_ratios[layer_id]</code> 取比值</td></tr>
+  <tr><td><a href="../cross-layer-kv-sharing/index.html">跨层共享</a></td><td>source 层 2/8/14/20；分组 2–7、8–13、14–19、20–39</td><td><code>kv_source_layers</code>；<code>verify_csa2_modes.py</code> 运行期回溯每层读到的缓存属主</td></tr>
+  <tr><td>层模式</td><td>Full = 2/8/14/20；Reindex = 24/28/32/36；其余 30 个压缩层为 Reuse</td><td><code>index_source_layers</code>；同上脚本的实测层表</td></tr>
+  <tr><td>索引器</td><td>32 个头、头维 128，每 query 保留 Top-512</td><td><code>index_n_heads=32</code>/<code>index_head_dim=128</code>/<code>index_topk=512</code></td></tr>
+  <tr><td>候选池</td><td>$2048 \times 8 = 16384$ 个候选位置</td><td><code>candidate_source_layer=20</code>、<code>candidate_topk_blocks=2048</code>、<code>candidate_block_size=8</code>；报告行 565–570</td></tr>
+  <tr><td>MoE</td><td>384 个路由专家取 top-6，另 1 个共享专家；中间维 2304</td><td><code>n_routed_experts</code>/<code>n_activated_experts</code>/<code>n_shared_experts</code>/<code>moe_inter_dim</code>；<code>verify_gate_formula.py</code> 独立重实现 indices 完全一致</td></tr>
+  <tr><td>路由打分与偏置</td><td>$\sqrt{\mathrm{softplus}}$ 打分，偏置只影响选择；权重乘 1.5</td><td><code>score_func="sqrtsoftplus"</code>、<code>route_scale=1.5</code>；<code>gate.weight</code> 形状 <code>[384, 5120]</code>，<code>gate.bias</code> 与 <code>gate.bias_vl</code> 各 <code>[384]</code></td></tr>
+  <tr><td>超连接</td><td>4 份残差流，Sinkhorn 20 轮，末步列方向</td><td><code>hc_mult=4</code>/<code>hc_sinkhorn_iters=20</code>；<code>hc_attn_fn</code> 形状 <code>[24, 20480]</code> $=24\times(4\times5120)$；<code>verify_sinkhorn.py</code> 行、列各 20 次</td></tr>
+  <tr><td>Engram</td><td>层 1、14；阶数 2/3/4 每阶 $8$ 头 = 每 token 24 行</td><td><code>engram_layer_ids=[1,14]</code>、<code>engram_max_ngram_size=4</code>、<code>engram_n_heads=8</code>、<code>engram_head_dim=256</code>；<code>probe_engram_layout.py</code> 实测层分布</td></tr>
+  <tr><td>DSpark</td><td>3 个 MTP 块，每块 5 个草稿位置，目标层 37/38/39</td><td><code>n_mtp_layers=3</code>/<code>dspark_block_size=5</code>/<code>dspark_target_layer_ids</code>；<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> $=5120\times(3\times5120)$</td></tr>
+  <tr><td>词表与上下文</td><td>词表 129280，上下文 1M</td><td><code>vocab_size</code>；<code>embed.weight</code> 与 <code>head.weight</code> 形状均为 <code>[129280, 5120]</code></td></tr>
+  <tr><td>视觉侧</td><td>32 层 ViT，宽 1024，patch 14，下采样 3</td><td><code>vision_n_layers</code>/<code>vision_dim</code>/<code>vision_patch_size</code>/<code>vision_downsample_ratio</code></td></tr>
+</table>
+
+<h2 id="flow">2. 交互式数据流</h2>
+<p>下图是实际前向路径。六个标签页切换粒度：整体总览之外，可下钻到注意力内部、压缩与稀疏选择、MoE 内部、Engram 注入与 DSpark 草稿链。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。形状与维度取自官方配置与真实 checkpoint 张量头。</p>
+
+<div class="viz">
+  <div class="viz-head">
+    <div class="tabs" id="tabs"></div>
+    <div class="crumb" id="crumb"></div>
+  </div>
+  <div id="cy"></div>
+  <div class="legend" id="legend"></div>
+</div>
+<div id="tip"></div>
+
+<h2 id="points">3. 要点</h2>
+
+<h3>整体结构：两半 + 四个缓存生产者</h3>
+<ul>
+  <li><b>沿深度</b>：40 层被切成前 20 层编码器（层 0–19）与后 20 层解码器（层 20–39）。解码器的全局 KV 不由各自隐状态产生，而由编码器末层隐状态 $H_{L/2}$ 投影得到；与跨层共享结合后只有层 20（解码器的 Full 层）执行这次投影。因此 prefill 跑完编码器就已拿到解码器所需的全局 KV。</li>
+  <li><b>沿缓存</b>：全模型只有 4 个层生产主 KV——层 2、8、14、20，对应压缩比 2、2、2、1。其余压缩层读同组 source 层的缓存，因此主 KV 的份数是 4 而非 40。这一项与压缩比、FP4 一起把每 token 缓存压到 890 字节。</li>
+  <li><b>前两层只有窗口</b>：层 0、1 的压缩比为 0（<code>compress_ratios</code> 前两位），不复用也不生产全局 KV，只有滑动窗口注意力。</li>
+  <li><b>沿宽度</b>：每层 384 个路由专家取 top-6，另加 1 个共享专家恒激活；专家中间维 2304。路由专家占层参数量的绝大部分，但每 token 只动用其中 6 个。</li>
+  <li><b>两条附加路径</b>：<a href="../ngram/index.html">Engram</a> 在层 1、14 把 n-gram 哈希查表结果写进残差流（不产生缓存）；<a href="../speculative-decoding/index.html">DSpark</a> 用层 37、38、39 的注意力输入驱动 3 个草稿块（不改变主干缓存）。</li>
+</ul>
+
+<h3>注意力：单 KV 头 + 低秩投影 + 8 组输出</h3>
+<ul>
+  <li><b>查询侧</b>：<code>wq_a</code> 把 5120 维压到 1280 维低秩，<code>q_norm</code> 归一化后再由 <code>wq_b</code> 展开成 $64 \times 512$ 维（64 个头、头维 512）。</li>
+  <li><b>键值侧</b>：只有 1 个 KV 头、头维 512，由 <code>wkv</code> 一次投影得到，经 <code>kv_norm</code> 归一化。多头查询共享同一份键值——这是把 KV 宽度压到 512 维的关键。</li>
+  <li><b>输出侧</b>：$64 \times 512 = 32768$ 维，先按 8 组各降到 1024 维（<code>wo_a</code>），再拼回 5120 维（<code>wo_b</code>）。<code>o_groups=8</code> 与 <code>o_lora_rank=1024</code> 是官方配置取值；分组的设计动机未在来源中说明，此处只陈述分组这一事实与其形状。</li>
+  <li><b>位置</b>：只旋转头维的<b>末尾</b> 64 维（源码用 <code>x[..., -rd:]</code> 切片，<code>rd = rope_head_dim = 64</code>）。频率表按<b>层</b>选择，不是按路径分：层 0、1（<code>compress_ratio=0</code>）用 base 10000 且关闭 YaRN；层 2–39（<code>compress_ratio&gt;0</code>）用 base 160000 且开启 YaRN，该层的查询、窗口 KV 与压缩条目共用同一份频率表（<code>model.py</code> L680–687 按层分支，L706、L758、L772 三处调用同一个 <code>freqs_cis</code>）。</li>
+</ul>
+
+<h3>可见集：窗口 128 个位置 + Top-512 压缩条目</h3>
+<ul>
+  <li>每个 query 能看到本层窗口内最多 128 个原始位置（FP8 存储），加上该层所属压缩比组中由索引器选出的至多 512 个压缩条目。</li>
+  <li>压缩条目按组编号，组 $j$ 覆盖 token $[jr,(j+1)r)$，位置取 $j\cdot r$；只有整组出现后条目才可达，可达条数是 $\lfloor(i+1)/r\rfloor$。</li>
+  <li>解码器还有一级候选池：建池层（层 20）按块打分选出 2048 个块、每块 8 个位置，共 16384 个候选；后续 Reindex 层只在这个池内选 Top-512。</li>
+</ul>
+
+<h2 id="ced">4. CED：解码器的全局 KV 从哪里来</h2>
+<p>报告对这一段给出的形式是 $C_l = H_{L/2}W_l^{KV}$、$Z_l = H_{L/2}W_l^{Z}$（$l > L/2$）：解码器各层的键值条目由编码器末层隐状态投影得到，投影权重逐层不同。共享的是<b>输入</b> $H_{L/2}$，不是投影结果。</p>
+<p>与跨层共享结合后还有一层收窄：真正执行这次投影的只有被指派为 Full 模式的解码器层。本模型的配置里这个层是层 20，参考实现中的表现是「层 20 的压缩器读取它自己的注意力输入」，而第 20 层的注意力输入正是第 19 层的输出，与公式里的 $H_{L/2}$ 对上。</p>
+<p><b>滑动窗口 KV 不能一起省</b>。窗口 KV 是最近位置的原始精度副本，必须由本层经过完整计算后的隐状态生成；第 $l$ 层的窗口 KV 需要第 $l$ 层的隐状态，而后者要等第 $l-1$ 层算完，这条依赖链无法用「读编码器输出」替代。服务端的替代办法是有界重放：只重算最后 $n_{\text{win}}$ 个位置，因为更早的位置已滑出可见集。参考实现中不含该分支，它属服务实现。</p>
+
+<h2 id="sparse">5. 稀疏选择：从打分到槽位</h2>
+<p>选择的输入是「全部因果可见的压缩条目」，输出是每个 query 的 Top-512 下标。三步：</p>
+<ul>
+  <li><b>打分</b>：索引器用 32 个头对条目打分，每头的贡献是 $\mathrm{ReLU}(q_h\cdot k_j)$ 再乘该头权重，按头求和。</li>
+  <li><b>块级筛选</b>：把位置切成大小 8 的块，块分取块内最大索引分，从建池层（层 20）选出 2048 个块。最新块只填了一部分，会被钉住以免被更早的完整块压过。</li>
+  <li><b>位置级选择</b>：候选池内的 16384 个位置按索引分取前 512，与窗口槽位拼进同一次稀疏注意力调用。</li>
+</ul>
+<p>不可达的条目（编号不小于 $\lfloor(i+1)/r\rfloor$）在打分阶段就被置为 $-\infty$。注意力本身对选中槽位做加权求和，并把每头一个可学习的汇聚点标量加在分母上——汇聚点只进分母、不参与取最大值，也不携带值向量。</p>
+<p>三种层模式决定了「谁算、谁复用」：Full 层自算主 KV、索引器 K 与 Top-K；Reindex 层复用最近的主 KV 与索引器 K，但自己重算 Top-K（在候选池内）；Reuse 层连 Top-K 一起复用，不算索引分。模式由配置静态决定。</p>
+
+<h2 id="extra">6. Engram 与 DSpark</h2>
+<p><b>Engram</b> 插在层 1 与层 14。它从当前位置往前取长度 2、3、4 的连续片段，各用 8 个哈希函数映射到嵌入表下标，共 24 个下标（每 token 取回 $24\times256=6144$ 个表元素）；取回的向量经一个稠密投影写回残差流，写入强度由「流与查表结果的归一化点积取绝对值开方、保留符号后过 sigmoid」的门控决定。两层嵌入表合计约 196B 参数，但每 token 只取回六千多个元素；真正计入激活的是那个稠密投影，每层 157.33M。</p>
+<p><b>DSpark</b> 是块式推测解码的草稿头：3 个 MTP 块，每块一次前向产出 5 个草稿位置。输入取主干层 37、38、39 的注意力输入，先在超连接副本维取均值，再把三层结果沿特征维拼接（<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> 即此）。草稿块自身是 MoE 结构，128 个专家取 top-3；末块另带 Markov 头（秩 256）与置信头，用于决定接受几个草稿。它不产生主干缓存，只提高 decode 吞吐。</p>
+
+<h2 id="verify">7. 核对方式</h2>
+<p><b>结构与形状</b>：用 HTTP Range 请求读取全部 48 个 safetensors 分片的 JSON 头（未下载权重本体），得到 96085 个张量的名称、形状与 dtype。以此交叉验证配置与源码推断：层数、专家数、各模块形状、MTP 张量数。</p>
+<p><b>公式与数值行为</b>：按官方实现逐行语义复现各算子，用官方配置的真实维度在随机张量上实跑。已完成对照包括压缩器池化（与独立重实现逐位一致）、Sinkhorn 迭代（float64 最大差 8.9e-08）、路由打分（indices 完全一致、权重最大差 0）、RoPE 频率、稀疏注意力（与解析解逐元素差 0）、FP4 量化误差。</p>
+<p><b>缓存与激活账</b>：<code>verify_cache_size.py</code> 按配置与源码常量推出每 token 890 字节；<code>verify_active_params.py</code> 用真实张量头加配置专家数算得半栈 7.8929B / 7.5758B，并由 <code>verify_halfstack_diff.py</code> 分解两者差额。</p>
+<p><b>端到端数据流</b>：构造等比缩小但保留全部结构特征的模型（dim 64、7 层），跑通 prefill 与逐 token decode。由此复现并定位了参考实现的一处行为：压缩比大于 1 的层在解码步的组未填满时读到其他层发布的索引键。</p>
+<p>实测脚本与原始输出存档于 <code>wiki/deepseek-v4-1/research/</code>；形状明细见 <code>ckpt/verify_dataflow_shapes.out</code>。</p>
+
+<h2 id="sources">来源与范围说明</h2>
+<table>
+  <tr><th>项目</th><th>依据</th></tr>
+  <tr><td>全部 config 数值</td><td>官方推理配置 <code>official/inference/config.json</code>（<code>generate.py</code> 中 <code>ModelArgs(**json.load(f))</code> 实际读取的文件）</td></tr>
+  <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方推理实现 <code>official/inference/model.py</code> 与 <code>kernel.py</code>（机制对应位置：压缩器池化见 <code>model.py</code> L458–485，频率表按层分支见 L680–687，超连接读出与写回见 L982–994，稀疏注意力内核见 <code>kernel.py</code> L310–403）</td></tr>
+  <tr><td>张量形状与 dtype、参数量、层分布</td><td>真实 checkpoint 的 48 个 safetensors 分片头（HTTP Range 读取，共 96085 个张量，存档 <code>ckpt/headers.json</code>）</td></tr>
+  <tr><td>设计动机与对外宣称</td><td>DeepSeek-V4.1-Flash 技术报告（<code>research/official/tech_report.txt</code>，页面标注的「行 N」即该文件行号）</td></tr>
+  <tr><td>池化、Sinkhorn、路由、RoPE、稀疏注意力、FP4 误差、缓存账、激活账、端到端一致性</td><td>本机实测，脚本与存档见 <code>research/*.py</code> 与 <code>research/ckpt/*.out</code></td></tr>
+</table>
+<p style="color:var(--text-light);font-size:14px">核对说明：本页只描述官方参考实现与配置的实际行为，并把报告的宣称（1/4、1/437、1/8 三个倍数、prefill 减半、有界重放）与服务实现的优化分开陈述。训练流程、服务端 KV 分层调度、视觉编码器内部结构与量化 kernel 实现不在本页范围。形状与维度取自官方配置与真实张量头；机制数值结论由本机脚本实算。</p>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 阅读时间估计 ============
+const bodyText = document.body.innerText || '';
+const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
+const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
+// 中文 350 字/分钟，英文 200 词/分钟
+const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
+const totalChars = chineseChars + englishWords;
+document.getElementById('readingTime').textContent =
+  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+cytoscape.use(window.cytoscapeDagre);
+
+var VIEWS = {
+// ---------- 视图1:整体总览 ----------
+overview: {
+  title:'整体总览 (40 层)',
+  rankSep:42, nodeSep:24,
+  legend:[['#1f9d6b','输入/输出'],['#c0392b','编码器层(可下钻)'],['#7a45c9','解码器层 / 草稿头(可下钻)'],['#e0922f','压缩条目(可下钻)'],['#b7791f','全局 KV'],['#8a93a3','层段']],
+  nodes:{
+    emb:  {label:'embed\nid → 5120', t:'io', io:'token id [1,T] -> [1,T,5120]', f:'x = \\mathrm{Embedding}(\\mathrm{ids})', d:'词嵌入。vocab_size=129280、dim=5120；真实权重 embed.weight 形状 [129280, 5120] BF16。'},
+    e0:   {label:'Layer 0\n纯窗口注意力', t:'enc', drill:'attn', io:'[1,T,5120] -> [1,T,5120]', f:'\\text{SWA only}', d:'层 0 的 compress_ratios 为 0：不生产也不复用全局 KV，只有滑动窗口注意力（窗口 128）。'},
+    e1:   {label:'Layer 1\n窗口 + Engram', t:'enc', drill:'engram', io:'[1,T,5120] -> [1,T,5120]', f:'h \\leftarrow h + \\mathrm{Engram}(h)', d:'全模型两个 Engram 注入层之一（另一个是层 14）。24 行 n-gram 哈希查表结果经稠密投影写回残差流。'},
+    e2:   {label:'Layer 2\nFull：生产主 KV (r=2)', t:'cmp', drill:'sparse', io:'[1,T,5120] -> [1,T,5120]', f:'C_j = \\mathrm{RMSNorm}(\\sum_{t=jr}^{(j+1)r-1}\\mathrm{softmax}(s_t)v_t)', d:'CSA2 的 Full 层：自算主 KV、索引器 K 与 Top-K。压缩比 2，是全模型四个 source 层中的第一个，其缓存被层 2–7 共用。'},
+    e3:   {label:'Layers 3..19\n同模式再重复', t:'grp', io:'[1,T,5120] -> [1,T,5120]', f:'\\text{Full} \\to \\text{Reuse} \\times 5', d:'层 8、14 是另外两个 Full 层（各生产一份 r=2 的主 KV），其余层复用同组缓存。层 19 的输出即 H_{L/2}。'},
+    hmid: {label:'H(L/2)\n编码器末层隐状态', t:'gt', io:'[1,T,5120]', f:'H_{L/2} = \\text{out}(\\text{Layer 19})', d:'解码器全局 KV 的输入。参考实现中层 20 的注意力输入就是它，因此「层 20 的压缩器读自己的输入」等价于「用 H_{L/2} 投影」。'},
+    d20:  {label:'Layer 20\nFull：生产主 KV (r=1)', t:'dec', drill:'attn', io:'[1,T,5120] -> [1,T,5120]', f:'C_{20} = H_{L/2} W_{20}^{KV}', d:'解码器的 Full 层，唯一执行 CED 投影的层。压缩比 1（每 token 一条 288 字节条目），其缓存被层 20–39 共用。'},
+    d21:  {label:'Layers 21..39\n含 4 个 Reindex 层', t:'grp', io:'[1,T,5120] -> [1,T,5120]', f:'\\text{Reuse} \\to \\text{Reindex} \\to \\text{Reuse}', d:'层 24、28、32、36 是 Reindex 层：复用主 KV 与索引器 K，但在候选池内自己重算 Top-K；其余层连 Top-K 一起复用。'},
+    head: {label:'lm_head\n5120 → 129280', t:'io', io:'[1,T,5120] -> [1,T,129280]', f:'\\mathrm{logits} = W_{lm}\\,x', d:'输出头。真实权重 head.weight 形状 [129280, 5120] BF16。'},
+    mtp:  {label:'DSpark\n3 个草稿块', t:'dspark', drill:'dspark', io:'[1,T,5120] -> 5 个草稿位置', f:'\\text{draft} \\times 3\\ \\text{blocks}', d:'块式推测解码。输入取自层 37、38、39 的注意力输入，不改变主干缓存。点击下钻看草稿链。'}
+  },
+  edges:[
+    ['emb','e0','5120'],['e0','e1','5120'],['e1','e2','5120'],['e2','e3','5120'],
+    ['e3','hmid','5120'],['hmid','d20','5120（同时喂 KV 投影）'],['d20','d21','5120'],
+    ['d21','head','5120'],['d21','mtp','5120']
+  ]
+},
+
+// ---------- 视图2:注意力内部 ----------
+attn: {
+  title:'注意力内部（层 2 / 层 20 的 Full 层结构相同，仅压缩比不同）',
+  rankSep:40, nodeSep:20,
+  legend:[['#8a93a3','残差流读写'],['#3f6fd0','注意力主体'],['#b7791f','位置与门控'],['#16a085','缓存'],['#e0922f','压缩条目']],
+  nodes:{
+    in:  {label:'残差流入\n4×5120', t:'grp', io:'[1,T,20480]', f:'x = (x_1,x_2,x_3,x_4)', d:'超连接把残差流复制成 4 份，每份 5120 宽。'},
+    hc1: {label:'attn 超连接\n读出', t:'grp', io:'[1,T,20480] -> [1,T,5120]', f:'\\tilde{x} = \\textstyle\\sum_i \\mathrm{sigmoid}(\\mathrm{mixes}\\cdot\\mathrm{scale}+\\mathrm{base})_i \\odot x_i', d:'读出系数由上一层 FFN 的超连接混合提供（层 0 为 one-hot）；本层 hc_attn_fn（形状 [24, 20480]）产出的 post/comb 系数用于本子层写回，其 attn_pre 供本层 FFN 读出。'},
+    wqa: {label:'wq_a\n5120 → 1280', t:'attn', io:'[1,T,5120] -> [1,T,1280]', f:'q = W_{q_a}\\tilde{x}', d:'查询低秩投影。q_lora_rank=1280；真实权重形状 [1280, 5120]。'},
+    qn:  {label:'q_norm\n1280', t:'attn', io:'[1,T,1280] -> [1,T,1280]', f:'q \\leftarrow \\mathrm{RMSNorm}(q)', d:'低秩后再归一化。q_norm.weight 形状 [1280]。'},
+    wqb: {label:'wq_b\n1280 → 32768', t:'attn', io:'[1,T,1280] -> [1,T,64,512]', f:'64 \\times 512 = 32768', d:'展开成 64 个查询头、头维 512。真实权重形状 [32768, 1280]。'},
+    rope:{label:'RoPE\n仅末尾 64 维', t:'gt', io:'[1,T,64,512]', f:'\\mathrm{rope\\_head\\_dim}=64', d:'只旋转头维的末尾 64 维（源码用 x[..., -rd:] 切片）。频率表按层选择：层 0、1（compress_ratio=0）用 base 10000 且关 YaRN；层 2–39（compress_ratio>0）用 base 160000 且开 YaRN，查询、窗口 KV 与压缩条目共用同一份表。'},
+    wkv: {label:'wkv\n5120 → 512', t:'attn', io:'[1,T,5120] -> [1,T,512]', f:'1\\ \\text{KV head} \\times 512', d:'只有一个 KV 头、头维 512，64 个查询头共享这一份键值。真实权重形状 [512, 5120]。'},
+    kvn: {label:'kv_norm\n512', t:'attn', io:'[1,T,512] -> [1,T,512]', f:'k,v \\leftarrow \\mathrm{RMSNorm}(\\cdot)', d:'键值归一化。kv_norm.weight 形状 [512]。'},
+    win: {label:'窗口 KV\nFP8，128 槽', t:'buf', io:'[bsz, 128, 512]', f:'128 \\times 512 \\times 1\\ \\mathrm{B} = 64\\ \\mathrm{KiB/层}', d:'最近 128 个位置的原始键值，环形缓冲、不随序列长度增长。保持 FP8。'},
+    cmp: {label:'压缩条目\nTop-512 条', t:'cmp', drill:'sparse', io:'[1,T,512,512]', f:'288\\ \\mathrm{B}/\\text{条目} \\times 512', d:'该层所属压缩比组的条目中被索引器选中的 512 条。位置取组起点 j·r。压缩条目由 Compressor 的独立投影产生（自带 wkv 与 norm），不复用窗口 KV 的 wkv/kv_norm。点击下钻看选择过程。'},
+    sink:{label:'汇聚点\n每头 1 个标量', t:'gt', io:'[64] F32', f:'+ e^{\\mathrm{sink}-m}\\ \\text{只进分母}', d:'每头一个可学习标量，加在 softmax 分母上，不携带值向量。真实张量 attn.attn_sink 形状 [64]。'},
+    sa:  {label:'稀疏注意力\n窗口 + 压缩', t:'attn', io:'窗口 128 + 压缩 512 -> [1,T,64,512]', f:'o = \\frac{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m}v_t}{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m} + e^{\\mathrm{sink}-m}}', d:'两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。索引为 $-1$ 的占位槽位分子分母都不贡献。'},
+    woa: {label:'wo_a\n32768 → 8192（8 组）', t:'attn', io:'[1,T,64,512] -> [1,T,8,1024]', f:'o\\_groups=8,\\ o\\_lora\\_rank=1024', d:'按 8 组各降到 1024 维，避免一次处理 32768 维。真实权重形状 [8192, 4096]。'},
+    wob: {label:'wo_b\n8192 → 5120', t:'attn', io:'[1,T,8192] -> [1,T,5120]', f:'y = W_{o_b}o', d:'拼回隐藏维。真实权重形状 [5120, 8192]。'},
+    hc2: {label:'写回四流\n× 系数', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow x_i + \\lambda_i y', d:'子层输出按每流系数写回残差流。'}
+  },
+  edges:[
+    ['in','hc1','20480'],['hc1','wqa','5120'],['wqa','qn','1280'],['qn','wqb','1280'],
+    ['wqb','rope','32768'],['hc1','wkv','5120'],['wkv','kvn','512'],
+    ['kvn','win','FP8 128 槽'],['hc1','cmp','经 Compressor 独立投影'],
+    ['rope','sa','q'],['win','sa','128 位置'],['cmp','sa','512 条目'],['sink','sa','分母'],
+    ['sa','woa','32768'],['woa','wob','8192'],['wob','hc2','5120']
+  ]
+},
+
+// ---------- 视图3:压缩与稀疏选择 ----------
+sparse: {
+  title:'压缩条目与两级稀疏选择',
+  rankSep:38, nodeSep:18,
+  legend:[['#16a085','索引器打分与可达集'],['#b7791f','边界处理'],['#1f9d6b','选择结果'],['#3f6fd0','注意力']],
+  nodes:{
+    pool0:{label:'全部可达压缩条目\n随上下文线性增长', t:'idxr', io:'[1,T,N_reach,r=2 层约 50 万条]', f:'n_{\\mathrm{reach}}(i) = \\lfloor (i+1)/r \\rfloor', d:'只有「整组 token 都已出现」的条目才可达。1M 上下文、r=2 时约 50 万条；不可达条目在打分前置 $-\\infty$。'},
+    score:{label:'索引器打分\n32 头 × 128 维', t:'idxr', io:'[1,T,32,128] x [n,r=128] -> [1,T,n]', f:'I_{q,j} = \\sum_h w_{q,h}\\mathrm{ReLU}(q_h\\cdot k_j)', d:'每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。'},
+    blk:  {label:'块级打分\n块分 = 块内最大', t:'idxr', io:'[1,T,n] -> [1,T,n/8]', f:'\\mathrm{block}(b) = \\max_{j\\in b} I_{q,j}', d:'把位置切成大小 8 的块，每块取块内最大索引分作为块分。'},
+    pin:  {label:'钉住最新块', t:'gt', io:'—', f:'\\text{pin the newest block}', d:'最新块只填了一部分，若不钉住会被更早的完整块以更大块分压过，导致 query 看不到紧邻的历史。'},
+    top2048:{label:'选出 2048 块', t:'idxr', io:'[1,T,n/8] -> 2048 块', f:'\\text{top-}2048', d:'只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。'},
+    cand:{label:'候选池\n2048 × 8 = 16384', t:'sel', io:'16384 个候选位置', f:'2048 \\times 8 = 16384', d:'候选位置集合。短上下文下可达条目本身少于 16384，此时候选池不起缩减作用。'},
+    top512:{label:'位置级 Top-512', t:'sel', io:'16384 -> [1,T,512]', f:'\\text{top-}512', d:'在池内按索引分取前 512 条。Reindex 层重做这一步，Reuse 层直接复用上一次的选择。'},
+    sa:   {label:'拼进稀疏注意力', t:'attn', io:'窗口 128 + 压缩 512', f:'\\mathcal{T} = \\text{窗口} \\cup \\text{Top-}512', d:'两部分槽位在同一次调用里做 softmax，窗口没有额外权重加成——谁的分高谁拿得多。'}
+  },
+  edges:[
+    ['pool0','score','逐条打分'],['score','blk','聚合'],['pin','blk','保留最新块'],
+    ['blk','top2048','块分排序'],['top2048','cand','展开 8 位置'],['cand','top512','池内排序'],
+    ['top512','sa','512 条'],['pool0','sa','可达性决定候选范围']
+  ]
+},
+
+// ---------- 视图4:MoE 内部 ----------
+moe: {
+  title:'MoE 与超连接写回',
+  rankSep:38, nodeSep:20,
+  legend:[['#8a93a3','残差流读写'],['#b7791f','门控'],['#3f6fd0','专家'],['#1f9d6b','选择']],
+  nodes:{
+    in:  {label:'残差流入\n读出后 5120', t:'grp', io:'[1,T,20480] -> [1,T,5120]', f:'\\tilde{x}', d:'由本层 hc_attn_fn 产出的 attn_pre 系数从 4 份残差流读出 5120 维——即「读入 FFN 的系数来自本层注意力产出」这一次序关系。'},
+    norm:{label:'ffn_norm', t:'grp', io:'[1,T,5120]', f:'x \\leftarrow \\mathrm{RMSNorm}(x)', d:'MoE 前的归一化。'},
+    gate:{label:'gate 打分\n384 专家', t:'gt', io:'[1,T,5120] -> [1,T,384]', f:'\\mathrm{score} = \\sqrt{\\mathrm{softplus}(xW^\\top)}', d:'真实权重 gate.weight 形状 [384, 5120]。另有 gate.bias 与 gate.bias_vl 各 [384]——图像 span 的 token 用另一套偏置。'},
+    bias:{label:'修正偏置\n只影响选择', t:'gt', io:'[384] F32', f:'\\mathrm{idx} = \\mathrm{topk}_6(\\mathrm{score}+b)', d:'无辅助损失的负载均衡偏置：只参与 topk 排序，不进入权重计算，因此不改变被选中专家的输出尺度。'},
+    sel: {label:'top-6 选择', t:'sel', io:'384 -> 6', f:'w = \\frac{\\mathrm{score}_{\\mathrm{idx}}}{\\sum \\mathrm{score}_{\\mathrm{idx}} + 10^{-20}} \\times 1.5', d:'选中 6 个路由专家；权重在选中集合内归一化后乘 route_scale=1.5。'},
+    rexp:{label:'6 个路由专家\n各 2304 × 5120 × 3', t:'moe', io:'[1,T,5120] -> 6 × [1,T,2304]', f:'\\mathrm{w1},\\mathrm{w3}{:}\\,[2304,5120]\\ \\ \\mathrm{w2}{:}\\,[5120,2304]', d:'每个专家约 35.39M 参数（fp4 量化存储，I8 打包）。384 个专家全存但每 token 只用 6 个。'},
+    shared:{label:'共享专家\n1 个，每 token 必过', t:'moe', io:'[1,T,5120] -> [1,T,2304]', f:'\\text{shared expert}', d:'与路由专家同形（约 35.39M），不参与稀疏选择。'},
+    sum: {label:'加权相加', t:'moe', io:'6 × [1,T,2304] + [1,T,2304] -> [1,T,5120]', f:'y = \\sum_{i\\in\\mathrm{idx}} w_i E_i(x) + E_{\\mathrm{shared}}(x)', d:'路由专家按权重加权，共享专家恒权相加。'},
+    hc:  {label:'写回四流', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow x_i + \\lambda_i y', d:'MoE 输出按每流系数写回四份残差流。'}
+  },
+  edges:[
+    ['in','norm','5120'],['norm','gate','5120'],['bias','gate','384'],
+    ['gate','sel','384 -> 6'],['sel','rexp','6 个专家'],['norm','shared','5120'],
+    ['rexp','sum','加权'],['shared','sum','恒权'],['sum','hc','5120']
+  ]
+},
+
+// ---------- 视图5:Engram 注入 ----------
+engram: {
+  title:'Engram：n-gram 哈希查表（层 1 与层 14）',
+  rankSep:36, nodeSep:18,
+  legend:[['#c0392b','哈希与投影'],['#16a085','嵌入表'],['#b7791f','门控'],['#8a93a3','残差流']],
+  nodes:{
+    ctx:  {label:'上下文片段\n长度 2 / 3 / 4', t:'engram', io:'token id 序列', f:'n\\text{-gram},\\ n \\in \\{2,3,4\\}', d:'从当前位置往前取三种长度的连续片段。'},
+    hash: {label:'哈希映射\n3 × 8 = 24 个下标', t:'engram', io:'-> 24 个表下标', f:'(4-1) \\times 8 = 24', d:'每种片段长度用 8 个不同的哈希函数映射，共 24 个下标。'},
+    tab:  {label:'嵌入表\n两层合计约 196B', t:'buf', io:'[384006168, 256] 与 [384016682, 256]', f:'\\approx 196\\ \\mathrm{B}\\ \\text{参数}', d:'engram_vocab_size=16000000、head_dim=256。表很大，但每 token 只按 24 个下标取值，因此不计入激活参数。'},
+    row:  {label:'取回 24 行\n每行 256 维', t:'engram', io:'-> [24, 256]', f:'24 \\times 256 = 6144', d:'每 token 实际取回 6144 个表元素，相对 196B 的表可以忽略。'},
+    proj: {label:'稠密投影\n每层 157.33M', t:'engram', io:'[1,T,24,256] -> [1,T,5120]', f:'\\approx 157.33\\ \\mathrm{M}', d:'把取回的向量投影回隐藏维。这一步是稠密的，只要该层启用 Engram 就整份参与计算——这是 Engram 计入激活参数的部分。'},
+    gate: {label:'门控\n带符号平方根后 sigmoid', t:'gt', io:'[1,T,5120]', f:'g = \\sigma(\\mathrm{copysign}(\\sqrt{|d|}, d))', d:'门控值取残差流与查表结果的归一化点积，先取绝对值开方、保留原符号，再经 sigmoid。与训练内核一致。'},
+    add:  {label:'写回残差流', t:'grp', io:'[1,T,5120]', f:'x \\leftarrow x + g \\odot \\mathrm{proj}', d:'按门控加权写回。图像 span 的 token 跳过这一步。'}
+  },
+  edges:[
+    ['ctx','hash','片段'],['hash','tab','24 个下标'],['tab','row','按行取值'],
+    ['row','proj','[24,256]'],['gate','add','门控'],['proj','add','投影结果'],['add','ctx','写回后继续前向']
+  ]
+},
+
+// ---------- 视图6:DSpark 草稿链 ----------
+dspark: {
+  title:'DSpark：块式推测解码草稿链',
+  rankSep:36, nodeSep:18,
+  legend:[['#7a45c9','主干层与草稿块'],['#8a93a3','拼接与投影'],['#b7791f','判定头'],['#556070','草稿输出']],
+  nodes:{
+    h37: {label:'层 37 注意力输入', t:'dec', io:'[1,T,4,5120]', f:'h_{37}', d:'取注意力子层的输入（不是输出），此时残差流仍是 4 份。'},
+    h38: {label:'层 38 注意力输入', t:'dec', io:'[1,T,4,5120]', f:'h_{38}', d:'同上。'},
+    h39: {label:'层 39 注意力输入', t:'dec', io:'[1,T,4,5120]', f:'h_{39}', d:'同上。'},
+    mean:{label:'按 hc 维取均值\n4 → 1', t:'grp', io:'[1,T,4,5120] -> [1,T,5120]', f:'h.\\mathrm{mean}(\\mathrm{dim}=2)', d:'在超连接副本维（大小为 4）上取均值，把三层各自压成 5120 维。'},
+    cat: {label:'沿特征维拼接\n3 → 15360', t:'grp', io:'3 × [1,T,5120] -> [1,T,15360]', f:'3 \\times 5120 = 15360', d:'三层的均值结果拼成一个 15360 维向量，作为一次性的草稿输入（不再自回归）。'},
+    proj:{label:'main_proj\n15360 → 5120', t:'dspark', io:'[1,T,15360] -> [1,T,5120]', f:'W{:}\\,[5120, 15360]', d:'真实权重 main_proj.weight 形状 [5120, 15360]，与三层拼接的宽度一致。'},
+    b1:  {label:'草稿块 1\n5 个位置', t:'dspark', io:'-> [1,5+V]', f:'\\text{block size} = 5', d:'块内位置用噪声 token（id 128799）占位，一次前向产出 5 个草稿位置。草稿块自身是 MoE：128 专家取 top-3。'},
+    b2:  {label:'草稿块 2\n5 个位置', t:'dspark', io:'-> [1,5+V]', f:'\\text{block size} = 5', d:'同上。共 3 个 MTP 块（n_mtp_layers=3）。'},
+    b3:  {label:'草稿块 3\n5 个位置', t:'dspark', io:'-> [1,5+V]', f:'\\text{block size} = 5', d:'最后一个块，额外带 Markov 头与置信头。'},
+    markov:{label:'Markov 头\n秩 256', t:'gt', io:'[1,5,256]', f:'\\mathrm{rank} = 256', d:'dspark_markov_rank=256，给草稿序列内部的相邻关系建模。'},
+    conf:{label:'置信头', t:'gt', io:'[1,5]', f:'\\text{confidence}', d:'输出每个草稿位置的接受置信度，决定这次接受几个草稿。'},
+    out: {label:'草稿 token\n交主干校验', t:'out', io:'5 个草稿位置', f:'\\text{draft} \\to \\text{verify}', d:'草稿交给主干一次性校验。DSpark 不产生主干缓存，只提高一次前向平均能确认的 token 数。'}
+  },
+  edges:[
+    ['h37','mean','取均值'],['h38','mean','取均值'],['h39','mean','取均值'],
+    ['mean','cat','5120'],['cat','proj','15360'],['proj','b1','5120'],
+    ['b1','b2','草稿'],['b2','b3','草稿'],['b3','markov','末块'],['b3','conf','末块'],
+    ['markov','out','修正'],['conf','out','接受数']
+  ]
+},
+};
+
+var COLOR={io:'#1f9d6b',enc:'#c0392b',dec:'#7a45c9',attn:'#3f6fd0',moe:'#3f6fd0',
+  grp:'#8a93a3',out:'#556070',cmp:'#e0922f',idxr:'#16a085',gt:'#b7791f',
+  sel:'#1f9d6b',buf:'#16a085',engram:'#c0392b',dspark:'#7a45c9'};
+
+var cy = cytoscape({
+  container:document.getElementById('cy'),
+  style:[
+    {selector:'node',style:{
+      'label':'data(label)','text-wrap':'wrap','text-valign':'center','text-halign':'center',
+      'text-justification':'center','font-size':'10.5px','color':'#fff','font-weight':'600',
+      'background-color':'data(c)','shape':'round-rectangle','width':'132px','height':'54px',
+      'border-width':0,'text-max-width':'124px','line-height':1.25
+    }},
+    {selector:'node[drill]',style:{'border-width':3,'border-color':'#ffd24d','border-style':'double'}},
+    {selector:'node:selected',style:{'border-width':3,'border-color':'#122'}},
+    {selector:'edge',style:{
+      'width':2,'line-color':'#9db0cf','target-arrow-color':'#9db0cf',
+      'target-arrow-shape':'triangle','curve-style':'bezier',
+      'label':'data(label)','font-size':'9px','color':'#0b64c4',
+      'font-family':'monospace','text-background-color':'#f6f8fc',
+      'text-background-opacity':1,'text-background-padding':'2px','text-rotation':'autorotate'
+    }},
+  ],
+  minZoom:0.25,maxZoom:2.5,wheelSensitivity:0.25
+});
+
+var tip=document.getElementById('tip');
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function nl(s){return esc(s).replace(/\n/g,'<br>');}
+function renderTeX(t){try{return katex.renderToString(t,{throwOnError:false,displayMode:true,strict:false});}catch(e){return '<code>'+esc(t)+'</code>';}}
+function renderInline(t){try{return katex.renderToString(t,{throwOnError:false,displayMode:false,strict:false});}catch(e){return '<code>'+esc(t)+'</code>';}}
+function renderD(s){var parts=String(s).split(/\$([^$]+)\$/g),out='';for(var i=0;i<parts.length;i++){if(i%2===1)out+=renderInline(parts[i]);else out+=esc(parts[i]);}return out;}
+if (window.renderMathInElement) { renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false}); }
+
+var curView='overview';
+function loadView(name){
+  curView=name;
+  var V=VIEWS[name];
+  var nodes=Object.keys(V.nodes).map(function(id){
+    var o=V.nodes[id];
+    return {data:{id:id,label:o.label,c:COLOR[o.t]||'#556070',drill:o.drill||undefined}};
+  });
+  var edges=V.edges.map(function(e,i){return {data:{id:'e'+i,source:e[0],target:e[1],label:e[2]}};});
+  cy.elements().remove();
+  cy.add(nodes.concat(edges));
+  cy.layout({name:'dagre',rankDir:'TB',nodeSep:V.nodeSep,rankSep:V.rankSep,edgeSep:10}).run();
+  cy.fit(undefined,30);
+  document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',t.dataset.v===name);});
+  document.getElementById('legend').innerHTML=V.legend.map(function(l){
+    return '<div><span class="sw" style="background:'+l[0]+'"></span>'+l[1]+'</div>';}).join('');
+  var cb=document.getElementById('crumb');
+  if(name==='overview') cb.innerHTML='<b>整体总览</b> — 点击黄框节点下钻到内部';
+  else cb.innerHTML='<span style="cursor:pointer" onclick="loadView(\'overview\')">整体总览</span> ▸ <b>'+V.title+'</b>';
+}
+
+var TABS=[['overview','整体总览'],['attn','注意力内部'],['sparse','压缩与稀疏选择'],['moe','MoE 内部'],['engram','Engram 注入'],['dspark','DSpark 草稿链']];
+document.getElementById('tabs').innerHTML=TABS.map(function(t){
+  return '<span class="tab" data-v="'+t[0]+'" onclick="loadView(\''+t[0]+'\')">'+t[1]+'</span>';}).join('');
+
+cy.on('mouseover','node',function(ev){
+  var o=VIEWS[curView].nodes[ev.target.id()];if(!o)return;
+  var h='<h4>'+esc(o.label.replace(/\n/g,' · '))+'</h4><div class="k">维度</div><div class="io b">'+nl(o.io)+'</div>';
+  if(o.f) h+='<div class="k">公式</div><div class="fx">'+renderTeX(o.f)+'</div>';
+  if(o.d) h+='<div class="k">说明</div><div>'+renderD(o.d)+'</div>';
+  if(o.drill) h+='<div class="hint">点击可下钻查看内部</div>';
+  tip.innerHTML=h;tip.classList.add('show');
+});
+cy.on('mouseout','node',function(){tip.classList.remove('show');});
+cy.on('tap','node',function(ev){
+  var o=VIEWS[curView].nodes[ev.target.id()];
+  if(o&&o.drill){tip.classList.remove('show');loadView(o.drill);}
+});
+document.addEventListener('mousemove',function(e){
+  if(!tip.classList.contains('show'))return;
+  var w=tip.offsetWidth||430,hh=tip.offsetHeight||200;
+  var x=e.clientX+18,y=e.clientY+14;
+  if(x+w>window.innerWidth-12)x=e.clientX-w-18;
+  if(y+hh>window.innerHeight-12)y=Math.max(12,e.clientY-hh-14);
+  tip.style.left=x+'px';tip.style.top=y+'px';
+});
+
+loadView('overview');
+</script>
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
