@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>跨层 KV 复用（Cross-Layer KV Sharing）· 概览 · Dojo</title>
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script defer src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+  <style>
+    :root { --body: Charter, Georgia, serif; --ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --mono: 'SF Mono', Menlo, monospace; --text: #24292f; --muted: #57606a; --faint: #8c959f; --bg: #f7f5ef; --soft: #f6f8fa; --border: #d8dee4; --accent: #0969da; --warn: #9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --text:#e6edf3; --muted:#8b949e; --faint:#6e7681; --bg:#0d1117; --soft:#161b22; --border:#30363d; --accent:#58a6ff; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--body); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+    nav { font: 14px/1.4 var(--ui); margin-bottom: 2.5rem; display: flex; gap: 1.25rem; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--accent); }
+    header { padding-bottom: 1.75rem; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font: 13px/1.4 var(--mono); }
+    h1 { font-size: 2rem; line-height: 1.3; margin: .5rem 0 .75rem; }
+    .lead { margin: 0; color: var(--muted); font-size: 1.05rem; }
+    .meta { margin-top: 1rem; color: var(--faint); font: 13px/1.5 var(--mono); }
+    h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; }
+    p { margin: .9rem 0; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: .5rem 0; }
+    code { font: .85em/1.5 var(--mono); background: var(--soft); padding: .15em .35em; border-radius: 4px; }
+    footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--faint); font: 13px/1.5 var(--ui); }
+    @media (max-width: 640px) { .wrap { padding-top: 2rem; } h1 { font-size: 1.7rem; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <nav>
+      <a href="../../index.html">← 返回 Dojo</a>
+      <a href="index.html">完整说明 →</a>
+    </nav>
+    <header>
+      <span class="eyebrow">概念概览 · 注意力机制</span>
+      <h1>跨层 KV 复用（Cross-Layer KV Sharing）</h1>
+      <p class="lead">不让每一层各自计算全局 KV，而是让一组层共用同一份：缓存复杂度里的层维度被消掉，prefill 阶段还能提前退出。省下的是"全局"那一份，每层自己的窗口 KV 仍然存在。</p>
+      <p class="meta">更新于 2026-09-10</p>
+    </header>
+
+    <h2>问题背景</h2>
+    <p>标准 Transformer 里，每一层都要为整段上下文保存一份键值，缓存随"层数 × 序列长度"增长。长上下文推理时这部分会占满显存，而层数又是固定的。跨层 KV 复用的思路是：全局 KV 不必每层各算一份，可以让一组层共用——由此把缓存里的层维度消掉。</p>
+
+    <h2>核心机制</h2>
+    <ol>
+      <li><b>复用对象</b>：把层分成下段（自解码器）与上段（交叉解码器）。下段末层隐状态 $X^{L/2}$ 经投影得到唯一的全局键值 $\hat K, \hat V$，上段各层通过交叉注意力复用它，不再从本层隐状态生成全局 KV。</li>
+      <li><b>省下的是层维度</b>：缓存复杂度从 $\mathcal{O}(LND)$ 降到 $\mathcal{O}((N+L)D)$，论文称约省 $L$ 倍；prefill 可在进入上段前提前退出，计算复杂度从 $\mathcal{O}(LN^2D)$ 降到 $\mathcal{O}(LND)$。</li>
+      <li><b>"只缓存一次"只指全局 KV</b>：每层仍保留自己的窗口 KV（大小固定，不随序列增长），这部分没有共享。</li>
+      <li><b>两级复用要分开看</b>：共享 KV 省缓存，复用索引省打分计算。DeepSeek-V4.1-Flash 把两者解耦成 Full（都自算）、Reindex（复用 KV、自算索引）、Reuse（两者都复用）三种模式。</li>
+      <li><b>同组才能共用</b>：压缩比不同的层无法共用同一批条目，因此共享发生在组内压缩比一致，每组由一个 source 层生产。</li>
+    </ol>
+
+    <h2>关键结论与边界</h2>
+    <ul>
+      <li>复用的收益随序列长度放大：复杂度式里保留的 $LD$ 项在 $N \gg L$ 时可忽略，短序列下局部缓存与全局缓存体量相当，收益有限。<b>成立条件</b>：全局 KV 的份数与层数解耦。</li>
+      <li>共享 KV 与复用索引是两件事：Reindex 层复用 KV 却重新打分，因此不同层的稀疏选择可以不同。<b>成立条件</b>：索引必须与它评分的那份 KV 配套。</li>
+      <li>实测 DeepSeek-V4.1-Flash 的共享分组为 2–7、8–13、14–19、20–39，source 层分别是 2、8、14、20；每个压缩层读到的 cache 都来自组内 source。<b>成立条件</b>：组内压缩比一致。</li>
+      <li>代价是上段各层失去"用自己的隐状态表示全局上下文"的能力，需要训练补偿；这不等于上下文变短，可见范围仍由选择规则决定。</li>
+    </ul>
+
+    <h2>前置概念</h2>
+    <ul>
+      <li><a href="../kv-cache/index.html">KV cache</a>：被复用的对象与字节账的基础。</li>
+      <li><a href="../standard-attention/index.html">标准注意力</a>：交叉注意力读取全局 KV 的方式。</li>
+      <li><a href="../mla/index.html">MLA</a>：在"每 token 维内"压缩，与跨层复用削减的是不同维度。</li>
+      <li><a href="../dsa/index.html">稀疏注意力与索引器</a>：Top-K 索引复用的前提。</li>
+    </ul>
+
+    <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
+  </main>
+</body>
+</html>

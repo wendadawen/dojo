@@ -1,0 +1,406 @@
+<blockquote class="meta">
+<p><b>主要依据</b>：Mistral 7B（Jiang et al., arXiv:2310.06825）§2「Architectural details」；StreamingLLM（Xiao et al., arXiv:2309.17453）§3；DeepSeek-V4.1-Flash 官方推理配置与参考实现（<code>inference/config.json</code>、<code>inference/model.py</code>）。字节账与索引规则的复算脚本见文末来源说明。</p>
+</blockquote>
+
+<div class="callout callout-blue">
+<p>本页的「窗口」指<b>单层的可见距离上限</b>：位置 $i$ 只能看到上一层最近的 $W$ 个位置。窗口之外的位置要么靠层堆叠间接看到，要么由另一路全局可见性补足；后者不在本页展开，只在使用处指出。</p>
+</div>
+
+<section class="learning-goals">
+  <h2>核心问题</h2>
+  <ol class="chapter-questions">
+    <li>
+      <p>滑动窗口注意力把 query 的可见集限制成了什么？</p>
+      <details>
+        <summary>解答：只保留上一层最近 $W$ 个位置，更远的位置单层内不可见</summary>
+        <p>位置 $i$ 在第 $k$ 层的隐状态只关注上一层位置落在 $[i-W, i]$ 的隐状态，即最多 $W$ 个槽位；序列开头不足 $W$ 个时只看到已存在的部分，实现上用 $-1$ 槽位占位、不参与打分。因果掩码管的是「不看未来」，窗口进一步管「不看太远」，两者叠加才是完整的可见集。完整定义与对照见第 1 章。</p>
+      </details>
+    </li>
+    <li>
+      <p>它省下多少计算与显存？</p>
+      <details>
+        <summary>解答：打分次数从 $N^2$ 降到 $N\cdot W$，缓存固定为 $W$ 条</summary>
+        <p>每层注意力打分次数从与序列长度平方成正比降为线性：$N=1048576$、$W=128$ 时少 8192 倍。KV cache 变成固定 $W$ 条的环形缓冲：$W=128$、$512$ 维、FP8 存储时每层 64 KiB，40 层共 2.50 MiB，与序列长度无关（相对 1M 位置的全缓存是 $1/8192$）。完整账目见第 2 章。</p>
+      </details>
+    </li>
+    <li>
+      <p>层堆叠能补回多少「看得远」的能力？什么时候不够？</p>
+      <details>
+        <summary>解答：感受野约 $k\times W$，40 层只有 5120 个 token</summary>
+        <p>信息每层最多前移 $W$，$k$ 层后 $h_i$ 可间接访问输入层距离至多 $k\times W$ 的位置。DeepSeek-V4.1-Flash 主干 40 层、$W=128$，感受野 5120 个 token，只占 1M 上下文的 0.49%，因此长上下文必须在窗口之外另加全局可见性。另一个边界是：只保留窗口、丢弃序列开头的位置会让模型崩溃，因为开头的位置承担了注意力汇聚点的角色。完整推导与实测数字见第 3 章。</p>
+      </details>
+    </li>
+    <li>
+      <p>环形缓冲怎么做到缓存不随长度增长？位置编码怎么处理？</p>
+      <details>
+        <summary>解答：槽位取 $i \bmod W$，位置用原序列下标</summary>
+        <p>位置 $i$ 的键值写入槽位 $i \bmod W$，位置超过 $W$ 后覆盖最旧的一条，缓存大小恒为 $W$ 条。前向分两种索引形态：prefill 时每个 query 各得一行可见槽位（含 $-1$ 占位），decode 时唯一的 query 看到整个环、槽位按最旧到最新列出；两者映射回的位置集合实测完全一致。DeepSeek-V4.1-Flash 给窗口 KV 施加 RoPE 时用原序列位置，因此窗口内相对距离不超过 $W$。完整规则与可运行复算见第 4 章。</p>
+      </details>
+    </li>
+  </ol>
+</section>
+
+<section class="misconceptions">
+  <h2>常见误解</h2>
+  <ul>
+    <li>「窗口注意力等于把长文本截断成 $W$ 个 token」——每个 query 的窗口不同且随位置滑动，位置 $i$ 仍能通过层堆叠间接访问 $i-kW$ 处的信息，只是保真度随层数衰减。</li>
+    <li>「窗口注意力可以替代全局注意力做长上下文」——感受野只有 $k\times W$，DeepSeek-V4.1-Flash 的 40 层是 5120 个 token，仅占 1M 上下文的 0.49%。</li>
+    <li>「环形缓冲会丢信息，所以不可靠」——被覆盖的是已经滑出窗口的最旧位置，它们本来就不在可见集内；真正会导致崩溃的是把序列开头的汇聚点位置一起覆盖掉。</li>
+    <li>「decode 与 prefill 列出的槽位顺序不同，结果就会不同」——槽位顺序不同但集合相同，稀疏注意力对每个槽位独立处理，顺序不影响结果；实测 300 步位置集合完全一致。</li>
+  </ul>
+</section>
+
+<h2 id="visible-set">1. 窗口把可见集切成「最近 $W$ 个位置」</h2>
+
+<p>先明确一个 query 到底能看到什么。全注意力里，位置 $i$ 的 query 可以看到从序列开头到 $i$ 的全部位置；滑动窗口注意力把上界砍到 $W$：只保留上一层位置在 $[i-W, i]$ 的隐状态<sup>[C1]</sup>。这里的 $W$ 是窗口大小，DeepSeek-V4.1-Flash 取 128<sup>[C4]</sup>。</p>
+
+<p>要注意窗口不是「把文本切成固定段」。每个位置的窗口都不同：位置 4999 的窗口是 4872–4999，位置 5000 的窗口是 4873–5000，窗口随位置滑动，这也是「滑动窗口」这个名字的来源。</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 680 140" role="img" aria-label="序列位置与滑动窗口示意：一个 query 只关注最近 W 个位置">
+    <rect class="dg-box" x="44" y="44" width="52" height="36" rx="4" style="opacity:0.45"/>
+    <rect class="dg-box" x="104" y="44" width="52" height="36" rx="4" style="opacity:0.45"/>
+    <rect class="dg-box" x="164" y="44" width="52" height="36" rx="4" style="opacity:0.45"/>
+    <rect class="dg-box" x="224" y="44" width="52" height="36" rx="4" style="opacity:0.45"/>
+    <rect class="dg-box" x="284" y="44" width="52" height="36" rx="4"/>
+    <rect class="dg-box" x="344" y="44" width="52" height="36" rx="4"/>
+    <rect class="dg-box" x="404" y="44" width="52" height="36" rx="4"/>
+    <rect class="dg-box" x="464" y="44" width="52" height="36" rx="4"/>
+    <rect class="dg-box" x="524" y="44" width="52" height="36" rx="4"/>
+    <rect class="dg-box dg-accent" x="584" y="44" width="52" height="36" rx="4"/>
+    <text x="70" y="67" text-anchor="middle">0</text>
+    <text x="130" y="67" text-anchor="middle">1</text>
+    <text x="190" y="67" text-anchor="middle">2</text>
+    <text x="250" y="67" text-anchor="middle">3</text>
+    <text x="310" y="67" text-anchor="middle">4</text>
+    <text x="370" y="67" text-anchor="middle">5</text>
+    <text x="430" y="67" text-anchor="middle">6</text>
+    <text x="490" y="67" text-anchor="middle">7</text>
+    <text x="550" y="67" text-anchor="middle">8</text>
+    <text x="610" y="67" text-anchor="middle">9</text>
+    <rect class="dg-accent" x="278" y="36" width="364" height="52" rx="6"/>
+    <text x="460" y="26" text-anchor="middle">可见窗口（示意 6 个位置）</text>
+    <text x="70" y="104" text-anchor="middle" style="opacity:0.45">窗口外</text>
+    <text x="610" y="104" text-anchor="middle">query 位置</text>
+    <line class="dg-line" x1="44" y1="118" x2="636" y2="118"/>
+    <text x="340" y="134" text-anchor="middle">位置下标</text>
+  </svg>
+  <figcaption class="diagram-caption">每个方格是一个序列位置，数字是位置下标。位置 9 是当前 query（用强调色描边），外框标出它的可见窗口：位置 4–9 可见，位置 0–3 在本层不可见。窗口随 query 位置整体右移，因此每个位置的可见集不同。</figcaption>
+</figure>
+
+<h3 id="visible-set-causal">1.1 因果掩码管方向，窗口管距离</h3>
+
+<p>两个限制是叠加的，不是替代关系。因果掩码禁止 query 关注未来位置，把可见集限制在 $[0, i]$；窗口再把它收缩到 $[i-W, i]$。因此单层的可见槽位数是 $\min(i+1, W)$：序列短于窗口时窗口不起作用（与全注意力等价），序列长于窗口时被截断。</p>
+
+<p>实现上，窗口槽位与另一路「压缩全局 KV」的槽位拼进同一次注意力调用<sup>[C4]</sup>，所以「可见集」在代码里是一张索引表：窗口部分按位置索引，压缩部分按压缩条目编号索引。本页只讨论窗口部分。</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>对比项</th><th>全注意力</th><th>滑动窗口注意力</th></tr></thead>
+<tbody>
+<tr><td>位置 $i$ 的可见集</td><td>$[0, i]$</td><td>$[i-W, i]$</td></tr>
+<tr><td>单层可见槽位数</td><td>$i+1$</td><td>$\min(i+1, W)$</td></tr>
+<tr><td>每层打分次数（$N$ 个 query）</td><td>约 $N^2$</td><td>约 $N\cdot W$</td></tr>
+<tr><td>KV cache 大小</td><td>随 $N$ 线性增长</td><td>恒为 $W$ 条</td></tr>
+<tr><td>远处信息</td><td>直接可见</td><td>只能经层堆叠间接获得（第 3 章）</td></tr>
+</tbody>
+</table>
+</div>
+
+<details>
+<summary>补充：$-1$ 槽位表示什么</summary>
+<p>prefill 时位置靠前的 query 凑不满 $W$ 个可见位置，索引表里这些空位用 $-1$ 标记。注意力实现遇到 $-1$ 槽位时既不取值、也不参与 softmax 的分母，效果等同于该槽位不存在。若不做这个标记而把「空位」当成位置 0，位置 0 会被重复计入并放大它的权重。</p>
+</details>
+
+<h3 id="visible-set-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>窗口大小 $W=128$ 时，位置 4999 的 query 在某一层能看到哪些位置？</p>
+    <details>
+      <summary>解答：上一层的位置 4872 到 4999，共 128 个</summary>
+      <p>可见区间是 $[i-W, i] = [4999-128, 4999] = [4871, 4999]$。由于区间长度是 $W+1 = 129$，而窗口只保留 $W=128$ 个位置，实现上取的是最近 128 个，即 4872–4999。位置 4871 及更早的位置在该层不可见；它们只能通过层堆叠间接影响位置 4999（第 3 章）。</p>
+    </details>
+  </li>
+  <li>
+    <p>窗口限制与因果掩码是什么关系？只加窗口能保证不看到未来吗？</p>
+    <details>
+      <summary>解答：不能，两者独立，必须同时使用</summary>
+      <p>窗口只限制「看多远」，不限制方向：区间 $[i-W, i]$ 已经天然不含未来位置，但这是因为它以 $i$ 为右端点。若实现时把窗口写成 $[i-W, i+W]$ 或按缓存槽位顺序取最近 $W$ 条而不带方向判断，就会把未来位置纳进来。因果掩码负责禁止 $>i$ 的位置，窗口负责禁止 $< i-W$ 的位置，两者叠加才是 $[i-W, i]$。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="cost">2. 省下的是打分次数与缓存字节</h2>
+
+<p>第 1 章确定了「每个 query 只看 $W$ 个位置」。这个限制换来两笔收益：计算量从平方变线性，缓存从「随长度增长」变成常量。</p>
+
+<h3 id="cost-scores">2.1 每层打分次数从 $N^2$ 降到 $N\cdot W$</h3>
+
+<p>注意力对每个 query 都要与可见槽位做一次点积，所以每层的打分次数就是「query 数 × 每个 query 的可见槽位数」<sup>[F3]</sup>：</p>
+
+$$n_{\text{score}}(N) = \underbrace{N}_{\text{query 数}} \times \underbrace{W}_{\text{每个 query 可见槽位数}} \quad\text{（窗口）}\qquad\text{vs}\qquad N^2 \quad\text{（全注意力）}$$
+
+<ul>
+<li>$N$：序列长度，即 query 个数；</li>
+<li>$W$：窗口大小，即单个 query 的可见槽位数上限；</li>
+<li>$n_{\text{score}}$：每层需要计算的注意力分数个数，不含 softmax、值加权与投影的开销。</li>
+</ul>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th>序列长度 $N$</th><th>全注意力打分次数</th><th>窗口打分次数（$W=128$）</th><th>倍数</th></tr></thead>
+<tbody>
+<tr><td>4 096</td><td>16 777 216</td><td>524 288</td><td>32×</td></tr>
+<tr><td>131 072</td><td>17 179 869 184</td><td>16 777 216</td><td>1 024×</td></tr>
+<tr><td>1 048 576</td><td>1 099 511 627 776</td><td>134 217 728</td><td>8 192×</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>倍数恰好等于 $N/W$，因为全注意力与窗口的打分次数之比是 $N^2/(N\cdot W) = N/W$。序列越长，窗口的收益越大<sup>[N5]</sup>。</p>
+
+<h3 id="cost-ring">2.2 环形缓冲让缓存不随长度增长</h3>
+
+<p>缓存侧的收益更直接：既然每个 query 只需要最近 $W$ 个位置的键值，就不必保存全部历史。Mistral 7B 把这写成固定大小 $W$ 的滚动缓冲：位置 $i$ 的键值写入槽位 $i \bmod W$，位置超过 $W$ 后旧值被覆盖，缓存大小停止增长<sup>[C2]</sup>。</p>
+
+<p>DeepSeek-V4.1-Flash 的窗口取值与精度给出了具体数字<sup>[C4][N5]</sup>：$W=128$、单头 512 维、窗口 KV 以 FP8 存储（每元素 1 字节），因此</p>
+
+$$\text{每层窗口缓存} = 128 \times 512 \times 1\ \text{B} = 65\,536\ \text{B} = 64\ \text{KiB}$$
+
+<ul>
+<li>$128$：槽位数，等于窗口大小；</li>
+<li>$512$：单个 KV 头的 latent 维（该模型只有 1 个 KV 头）；</li>
+<li>$1\ \text{B}$：FP8 每元素字节数。</li>
+</ul>
+
+<details>
+<summary>展开：40 层窗口缓存的总量与「不随长度增长」的含义</summary>
+<p><b>构造示例</b>（数字取自官方配置，非实测运行）。40 层各有一份窗口缓存：$40 \times 64\ \text{KiB} = 2560\ \text{KiB} = 2.50\ \text{MiB}$。这一项与序列长度无关：序列从 4K 涨到 1M，窗口缓存始终是 2.50 MiB。作为对照，若把 1M 个位置的窗口 KV 全部留下，单层就是 $1\,048\,576 \times 512 \times 1\ \text{B} = 512\ \text{MiB}$，40 层为 20 GiB；固定窗口相对它是 $1/8192$。注意这里只算窗口 KV，不含另一路压缩全局 KV 与索引器缓存——那两项才是长上下文缓存的主要部分。</p>
+</details>
+
+<h3 id="cost-precision">2.3 窗口 KV 为什么保持 FP8</h3>
+
+<p>同一份模型里，压缩后的全局 KV 被量化到 FP4，而窗口 KV 保持 FP8。技术报告给出的理由是窗口 KV 对量化更敏感<sup>[C4]</sup>。这与两路 KV 的角色一致：窗口 KV 是最近位置的「原始精度」副本，每个 query 都必然读到；压缩全局 KV 是远距离的粗粒度摘要，本身已经过池化。</p>
+
+<h3 id="cost-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>为什么窗口化对长序列的收益比短序列大？</p>
+    <details>
+      <summary>解答：因为收益倍数等于 $N/W$，随序列长度线性增长</summary>
+      <p>全注意力的打分次数是 $N^2$，窗口是 $N\cdot W$，比值 $N/W$。序列越短这个比值越接近 1（序列长度等于窗口时两者完全一样）；序列越长收益越大：$N=1\,048\,576$、$W=128$ 时是 8192 倍。反过来说，短序列上引入窗口不会带来计算收益，只会损失可见范围。</p>
+    </details>
+  </li>
+  <li>
+    <p>窗口缓存 64 KiB 是「每层」还是「整个模型」？为什么它可以与序列长度无关？</p>
+    <details>
+      <summary>解答：每层 64 KiB，整个模型 2.50 MiB；因为缓存只存最近 $W$ 个位置</summary>
+      <p>64 KiB = 128 槽 × 512 维 × 1 字节，是单层的量；40 层合计 2.50 MiB。它与序列长度无关的原因是：写入按 $i \bmod W$ 循环覆盖，超过 $W$ 的位置直接覆盖最旧的一条，缓存条数恒为 $W$，不随 $i$ 增长。代价是位置 $i$ 只能看到最近 $W$ 个位置，超出部分不再保存在缓存里。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="receptive-field">3. 层堆叠接力：感受野 $k\times W$ 与它的天花板</h2>
+
+<p>窗口砍掉了可见范围，但模型并没有因此「只记得最近 128 个 token」——因为层与层是串联的：第 1 层把远处信息搬到近处，第 2 层再搬一次。这一章算清这个接力能走多远，以及它什么时候不够用。</p>
+
+<h3 id="rf-propagation">3.1 信息每层前移 $W$</h3>
+
+<p>第 $k$ 层位置 $i$ 的隐状态关注上一层 $[i-W, i]$ 的隐状态，而上一层那些位置各自又关注了更早的 $W$ 个位置。递归展开，$k$ 层之后 $h_i$ 可以间接访问输入层距离至多 $k\times W$ 的位置<sup>[C1]</sup>：</p>
+
+$$\text{span}(k) = k \times W$$
+
+<ul>
+<li>$k$：层数（从输入层算起的注意力层数）；</li>
+<li>$W$：窗口大小；</li>
+<li>$\text{span}(k)$：第 $k$ 层可以间接访问的输入层最大距离，单位是 token。</li>
+</ul>
+
+<figure class="diagram">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="dg-node-title">输入层</div>
+      <div class="dg-node-note">位置 $i$ 的信息在这里</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">第 1 层</div>
+      <div class="dg-node-note">前移至多 $W$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">第 2 层</div>
+      <div class="dg-node-note">再前移至多 $W$</div>
+    </div>
+    <div class="dg-arrow">&#8594;</div>
+    <div class="dg-node">
+      <div class="dg-node-title">第 $k$ 层</div>
+      <div class="dg-node-note">累计至多 $k\times W$</div>
+    </div>
+  </div>
+  <figcaption class="diagram-caption">箭头表示信息的间接可达路径：每一层把可见范围向前推 $W$，$k$ 层后累计约 $k\times W$。这条链只说明「能间接看到」，不代表信息保真度与直接可见相同。</figcaption>
+</figure>
+
+<p>用 Mistral 7B 的公开数字可以对照这个公式：$W=4096$、32 层，理论上限注意力跨度约 $4096 \times 32 = 131\,072$ 个 token<sup>[N1]</sup>。数字与公式吻合。</p>
+
+<h3 id="rf-limit">3.2 5120 对 1M：窗口之外需要另一路可见性</h3>
+
+<p>把公式套到 DeepSeek-V4.1-Flash 上<sup>[N6]</sup>：$W=128$、主干 40 层，</p>
+
+$$\text{span}(40) = 40 \times 128 = 5120\ \text{token}$$
+
+<p>而该模型支持的上下文是 $1\,048\,576$ 个 token，5120 只占 $0.49\%$。也就是说：位置 999 999 的 query 单靠窗口只能间接看到 994 879 之后的内容，更早的 99.5% 上下文它「够不着」。这正是长上下文模型需要第二路可见性的原因——DeepSeek-V4.1-Flash 的做法是给每层再挂一路压缩后的全局 KV（把远距离的每 $r$ 个 token 池化成一条），由索引器为每个 query 挑出其中最重要的若干个位置<sup>[C4]</sup>。那一路的压缩比、选择规则与缓存账不属于本页范围，本页只用到「窗口之外另有全局可见性」这个结论。</p>
+
+<h3 id="rf-collapse">3.3 只用窗口会崩：注意力汇聚点</h3>
+
+<p>窗口还有一个反直觉的失效模式。StreamingLLM 的实测显示：如果只保留最近窗口的 KV、把序列开头的位置全部丢弃，模型在序列长度超过缓存后会崩溃（困惑度从个位数涨到数千），而只要把最前面的 4 个位置留下就能恢复<sup>[C3]</sup>。原因是开头的位置承担了<a href="../attention-sink/index.html">注意力汇聚点</a>的角色——大量注意力分数被分配给它们，而它们一旦被移除，softmax 的分母会缺掉一大块，注意力分布随之偏移<sup>[C3]</sup>。这与语义无关：把开头 4 个 token 换成换行符，模型仍然依赖它们。</p>
+
+<details>
+<summary>补充：StreamingLLM 给出的对照数字</summary>
+<p>Llama-2-13B 在 PG19 首本书（65K token）上：只用窗口（0 个初始位置 + 1024 个近期位置）困惑度 5158.07；保留 4 个初始位置（4+1020）后降到 5.40<sup>[N3]</sup>。另一个对照是 160M 参数模型：用可学习 sink token 训练的模型在「1 个 sink + 1023 个近期位置」下困惑度 18.01，而未做该训练的模型即使保留 2 个初始位置也只有 18.05——差别在于前者只需要 1 个 sink 就够<sup>[N4]</sup>。这两组数字说明「窗口 + 汇聚点」才是可用组合，也解释了为什么后续模型会把汇聚点做成一个可学习参数。</p>
+</details>
+
+<h3 id="rf-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>40 层、$W=128$ 的模型，感受野是 5120 个 token，这个数字怎么来的？它意味着什么？</p>
+    <details>
+      <summary>解答：$40 \times 128$，意味着窗口只能覆盖 1M 上下文的 0.49%</summary>
+      <p>每层把可见范围向前推 $W=128$ 个位置，40 层累计 $40 \times 128 = 5120$。它意味着：只有落在最近 5120 个 token 内的信息能通过层堆叠间接到达当前 query，更早的内容必须由另一路全局可见性提供。注意这是「上限」而非「保真范围」——间接路径要经过多层混合，实际可利用性会随距离下降。</p>
+    </details>
+  </li>
+  <li>
+    <p>为什么「只保留最近窗口」会让模型崩溃？留下序列开头的位置解决了什么？</p>
+    <details>
+      <summary>解答：开头位置是注意力汇聚点，移除它们会抽掉 softmax 分母的一大块</summary>
+      <p>自回归模型里，序列开头的位置对所有后续位置都可见，训练时容易演变成「注意力汇聚点」：即使语义上不重要，也会被分配大量注意力。softmax 要求权重非零，模型需要一个「倾倒」注意力的去处，开头位置正好充当这个角色。把它们从缓存里移除后，分母缺少这一块，注意力分布显著偏移，模型输出崩溃；保留少量（4 个）开头位置即可锚定注意力计算。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="ring-buffer">4. 环形缓冲：槽位、覆盖与位置编码</h2>
+
+<p>前两章把「缓存固定为 $W$ 条」当作结论使用，这一章说明它怎么实现，以及实现中最容易出错的两处：索引与位置。</p>
+
+<h3 id="rb-slot">4.1 槽位 = 位置对窗口取模</h3>
+
+<p>规则只有一条<sup>[C2][F2]</sup>：</p>
+
+$$\text{slot}(i) = i \bmod W$$
+
+<ul>
+<li>$i$：token 在序列中的位置（0 起）；</li>
+<li>$W$：窗口大小；</li>
+<li>$\text{slot}(i)$：该位置在缓存数组中的下标，取值 $0 \sim W-1$。</li>
+</ul>
+
+<p>写入是循环覆盖：位置 $W$ 写进槽位 0，覆盖位置 0；位置 $W+1$ 覆盖位置 1，依此类推。因此缓存里始终是最新 $W$ 个位置，且数组长度不变。</p>
+
+<details class="code-details">
+<summary>代码：环形缓冲的写入与索引是否一致</summary>
+<div class="code-block">
+<pre><code class="language-python">W = 8          # 窗口大小（示意用的小值）
+seq_len = 20   # 序列长度
+
+ring = {}      # 槽位 -&gt; 它当前保存的位置
+for p in range(seq_len):
+    ring[p % W] = p                       # 写入：位置 p 进入槽位 p mod W
+    # decode 时唯一的 query 看到整个环：槽位从"最旧"开始绕一圈
+    oldest = p % W + 1
+    slots = [s for s in list(range(oldest, W)) + list(range(oldest)) if s &lt;= p]
+    positions = sorted(ring[s] for s in slots)
+    expect = list(range(max(0, p - W + 1), p + 1))
+    assert positions == expect, (p, positions, expect)
+
+print("W =", W, " 序列长度 =", seq_len, " 全程一致")
+print("最后一步 p =", seq_len - 1)
+print("  槽位序列   :", slots)
+print("  映射回位置 :", positions)
+print("  期望因果窗 :", expect)
+print("  位置 % W   :", [p % W for p in positions])</code></pre>
+</div>
+<p><b>预期输出</b>：</p>
+<div class="code-block">
+<pre><code class="language-text">W = 8  序列长度 = 20  全程一致
+最后一步 p = 19
+  槽位序列   : [4, 5, 6, 7, 0, 1, 2, 3]
+  映射回位置 : [12, 13, 14, 15, 16, 17, 18, 19]
+  期望因果窗 : [12, 13, 14, 15, 16, 17, 18, 19]
+  位置 % W   : [4, 5, 6, 7, 0, 1, 2, 3]</code></pre>
+</div>
+<p><b>验证的机制</b>：第 4.1 节的槽位映射与第 4.2 节的 decode 索引规则。每次写入后检查「按槽位读回的位置集合」是否等于期望的因果窗口 $[\max(0, p-W+1), p]$。</p>
+<p><b>观察重点</b>：槽位序列是 $[4,5,6,7,0,1,2,3]$——它并不按位置递增排列，因为环形缓冲的物理顺序是「最旧到最新绕一圈」；但映射回位置后与期望窗口逐项相等。这说明槽位顺序与可见集是两件事。</p>
+<p><b>简化条件</b>：单序列、单层、纯 Python 字典模拟；未涉及批量、chunked prefill 的分块边界，也未涉及缓存中的实际张量布局与精度。</p>
+</details>
+
+<h3 id="rb-indexing">4.2 prefill 逐行、decode 整环</h3>
+
+<p>同一份缓存，两种前向形态的索引方式不同<sup>[C4]</sup>：</p>
+
+<ul>
+<li><b>prefill</b>：一次处理 $N$ 个位置，每个 query 各需要一行可见槽位。实现按「位置减窗口再加偏移」算出每行的槽位下标，超出序列开头的部分填 $-1$。</li>
+<li><b>decode</b>：一次只有 1 个 query，它需要看到整个环。实现把槽位从「最旧」开始绕一圈列出，再对「位置还没写到」的槽位填 $-1$。</li>
+</ul>
+
+<p>两种形态列出的槽位顺序不同（prefill 每行按位置递增，decode 从最旧槽位绕一圈），但映射回位置后集合相同。实测：$W=128$、序列长 300 时逐位置比对，decode 槽位映射回的位置集合与 prefill 的因果窗口在全部 300 步一致；换成 $W=8$、序列长 20 的官方函数对照同样成立<sup>[N7]</sup>。顺序不影响结果，因为注意力实现把每个槽位独立处理（softmax 在同一组值上求和，与顺序无关）。</p>
+
+<h3 id="rb-position">4.3 位置编码用原序列位置</h3>
+
+<p>最后一处易错点是位置。RoPE 的相位由位置决定，而环形缓冲里的槽位下标会重复使用，因此不能用槽位下标当位置。DeepSeek-V4.1-Flash 的做法是用原序列位置：prefill 取 <code>freqs_cis[start_pos : start_pos+seqlen]</code>，decode 取 <code>freqs_cis[start_pos]</code><sup>[C5]</sup>。由于缓存里只有最近 $W$ 个位置，窗口内任意两个位置的相对距离不超过 $W$。</p>
+
+<p>作为对照，StreamingLLM 为了让「序列开头的汇聚点」与「最近的窗口」共处一个缓存，改用<b>缓存内位置</b>：把缓存里的位置重新编号成 $0,1,2,\dots$，而不是用它们在原文中的下标<sup>[C5]</sup>。两种口径的差别在需要跨越很远距离时显现：用原位置时，开头位置的相位差随序列增长而增大；用缓存内位置时，汇聚点被「拉近」到缓存开头。选择哪种取决于是否要把远处的汇聚点与近期窗口拼在同一个缓存里。</p>
+
+<h3 id="rb-questions">本章问题</h3>
+<ol class="chapter-questions">
+  <li>
+    <p>为什么 decode 时列出的槽位顺序与 prefill 不同，却不会影响结果？</p>
+    <details>
+      <summary>解答：集合相同且每个槽位独立处理，顺序只影响累加次序</summary>
+      <p>prefill 每行按位置递增列出可见槽位；decode 只有一行，按「最旧到最新」绕环列出。两者覆盖的位置集合相同（实测 300 步一致）。注意力对每个槽位算出分数后做 softmax 再加权求和，这个过程对槽位顺序不敏感：交换两个槽位只会改变浮点加法的次序，不会改变数学结果。真正会出错的是把「槽位下标」当成「位置」使用，那会改变 RoPE 相位与可见性判断。</p>
+    </details>
+  </li>
+  <li>
+    <p>如果窗口 KV 用槽位下标而不是原序列位置来加 RoPE，会发生什么？</p>
+    <details>
+      <summary>解答：相位会周期性重复，相同槽位的键在不同轮次被赋予同一位置</summary>
+      <p>槽位下标只有 $W$ 个取值，位置 $i$ 与 $i+W$ 会落在同一槽位、被赋予同一相位。于是模型无法区分「最近的第 $W$ 个位置」与「$2W$ 之前的那个位置」，相对距离信息被破坏，注意力的距离分辨能力退化成周期性的。因此实现必须用原序列位置（或用缓存内位置并接受相应的语义变化，如 StreamingLLM 为汇聚点所做的处理）。</p>
+    </details>
+  </li>
+</ol>
+
+<h2 id="sources-and-scope-notes">来源与范围说明</h2>
+
+<h3>核心论断与来源</h3>
+<p>[C1] Mistral 7B（Jiang et al., arXiv:2310.06825）§2「Sliding Window Attention」：「the hidden state in position i of the layer k, h_i, attends to all hidden states from the previous layer with positions between i−W and i. Recursively, h_i can access tokens from the input layer at a distance of up to W×k tokens」；「At each attention layer, information can move forward by W tokens. Hence, after k attention layers, information can move forward by up to k×W tokens.」</p>
+<p>[C2] 同上 §2「Rolling Buffer Cache」：「The cache has a fixed size of W, and the keys and values for the timestep i are stored in position i mod W of the cache. As a result, when the position i is larger than W, past values in the cache are overwritten, and the size of the cache stops increasing.」</p>
+<p>[C3] StreamingLLM（Xiao et al., arXiv:2309.17453）§3.1、§3.2 与 Table 2：「Window attention (0+y) has a drastic increase in perplexity.」；「removing these initial tokens' KV will remove a considerable portion of the denominator in the SoftMax function in attention computation.」；「StreamingLLM simply keeps the attention sink tokens' KV (with just 4 initial tokens sufficing) together with the sliding window's KV」。</p>
+<p>[C4] DeepSeek-V4.1-Flash 官方推理配置 <code>official/inference/config.json</code>（<code>window_size=128</code>、<code>head_dim=512</code>、<code>n_layers=40</code>）与参考实现 <code>official/inference/model.py</code>：<code>_window_kv</code> 中 <code>act_quant(kv, fp8_block_size, ...)</code> 与注释「The K stays fp8, quantized over the whole post-RoPE vector」；<code>forward</code> 中 <code>kv = torch.cat([kv, compress_kv], dim=1)</code>。技术报告 §2.4.4：「We retain FP8 for the SWA KV cache due to its sensitivity to quantization.」</p>
+<p>[C5] 原序列位置：参考实现 <code>model.py</code> 中 <code>freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]</code>（窗口 KV 的 RoPE）与 decode 分支的 <code>start_pos</code> 用法。缓存内位置：StreamingLLM §3.2「StreamingLLM focuses on positions within the cache rather than those in the original text. This distinction is crucial for StreamingLLM's performance.」</p>
+
+<h3>核心公式与来源</h3>
+<p>[F1] $\text{span}(k)=k\times W$：由 [C1] 的逐层前移直接推出，Mistral 7B 用 $W=4096$、32 层给出 131K 的对照。</p>
+<p>[F2] $\text{slot}(i)=i \bmod W$：[C2] 的定义式；参考实现写作 <code>window_kv_cache[:bsz, start_pos % win]</code>。</p>
+<p>[F3] $n_{\text{score}}(N)=N\times W$：按「query 数 × 每 query 可见槽位数」计数，与 [C1] 的可见集定义一致。</p>
+
+<h3>外部数字与实验条件</h3>
+<p>[N1] Mistral 7B：$W=4096$、32 层、窗口外仍可经层堆叠影响预测；理论上限注意力跨度约 131K token（$4096\times32=131072$）。来源：同 [C1] 论文 §2 与 Table 1。</p>
+<p>[N2] Mistral 7B：32K 序列下滚动缓冲把缓存显存减少 8 倍（$32768/4096=8$）。来源：同 [C2] 论文 §2。本页只引用其倍数关系，不引用其加速比数字。</p>
+<p>[N3] StreamingLLM Table 1（Llama-2-13B，PG19 首本书 65K token）：「0+1024」（纯窗口）困惑度 5158.07，「4+1020」5.40。x+y 表示 x 个初始位置 + y 个近期位置。</p>
+<p>[N4] StreamingLLM Table 3（160M 参数模型，PG19 首样本）：可学习 sink token 训练的模型在 1+1023 配置下困惑度 18.01；未做该训练的模型在 2+1022 下 18.05。</p>
+<p>[N5] DeepSeek-V4.1-Flash 的窗口缓存账：$W=128$、512 维、FP8，每层 64 KiB，40 层 2.50 MiB，相对 1M 位置全缓存为 $1/8192$；打分次数对照表的三个规模由 $N\times W$ 与 $N^2$ 直接算出。复算脚本：<code>research/verify_swa_accounts.py</code>。</p>
+<p>[N6] 感受野：$40\times128=5120$，占 $1\,048\,576$ 的 0.49%。同上脚本。</p>
+<p>[N7] 索引一致性：$W=128$、序列长 300 时 decode 槽位映射回的位置集合与 prefill 因果窗口逐步一致（0 处不符）；$W=8$、序列长 20 时对官方函数 <code>get_window_topk_idxs</code> 的直接对照同样一致。复算脚本同上；官方函数对照存档见 <code>wiki/deepseek-v4-1/research/ckpt/verify_sparse_attn_window.out</code>。</p>
+
+<h3>构造示例</h3>
+<p>64 KiB 与 2.50 MiB 的加总、$W=3$ 与 $W=6$ 的窗口示意、可运行代码中的 $W=8$、序列长 20 均为构造示例，用于说明计算步骤；数值取自官方配置而非实测运行。代码输出为实际运行结果。</p>
+
+<h3>辅助解释与类比边界</h3>
+<p>「层堆叠接力」是辅助解释：它说明信息每层前移 $W$、累计 $k\times W$，但不代表间接可见的信息保真度与直接可见相同——每层都要经过 softmax 加权混合，距离越远、路径越长，可恢复性越低。本页不量化这个衰减，只在使用 $k\times W$ 作为上限时说明它是上限。</p>
+
+<h3>简化条件及其限制</h3>
+<ul>
+<li>字节账只算窗口 KV（单序列、单层），不含压缩全局 KV、索引器缓存与压缩器跨步残态；这些项随 batch 与实现变化，不影响「窗口缓存与序列长度无关」这个结论。</li>
+<li>复杂度按注意力打分次数计数，不含 softmax、值加权与投影开销；因此「少 8192 倍」指打分次数，不等于端到端延迟的倍数。</li>
+<li>索引一致性复算覆盖 $W=8$ 与 $W=128$ 两种规模、单序列；未覆盖多 batch、chunked prefill 分块边界与张量并行切分。</li>
+<li>窗口取值的对照（Mistral 的 4096 与 DeepSeek-V4.1-Flash 的 128）只说明两者取值不同，不构成优劣判断——窗口大小与是否需要全局 KV、模型深度共同决定。</li>
+</ul>
