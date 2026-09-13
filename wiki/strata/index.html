@@ -67,7 +67,7 @@
 
 <p>长上下文 LLM 服务面对一对矛盾：模型能处理的上下文越来越长（128K、1M token 已成主流），但 GPU 显存装不下这么多 KV cache，生产系统不得不把缓存分层到 CPU 内存和 SSD。问题出在"搬回来"这一步——把缓存从 CPU 内存搬回 GPU 的带宽利用率远低于硬件上限：一份 8192 token 的 Llama-3.1-8B KV cache 加载只达到 PCIe 5.0 理论带宽的约 22%，GH200 上更跌到约 5%。原因有两类：分页布局让一个序列的缓存散布在大量不连续的页中，传输粒度只有几 KB（打不满带宽）；现有调度器按"prefill 计算能掩盖加载时间"的旧假设组批，长上下文下加载时间反超计算，系统变成 loading-bound（74% prefill 时间阻塞在 I/O，吞吐降 4 倍）。</p>
 
-<p>Strata 用三个机制回应这两个原因。<b>GPU-assisted I/O</b>用 CUDA kernel 代替传统的 cudaMemcpyAsync 传输——数千线程各搬一小块数据，并发与传输粒度都大幅改善；用少量大 block 把 kernel 关进少数 SM 不影响计算；让 GPU 保持 layer-first 计算布局，host 与存储用 page-first 传输布局，布局转换由 I/O kernel 内一次算术完成。<b>Cache-aware 调度</b>把 PCIe 带宽当成一等资源：transient node 标记避免 delay hit（同一缓存"正在计算中"时的重复 prefill），均衡组批（load/compute 比例阈值 100）避免 loading-bound，bubble filling 在不可避免的空泡里插入 decode 批填充。H200 上的实验显示，对比 vLLM+LMCache 吞吐最多提升 5 倍、对比 TensorRT-LLM 最多 3.75 倍，短上下文不退化<sup>[C26]</sup>。</p>
+<p>Strata 用三个机制回应这两个原因。<b>GPU-assisted I/O</b>用 CUDA kernel 代替传统的 cudaMemcpyAsync 传输——数千线程各搬一小块数据，并发与传输粒度都大幅改善；用少量大 block 把 kernel 关进少数 SM 不影响计算；让 GPU 保持 layer-first 计算布局，host 与存储用 page-first 传输布局，布局转换由 I/O kernel 内一次算术完成。<b>Cache-aware 调度</b>把 PCIe 带宽当成一等资源：transient node 标记避免 delay hit（同一缓存"正在计算中"时的重复 prefill），均衡组批（load/compute 比例阈值 100）避免 loading-bound，bubble filling 在不可避免的空泡里插入 decode 批填充。H200 上的实验显示，对比 vLLM+LMCache 吞吐最多提升 5 倍、对比 TensorRT-LLM 最多 3.75 倍，短上下文不退化<sup>[C24]</sup>。</p>
 
 <p>阅读前假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿示例：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.56 GB——已超出单请求显存预算，分层与跨层搬运不可避免。</p>
 
@@ -78,7 +78,7 @@
       <p>把缓存的 KV cache 从 CPU 搬回 GPU 为什么会成为主要瓶颈？</p>
       <details>
         <summary>解答：分页碎片化传输 + 调度器忽略加载延迟</summary>
-        <p>两个独立来源。其一，PagedAttention 为显存管理把页切到 1–32 token，一个序列的 KV cache 散布在大量不连续页中（页 1 的页里只有 KB 级数据，TensorRT-LLM 32、vLLM 16、SGLang 1），跨内存层传输粒度只有几 KB——达到 PCIe 5.0 约 75–80% 带宽需 1–2 MB 传输，实测 8192 token 加载只达约 22% 带宽、GH200 上约 5%。其二，现有调度器假设 prefill 计算能掩盖加载延迟，长上下文下该假设失效（加载量大、新 token 少），系统 loading-bound——LooGLE 上 74% prefill 时间阻塞在 I/O，吞吐降 4 倍。加大页改善 I/O 但 hit rate 与 TTFT 显著恶化（页 1$\to$1024，TTFT 最多 2x、P90 2.9x），是根本性权衡。完整论证见第 1 章。</p>
+        <p>两个独立来源。其一，PagedAttention 为显存管理把页切到 1–32 token，一个序列的 KV cache 散布在大量不连续页中（页 1 的页里只有 KB 级数据，TensorRT-LLM 32、vLLM 16、SGLang 1），跨内存层传输粒度只有几 KB——达到 PCIe 5.0 约 75–80% 带宽需 1–2 MB 传输，实测 8192 token 加载只达约 22% 带宽、GH200 上约 5%。其二，现有调度器假设 prefill 计算能掩盖加载延迟，长上下文下该假设失效（加载量大、新 token 少），系统 loading-bound——LooGLE 上 74% prefill 时间阻塞在 I/O，吞吐降 4 倍。加大页改善 I/O 但 hit rate 与 TTFT 显著恶化（页 1$\to$1024，TTFT 最多 $2\times$、P90 $2.9\times$），是根本性权衡。完整论证见第 1 章。</p>
       </details>
     </li>
     <li>
@@ -98,8 +98,8 @@
     <li>
       <p>Strata 的收益有多大、在什么条件下成立？</p>
       <details>
-        <summary>解答：长上下文最多 5x 吞吐提升，条件为 prefill 主导 + 1TB pinned DRAM</summary>
-        <p>H200、三模型、四数据集。LooGLE 上同 TTFT 吞吐：Llama-8B 对 SGLang-HiCache/vLLM-LMCache/TensorRT-HiCache 分别 3.2$\times$/2.6$\times$/1.9$\times$；Qwen-14B 3.9$\times$/2.1$\times$/1.9$\times$；Llama-70B 5$\times$/5$\times$/3.75$\times$（abstract 的 5x/3.75x 即此行）。ReviewMT、ShareGPT、NarrativeQA 预热稳态全套数字见第 5 章。条件：长上下文 prefill 主导负载、分层缓存已必要（非分层系统迅速耗尽显存）、1TB pinned DRAM 配置（GH200 400GB）、disk 未纳入端到端对比。消融：调度单独 1.8x、I/O 单独 2.3x 峰值吞吐（相对 SGLang-HiCache）；低请求率下调度收益更大，高请求率下 I/O 主导。SGLang-HiCache 最优页 512 也只有 Strata-IO 的 93%——Strata 免去页大小调参。GH200：I/O 机制把持续带宽 40$\to$150 GB/s；调度是吃满新硬件的必要条件。短上下文无退化（ShareGPT）。完整数据见第 5 章。</p>
+        <summary>解答：长上下文最多 $5\times$ 吞吐提升，条件为 prefill 主导 + 1TB pinned DRAM</summary>
+        <p>H200、三模型、四数据集。LooGLE 上同 TTFT 吞吐：Llama-8B 对 SGLang-HiCache/vLLM-LMCache/TensorRT-HiCache 分别 3.2$\times$/2.6$\times$/1.9$\times$；Qwen-14B 3.9$\times$/2.1$\times$/1.9$\times$；Llama-70B 5$\times$/5$\times$/3.75$\times$（abstract 的 $5\times$/$3.75\times$ 即此行）。ReviewMT、ShareGPT、NarrativeQA 预热稳态全套数字见第 5 章。条件：长上下文 prefill 主导负载、分层缓存已必要（非分层系统迅速耗尽显存）、1TB pinned DRAM 配置（GH200 400GB）、disk 未纳入端到端对比。消融：调度单独 $1.8\times$、I/O 单独 $2.3\times$ 峰值吞吐（相对 SGLang-HiCache）；低请求率下调度收益更大，高请求率下 I/O 主导。SGLang-HiCache 最优页 512 也只有 Strata-IO 的 93%——Strata 免去页大小调参。GH200：I/O 机制把持续带宽 40$\to$150 GB/s；调度是吃满新硬件的必要条件。短上下文无退化（ShareGPT）。完整数据见第 5 章。</p>
       </details>
     </li>
     <li>
@@ -136,7 +136,7 @@
 
 <h2 id="bottleneck">1. 瓶颈定位：分层缓存为什么救不了长上下文的响应时间</h2>
 
-<p>分层缓存解决了"存得下"，但搬回来"成为"了新的瓶颈。瓶颈的成因分成两层，由机制与实验数字共同支撑：为什么分页让传输打不满带宽，为什么加大页不解决问题反而引入新问题；以及为什么现有调度器把这一困境再放大一层。</p>
+<p>分层缓存解决了"存得下"，但"搬回来"成为了新的瓶颈。瓶颈的成因分成两层，由机制与实验数字共同支撑：为什么分页让传输打不满带宽，为什么加大页不解决问题反而引入新问题；以及为什么现有调度器把这一困境再放大一层。</p>
 
 <h3 id="capacity-math">1.1 分层缓存成为标配——容量账</h3>
 
@@ -460,7 +460,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h2 id="experiments">5. 实验验证：收益数字与成立条件</h2>
 
-<p>实验结果分四组：① 端到端全套数字（含 abstract 5x/3.75x 的来源）② 消融各机制贡献 ③ 页大小负担与 cache distance ④ GH200 新硬件；短上下文（ShareGPT）单列。实验设置是理解这些数字的前提，列在最前。</p>
+<p>实验结果分四组：① 端到端全套数字（含 abstract $5\times$/$3.75\times$ 的来源）② 消融各机制贡献 ③ 页大小负担与 cache distance ④ GH200 新硬件；短上下文（ShareGPT）单列。实验设置是理解这些数字的前提，列在最前。</p>
 
 <h3 id="setup">5.1 实验设置</h3>
 
@@ -476,7 +476,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>图 8 为全景（H200）：</p>
 <img src="assets/img-06.webp" alt="图（原文 Figure 8）：H200 上三模型四数据集端到端吞吐-TTFT 对比">
-<p><b>图（原文 Figure 8）</b>：每行一个数据集，纵轴 Average TTFT (s)、横轴 Throughput (output tokens/s)，曲线终点由请求率驱动。曲线越靠右下越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。Strata 在所有长上下文（前三行）上显著领先 short context（ShareGPT，末行）上各系统接近。LooGLE 上 Strata 对 Llama-70B 达到 abstract 的 5x vs vLLM-LMCache 与 3.75x vs TensorRT-LLM（详见下表）。</p>
+<p><b>图（原文 Figure 8）</b>：每行一个数据集，纵轴 Average TTFT (s)、横轴 Throughput (output tokens/s)，曲线终点由请求率驱动。曲线越靠右下越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。Strata 在所有长上下文（前三行）上显著领先 short context（ShareGPT，末行）上各系统接近。LooGLE 上 Strata 对 Llama-70B 达到 abstract 的 $5\times$ vs vLLM-LMCache 与 $3.75\times$ vs TensorRT-LLM（详见下表）。</p>
 
 <p>核心数字表（汇总 N10、N11、N20）：</p>
 
@@ -484,20 +484,20 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <table>
 <thead><tr><th>数据集</th><th>模型</th><th>vs SGLang-HiCache</th><th>vs vLLM-LMCache</th><th>vs TensorRT-HiCache</th></tr></thead>
 <tbody>
-<tr><td>LooGLE</td><td>Llama-8B</td><td><b>3.2x</b></td><td><b>2.6x</b></td><td><b>1.9x</b></td></tr>
-<tr><td>LooGLE</td><td>Qwen-14B</td><td><b>3.9x</b></td><td><b>2.1x</b></td><td><b>1.9x</b></td></tr>
-<tr><td>LooGLE</td><td>Llama-70B</td><td><b>5x</b></td><td><b>5x</b></td><td><b>3.75x</b></td></tr>
-<tr><td>ReviewMT</td><td>Llama-8B</td><td><b>1.7x</b></td><td><b>2.3x</b></td><td><b>2.3x</b></td></tr>
-<tr><td>NarrativeQA（预热稳态）</td><td>Llama-8B / Qwen-14B / Llama-70B</td><td>—</td><td>2.3x / 2.6x / 2.5x</td><td>—</td></tr>
+<tr><td>LooGLE</td><td>Llama-8B</td><td><b>$3.2\times$</b></td><td><b>$2.6\times$</b></td><td><b>$1.9\times$</b></td></tr>
+<tr><td>LooGLE</td><td>Qwen-14B</td><td><b>$3.9\times$</b></td><td><b>$2.1\times$</b></td><td><b>$1.9\times$</b></td></tr>
+<tr><td>LooGLE</td><td>Llama-70B</td><td><b>$5\times$</b></td><td><b>$5\times$</b></td><td><b>$3.75\times$</b></td></tr>
+<tr><td>ReviewMT</td><td>Llama-8B</td><td><b>$1.7\times$</b></td><td><b>$2.3\times$</b></td><td><b>$2.3\times$</b></td></tr>
+<tr><td>NarrativeQA（预热稳态）</td><td>Llama-8B / Qwen-14B / Llama-70B</td><td>—</td><td>$2.3\times$ / $2.6\times$ / $2.5\times$</td><td>—</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>abstract 的"<b>up to $5\times$ lower TTFT vs vLLM+LMCache</b>"与"<b>$3.75\times$ speedup over TensorRT-LLM</b>"对应 Llama-70B LooGLE 行：同 TTFT 下 Strata 吞吐提升 5x（vs vLLM-LMCache 与 vs SGLang-HiCache 均 5x）、vs TensorRT-HiCache 提升 3.75x<sup>[N10]</sup>。两者口径略异：abstract 说"lower TTFT"、正文说"higher throughput at the same TTFT"，出自同一组实验的不同读法（吞吐-延迟曲线上的同位点），并非冲突。</p>
+<p>abstract 的"<b>up to $5\times$ lower TTFT vs vLLM+LMCache</b>"与"<b>$3.75\times$ speedup over TensorRT-LLM</b>"对应 Llama-70B LooGLE 行：同 TTFT 下 Strata 吞吐提升 $5\times$（vs vLLM-LMCache 与 vs SGLang-HiCache 均 $5\times$）、vs TensorRT-HiCache 提升 $3.75\times$<sup>[N10]</sup>。两者口径略异：abstract 说"lower TTFT"、正文说"higher throughput at the same TTFT"，出自同一组实验的不同读法（吞吐-延迟曲线上的同位点），并非冲突。</p>
 
 <p>分层缓存的必要性：LooGLE 上非分层系统"迅速耗尽 GPU 显存容量、导致 prefill 频繁 miss、反复重算、低吞吐高延迟"，分层系统借 CPU 内存稳定达到约 95% cache hit rate<sup>[C19, N20]</sup>。换言之，没有 1TB pinned DRAM 配置（GH200 400GB）的容量基础，Strata 的传输与调度优化无从谈起。</p>
 
-<p>NarrativeQA 预热稳态：先预计算全部上下文 KV 缓存入 CPU 内存、刷 GPU 初始状态后重启负载（TensorRT-HiCache 不支持预热未测）。NarrativeQA 因 avg 输入 54,797 token 远超 LooGLE，"无分层缓存系统跑不动"——这就是该实验以预热稳态为主的原因。对比 vLLM-LMCache：Llama-8B 2.3x、Qwen-14B 2.6x、Llama-70B 2.5x<sup>[N11]</sup>。</p>
+<p>NarrativeQA 预热稳态：先预计算全部上下文 KV 缓存入 CPU 内存、刷 GPU 初始状态后重启负载（TensorRT-HiCache 不支持预热未测）。NarrativeQA 因 avg 输入 54,797 token 远超 LooGLE，"无分层缓存系统跑不动"——这就是该实验以预热稳态为主的原因。对比 vLLM-LMCache：Llama-8B $2.3\times$、Qwen-14B $2.6\times$、Llama-70B $2.5\times$<sup>[N11]</sup>。</p>
 
 <details>
 <summary>补充：NarrativeQA 预热与 ShareGPT 60 秒思考时间</summary>
@@ -510,7 +510,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>图 9 显示 Strata-IO、Strata-Schedule-Only、Strata-IO-LPM 与完整 Strata 的吞吐-TTFT 曲线对比——各机制独立有效，组合更优。</p>
 <img src="assets/img-05.webp" alt="图（原文 Figure 9）：消融 Strata-IO / Schedule-Only / IO-LPM 的吞吐-延迟对比">
-<p><b>图（原文 Figure 9）</b>：相对 SGLang-HiCache 基线，Strata-IO 与 Strata-Schedule-Only 分别最高 2.3x 与 1.8x 峰值吞吐<sup>[N12, C20]</sup>。两者各从一个角度缓解 loading stall：低请求率下调度收益大（批小、I/O 压力轻，调度可更有效掩盖加载）；高请求率下 I/O 主导（批大、加载量大，I/O 机制是维持高吞吐的关键）。vLLM-LMCache 与 TensorRT-HiCache 也用 CUDA kernel 加速 KV cache I/O，与 Strata-IO 低请求率下相当，高请求率下 Strata-IO 维持更高吞吐（干扰抑制更有效）。Strata-IO-LPM（最长前缀匹配调度）低请求率下因提高在设备页复用而获益，高请求率下因频繁逐出无法保持。</p>
+<p><b>图（原文 Figure 9）</b>：相对 SGLang-HiCache 基线，Strata-IO 与 Strata-Schedule-Only 分别最高 $2.3\times$ 与 $1.8\times$ 峰值吞吐<sup>[N12, C20]</sup>。两者各从一个角度缓解 loading stall：低请求率下调度收益大（批小、I/O 压力轻，调度可更有效掩盖加载）；高请求率下 I/O 主导（批大、加载量大，I/O 机制是维持高吞吐的关键）。vLLM-LMCache 与 TensorRT-HiCache 也用 CUDA kernel 加速 KV cache I/O，与 Strata-IO 低请求率下相当，高请求率下 Strata-IO 维持更高吞吐（干扰抑制更有效）。Strata-IO-LPM（最长前缀匹配调度）低请求率下因提高在设备页复用而获益，高请求率下因频繁逐出无法保持。</p>
 
 <h3 id="page-size-scan">5.4 页大小负担与 cache distance</h3>
 
@@ -545,10 +545,10 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <h3 id="experiments-questions">本章问题</h3>
 <ol class="chapter-questions">
   <li>
-    <p>abstract 说"5x lower TTFT vs vLLM+LMCache、3.75x vs TensorRT-LLM"是怎么读出来的？</p>
+    <p>abstract 说"$5\times$ lower TTFT vs vLLM+LMCache、$3.75\times$ vs TensorRT-LLM"是怎么读出来的？</p>
     <details>
       <summary>解答：LooGLE 上 Llama-70B 行的同 TTFT 吞吐倍数</summary>
-      <p>LooGLE 是 prefill 主导、avg 输入 21,613 token 的长上下文负载；Llama-70B 用 4 GPU 张量并行（KV cache 总量更大，跨内存层搬运规模更大）；Strata 在吞吐-TTFT 曲线上同 TTFT 下吞吐提升倍数：vs SGLang-HiCache 与 vs vLLM-LMCache 各 5x、vs TensorRT-HiCache 3.75x。abstract 取最大数字（5x 与 3.75x），正文表格完整列出全部基线 $\times$ 模型 $\times$ 数据集组合。</p>
+      <p>LooGLE 是 prefill 主导、avg 输入 21,613 token 的长上下文负载；Llama-70B 用 4 GPU 张量并行（KV cache 总量更大，跨内存层搬运规模更大）；Strata 在吞吐-TTFT 曲线上同 TTFT 下吞吐提升倍数：vs SGLang-HiCache 与 vs vLLM-LMCache 各 $5\times$、vs TensorRT-HiCache $3.75\times$。abstract 取最大数字（$5\times$ 与 $3.75\times$），正文表格完整列出全部基线 $\times$ 模型 $\times$ 数据集组合。</p>
     </details>
   </li>
   <li>
@@ -624,7 +624,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>F1（Little's Law $C=\lambda L$）见 §3.1 L26–27；F2（$X=\lambda S=C\cdot S/L$）见 §3.1 L28。F3（KV cache 每 token 字节数）见 <a href="../kv-cache/index.html">KV cache</a> F1，定义沿用如下：$2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$，Llama-3.1-8B 32 层/8 KV 头/head_dim 128/bf16 得 128 KB/token，20,000 token 手册约 2.56 GB。</p>
 
 <h3>外部数字与实验条件</h3>
-<p>N1（40 GB HBM $\approx$ Llama-8B 0.3M token）见 §1 L10。N2（页大小 32/16/1 token）见 §2.2 L14、§3.1 L48。N3（8192 token 加载约 22% PCIe 5.0 带宽、GH200 约 5%）见 §3.1 L47–49。N4（页 1$\to$1024 TTFT 最多 2x、P90 2.9x）见 §3.1 L41–42。N5（2 block $\times$ 1024 thread $\to$ 50 GB/s、prefill <5%、decode 10%）见 §4.2 L56–59。N6（128 字节粒度）见 §4.2 L35。N7（transient node 阈值 100）见 §4.3.1 L115。N8（loading_bound 阈值 100）见 §4.3.2 L162。N9（磁盘 page-first 延迟最多降 4x）见 §5.3.4 L186–190。N10–N20（端到端全套与设置）见 §5.1 与 §5.2 表。</p>
+<p>N1（40 GB HBM $\approx$ Llama-8B 0.3M token）见 §1 L10。N2（页大小 32/16/1 token）见 §2.2 L14、§3.1 L48。N3（8192 token 加载约 22% PCIe 5.0 带宽、GH200 约 5%）见 §3.1 L47–49。N4（页 1$\to$1024 TTFT 最多 $2\times$、P90 $2.9\times$）见 §3.1 L41–42。N5（2 block $\times$ 1024 thread $\to$ 50 GB/s、prefill <5%、decode 10%）见 §4.2 L56–59。N6（128 字节粒度）见 §4.2 L35。N7（transient node 阈值 100）见 §4.3.1 L115。N8（loading_bound 阈值 100）见 §4.3.2 L162。N9（磁盘 page-first 延迟最多降 $4\times$）见 §5.3.4 L186–190。N10–N20（端到端全套与设置）见 §5.1 与 §5.2 表。</p>
 
 <h3>原图与原文对应</h3>
 <p>Figure 1（cdf_stall.pdf）$\to$ §1.2 末，作为"瓶颈一$\to$瓶颈二"的过渡证据（图像主体是 Load/Compute Ratio 分布 + I/O stall 百分比，论文 §1 L14/L37 用于论证调度瓶颈）。Figure 2（page_size_ttft.pdf）$\to$ 第 1 章"大页不是出路"。Figure 3（motivation_poor_utilization.pdf）$\to$ 第 1 章"瓶颈一"。Figure 4（strata_system_diagram.pdf）$\to$ 第 4 章"系统全景"。Figure 5（io_overhead.pdf）$\to$ 第 2 章"干扰控制"。Figure 6（layout_difference.pdf）$\to$ 第 3 章"两种布局"。Figure 7（schedule_diagram.pdf）$\to$ §4.2 delay hit 段（含自绘 SVG HiRadixTree 状态流转作 Figure 7 内容的延伸，正文已嵌入 Figure 7 原图）。Figure 8（e2e_bench_all.png）$\to$ 第 5 章"端到端"。Figure 9（loogle_break.pdf）$\to$ 第 5 章"消融"。Figure 10（loogle_page_size_scan.pdf）$\to$ 第 5 章"页大小"。Figure 11（incremental_contributions.pdf）$\to$ 第 5 章"cache distance"。Figure 12（loading_latency_comparison.pdf）$\to$ 第 3 章"解法"。Figure 13（grace_hopper_compare.pdf）$\to$ 第 5 章"GH200"。Figure 14（grace_hopper_bandwidth.pdf）$\to$ 第 5 章"GH200"。</p>

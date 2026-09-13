@@ -117,7 +117,7 @@
       <details>
         <summary>解答：三条适用条件、外推越界、与矩阵吸收冲突</summary>
         <p>适用条件有三条：使用 softmax 注意力（分数来自 $QK^T$）；query/key 维度 $d$ 为偶数（可拆成 $d/2$ 个二维对）；token 位置可用整数 $m$ 表示。RoPE 不替代 token 类型嵌入，也不提供绝对位置查询能力；纯双向编码器若需要显式绝对位置信号，APE 更直接。</p>
-      <p>长度外推需要扩展方法，因为训练时 $m$ 只在 $[0, L_{\text{train}})$ 取值，模型只见过 $m\theta_i$ 落在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合；超出训练长度后角度进入训练分布外区间，$i$ 小的高频分量最先越界。PI（Position Interpolation）把位置整体缩放回训练范围（$m'=m\cdot L_{\text{train}}/L_{\text{target}}$）；YaRN 按频率分组施加不同缩放，高频基本保持以保留局部分辨力、低频缩放以覆盖更长距离；LongRoPE 按维度非均匀搜索缩放因子。"RoPE 可任意外推"是常见误解，论文所说的长度灵活性指结构上可扩展，不代表简单外推效果不变。</p>
+      <p>长度外推需要扩展方法，因为训练时 $m$ 只在 $[0, L_{\text{train}})$ 取值，模型只见过 $m\theta_i$ 落在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合；超出训练长度后角度进入训练分布外区间，$i$ 大、$\theta_i$ 小的低频分量（波长不小于 $L_{\text{train}}$）最先进入未见相位。PI（Position Interpolation）把位置整体缩放回训练范围（$m'=m\cdot L_{\text{train}}/L_{\text{target}}$）；YaRN 按频率分组施加不同缩放，高频基本保持以保留局部分辨力、低频缩放以覆盖更长距离；LongRoPE 按维度非均匀搜索缩放因子。"RoPE 可任意外推"是常见误解，论文所说的长度灵活性指结构上可扩展，不代表简单外推效果不变。</p>
       <p>K3 的 MLA 层不施加旋转，是因为 RoPE 与<strong>矩阵吸收</strong>冲突：吸收要求 $W^{UK}$ 与位置无关，而施加 RoPE 后注意力项变成 $\tilde q^T(R_n W^{UK} c^{KV})$，位置相关且逐 token 不同的 $R_n$ 夹在中间，无法合并为固定矩阵。DeepSeek-V2 的应对是解耦 RoPE、用额外一组共享 key 承载位置；Kimi K3 的 Gated MLA 在结构上保留 rot 分量接口，但 <code>mla_use_nope=true</code>，位置信息交由 KDA（K3 中的递归注意力变体）通过递归门控与衰减隐式提供，因此扩展上下文时无需调整位置编码参数。详见「适用边界」一章。</p>
       </details>
     </li>
@@ -126,13 +126,13 @@
 
 <p><a href="../../wiki/standard-attention/index.html"><strong>自注意力</strong></a>（softmax 注意力）是"用 query 和 key 做匹配、按匹配程度对 value 加权求和"的机制；<a href="../../wiki/positional-encoding/index.html"><strong>位置编码</strong></a>是给注意力注入位置信息的方法；<a href="../../wiki/causal-mask/index.html"><strong>因果掩码</strong></a>是 decoder-only 注意力中阻止看到未来 token 的上三角 mask；<strong>排列等变</strong>——交换输入顺序后各位置的输出值不变——的形式化讨论见 <a href="../../wiki/nope/index.html">NoPE</a>。矩阵吸收与 RoPE 解耦见 <a href="../../wiki/mla/index.html">MLA</a>，K3 的 MLA 用 NoPE 设计见 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a>。</p>
 
-<p>先看一个贯穿全文的问题：把同一组 2 维 query 和 key 放在不同位置 $m$、$n$ 上，旋转后它们的内积会是什么样？这个问题会在 2 维 RoPE 一章手算回答，并在内积证明一章验证它只依赖 $m-n$。</p>
+<p>贯穿全文的问题是：把同一组 2 维 query 和 key 放在不同位置 $m$、$n$ 上，旋转后它们的内积会是什么样？这个问题在 2 维 RoPE 一章手算回答，并在内积证明一章验证它只依赖 $m-n$。</p>
 
 <h2 id="why-position-encoding">1. 为什么 Transformer 需要位置编码——RoPE 与四类方案的差异</h2>
 
 <p>标准自注意力做的事情是"用 query 和 key 做匹配，按匹配程度对 value 加权求和"。它只关心两个 token 的内容像不像，不关心它们各自在第几位。这引出一个问题：如果模型不知道 token 的位置，它还能区分"甲在前、乙在后"和"乙在前、甲在后"吗？</p>
 
-<p>要回答它，先看注意力本身的一个性质。如果注意力是双向的（每个位置都能看到所有位置）并且不给任何位置信息，那么交换输入顺序后，每个位置仍然看到同样的一组 token、按同样的内容匹配得到同样的权重——只是输出跟着挪了位置，而每个位置上的输出值不变。这种现象叫<strong>排列等变</strong>：模型对"谁先谁后"没有真正的区分能力。排列等变的更完整讨论见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
+<p>注意力本身有一个性质：如果注意力是双向的（每个位置都能看到所有位置）并且不给任何位置信息，那么交换输入顺序后，每个位置仍然看到同样的一组 token、按同样的内容匹配得到同样的权重——只是输出跟着挪了位置，而每个位置上的输出值不变。这种现象叫<strong>排列等变</strong>：模型对"谁先谁后"没有真正的区分能力。排列等变的更完整讨论见 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
 
 <p>正因如此，主流做法是主动注入位置信息——这就是<a href="../../wiki/positional-encoding/index.html"><strong>位置编码</strong></a>。常见的显式位置编码分四类，各自"做了什么"不同：</p>
 
@@ -179,7 +179,7 @@
   </li>
 </ol>
 
-<p>本章把 RoPE 的"做什么"与已有方案的差异说清了：相对位置是<strong>效果</strong>不是<strong>构造</strong>，参数为零，作用点在每个注意力层内。但旋转矩阵长什么样、内积为何只剩 $m-n$ 尚未回答——下一章用最小 2 维例子讲旋转矩阵的形式。</p>
+<p>相对位置是<strong>效果</strong>不是<strong>构造</strong>、参数为零、作用点在每个注意力层内——这三点确定了 RoPE 与已有方案的差异。旋转矩阵具体长什么样、内积为何只剩 $m-n$，要到最小 2 维例子里才能看清。</p>
 
 <h2 id="rope-2d">2. 2 维 RoPE 是怎么旋转的——最小可手算机制</h2>
 
@@ -293,7 +293,7 @@ $$\langle R_m q, R_n k \rangle = (q_0 k_0 + q_1 k_1)\cos((n-m)\theta) - (q_0 k_1
   </li>
 </ol>
 
-<p>本章给出了 2 维旋转矩阵和内积公式，并用 $q=(1,0)$ 验证了内积只含 $(n-m)\theta$。但旋转矩阵用了绝对位置 $m$、$n$，内积为何只剩 $m-n$——下一章用三角恒等式证明这是旋转矩阵群的性质。</p>
+<p>2 维旋转矩阵与内积公式已经给出，$q=(1,0)$ 的例子显示内积只含 $(n-m)\theta$。旋转明明用了绝对位置 $m$、$n$，内积却只剩 $m-n$；原因要用三角恒等式从旋转矩阵群的性质里找。</p>
 
 <h2 id="relative-position-proof">3. 内积为何只依赖 $m-n$——旋转矩阵群的性质</h2>
 
@@ -353,7 +353,7 @@ $$\langle R_m q, R_n k \rangle = q^T R_m^T R_n k = q^T R_{n-m} k.$$
   </li>
 </ol>
 
-<p>本章证明了 2 维相对位置保持是旋转矩阵群的性质。但真实模型 $d$ 是 64 或 128 而非 2——下一章讲 d 维推广与 $\theta_i$ 几何级数。</p>
+<p>2 维相对位置保持已被证明是旋转矩阵群的性质。真实模型 $d$ 是 64 或 128 而非 2，需要把这套分块机制推广到 d 维，并交代 $\theta_i$ 几何级数怎样覆盖多个尺度。</p>
 
 <h2 id="d-dim-generalization">4. d 维推广——分块对角旋转矩阵与 $\theta_i$ 几何级数</h2>
 
@@ -410,7 +410,7 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 <p>$$\theta_0 = 4^0 = 1, \qquad \theta_1 = 4^{-1/2} = 1/2.$$</p>
 <p>取 $q=(1, 0, 1, 0)$、$k=(1, 0, 1, 0)$、$m=1$、$n=2$。</p>
 <p><strong>第 0 对</strong> $(q_0, q_1)=(1,0)$、$(k_0, k_1)=(1,0)$、$\theta_0=1$：</p>
-<p>$(n-m)\theta_0 = 1$。F2 公式：$(1\cdot1 + 0\cdot0)\cos(1) + (1\cdot0 - 0\cdot1)\sin(1) = \cos(1) \approx 0.5403$。</p>
+<p>$(n-m)\theta_0 = 1$。F2 公式：$(1\cdot1 + 0\cdot0)\cos(1) - (1\cdot0 - 0\cdot1)\sin(1) = \cos(1) \approx 0.5403$。</p>
 <p><strong>第 1 对</strong> $(q_2, q_3)=(1,0)$、$(k_2, k_3)=(1,0)$、$\theta_1=0.5$：</p>
 <p>$(n-m)\theta_1 = 0.5$。F2 公式：$\cos(0.5) \approx 0.8776$。</p>
 <p><strong>总内积</strong> = $0.5403 + 0.8776 = 1.4179$。</p>
@@ -444,7 +444,7 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
   </li>
 </ol>
 
-<p>本章把 2 维机制推广到 d 维，解释了 $\theta_i$ 几何级数的多尺度编码。但 $|m-n|$ 增大时内积怎样变化、为何只动 Q/K 不动 V——下一章讲远程衰减与 QK-only 机制。</p>
+<p>从 2 维机制到 d 维的推广已经完成，$\theta_i$ 几何级数承担多尺度编码。剩下两个问题：$|m-n|$ 增大时内积怎样变化，以及为什么只旋转 Q/K 而不动 V。</p>
 
 <h2 id="long-range-decay">5. 远程衰减——相位抵消与 QK-only 机制</h2>
 
@@ -497,7 +497,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 </table>
 </div>
 
-<p>衰减不是严格单调的——在 $|m-n|=5000$ 附近归一化内积穿过 0 并进入小幅振荡——但总体趋势是 $|m-n|$ 增大时趋向 0。这是 RoPE 经验上对长程依赖有隐式 locality bias 的来源：远距离 token 之间的注意力权重衰减。注意这是特定情形的确定性计算，真实分量分布有结构，所以具体 token 对可能不遵循这个曲线；但相位抵消的定性趋势作为"训练后整体倾向"的近似成立。</p>
+<p>衰减不是严格单调的——在 $|m-n|=5000$ 附近归一化内积穿过 0 并进入小幅振荡——但总体趋势是 $|m-n|$ 增大时趋向 0。这是 RoPE 经验上对长程依赖有隐式局部性偏置的来源：远距离 token 之间的注意力权重衰减。注意这是特定情形的确定性计算，真实分量分布有结构，所以具体 token 对可能不遵循这个曲线；但相位抵消的定性趋势作为"训练后整体倾向"的近似成立。</p>
 
 <div class="callout callout-yellow">
 <p><strong>教学解释</strong>。可以把 d 维 RoPE 暂时理解为 $d/2$ 只钟表指针：$i$ 小的指针转得快（$\theta_i$ 大），$i$ 大的指针转得慢（$\theta_i$ 小）；位置 $m$ 就是各指针一起走过的"时间"。两个 token 比较时，把它们的指针角度相减；如果两 token 距离 $|m-n|$ 小，慢指针基本没动、角度差接近 0，$\cos$ 接近 1；如果距离大，慢指针也转了一段、快指针转了好几圈，各指针的相位差散乱、$\cos$ 平均后抵消。这个类比只帮助理解"为什么 $|m-n|$ 大时归一化内积趋于 0"。它失效的边界：真实模型分量分布有结构，非特定情形的恒定值；指针是离散的 $d/2$ 只而非连续积分；具体 token 对不一定遵循这条曲线。</p>
@@ -534,7 +534,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
   </li>
 </ol>
 
-<p>本章解释了远程衰减来源与"只在 QK 不在 V"的机制。但超出训练长度时 RoPE 会失效——下一章讲长度外推边界与 K3 MLA 的 NoPE 选择。</p>
+<p>远程衰减来自相位抵消，旋转只作用于 Q/K——这是 RoPE 在注意力内部的机制。序列一旦超出训练长度，这套机制的前提被打破，由此引出长度外推与 K3 MLA 的 NoPE 选择。</p>
 
 <h2 id="applicability-boundary">6. 适用边界——长度外推、K3 MLA 的 NoPE 选择</h2>
 
@@ -546,7 +546,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 
 <h3 id="length-extrapolation">6.1 长度外推的边界与扩展方法</h3>
 
-<p>训练长度内，位置 $m$ 在 $[0, L_{\text{train}})$（如 $L_{\text{train}}=4096$）范围取值，模型见过 $m\theta_i$ 在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合。超出训练长度时，$m\theta_i$ 进入训练分布外的角度区间，简单外推性能下降——尤其是 $i$ 小的高频分量（$\theta_i$ 大）很快超出已学角度范围。</p>
+<p>训练长度内，位置 $m$ 在 $[0, L_{\text{train}})$（如 $L_{\text{train}}=4096$）范围取值，模型见过 $m\theta_i$ 在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合。超出训练长度时，$m\theta_i$ 进入训练分布外的角度区间，简单外推性能下降。失效主要来自 $i$ 大、$\theta_i$ 小的低频分量：其波长 $\lambda_i=2\pi/\theta_i$ 不小于训练长度，训练区间覆盖的角度不足一个整周期，外推进入从未出现过的相位。$i$ 小的高频分量则相反——它在训练区间内已走过大量整周期、各相位几乎都被见过，外推只是重复既有相位。</p>
 
 <div class="callout callout-yellow">
 <p><strong>常见误解</strong>："RoPE 可以任意外推到更长序列。"这是错的。论文摘要提到"flexibility of sequence length"，指的是 RoPE 在结构上能扩展到任意长度（不像 learned APE 超出表长即失败），但不意味着简单外推效果不变。超出训练长度时性能下降是经验事实，需要扩展方法处理。</p>
@@ -558,7 +558,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <table>
 <thead><tr><th>方法</th><th>核心思路</th><th>来源</th></tr></thead>
 <tbody>
-<tr><td>Position Interpolation（PI）</td><td>把位置 $m$ 缩放到训练范围内，如 $m' = m \cdot L_{\text{train}}/L_{\text{target}}$，让 $m'\theta_i$ 落在已学区间</td><td>Chen et al. 2023, arXiv:2306.13595</td></tr>
+<tr><td>Position Interpolation（PI）</td><td>把位置 $m$ 缩放到训练范围内，如 $m' = m \cdot L_{\text{train}}/L_{\text{target}}$，让 $m'\theta_i$ 落在已学区间</td><td>Chen et al. 2023, arXiv:2306.15595</td></tr>
 <tr><td>YaRN</td><td>按 $\theta_i$ 的频率分组，对不同频率用不同缩放因子（高频保持、低频缩放），保留局部信息</td><td>Peng et al. 2023, arXiv:2309.00071</td></tr>
 <tr><td>LongRoPE</td><td>非均匀地按维度搜索缩放因子，支持百万级上下文</td><td>Microsoft 2024, arXiv:2402.13753</td></tr>
 </tbody>
@@ -585,7 +585,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
     <p>RoPE 在长度外推时为什么失效？PI 与 YaRN 各自的解决思路是什么。</p>
     <details>
       <summary>解答：外推失效原因与两种扩展思路</summary>
-      <p>训练时位置 $m$ 只在 $[0, L_{\text{train}})$ 内取值，模型只见过 $m\theta_i$ 落在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合。超出训练长度后 $m\theta_i$ 进入训练分布外的角度区间，尤其 $i$ 小的高频分量很快越界，性能下降。</p><p>PI（Position Interpolation）把位置整体缩放回训练范围，如 $m'=m\cdot L_{\text{train}}/L_{\text{target}}$，使 $m'\theta_i$ 仍落在已学区间。YaRN 按频率分组施加不同缩放：高频基本保持以保留局部分辨力，低频缩放以覆盖更长距离。此外 LongRoPE 按维度非均匀搜索缩放因子，支持百万级上下文。</p>
+      <p>训练时位置 $m$ 只在 $[0, L_{\text{train}})$ 内取值，模型只见过 $m\theta_i$ 落在 $[0, L_{\text{train}}\cdot\theta_i)$ 的角度组合。超出训练长度后 $m\theta_i$ 进入训练分布外的角度区间；$i$ 大、$\theta_i$ 小的低频分量波长不小于训练长度，训练区间内的角度不足一个整周期，外推最先进入未见相位，性能下降。</p><p>PI（Position Interpolation）把位置整体缩放回训练范围，如 $m'=m\cdot L_{\text{train}}/L_{\text{target}}$，使 $m'\theta_i$ 仍落在已学区间。YaRN 按频率分组施加不同缩放：高频基本保持以保留局部分辨力，低频缩放以覆盖更长距离。此外 LongRoPE 按维度非均匀搜索缩放因子，支持百万级上下文。</p>
     </details>
   </li>
   <li>
@@ -615,7 +615,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p><strong>C4（几何级数多尺度）</strong>：Su et al. 2021, §3.2.2 Eq.(15) 后的 $\Theta$ 定义与 §3.3；多源综述印证（agentica.wiki、unseel.com/cs/rotary-position-embedding、spawn08.github.io）。</p>
 <p><strong>C5（远程衰减性质）</strong>：Su et al. 2021, §3.4.3 "Long-term decay", Eq.(35)–(37)；论文用 Abel 变换证明上界（Eq.(36)–(37)），图 2 给出上界量 $\frac{1}{d/2}\sum_{i=1}^{d/2}|S_i|$ 随相对距离增大而衰减的曲线（原文 "the value of $\frac{1}{d/2}\sum_{i=1}^{d/2}|S_{i}|$ decay with the relative distance $m-n$ increases … as shown in Figure 2"；论文未标注图中维度取值）。本文用特定情形（$q=k$、分量恒定）的确定性计算作教学简化（见简化 3），论证不等价于论文上界。</p>
 <p><strong>C6（主流 LLM 采用）</strong>：多源综述印证（LLaMA / Mistral / Falcon / Qwen / PaLM / Gemma / GPT-NeoX）；逐模型引用需查对应论文 / 配置文件。</p>
-<p><strong>C7（长度外推需扩展）</strong>：Chen et al. 2023, arXiv:2306.13595（PI）；Peng et al. 2023, arXiv:2309.00071（YaRN）。</p>
+<p><strong>C7（长度外推需扩展）</strong>：Chen et al. 2023, arXiv:2306.15595（PI）；Peng et al. 2023, arXiv:2309.00071（YaRN）。</p>
 <p><strong>C8（K3 MLA 用 NoPE）</strong>：Kimi K3 技术报告 §2.1.2、§3.4；config.json <code>mla_use_nope=true</code>；<a href="../../wiki/mla/index.html">MLA</a> 的"为什么 RoPE 要解耦"一章、<a href="../../wiki/nope/index.html">NoPE</a>、<a href="../../wiki/kimi-k3/index.html">Kimi K3</a> 的"Gated MLA"与"长上下文扩展"一章已对此论证。</p>
 
 <h3>公式与来源（F）</h3>

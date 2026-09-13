@@ -93,7 +93,7 @@
     <li>
       <p>复用的前提是什么？为什么不能所有层共用一份？</p>
       <details>
-        <summary>解答：同组压缩比必须一致；不同压缩比的组各有一份</summary>
+        <summary>解答：同组压缩比必须一致；不同压缩比的层各自有独立的份，分组由配置声明</summary>
         <p>共用一份 KV 要求同组层的压缩比相同——条目覆盖的 token 数不同就无法共用。DeepSeek-V4.1-Flash 的配置声明的共享分组是层 2–7、8–13、14–19、20–39，source 层分别是 2、8、14、20，每个压缩层读到的 cache 都来自组内 source 层。代价是上段各层不再有各自的全局 KV。完整前提与边界见第 4 章。</p>
       </details>
     </li>
@@ -103,7 +103,7 @@
 <section class="misconceptions">
   <h2>常见误解</h2>
   <ul>
-    <li>「跨层复用就是所有层共用一份 KV」——是"同组共用一份"；不同压缩比的组各有一份，配置声明的 source 层有 4 个。</li>
+    <li>「跨层复用就是所有层共用一份 KV」——是"同组共用一份"；不同压缩比的层无法共用、各自有独立的份，分组由配置的生产层列表给定（压缩比相同的层也可能分属不同组），source 层有 4 个。</li>
     <li>「复用索引与复用 KV 总是一起发生」——CSA2 把两者解耦：Reindex 层复用 KV 但自算索引。</li>
     <li>「复用了 KV，所有层看到的内容就一样了」——各层仍用自己的 query 与本层窗口 KV，只是全局部分来自同一份条目。</li>
     <li>「复用后缓存复杂度是常数」——被消掉的是层维度，全局 KV 仍随序列长度增长；局部窗口 KV 也仍按层存在。</li>
@@ -177,7 +177,7 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 
 <p>当 $N$ 远大于 $L$ 时（长序列），$\mathcal{O}((N+L)D)$ 与 $\mathcal{O}(ND)$ 同阶，也就是说全局 KV 的份数从 $L$ 份降到 1 份。论文据此给出"约省 $L$ 倍缓存"的结论<sup>[C2]</sup>。论文在 65B 规模下给出的实测宣称是缓存显存减少约 80 倍，并举例 128K token 只需 1GB 显存<sup>[N1]</sup>。</p>
 
-<p>prefill 侧还有一笔账：既然上段复用了下段的输出，prefill 阶段就可以在进入上段之前提前退出<sup>[C3]</sup>。计算复杂度由 $\mathcal{O}(LN^2D)$ 降到 $\mathcal{O}(LND)$，论文称至少省一半的层计算<sup>[F3]</sup>。DeepSeek-V4.1-Flash 的报告也采用同一说法，称 CED 让 prefill 计算接近减半<sup>[N4]</sup>。</p>
+<p>prefill 侧还有一笔账：既然上段复用了下段的输出，prefill 阶段就可以在进入上段之前提前退出<sup>[C3]</sup>。计算复杂度由 $\mathcal{O}(LN^2D)$ 降到 $\mathcal{O}(LND)$<sup>[F3]</sup>，论文称至少省一半的层计算<sup>[C3]</sup>。DeepSeek-V4.1-Flash 的报告也采用同一说法，称 CED 让 prefill 计算接近减半<sup>[N4]</sup>。</p>
 
 <div class="table-scroll">
 <table>
@@ -223,7 +223,7 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 <li><b>复用索引</b>：让多层沿用同一份 Top-K 选择结果——省的是打分计算。</li>
 </ul>
 
-<p>DeepSeek-V4.1-Flash 的 CSA2 把两者解耦，并据此把层分成三种模式<sup>[C4]</sup>：</p>
+<p>DeepSeek-V4.1-Flash 的 CSA2 把两者解耦，并据此把层分成三种模式<sup>[C4]</sup>。表中的「主 KV」是压缩条目构成的全局键值；「索引器 K」是索引器打分用的键——索引器负责为每层选出要关注的全局位置（见<a href="../dsa/index.html">稀疏注意力与索引器</a>），它的 K 由主 KV 投影得到：</p>
 
 <div class="table-scroll">
 <table>
@@ -343,7 +343,7 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 <p>[N5] 每 token 全局 KV 缓存 890 字节：技术报告 §1（§6 Conclusion 有同义重述）「DeepSeek-V4.1-Flash combines cross-layer KV cache reuse in Compressed Sparse Attention 2 (CSA2) with FP4 KV caching. These designs reduce its global KV cache footprint (always in HBM) to 890 bytes per token, roughly 1/4 of the corresponding footprint of DeepSeek-V4-Flash.」报告把成因列为「跨层复用 + FP4 KV 缓存」两项并列。</p>
 
 <h3>构造示例</h3>
-<p>分组表中的层区间与 source 层由官方配置 <code>kv_source_layers=[2,8,14,20]</code> 声明：列表中的每个值即该组的首个层，也就是发布主 KV 的 source 层；组内其余层按静态模式读取它发布的 KV。</p>
+<p>本页唯一的人为设定是压缩条目编号与位置的换算：第 $j$ 条条目覆盖从位置 $j\cdot r$ 起的一段（$r$ 为该层的压缩比）。这一换算把"条目编号"与"上下文位置"对应起来，是第 4 章说明"压缩比不同的层无法共用同一批条目"的依据。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>本页的辅助解释是「多层共用一份全局 KV」这一份数关系本身：它说明全局 KV 的份数从"每层一份"变成"每组一份"。边界：它只覆盖全局 KV，每层仍需自己的窗口 KV；也不说明复用对质量没有代价。</p>
@@ -351,7 +351,7 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 <h3>简化条件及其限制</h3>
 <ul>
 <li>份数账按"每个 source 层各一份主 KV 与一份索引器 K"计算，不含局部窗口 KV、压缩器残态与运行时缓冲。</li>
-<li>论文的 80 倍 与加速数字按原值登记，本页不重跑实验、不据此比较架构优劣。</li>
+<li>论文的 80 倍与加速数字按原值登记，本页不重跑实验、不据此比较架构优劣。</li>
 <li>本页不展开压缩条目的池化方式与训练补偿策略，只使用"条目覆盖 $r$ 个 token"这一属性。</li>
 </ul>
 

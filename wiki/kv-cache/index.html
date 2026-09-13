@@ -62,7 +62,7 @@
 <p><b>主要依据</b>：Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention"（SOSP 2023, arXiv:2309.06180）§1、§3；Xie et al., "Strata: Hierarchical Context Caching for Long Context Language Model Serving"（OSDI 2026, arXiv:2508.18572v2）§1、§2.1；Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs"（NeurIPS 2024, arXiv:2312.07104）§1、§3。</p>
 </blockquote>
 
-<p>一个客服模型读完 20,000 token 的产品手册后回答了一个问题。紧接着第二个问题到来，仍然以这本手册开头。回答第二个问题时，模型还需要手册 20,000 个 token 的哪些中间结果？从头再算一遍，还是留在显存里备用？如果留下，要留多少、够不够放？这四个问题依次是：注意力计算为什么需要全部历史 token 的 K/V，缓存到底省了什么计算；prefill 与 decode 两阶段各自怎么产生和使用缓存；一份上下文的 KV cache 有多大；以及为什么它会成为显存瓶颈。后两个问题的答案，是理解一切 KV cache 管理机制（分页、前缀复用、分层存储）的定量基础。</p>
+<p>一个客服模型读完 20,000 token 的产品手册后回答了一个问题。紧接着第二个问题到来，仍然以这本手册开头。回答第二个问题时，模型还需要手册 20,000 个 token 的哪些中间结果？从头再算一遍，还是留在显存里备用？如果留下，要留多少、够不够放？本文按顺序回答：注意力计算为什么需要全部历史 token 的 K/V，缓存到底省了什么计算；prefill 与 decode 两阶段各自怎么产生和使用缓存；一份上下文的 KV cache 有多大；以及为什么它会成为显存瓶颈。后两个问题的答案，是理解一切 KV cache 管理机制（分页、前缀复用、分层存储）的定量基础。</p>
 
 <p>本文讨论的是推理阶段的 KV cache。注意力计算本身（缩放点积、多头结构）见 <a href="../standard-attention/index.html">标准 Transformer 注意力</a>，其结论直接使用，不重复推导。</p>
 
@@ -112,7 +112,7 @@ $$\text{Attention}(q_t)=\mathrm{softmax}\!\left(\frac{q_t\,k_1^{\top},\ldots,q_t
 
 $$k_i=x_i W_K,\qquad v_i=x_i W_V,$$
 
-<p>其中 $W_K$、$W_V$ 是该层的参数矩阵。$k_i$、$v_i$ 只取决于第 $i$ 个 token 自己的输入和模型参数，与"当前在算第几个查询"完全无关。生成第 4 个 token 需要 $k_1,\ldots,k_4$，但 $k_1,\ldots,k_3$ 在前几步已经算过，而且值不会变。<span class="callout-inline">这一观察是 KV cache 可行性的全部基础：既然历史 K/V 只依赖该 token 的输入与模型参数（其输入 $x_i$ 由前 $1\ldots i$ 个 token 逐层计算得到），就可以算一次、存下来、之后纯读取。</span><sup>[C3]</sup></p>
+<p>其中 $W_K$、$W_V$ 是该层的参数矩阵。$k_i$、$v_i$ 只取决于第 $i$ 个 token 自己的输入和模型参数，与"当前在算第几个查询"完全无关。生成第 4 个 token 需要 $k_1,\ldots,k_4$，但 $k_1,\ldots,k_3$ 在前几步已经算过，而且值不会变。这一观察是 KV cache 可行性的全部基础：既然历史 K/V 只依赖该 token 的输入与模型参数（其输入 $x_i$ 由前 $1\ldots i$ 个 token 逐层计算得到），就可以算一次、存下来、之后纯读取。<sup>[C3]</sup></p>
 
 <p>不缓存的代价是平方级的。构造示例。取 4 个 token 的序列「今天 / 天气 / 很 / 好」，第 $t$ 步生成时需要算出第 $t$ 个 token 的 $k_t,v_t$（若无缓存还要重算 $k_1,\ldots,k_{t-1},v_1,\ldots,v_{t-1}$）：</p>
 
@@ -182,7 +182,7 @@ $$k_i=x_i W_K,\qquad v_i=x_i W_V,$$
   <figcaption class="diagram-caption">箭头为单个请求的处理顺序；decode 循环每转一圈缓存增加 1 个 token 的 K/V。</figcaption>
 </figure>
 
-<p>沿用手册场景：prefill 处理 20,100 个输入 token，缓存从 0 涨到 20,100 token；decode 生成回答的每个 token 都让缓存多 1 token——回答 200 token，缓存最终 20,300 token。多轮对话时，下一轮请求的输入等于「上一轮全部输入 + 上一轮输出 + 新问题」，其前 20,300 token 的缓存恰好已经存在，这正是前缀复用的基础（见 <a href="../prefix-caching/index.html">前缀缓存</a>）。</p>
+<p>沿用手册场景：prefill 处理 20,100 个输入 token，缓存从 0 涨到 20,100 token；decode 生成回答的每个 token 都让缓存多 1 token——回答 200 token，缓存最终 20,300 token。多轮对话时，下一轮请求的输入等于「上一轮全部输入 + 上一轮输出 + 新问题」，上一轮这 20,300 个 token 的 K/V 与已完成请求完全相同，只要系统保留这份缓存即可复用（见 <a href="../prefix-caching/index.html">前缀缓存</a>）。</p>
 
 <p>两个阶段的资源特征不同，这个差别贯穿后续所有 serving 机制的分析。prefill 是一次大矩阵乘：全部输入 token 并行过模型，计算量大、每字节访存的计算量高，属于计算密集。decode 每步只处理 1 个 token：计算量很小，但注意力要读取全部缓存（$20{,}100\times 128\,\text{KB}\approx 2.45\,\text{GB}$），属于访存密集。因此优化 prefill 与 decode 的手段不同，部署形态上也衍生出把它们分开调度的方案（见 <a href="../hetero-pd/index.html">异构 PD 分离</a>）。</p>
 
@@ -213,16 +213,16 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 <ul>
 <li>$2$：K 与 V 各一份；</li>
 <li>$L_{\text{layers}}$：Transformer 层数，每层各存一套；</li>
-<li>$H_{\text{kv}}$：KV 头（组）数——每个注意力头的 $q$ 都要与各 KV 头的 $k,v$ 交互；</li>
+<li>$H_{\text{kv}}$：KV 头（组）数——每个查询头的 $q$ 只与该头所属组的那个 KV 头的 $k,v$ 交互（MHA 下每个查询头对应一个 KV 头）；</li>
 <li>$d_{\text{head}}$：每个头的向量维度（与第 1 章的 $d_k$ 同义）；</li>
 <li>$b$：每个元素的存储字节数，bf16/FP16 为 2，FP8 为 1。</li>
 </ul>
 
-<p>本文 KB/GB 按存储行业惯例换算：$1\,\text{KB}=1{,}024$ 字节、$1\,\text{GB}=2^{30}$ 字节。按此口径 128 KB/token 下，20,000 token 手册约 2.44 GB，128K 窗口单请求恰为 16 GB。</p>
+<p>本文按 $1\,\text{KB}=1{,}024$ 字节、$1\,\text{GB}=2^{30}$ 字节换算。按此口径 128 KB/token 下，20,000 token 手册约 2.44 GB，128K 窗口单请求恰为 16 GB。</p>
 
-<p>$H_{\text{kv}}$ 的取值区分两种注意力结构。MHA（多头注意力）中 KV 头数等于查询头数，$H_{\text{kv}}=H_q$；GQA（分组查询注意力）中查询头分成 $H_{\text{kv}}$ 组、每组共享一个 KV 头，$H_{\text{kv}}&lt;H_q$——KV cache 直接缩小为 MHA 的 $H_{\text{kv}}/H_q$。多数现代开源模型（Llama 3、Qwen2.5 等）采用 GQA 省下的正是这份显存。</p>
+<p>$H_{\text{kv}}$ 的取值区分两种注意力结构。MHA（多头注意力）中 KV 头数等于查询头数，$H_{\text{kv}}=H_q$；GQA（分组查询注意力）中查询头分成 $H_{\text{kv}}$ 组、每组共享一个 KV 头，$H_{\text{kv}}&lt;H_q$——KV cache 直接缩小为 MHA 的 $H_{\text{kv}}/H_q$。本文用作算例的 Llama-3.1-8B 采用 GQA，省下的正是这份显存。</p>
 
-<p>两个算例对照。构造示例。Llama-3.1-8B（GQA）：32 层、$H_{\text{kv}}=8$、$d_{\text{head}}=128$、bf16（bfloat16，每元素 2 字节）<sup>[N2]</sup>，代入公式 $2\times 32\times 8\times 128\times 2=131{,}072$ 字节 = 128 KB/token。20,000 token 的手册共 $20{,}000\times 131{,}072\,\text{B}\approx 2.44\,\text{GB}$。文献算例。OPT-13B（MHA）：40 层、隐藏维 5120（即 $H_{\text{kv}}\cdot d_{\text{head}}=5120$）、FP16，得 $2\times 5120\times 40\times 2=800$ KB/token<sup>[N1]</sup>，单请求最长（2048 token）达 1.6 GB——这是 vLLM 论文给出的原始数字。GQA 的效果直接可见：Llama-3.1-8B 的 $H_{\text{kv}}/H_q=8/32=1/4$，若它是 MHA 结构，每 token 将是 512 KB。</p>
+<p>两个算例对照：Llama-3.1-8B 是按本页公式代入的构造算例，OPT-13B 是 vLLM 论文给出的原始算例。Llama-3.1-8B（GQA）：32 层、$H_{\text{kv}}=8$、$d_{\text{head}}=128$、bf16（bfloat16，每元素 2 字节）<sup>[N2]</sup>，代入公式 $2\times 32\times 8\times 128\times 2=131{,}072$ 字节 = 128 KB/token。20,000 token 的手册共 $20{,}000\times 131{,}072\,\text{B}\approx 2.44\,\text{GB}$。OPT-13B（MHA）：40 层、隐藏维 5120（即 $H_{\text{kv}}\cdot d_{\text{head}}=5120$）、FP16，得 $2\times 5120\times 40\times 2=800$ KB/token<sup>[N1]</sup>，单请求最长（2048 token）达 1.6 GB。GQA 的效果直接可见：Llama-3.1-8B 的 $H_{\text{kv}}/H_q=8/32=1/4$，若它是 MHA 结构，每 token 将是 512 KB。</p>
 
 <details>
 <summary>展开：128 KB/token 的完整代入与两个检查</summary>
@@ -251,7 +251,7 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 
 <p>单看 128 KB/token 似乎不大，瓶颈来自三个因素的相乘。第一，缓存随 token 数<b>线性增长</b>：20,000 token 手册约 2.44 GB，128K 窗口单请求就要 16 GB<sup>[N5]</sup>。第二，并发请求数相乘：10 个客服同时各自带一份不同文档，就是 10 份 2.44 GB。第三，KV cache 与模型权重共用同一块显存，此消彼长：13B 参数模型在 40GB A100 上，约 65% 显存是静态权重，留给 KV cache 的只有近 30%<sup>[C4, N3]</sup>。</p>
 
-<p>量级判断：40 GB HBM（GPU 高带宽显存）对 Llama-3.1-8B 大约只够缓存 0.3M token<sup>[N4]</sup>——按每 token 128 KB 换算 $40\times 2^{30}\,\text{B}/131{,}072\,\text{B}\approx 0.33\text{M}$，与 Strata 论文的"约 0.3M"口径一致。0.3M token 听起来多，但一份手册就 0.02M，几十份文档或几百轮对话就会耗尽，而生产服务往往同时服务成百上千个会话。OPT-13B 时代单请求最长 1.6 GB 已被视为"大"（vLLM 论文原话）<sup>[N1]</sup>，上下文窗口扩张到 128K–1M 后，单请求缓存就到了 16–128 GB 量级。</p>
+<p>量级判断：40 GB HBM（GPU 高带宽显存）对 Llama-3.1-8B 大约只够缓存 0.3M token<sup>[N4]</sup>——按每 token 128 KB 换算 $40\times 2^{30}\,\text{B}/131{,}072\,\text{B}\approx 0.33\text{M}$，与 Strata 论文的"约 0.3M"口径一致。0.3M token 听起来多，但一份手册就 0.02M，十几份文档或几百轮对话就会耗尽，而生产服务往往同时服务成百上千个会话。OPT-13B 时代单请求最长 1.6 GB 已被视为"大"（vLLM 论文原话）<sup>[N1]</sup>，上下文窗口扩张到 128K–1M 后，单请求缓存就到了 16–128 GB 量级。</p>
 
 <div class="table-scroll">
 <table>
@@ -265,7 +265,7 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 </table>
 </div>
 
-<p>三处常见误解需要在此澄清。其一，KV cache 不是模型自带的固定组件：它是每个请求动态产生的中间数据，系统消耗多少显存放缓存取决于负载（并发 $\times$ 上下文长度），部署时的"显存规划"规划的就是权重与缓存份额的切分。其二，上下文窗口 128K 是模型<b>可接受</b>的长度上限，不是显存保证：128K token 需要 16 GB 缓存，与"放不放得下"无关。其三，缓存只省计算、不省存储——显存不够时系统只有两条路：逐出（丢掉缓存、下次重算）或分层（把不常用的缓存搬到 CPU 内存或 SSD，用时再搬回）。既有系统在请求完成即丢弃缓存<sup>[C5]</sup>，这让后续请求无法复用，也引出了两个后续问题：如何在显存内高效组织这些页（见 <a href="../paged-attention/index.html">PagedAttention 分页管理</a>），以及哪些前缀值得跨请求留着复用（见 <a href="../prefix-caching/index.html">前缀缓存</a>）。当缓存分层后，"搬回 GPU 的速度"会成为新的瓶颈——那是 <a href="../strata/index.html">Strata</a> 一文要解决的问题。对稀疏注意力模型，分层还有更省的做法：<a href="../hisparse/index.html">HiSparse</a> 不搬动完整 KV，而是把全量历史留在主机内存、显存里每请求每层只保留固定大小的缓存，按当前选择拉取缺失条目，使解码显存不随上下文长度增长。</p>
+<p>KV cache 有三处常被误读的地方。其一，KV cache 不是模型自带的固定组件：它是每个请求动态产生的中间数据，系统消耗多少显存放缓存取决于负载（并发 $\times$ 上下文长度），部署时的"显存规划"规划的就是权重与缓存份额的切分。其二，上下文窗口 128K 是模型<b>可接受</b>的长度上限，不是显存保证：128K token 需要 16 GB 缓存，与"放不放得下"无关。其三，缓存只省计算、不省存储——显存不够时系统只有两条路：逐出（丢掉缓存、下次重算）或分层（把不常用的缓存搬到 CPU 内存或 SSD，用时再搬回）。既有系统在请求完成即丢弃缓存<sup>[C5]</sup>，这让后续请求无法复用，也引出了两个后续问题：如何在显存内高效组织这些页（见 <a href="../paged-attention/index.html">PagedAttention 分页管理</a>），以及哪些前缀值得跨请求留着复用（见 <a href="../prefix-caching/index.html">前缀缓存</a>）。当缓存分层后，"搬回 GPU 的速度"会成为新的瓶颈——那是 <a href="../strata/index.html">Strata</a> 一文要解决的问题。对稀疏注意力模型，分层还有更省的做法：<a href="../hisparse/index.html">HiSparse</a>（arXiv:2608.07009v1）不搬动完整 KV，而是把全量历史留在主机内存、显存里每请求每层只保留固定大小的缓存，按当前选择拉取缺失条目，使解码显存不随上下文长度增长。</p>
 
 <h3 id="memory-pressure-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -304,7 +304,7 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 <p>N1（OPT-13B 800 KB/token、单请求 1.6 GB）：vLLM 论文 §3。N2（Llama-3.1-8B 配置 32 层/8 KV 头/head_dim 128/128K 窗口/bf16）：HuggingFace 模型配置（meta-llama/Llama-3.1-8B-Instruct config.json）。N3（65%/30% 显存分布）：vLLM 论文 §1 Figure 1（13B 模型、A100 40GB）。N4（40GB $\approx$ 0.3M token）：Strata 论文 §1（Llama-8B 口径，与本文 F1 复算一致）。N5（128K $\to$ 16 GB）：F1$\times$N2 推算。</p>
 
 <h3>构造示例</h3>
-<p>「今天/天气/很/好」4 token 序列（第 1、2 章）：展示每步新算与复用的 K/V 组数，便于手算，不代表真实负载。20,000 token 手册（第 2–4 章）：规模算例，数字为构造选择（与长上下文评测负载的平均规模同量级，见 Strata 一文实验部分），计算本身可复算。</p>
+<p>「今天/天气/很/好」4 token 序列（第 1、2 章）：展示每步新算与复用的 K/V 组数，便于手算，不代表真实负载。20,000 token 手册（第 1–4 章）：规模算例，数字为构造选择（与长上下文评测负载的平均规模同量级，见 Strata 一文实验部分），计算本身可复算。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>本文未使用类比解释机制；"纯读取"表述指不再执行矩阵乘、只访存，不暗示读取零成本（decode 每步读全部缓存正是访存瓶颈的来源，见第 2 章）。</p>

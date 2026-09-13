@@ -84,14 +84,14 @@
 <p>高吞吐内核如何利用 NVLink 与 RDMA 两种带宽，把跨节点 dispatch/combine 跑满？</p>
 <details>
 <summary>解答：两段转发让两种网络完全重叠</summary>
-<p>token 先经 IB 到目标节点上与发送 rank 同 in-node index 的 GPU，落地后经 NVLink 转发给持有目标专家的 GPU，不被后到 token 阻塞——IB 与 NVLink 完全重叠。配合 node-limited routing（每 token 至多 4 个目标节点）限制 IB 流量，20 个 SM 分成 10 个通信通道即可跑满两种网络。实测节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s 逼近 50 GB/s 的 RDMA 峰值。完整论证见第 2 章「高吞吐内核」。</p>
+<p>token 先经 IB 到目标节点上与发送 rank 同 in-node index 的 GPU，落地后经 NVLink 转发给持有目标专家的 GPU，不被后到 token 阻塞——IB 与 NVLink 完全重叠。配合 node-limited routing（每 token 至多 4 个目标节点）限制 IB 流量，20 个 SM 分成 10 个通信通道即可跑满两种网络。实测节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s（含本 rank 流量的逻辑带宽口径，可超过单卡网卡约 50 GB/s 的峰值）。完整论证见第 2 章「高吞吐内核」。</p>
 </details>
 </li>
 <li>
 <p>decode 场景为什么需要另一套低延迟内核，纯 RDMA、固定槽位与 hook 各解决什么问题？</p>
 <details>
 <summary>解答：用带宽换延迟的三个取舍</summary>
-<p>decode 每步都发生通信、batch 小、TPOT 敏感，且 CUDA graph 要求无隐式 CPU 同步。低延迟内核放弃 NVLink 走纯 RDMA（所有 rank 经 RDMA 可见，点对点直达去掉两段转发的中转与同步）；接收张量按最坏情况预留固定槽位，不做 CPU 接收计数同步从而兼容 CUDA graph；hook 让 dispatch 只发 RDMA 请求不等待，等待期 GPU 去算另一个 micro-batch，不占任何 SM。代价是 RDMA 带宽利用率显著低于高吞吐模式。完整论证见第 3 章「低延迟内核」。</p>
+<p>decode 每步都发生通信、batch 小、TPOT 敏感，且 CUDA graph 要求无隐式 CPU 同步。低延迟内核放弃 NVLink 走纯 RDMA（所有 rank 经 RDMA 可见，点对点直达去掉两段转发的中转与同步）；接收张量按最坏情况预留固定槽位，不做 CPU 接收计数同步从而兼容 CUDA graph；hook 让 dispatch 只发 RDMA 请求不等待，等待期 GPU 去算另一个 micro-batch，不占任何 SM。代价是大 EP 规模下 RDMA 折算带宽低于高吞吐内核的跨节点水平（见 3.5 节「低延迟的代价」）。完整论证见第 3 章「低延迟内核」。</p>
 </details>
 </li>
 <li>
@@ -189,7 +189,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 
 <p>第三，FP8 dispatch。V3 把 MoE up 投影前的激活量化为 FP8 再 dispatch，反向的激活梯度同样处理；前后向 combine 保留 BF16 以保住训练关键路径的精度<sup>[C30]</sup>。dispatch 载荷的 FP8（连同样因子的布局约定）不是通用库的标准需求。</p>
 
-<p>第四，decode 的延迟与 CUDA graph。decode 的通信每步都发生、batch 小（低延迟内核的实测条件为每 batch 128 tokens，即 V3/R1 的典型生产设置<sup>[N3]</sup>）、直接计入 TPOT（每输出一个 token 的耗时）；且推理引擎用 CUDA graph 消除 kernel 启动开销，要求 GPU 工作形状固定、无隐式 CPU 同步。而"发送侧事先不知道本 rank 会收到多少 token"的动态 all-to-all 天然带同步点——即使 DeepEP 自己的 V1 高吞吐 dispatch 内核，内部也包含等待 GPU 接收计数信号的隐式 CPU 等待，与 CUDA graph 不兼容<sup>[C11]</sup>。decode 需要另一套内核（第 3 章「低延迟内核」）。</p>
+<p>第四，decode 的延迟与 CUDA graph。decode 的通信每步都发生、batch 小（低延迟内核的实测条件为每 batch 128 tokens，即 V3/R1 的典型生产设置<sup>[N3]</sup>）、直接计入 TPOT（每输出一个 token 的耗时）；且推理引擎用 CUDA graph 消除 kernel 启动开销，要求 GPU 工作形状固定、无隐式 CPU 同步。而"接收侧事先不知道本 rank 会收到多少 token"的动态 all-to-all 天然带同步点——即使 DeepEP 自己的 V1 高吞吐 dispatch 内核，内部也包含等待 GPU 接收计数信号的隐式 CPU 等待，与 CUDA graph 不兼容<sup>[C11]</sup>。decode 需要另一套内核（第 3 章「低延迟内核」）。</p>
 
 <div class="callout callout-yellow">
 <p>常见误解：NCCL 也有 all-to-all，DeepEP 只是快一点。差异是结构性的：按专家分组的接收布局、FP8 dispatch、SM 用量控制、CUDA graph 兼容与零 SM 等待的 hook，都是接口语义层面的差别，带宽数字只是这些设计的结果之一。</p>
@@ -328,7 +328,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 </table>
 </div>
 
-<p>节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s 逼近 50 GB/s 的 RDMA 峰值——高吞吐内核的设计目标就是把两种网络都跑满。表中带宽为瓶颈带宽口径：按最慢一段网络折算。V2 的实测（每 batch 8K tokens、hidden 7168、top-8 专家、FP8 dispatch + BF16 combine，逻辑带宽含本 rank 流量）在 SM90 + CX7 的 EP 8×2 拓扑用 12 个 SM 达到 90/81 GB/s<sup>[N4]</sup>，见第 4 章「V2 重构」。</p>
+<p>节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值；跨节点 43-58 GB/s 中 EP32/64 的 57-58 GB/s 已高于单卡 CX7 网卡约 50 GB/s 的峰值。这与第 4 章 V2 表同理：RDMA 带宽是含本 rank 流量的逻辑带宽，故可超过单卡网卡峰值（legacy.md 未注明口径，此为页面据数值与 NIC 峰值的推断）——高吞吐内核的设计目标就是把两种网络都跑满。V2 的实测（每 batch 8K tokens、hidden 7168、top-8 专家、FP8 dispatch + BF16 combine，逻辑带宽含本 rank 流量）在 SM90 + CX7 的 EP 8×2 拓扑用 12 个 SM 达到 90/81 GB/s<sup>[N4]</sup>，见第 4 章「V2 重构」。</p>
 
 <p>高吞吐内核用两段转发换带宽，代价是路径长、同步点多：V1 的 normal dispatch 内部还有等待接收计数的隐式 CPU 同步，与 CUDA graph 不兼容<sup>[C11]</sup>。prefill 与训练的大 batch 扛得住这些代价，decode 的每步小 batch 通信等不起——需要一套设计点完全不同的内核。</p>
 
@@ -366,7 +366,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 <p>实测带宽到什么水平？</p>
 <details>
 <summary>解答：节点内与跨节点都逼近各自峰值</summary>
-<p>V1 normal 实测（H800、每 batch 4096 tokens、hidden 7168、top-4 组 top-8 专家、FP8 dispatch + BF16 combine）：节点内 EP8 dispatch/combine 为 153/158 GB/s，逼近 160 GB/s 的 NVLink 峰值；跨节点 EP16/32/64 为 43-58 GB/s，逼近 50 GB/s 的 RDMA 峰值。口径为瓶颈带宽（按最慢一段网络折算）。</p>
+<p>V1 normal 实测（H800、每 batch 4096 tokens、hidden 7168、top-4 组 top-8 专家、FP8 dispatch + BF16 combine）：节点内 EP8 dispatch/combine 为 153/158 GB/s，逼近 160 GB/s 的 NVLink 峰值；跨节点 EP16/32/64 为 43-58 GB/s，其中 EP32/64 的 57-58 GB/s 高于单卡网卡约 50 GB/s 的峰值——口径为含本 rank 流量的逻辑带宽。</p>
 </details>
 </li>
 </ol>
@@ -382,7 +382,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 <p>低延迟内核基于 IBGDA 的纯 RDMA 实现：要求所有 rank——无论节点内还是跨节点——都经 RDMA 可见；为简化设计，连节点内也完全禁用 NVLink<sup>[C12]</sup>。V1 源码把低延迟模式的 IBGDA 释义为"不在 NVLink 与 RDMA 之间做包转发"，并把 NIC handler 设到 GPU 侧<sup>[C12]</sup>。每个 token 副本从原 rank 直接点对点写入目标专家 rank 的接收 buffer，没有两段转发的中转 GPU，也没有转发引入的同步点——路径短，延迟就低。</p>
 
 <div class="callout callout-yellow">
-<p>常见误解：低延迟内核就是高吞吐内核的小 batch 版。两者是不同的设计点：高吞吐内核用两段转发最大化带宽利用率（节点内 153/158 GB/s），低延迟内核放弃 NVLink、用固定槽位与纯 RDMA 把延迟压到百微秒级，但 RDMA 带宽利用率显著低于高吞吐模式（3.5 节「低延迟的代价」的数字对比）。都叫 dispatch/combine，优化的目标函数不同。</p>
+<p>常见误解：低延迟内核就是高吞吐内核的小 batch 版。两者是不同的设计点：高吞吐内核用两段转发最大化带宽利用率（节点内 153/158 GB/s），低延迟内核放弃 NVLink、用固定槽位与纯 RDMA 把延迟压到百微秒级；其折算带宽随 EP 增大下探到高吞吐内核跨节点水平之下（3.5 节「低延迟的代价」的数字对比）。都叫 dispatch/combine，优化的目标函数不同。</p>
 </div>
 
 <h3 id="fixed-slots">3.3 固定槽位布局：接收侧不做 CPU 同步</h3>
@@ -634,7 +634,7 @@ rank 0 两个 token 的 combine 结果：
 </table>
 </div>
 
-<p>dispatch 延迟从 EP8 的 77 µs 涨到 EP128 的 192 µs 后趋于平坦，但折算带宽从 98 GB/s 掉到 39 GB/s——对比 normal 内核跨节点的 43-58 GB/s（节点内 153/158 GB/s），纯 RDMA 的带宽利用率明显更低。小 batch 的 decode 关心的是延迟而非带宽，这个交换才划算；低延迟内核的定位本来就是延迟敏感的 decode——与 high-throughput 内核面向训练/prefill 的分工相对（见第 1 章「专家并行的 all-to-all 卡在哪」）。另一个代价是显存：固定槽位按最坏情况预留，低延迟模式的 buffer 消耗远大于 normal 模式<sup>[C17]</sup>。</p>
+<p>dispatch 延迟从 EP8 的 77 µs 涨到 EP128 的 192 µs 后趋于平坦，折算带宽则随 EP 增大持续下降。与 normal 内核跨节点的 43-58 GB/s 相比：EP8 的 98/127 GB/s、EP16 的 63/74 GB/s 都高于这个范围；EP64 的 43/46 GB/s 落进范围之内；到 EP128/256 才下探到范围下界之下（39/39、39/40 GB/s）——只有更大 EP 规模下，纯 RDMA 的带宽利用率才明显更低。表列带宽同为含本 rank 流量的逻辑带宽，可超过单卡网卡峰值。小 batch 的 decode 关心的是延迟而非带宽，这个交换才划算；低延迟内核的定位本来就是延迟敏感的 decode——与 high-throughput 内核面向训练/prefill 的分工相对（见第 1 章「专家并行的 all-to-all 卡在哪」）。另一个代价是显存：固定槽位按最坏情况预留，低延迟模式的 buffer 消耗远大于 normal 模式<sup>[C17]</sup>。</p>
 
 <p>两套内核讲完，剩下的是工程面：V1 的接口是两套、通信后端是 NVSHMEM、SM 数量靠 auto-tuning——V2 把这些统一重做，引出第 4 章「V2 重构」。</p>
 
@@ -728,6 +728,8 @@ rank 0 两个 token 的 combine 结果：
 </tbody>
 </table>
 </div>
+
+<p>对比表「V3 式训练 SM 用量」一行的 V1 值 24 是 V1 示例代码的默认配置（<code>Buffer.set_num_sms(24)</code><sup>[C10]</sup>），与第 1、2 章引用的 V3 论文 20/132 个 H800 SM 是两个口径：20 来自 V3 报告 §3.5.1 为其训练内核分配的 SM 数，24 是 V1 库示例中给出的设置，两者不必相等<sup>[N5]</sup>。</p>
 
 <div class="callout callout-yellow">
 <p>常见误解：V2 把 V1 的机制全部推翻了。hybrid（分层 NVLink+RDMA）与 direct 两种模式都保留，两段转发的分层思想延续；变化集中在后端、接口、调参方式与规模，个别能力被移除（0 SM RDMA 低延迟 EP）<sup>[C19, C21, C23]</sup>。</p>

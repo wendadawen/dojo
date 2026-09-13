@@ -62,7 +62,7 @@
 <p><b>主要依据</b>：Howard et al., <i>MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications</i>, arXiv:1704.04861（2017）；GLM-5.3-Flash 官方实现（transformers <code>models/glm5_next</code>）。</p>
 </blockquote>
 
-<p>一个 $3\times3$、64 进 64 出的卷积层，每个空间位置上全部输出通道合计要做 $9\times64\times64=36{,}864$ 次乘加；MobileNets 把这一步拆成两步——先逐通道滤波、再跨通道组合——同样的输出只要约 $4{,}700$ 次乘加，缩减到原来的约 12.7%（这组数字可由公式实算）。在大模型里，它的「半边」——depthwise 卷积——也出现在线性注意力层中：GLM-5.3-Flash 的 KDA 层用它为无位置编码的主干提供局部时序结构（结构解读，非源码直陈）。本文讲清拆分的原理、省算的账，以及「只见半边」的 KDA 用法。</p>
+<p>一个 $3\times3$、64 进 64 出的卷积层，每个空间位置上全部输出通道合计要做 $9\times64\times64=36{,}864$ 次乘加；MobileNets 把这一步拆成两步——先逐通道滤波、再跨通道组合——同样的输出只要约 $4{,}700$ 次乘加，缩减到原来的约 12.7%（这组数字可由公式实算）。在大模型里，它的「半边」——depthwise 卷积——也出现在线性注意力层中：GLM-5.3-Flash 的 KDA 层用它为无位置编码的主干提供局部时序结构（结构解读，非源码直陈）。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -276,7 +276,7 @@ pointwise 乘加: 1,048,576
     <p>$3\times3$ 拆分后为什么 pointwise 反而比 depthwise 贵？什么时候反过来？</p>
     <details>
       <summary>解答：看 $D_K^2$ 与 $N$ 的相对大小</summary>
-      <p>两项之比是 $D_K^2M D_F^2 : MND_F^2 = D_K^2 : N$。$3\times3$（$D_K^2=9$）对 $N=64$：depthwise 只占约 12%，组合占大头。核更大（如 $9\times9$、$D_K^2=81$）或输出通道更少（$N&lt;9$）时 depthwise 反超。这也解释了收益上限：比值 $1/N+1/D_K^2$ 恒大于其中较大的一项，故收益不超过相对较小项的倒数。</p>
+      <p>两项之比是 $D_K^2M D_F^2 : MND_F^2 = D_K^2 : N$。$3\times3$（$D_K^2=9$）对 $N=64$：depthwise 只占约 12%，组合占大头。核更大（如 $9\times9$、$D_K^2=81$）或输出通道更少（$N&lt;9$）时 depthwise 反超。这也解释了收益上限：比值 $1/N+1/D_K^2$ 恒大于其中较大的一项，故收益 $=1/(1/N+1/D_K^2)$ 不超过较大项的倒数，即不超过 $N$ 与 $D_K^2$ 中较小者的值（$N=64,D_K^2=9$ 时收益 $&lt;9$）。</p>
     </details>
   </li>
 </ol>
@@ -330,7 +330,7 @@ groups=2 通道 0（核 [1,1]）: [1.0, 3.0, 5.0, 7.0]    # 当前 + 前一位�
 groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></pre>
   </div>
   <p><b>验证的机制</b>：左 padding + 头部切片实现因果，每个输出只依赖当前与之前的位置；<code>groups=2</code> 时通道 1 的核 $[0,1]$ 输出当前位置的值，通道 0 的核 $[1,1]$ 输出当前位置与前一位置之和，验证逐通道独立<sup>[F6]</sup>。</p>
-  <p><b>观察重点</b>：5 个输出从 $-1$ 单调不增到 $-3.5$（$-1, -2.5, -3.5, -3.5, -3.5$）。$-3.5$ 恒定来自两点：核系数之和为零（$1+0.5-0.5-1=0$），配合等差输入 $(1,2,3,4,5)$ 使滑窗加权和 $\sum_j k_j\cdot x[t+j]$ 与位置 $t$ 无关；而 $t\geq2$ 时左侧补零给出的 $x[-1]=0$ 恰等于等差数列的外推值，故此后输出恒为 $-3.5$。第二段中通道 0 核 $[1,1]$ 在 $t=0$ 用了 padding 0，后三个位置 $[3, 5, 7]$ 是当前位置加前一位置；通道 1 核 $[0,1]$ 严格只看自己，故 $[10, 20, 30, 40]$ 与输入完全相同。</p>
+  <p><b>观察重点</b>：5 个输出从 $-1$ 单调不增到 $-3.5$（$-1, -2.5, -3.5, -3.5, -3.5$）。$-3.5$ 恒定：核系数之和为零（$1+0.5-0.5-1=0$），配合等差输入 $(1,2,3,4,5)$ 使滑窗加权和 $\sum_j k_j\cdot x[t+j]$ 与位置 $t$ 无关；$t=2$ 时窗口首元素是补零 $x[-1]=0$，恰等于等差数列的外推值，使该窗口也成为等差窗口；$t\geq3$ 的窗口本就无补零、同为等差窗口，故 $t\geq2$ 起输出恒为 $-3.5$。第二段中通道 0 核 $[1,1]$ 在 $t=0$ 用了 padding 0，后三个位置 $[3, 5, 7]$ 是当前位置加前一位置；通道 1 核 $[0,1]$ 严格只看自己，故 $[10, 20, 30, 40]$ 与输入完全相同。</p>
   <p><b>简化条件</b>：单通道/双通道、长度 4~5 的构造序列；GLM 的真实配置是 24576 通道、拼接的 $q$/$k$/$v$ 三段，机制相同。</p>
 </details>
 
@@ -347,7 +347,7 @@ groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></
     <p>因果方向的卷积怎么实现「只看过去」？</p>
     <details>
       <summary>解答：左 padding 后取头部</summary>
-      <p>PyTorch 的 <code>Conv1d</code> 在指定 <code>padding</code> 时于两侧对称补零。做法是在序列左侧补 $D_K-1$ 个零再卷积，取前 $S$ 个输出（代码里的 $[:, :, :5]$）：这样位置 $t$ 的输出只聚合 $0$ 到 $t$ 的输入。GLM 的 <code>causal_conv1d_fn</code>（L404-410）用 $F.\mathrm{conv1d}(\mathrm{padding}{=}k{-}1)$ 后取 $[:, :, :\mathrm{seq\_len}]$ 实现同一目标。语言模型不能看未来 token，因果性是必需的。</p>
+      <p>PyTorch 的 <code>Conv1d</code> 在指定 <code>padding</code> 时于两侧对称补零。做法是在序列左侧补 $D_K-1$ 个零再卷积，取前 $S$ 个输出（代码里的 $[:, :, :5]$）：这样位置 $t$ 的输出只聚合 $0$ 到 $t$ 的输入。GLM 的 <code>causal_conv1d_fn</code>（L396-412）用 $F.\mathrm{conv1d}(\mathrm{padding}{=}k{-}1)$ 后取 $[:, :, :\mathrm{seq\_len}]$ 实现同一目标。语言模型不能看未来 token，因果性是必需的。</p>
     </details>
   </li>
 </ol>
@@ -359,7 +359,7 @@ groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></
 <li><strong>[C1]</strong> 标准卷积一步完成滤波与组合；深度可分离拆成两层。MobileNets §3.1 原句。</li>
 <li><strong>[C2]</strong> depthwise 单滤波器作用于单通道；pointwise 为 $1\times1$ 跨通道线性组合。MobileNets §3.1。</li>
 <li><strong>[C3]</strong> $3\times3$ 深度可分离省 8~9 倍计算、精度小幅下降。MobileNets §3.1。</li>
-<li><strong>[C4]</strong> GLM KDA conv1d 配置（通道 24576、kernel 4、groups=通道数、无偏置、因果）。transformers <code>models/glm5_next/modeling_glm5_next.py</code> L603-680；checkpoint 拆为 q/k/v_conv1d 三个 $[8192,1,4]$ 张量（<a href="../glm-5-3-flash-dataflow/index.html">GLM 数据流页</a>交叉验证）。GLM 的 <code>causal_conv1d_fn</code>（L404-410）以左 padding + 头部切片实现因果，与本节代码演示的 <code>padding=k-1</code> + <code>[:, :, :S]</code> 等价。</li>
+<li><strong>[C4]</strong> GLM KDA conv1d 配置（通道 24576、kernel 4、groups=通道数、无偏置、因果）。transformers <code>models/glm5_next/modeling_glm5_next.py</code>（main，行号随上游漂移）L603-680；checkpoint 拆为 q/k/v_conv1d 三个 $[8192,1,4]$ 张量（<a href="../glm-5-3-flash-dataflow/index.html">GLM 数据流页</a>交叉验证）。GLM 的 <code>causal_conv1d_fn</code>（L396-412）以左 padding + 头部切片实现因果，与本节代码演示的 <code>padding=k-1</code> + <code>[:, :, :S]</code> 等价。</li>
 <li><strong>[C5]</strong> 跨通道混合由 $q$/$k$/$v$ 投影承担：结构解读（源码只有投影与卷积的顺序事实，无此陈述）。</li>
 </ul>
 

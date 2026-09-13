@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Not All Prefills Are Equal: PPD Disaggregation for Multi-turn LLM Serving（ICML 2026, arXiv:2603.13358v2）解析：发现 PD 分离在多轮对话下因全历史重算与 KV 传输饱和两条路径系统性低效，量化 full prefill 与 append-prefill 对 decode 的干扰差一个数量级（48% vs 2%），并以 PPD 动态路由把 send-to-P 或 stay-on-D 形式化为带 SLO 权重的逐请求二元决策。真实负载使 Turn 2+ TTFT 平均降低约 68%。">
-  <meta name="dojo:summary" content="本文把多轮对话下 PD 分离的两个低效——每轮全历史重算与 KV 传输饱和——归因到 full prefill 与 append-prefill 的干扰非对称性（batch 200 时 TPOT 减速 $48\%$ vs $2\%$），并以打分函数 $S(\psi;\pi,\mathbf{w})=w_{\text{ttft}}\Delta_{\text{ttft}}-w_{\text{tpot}}\Delta_{\text{tpot}}$ 把是否走 P 路由为带 SLO 权重的逐请求决策；离线建表+在线 $&lt;1\,\text{ms}$ 查表的 PPD 路由系统在 3060 配置扫描与 ShareGPT/WildChat 真实负载上把 Turn 2+ TTFT 平均降低约 $68\%$，TPOT 保持竞争力。">
+  <meta name="dojo:summary" content="本文把多轮对话下 PD 分离的两个低效——每轮全历史重算与 KV 传输饱和——归因到 full prefill 与 append-prefill 的干扰非对称性（batch 200 时 TPOT 减速 $48\%$ vs $2\%$），并以打分函数 $S(\psi;\pi,\mathbf{w})=w_{\text{ttft}}\Delta_{\text{ttft}}-w_{\text{tpot}}\Delta_{\text{tpot}}$ 把是否走 P 路由为带 SLO 权重的逐请求决策；离线建表+在线 $&lt;1\,\text{ms}$ 查表的 PPD 路由系统在 3060 数据点扫描与 ShareGPT/WildChat 真实负载上把 Turn 2+ TTFT 平均降低约 $68\%$，TPOT 保持竞争力。">
   <meta name="dojo:type" content="paper">
   <meta name="dojo:topics" content="推理系统, 并行与通信, 内存与缓存, 模型结构">
   <meta name="dojo:tag" content="推理系统">
@@ -69,7 +69,7 @@
 
 <p>构造示例。 一个 5 轮客服对话部署在 4×H100 的 PD 分离集群上（1 prefill 节点 + 3 decode 节点）：第 1 轮用户输入 1000 token、得到 200 token 回复；第 2 轮用户只追加了 50 token（"再详细一点"）。在传统 PD 分离下，第 2 轮请求被送回 P 节点、把"第 1 轮输入 1000 + 第 1 轮回复 200 + 新 50 = 1250 token"全部重新 prefill 一次、再经网络把生成的 KV 传回 D。两段与新轮次无关的历史每一次追问都要重算一遍——这就是多轮 PD 分离的核心低效。</p>
 
-<p>预填充-解码（PD）分离已成为 vLLM、SGLang、TensorRT-LLM、DeepSeek、Gemini 等主流 LLM 推理引擎的标准架构：把计算密集的 prefill 与带宽敏感的 decode 物理分置到不同 GPU 池。它解决了 single-turn 独立查询下的两类工作负载干扰问题<sup>[C1, C6]</sup>，但本文论证在多轮对话场景下它不但没有消失，反而被放大成两个独立的可量化代价：每个新轮次都要重算整段历史 KV（沿用前一轮的 KV 在朴素 PD 设计下不可达<sup>[C3, C4]</sup>），并且每轮的 KV 传输持续饱和网络带宽。本文用 3060 个配置的系统扫描证明任何一种固定路由都不能在 TTFT、TPOT、吞吐上同时最优，并提出 PPD（Prefill Prefill-capable Decode）——一种把"每个 Turn 2+ 走 P 还是留在 D 本地"路由为带 SLO（Service Level Objectives，服务等级目标）权重的逐请求二元决策的动态路由系统。</p>
+<p>预填充-解码（PD）分离已成为 vLLM、SGLang、TensorRT-LLM、DeepSeek、Gemini 等主流 LLM 推理引擎的标准架构：把计算密集的 prefill 与带宽敏感的 decode 物理分置到不同 GPU 池。它解决了 single-turn 独立查询下的两类工作负载干扰问题<sup>[C1]</sup>，但本文论证在多轮对话场景下它不但没有消失，反而被放大成两个独立的可量化代价：每个新轮次都要重算整段历史 KV（沿用前一轮的 KV 在朴素 PD 设计下不可达<sup>[C3, C4]</sup>），并且每轮的 KV 传输持续饱和网络带宽。本文用 3060 个数据点的系统扫描证明任何一种固定路由都不能在 TTFT、TPOT、吞吐上同时最优，并提出 PPD（Prefill Prefill-capable Decode）——一种把"每个 Turn 2+ 走 P 还是留在 D 本地"路由为带 SLO（Service Level Objectives，服务等级目标）权重的逐请求二元决策的动态路由系统。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -85,21 +85,21 @@
       <p>为什么 append-prefill 可以放在 decode 节点本地运行而不严重拖慢 decode？</p>
       <details>
         <summary>解答：append-prefill 只对新增 token 计算 attention，复杂度比同长度 full prefill 低约 $n/m$ 倍，实测干扰差一个数量级</summary>
-        <p>full prefill 处理 $n$ 个新 token，attention 复杂度 $O(n^2)$（[C5, F2]；注意力复杂度推导见 <a href="../standard-attention/index.html">标准注意力</a>）；append-prefill 只对 $m$ 个新 token 计算（每个关注 $n+m$ 个 key），复杂度 $O(m(n+m))$，$m\ll n$ 时比同长度 full prefill 便宜约 $n/m$ 倍<sup>[C5]</sup>。H100 单卡 Llama-3.1-8B 微基准：batch 200 时 full prefill 让 decode TPOT 减速约 48%、append-prefill 仅约 2%，差一个数量级<sup>[N1]</sup>；4 并发 prefill 时 +57% vs +21%<sup>[N2]</sup>；full prefill 干扰在 32K token 时增长到 3–4 倍，append-prefill 在 64K 时仍低于 25%<sup>[N3]</sup>。结论：decode 节点可以安全地本地处理 Turn 2+。完整论证见「full prefill 与 append-prefill 差一个数量级」一章。</p>
+        <p>full prefill 处理全部 $n+m$ 个 token，attention 复杂度 $O((n+m)^2)$（[C5, F2]；注意力复杂度推导见 <a href="../standard-attention/index.html">标准注意力</a>）；append-prefill 只对 $m$ 个新 token 计算（每个关注 $n+m$ 个 key），复杂度 $O(m(n+m))$，$m\ll n$ 时比同长度 full prefill 便宜约 $n/m$ 倍<sup>[C5]</sup>。H100 单卡 Llama-3.1-8B 微基准：batch 200 时 full prefill 让 decode TPOT 减速约 48%、append-prefill 仅约 2%，差一个数量级<sup>[N1]</sup>；4 并发 prefill 时 +57% vs +21%<sup>[N2]</sup>；full prefill 干扰在 32K token 时增长到 3–4 倍，append-prefill 在 64K 时仍低于 25%<sup>[N3]</sup>。结论：decode 节点可以安全地本地处理 Turn 2+。完整论证见「full prefill 与 append-prefill 差一个数量级」一章。</p>
       </details>
     </li>
     <li>
       <p>既然本地处理这么好，为什么不固定把全部 append-prefill 留在 D 节点（$x{=}1$）？</p>
         <details>
           <summary>解答：92.2% 的（负载, QPS）组合下 Turn 2 TTFT 最优配置与 TPOT 最优配置不同，TPOT 维度 $x{=}0$ 仍然占优</summary>
-          <p>17 配置 × 18 合成负载 × 10 QPS = 3060 个数据点的系统扫描显示，92.2% 的（负载, QPS）组合里 Turn 2 TTFT 的最优配置与 Avg TPOT 的最优配置不同<sup>[N6]</sup>。Winner 分布上 Replica 拿走 63.3% 的 TTFT 胜场却几乎不赢 TPOT 与吞吐，$x{=}0$ 拿走 38.3% 的 TPOT 胜场却 0% TTFT 胜场，$x{=}1$ 最均衡（平均 27.0%）但单项不垄断<sup>[N7]</sup>。TPOT 决定流式输出的平滑度，生产部署可能宁可保 TPOT。完整论证见「没有静态最优：3060 个配置的扫描证据」一章。</p>
+          <p>17 配置 × 18 合成负载 × 10 QPS = 3060 个数据点的系统扫描显示，92.2% 的（负载, QPS）组合里 Turn 2 TTFT 的最优配置与 Avg TPOT 的最优配置不同<sup>[N6]</sup>。Winner 分布上 Replica 拿走 63.3% 的 TTFT 胜场却几乎不赢 TPOT 与吞吐，$x{=}0$ 拿走 38.3% 的 TPOT 胜场却 0% TTFT 胜场，$x{=}1$ 最均衡（平均 27.0%）但单项不垄断<sup>[N7]</sup>。TPOT 决定流式输出的平滑度，生产部署可能宁可保 TPOT。完整论证见「没有静态最优：3060 个数据点的扫描证据」一章。</p>
         </details>
     </li>
     <li>
       <p>PPD 如何对每个请求做路由决策，为什么这样设计？</p>
       <details>
         <summary>解答：带 SLO 权重的打分函数 + 离线建表/在线毫秒级查表，Turn 1 恒走 P</summary>
-        <p>打分函数 $S(\psi;\pi,\mathbf{w}) = w_{\text{ttft}}\Delta_{\text{ttft}} - w_{\text{tpot}}\Delta_{\text{tpot}}$（Eq.1）<sup>[F1, C18]</sup>，$S>0$ 表示本地处理收益大、留 D；否则走 P。Turn 1 恒 $x{=}0$（无缓存 KV）<sup>[C6]</sup>。两阶段：离线在负载网格的每个 cell 上实测 $x{=}0$/$x{=}1$ 两个端点指标，按 $S$ 符号存布尔决策；在线把请求按（累积上下文长度、输入/输出比、当前 QPS）量化到最近 cell 查表，&lt;1 ms 返回<sup>[C10]</sup>。传统 PD 是 $x{\equiv}0$ 特例，极端权重可回收 $x{=}0$ 或 $x{=}1$<sup>[C8]</sup>。这套设计把 P:D 比例（管 Turn 1 吞吐）与权重 $\mathbf{w}$（管 Turn 2+ 工作点）解耦为两个独立旋钮<sup>[C14]</sup>。完整论证见「PPD：把路由变成带权重的逐请求决策」一章。</p>
+        <p>打分函数 $S(\psi;\pi,\mathbf{w}) = w_{\text{ttft}}\Delta_{\text{ttft}} - w_{\text{tpot}}\Delta_{\text{tpot}}$（Eq.1）<sup>[F1]</sup>，$S>0$ 表示本地处理收益大、留 D；否则走 P。Turn 1 恒 $x{=}0$（无缓存 KV）<sup>[C6]</sup>。两阶段：离线在负载网格的每个 cell 上实测 $x{=}0$/$x{=}1$ 两个端点指标，按 $S$ 符号存布尔决策；在线把请求按（累积上下文长度、输入/输出比、当前 QPS）量化到最近 cell 查表，&lt;1 ms 返回<sup>[C10]</sup>。传统 PD 是 $x{\equiv}0$ 特例，极端权重可回收 $x{=}0$ 或 $x{=}1$<sup>[C8]</sup>。这套设计把 P:D 比例（管 Turn 1 吞吐）与权重 $\mathbf{w}$（管 Turn 2+ 工作点）解耦为两个独立旋钮<sup>[C14]</sup>。完整论证见「PPD：把路由变成带权重的逐请求决策」一章。</p>
       </details>
     </li>
     <li>
@@ -118,7 +118,7 @@
 <tbody>
 <tr><td>PD 分离</td><td>prefill 与 decode 物理分置到两个 GPU 池（prefill-only 与 decode-only），KV 缓存严格 P→D 流向</td></tr>
 <tr><td>单向协议</td><td>P 是 KV 生产者、D 是消费者，无反向通道；D 上的 KV（含历史回复）对 P 不可达</td></tr>
-<tr><td>full prefill</td><td>无缓存上下文的新 prompt 整体 prefill，复杂度 $O(n^2)$</td></tr>
+<tr><td>full prefill</td><td>无缓存上下文的新 prompt 整体 prefill，处理全部 $n+m$ 个 token，复杂度 $O((n+m)^2)$（$n$ 为已缓存前缀、$m$ 为本轮新增）</td></tr>
 <tr><td>append-prefill（AP）</td><td>只对 $m$ 个新 token 计算 attention、复用已缓存 $n$ 段 KV，复杂度 $O(m(n+m))$</td></tr>
 <tr><td>$x{=}0$ / $x{=}1$ / $0&lt;x&lt;1$</td><td>AP 路由到 D 的比例：传统 PD（0）/ 全部本地（1）/ 部分路由（1/3、1/2、2/3）</td></tr>
 <tr><td>P:D 配比 $\pi$</td><td>初始节点分配，如 1P_3D、2P_2D、3P_1D、4R</td></tr>
@@ -132,7 +132,7 @@
 
 <h2 id="two-costs">1. 多轮对话暴露 PD 分离的两个代价：历史重算与 KV 传输</h2>
 
-<p>PD 分离的设计动机是消解两类工作负载的相互干扰<sup>[C1, C6]</sup>。Prefill 阶段并行处理输入 prompt、计算密集；Decode 阶段逐 token 自回归生成、访存带宽敏感。把它们分到不同 GPU 池，可让 decode 不再被 prefill 阻塞、并允许 P 与 D 独立扩缩容与硬件异构<sup>[C6]</sup>。这一架构已被 vLLM、SGLang、TensorRT-LLM、DeepSeek、Gemini 等几乎所有主流引擎采用<sup>[C6]</sup>。它对单轮独立查询工作得很好——但多轮对话把它内部的两个隐含约束推到了前台。</p>
+<p>PD 分离的设计动机是消解两类工作负载的相互干扰<sup>[C1]</sup>。Prefill 阶段并行处理输入 prompt、计算密集；Decode 阶段逐 token 自回归生成、访存带宽敏感。把它们分到不同 GPU 池，可让 decode 不再被 prefill 阻塞、并允许 P 与 D 独立扩缩容与硬件异构<sup>[C1]</sup>。这一架构已被 vLLM、SGLang、TensorRT-LLM、DeepSeek、Gemini 等几乎所有主流引擎采用<sup>[C1]</sup>。它对单轮独立查询工作得很好——但多轮对话把它内部的两个隐含约束推到了前台。</p>
 
 <p>第一个约束是<strong>单向协议</strong>。canonical PD 设计中 KV 传输严格单向：P 是 KV 生产者、D 是消费者，没有从 D 回到 P 的反向通道<sup>[C1]</sup>。这条契约被所有主流生产引擎保留——它最简化 KV 传输路径，代价是 D 上生成的 KV 永远到不了 P。在多轮场景下，这意味着每当用户发来下一轮请求，P 节点必须接收整段历史（此前所有轮次的回复 + 新的输入）、重新 prefill 一次生成 KV、再传回 D<sup>[C3, C4]</sup>。CachedAttention 在真实聊天负载上的测量发现该重算可占多轮 prefill 成本高达 99%<sup>[C4]</sup>（本文引用 gao2024 的结论，非本文实测）。</p>
 
@@ -162,7 +162,7 @@
   <figcaption class="diagram-caption">$x{=}0$（传统 PD）下第 2 轮请求的完整路径（构造示例）。第 1 轮回复的 KV 留在 D 上、对 P 不可达；新请求把整套历史送往 P 重算，再经网络传回 D。整段重算与一次完整 KV 传输是「两个代价」的具体形态，与第 4 章的 PPD 路径形成对照。</figcaption>
 </figure>
 
-<p>一个易被误读的点：<strong>PPD 并不打破这个单向协议</strong>。协议在 vLLM 标准 disaggregated serving 格式下保持原样，PPD 只改请求路由——Turn 2+ 请求根本不送 P，而是在 D 上用本地前缀缓存做 append-prefill（详见第 4 章）。下文会看到，「让 D 本地处理 append-prefill」与「让 P 重新 prefill」是同一个路由参数 $x$ 的两种取值，不涉及反向通道。<sup>[C1, C13]</sup></p>
+<p>一个易被误读的点：<strong>PPD 并不打破这个单向协议</strong>。协议在 vLLM 标准 disaggregated serving 格式下保持原样，PPD 只改请求路由——Turn 2+ 请求根本不送 P，而是在 D 上用本地前缀缓存做 append-prefill（详见第 4 章）。「让 D 本地处理 append-prefill」与「让 P 重新 prefill」是同一个路由参数 $x$ 的两种取值，不涉及反向通道。<sup>[C1, C13]</sup></p>
 
 <h3 id="two-costs-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -215,7 +215,7 @@
 
 <p>两线差距在 batch 200 处达到一个数量级：full prefill +48%、append-prefill +2%。</p>
 <img src="assets/img-06.webp" alt="单 H100 上 Llama-3.1-8B 干扰微基准：full prefill 让 decode TPOT 在 batch 200 处上升 48%，append-prefill 仅上升 2%">
-<p><b>图（原文 Figure 2）</b>：单卡 H100、Llama-3.1-8B、共卡运行下的 decode TPOT 随 batch size 的变化。蓝线为 decoding-only 基线；绿线为与 1 个 append-prefill 共卡；红线为与 1 个 full prefill 共卡。Full prefill 在 batch 200 处让 TPOT 减速约 48%，append-prefill 仅约 2%，差距一个数量级<sup>[N1]</sup>。该图是「让 D 节点本地处理 append-prefill 几乎不付代价」的实证基础——直接支撑全文 PPD 决策的微观合法性。4 并发 prefill 的更激进版本（full +57% vs append +21%）见原文 Fig.A1<sup>[N2]</sup>，上下文敏感性（full 32K 时达 3–4×、append 64K 时仍 &lt;25%）见原文 Fig.A2<sup>[N3]</sup>。</p>
+<p><b>图（原文 Figure 2）</b>：单卡 H100、Llama-3.1-8B、共卡运行下的 decode TPOT 随 batch size 的变化。蓝线为 decoding-only 基线；绿线为与 1 个 append-prefill 共卡；红线为与 1 个 full prefill 共卡。Full prefill 在 batch 200 处让 TPOT 减速约 48%，append-prefill 仅约 2%，差距一个数量级<sup>[N1]</sup>。该图是「让 D 节点本地处理 append-prefill 几乎不付代价」的实证基础——直接支撑全文 PPD 决策的微观合法性。4 并发 prefill 的更激进版本（full +57% vs append +21%）见原文 Fig.7（附录 C.1）<sup>[N2]</sup>，上下文敏感性（full 32K 时达 3–4×、append 64K 时仍 &lt;25%）见原文 Fig.8（附录 C.1）<sup>[N3]</sup>。</p>
 
 <p>把这套数字翻成机制结论：full prefill 让同卡 decode 的 TPOT 抬升约 48%（约 1.5 倍），而 append-prefill 在 batch 200 内几乎无感。「所有 prefill 都必须物理隔离」的旧前提被精细化——对 Turn 1 仍然成立，对 Turn 2+ 的 append-prefill 几乎不成立。这是论文的方法论起点：让 D 节点本地处理 Turn 2+ 的代价，远低于直觉。</p>
 
@@ -244,9 +244,9 @@
   </li>
 </ol>
 
-<h2 id="no-universal-best">3. 没有静态最优：3060 个配置的扫描证据</h2>
+<h2 id="no-universal-best">3. 没有静态最优：3060 个数据点的扫描证据</h2>
 
-<p>第 2 章给出了「D 处理 append-prefill 几乎不付代价」的微观证据。一个自然的问题是：为什么干脆固定全部本地处理（$x{=}1$）？这章用 3060 个配置的系统扫描回答这个问题——没有单一固定策略在 TTFT、TPOT、吞吐上同时最优。</p>
+<p>第 2 章给出了「D 处理 append-prefill 几乎不付代价」的微观证据。一个自然的问题是：为什么干脆固定全部本地处理（$x{=}1$）？这章用 3060 个数据点的系统扫描回答这个问题——没有单一固定策略在 TTFT、TPOT、吞吐上同时最优。</p>
 
 <h3 id="config-space">3.1 配置空间与工作负载</h3>
 
@@ -279,7 +279,7 @@
 <p>各配置类别的胜场结构：</p>
 
 <ul>
-<li><strong>Replica 拿下 TTFT 的 63.3%</strong>——零网络传输、本地前缀缓存，可 Turn 2 延迟最低；代价是 prefill 干扰 decode，缺乏 PD 隔离带来的 TPOT 与吞吐几乎为零胜场。</li>
+<li><strong>Replica 拿下 TTFT 的 63.3%</strong>——零网络传输、本地前缀缓存使 Turn 2 延迟最低；代价是 prefill 干扰 decode，缺乏 PD 隔离带来的 TPOT 与吞吐几乎为零胜场。</li>
 <li><strong>$x{=}0$ 拿下 TPOT 的 38.3%</strong>——物理隔离让 decode 不被 prefill 阻塞，TPOT 稳定；TTFT 0% 胜场（每轮 KV 传输必延迟 Turn 2 首 token）。</li>
 <li><strong>$x{=}1$ 拿下吞吐的 38.3%</strong>并以 27.0% 平均胜场居首——它是<strong>唯一</strong>三项均有竞争力的分离模式，特别在 TTFT 维度上（27.2% vs $x{=}0$ 的 0%）取得显著突破。</li>
 </ul>
@@ -301,7 +301,7 @@
 </table>
 </div>
 
-<p>两个值得注意的模式<sup>[C14]</sup>：一是 $x{=}1$ 优势随负载增大——QPS 越高、传输排队越严重、本地缓存访问越有价值；二是 P 越稀缺本地处理收益越大——1P_3D 高 QPS 时 -73.3%，3P_1D 高 QPS 时只剩 -24.9%。直观解释：P 节点本身就是瓶颈时，$x{=}1$ 完全绕过 P；P 资源充裕时，本地处理的相对价值受限于 TPOT 代价（7–12%，详见第 5 章权重案例）<sup>[N12]</sup>。</p>
+<p>两条规律<sup>[C14]</sup>：一是 $x{=}1$ 优势随负载增大——QPS 越高、传输排队越严重、本地缓存访问越有价值；二是 P 越稀缺本地处理收益越大——1P_3D 高 QPS 时 -73.3%，3P_1D 高 QPS 时只剩 -24.9%。直观解释：P 节点本身就是瓶颈时，$x{=}1$ 完全绕过 P；P 资源充裕时，本地处理的相对价值受限于 TPOT 代价（7–12%，详见第 5 章权重案例）<sup>[N12]</sup>。</p>
 
 <h3 id="no-universal-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -330,11 +330,11 @@
 
 <h2 id="ppd-design">4. PPD：把路由变成带权重的逐请求决策</h2>
 
-<p>第 3 章证明静态 $x$ 都不是普遍最优；本章给出 PPD——一个为每个 Turn 2+ 请求单独选 $x$ 的动态路由系统。它做了两件事：把"<strong>送 P 还是留 D</strong>"写成带 SLO 权重的数<sup>[C18, F1]</sup>，把决策计算前移到离线阶段、在线只做毫秒级查表。</p>
+<p>第 3 章证明静态 $x$ 都不是普遍最优；本章给出 PPD——一个为每个 Turn 2+ 请求单独选 $x$ 的动态路由系统。它做了两件事：把"<strong>送 P 还是留 D</strong>"写成带 SLO 权重的数<sup>[F1]</sup>，把决策计算前移到离线阶段、在线只做毫秒级查表。</p>
 
 <h3 id="score-formula">4.1 打分函数：把二元决策变成一个数</h3>
 
-<p>对每个 Turn 2+ 请求，PPD 评估两个候选路径：本地处理（$x{=}1$，D 上做 append-prefill）与走 P（$x{=}0$）。定义相对收益为带 SLO 权重的差分<sup>[C18, F1]</sup>：</p>
+<p>对每个 Turn 2+ 请求，PPD 评估两个候选路径：本地处理（$x{=}1$，D 上做 append-prefill）与走 P（$x{=}0$）。定义相对收益为带 SLO 权重的差分<sup>[F1]</sup>：</p>
 
 <p>$$S(\psi;\pi,\mathbf{w}) = w_{\text{ttft}}\Delta_{\text{ttft}} - w_{\text{tpot}}\Delta_{\text{tpot}}.$$</p>
 
@@ -350,7 +350,7 @@
 
 <p>吞吐不在打分函数内——它是 KV 传输量下降的系统级副产物<sup>[C9]</sup>。把多目标路由硬塞进单个目标函数的做法不可行；该形式只显式优化 TTFT 与 TPOT 的可调权重组合，把吞吐作为外部约束的隐式解。</p>
 
-<p>用开篇 1250 token 第 2 轮请求作为构造示例代入。论文 Eq.1 抽象地使用 $\Delta_{\text{ttft}}$（"the relative TTFT improvement"）与 $\Delta_{\text{tpot}}$（TPOT 相对退化），两者在下列代入中均取正值表示本地更优：$\Delta_{\text{ttft}}=+0.6$（本地 TTFT 比走 P 低 60%）、$\Delta_{\text{tpot}}=+0.08$（本地 TPOT 比走 P 慢 8%）。</p>
+<p>用开篇 1250 token 第 2 轮请求作为构造示例代入。论文 Eq.1 抽象地使用 $\Delta_{\text{ttft}}$（"the relative TTFT improvement"）与 $\Delta_{\text{tpot}}$（TPOT 相对退化）：$\Delta_{\text{ttft}}$ 取正值表示本地更优，$\Delta_{\text{tpot}}$ 取正值表示本地退化。下列代入中：$\Delta_{\text{ttft}}=+0.6$（本地 TTFT 比走 P 低 60%）、$\Delta_{\text{tpot}}=+0.08$（本地 TPOT 比走 P 慢 8%）。</p>
 
 <ul>
 <li>balanced 权重 $\mathbf{w}=(1,1)$：$S = 1\times 0.6 - 1\times 0.08 = 0.52 > 0$ → 本地处理（$x{=}1$）。</li>
@@ -418,7 +418,7 @@
     <p>打分函数如何把"送 P 还是留本地"变成一个数？</p>
     <details>
       <summary>解答：$S=w_{\text{ttft}}\Delta_{\text{ttft}}-w_{\text{tpot}}\Delta_{\text{tpot}}$ 大于 0 则本地，否则走 P</summary>
-      <p>把两个候选路径的（TTFT 改善、TPOT 退化）按算子给出的 SLO 权重线性组合为单标量 $S$<sup>[C18, F1]</sup>。$S>0$ 表示收益大于代价、留本地；否则走 P。Turn 1 恒 $x{=}0$（无缓存 KV）<sup>[C6]</sup>。$\mathbf{w}$ 在线调整即可在 TTFT 与 TPOT 之间切换偏好。</p>
+      <p>把两个候选路径的（TTFT 改善、TPOT 退化）按算子给出的 SLO 权重线性组合为单标量 $S$<sup>[F1]</sup>。$S>0$ 表示收益大于代价、留本地；否则走 P。Turn 1 恒 $x{=}0$（无缓存 KV）<sup>[C6]</sup>。$\mathbf{w}$ 在线调整即可在 TTFT 与 TPOT 之间切换偏好。</p>
     </details>
   </li>
   <li>
@@ -443,7 +443,7 @@
 
 <h3 id="sharegpt-wildchat">5.1 真实负载下的延迟与稳定性</h3>
 
-<p>两个公开多轮对话数据集：ShareGPT（用户分享的 ChatGPT 对话）与 WildChat（真实用户日志，预填充/解码比多样）<sup>[C13]</sup>。过滤多轮会话，在三个代表 PD 配置（1P_3D、2P_2D、3P_1D）上以 balanced 权重（$w_{\text{ttft}}=w_{\text{tpot}}=1.0$）评估，QPS 1–20。测量平均查询延迟、Turn 2+ TTFT、吞吐、成功率（${\geq}$95% 请求不超时）。</p>
+<p>两个公开多轮对话数据集：ShareGPT（用户分享的 ChatGPT 对话）与 WildChat（真实用户日志，预填充/解码比多样）<sup>[C2]</sup>。过滤多轮会话，在三个代表 PD 配置（1P_3D、2P_2D、3P_1D）上以 balanced 权重（$w_{\text{ttft}}=w_{\text{tpot}}=1.0$）评估，QPS 1–20。测量平均查询延迟、Turn 2+ TTFT、吞吐、成功率（${\geq}$95% 请求不超时）。</p>
 
 <p>下图展示三配置在两数据集上的平均查询延迟 vs QPS。虚线为 PD（$x{=}0$），实线为 PPD（$x\in[0,1]$ 动态）；× 标记为服务降级（成功率 &lt;95%）。</p>
 <img src="assets/img-04.webp" alt="ShareGPT/WildChat 上 1P_3D/2P_2D/3P_1D 平均查询延迟：PD 虚线、PPD 实线、× 为降级">
@@ -615,9 +615,10 @@
 <thead><tr><th>编号</th><th>论断</th><th>原文定位</th></tr></thead>
 <tbody>
 <tr><td>C1</td><td>PD 分离中 KV 传输严格单向 P→D，无反向通道</td><td>§2.2 One-way KV Transfer Protocol</td></tr>
+<tr><td>C2</td><td>真实负载使用 ShareGPT 与 WildChat 两个公开多轮对话数据集</td><td>§6.1</td></tr>
 <tr><td>C3</td><td>多轮场景下 P 必须重算整段历史 KV 再传回 D</td><td>§1、§2.3</td></tr>
 <tr><td>C4</td><td>重算占多轮 prefill 成本高达 99%（引用 gao2024 CachedAttention）</td><td>§1（[gao2024] 引用）</td></tr>
-<tr><td>C5</td><td>full prefill $O(n^2)$ vs append-prefill $O(m(n+m))$，$m\ll n$ 时便宜约 $n/m$ 倍</td><td>§4.1 Full Prefill vs. Append Prefill</td></tr>
+<tr><td>C5</td><td>full prefill $O((n+m)^2)$ vs append-prefill $O(m(n+m))$，$m\ll n$ 时便宜约 $n/m$ 倍</td><td>§4.1 Full Prefill vs. Append Prefill</td></tr>
 <tr><td>C6</td><td>Turn 1 恒 $x{=}0$（无缓存 KV）</td><td>§3、Alg.1</td></tr>
 <tr><td>C7</td><td>路由参数 $x$ 双重含义：硬件级分数 $x\in[0,1]$ 与每请求二元决策 $x\in\{0,1\}$</td><td>§3 开头</td></tr>
 <tr><td>C8</td><td>传统 PD 是 $x{\equiv}0$ 特例；PPD 极端权重可回收 $x{=}0$ 或 $x{=}1$</td><td>§3、§6.3</td></tr>
@@ -639,7 +640,7 @@
 
 <h3>核心公式与原文定位</h3>
 <p>F1（Eq.1）：$S(\psi;\pi,\mathbf{w}) = w_{\text{ttft}}\Delta_{\text{ttft}} - w_{\text{tpot}}\Delta_{\text{tpot}}$，决策 $S>0$ 本地、否则走 P。｜原文 §3 Eq.(1)。</p>
-<p>F2（§4.1 文中）：full prefill $O(n^2)$ vs append-prefill $O(m(n+m))$，$m\ll n$ 时约 $n/m$ 倍便宜。｜原文 §4.1；§2.1 同给出 $O(n^2)$。</p>
+<p>F2（§4.1 文中）：full prefill $O((n+m)^2)$ vs append-prefill $O(m(n+m))$，$m\ll n$ 时约 $n/m$ 倍便宜（$n$ 为已缓存前缀、$m$ 为本轮新增）。｜原文 §4.1；§2.1 同给出该 full prefill 复杂度。</p>
 <p>F3（Eq.2）：$\Delta t = \max(0,\tfrac{B(\psi)}{\beta_{\text{target}}}-t_{\text{NVLink}})$，$B(\psi)=n_{\text{tokens}}\cdot s_{\text{kv}}$。｜原文 App.B.6。</p>
 <p>F4（页面构造的验证计算，非论文公式）：$s_{\text{kv}}=128$ KiB/token 构成 = 2 bytes × 8 KV heads × 128 head_dim × 2(K/V) × 32 layers = 131072 bytes = 128 KiB。论文 App.B.6 仅给出结果数字与条件（"For Llama-3.1-8B (BF16, GQA with 8 KV heads, 32 layers) the per-token footprint is $s_{\text{kv}}=128$ KiB"）；8 KV heads 与 32 layers 来自论文同一句，head_dim=128 来自 Hugging Face Llama-3.1-8B 模型配置（公开模型卡）。该构成作为构造验证计算呈现，验证 $2048\times 128\,\text{KiB}=256\,\text{MiB}$ 与 §2.2 §5.3 的 ~256 MB /WildChat ~670 MB 数字自洽。</p>
 <p>F5（页面构造的换算，非论文公式）：$2\text{K}\times 128\,\text{KiB}=256\,\text{MiB}$，对应 §2.2 §5.3 数字。</p>
@@ -651,8 +652,8 @@
 <thead><tr><th>编号</th><th>数值</th><th>原文定位</th></tr></thead>
 <tbody>
 <tr><td>N1</td><td>batch 200 时 full prefill +48% TPOT 减速、append-prefill +2%</td><td>§4.1 Fig.2</td></tr>
-<tr><td>N2</td><td>4 并发 prefill 时 full +57%、append +21%</td><td>§4.1 Fig.A1</td></tr>
-<tr><td>N3</td><td>full prefill 干扰 32K 时 3–4×；append 64K 时 <25%</td><td>§4.1 Fig.A2</td></tr>
+<tr><td>N2</td><td>4 并发 prefill 时 full +57%、append +21%</td><td>附录 C.1 Fig.7</td></tr>
+<tr><td>N3</td><td>full prefill 干扰 32K 时 3–4×；append 64K 时 <25%</td><td>附录 C.1 Fig.8</td></tr>
 <tr><td>N4</td><td>17 配置 × 18 负载 × 10 QPS = 3060 数据点</td><td>§4.2</td></tr>
 <tr><td>N5</td><td>P 稀缺配置 1P_3D 高 QPS -73.3%、2P_2D -56.2%（汇总 48–73%）；3P_1D 仅 -24.9%</td><td>Tab.1</td></tr>
 <tr><td>N6</td><td>92.2%（负载, QPS）组合中 TTFT 与 TPOT 最优配置不同</td><td>§4.4</td></tr>
@@ -690,7 +691,7 @@
 <p>方法评价章节（"方法评价"）及其中"优点 / 局限 / 适用场景与位置"三小节为分析性判断，依据论文事实与机制推理延伸，不属于论文原文结论。</p>
 
 <h3>构造示例</h3>
-<p>开篇 5 轮客服对话（输入 1000/追加 50 token、回复 200 token）：数字为构造示例，目的在于让两个代价在第一个场景中可见。第 2 章 1250/1200/50 计算量比、$O(n^2)$ 与 $O(m(n+m))$ 例子：构造示例。$s_{\text{kv}}=128$ KiB 构成推导：构造验证计算，验证论文数字自洽。Eq.1 的 $\Delta$ 代入（balanced、TPOT 强调、TTFT 强化三种权重下 S 的符号变化）：构造示例，展示决策对权重的依赖。</p>
+<p>开篇 5 轮客服对话（输入 1000/追加 50 token、回复 200 token）：数字为构造示例，目的在于让两个代价在第一个场景中可见。第 2 章 1250/1200/50 计算量比、$O((n+m)^2)$ 与 $O(m(n+m))$ 例子：构造示例。$s_{\text{kv}}=128$ KiB 构成推导：构造验证计算，验证论文数字自洽。Eq.1 的 $\Delta$ 代入（balanced、TPOT 强调、TTFT 强化三种权重下 S 的符号变化）：构造示例，展示决策对权重的依赖。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>第 1 章自绘 SVG（"x=0 下多轮请求路径"）展示两个代价的物理形态：辅助说明，不引入新机制声明。第 4 章该段文字"把多目标路由硬塞进单个目标函数的做法不可行"是分析性判断延伸（论文未明说）。</p>

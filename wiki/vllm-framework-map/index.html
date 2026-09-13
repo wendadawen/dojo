@@ -88,7 +88,7 @@
 
 <h1 class="title">vLLM 框架全景</h1>
 <p class="page-lead">vLLM 的进程按 API Server、EngineCore、GPU Worker、DP Coordinator 四类划分；代码按入口、引擎、执行、模型、编译五层组织，外加采样、推测解码、结构化输出、KV 传输等跨层子系统。</p>
-<p class="page-meta">更新于 2026-08-21 · 类型：框架总览（vLLM 0.23.1rc0）</p>
+<p class="page-meta">更新于 2026-08-21 · 类型：框架总览（检出 v0.23.1rc0-1383-g95e073e17）</p>
 <p class="reading-time" id="readingTime"></p>
 
 <h2 id="proc">1. 进程架构</h2>
@@ -100,7 +100,7 @@
       <tr><td>GPU Worker</td><td>= DP × PP × TP（即卡数）</td><td>加载权重、执行 forward、管理显存</td></tr>
       <tr><td>DP Coordinator</td><td>DP&gt;1 时 1 个</td><td>跨 DP rank 负载均衡、MoE 同步</td></tr>
     </table>
-    <p>单机 4 卡 TP=4 共 6 个进程（1 API + 1 EngineCore + 4 Worker）；8 卡 TP=2 DP=4 共 17 个进程。进程间通信三类：请求与结果走 ZMQ（单机 ipc、跨机 tcp）；EngineCore 到 worker 的调用广播走共享内存环形缓冲 + ZMQ 发布订阅；GPU 之间走 NCCL。APIServer 与 EngineCore 两个进程各自的代码边界、忙等循环与 Executor→Worker→Runner 三层调用链，另见 <a href="../vllm-v1-two-process-arch/index.html">vLLM V1 框架总览</a>。</p>
+    <p>单机 4 卡 TP=4 共 6 个进程（1 API + 1 EngineCore + 4 Worker）；8 卡 TP=2 DP=4 共 17 个进程。进程间通信三类：请求与结果走 ZMQ（单机 ipc、跨机 tcp）；EngineCore 到 worker 的调用广播走共享内存环形缓冲 + ZMQ 发布订阅；GPU 之间走 NCCL。API Server 与 EngineCore 两个进程各自的代码边界、忙等循环与 Executor→Worker→Runner 三层调用链，另见 <a href="../vllm-v1-two-process-arch/index.html">vLLM V1 框架总览</a>。</p>
 
     <svg viewBox="0 0 760 230" width="100%" style="max-width:700px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="进程拓扑示意">
       <rect x="10" y="20" width="740" height="80" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4"/>
@@ -223,7 +223,7 @@
     <ol>
       <li><strong>VllmConfig 全局配置对象</strong>：所有类接收同一个完整配置对象而非散装参数。新增功能只需在 VllmConfig 加字段，任何层直接读取，不用层层改构造函数——这是应对快速演进的扩展性设计。</li>
       <li><strong>统一模型构造签名</strong>：所有模型构造函数统一为 <code>__init__(*, vllm_config, prefix="")</code>。ModelRunner 不必知道模型类型即可创建模型；视觉语言模型可由子模型组合而成。prefix 用于非均匀量化（模型不同部分用不同量化）。</li>
-      <li><strong>分片与量化在初始化时完成</strong>：不在加载后处理。以 405B 模型跑 16 卡为例，若先加载全部再分片，每卡都要装下 810GB；初始化时分片则每层只创建自己需要的分片，显存开销最小。量化同理。</li>
+      <li><strong>分片与量化在初始化时完成</strong>：不在加载后处理。以 405B 模型跑 16 卡为例，若先加载全部再分片，每卡都要装下 810GB；初始化时分片则每层只创建自己需要的分片，显存开销显著更小。量化同理。</li>
     </ol>
 
     <h2 id="docs">5. 官方设计文档索引</h2>
@@ -240,14 +240,14 @@
 
     <h2 id="lifecycle">6. 请求生命周期</h2>
     <p>一次生成请求依次经过九个环节：① 请求进来（前端预处理）→ ② ZMQ 交给 EngineCore → ③ 主循环收请求进调度器 → ④ 调度选批 → ⑤ 模型 forward → ⑥ 采样出新 token → ⑦ 更新 KV cache → ⑧ 新 token 回下一轮 → ⑨ 结果回 API Server。</p>
-    <p>其中前端的预处理集中在 <code>v1/worker/gpu_model_runner.py</code> 的 <code>_preprocess</code>（含 <code>_gather_mm_embeddings</code>、<code>embed_input_ids</code>、<code>_prepare_mm_inputs</code> 等函数）与 <code>v1/sample/</code> 的采样器；原理在关联笔记（图片两段处理、inputs embeds 与 cudagraph）中展开。</p>
+    <p>链路三段各归其位：前端预处理在 API Server 的 renderers 链路（tokenize、多模态图片加载与 smart_resize）；模型输入准备在 worker，由 <code>v1/worker/gpu_model_runner.py</code> 的 <code>_preprocess</code> 完成（含 <code>_gather_mm_embeddings</code>、<code>embed_input_ids</code>、<code>_prepare_mm_inputs</code> 等函数）；采样由 <code>v1/sample/</code> 的采样器完成。三段原理见关联笔记<a href="../vllm-mm-image-two-stage/index.html">多模态图片的两阶段处理</a>与<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>。</p>
 
     <h2 id="ref">来源与范围说明</h2>
     <ul>
       <li>本地代码库扫描（本地检出 v0.23.1rc0-1383-g95e073e17）：各层目录结构、模块计数（约 290 个模型文件、25 种量化方法、7 种模型加载器、16 个推测解码模块、14 个 v1 侧 KV connector 及 mooncake/nixl 等子目录实现）</li>
       <li>官方设计文档：仓库 docs/design/ 目录（arch_overview、paged_attention、prefix_caching、multiprocessing、cuda_graphs、torch_compile、model_runner_v2、vllm_ir 等 29 篇）</li>
       <li>进程数量公式与设计决策摘自 arch_overview.md；fork/spawn 取舍详见 multiprocessing.md</li>
-      <li>模块机制在关联笔记中展开（两进程架构、图片两段处理、inputs embeds 与 cudagraph）</li>
+      <li>模块机制在关联笔记中展开（两进程架构、图片两段处理、<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）</li>
     </ul>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

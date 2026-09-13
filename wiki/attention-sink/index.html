@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="注意力汇聚点是被注意力倾倒的位置：softmax 要求权重非零且和为 1，模型必须把多余的注意力分配出去，序列开头的位置最容易被训练成这个去处；移除它会让分母缺一大块、模型崩溃。含两种实现形态（保留初始位置 / 每头一个可学习标量）与份额公式及数值示例。">
-  <meta name="dojo:summary" content="注意力汇聚点是被注意力倾倒的位置：softmax 必须把权重分配完，分母里的汇聚点项 $e^{\text{sink}-m}$ 只影响归一化、不携带内容；DeepSeek-V4.1-Flash 每头一个可学习标量（43 层 $\times$ 64 头），$W=128$ 时 logit 从 0 增到 5 可让它的份额从 0.78% 升到 53.69%。">
+  <meta name="dojo:summary" content="注意力汇聚点是被注意力倾倒的位置：softmax 必须把权重分配完，分母里的汇聚点项 $e^{\text{sink}-m}$ 只影响归一化、不携带内容；DeepSeek-V4.1-Flash 每层每头一个可学习标量（主干 40 层 + 3 个 MTP 层，形状 $[64]$），$W=128$ 时 logit 从 0 增到 5 可让它的份额从 0.78% 升到 53.69%。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制">
   <meta name="dojo:tag" content="KV cache">
@@ -63,7 +63,7 @@
 </blockquote>
 
 <div class="callout callout-blue">
-<p>本页讨论的汇聚点是<b>注意力分配的去处</b>，不是「重要的位置」。它有两种落地形态：把少数初始位置的 KV 留在缓存里，或给每个注意力头一个只进分母的可学习标量。DeepSeek-V4.1-Flash 用后一种。</p>
+<p>汇聚点是<b>注意力分配的去处</b>，不是「重要的位置」。它有两种落地形态：把少数初始位置的 KV 留在缓存里，或给每个注意力头一个只进分母的可学习标量。DeepSeek-V4.1-Flash 用后一种。</p>
 </div>
 
 <section class="learning-goals">
@@ -126,7 +126,7 @@
 </table>
 </div>
 
-<p>因此本页把「注意力分数高」与「信息重要」明确分开：前者说明模型在这个位置分配了权重，后者要看这个位置的内容是否影响输出。汇聚点属于前者。</p>
+<p>因此「注意力分数高」与「信息重要」需要分开看：前者说明模型在这个位置分配了权重，后者要看这个位置的内容是否影响输出。汇聚点属于前者。</p>
 
 <h3 id="phenomenon-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -247,7 +247,7 @@ $$o = \frac{\sum_{t\in\mathcal{T}} e^{\,q\cdot k_t/\sqrt{d}\,-\,m}\,v_t}{\sum_{t
     <p>为什么可学习标量能替代「保留几个初始位置」？</p>
     <details>
       <summary>解答：它提供了同样的「去处」，但不依赖任何 token</summary>
-      <p>两种做法的共同作用是在 softmax 分母里提供一个不携带信息的份额：初始位置是真实 token，靠「对所有 query 可见」获得这个角色；可学习标量则直接以参数形式加在分母上。因此后者不需要在缓存里保留任何位置，也不受位置编码口径影响。代价是它必须通过训练学到合适的量级。一个直接对照：用可学习 sink token 训练的 160M 模型，只需 1 个 sink 配 1023 个近期位置即可把困惑度压到 18.01；未做该训练的模型即使保留 2 个初始位置也只有 18.05——差别就在于前者不需要靠真实位置来充当这个角色<sup>[N3]</sup>。</p>
+      <p>两种做法的共同作用是在 softmax 分母里提供一个不携带信息的份额：初始位置是真实 token，靠「对所有 query 可见」获得这个角色；可学习标量则直接以参数形式加在分母上。因此后者不需要在缓存里保留任何位置，也不受位置编码口径影响。代价是它必须通过训练学到合适的量级。一个相关但机制不同的对照：用可学习 sink token 训练的 160M 模型，只需 1 个 sink 配 1023 个近期位置即可把困惑度压到 18.01；未做该训练的模型即使保留 2 个初始位置也只有 18.05<sup>[N3]</sup>。这里的 sink token 是预置在每个训练样本前的占位 token，带可学习 KV 并占 1 个缓存槽位（对应 Table 3 配置 1+1023 中的那个 1），与本节只进分母、不占缓存槽位的标量属于两种机制。该实验支持的是「专用可学习 sink 可减少对多个初始位置的依赖」，并不支持标量形态的「不占用任何缓存槽位、不依赖任何 token」。</p>
     </details>
   </li>
   <li>
@@ -282,18 +282,18 @@ $$\text{share} = \frac{e^{\text{sink}}}{W + e^{\text{sink}}}$$
 
 <ul>
 <li>$\text{sink}$：该头的汇聚点标量（作为 logit）；</li>
-<li>$W$：可见槽位个数（窗口场景下即窗口大小）；</li>
+<li>$W$：可见槽位个数（窗口场景下即窗口大小；构造示例取 128）；</li>
 <li>$\text{share}$：汇聚点占分母的比例，其余 $1-\text{share}$ 由可见槽位分摊。</li>
 </ul>
 
-<p>取 $W=128$（DeepSeek-V4.1-Flash 的窗口大小）、$W$ 个可见槽位分数均为 0（$m=0$，于是每个可见槽位的指数项都是 1）这一构造假设时，份额 $\text{share}=e^{\text{sink}}/(W+e^{\text{sink}})$ 随 $\text{sink}$ 单调上升：$\text{sink}=0$ 时为 0.78%、$\text{sink}=2$ 时 5.46%、$\text{sink}=5$ 时 53.69%、$\text{sink}=8$ 时 95.88%<sup>[N5]</sup>。取值越大份额越接近 1 但永远取不到 1。真实取值由训练决定，本页未读取真实权重数值。</p>
+<p>取 $W=128$（DeepSeek-V4.1-Flash 的窗口大小）、$W$ 个可见槽位分数均为 0（$m=0$，于是每个可见槽位的指数项都是 1）这一构造假设时，份额 $\text{share}=e^{\text{sink}}/(W+e^{\text{sink}})$ 随 $\text{sink}$ 单调上升：$\text{sink}=0$ 时为 0.78%、$\text{sink}=2$ 时 5.46%、$\text{sink}=5$ 时 53.69%、$\text{sink}=8$ 时 95.88%<sup>[N5]</sup>。取值越大份额越接近 1 但永远取不到 1。这里的 $W=128$ 只是取该模型的窗口大小作为构造取值，并非它的实际可见槽位总数：该模型是稀疏注意力，一次调用的可见集并不止窗口这一部分，因此上列 0.78%–95.88% 是这一构造口径下的份额，而不是在真实可见槽位集合上算出的份额。真实取值由训练决定，本页未读取真实权重数值。</p>
 
 <details class="code-details">
 <summary>代码：份额随汇聚点标量的变化</summary>
 <div class="code-block">
 <pre><code class="language-python">import math
 
-W = 128                       # 可见槽位个数（等于窗口大小）
+W = 128                       # 可见槽位个数（构造取窗口大小）
 for sink in (0.0, 2.0, 5.0, 8.0):
     share = math.exp(sink) / (W + math.exp(sink))
     print(f"sink={sink:>4}: 份额 {share:.4f} = {share * 100:.2f}%")</code></pre>
@@ -337,7 +337,7 @@ sink= 8.0: 份额 0.9588 = 95.88%</code></pre>
 <h3>论断与来源（C）</h3>
 <p>[C1] StreamingLLM（Xiao et al., arXiv:2309.17453）§3.1 与 Figure 2：「We find that, beyond the bottom two layers, the model consistently focuses on the initial tokens across all layers and heads.」；「a surprisingly large amount of attention score is allocated to the initial tokens, irrespective of their relevance to the language modeling task」；换行符实验见同节 Table 1 及其说明。</p>
 <p>[C2] 同上 §3.1：「The nature of the SoftMax function (Equation 1) prevents all attended tokens from having zero values. This requires aggregating some information from other tokens across all heads in all layers, even if the current embedding has sufficient self-contained information for its prediction. Consequently, the model tends to dump unnecessary attention values to specific tokens.」；「removing these initial tokens' KV will remove a considerable portion of the denominator in the SoftMax function (Equation 1) in attention computation. This alteration leads to a significant shift in the distribution of attention scores」；「Due to the sequential nature of autoregressive language modeling, initial tokens are visible to all subsequent tokens... As a result, initial tokens are more easily trained to serve as attention sinks」。</p>
-<p>[C3] 同上 §3.2 与 Table 1/2：「StreamingLLM simply keeps the attention sink tokens' KV (with just 4 initial tokens sufficing) together with the sliding window's KV to anchor the attention computation and stabilize the model's performance.」；「Introducing four initial tokens generally suffices; further additions have diminishing returns.」；位置口径：「StreamingLLM focuses on positions within the cache rather than those in the original text.」</p>
+<p>[C3] 同上 §1 引言（§3.2 同述该方法）与 Table 1/2：「StreamingLLM simply keeps the attention sink tokens' KV (with just 4 initial tokens sufficing) together with the sliding window's KV to anchor the attention computation and stabilize the model's performance.」；「Introducing four initial tokens generally suffices; further additions have diminishing returns.」；位置口径（§3.2）：「StreamingLLM focuses on positions within the cache rather than those in the original text.」</p>
 <p>[C4] DeepSeek-V4.1-Flash 官方参考实现：其注意力模块中 <code>self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))</code>，随稀疏注意力调用传入；稀疏注意力内核把汇聚点项加在分母上。源码语义经本机复现核对，实测清单见 <code>research/measured.md</code>。真实 checkpoint 分片头（HTTP Range 读取）：43 个 <code>attn_sink</code> 张量，形状集合 $\{(64,)\}$，dtype F32，覆盖主干层 0–39 与 3 个 MTP 层。</p>
 <p>[C5] 解析解与边界（汇聚点只进分母、行最大值不含它、整行无效输出零）：由 [C4] 的内核语义推出，并经语义复现实现实测，与解析解逐元素差为 0；复算记录见 <code>research/measured.md</code>。</p>
 <p>[C6] StreamingLLM 附录 A：「While StreamingLLM improves the efficiency of LLMs in streaming contexts, it does not extend the models' context window or enhance their long-term memory capabilities.」</p>
@@ -349,7 +349,7 @@ sink= 8.0: 份额 0.9588 = 95.88%</code></pre>
 <h3>外部数字与实验条件（N）</h3>
 <p>[N1] StreamingLLM Table 1（Llama-2-13B，PG19 首本书 65K token）：「0+1024」困惑度 5158.07，「4+1020」5.40，「4"\n"+1020」（4 个换行符 + 1020）5.60。来源：StreamingLLM（arXiv:2309.17453）Table 1 及其说明「Cache config x+y denotes adding x initial tokens with y recent tokens.」与 §3.1。注意：x+y 中的 $x$、$y$ 是该实验的配置取值——表内 1024/2048/4096 是各次实验设定的窗口长度（同族不同设置下取值不同，如 Table 2 的 Llama-2-7B 组用 4096），不是模型固有的窗口大小。</p>
 <p>[N2] 同上 Table 2：Falcon-7B / MPT-7B / Pythia-12B / Llama-2-7B 在 PG19 拼接 400K token 上的对照，结论为「4 个初始位置一般足够」。</p>
-<p>[N3] 同上 Table 3 与 §4.2：两个 160M 参数模型在同一条件下训练（采用 Pythia-160M 代码库与训练配方），在 PG19 首个样本上评测；用可学习 sink token 训练的模型在 1+1023 下困惑度 18.01，未做该训练的模型在 2+1022 下 18.05。</p>
+<p>[N3] 同上 Table 3 与 §4.2：两个 160M 参数模型在同一条件下训练（采用 Pythia-160M 代码库与训练配方），在 PG19 首个样本上评测；这里的 sink token 是预置在每个训练样本前的可学习占位 token（带可学习 KV、占 1 个缓存槽）。用可学习 sink token 训练的模型在 1+1023 下困惑度 18.01，未做该训练的模型在 2+1022 下 18.05。</p>
 <p>[N4] 真实 checkpoint 的 <code>attn_sink</code> 形状与数量：43 个张量、形状 $(64,)$、F32。来源：对官方 checkpoint 分片头（HTTP Range 读到的 48 个分片头）的实测，产物登记见 <code>wiki/deepseek-v4-1/research/measured.md</code>。</p>
 <p>[N5] 份额数值（0.78% / 5.46% / 53.69% / 95.88%）：构造示例，$W=128$、可见槽位分数均为 0（$m=0$）；复算记录见 <code>research/measured.md</code>。</p>
 
@@ -361,7 +361,7 @@ sink= 8.0: 份额 0.9588 = 95.88%</code></pre>
 
 <h3>简化条件及其限制</h3>
 <ul>
-<li>份额表假设所有可见槽位分数均为 0（$m=0$），只用于说明量级；实际份额随 query 的分数分布变化。</li>
+<li>份额表假设所有可见槽位分数均为 0（$m=0$），且 $W=128$ 只是取该模型的窗口大小作为构造取值、并非它的实际可见槽位总数；数值只用于说明量级，实际份额随 query 的分数分布变化。</li>
 <li>解析解用单头、4 维的构造张量，验证的是分母构成，不含真实头维、量化与数值稳定实现细节。</li>
 <li>论文的困惑度数字按原值登记（不同模型、不同数据集），本页不重跑实验，也不据此比较模型质量。</li>
 <li>本页不评估可学习汇聚点对模型质量的净影响；checkpoint 头只提供参数形状，未读取权重数值。</li>

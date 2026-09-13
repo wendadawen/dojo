@@ -67,7 +67,7 @@
 <p><b>主要依据</b>：Li et al. 2024, "EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty", arXiv:2401.15077, ICML 2024；Li et al. 2025, "EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test", arXiv:2503.01840, NeurIPS 2025；Kimi K3 Technical Report（<a href="https://arxiv.org/abs/2607.24653">arXiv:2607.24653</a>）§4.1.4 Draft Model Fine-Tuning。</p>
 </blockquote>
 
-<p>给一个 70B 模型用投机解码加速推理，draft 模型该是什么？传统答案是「找一个独立小语言模型」，比如用 LLaMA2-7B 给 LLaMA2-70B 打草稿。但小模型有两难：太弱（如 TinyLLaMA）难以贴近 target 分布、加速收益有限；太强（如 7B 给 70B 打草稿）draft 自身成本 $c$ 接近 target，加速比退化。EAGLE 论文给出更具体的原因 <sup>[C1]</sup>：7B draft 的高开销削弱加速收益，TinyLLaMA 则因指令模板不一致而不适合 instruct 模型。EAGLE 系列给出反直觉的答案：<strong>不训练独立小模型，直接复用 target 模型已经算出的隐藏状态作为 draft 输入</strong>。EAGLE-3 把这个思路推到极致：draft 只有单层 transformer decoder，复用 target 的低、中、高三层特征融合作为输入、直接预测 token 分布，并用 training-time test 训练让自己在多步预测中保持接受率不衰减。在 Vicuna 13B 上 EAGLE-3 比 vanilla decoding 快 5.6x。EAGLE-3 如何用单层 decoder 做到这一点？</p>
+<p>给一个 70B 模型用投机解码加速推理，draft 模型该是什么？传统答案是「找一个独立小语言模型」，比如用 LLaMA2-7B 给 LLaMA2-70B 打草稿。但小模型有两难：太弱（如 TinyLLaMA）难以贴近 target 分布、加速收益有限；太强（如 7B 给 70B 打草稿）draft 单步成本 $c$ 不可忽略，加速比退化。EAGLE 论文给出更具体的原因 <sup>[C1]</sup>：7B draft 的高开销削弱加速收益，TinyLLaMA 则因指令模板不一致而不适合 instruct 模型。EAGLE 系列给出反直觉的答案：<strong>不训练独立小模型，直接复用 target 模型已经算出的隐藏状态作为 draft 输入</strong>。EAGLE-3 把这个思路推到极致：draft 只有单层 transformer decoder，复用 target 的低、中、高三层特征融合作为输入、直接预测 token 分布，并用 training-time test 训练让自己在多步预测中保持接受率不衰减。在 Vicuna 13B 上 EAGLE-3 比 vanilla decoding 快 5.6x。EAGLE-3 如何用单层 decoder 做到这一点？</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -132,7 +132,7 @@
 
 <p>这里要澄清一个关键边界：<strong>EAGLE 系列只替换 draft 角色，不改变投机解码的接受/拒绝规则</strong>。draft-then-verify 流程、拒绝采样规则、残差分布、bonus token、lossless 性质都来自通用投机解码框架，见 <a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「Draft-then-Verify」与「为什么这条规则能保分布」两章。EAGLE-3 的输出分布仍与纯 target 采样完全相同 <sup>[C10]</sup>，只是用更小、更准的 draft 提高了 $\alpha$、从而提高了加速比。</p>
 
-<p>本章说明 EAGLE 的思路转向——「复用 target 隐藏状态」——但具体怎么复用？EAGLE-1 给出第一个答案：在 feature 空间做自回归。下一章讲 EAGLE-1 的具体机制。</p>
+<p>「复用 target 隐藏状态」只确立了方向，具体怎么复用由后续各代给出各自答案。EAGLE-1 选的第一个答案是在 feature 空间做自回归。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -194,9 +194,9 @@
   <figcaption class="diagram-caption">箭头为 EAGLE-1 draft 的前向数据流：draft 输出的是 feature（不是 token），必须再过 target 共享的 lm_head 才得到 token 分布并采样。</figcaption>
 </figure>
 
-<p>EAGLE-1 的 draft 输出是 feature（不是 token），再过 target 共享的 lm_head 才得到 token 分布 q、采样得到 draft token。这一点与 EAGLE-3 直接预测 token 是关键区别，下一章展开。EAGLE-1 在 LLaMA2-Chat 70B 上延迟加速 2.7x-3.5x、吞吐翻倍 <sup>[N1]</sup>，证明「复用 target feature」的思路有效。</p>
+<p>EAGLE-1 的 draft 输出是 feature（不是 token），再过 target 共享的 lm_head 才得到 token 分布 q、采样得到 draft token；这一输出空间上的选择与 EAGLE-3 直接预测 token 形成对比。EAGLE-1 在 LLaMA2-Chat 70B 上延迟加速 2.7x-3.5x、吞吐翻倍 <sup>[N1]</sup>，证明「复用 target feature」的思路有效。</p>
 
-<p>EAGLE-1 在 feature 空间做自回归有效，但 EAGLE-3 发现扩大训练数据对 EAGLE-1 提升有限——扩大数据看到的曲线在 EAGLE 上饱和。这个瓶颈源于「feature 回归任务占用了 draft 容量」。下一章讲 EAGLE-3 的两项架构改变如何突破这个瓶颈。</p>
+<p>EAGLE-1 在 feature 空间做自回归有效，但 EAGLE-3 发现扩大训练数据对 EAGLE-1 提升有限——扩大数据看到的曲线在 EAGLE 上饱和。这个瓶颈源于「feature 回归任务占用了 draft 容量」，突破它需要改动 draft 的架构本身。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -239,7 +239,7 @@
 
 $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
-<p>其中 $k$ 是 target 模型的 hidden size（特征维度），$l_t, m_t, h_t \in \mathbb{R}^k$ 分别是 target 在第 $t$ 个位置上 low/mid/high 三层 feature，$[\cdot;\cdot;\cdot]$ 是拼接得到 $3k$ 维向量，$W_{\text{fuse}} \in \mathbb{R}^{k \times 3k}$ 是无偏融合矩阵（K3 命名为 $W_{E3}$），$g_t \in \mathbb{R}^k$ 是融合后的 feature <sup>[F1]</sup>。论文指出融合低、中、高三层 feature 能捕捉不同层次的语义信息，融合后的 $g_t$ 比单层 top-layer feature 信息更丰富 <sup>[C3]</sup>。</p>
+<p>其中 $k$ 是 target 模型的 hidden size（特征维度），$l_t, m_t, h_t \in \mathbb{R}^k$ 分别是 target 在第 $t$ 个位置上 low/mid/high 三层 feature，$[\cdot;\cdot;\cdot]$ 是拼接得到 $3k$ 维向量，$W_{\text{fuse}} \in \mathbb{R}^{k \times 3k}$ 是融合矩阵（K3 实现为无偏矩阵 $W_{E3}$），$g_t \in \mathbb{R}^k$ 是融合后的 feature <sup>[F1]</sup>。论文指出融合低、中、高三层 feature 能捕捉不同层次的语义信息，融合后的 $g_t$ 比单层 top-layer feature 信息更丰富 <sup>[C3]</sup>。</p>
 
 <h3 id="arch-summary">3.3 架构总览</h3>
 
@@ -285,7 +285,7 @@ $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
 <p>EAGLE-3 在 Vicuna 13B 上比 vanilla decoding 快 5.6x、比 EAGLE-1 快 1.8x <sup>[N3]</sup>；最高加速 6.5x、相比 EAGLE-2 提升约 1.4x；在 SGLang 框架中 batch size 64 时吞吐提升 1.38x <sup>[N2]</sup>。这些数字是辅助参考，核心是两项架构改变让 draft 容量更聚焦于 token 预测、信息输入更全面。</p>
 
-<p>推理时单层 decoder 怎么自回归生成 $\gamma$ 个 token？为什么后续步骤要用自己的输出替代 target feature？下一章用构造示例手算走一遍。</p>
+<p>推理时单层 decoder 怎么自回归生成 $\gamma$ 个 token？为什么后续步骤要用自己的输出替代 target feature？后面的构造示例会把这三步逐步手算一遍。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -356,7 +356,7 @@ $$a_{t+1} = \text{DraftLayer}([g_{1:t};\, e_{t+1}]),\qquad q_1 = \mathrm{softmax
 
 <p><strong>为什么必须替代</strong>？新位置 $t+1$ 的 target feature $g_{t+1}$ 在 target 验证前不存在——target 的下一次前向就是要验证 draft 给出的 $x_{t+2}$ 等 token，验证时才能算出 $g_{t+1}$。draft 在生成期间无法访问 target 的未来计算结果，只能用自己的输出 $a_{t+1}$ 近似 $g_{t+1}$。</p>
 
-<p><strong>「自替代」引入噪声</strong>。$a_{t+1}$ 是 draft 单层 decoder 的输出，是 $g_{t+1}$ 的近似，与真实 $g_{t+1}$ 有偏差。这个偏差会随 draft 深度累积——第二步的输入已经包含一个近似 $a_{t+1}$，第三步又叠加 $a_{t+2}$ 的偏差，深度越大、噪声越显著。如果不专门训练，draft 在深度预测中接受率会快速衰减。这正是 EAGLE-3 引入 training-time test 的原因，下一章展开。</p>
+<p><strong>「自替代」引入噪声</strong>。$a_{t+1}$ 是 draft 单层 decoder 的输出，是 $g_{t+1}$ 的近似，与真实 $g_{t+1}$ 有偏差。这个偏差会随 draft 深度累积——第二步的输入已经包含一个近似 $a_{t+1}$，第三步又叠加 $a_{t+2}$ 的偏差，深度越大、噪声越显著。如果不专门训练，draft 在深度预测中接受率会快速衰减。这正是 EAGLE-3 引入 training-time test 要处理的问题。</p>
 
 <h3 id="worked-example">4.4 构造示例：prefix = "How can"、上一步采样 token = "I"，$\gamma=3$</h3>
 
@@ -383,7 +383,7 @@ $$a_{\text{I}} = \tanh([0.08, 0.45, 0.14, 0.13]) \approx [0.080,\, 0.422,\, 0.13
 
 $$q_1 \approx [0.155,\, 0.307,\, 0.174,\, 0.171,\, 0.194].$$
 
-<p>最大概率 $0.307$ 对应 "do"，贪心采样得 $x_1 = \text{do}$。</p>
+<p>最大概率 $0.307$ 对应 "do"，贪心采样得 $x_{t+2} = \text{do}$。</p>
 
 <p><strong>Step 2：用 $a_{\text{I}}$ 替代 $g_{\text{I}}$，输入 $(a_{\text{I}}, e_{\text{do}})$</strong>。$e_{\text{do}} = [0, 1, 0, 0]$。$W_a$ 作用于 $\text{concat}(a_{\text{I}}, e_{\text{do}}) = [0.080, 0.422, 0.139, 0.129,\, 0, 1, 0, 0]$ 得 $[0.092, 0.084, 0.329, 0.040]$，过 tanh 得</p>
 
@@ -393,13 +393,13 @@ $$a_{\text{do}} \approx [0.092,\, 0.084,\, 0.318,\, 0.040].$$
 
 $$q_2 \approx [0.180,\, 0.178,\, 0.283,\, 0.163,\, 0.196].$$
 
-<p>最大概率 $0.283$ 对应 "it"，贪心采样得 $x_2 = \text{it}$。</p>
+<p>最大概率 $0.283$ 对应 "it"，贪心采样得 $x_{t+3} = \text{it}$。</p>
 
 <p><strong>Step 3：用 $a_{\text{do}}$ 替代 $g_{\text{do}}$，输入 $(a_{\text{do}}, e_{\text{it}})$</strong>。$e_{\text{it}} = [0, 0, 1, 0]$。同理算得 $a_{\text{it}} \approx [0.026,\, 0.103,\, 0.022,\, 0.493]$，logits $[0.052,\, 0.207,\, 0.045,\, 0.985,\, 0.322]$，softmax 得</p>
 
 $$q_3 \approx [0.143,\, 0.166,\, 0.142,\, 0.363,\, 0.187].$$
 
-<p>最大概率 $0.363$ 对应 "now"，贪心采样得 $x_3 = \text{now}$。</p>
+<p>最大概率 $0.363$ 对应 "now"，贪心采样得 $x_{t+4} = \text{now}$。</p>
 
 <p>本轮产出 3 个 draft token：$[\text{do}, \text{it}, \text{now}]$。target 一次前向验证，按拒绝采样规则接受。</p>
 
@@ -477,7 +477,7 @@ Verify 阶段（一次 target 前向）：
 <p>关键行是 <code>g_seq ← g_seq + [a]</code>——下一步把本步的 draft 输出 $a$ 当作新位置的 $g$ 输入。这是「自替代」在伪代码中的体现。每轮的 target 前向次数始终为 1（验证阶段），draft 单层 decoder 调用 $\gamma$ 次。</p>
 </details>
 
-<p>推理时 draft 必须自替代、噪声会累积——训练时如何让 draft 在自替代噪声下仍输出有效分布？下一章讲 training-time test 与损失函数。</p>
+<p>推理时 draft 必须自替代、噪声会累积——训练时如何让 draft 在自替代噪声下仍输出有效分布？EAGLE-3 的对策是 training-time test 与配套的损失函数选择。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -616,7 +616,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 <p>对比 KL 散度 $\mathrm{KL}(p \| q) = \sum_x p(x) \log(p(x)/q(x))$：它对 $q(x)$ 在 $p(x)$ 小处的变化不敏感（因为权重 $p(x)$ 小），但 $\alpha = \sum_x \min(p, q)$ 对每个 token 的 $\min(p, q)$ 一视同仁——$p(x)$ 小处的 $q(x)$ 偏差也会直接降低 $\min(p, q)$。这就是 K3 选择 LK loss 而非 KL 的核心原因：直接对齐接受率定义，不通过分布距离代理。</p>
 </details>
 
-<p>K3 在生产级 MoE 模型上如何应用这套机制、边界在哪里？下一章给出工程实例与边界。</p>
+<p>K3 在生产级 MoE 模型上如何应用这套机制、边界在哪里？K3 报告的部署配置提供了一个可对照的工程实例。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -653,7 +653,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <h3 id="k3-feature-fusion">6.2 三层 feature 来源与 $W_{E3}$ 初始化</h3>
 
-<p>K3 的 draft 输入融合 target 的 low/mid/high feature，分别取自第 1、第 4、最后一个 AttnRes blocks 的输出 <sup>[C8]</sup>（AttnRes 是 K3 的注意力残差块，见 K3 报告 §2.2）。融合矩阵 $W_{E3}$ 初始化为 $[0\, 0\, I]$（列拼接的零矩阵、零矩阵、单位矩阵），使得初始 fused feature 等于 high-level feature $h_h$——这正是 MTP 层预训练时用的输入。这样初始化让 fine-tune 开始时 draft 的输入分布与预训练时一致，训练中 $W_{E3}$ 逐渐学到 incorporate low/mid feature <sup>[C8]</sup>。</p>
+<p>K3 的 draft 输入融合 target 的 low/mid/high feature，分别取自第 1、第 4、最后一个 AttnRes blocks 的输出 <sup>[C8]</sup>（AttnRes 是 K3 的注意力残差块，见 K3 报告 §2.2）。融合矩阵 $W_{E3}$ 初始化为 $[0\, 0\, I]$（列拼接的零矩阵、零矩阵、单位矩阵），使得初始 fused feature 等于 high-level feature $h_h$——这正是 MTP 层预训练时用的输入。这样初始化让 fine-tune 开始时 draft 的输入分布与预训练时一致，训练中 $W_{E3}$ 逐渐学到引入 low/mid feature <sup>[C8]</sup>。</p>
 
 <h3 id="k3-qat-config">6.3 QAT 配置：draft 与 target 共享</h3>
 
@@ -737,7 +737,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <p>[C9] K3 draft fine-tuning 沿用 QAT 配置：K3 报告（arXiv:2607.24653）§4.1.4 末段。原文「Draft fine-tuning follows the post-training QAT configuration (§ 4.1.4), with MoE expert weights in MXFP4 and their input activations in MXFP8, while non-expert modules remain in higher precision.」</p>
 
-<p>[C10] EAGLE 系列不改变投机解码框架、lossless：投机解码框架见 Leviathan et al. 2023 (arXiv:2211.17192) §3 Theorem 3.5（正确性证明另见附录 A.1 Correctness of Speculative Sampling）；EAGLE-1 摘要「maintaining the distribution of the generated text」；EAGLE-3 §4「EAGLE-3 does not modify the target model's weights and uses strict speculative sampling acceptance conditions, ensuring no loss in performance.」（在严格接受条件下的无性能损失结论；「lossless」一词见于 Hugging Face EAGLE 模型卡 README）；<a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「为什么这条规则能保分布」一章已证明。</p>
+<p>[C10] EAGLE 系列不改变投机解码框架、lossless：投机解码框架见 Leviathan et al. 2023 (arXiv:2211.17192) §3（接受率定义与拒绝采样算法），输出分布不变的正确性证明见附录 A.1 Correctness of Speculative Sampling；EAGLE-1 摘要「maintaining the distribution of the generated text」；EAGLE-3 §4「EAGLE-3 does not modify the target model's weights and uses strict speculative sampling acceptance conditions, ensuring no loss in performance.」（在严格接受条件下的无性能损失结论；「lossless」一词见于 Hugging Face EAGLE 模型卡 README）；<a href="../../wiki/speculative-decoding/index.html">投机解码</a> 的「为什么这条规则能保分布」一章已证明。</p>
 
 <h3>公式与来源（F）</h3>
 

@@ -102,10 +102,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Kimi K3 Technical Report §2.1.1（Eq.1–6, Fig.3）、§5.1；HuggingFace 官方 <code>moonshotai/Kimi-K3</code> 的 <code>config.json</code>（<code>linear_attn_config</code> 数值）。Kimi Linear 论文 [64] 用于对比。</p>
+<p><b>主要依据</b>：Kimi K3 Technical Report §2.1.1（Eq.1–6, Fig.3）、§5.1；HuggingFace 官方 <code>moonshotai/Kimi-K3</code> 的 <code>config.json</code>（<code>linear_attn_config</code> 数值）。Kimi Linear 论文 [63] 用于对比。</p>
 </blockquote>
 
-<p>把 Kimi K3 的上下文推到 1,048,576 个 token（1M），标准 softmax 单层单份 KV cache 就要约 48 GB。K3 的解法是 93 层里 69 层用 KDA（Kimi Delta Attention）——delta rule 加每通道遗忘门、并限定衰减下界的线性注意力变体——把序列混合压成固定大小状态更新；24 层用 Gated MLA 补全局内容交互。K3 相对直接前身 Kimi Linear 做了两处改动：scaled sigmoid 限定 log-decay 下界让 BF16 不溢出，full-rank output gate 替换 low-rank。本文回答：KDA 的递归长什么样，两处改动解决什么问题，以及 KDA 在 K3 中的配置与边界。</p>
+<p>把 Kimi K3 的上下文推到 1,048,576 个 token（1M），标准 softmax 单层单份 KV cache 就要约 48 GB。K3 的解法是 93 层里 69 层用 KDA（Kimi Delta Attention）——delta rule 加每通道遗忘门、并限定衰减下界的线性注意力变体——把序列混合压成固定大小状态更新；24 层用 Gated MLA 补全局内容交互。K3 的 KDA 相对其来源 Kimi Linear 做了两处改动：scaled sigmoid 限定 log-decay 下界让 BF16 不溢出，full-rank output gate 替换 low-rank。要回答的问题有三个：KDA 的递归长什么样，两处改动解决什么问题，以及 KDA 在 K3 中的配置与边界。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -169,7 +169,7 @@ $$N\ (\text{token}) \times \text{num\_heads} \times \text{head\_dim} \times 2\ (
 <p>$2^{20} \times 96 \times 128 \times 2 \times 2 = 2^{20} \times 96 \times 512 = 2^{20} \times 49{,}152 \approx 4.92 \times 10^{4} \times 2^{20}$。换算：$2^{30}$ bytes = 1 GB，所以约 $5.15 \times 10^{10} / 2^{30} \approx 48$ GB。注意这是单层单份的"理论上限"，真实 K3 用 MLA 压缩后小得多；这里只为展示 softmax 的 $O(N)$ KV 增长。</p>
 </details>
 
-<p>线性注意力换了一条路：把注意力写成核函数形式后，因果掩码下变成<strong>固定大小的递归状态</strong>，与序列长度无关。具体的核函数分解与结合律推导见<a href="../../wiki/linear-attention/index.html">线性注意力</a>页，本页直接用它的结论：单步更新 $s_i = s_{i-1} + \phi(k_i) v_i^\top$，状态 $s$ 的形状只由 $d$ 决定。K3 单头 KDA 的状态 $S \in \mathbb{R}^{128 \times 128}$ 只占 $128 \times 128 \times 2 \approx 32$ KB（BF16），单层 96 头合计约 3 MB，与 1M 无关。</p>
+<p>线性注意力换了一条路：把注意力写成核函数形式后，因果掩码下变成<strong>固定大小的递归状态</strong>，与序列长度无关。具体的核函数分解与结合律推导见<a href="../../wiki/linear-attention/index.html">线性注意力</a>页，这里直接引用该页结论：单步更新 $s_i = s_{i-1} + \phi(k_i) v_i^\top$，状态 $s$ 的形状只由 $d$ 决定。K3 单头 KDA 的状态 $S \in \mathbb{R}^{128 \times 128}$ 只占 $128 \times 128 \times 2 \approx 32$ KB（BF16），单层 96 头合计约 3 MB，与 1M 无关。</p>
 
 <p>但 vanilla 线性注意力是<strong>纯加性累加</strong>：$s_i = s_{i-1} + \phi(k_i) v_i^\top$，没有遗忘也没有擦除。当序列长度 $L$ 超过状态维度 $d$ 时，不同 token 的 key 投影到同一方向，新写入会覆盖旧值——这就是 key 碰撞，详见<a href="../../wiki/delta-rule/index.html">delta rule</a>页对"线性注意力为何记不清"的分析。DeltaNet 用"先擦后写"的 delta rule 解决了擦除，但它的遗忘只能靠擦除项 $I - \beta_t k_t k_t^\top$，没有显式的"时间衰减"——旧 token 不会被主动淡忘，只在被新 key 覆盖时才消失。</p>
 
@@ -206,7 +206,7 @@ $$N\ (\text{token}) \times \text{num\_heads} \times \text{head\_dim} \times 2\ (
   <p class="flow-note">K = KDA（69 层）　G = Gated MLA（24 层）　共 93 层。数据来自 config.json：kda_layers（69 项）+ full_attn_layers（24 项）。</p>
 </div>
 
-<p>这样 69 层 KDA 把"1M 序列的混合"压成 69 次固定大小状态更新，单层状态合计只有几 MB；24 层 Gated MLA 周期性地补一次全局内容交互。本文聚焦 KDA 的机制与 K3 的两处改动，Gated MLA、Attention Residuals、FlashKDA kernel 都不在本页展开。</p>
+<p>这样 69 层 KDA 把"1M 序列的混合"压成 69 次固定大小状态更新，单层状态合计只有几 MB；24 层 Gated MLA 周期性地补一次全局内容交互。Gated MLA、Attention Residuals 与 FlashKDA kernel 属于其它机制，不展开。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -249,7 +249,7 @@ $$\boxed{\,S_t = (I - \beta_t k_t k_t^\top)\,\mathrm{Diag}(\alpha_t)\,S_{t-1} + 
   <li>$I \in \mathbb{R}^{d_k \times d_k}$：单位矩阵。</li>
 </ul>
 
-<p><strong>约定提醒</strong>：<a href="../../wiki/delta-rule/index.html">delta rule</a>页用 DeltaNet 形式 $S_t \in \mathbb{R}^{d_v \times d_k}$（状态在左，读取式 $o_t = S_t q_t$），本页按 K3 报告约定用 $S_t \in \mathbb{R}^{d_k \times d_v}$（状态在右，$\tilde o = S^\top q$）。两者是 $S_{\text{K3}} = S_{\text{DeltaNet}}^\top$ 的转置，机制等价。引用前置页结论时不重讲擦除-写入的几何。</p>
+<p><strong>约定提醒</strong>：<a href="../../wiki/delta-rule/index.html">delta rule</a>页用 DeltaNet 形式 $S_t \in \mathbb{R}^{d_v \times d_k}$（状态在左，读取式 $o_t = S_t q_t$），按 K3 报告约定则用 $S_t \in \mathbb{R}^{d_k \times d_v}$（状态在右，$\tilde o = S^\top q$）。两者是 $S_{\text{K3}} = S_{\text{DeltaNet}}^\top$ 的转置，机制等价。引用前置页结论时不重讲擦除-写入的几何。</p>
 
 <p>公式分三步读，顺序由矩阵乘法的结合律决定：</p>
 
@@ -283,7 +283,7 @@ $$\boxed{\,S_t = (I - \beta_t k_t k_t^\top)\,\mathrm{Diag}(\alpha_t)\,S_{t-1} + 
   <li>$\beta_t$ 是<strong>标量</strong>：$\beta_t \in (0,1)$ 是一个数，控制本步擦多狠、写多深。</li>
 </ul>
 
-<p>构造示例。 取 4 维 key/value，$S_0 = 0$。第 1 步 $k_1 = (1,1,1,1)^\top / 2$（单位范数）、$v_1 = (2,2,2,2)^\top$、$\beta_1 = 1$。无旧状态可衰减，$S_1 = k_1 v_1^\top$：</p>
+<p>构造示例。取 4 维 key/value，$S_0 = 0$。第 1 步 $k_1 = (1,1,1,1)^\top / 2$（单位范数）、$v_1 = (2,2,2,2)^\top$、$\beta_1 = 1$。无旧状态可衰减，$S_1 = k_1 v_1^\top$：</p>
 
 $$S_1 = \frac{1}{2}\begin{pmatrix}2&2&2&2\\2&2&2&2\\2&2&2&2\\2&2&2&2\end{pmatrix} = \begin{pmatrix}1&1&1&1\\1&1&1&1\\1&1&1&1\\1&1&1&1\end{pmatrix}.$$
 
@@ -377,7 +377,7 @@ $$\boxed{\,g_t^h = g_{\min}\,\mathrm{Sigmoid}(e^{A_h}\,z_t^h) \in (g_{\min}, 0)^
 </table>
 </div>
 
-<p>构造示例。 取 $A_h = 0$、$z_t^h = 1$，算两种映射下的 $\alpha$：</p>
+<p>构造示例。取 $A_h = 0$、$z_t^h = 1$，算两种映射下的 $\alpha$：</p>
 
 <ul>
   <li>Kimi Linear：$\mathrm{Softplus}(1) = \ln(1 + e) \approx 1.313$；$g = -1 \times 1.313 = -1.313$；$\alpha = e^{-1.313} \approx 0.269$。</li>
@@ -482,7 +482,7 @@ $$z_t^h = W_\alpha^{\uparrow\downarrow} x_t + b_h^\alpha \in \mathbb{R}^{d_k}.$$
 </div>
 
 <ul>
-  <li><strong>ShortConv</strong>（<code>short_conv_kernel_size = 4</code>，<sup>[N5]</sup>）：对投影后的特征做 kernel=4 的短卷积，让 $k_t$ 带一点局部时序信息（最近 4 个 token 的加权）。这是 KDA 从 Kimi Linear<sup>[64]</sup> 继承的参数化步骤，相对原始 DeltaNet 增加了局部时序信息，让 key 不只看当前 token。</li>
+  <li><strong>ShortConv</strong>（<code>short_conv_kernel_size = 4</code>，<sup>[N5]</sup>）：对投影后的特征做 kernel=4 的短卷积，让 $k_t$ 带一点局部时序信息（最近 4 个 token 的加权）。这是 KDA 从 Kimi Linear<sup>[63]</sup> 继承的参数化步骤，相对原始 DeltaNet 增加了局部时序信息，让 key 不只看当前 token。</li>
   <li><strong>Swish</strong>（$x \cdot \mathrm{Sigmoid}(x)$）：非线性激活。q/k/v 都过 Swish，让投影后的向量带非线性。</li>
   <li><strong>L2Norm</strong>（仅 q/k）：把 $q_t, k_t$ 归一化到单位范数。这让 $I - \beta_t k_t k_t^\top$ 接近正交投影（与<a href="../../wiki/delta-rule/index.html">delta rule</a>页 $\|k\|=1$ 时的几何结论一致），擦除项数值稳定。v 不归一化，因为 v 是要写入的"内容"，幅度自由。</li>
   <li><strong>$\beta_t = \mathrm{Sigmoid}(W_\beta x_t)$</strong>：数据相关的写入强度标量。</li>
@@ -530,7 +530,7 @@ $$\boxed{\,y_t = W_o\left[\mathrm{Sigmoid}(W_g x_t) \odot \mathrm{RMSNorm}(\tild
 
 <h2 id="chunkwise-parallel">5. chunkwise 并行形式——chunk 内并行 + chunk 间递归</h2>
 
-<p>Eq.1 是串行的：要算 $S_t$ 必须先有 $S_{t-1}$。1M token 串行跑不动。KDA 借用 Kimi Linear<sup>[64]</sup>的 chunkwise 形式<sup>[C7]</sup>：把序列切成大小 $C$ 的 chunk，<strong>chunk 内并行 matmul，chunk 间递归传 $S$</strong>。本页只讲形式，UT 变换的完整推导 K3 报告指向 [64]。</p>
+<p>Eq.1 是串行的：要算 $S_t$ 必须先有 $S_{t-1}$。1M token 串行跑不动。KDA 借用 Kimi Linear<sup>[63]</sup>的 chunkwise 形式<sup>[C7]</sup>：把序列切成大小 $C$ 的 chunk，<strong>chunk 内并行 matmul，chunk 间递归传 $S$</strong>。这里只讲形式，UT 变换的完整推导见 Kimi Linear [63]。</p>
 
 <h3 id="cumulative-decay">5.1 累积衰减 $\Gamma$</h3>
 
@@ -540,7 +540,7 @@ $$\gamma_{i\to j}[t] := \prod_{r=i}^{j} \alpha_r[t],\qquad \Gamma_{1\to r}[t] :=
 
 <p>$\Gamma_{1\to r}$ 是 chunk $t$ 内从位置 1 到位置 $r$ 的累积留存因子。它是 $\alpha$ 的连乘，每个 $\alpha \in (e^{-5}, 1)$，所以 $\Gamma$ 单调递减。矩阵 $\Gamma[t] \in \mathbb{R}^{C \times d_k}$ 行向堆叠 $\Gamma_{1\to 1}, \ldots, \Gamma_{1\to C}$。</p>
 
-<p>构造示例。 在递归核心章 2 步示例的基础上扩展为一个 $C=3$ 的 chunk，新增第 3 步，取 $\alpha_1 = (1, 1, 1, 1)$（为便于手算取的理想值，表示第 1 步无衰减，真实 $\alpha < 1$）、$\alpha_2 = (0.5, 0.8, 0.9, 0.3)$、$\alpha_3 = (0.7, 0.6, 0.95, 0.4)$：</p>
+<p>构造示例。在递归核心章 2 步示例的基础上扩展为一个 $C=3$ 的 chunk，新增第 3 步，取 $\alpha_1 = (1, 1, 1, 1)$（为便于手算取的理想值，表示第 1 步无衰减，真实 $\alpha < 1$）、$\alpha_2 = (0.5, 0.8, 0.9, 0.3)$、$\alpha_3 = (0.7, 0.6, 0.95, 0.4)$：</p>
 
 <ul>
   <li>$\Gamma_{1\to 1} = \alpha_1 = (1, 1, 1, 1)$。</li>
@@ -562,7 +562,7 @@ $$O[t] = \underbrace{(\Gamma_{1\to C}[t]\odot Q[t])\,S[t]}_{\text{inter-chunk}} 
   <li>$Q[t], K[t] \in \mathbb{R}^{C \times d_k}$、$V[t] \in \mathbb{R}^{C \times d_v}$：chunk 内堆叠的 query/key/value。</li>
   <li>$\Gamma_{1\to C}[t] \in \mathbb{R}^{C \times d_k}$：每个位置 1 到 $r$ 的累积衰减。</li>
   <li>$A[t]$：intra-chunk attention 矩阵，$\mathrm{Tril}$ 保留对角及以下（因果掩码）。</li>
-  <li>$V_e[t]$：pseudo-value，由 UT 变换的 $U[t], W[t]$ 与 $S[t]$ 构造，来自 [64]。</li>
+  <li>$V_e[t]$：pseudo-value，由 UT 变换的 $U[t], W[t]$ 与 $S[t]$ 构造，来自 [63]。</li>
 </ul>
 
 <p>两项分工：</p>
@@ -597,7 +597,7 @@ $$O[t] = \underbrace{(\Gamma_{1\to C}[t]\odot Q[t])\,S[t]}_{\text{inter-chunk}} 
 
 <p>这就是 lower-bounded decay 章讲的 lower-bound 收益的具体位置：在 Eq.4 的 $K/\Gamma$ 这一步。K3 报告 Fig.3b 把它画成"Kimi Linear 对角 tile = position-pair path"vs"K3 对角 tile = Tensor Core path"。</p>
 
-<p>chunk 间仍然递归：每个 chunk 算完后把 $S[t]$ 传给下一个 chunk，$S[t+1]$ 依赖 $S[t]$。所以 KDA 是<strong>chunk 内并行 + chunk 间串行</strong>——比纯串行快 $C$ 倍，但仍有序列依赖。K3 的 FlashKDA kernel（§5.1.1）和 KCP（§5.1.2）专门处理这个串行依赖，本页不展开。</p>
+<p>chunk 间仍然递归：每个 chunk 算完后把 $S[t]$ 传给下一个 chunk，$S[t+1]$ 依赖 $S[t]$。所以 KDA 是<strong>chunk 内并行 + chunk 间串行</strong>——单 chunk 内 $C$ 个位置可并行计算，但 chunk 间仍存在串行依赖，整体加速受此限制。K3 的 FlashKDA kernel（§5.1.1）和 KCP（§5.1.2）专门处理这个串行依赖，不展开。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -660,8 +660,8 @@ $$O[t] = \underbrace{(\Gamma_{1\to C}[t]\odot Q[t])\,S[t]}_{\text{inter-chunk}} 
 
 <ul>
   <li><strong>全局内容交互</strong>：KDA 的固定状态只记"最近 + 位置敏感"的信息，不能让任意两个远距离 token 直接交互。这由 Gated MLA 负责（每 4 层一次全局注意力）。</li>
-  <li><strong>跨设备状态同步</strong>：KDA 的状态递归在多卡上需要 KCP（KDA Context Parallelism，§5.1.2）做 prefix scan + all-gather，本页不展开。</li>
-  <li><strong>kernel 调度</strong>：FlashKDA（§5.1.1）是 CUTLASS-based 的 chunkwise kernel，处理 intra-chunk 计算与 inter-chunk 状态传播的重叠，本页不展开。</li>
+  <li><strong>跨设备状态同步</strong>：KDA 的状态递归在多卡上需要 KCP（KDA Context Parallelism，§5.1.2）做 prefix scan + all-gather，不展开。</li>
+  <li><strong>kernel 调度</strong>：FlashKDA（§5.1.1）是 CUTLASS-based 的 chunkwise kernel，处理 intra-chunk 计算与 inter-chunk 状态传播的重叠，不展开。</li>
   <li><strong>Attention Residuals</strong>：K3 的深度方向残差（§2.2）是另一独立机制，与 KDA 的序列方向混合正交。</li>
 </ul>
 
@@ -701,7 +701,7 @@ $$O[t] = \underbrace{(\Gamma_{1\to C}[t]\odot Q[t])\,S[t]}_{\text{inter-chunk}} 
 <h3>论断与来源（C）</h3>
 
 <p><sup>[C1]</sup> KDA = delta rule + channel-wise forget gate + lower-bounded decay + full-rank output gate：Kimi K3 Technical Report §2.1.1，Eq.1、Eq.5、Eq.6，Fig.3。<br>
-<sup>[C2]</sup> forget gate 在 delta 更新前先衰减：K3 报告 §2.1.1 Eq.1，原文 <code>St = (I − βt kt kt⊤) Diag(αt)St−1 + βt kt vt⊤</code>。<br>
+<sup>[C2]</sup> forget gate 在 delta 更新前先衰减：K3 报告 §2.1.1 Eq.1，原文 $S_t = (I - \beta_t k_t k_t^\top)\,\mathrm{Diag}(\alpha_t) S_{t-1} + \beta_t k_t v_t^\top$。<br>
 <sup>[C3]</sup> K3 用 scaled sigmoid，$g \in (g_{\min}, 0)$，$g_{\min}=-5$：K3 报告 §2.1.1 Eq.5 与正文。<br>
 <sup>[C4]</sup> Kimi Linear 用 negative-softplus，$g \in (-\infty, 0)$：K3 报告 §2.1.1 Fig.3a 与正文。<br>
 <sup>[C5]</sup> lower-bound 使 16-token tile 的 $1/\Gamma < e^{80}$，对角 tile 用 Tensor Core：K3 报告 §2.1.1 正文与 Fig.3b。<br>
@@ -716,7 +716,7 @@ $$O[t] = \underbrace{(\Gamma_{1\to C}[t]\odot Q[t])\,S[t]}_{\text{inter-chunk}} 
 <p><sup>[F1]</sup> KDA 单头递归（Eq.1）：K3 报告 §2.1.1 Eq.1。<br>
 <sup>[F2]</sup> 参数化（Eq.2）：K3 报告 §2.1.1 Eq.2。<br>
 <sup>[F3]</sup> 累积衰减（Eq.3）：K3 报告 §2.1.1 Eq.3。<br>
-<sup>[F4]</sup> chunkwise 并行形式（Eq.4）：K3 报告 §2.1.1 Eq.4；UT 变换 $V_e = U - WS$ 来自 Kimi Linear [64]。<br>
+<sup>[F4]</sup> chunkwise 并行形式（Eq.4）：K3 报告 §2.1.1 Eq.4；UT 变换 $V_e = U - WS$ 来自 Kimi Linear [63]。<br>
 <sup>[F5]</sup> lower-bounded decay（Eq.5，K3 改）：K3 报告 §2.1.1 Eq.5 与 Fig.3a。<br>
 <sup>[F6]</sup> full-rank output gate（Eq.6）：K3 报告 §2.1.1 Eq.6。</p>
 
@@ -746,11 +746,11 @@ $$O[t] = \underbrace{(\Gamma_{1\to C}[t]\odot Q[t])\,S[t]}_{\text{inter-chunk}} 
 
 <p>(1) <strong>状态约定简化</strong>：按 K3 报告用 $S \in \mathbb{R}^{d_k \times d_v}$（状态在右），与 <a href="../../wiki/delta-rule/index.html">delta rule</a>页的 DeltaNet 形式（状态在左）是转置。可推出：与 K3 报告一致，便于对照原文。不可推出：引用前置页公式时需注意转置，不能直接代入。<br>
 (2) <strong>单头简化</strong>：所有公式默认单头，多头时加 $h$ 上标并按 head 独立参数化 $A_h, b_h^\alpha$。可推出：先讲清单头机制。不可推出：K3 实际有 96 个 head，多头并行与 head 间交互未展开。<br>
-(3) <strong>UT 变换未展开</strong>：Eq.4 的 $V_e = U - WS$ 直接引用 Kimi Linear [64] 的结论，不展开推导。可推出：chunkwise 形式的使用方法。不可推出：$U, W$ 的具体形式与 UT 变换的推导，需查 Kimi Linear 论文。<br>
+(3) <strong>UT 变换未展开</strong>：Eq.4 的 $V_e = U - WS$ 直接引用 Kimi Linear [63] 的结论，不展开推导。可推出：chunkwise 形式的使用方法。不可推出：$U, W$ 的具体形式与 UT 变换的推导，需查 Kimi Linear 论文。<br>
 (4) <strong>1M KV cache 估算简化</strong>：不区分 MLA 的 latent 压缩，只算标准 softmax 的原始体积。可推出：$O(N)$ 增长的量级感。不可推出：K3 实际 KV 体积——Gated MLA 压缩后小得多，估算值是上限。<br>
 (5) <strong>无伪代码与可运行代码</strong>：不提供伪代码与可运行代码，KDA 是模型层机制，chunkwise 形式本身已是算法描述。可推出：机制理解与公式对照。不可推出：工程实现——需要 flash-linear-attention、CUTLASS 等完整框架。</p>
 
-<p>本文从 KV cache 爆炸问题出发，拆解了 KDA 的三步递归（先衰减、再擦除、再写入），K3 的 lower-bounded decay（scaled sigmoid 把 $\alpha$ 钳在 $e^{-5}$），以及 chunkwise 并行形式（chunk 内并行 + chunk 间递归）。KDA 在 K3 中占 69 层，与 24 层 Gated MLA 按 3:1 交替，把 1M 序列的混合压成固定大小状态更新。核心权衡是用"不能彻底遗忘"换"BF16 安全 + Tensor Core 友好"。</p>
+<p>从 KV cache 爆炸问题出发，KDA 的机制可拆解为三步递归（先衰减、再擦除、再写入）、K3 的 lower-bounded decay（scaled sigmoid 把 $\alpha$ 钳在 $e^{-5}$）与 chunkwise 并行形式（chunk 内并行 + chunk 间递归）。KDA 在 K3 中占 69 层，与 24 层 Gated MLA 按 3:1 交替，把 1M 序列的混合压成固定大小状态更新。核心权衡是用"不能彻底遗忘"换"BF16 安全 + Tensor Core 友好"。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

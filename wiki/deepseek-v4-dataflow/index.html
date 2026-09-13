@@ -149,7 +149,7 @@
   <h3>整体结构：两种注意力逐层交替 + 四份残差流</h3>
   <ul>
     <li><b>沿序列</b>：61 层里 HCA（<code>compress_ratio=128</code>）与 CSA（<code>compress_ratio=4</code>）交替。<code>compress_ratios</code> 前 12 项为 <code>[128,128,4,128,4,128,4,128,4,128,4,128]</code>——第 0、1 层连续两层 HCA，此后严格奇偶交替，最终 HCA 31 层、CSA 30 层。只有 CSA 层带 Indexer，checkpoint 中恰好 30 层含 <code>attn.indexer.*</code>。</li>
-    <li><b>压缩不是池化</b>：每个压缩条目是 <code>wgate</code> 从隐藏状态算出的 softmax 权重对 <code>wkv</code> 结果的加权和，再加可学习位置偏置 <code>ape</code>。实测将其与均值池化对比，相对差异 0.76，确认权重是数据相关的。</li>
+    <li><b>压缩不是池化</b>：每个压缩条目是 <code>wgate</code> 从隐藏状态算出的 softmax 权重对 <code>wkv</code> 结果的加权和，再加可学习位置偏置 <code>ape</code>。实测将其与均值池化对比，压缩条目与均值池化输出的 RMS 相对差为 0.76，确认权重是数据相关的。</li>
     <li><b>沿深度</b>：mHC 把残差流从 1 份扩成 4 份。每个 Block 内 <code>hc_pre</code>/<code>hc_post</code> 各调用两次（attn 前后、ffn 前后）：<code>hc_pre</code> 把 4 份加权归约成 1 份送进子层，<code>hc_post</code> 把子层输出扩回 4 份并叠加经混合矩阵重排的旧残差。子层内部维度不受残差份数影响。</li>
     <li><b>沿宽度</b>：每层 384 个路由专家取 top-6，另有 1 个共享专家恒激活。共享专家与路由专家的分工见 <a href="../deepseek-moe/index.html">DeepSeek MoE</a>。路由专家占总参数 96.8%（1.547T / 1.599T），但每 token 只激活 6/384。</li>
   </ul>
@@ -171,7 +171,7 @@
 
   <h3>两种层共有的四个细节</h3>
   <ul>
-    <li><b>滑窗与压缩条目同处一个 softmax</b>：<code>model.py</code> 把窗口索引与压缩索引 <code>cat</code> 成一个 <code>topk_idxs</code> 再调用一次 <code>sparse_attn</code>。即两条分支不是各算一次注意力再融合，而是共享同一个归一化分母。实测把压缩索引拼进去后输出变化 1.57，确认其参与同一归一化。</li>
+    <li><b>滑窗与压缩条目同处一个 softmax</b>：<code>model.py</code> 把窗口索引与压缩索引 <code>cat</code> 成一个 <code>topk_idxs</code> 再调用一次 <code>sparse_attn</code>。即两条分支不是各算一次注意力再融合，而是共享同一个归一化分母。实测把压缩索引拼进去后，该层输出张量的 RMS 相对变化为 1.57，确认其参与同一归一化。</li>
     <li><b>Attention sink</b>：每头一个可学习标量，$\mathrm{Exp}(z'_h)$ 直接加进 softmax 分母。实测 sink 取 5 时注意力权重之和降到 0.26，即该头可以选择几乎不看任何 KV。</li>
     <li><b>输出侧反向 RoPE</b>：KV 条目同时充当 key 和 value，输出因此携带绝对位置相位；<code>apply_rotary_emb(o, freqs, inverse=True)</code> 用共轭旋转把它转回相对位置。实测正向再反向的误差为 2.4e-7，是精确逆变换。</li>
     <li><b>分组输出投影</b>：$128 \times 512 = 65536$ 维的输出按 <code>o_groups=16</code> 分 16 组，每组先降到 <code>o_lora_rank=1024</code>（<code>wo_a</code> [16384, 4096]）再合并投回（<code>wo_b</code> [7168, 16384]）。</li>
@@ -218,16 +218,17 @@
   <p>参数量未采用宣传口径，而是用 HTTP Range 请求读取全部 64 个 safetensors 的 JSON 文件头（每个约 260KB，未下载 864GB 权重本体），合并得到 145116 个张量后逐一累加（含 61 层主干与 1 层 MTP），FP4 权重按每字节两值折算逻辑参数数：</p>
   <table>
     <tr><th>组件</th><th>参数量</th><th>占比</th></tr>
-    <tr><td>路由专家（61 层）</td><td>1547.40 B</td><td>96.8%</td></tr>
-    <tr><td>注意力（61 层）</td><td>19.47 B</td><td>1.2%</td></tr>
-    <tr><td>共享专家（61 层）</td><td>4.03 B</td><td>0.3%</td></tr>
-    <tr><td>embedding</td><td>0.93 B</td><td>0.1%</td></tr>
-    <tr><td>lm_head</td><td>0.93 B</td><td>0.1%</td></tr>
-    <tr><td>MoE gate（61 层）</td><td>0.17 B</td><td>0.0%</td></tr>
-    <tr><td>mHC（61 层）</td><td>0.08 B</td><td>0.0%</td></tr>
-    <tr><td>MTP（1 层：路由专家 + 注意力 + 融合投影 + mHC）</td><td>25.84 B</td><td>1.6%</td></tr>
-    <tr><td><b>合计</b></td><td><b>1598.84 B = 1.599 T</b></td><td>官方宣称 1.6T</td></tr>
+    <tr><td>路由专家（61 层）</td><td>1547.396 B</td><td>96.8%</td></tr>
+    <tr><td>注意力（61 层）</td><td>19.465 B</td><td>1.2%</td></tr>
+    <tr><td>共享专家（61 层）</td><td>4.030 B</td><td>0.3%</td></tr>
+    <tr><td>embedding</td><td>0.927 B</td><td>0.1%</td></tr>
+    <tr><td>lm_head</td><td>0.927 B</td><td>0.1%</td></tr>
+    <tr><td>MoE gate（61 层）</td><td>0.168 B</td><td>0.0%</td></tr>
+    <tr><td>mHC（61 层）</td><td>0.084 B</td><td>0.0%</td></tr>
+    <tr><td>MTP（1 层：路由专家 + 共享专家 + 注意力 + 融合投影 + mHC）</td><td>25.840 B</td><td>1.6%</td></tr>
+    <tr><td><b>合计</b></td><td><b>1598.837 B = 1.599 T</b></td><td>官方宣称 1.6T</td></tr>
   </table>
+  <p style="color:var(--text-light);font-size:14px">分项参数量按逐张量实算值保留三位小数，逐项相加即得合计；占比列按一位小数取整，逐项相加为 100.1%，0.1% 的余差为显示取整所致。</p>
   <p>每 token 激活 = 61 层 $\times$ 6 个路由专家（24.18 B）+ 非专家部分（注意力 19.47 + 共享专家 4.03 + 嵌入 0.93 + 门控 0.17 + mHC 0.08 = 24.68 B，不含 lm_head）= 48.86 B，官方宣称 49B。</p>
   <div class="note">上述结论由本机实测得到；算子等价复现方式见本节开头，缩小配置为 4~6 层、dim 256。实测脚本与运行输出不随仓库分发，实测清单见 <code>research/measured.md</code>。</div>
 
@@ -476,7 +477,7 @@ overview: {
 
 // ---------- 视图:CSA 内部 ----------
 csa: {
-  title:'CSA 内部 (Compressed Sparse Attention, ratio=4)',
+  title:'CSA 内部 (Compressed Sparse Attention, ratio=4, prefill seqlen=512)',
   rankSep:50, nodeSep:24,
   legend:[['#556070','输入/归一'],['#3f6fd0','投影 Linear'],['#e0922f','压缩器'],['#16a085','Indexer'],['#c0392b','核心注意力']],
   nodes:{
@@ -489,9 +490,9 @@ csa: {
     wkv:  {label:'wkv\n7168 → 512', t:'lin', io:'[1,512,7168] -> [1,512,512]', f:'kv = x W^{KV}', d:'滑窗用的未压缩 KV。num_key_value_heads=1，即所有 128 个 query 头共享这唯一一个 KV 头（MQA）。真实权重 F8_E4M3 [512, 7168]。'},
     kvn:  {label:'kv_norm + RoPE\n+ FP8 模拟', t:'nrm', io:'[1,512,512]', f:'\\mathrm{RMSNorm}(kv)', d:'带权重 RMSNorm，后 64 维施加 RoPE，前 448 维按 block=64 做 FP8 量化再反量化（QAT 模拟）。这对应报告的混合存储：RoPE 维 BF16、其余维 FP8。'},
     comp: {label:'Compressor\nratio=4 重叠', t:'cmp', drill:'compressor', io:'[1,512,7168] -> [1,128,512]', f:'C^{\\mathrm{Comp}}', d:'压缩器。wkv/wgate 输出宽度翻倍(1024=2×512)以支持重叠压缩。真实权重 layers.2.attn.compressor.wkv.weight 为 BF16 [1024, 7168]，恰为 HCA 层的两倍。'},
-    idx:  {label:'Lightning Indexer\n→ top-1024', t:'idxr', drill:'indexer', io:'[1,512,7168] -> [1,512,1024]', f:'I_{t,s} = \\sum_h w_{t,h}\\mathrm{ReLU}(q^I_{t,h}\\cdot K^{\\mathrm{IComp}}_s)', d:'从压缩条目中选出 index_topk=1024 条。自带独立压缩器(index_head_dim=128)。打分是 ReLU 后按头加权求和，不是 softmax。'},
-    catidx:{label:'索引拼接\n128 + 1024', t:'nrm', io:'[1,512,128] ++ [1,512,1024] -> [1,512,1152]', f:'\\mathrm{cat}[\\text{win}, \\text{compress}]', d:'滑窗索引与 Indexer 选中的压缩索引拼成一个索引表。两者进入同一次 sparse_attn 调用，共享同一个 softmax 分母，而非各算一次再融合。'},
-    attn: {label:'sparse_attn\nMQA + sink', t:'core', io:'q[1,512,128,512], kv[1,640,512], idx[1,512,1152] -> [1,512,128,512]', f:'s_{h,i,j}=\\frac{\\mathrm{Exp}(z_{h,i,j})}{\\sum_k \\mathrm{Exp}(z_{h,i,k})+\\mathrm{Exp}(z_h\')}', d:'按索引 gather KV 后做 online softmax。attn_sink 为每头一个可学习标量(真实权重 F32 [128])，其 Exp 加进分母，使注意力权重之和可小于 1。索引为 -1 的位置完全不参与（实测差异为 0）。'},
+    idx:  {label:'Lightning Indexer\n→ top-k', t:'idxr', drill:'indexer', io:'[1,512,7168] -> [1,512,128]', f:'I_{t,s} = \\sum_h w_{t,h}\\mathrm{ReLU}(q^I_{t,h}\\cdot K^{\\mathrm{IComp}}_s)', d:'从压缩条目中选出 min(index_topk, seqlen/4) 条：本视图 prefill seqlen=512、压缩后 128 条，故取 128 条，上下文 ≥4096 时才取满 index_topk=1024。自带独立压缩器(index_head_dim=128)。打分是 ReLU 后按头加权求和，不是 softmax。'},
+    catidx:{label:'索引拼接\n128 + 128', t:'nrm', io:'[1,512,128] ++ [1,512,128] -> [1,512,256]', f:'\\mathrm{cat}[\\text{win}, \\text{compress}]', d:'滑窗索引与 Indexer 选中的压缩索引拼成一个索引表。两者进入同一次 sparse_attn 调用，共享同一个 softmax 分母，而非各算一次再融合。'},
+    attn: {label:'sparse_attn\nMQA + sink', t:'core', io:'q[1,512,128,512], kv[1,640,512], idx[1,512,256] -> [1,512,128,512]', f:'s_{h,i,j}=\\frac{\\mathrm{Exp}(z_{h,i,j})}{\\sum_k \\mathrm{Exp}(z_{h,i,k})+\\mathrm{Exp}(z_h\')}', d:'按索引 gather KV 后做 online softmax。attn_sink 为每头一个可学习标量(真实权重 F32 [128])，其 Exp 加进分母，使注意力权重之和可小于 1。索引为 -1 的位置完全不参与（实测差异为 0）。'},
     oinv: {label:'输出反向 RoPE\n位置 −t', t:'nrm', io:'o[..., -64:]', f:'\\mathrm{RoPE}_{-t}(o_{[-64:]})', d:'KV 同时充当 key 和 value，输出因此带绝对位置相位。用共轭旋转转回相对位置。实测正向再反向误差 2.4e-7，是精确逆变换。'},
     woa:  {label:'wo_a 分组\n16 组 → 1024', t:'lin', io:'[1,512,16,4096] -> [1,512,16,1024]', f:'o^{G\'}_{t,i} = o^G_{t,i} W^{O_a}_i', d:'o_groups=16。每组把 4096(=65536/16) 维降到 o_lora_rank=1024。真实权重 F8_E4M3 [16384, 4096]。'},
     wob:  {label:'wo_b\n16384 → 7168', t:'lin', io:'[1,512,16384] -> [1,512,7168]', f:'\\hat o_t = [o^{G\'}] W^{O_b}', d:'合并 16 组后投回 7168。真实权重 F8_E4M3 [7168, 16384]。分组设计把 65536→7168 的直接投影拆成两步，大幅降低开销。'},
@@ -500,7 +501,7 @@ csa: {
     ['x','wqa','7168'],['wqa','qn','1536'],['qn','wqb','1536'],['wqb','qrms','65536'],['qrms','qrope','128×512'],
     ['x','wkv','7168'],['wkv','kvn','512'],
     ['x','comp','7168'],['x','idx','7168'],['qn','idx','共享 qr'],['comp','idx','压缩条目'],
-    ['kvn','catidx','滑窗'],['idx','catidx','top-1024'],
+    ['kvn','catidx','滑窗'],['idx','catidx','top-128'],
     ['qrope','attn','q'],['catidx','attn','索引'],['comp','attn','压缩 KV'],
     ['attn','oinv','128×512'],['oinv','woa','分组'],['woa','wob','16×1024'],
   ],
@@ -518,7 +519,7 @@ hca: {
     comp: {label:'Compressor\nratio=128 不重叠', t:'cmp', drill:'compressor', io:'[1,512,7168] -> [1,4,512]', f:'C^{\\mathrm{Comp}}_i = \\sum_{j} S_j \\odot C_j', d:'压缩率 128、overlap=False，故 wkv/wgate 输出宽度就是 512（真实权重 BF16 [512, 7168]，是 CSA 层 [1024, 7168] 的一半）。softmax 在 128 个元素上归一化（实测宽度=128）。'},
     winidx:{label:'滑窗索引\n128', t:'nrm', io:'[1,512,128]', f:'\\text{window}', d:'get_window_topk_idxs 生成的环形缓冲索引，覆盖最近 128 个 token。'},
     cmpidx:{label:'压缩索引\n全部条目', t:'nrm', io:'[1,512,4]', f:'\\text{all compressed}', d:'get_compress_topk_idxs 直接给出全部合法压缩块索引——HCA 不做稀疏选择，无 Indexer。1M 上下文下为 8192 条。'},
-    attn: {label:'sparse_attn\nMQA + sink', t:'core', io:'kv[1,516,512], idx[1,512,132] -> [1,512,128,512]', f:'\\mathrm{softmax}\\!\\left(\\frac{qK^\\top}{\\sqrt{d}}\\right)V', d:'实测 seqlen=512、ratio=128 时候选集为 128+512/128=132，与手算一致。虽名为 sparse_attn，HCA 层里它承担的是「稠密于压缩条目」的注意力。'},
+    attn: {label:'sparse_attn\nMQA + sink', t:'core', io:'kv[1,516,512], idx[1,512,132] -> [1,512,128,512]', f:'s_{h,i,j}=\\frac{\\mathrm{Exp}(z_{h,i,j})}{\\sum_k \\mathrm{Exp}(z_{h,i,k})+\\mathrm{Exp}(z_h\')}', d:'实测 seqlen=512、ratio=128 时候选集为 128+512/128=132，与手算一致。虽名为 sparse_attn，HCA 层里它承担的是「稠密于压缩条目」的注意力。'},
     opath:{label:'输出路(同 CSA)\n反向RoPE→分组投影', t:'lin', io:'[1,512,128,512] -> [1,512,7168]', f:'\\hat o = \\mathrm{group}(\\mathrm{RoPE}_{-t}(o))', d:'反向 RoPE → wo_a 分 16 组降到 1024 → wo_b 投回 7168。与 CSA 层完全相同。'},
   },
   edges:[
@@ -537,7 +538,7 @@ compressor: {
   nodes:{
     x:    {label:'隐藏状态\n7168', t:'nrm', io:'[1,512,7168]', f:'H', d:'压缩器直接吃 block 的输入隐藏状态（fp32 计算，model.py 中 x = x.float()）。'},
     wkv:  {label:'wkv\n7168 → c·512', t:'lin', io:'[1,512,7168] -> [1,512,512 或 1024]', f:'C = H W^{KV}', d:'待压缩的 KV 内容。CSA(ratio=4) 时输出 1024（前半供重叠、后半供本块）；HCA(ratio=128) 时输出 512。'},
-    wg:   {label:'wgate\n7168 → c·512', t:'lin', io:'[1,512,7168] -> [1,512,512 或 1024]', f:'Z = H W^{Z}', d:'压缩权重的 logits。权重由内容算出，使压缩成为学习式而非池化。实测与均值池化的相对差异为 0.76。'},
+    wg:   {label:'wgate\n7168 → c·512', t:'lin', io:'[1,512,7168] -> [1,512,512 或 1024]', f:'Z = H W^{Z}', d:'压缩权重的 logits。权重由内容算出，使压缩成为学习式而非池化。实测压缩条目与均值池化输出的 RMS 相对差为 0.76。'},
     ape:  {label:'ape 位置偏置\n(ratio, c·512)', t:'agg', io:'CSA: [4,1024]  HCA: [128,512]', f:'B', d:'块内位置偏置，加在 logits 上。真实权重：layers.2.attn.compressor.ape 为 F32 [4,1024]（CSA），layers.0.attn.compressor.ape 为 F32 [128,512]（HCA）。'},
     ovl:  {label:'overlap_transform\n(仅 ratio=4)', t:'agg', io:'[b,s,4,1024] -> [b,s,8,512]', f:'[Z^a_{mi:m(i+1)}; Z^b_{m(i-1):mi}]', d:'重排为 2m 个来源：后 m 个取本块的后半维，前 m 个取上一块的前半维。相邻压缩条目因此共享来源，但序列长度仍只压到 1/m。实测 softmax 宽度为 8=2m。'},
     sm:   {label:'softmax\n沿来源维', t:'agg', io:'[b,s,2m 或 m,512]', f:'S = \\mathrm{Softmax}_{\\mathrm{row}}(Z + B)', d:'在 2m（CSA）或 m（HCA）个来源上归一化。padding 位置填 -inf，故不占权重。'},
@@ -613,7 +614,7 @@ mhc: {
     split:{label:'切分 4/4/16', t:'gt', io:'[1,512,24] -> pre[4], post[4], comb[16]', f:'[\\mathrm{pre}; \\mathrm{post}; \\mathrm{comb}]', d:'前 4 维给输入映射 A，中 4 维给输出映射 C，后 16 维给残差矩阵 B（4×4）。'},
     pre:  {label:'pre = σ(·)+ε\n[b,s,4]', t:'gt', io:'[1,512,4]', f:'A_l = \\sigma(\\tilde A_l)', d:'报告 Eq.6。实测取值落在 (0,1)+ε 内。用于把 4 份残差加权归约成 1 份。'},
     post: {label:'post = 2σ(·)\n[b,s,4]', t:'gt', io:'[1,512,4]', f:'C_l = 2\\sigma(\\tilde C_l)', d:'报告 Eq.7。实测取值落在 (0,2) 内。用于把子层输出分发回 4 份残差。'},
-    sink: {label:'Sinkhorn 20 轮\n[b,s,4,4]', t:'sk', io:'[1,512,4,4]', f:'M^{(t)} = \\mathcal{T}_r(\\mathcal{T}_c(M^{(t-1)}))', d:'softmax(-1)+ε → 列归一化 → 19 轮(行归一化→列归一化)。实测：列和精确为 1（1e-6，来自 hc_eps）；行和收敛慢，logits 尺度为 3 时 20 轮后仍偏离 3.5e-2，需约 231 轮才到 1e-3。尺度 $\le 0.1$ 时 20 轮已足够。'},
+    sink: {label:'Sinkhorn 20 轮\n[b,s,4,4]', t:'sk', io:'[1,512,4,4]', f:'M^{(t)} = \\mathcal{T}_c(\\mathcal{T}_r(M^{(t-1)}))', d:'官方 kernel 的迭代顺序：softmax(-1)+ε → 列归一化 → 19 轮(行归一化→列归一化)，每轮最后一步是列归一化，故列和精确为 1。报告式(8)把该复合写成 𝒯_r∘𝒯_c(M)（末步为行归一化），与 kernel 顺序相反。实测：列和精确为 1（1e-6，来自 hc_eps）；行和收敛慢，logits 尺度为 3 时 20 轮后仍偏离 3.5e-2，需约 231 轮才到 1e-3。尺度 $\le 0.1$ 时 20 轮已足够。'},
     reduce:{label:'hc_pre 归约\n4×7168 → 7168', t:'nrm', io:'[1,512,4,7168] -> [1,512,7168]', f:'y = \\sum_j \\mathrm{pre}_j x_j', d:'加权求和成单份，送进 attn_norm/ffn_norm 再进子层。子层内部完全不感知残差份数。'},
     sub:  {label:'子层\nattn 或 ffn', t:'core', io:'[1,512,7168] -> [1,512,7168]', f:'\\mathcal{F}_l(A_l X_l)', d:'注意力或 MoE FFN。输入输出都是 7168 维，与残差宽度解耦。'},
     expand:{label:'hc_post 扩展\n→ [b,s,4,7168]', t:'nrm', io:'-> [1,512,4,7168]', f:'X_{l+1} = \\mathrm{post}\\otimes \\mathcal{F} + \\sum_j \\mathrm{comb}_{ij} x_j', d:'子层输出按 post 分发到 4 份，再叠加经 comb 重排的旧残差。实测双随机 comb 的混合使 L2 范数比值为 0.83（压缩映射）；若只做行归一化，列和会散到 [0, 2.62]，部分通道被反复放大。'},
