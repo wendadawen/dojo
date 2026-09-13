@@ -512,7 +512,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
       <tr><td class="num">40</td><td class="num">4.8e-04</td><td class="num">1.0e-06</td></tr>
     </table>
 
-    <p>把 <code>hc_mult</code> 设为 1 并让 <code>fn</code> 输出 0，$post$ 变成 $2\sigma(0)=1$、$comb$ 变成 $1\times1$ 矩阵，回写式退化为 $h+f(h)$，实测与普通残差的差距是 $3.8\times10^{-6}$，量级由 <code>hc_eps</code> 决定<sup>[N5]</sup>。也就是说普通残差是这套机制的一个特例。</p>
+    <p>把 <code>hc_mult</code> 设为 1 并让 <code>fn</code> 输出 0，$post$ 变成 $2\sigma(0)=1$、$comb$ 退化成 $1\times1$ 矩阵，回写结构因此变为 $h+y$（$y$ 为子层输出）这种普通残差形式。实测 $3.8\times10^{-6}$ 这个数度量的是 $comb$ 与单位阵之差经 $h$ 放大后的结果（$1-comb\approx9.5\times10^{-7}$，量级由 <code>hc_eps</code> 决定），而不是该构造与 $h+f(h)$ 之差<sup>[N5]</sup>。该构造下的预压缩系数是 $pre=\sigma(0)+hc\_eps\approx0.5$ 而非 1，子层输入被减半，与普通残差的 $h+f(h)$ 并不相等——要使子层输入恰为 $h$，需另行把 $pre$ 置 1。普通残差是这套机制在回写结构上的特例。</p>
 
     <div class="callout">
       <p>代价在激活显存：主干隐藏状态张量放大 4 倍，每 token 从 4096 个元素变成 16384 个。参数代价则很小——全模型两个站点共 45 层合计 35.39 M，占 321.32 B 的 0.011%<sup>[N6]</sup>。</p>
@@ -612,7 +612,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
     <p>$$S_t = \mathrm{diag}(e^{g_t})\,S_{t-1},\qquad \delta_t = \beta_t\bigl(v_t - S_t^{\top}\hat{k}_t\bigr)$$</p>
     <p>$$S_t \leftarrow S_t + \hat{k}_t\,\delta_t^{\top},\qquad o_t = S_t^{\top}\hat{q}_t$$</p>
 
-    <p>其中 $t = 1,\dots,S$ 逐 token 推进，初值 $S_0 = 0$；下面各式对每个头独立成立。</p>
+    <p>其中 $t = 1,\dots,L$ 逐 token 推进，初值 $S_0 = 0$；各式对每个头独立成立。</p>
 
     <ul>
       <li>$S_t\in\mathbb{R}^{128\times128}$：该头在第 $t$ 步的状态矩阵，逐头独立</li>
@@ -851,7 +851,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
       <figcaption>MoE 层。共享专家走的是<strong>原始输入</strong>而非路由后的结果，两路相加构成层输出；实测拆分两路后相加与官方输出误差为 0<sup>[F2]</sup>。</figcaption>
     </figure>
 
-    <p>专家内部的 <a href="../swiglu/index.html">SwiGLU</a> 带一个容易被忽略的细节：<code>swiglu_limit = 10.0</code> 的截断是<strong>不对称</strong>的。gate 只截上界（$\min$ 侧为 <code>None</code>），up 双侧截断。实测输入 $[-50, -10, 0, 5, 10, 50]$ 时，gate 得到 $[-50,-10,0,5,10,10]$，而 up 得到 $[-10,-10,0,5,10,10]$<sup>[F2]</sup>。gate 负半轴不截是因为 SiLU 在负半轴本就趋于 0，不会溢出。</p>
+    <p>专家内部的 <a href="../swiglu/index.html">SwiGLU</a> 在 <code>swiglu_limit = 10.0</code> 下的截断是<strong>不对称</strong>的。gate 只截上界（$\min$ 侧为 <code>None</code>），up 双侧截断。实测输入 $[-50, -10, 0, 5, 10, 50]$ 时，gate 得到 $[-50,-10,0,5,10,10]$，而 up 得到 $[-10,-10,0,5,10,10]$<sup>[F2]</sup>。gate 负半轴不截是因为 SiLU 在负半轴本就趋于 0，不会溢出。</p>
 
     <h3>每 token 激活量的构成</h3>
 
@@ -885,7 +885,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
     <p>那么顺序信息由什么携带？可确认的是两条：KDA 层的状态按 $e^{g_t}$ 逐 token 衰减，天然带先后；KDA 层的深度卷积（kernel 4）提供局部相对位置。DSA 层本身位置无关，依赖上游 KDA 层已注入的信息。</p>
 
     <div class="callout">
-      <p>由此可以<strong>推断</strong>（本页标注为推断，非官方声称）：KDA 层承担了位置编码的职责，这构成对层排布的约束——第 0 层必须是 KDA，且 DSA 层不能连续出现。实际排布（每 4 层中前 3 层 KDA）满足这两点。该推断未在官方材料中找到对应表述。</p>
+      <p>由此可以<strong>推断</strong>（此处标注为推断，非官方声称）：KDA 层承担了位置编码的职责，这构成对层排布的约束——第 0 层必须是 KDA，且 DSA 层不能连续出现。实际排布（每 4 层中前 3 层 KDA）满足这两点。该推断未在官方材料中找到对应表述。</p>
     </div>
 
     <p>视觉塔另有独立的二维 RoPE（<code>Glm5NextVisionRotaryEmbedding</code>，$\theta=10000$，按 patch 的高宽位置施加），与文本主干无关。</p>
@@ -912,11 +912,11 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
     <p>节省比例随长度上升并趋近 $1-11/45 = 75.6\%$ 的上限：长度越大，KDA 的常数开销越被摊薄。令两侧相等可解出交叉点 $S = 142.38\ \mathrm{MiB} / (34\times769\times2\ \mathrm{B}) \approx 2855$ token —— 短于此长度时 KDA 的常数状态还没摊平，混合架构反而占用更多。$S=4096$ 已越过该点，故表中首行已经是净节省。</p>
 
     <div class="callout">
-      <p>这里有一个容易漏掉的项：把 DSA 侧只按 MLA 潜向量的 512 维计算，会漏掉 indexer 的 257 维打分状态，交叉点被高估为 4288 token，$S=4096$ 那行也会从「节省 22.89%」错算成「多占 3.54%」，结论方向相反。稀疏注意力的显存账必须把选择机制自身的状态计入<sup>[N10]</sup>。</p>
+      <p>DSA 侧的显存账要计入 indexer 的 257 维打分状态：只按 MLA 潜向量的 512 维计算，交叉点会被高估为 4288 token，$S=4096$ 那行也会从「节省 22.89%」错算成「多占 3.54%」，结论方向相反。稀疏注意力的显存必须把选择机制自身的状态计入<sup>[N10]</sup>。</p>
     </div>
 
     <div class="callout">
-      <p>上表的 MLA 部分按<strong>潜向量</strong>口径算（每 token 每层 512 维），这是推理框架的做法。官方 transformers 实现走的是另一条路：先 <code>expand_kv</code> 展开成 64 个头再 cache，实测缓存形状为 $[B,64,S,256]$，每 token 每层 32768 个元素即 64 KiB，是潜向量口径的 64 倍<sup>[N11]</sup>。两个口径差 64 倍，本页长上下文数字用前者；transformers 的展开口径不代表实际部署时的显存占用。</p>
+      <p>上表的 MLA 部分按<strong>潜向量</strong>口径算（每 token 每层 512 维），这是推理框架的做法。官方 transformers 实现走的是另一条路：先 <code>expand_kv</code> 展开成 64 个头再 cache，实测缓存形状为 $[B,64,S,256]$，每 token 每层 32768 个元素即 64 KiB，是潜向量口径的 64 倍<sup>[N11]</sup>。两个口径差 64 倍，长上下文数字取潜向量口径；transformers 的展开口径不代表实际部署时的显存占用。</p>
     </div>
 
     <h2 id="quant">10. FP8 量化的覆盖范围</h2>
@@ -953,7 +953,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
       <tr><td class="num">视频，$T=4$</td><td class="num">$4\times32\times32$</td><td class="num">4,096</td><td class="num">1,024</td><td class="num">—</td></tr>
     </table>
 
-    <p>视频走的是同一个换算式，只是 $T$ 大于 1；<code>get_video_features</code> 先把 $[T,H_p,W_p]$ 展平成 $T$ 个 $[1,H_p,W_p]$ 再送进视觉塔。需要注意<strong>输入帧数与 grid 的 $T$ 不是同一个量</strong>：<code>temporal_patch_size</code> 为 2，且帧到 grid 的换算发生在 processor 而非模型代码里，本页的可核对来源不含该逻辑，因此上表末行以 grid 的 $T$ 为输入，不换算帧数<sup>[N3]</sup>。</p>
+    <p>视频走的是同一个换算式，只是 $T$ 大于 1；<code>get_video_features</code> 先把 $[T,H_p,W_p]$ 展平成 $T$ 个 $[1,H_p,W_p]$ 再送进视觉塔。<strong>输入帧数与 grid 的 $T$ 不是同一个量</strong>：<code>temporal_patch_size</code> 为 2，且帧到 grid 的换算发生在 processor 而非模型代码里，可核对的来源不含该逻辑，因此上表末行以 grid 的 $T$ 为输入，不换算帧数<sup>[N3]</sup>。</p>
 
     <p>与多数视觉语言模型不同的一点：图像与视频<strong>共用同一个 token id</strong>。配置里虽有 <code>video_token_id = 154855</code>，但掩码判定路径并不使用它，而是靠视频起止标记划出区间：</p>
 
@@ -966,7 +966,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
 
     <p>checkpoint 有 46 个层号，第 45 层是多 token 预测层（供<a href="../speculative-decoding/index.html">投机解码</a>使用），7.43 B 参数。transformers 实现把它显式忽略（<code>_keys_to_ignore_on_load_unexpected</code> 含 <code>layers\.45\.</code>），只构建 45 层主干；MTP 由推理框架单独加载。</p>
 
-    <p>它与主干层有三处结构差异。张量清单能确认的是模块的存在与形状，模块用途按 DeepSeek-V3 系 MTP 的公开做法解读，本页标注为推断<sup>[C5]</sup>：</p>
+    <p>它与主干层有三处结构差异。张量清单能确认的是模块的存在与形状，模块用途按 DeepSeek-V3 系 MTP 的公开做法解读，此处标注为推断<sup>[C5]</sup>：</p>
 
     <ul>
       <li><strong>是 DSA 类型而非 KDA</strong>：带 <code>kv_a_proj_with_mqa</code> 与完整 indexer，不带 KDA 的卷积与遗忘门张量</li>
@@ -974,11 +974,11 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
       <li><strong>独有三个模块</strong>：<code>enorm</code>、<code>hnorm</code> 与 <code>eh_proj</code>（形状 $[4096, 8192]$）。8192 是 $2\times4096$，即把「上一步隐藏态」与「下一 token 嵌入」拼接后投影回 4096，这是 DeepSeek-V3 系 MTP 的标准做法；另有 <code>shared_head.norm</code></li>
     </ul>
 
-    <p>它同样带完整的 288 专家 MoE。配置里还有一个 <code>index_share_for_mtp_iteration: true</code>，字面指向「投机解码的多次迭代之间复用 indexer 的选择」，但 transformers 的源码里搜不到这个键，它不被该实现消费<sup>[C6]</sup>；具体语义需要看推理框架的实现，本页不下结论。</p>
+    <p>它同样带完整的 288 专家 MoE。配置里还有一个 <code>index_share_for_mtp_iteration: true</code>，字面指向「投机解码的多次迭代之间复用 indexer 的选择」，但 transformers 的源码里搜不到这个键，它不被该实现消费<sup>[C6]</sup>；具体语义需要看推理框架的实现，不在讨论范围。</p>
 
     <h2 id="verify">13. 核对方式</h2>
 
-    <p>本页数字的来源分三层，脚本与原始输出都在 <code>research/</code> 下。</p>
+    <p>数字的来源分三层：结构与形状取自真实 checkpoint 张量头，公式与数据流取自官方源码的实跑，外部数字取自官方配置、README 与技术报告。实测脚本与运行输出不随仓库分发（清单见 <code>research/measured.md</code>），正文引用实测结论处均写「实测得到」。</p>
 
     <h3>结构与形状：真实 checkpoint 张量头</h3>
 
@@ -992,69 +992,67 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
 
     <p>在此基础上用真实 config 的维度喂小随机张量：单个 KDA 层与 DSA 层用完整真实维度（隐藏 4096、64 头、128/256 维），端到端前向缩到 8 层、16 专家但保留全部结构特征（4 层一循环的类型交替、前 3 层 dense、4 路残差流），跑通 prefill 加 4 步 decode，全程无 NaN 或 Inf。</p>
 
-    <h3>两处容易想错的机制</h3>
-
-    <p>以下两处机制的常见推断与实现不符，实测结论如下：</p>
+    <h3>两处机制的实测结论</h3>
 
     <ul>
       <li><strong>Sinkhorn 的收敛程度</strong>：20 次迭代并不足以让 <code>comb</code> 达到机器精度意义上的双随机。行和偏差 $1.0\times10^{-2}$，比列和的 $1.1\times10^{-6}$ 差四个数量级，只能称「近似」。方向性原因是迭代序末尾为列归一化。</li>
       <li><strong>「总是选尾巴」的含义</strong>：不是「末尾 token 必被选中」，而是「附上当前不完整的池」。尾巴长度为 $\text{可见数} \bmod 4$，可见数为 4 的倍数时尾巴为空。在把 <code>index_topk</code> 缩到 16、$S=64$ 的构造下（真实预算 2048 时 $S=64$ 全部可见，观察不到稀疏），第 63 个 query 的选中集恰好不含下标 63。</li>
     </ul>
 
-    <p>此外，复现 mHC 时若只初始化维度 $\ge 2$ 的参数，一维的 <code>base</code> 与 <code>scale</code>（源码用 <code>torch.empty</code> 创建）会保留未初始化内存，4 路残差流将不产生分化。按官方 <code>_init_weights</code> 初始化全部参数是复现该机制的前提。</p>
+    <p>官方 <code>_init_weights</code> 对 <code>base</code> 与 <code>scale</code> 分别零初始化与置 1，<code>fn</code> 取 $\mathcal{N}(0, 0.02)$；4 路分化依赖该初始化——<code>base</code> 与 <code>scale</code> 在源码中用 <code>torch.empty</code> 创建，不按此初始化则保留未初始化内存，4 路残差流不产生分化。</p>
 
     <h2 id="sources">来源与范围说明</h2>
 
     <h3>论断与来源（C）</h3>
     <ol class="src">
-      <li id="c1"><strong>[C1]</strong> 45 层中第 $3,7,11,\dots,43$ 层为 DSA、其余 34 层为 KDA。来源：<code>config.json</code> 的 <code>text_config.layer_types</code>；交叉验证：checkpoint 中 34 个层带 <code>self_attn.q_conv1d.weight</code>、11 个层带 <code>self_attn.kv_a_proj_with_mqa.weight</code>，层号与数组逐项一致（<code>verify_structure.out</code> 项 [3][4]）。</li>
+      <li id="c1"><strong>[C1]</strong> 45 层中第 $3,7,11,\dots,43$ 层为 DSA、其余 34 层为 KDA。来源：<code>config.json</code> 的 <code>text_config.layer_types</code>；交叉验证：checkpoint 中 34 个层带 <code>self_attn.q_conv1d.weight</code>、11 个层带 <code>self_attn.kv_a_proj_with_mqa.weight</code>，层号与数组逐项一致（实测得到）。</li>
       <li id="c2"><strong>[C2]</strong> 文本主干无位置编码。来源：<code>config.json</code> 中 <code>qk_rope_head_dim: 0</code>；<code>configuration_glm5_next.py</code> 的 <code>validate_architecture()</code> 在该值大于 0 时抛出「Expecting NoPE for the DSA attention layers」；<code>modeling_glm5_next.py</code> 主干 forward 传 <code>position_embeddings=None</code>。这三条互不依赖，均不依赖惰性键 <code>mla_use_nope</code>。</li>
-      <li id="c3"><strong>[C3]</strong> FP8 块量化只覆盖大矩阵乘，KDA 路径与 indexer 全程高精度。来源：<code>config.json</code> 的 <code>quantization_config</code>；<code>modeling_glm5_next.py</code> 的 <code>_keep_in_fp32_modules_strict = ["e_score_correction_bias", "conv1d", "dt_bias", "A_log"]</code>；实测见 <code>p7.out</code> 节 7.2、7.3（37,338 个 scale 全部符合分块形状，KDA 层被量化的投影张量数为 0）。</li>
-      <li id="c4"><strong>[C4]</strong> 跨层 top-k 共享机制存在但本 checkpoint 未启用。来源：<code>config.json</code> 的 <code>indexer_types</code> 45 项全为 <code>full</code>；源码中 <code>skip_topk = config.indexer_types[layer_idx] == "shared"</code> 决定是否创建 indexer，<code>shared</code> 层改用上层传入的 <code>prev_topk_indices</code>。实测见 <code>p2.out</code> 节 2.7。</li>
-      <li id="c5"><strong>[C5]</strong> MTP 层是 DSA 类型、不使用 mHC、独有 <code>enorm</code>/<code>hnorm</code>/<code>eh_proj</code>/<code>shared_head</code>。来源：checkpoint 第 45 层张量清单与第 44 层的差集（<code>p7.out</code> 节 7.5）；transformers 忽略该层见源码 <code>_keys_to_ignore_on_load_unexpected</code>。</li>
-      <li id="c6"><strong>[C6]</strong> 部分 config 键不被 transformers 实现消费（惰性键）。核对方式：在 <code>modeling_glm5_next.py</code> 与 <code>configuration_glm5_next.py</code> 中检索键名，命中数为 0 的有 <code>mla_use_nope</code>、<code>first_k_dense_replace</code>、<code>mhc</code>、<code>scoring_func</code>、<code>topk_method</code>、<code>indexer_rope_interleave</code>、<code>index_share_for_mtp_iteration</code>、<code>num_nextn_predict_layers</code>、<code>moe_router_dtype</code>。其中一部分的字面含义与实现一致（如 <code>scoring_func: sigmoid</code> 对应源码的 <code>.sigmoid()</code>），但那是<strong>硬编码的行为，不是被读取的开关</strong>；另一部分（如 <code>indexer_rope_interleave</code>，在 <code>qk_rope_head_dim=0</code> 下无对应实现）则无法从该实现确认其语义。两类都不能单独作为论断依据。本页凡引用这类键处均已标注，实际依据取自源码。</li>
+      <li id="c3"><strong>[C3]</strong> FP8 块量化只覆盖大矩阵乘，KDA 路径与 indexer 全程高精度。来源：<code>config.json</code> 的 <code>quantization_config</code>；<code>modeling_glm5_next.py</code> 的 <code>_keep_in_fp32_modules_strict = ["e_score_correction_bias", "conv1d", "dt_bias", "A_log"]</code>；实测得到：37,338 个 scale 全部符合分块形状，KDA 层被量化的投影张量数为 0。</li>
+      <li id="c4"><strong>[C4]</strong> 跨层 top-k 共享机制存在但本 checkpoint 未启用。来源：<code>config.json</code> 的 <code>indexer_types</code> 45 项全为 <code>full</code>；源码中 <code>skip_topk = config.indexer_types[layer_idx] == "shared"</code> 决定是否创建 indexer，<code>shared</code> 层改用上层传入的 <code>prev_topk_indices</code>。实测得到：45 项 <code>indexer_types</code> 全为 <code>full</code>，无 <code>shared</code> 层。</li>
+      <li id="c5"><strong>[C5]</strong> MTP 层是 DSA 类型、不使用 mHC、独有 <code>enorm</code>/<code>hnorm</code>/<code>eh_proj</code>/<code>shared_head</code>。来源：checkpoint 第 45 层张量清单与第 44 层的差集（实测得到）；transformers 忽略该层见源码 <code>_keys_to_ignore_on_load_unexpected</code>。</li>
+      <li id="c6"><strong>[C6]</strong> 部分 config 键不被 transformers 实现消费（惰性键）。核对方式：在 <code>modeling_glm5_next.py</code> 与 <code>configuration_glm5_next.py</code> 中检索键名，命中数为 0 的有 <code>mla_use_nope</code>、<code>first_k_dense_replace</code>、<code>mhc</code>、<code>scoring_func</code>、<code>topk_method</code>、<code>indexer_rope_interleave</code>、<code>index_share_for_mtp_iteration</code>、<code>num_nextn_predict_layers</code>、<code>moe_router_dtype</code>。其中一部分的字面含义与实现一致（如 <code>scoring_func: sigmoid</code> 对应源码的 <code>.sigmoid()</code>），但那是<strong>硬编码的行为，不是被读取的开关</strong>；另一部分（如 <code>indexer_rope_interleave</code>，在 <code>qk_rope_head_dim=0</code> 下无对应实现）则无法从该实现确认其语义。两类都不能单独作为论断依据。凡引用这类键处均已标注，实际依据取自源码。</li>
     </ol>
 
     <h3>公式与来源（F）</h3>
     <ol class="src">
-      <li id="f1"><strong>[F1]</strong> KDA 的 delta rule 递推、遗忘门 safe 分支公式、chunk 与 recurrent 两实现的等价性。来源：<code>modeling_glm5_next.py</code> 中 <code>recurrent_kimi_delta_attention</code>、<code>chunk_kimi_delta_attention</code>、<code>Glm5NextTextForgetGate.forward</code>。核对方式：按公式独立重写一遍与官方 kernel 逐元素比对，最大绝对误差 0；两实现在 $S\in\{1,7,64,65,130\}$ 上误差 $\le 8.9\times10^{-7}$。实测见 <code>p1.out</code> 节 1.3–1.5。</li>
+      <li id="f1"><strong>[F1]</strong> KDA 的 delta rule 递推、遗忘门 safe 分支公式、chunk 与 recurrent 两实现的等价性。来源：<code>modeling_glm5_next.py</code> 中 <code>recurrent_kimi_delta_attention</code>、<code>chunk_kimi_delta_attention</code>、<code>Glm5NextTextForgetGate.forward</code>。核对方式：按公式独立重写一遍与官方 kernel 逐元素比对，最大绝对误差 0；两实现在 $S\in\{1,7,64,65,130\}$ 上误差 $\le 8.9\times10^{-7}$（实测得到）。</li>
       <li id="f3"><strong>[F3]</strong> indexer 的池内加权是输入相关的逐通道门控。来源：<code>Glm5NextTextIndexer.forward</code> 中 <code>gate_scores = F.linear(hidden_states, self.index_kpool_compress_gate)</code> 把逐 token 的隐藏状态投影成 128 维门控分数，随键一起打包进 cache；<code>get_pooled_states</code> 中 <code>logits = grouped_gate_scores + index_kpool_compress_ape</code> 后沿池内位置维（<code>dim=2</code>）做 softmax，得到 $[\dots,4,128]$ 的权重再与池内键相乘求和。因此权重既依赖输入，也逐通道不同；<code>index_kpool_compress_ape</code> 形状 $[4,128]$ 只提供池内位置偏置。</li>
-      <li id="f2"><strong>[F2]</strong> MoE 的 <code>noaux_tc</code> 路由公式、偏置只影响选择、权重和为 2.5、SwiGLU 不对称截断、共享专家并联相加。来源：<code>Glm5NextTextTopkRouter.forward</code>、<code>Glm5NextTextExperts._apply_gate</code>、<code>Glm5NextTextMoE.forward</code>。核对方式：手写复现路由，索引完全一致、权重误差 0；替换偏置后权重误差 0；拆分两路相加与官方输出误差 0。实测见 <code>p4.out</code> 节 4.2–4.6。</li>
+      <li id="f2"><strong>[F2]</strong> MoE 的 <code>noaux_tc</code> 路由公式、偏置只影响选择、权重和为 2.5、SwiGLU 不对称截断、共享专家并联相加。来源：<code>Glm5NextTextTopkRouter.forward</code>、<code>Glm5NextTextExperts._apply_gate</code>、<code>Glm5NextTextMoE.forward</code>。核对方式：手写复现路由，索引完全一致、权重误差 0；替换偏置后权重误差 0；拆分两路相加与官方输出误差 0（实测得到）。</li>
     </ol>
 
     <h3>外部数字与实验条件（N）</h3>
     <ol class="src">
-      <li id="n1"><strong>[N1]</strong> 总参数量 321,323,031,390。条件：76,108 个张量按 shape 累加，排除 37,338 个 <code>weight_scale_inv</code>（量化缩放因子不计入参数）。脚本 <code>verify_structure.py</code>，输出项 [0][10]。</li>
-      <li id="n2"><strong>[N2]</strong> 单 token 激活 17,376,348,990（17.38 B），含嵌入与输出头。条件：按真实 config 的张量形状逐项累加，MoE 层计 top-8 专家、共享专家、路由器权重与 288 个路由偏置，不含 MTP 层。官方 README 声称 18B active / 320B total，本值低 3.5%。脚本 <code>p4_moe.py</code> 节 4.7（该脚本的 MoE 行未计路由偏置，差 $42\times288=12{,}096$，本页表格已补齐）。</li>
-      <li id="n3"><strong>[N3]</strong> 视觉塔 563,627,008 参数、$448\times448$ 图像产生 256 个视觉 token。条件：按官方 <code>vision_config</code>（depth=24）构建模块统计参数；token 数为 depth 缩至 2 时的实跑结果（token 数与 depth 无关）。与 checkpoint visual 命名空间统计差值为 0。视频行以 grid 的 $T$ 为输入：帧数到 grid 的换算在 processor 中完成，不在本页核对范围内，故不给出帧数换算。脚本 <code>p6_vision.py</code> 节 6.2、6.3、6.6。</li>
-      <li id="n4"><strong>[N4]</strong> 端到端前向的张量形状、4 路分化偏差 $0.48$–$0.54$。条件：8 层缩小模型（层类型序列取真实 config 前 8 项、专家数 16），隐藏宽度与全部头维度为真实值，float32，随机权重按官方 <code>_init_weights</code> 初始化，B=1、prefill S=12 后 decode 4 步。随机权重下的数值分布不代表真实模型行为，此处只用于验证形状与数据通路。脚本 <code>p5_end2end.py</code>。</li>
-      <li id="n5"><strong>[N5]</strong> Sinkhorn 后行和偏差 $1.0\times10^{-2}$ / 列和 $1.1\times10^{-6}$、迭代次数扫描表、退化检验误差 $3.8\times10^{-6}$、<code>hc_head</code> 与均值误差 0。条件：真实 <code>hidden_size=4096</code> 与 <code>hc_mult=4</code>，<code>fn</code> 按官方初始化取 $\mathcal{N}(0, 0.02)$、<code>base</code>=0、<code>scale</code>=1，float32，B=1、S=6 随机输入。偏差量级依赖输入分布，此处结论限于该构造条件。脚本 <code>p3_mhc.py</code> 节 3.3、3.4、3.6、3.7。</li>
-      <li id="n6"><strong>[N6]</strong> mHC 全模型 35,391,870 参数。条件：单站点 $393{,}243 = 24\times16384 + 24 + 3$，每层两站点、45 层。脚本 <code>p3_mhc.py</code> 节 3.1；与 checkpoint 的 <code>hc_attn_fn</code>/<code>hc_ffn_fn</code> 张量形状 $[24, 16384]$ 一致。</li>
-      <li id="n7"><strong>[N7]</strong> 遗忘门 $g\in[-4.02, -0.84]$、衰减因子 $\in[0.018, 0.431]$。条件：真实维度（64 头 $\times$ 128 维），<code>A_log</code>=0 与 <code>dt_bias</code>=0（官方 safe 分支初始化），输入为标准正态随机张量 B=1、S=16。这是随机初始化下的范围，不代表训练后的实际分布；理论范围由公式确定为 $(-5, 0)$。脚本 <code>p1_kda.py</code> 节 1.3。</li>
-      <li id="n8"><strong>[N8]</strong> k-pool 候选数与稀疏度换算表。条件：按 <code>index_topk=2048</code>、<code>index_kpool=4</code> 计算，候选池数为 $\lceil S/4\rceil$、选中数为 $\min(512, \lceil S/4\rceil)$。为公式推算而非逐长度实跑（未构造 1M 序列）；换算式本身在 $S\in\{16,40,64\}$ 上经实跑验证。脚本 <code>p8_longctx.py</code> 节 8.2、<code>p2_dsa.py</code> 节 2.4。</li>
-      <li id="n9"><strong>[N9]</strong> $S\le$ 预算时退化为因果掩码、缩小预算后的稀疏选择与尾巴语义。条件：真实 DSA 层维度；因果退化在 <code>index_topk=2048</code>、$S\in\{16,40\}$ 下实测；稀疏行为在 <code>index_topk=16</code>（其余不变）、$S=64$ 下实测。脚本 <code>p2_dsa.py</code> 节 2.5、2.6。</li>
-      <li id="n10"><strong>[N10]</strong> 长上下文显存对照表与 4288 token 交叉点。条件与依据：KDA 侧循环状态 $[64,128,128]$ 按 fp32 计——源码调用 <code>update_recurrent_state(last_recurrent_state.to(torch.float32))</code>，显式转 fp32；卷积状态按 $[24576,4]$、bf16 计——<code>cache_utils.py</code> 的 <code>lazy_initialization</code> 用 <code>torch.zeros((*conv_states.shape[:-1], conv_kernel_size), dtype=conv_states.dtype)</code> 分配，宽度等于 <code>conv_kernel_size</code>（即 kernel 值 4，非 $kernel-1$），dtype 随激活。共 34 层。DSA 侧每 token 每层计 769 个元素、bf16：MLA 潜向量 $kv\_lora\_rank + qk\_rope\_head\_dim = 512$，加 indexer 的 packed 状态 $index\_head\_dim\times2+1 = 257$——源码把 <code>cat([k, gate_scores, valid_channel])</code> 交给 <code>update_indexer</code> 逐 token 累积，<code>get_pooled_states</code> 每步都要读它重建候选池，属解码必需状态。共 11 层。漏掉这 257 维会把交叉点高估为 4288 token 并使 $S=4096$ 行的符号反转。「假想全 DSA」是为算节省比例构造的基线，非真实存在的配置。脚本 <code>p8_longctx.py</code> 节 8.1、8.3。</li>
-      <li id="n11"><strong>[N11]</strong> transformers 实现的 KV cache 形状为 $[1,64,S,256]$，每 token 每层 32768 个元素。条件：真实 DSA 层，B=1、S=40 prefill 后读取缓存张量形状。这是官方 transformers 的实现口径（<code>expand_kv</code> 后 cache）；推理框架可改为 cache 潜向量，本探针不能证明后者的实现细节。脚本 <code>p2_dsa.py</code> 节 2.3。</li>
-      <li id="n12"><strong>[N12]</strong> 图像与视频掩码划分。条件：按源码的 <code>get_placeholder_mask</code> 判定式，在构造的 12 token 序列上实测。脚本 <code>p6_vision.py</code> 节 6.4、6.5。</li>
-      <li id="n13"><strong>[N13]</strong> routed 专家占比与激活率。条件：口径需一致——311.65 B 与 96.99% 的分母是含 MTP 层的 321.32 B；304.41 B 只含主干 42 个 MoE 层；96.98% 与 5.54% 的分母是扣除 MTP 层后的主干 313.89 B。混用分母会得到错误比例。统计脚本为 <code>verify_structure.py</code> 的分组逻辑。</li>
+      <li id="n1"><strong>[N1]</strong> 总参数量 321,323,031,390。条件：76,108 个张量按 shape 累加，排除 37,338 个 <code>weight_scale_inv</code>（量化缩放因子不计入参数）。实测得到。</li>
+      <li id="n2"><strong>[N2]</strong> 单 token 激活 17,376,348,990（17.38 B），含嵌入与输出头。条件：按真实 config 的张量形状逐项累加，MoE 层计 top-8 专家、共享专家、路由器权重与 288 个路由偏置，不含 MTP 层。官方 README 声称 18B active / 320B total，本值低 3.5%（实测得到；累加须计入 288 个路由偏置，漏计会少 $42\times288=12{,}096$，上表已计入）。</li>
+      <li id="n3"><strong>[N3]</strong> 视觉塔 563,627,008 参数、$448\times448$ 图像产生 256 个视觉 token。条件：按官方 <code>vision_config</code>（depth=24）构建模块统计参数；token 数为 depth 缩至 2 时的实跑结果（token 数与 depth 无关）。与 checkpoint visual 命名空间统计差值为 0。视频行以 grid 的 $T$ 为输入：帧数到 grid 的换算在 processor 中完成，不在核对范围内，故不给出帧数换算。实测得到。</li>
+      <li id="n4"><strong>[N4]</strong> 端到端前向的张量形状、4 路分化偏差 $0.48$–$0.54$。条件：8 层缩小模型（层类型序列取真实 config 前 8 项、专家数 16），隐藏宽度与全部头维度为真实值，float32，随机权重按官方 <code>_init_weights</code> 初始化，B=1、prefill S=12 后 decode 4 步。随机权重下的数值分布不代表真实模型行为，此处只用于验证形状与数据通路。实测得到。</li>
+      <li id="n5"><strong>[N5]</strong> Sinkhorn 后行和偏差 $1.0\times10^{-2}$ / 列和 $1.1\times10^{-6}$、迭代次数扫描表、退化检验误差 $3.8\times10^{-6}$、<code>hc_head</code> 与均值误差 0。条件：真实 <code>hidden_size=4096</code> 与 <code>hc_mult=4</code>，<code>fn</code> 按官方初始化取 $\mathcal{N}(0, 0.02)$、<code>base</code>=0、<code>scale</code>=1，float32，B=1、S=6 随机输入。偏差量级依赖输入分布，此处结论限于该构造条件。实测得到。</li>
+      <li id="n6"><strong>[N6]</strong> mHC 全模型 35,391,870 参数。条件：单站点 $393{,}243 = 24\times16384 + 24 + 3$，每层两站点、45 层。实测得到；与 checkpoint 的 <code>hc_attn_fn</code>/<code>hc_ffn_fn</code> 张量形状 $[24, 16384]$ 一致。</li>
+      <li id="n7"><strong>[N7]</strong> 遗忘门 $g\in[-4.02, -0.84]$、衰减因子 $\in[0.018, 0.431]$。条件：真实维度（64 头 $\times$ 128 维），<code>A_log</code>=0 与 <code>dt_bias</code>=0（官方 safe 分支初始化），输入为标准正态随机张量 B=1、S=16。这是随机初始化下的范围，不代表训练后的实际分布；理论范围由公式确定为 $(-5, 0)$。实测得到。</li>
+      <li id="n8"><strong>[N8]</strong> k-pool 候选数与稀疏度换算表。条件：按 <code>index_topk=2048</code>、<code>index_kpool=4</code> 计算，候选池数为 $\lceil S/4\rceil$、选中数为 $\min(512, \lceil S/4\rceil)$。为公式推算而非逐长度实跑（未构造 1M 序列）；换算式本身在 $S\in\{16,40,64\}$ 上经实跑验证（实测得到）。</li>
+      <li id="n9"><strong>[N9]</strong> $S\le$ 预算时退化为因果掩码、缩小预算后的稀疏选择与尾巴语义。条件：真实 DSA 层维度；因果退化在 <code>index_topk=2048</code>、$S\in\{16,40\}$ 下实测；稀疏行为在 <code>index_topk=16</code>（其余不变）、$S=64$ 下实测（实测得到）。</li>
+      <li id="n10"><strong>[N10]</strong> 长上下文显存对照表与 4288 token 交叉点。条件与依据：KDA 侧循环状态 $[64,128,128]$ 按 fp32 计——源码调用 <code>update_recurrent_state(last_recurrent_state.to(torch.float32))</code>，显式转 fp32；卷积状态按 $[24576,4]$、bf16 计——<code>cache_utils.py</code> 的 <code>lazy_initialization</code> 用 <code>torch.zeros((*conv_states.shape[:-1], conv_kernel_size), dtype=conv_states.dtype)</code> 分配，宽度等于 <code>conv_kernel_size</code>（即 kernel 值 4，非 $kernel-1$），dtype 随激活。共 34 层。DSA 侧每 token 每层计 769 个元素、bf16：MLA 潜向量 $kv\_lora\_rank + qk\_rope\_head\_dim = 512$，加 indexer 的 packed 状态 $index\_head\_dim\times2+1 = 257$——源码把 <code>cat([k, gate_scores, valid_channel])</code> 交给 <code>update_indexer</code> 逐 token 累积，<code>get_pooled_states</code> 每步都要读它重建候选池，属解码必需状态。共 11 层。漏掉这 257 维会把交叉点高估为 4288 token 并使 $S=4096$ 行的符号反转。「假想全 DSA」是为算节省比例构造的基线，非真实存在的配置。实测得到。</li>
+      <li id="n11"><strong>[N11]</strong> transformers 实现的 KV cache 形状为 $[1,64,S,256]$，每 token 每层 32768 个元素。条件：真实 DSA 层，B=1、S=40 prefill 后读取缓存张量形状。这是官方 transformers 的实现口径（<code>expand_kv</code> 后 cache）；推理框架可改为 cache 潜向量，本探针不能证明后者的实现细节。实测得到。</li>
+      <li id="n12"><strong>[N12]</strong> 图像与视频掩码划分。条件：按源码的 <code>get_placeholder_mask</code> 判定式，在构造的 12 token 序列上实测（实测得到）。</li>
+      <li id="n13"><strong>[N13]</strong> routed 专家占比与激活率。条件：口径需一致——311.65 B 与 96.99% 的分母是含 MTP 层的 321.32 B；304.41 B 只含主干 42 个 MoE 层；96.98% 与 5.54% 的分母是扣除 MTP 层后的主干 313.89 B。混用分母会得到错误比例。统计按 checkpoint 张量名分组进行（实测得到）。</li>
     </ol>
 
     <h3>简化条件及其限制</h3>
     <ol class="src">
-      <li><strong>不加载真实权重。</strong> 所有实跑使用随机张量，验证的是公式正确性、形状代数与数据通路，不涉及模型的语义能力。因此本页不含任何关于输出质量、基准分数或数值分布的结论；<code>[N5]</code><code>[N7]</code> 中的取值范围只在对应构造条件下成立。</li>
+      <li><strong>不加载真实权重。</strong> 所有实跑使用随机张量，验证的是公式正确性、形状代数与数据通路，不涉及模型的语义能力。因此不含任何关于输出质量、基准分数或数值分布的结论；<code>[N5]</code><code>[N7]</code> 中的取值范围只在对应构造条件下成立。</li>
       <li><strong>端到端前向缩小到 8 层 16 专家。</strong> 保留了全部结构特征（层类型 4 层一循环、前 3 层 dense、4 路残差流、indexer 配置、真实隐藏宽度与头维度），因此可支持关于形状与数据通路的结论，不可支持关于参数量或规模效应的结论——后者一律由 checkpoint 张量头统计给出。</li>
       <li><strong>缩小 <code>index_topk</code> 观察稀疏。</strong> 真实预算 2048 需要更长序列才能触发稀疏，改用 16 观察机制。这支持关于「选择规则与尾巴语义」的结论，不支持关于「真实模型在长序列上选中哪些 token」的结论。</li>
       <li><strong>长上下文表为公式推算。</strong> 未构造 1M 序列，表中数字由每层每 token 占用乘长度得出；每 token 占用的构成（KDA 的两块常数状态、DSA 的潜向量与 indexer 状态）取自源码与 cache 实现，换算式在短序列上经实跑验证。若推理框架采用不同的缓存布局或精度，绝对值与交叉点都会变化，只有节省比例的上限 $1-11/45$ 由层数比例决定、不受布局影响。</li>
       <li><strong>视觉塔 depth 缩至 2 跑通。</strong> patch 到 token 的换算与输出维度不依赖 depth，故这两项结论成立；参数量一项按真实 depth=24 构建模块统计，并与 checkpoint 精确吻合。</li>
-      <li><strong>Sinkhorn 结论的输入依赖。</strong> 双随机偏差量级依赖 <code>fn</code> 的取值分布，本页用官方初始化下的随机权重测得。行列不对称这一<em>方向性</em>结论由迭代顺序决定，不依赖输入；具体偏差数值依赖构造条件。</li>
+      <li><strong>Sinkhorn 结论的输入依赖。</strong> 双随机偏差量级依赖 <code>fn</code> 的取值分布，用官方初始化下的随机权重测得。行列不对称这一<em>方向性</em>结论由迭代顺序决定，不依赖输入；具体偏差数值依赖构造条件。</li>
     </ol>
 
     <h3>范围之外</h3>
     <ol class="src">
-      <li><strong>技术报告的适用范围。</strong> arXiv:2602.15763（GLM-5 技术报告，v2）§2.1「Model size scaling」写的是：GLM-5 扩到 256 专家、层数降到 80、共 744 B 参数（40 B 激活），注意力为 MLA 加 DSA，全文未出现线性注意力或 mHC。GLM-5.3-Flash 是 320 B / 45 层 / 288 专家、含 KDA 与 mHC 的不同架构，README 也写明它「starts from a newly trained base model」。因此本页<strong>不引用该报告作为 GLM-5.3-Flash 的结构依据</strong>，结构性结论全部出自 config 与源码。报告 §2.1.1 中关于 DSA 的设计动机（长上下文中约 90% 注意力项冗余、长序列注意力计算降低约 1.5–2 倍）适用于 DSA 这一机制本身，但其实验对象是 GLM-5 而非本模型，本页未用它支撑任何数字。</li>
-      <li><strong>训练相关内容。</strong> 预训练语料、Muon 优化器配置、RL 流程、负载均衡的实际效果均不在本页范围——这些无法用前向实跑验证。</li>
-      <li><strong>基准分数。</strong> README 列出的评测结果依赖具体采样参数与评判模型，本页不复述也不评价。</li>
-      <li><strong>推理框架的实现细节。</strong> SGLang / vLLM 如何做 KV 布局、EP 切分、MTP 调度不在源码可验证范围内，本页只说明 transformers 实现的口径并明确标注差异。</li>
+      <li><strong>技术报告的适用范围。</strong> arXiv:2602.15763（GLM-5 技术报告，v2）§2.1「Model size scaling」写的是：GLM-5 扩到 256 专家、层数降到 80、共 744 B 参数（40 B 激活），注意力为 MLA 加 DSA，全文未出现线性注意力或 mHC。GLM-5.3-Flash 是 320 B / 45 层 / 288 专家、含 KDA 与 mHC 的不同架构，README 也写明它「starts from a newly trained base model」。因此<strong>不引用该报告作为 GLM-5.3-Flash 的结构依据</strong>，结构性结论全部出自 config 与源码。报告 §2.1.1 中关于 DSA 的设计动机（长上下文中约 90% 注意力项冗余、长序列注意力计算降低约 1.5–2 倍）适用于 DSA 这一机制本身，但其实验对象是 GLM-5 而非本模型，未用它支撑任何数字。</li>
+      <li><strong>训练相关内容。</strong> 预训练语料、Muon 优化器配置、RL 流程、负载均衡的实际效果均不在讨论范围——这些无法用前向实跑验证。</li>
+      <li><strong>基准分数。</strong> README 列出的评测结果依赖具体采样参数与评判模型，不复述也不评价。</li>
+      <li><strong>推理框架的实现细节。</strong> SGLang / vLLM 如何做 KV 布局、EP 切分、MTP 调度不在源码可验证范围内，只说明 transformers 实现的口径并明确标注差异。</li>
     </ol>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

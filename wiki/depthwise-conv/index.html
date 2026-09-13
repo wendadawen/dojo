@@ -62,9 +62,7 @@
 <p><b>主要依据</b>：Howard et al., <i>MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications</i>, arXiv:1704.04861（2017）；GLM-5.3-Flash 官方实现（transformers <code>models/glm5_next</code>）。</p>
 </blockquote>
 
-<p>一个 $3\times3$、64 进 64 出的卷积层，每个输出位置要做 $9\times64\times64=36{,}864$ 次乘加；MobileNets 把这一步拆成两步——先逐通道滤波、再跨通道组合——同样的输出只要约 $4{,}700$ 次乘加，缩减到原来的约 12.7%（这组数字可由公式实算）。深度可分离卷积由此成为移动端视觉模型的标配；在大模型里，它的「半边」——depthwise 卷积——出现在线性注意力层中，为无位置编码的模型提供局部时序结构。本文讲清拆分的原理、省算的账，以及「只见半边」的 KDA 用法。</p>
-
-<p>结构：先拆解标准卷积做的两件事，再看两步拆分，然后推导缩减比，最后核对 GLM-5.3-Flash 里 KDA 层的短卷积。</p>
+<p>一个 $3\times3$、64 进 64 出的卷积层，每个空间位置上全部输出通道合计要做 $9\times64\times64=36{,}864$ 次乘加；MobileNets 把这一步拆成两步——先逐通道滤波、再跨通道组合——同样的输出只要约 $4{,}700$ 次乘加，缩减到原来的约 12.7%（这组数字可由公式实算）。在大模型里，它的「半边」——depthwise 卷积——也出现在线性注意力层中：GLM-5.3-Flash 的 KDA 层用它为无位置编码的主干提供局部时序结构（结构解读，非源码直陈）。本文讲清拆分的原理、省算的账，以及「只见半边」的 KDA 用法。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -73,7 +71,7 @@
       <p>标准卷积在一个输出位置上同时做哪两件事？成本由什么决定？</p>
       <details>
         <summary>解答：滤波与组合一步完成；成本对通道数与核尺寸乘性依赖</summary>
-        <p>每个输出值是对「空间邻域 × 全部输入通道」的加权求和：空间邻域上的加权是滤波，跨输入通道的加权是组合，标准卷积一步做完。成本 $D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F$，对核尺寸、输入/输出通道数、特征图尺寸都是乘性依赖。见「标准卷积」一章。</p>
+        <p>每个输出值是对「空间邻域 $\times$ 全部输入通道」的加权求和：空间邻域上的加权是滤波，跨输入通道的加权是组合，标准卷积一步做完。成本 $D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F$，对核尺寸、输入/输出通道数、特征图尺寸都是乘性依赖。见「标准卷积」一章。</p>
       </details>
     </li>
     <li>
@@ -87,14 +85,14 @@
       <p>省了多少？$1/N+1/D_K^2$ 怎么除出来的？</p>
       <details>
         <summary>解答：两项成本分别除以标准成本</summary>
-        <p>深度可分离成本 $D_K^2MD_F^2+MND_F^2$ 除以标准成本 $D_K^2MND_F^2$：第一项约掉 $D_K^2MN$ 剩 $1/N$，第二项约掉 $MN$ 剩 $1/D_K^2$。$3\times3$ 核时 $1/9$ 主导，约省 8~9 倍；构造数字例实测比值 0.126736。见「省了多少」一章。</p>
+        <p>深度可分离成本 $D_K^2MD_F^2+MND_F^2$ 除以标准成本 $D_K^2MND_F^2$：第一项分子分母约去 $D_K^2MD_F^2$，剩 $1/N$；第二项约去 $MND_F^2$，剩 $1/D_K^2$。$3\times3$ 核时 $1/9$ 主导，约省 8~9 倍；构造数字例实测比值 0.126736。见「省了多少」一章。</p>
       </details>
     </li>
     <li>
       <p>KDA 里的短卷积是完整的深度可分离卷积吗？</p>
       <details>
         <summary>解答：不是，只有 depthwise 半边</summary>
-        <p>GLM-5.3-Flash 的 KDA 层用 kernel 为 4 的因果 depthwise 卷积（groups 等于通道数 24576），没有配对的 pointwise；跨通道混合由其后的 $q$/$k$/$v$ 线性投影承担。它的职能是给线性注意力提供局部时序上下文。见「大模型里的用法」一章。</p>
+        <p>GLM-5.3-Flash 的 KDA 层用 kernel 为 4 的因果 depthwise 卷积（groups 等于通道数 24576），没有配对的 pointwise；跨通道混合由卷积之前的 $q$/$k$/$v$ 线性投影承担。它的职能是给线性注意力提供局部时序上下文。见「大模型里的用法」一章。</p>
       </details>
     </li>
   </ol>
@@ -109,7 +107,7 @@
   </ul>
 </section>
 
-<h2 id="standard-conv">1. 标准卷积：滤波与组合一步完成</h2>
+<h2 id="standard-conv">1. 标准卷积——滤波与组合一步完成</h2>
 
 <p>标准卷积层的输入是 $D_F\times D_F\times M$ 的特征图 $\mathbf{F}$，输出是 $D_F\times D_F\times N$ 的特征图 $\mathbf{G}$（设宽高相同、步长为 1）<sup>[F1]</sup>：</p>
 
@@ -126,7 +124,7 @@
 
 <p>$$D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F.$$</p>
 
-<p>每个输出位置做 $D_K\cdot D_K\cdot M$ 次乘加、共 $N\cdot D_F\cdot D_F$ 个输出——四个量里任何一个翻倍，成本翻倍。计算示例（贯穿本页的构造数字）：$D_K=3$、$M=N=64$、$D_F=16$ 时，标准卷积需要 $9\times64\times64\times256=9{,}437{,}184$ 次乘加<sup>[N2]</sup>。</p>
+<p>每个标量输出做 $D_K\cdot D_K\cdot M$ 次乘加、共 $N\cdot D_F\cdot D_F$ 个输出——$M$、$N$ 翻倍成本翻倍，$D_K$、$D_F$ 翻倍成本变为四倍。计算示例（贯穿本页的构造数字）：$D_K=3$、$M=N=64$、$D_F=16$ 时，标准卷积需要 $9\times64\times64\times256=9{,}437{,}184$ 次乘加<sup>[N2]</sup>。</p>
 
 <h3 id="std-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -134,12 +132,12 @@
     <p>成本公式的四个量分别对应「滤波」和「组合」中的哪些？</p>
     <details>
       <summary>解答：$D_K^2$ 与 $D_F^2$ 属于空间侧，$M$ 与 $N$ 属于通道侧</summary>
-      <p>滤波在每个输出位置扫描 $D_K\times D_K$ 的邻域（$D_K^2$），全图共 $D_F\times D_F$ 个位置（$D_F^2$）；组合在每个位置对 $M$ 个输入通道求加权和（$M$），并为 $N$ 个输出通道各做一遍（$N$）。所以成本 = 空间侧两个因子 × 通道侧两个因子，两件事在成本上也是相乘关系——这正是拆分能省算的结构原因。</p>
+      <p>滤波在每个输出位置扫描 $D_K\times D_K$ 的邻域（$D_K^2$），全图共 $D_F\times D_F$ 个位置（$D_F^2$）；组合在每个位置对 $M$ 个输入通道求加权和（$M$），并为 $N$ 个输出通道各做一遍（$N$）。所以成本是空间侧两个因子与通道侧两个因子的乘积，两件事在成本上也是相乘关系——这正是拆分能省算的结构原因。</p>
     </details>
   </li>
 </ol>
 
-<h2 id="two-steps">2. 拆成两步：depthwise 与 pointwise</h2>
+<h2 id="two-steps">2. 拆成两步——depthwise 与 pointwise</h2>
 
 <p>深度可分离卷积把捆绑的两件事拆成先后两层<sup>[C1]</sup>。</p>
 
@@ -180,7 +178,7 @@
       <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">输出<br/>$N$ 个通道</div>
     </foreignObject>
     <foreignObject x="14" y="216" width="260" height="40">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">每个输出 = 邻域 × <strong>全部</strong>输入通道的加权和</div>
+      <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">每个输出是邻域与<strong>全部</strong>输入通道的加权和</div>
     </foreignObject>
     <!-- 拆分 -->
     <foreignObject x="360" y="14" width="300" height="22">
@@ -214,7 +212,7 @@
       <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">①只在单通道内滤波，②只在通道间组合，两步各做一件事</div>
     </foreignObject>
   </svg>
-  <figcaption class="diagram-caption">左半：标准卷积的核同时跨空间与跨通道。右半：depthwise 的每个核被锁进单个通道（图中 accent 框各自独立），pointwise 在通道维度做 $1\times1$ 组合。竖条表示通道堆叠。</figcaption>
+  <figcaption class="diagram-caption">左半：标准卷积的核同时跨空间与跨通道。右半：depthwise 的每个核被锁进单个通道（图中各自独立的高亮小框），pointwise 在通道维度做 $1\times1$ 组合。竖条表示通道堆叠。</figcaption>
 </figure>
 
 <h3 id="two-steps-questions">本章问题</h3>
@@ -228,7 +226,7 @@
   </li>
 </ol>
 
-<h2 id="saving">3. 省了多少：比值推导</h2>
+<h2 id="saving">3. 省了多少——比值推导</h2>
 
 <p>把两步的成本除以标准成本，逐项约分<sup>[F5]</sup>：</p>
 
@@ -267,8 +265,8 @@ pointwise 乘加: 1,048,576
 比值 sep/std = 0.126736   公式 1/N + 1/D_K^2 = 0.126736
 缩减倍数: 7.9x</code></pre>
   </div>
-  <p><b>验证的机制</b>：按公式 (2)(4)(5) 直接计数乘加；实算比值与 $1/N+1/D_K^2$ 完全一致。</p>
-  <p><b>观察重点</b>：$D_K=3$、$M=N=64$ 时 pointwise（约 105 万）比 depthwise（约 15 万）贵得多——3×3 场景下主要开销移到了组合这一步；缩减 7.9 倍落在论文「8~9 倍」区间的边缘（因为 $N=64$ 使 $1/N$ 项不可忽略）。</p>
+  <p><b>验证的机制</b>：按标准卷积成本式、depthwise 成本式与 pointwise 成本式直接计数乘加；实算比值与 $1/N+1/D_K^2$ 完全一致。</p>
+  <p><b>观察重点</b>：$D_K=3$、$M=N=64$ 时 pointwise（约 105 万）比 depthwise（约 15 万）贵得多——$3\times3$ 核时主要开销移到组合这一步；缩减 7.9 倍落在论文「8~9 倍」区间的边缘（因为 $N=64$ 使 $1/N$ 项不可忽略）。</p>
   <p><b>简化条件</b>：$D_F=16$ 只影响总量、不影响比值（比值里 $D_F$ 约掉）；计数假设步长 1、正方形核与特征图。</p>
 </details>
 
@@ -278,18 +276,18 @@ pointwise 乘加: 1,048,576
     <p>$3\times3$ 拆分后为什么 pointwise 反而比 depthwise 贵？什么时候反过来？</p>
     <details>
       <summary>解答：看 $D_K^2$ 与 $N$ 的相对大小</summary>
-      <p>两项之比是 $D_K^2M D_F^2 : MND_F^2 = D_K^2 : N$。$3\times3$（$D_K^2=9$）对 $N=64$：depthwise 只占约 12%，组合占大头。核更大（如 $9\times9$、$D_K^2=81$）或输出通道更少（$N&lt;9$）时 depthwise 反超。这也解释了收益上限：无论参数怎么取，比值 $1/N+1/D_K^2$ 不会低于其中较大者对应的缩减。</p>
+      <p>两项之比是 $D_K^2M D_F^2 : MND_F^2 = D_K^2 : N$。$3\times3$（$D_K^2=9$）对 $N=64$：depthwise 只占约 12%，组合占大头。核更大（如 $9\times9$、$D_K^2=81$）或输出通道更少（$N&lt;9$）时 depthwise 反超。这也解释了收益上限：比值 $1/N+1/D_K^2$ 恒大于其中较大的一项，故收益不超过相对较小项的倒数。</p>
     </details>
   </li>
 </ol>
 
-<h2 id="kda-usage">4. 大模型里的用法：KDA 的短深度卷积</h2>
+<h2 id="kda-usage">4. 大模型里的用法——KDA 的短深度卷积</h2>
 
-<p>线性注意力层里出现的卷积用的是这套结构的「半边」。GLM-5.3-Flash 的 KDA（Kimi Delta Attention，见<a href="../kda/index.html">KDA</a>）层把 $q$/$k$/$v$ 三路拼接后过一个一维卷积，配置为<sup>[C5][N3]</sup>：通道数 24576（$=3\times8192$）、kernel 为 4、<strong>groups 等于通道数</strong>、无偏置、因果方向（只看当前与历史位置）。</p>
+<p>线性注意力层里出现的卷积用的是这套结构的「半边」。GLM-5.3-Flash 的 KDA（Kimi Delta Attention，见<a href="../kda/index.html">KDA</a>）层把 $q$/$k$/$v$ 三路拼接后过一个一维卷积，配置为<sup>[C4][N3]</sup>：通道数 24576（$=3\times8192$）、kernel 为 4、<strong>groups 等于通道数</strong>、无偏置、因果方向（只看当前与历史位置）。</p>
 
-<p>groups 等于通道数正是 depthwise 的实现形式：每组恰好一个输入通道和一个输出通道，核退化为每通道一个长度 4 的一维向量——这就是第 2 章的第一步，只是从二维空间邻域换成了一维时间邻域。<strong>没有</strong>配对的 pointwise：跨通道混合由卷积之前各自的 $q$/$k$/$v$ 线性投影承担（这一句是结构解读，非源码直陈）<sup>[C6]</sup>。所以严格说，KDA 用的是「深度卷积」而不是「深度可分离卷积」——只有滤波半边。</p>
+<p>groups 等于通道数正是 depthwise 的实现形式：每组恰好一个输入通道和一个输出通道，核退化为每通道一个长度 4 的一维向量——这就是「拆成两步」一章的第一步，只是从二维空间邻域换成了一维时间邻域。<strong>没有</strong>配对的 pointwise：跨通道混合由卷积之前各自的 $q$/$k$/$v$ 线性投影承担（这一句是结构解读，非源码直陈）<sup>[C5]</sup>。所以严格说，KDA 用的是「深度卷积」而不是「深度可分离卷积」——只有滤波半边。</p>
 
-<p>职能上，这个短卷积让每个 token 的 $q$/$k$/$v$ 混合最近 4 个位置的同类信息，为线性注意力的递推提供局部时序上下文；在 GLM-5.3-Flash 这样主干无位置编码的模型里，它也是局部相对位置信号的来源之一（结构解读，非源码直陈）（结构解读，非源码直陈）（模型层面的分析见 GLM-5.3-Flash 数据流页）。</p>
+<p>职能上，这个短卷积让每个 token 的 $q$/$k$/$v$ 混合最近 4 个位置的同类信息，为线性注意力的递推提供局部时序上下文；在 GLM-5.3-Flash 这样主干无位置编码的模型里，它也是局部相对位置信号的来源之一（结构解读，非源码直陈）（模型层面的分析见<a href="../glm-5-3-flash-dataflow/index.html">GLM-5.3-Flash 数据流页</a>）。</p>
 
 <details class="code-details">
   <summary>代码：因果 1D depthwise 卷积与 groups 语义</summary>
@@ -310,7 +308,7 @@ print("核:", k.flatten().tolist())
 # t=2: 0+0.5*1+(-0.5)*2+(-1)*3 = -3.5
 # t=3: 1*1+0.5*2+(-0.5)*3+(-1)*4 = -3.5
 # t=4: 1*2+0.5*3+(-0.5)*4+(-1)*5 = -3.5
-print("torch 输出:", [-1.0, -2.5, -3.5, -3.5, -3.5])  # 与手算一致
+print("torch 输出:", out.flatten().tolist())  # 与手算一致
 
 x2 = torch.tensor([[1.0, 2.0, 3.0, 4.0],
                    [10.0, 20.0, 30.0, 40.0]]).view(1, 2, 4)
@@ -318,7 +316,7 @@ dw = torch.nn.Conv1d(2, 2, kernel_size=2, groups=2, bias=False, padding=1)
 with torch.no_grad():
     dw.weight.copy_(torch.tensor([[[1.0, 1.0]], [[0.0, 1.0]]]))
 o2 = dw(x2)[:, :, :4]
-# 通道 0 核=[1,1]：每个位置是其前两个位置之和（前 1 个是 padding 0）
+# 通道 0 核=[1,1]：每个位置是当前位置与前一位置之和（最左位置的前一位是 padding 0）
 # 通道 1 核=[0,1]：每个位置是当前位置的值（仅看自己）
 print("groups=2 通道 0（核 [1,1]）:", [round(v, 1) for v in o2[0, 0].tolist()])
 print("groups=2 通道 1（核 [0,1]）:", [round(v, 1) for v in o2[0, 1].tolist()])</code></pre>
@@ -331,8 +329,8 @@ torch 输出: [-1.0, -2.5, -3.5, -3.5, -3.5]  # 与手算 t=0..4 一致
 groups=2 通道 0（核 [1,1]）: [1.0, 3.0, 5.0, 7.0]    # 当前 + 前一位置
 groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></pre>
   </div>
-  <p><b>验证的机制</b>：左 padding + 头部切片实现因果，每个输出只依赖当前与之前的位置；<code>groups=2</code> 时通道 1 的核 $[0,1]$ 输出当前位置的值，通道 0 的核 $[1,1]$ 输出当前位置与前一位置之和，验证逐通道独立。</p>
-  <p><b>观察重点</b>：5 个输出从 $-1$ 单调不增到 $-3.5$（$-1, -2.5, -3.5, -3.5, -3.5$），$-3.5$ 稳定是核 $[1, 0.5, -0.5, -1]$ 在 $t\geq2$ 时能用上至少 3 个非零元素、加权后总和恰为 $-3.5$。第二段中通道 0 核 $[1,1]$ 在 $t=0$ 用了 padding 0，后三个位置 $[3, 5, 7]$ 是当前位置加前一位置；通道 1 核 $[0,1]$ 严格只看自己，故 $[10, 20, 30, 40]$ 与输入完全相同。</p>
+  <p><b>验证的机制</b>：左 padding + 头部切片实现因果，每个输出只依赖当前与之前的位置；<code>groups=2</code> 时通道 1 的核 $[0,1]$ 输出当前位置的值，通道 0 的核 $[1,1]$ 输出当前位置与前一位置之和，验证逐通道独立<sup>[F6]</sup>。</p>
+  <p><b>观察重点</b>：5 个输出从 $-1$ 单调不增到 $-3.5$（$-1, -2.5, -3.5, -3.5, -3.5$）。$-3.5$ 恒定来自两点：核系数之和为零（$1+0.5-0.5-1=0$），配合等差输入 $(1,2,3,4,5)$ 使滑窗加权和 $\sum_j k_j\cdot x[t+j]$ 与位置 $t$ 无关；而 $t\geq2$ 时左侧补零给出的 $x[-1]=0$ 恰等于等差数列的外推值，故此后输出恒为 $-3.5$。第二段中通道 0 核 $[1,1]$ 在 $t=0$ 用了 padding 0，后三个位置 $[3, 5, 7]$ 是当前位置加前一位置；通道 1 核 $[0,1]$ 严格只看自己，故 $[10, 20, 30, 40]$ 与输入完全相同。</p>
   <p><b>简化条件</b>：单通道/双通道、长度 4~5 的构造序列；GLM 的真实配置是 24576 通道、拼接的 $q$/$k$/$v$ 三段，机制相同。</p>
 </details>
 
@@ -348,8 +346,8 @@ groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></
   <li>
     <p>因果方向的卷积怎么实现「只看过去」？</p>
     <details>
-      <summary>解答：右侧 padding 后截尾</summary>
-      <p>一维卷积默认两边对称 padding。做法是在序列左侧补 $D_K-1$ 个零再卷积，取前 $S$ 个输出（代码里的 $[:, :, :5]$）：这样位置 $t$ 的输出只聚合 $0$ 到 $t$ 的输入。GLM 的 <code>causal_conv1d_fn</code>（L404-410）用 $F.\mathrm{conv1d}(\mathrm{padding}{=}k{-}1)$ 后取 $[:, :, :\mathrm{seq\_len}]$ 实现同一目标。语言模型不能看未来 token，因果性是必需的。</p>
+      <summary>解答：左 padding 后取头部</summary>
+      <p>PyTorch 的 <code>Conv1d</code> 在指定 <code>padding</code> 时于两侧对称补零。做法是在序列左侧补 $D_K-1$ 个零再卷积，取前 $S$ 个输出（代码里的 $[:, :, :5]$）：这样位置 $t$ 的输出只聚合 $0$ 到 $t$ 的输入。GLM 的 <code>causal_conv1d_fn</code>（L404-410）用 $F.\mathrm{conv1d}(\mathrm{padding}{=}k{-}1)$ 后取 $[:, :, :\mathrm{seq\_len}]$ 实现同一目标。语言模型不能看未来 token，因果性是必需的。</p>
     </details>
   </li>
 </ol>
@@ -361,31 +359,31 @@ groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></
 <li><strong>[C1]</strong> 标准卷积一步完成滤波与组合；深度可分离拆成两层。MobileNets §3.1 原句。</li>
 <li><strong>[C2]</strong> depthwise 单滤波器作用于单通道；pointwise 为 $1\times1$ 跨通道线性组合。MobileNets §3.1。</li>
 <li><strong>[C3]</strong> $3\times3$ 深度可分离省 8~9 倍计算、精度小幅下降。MobileNets §3.1。</li>
-<li><strong>[C5]</strong> GLM KDA conv1d 配置（通道 24576、kernel 4、groups=通道数、无偏置、因果）。transformers <code>models/glm5_next/modeling_glm5_next.py</code> L603-680；checkpoint 拆为 q/k/v_conv1d 三个 $[8192,1,4]$ 张量（GLM 数据流页交叉验证）。GLM 的 <code>causal_conv1d_fn</code>（L404-410）以左 padding + 头部切片实现因果，与本节代码演示的 <code>padding=k-1</code> + <code>[:, :, :S]</code> 等价。</li>
-<li><strong>[C6]</strong> 跨通道混合由 $q$/$k$/$v$ 投影承担：结构解读（源码只有投影与卷积的顺序事实，无此陈述）。</li>
+<li><strong>[C4]</strong> GLM KDA conv1d 配置（通道 24576、kernel 4、groups=通道数、无偏置、因果）。transformers <code>models/glm5_next/modeling_glm5_next.py</code> L603-680；checkpoint 拆为 q/k/v_conv1d 三个 $[8192,1,4]$ 张量（<a href="../glm-5-3-flash-dataflow/index.html">GLM 数据流页</a>交叉验证）。GLM 的 <code>causal_conv1d_fn</code>（L404-410）以左 padding + 头部切片实现因果，与本节代码演示的 <code>padding=k-1</code> + <code>[:, :, :S]</code> 等价。</li>
+<li><strong>[C5]</strong> 跨通道混合由 $q$/$k$/$v$ 投影承担：结构解读（源码只有投影与卷积的顺序事实，无此陈述）。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
 <ul>
-<li><strong>[F1]</strong> 标准卷积定义（式 1）。MobileNets §3.1。</li>
-<li><strong>[F2]</strong> 标准成本 $D_KD_KMND_FD_F$（式 2）。MobileNets §3.1。</li>
-<li><strong>[F3]</strong> depthwise 定义与成本（式 3、4）。MobileNets §3.1。</li>
-<li><strong>[F4]</strong> 深度可分离总成本（式 5）。MobileNets §3.1。</li>
-<li><strong>[F5]</strong> 缩减比 $1/N+1/D_K^2$ 的推导（式 5 除以式 2）。MobileNets §3.1；构造数字例实算一致（research/ 实跑输出）。</li>
-<li id="f6"><strong>[F6]</strong> 因果 1D depthwise 前向与 groups 语义实测（手算与 torch 一致、通道独立）。本节代码以左 padding + 头部切片实现因果，与 GLM <code>causal_conv1d_fn</code> 等价。research/ 实跑输出（构造示例）。</li>
+<li><strong>[F1]</strong> 标准卷积定义。MobileNets §3.1。</li>
+<li><strong>[F2]</strong> 标准成本 $D_KD_KMND_FD_F$。MobileNets §3.1。</li>
+<li><strong>[F3]</strong> depthwise 定义与成本。MobileNets §3.1。</li>
+<li><strong>[F4]</strong> 深度可分离总成本。MobileNets §3.1。</li>
+<li><strong>[F5]</strong> 缩减比 $1/N+1/D_K^2$ 的推导（两步合计成本式除以标准卷积成本式）。MobileNets §3.1；构造数字例实算一致（「省了多少」一章代码块实跑输出，可复现）。</li>
+<li id="f6"><strong>[F6]</strong> 因果 1D depthwise 前向与 groups 语义实测（手算与 torch 一致、通道独立）。本节代码以左 padding + 头部切片实现因果，与 GLM <code>causal_conv1d_fn</code> 等价。「大模型里的用法」一章代码块实跑输出（构造示例，可复现）。</li>
 </ul>
 
 <h3>外部数字与实验条件（N）</h3>
 <ul>
 <li><strong>[N1]</strong> 8~9 倍（$3\times3$）。MobileNets §3.1。</li>
-<li><strong>[N2]</strong> 构造数字例：标准 9,437,184、depthwise 147,456、pointwise 1,048,576、合计 1,196,032 次乘加，比值 0.126736、7.9 倍（$D_K=3,M=N=64,D_F=16$）。research/ 实跑输出。</li>
+<li><strong>[N2]</strong> 构造数字例：标准 9,437,184、depthwise 147,456、pointwise 1,048,576、合计 1,196,032 次乘加，比值 0.126736、7.9 倍（$D_K=3,M=N=64,D_F=16$）。「省了多少」一章代码块实跑输出。</li>
 <li><strong>[N3]</strong> GLM：conv_dim$=3\times8192=24576$、kernel 4、checkpoint 拆三个 $[8192,1,4]$。GLM 源码与张量头。</li>
 </ul>
 
 <h3>构造示例</h3>
 <ul>
-<li>$D_K=3,M=N=64,D_F=16$ 的成本对照（贯穿第 1、3 章）。</li>
-<li>序列 $(1,2,3,4,5)$ × 核 $(1,0.5,-0.5,-1)$ 的因果卷积手算（第 4 章）。</li>
+<li>$D_K=3,M=N=64,D_F=16$ 的成本对照（贯穿「标准卷积」「省了多少」两章）。</li>
+<li>序列 $(1,2,3,4,5)$ 与核 $(1,0.5,-0.5,-1)$ 的因果卷积手算（「大模型里的用法」一章）。</li>
 <li>groups=2 双通道独立核演示。</li>
 </ul>
 
@@ -397,7 +395,7 @@ groups=2 通道 1（核 [0,1]）: [10.0, 20.0, 30.0, 40.0]  # 仅当前</code></
 <h3>简化条件及其限制</h3>
 <ul>
 <li>成本公式假设步长 1、正方形核与特征图、无 dilation；其他配置需重推。</li>
-<li>「精度小幅下降」是 MobileNets 在 ImageNet 分类上的定性结论，具体幅度依赖任务与规模，本页不引用具体数字（论文正文未给）。</li>
+<li>「精度小幅下降」在 MobileNets 的 ImageNet 分类对照里有具体数值：论文 §4 Table 4 给出标准卷积 MobileNet 与深度可分离 MobileNet 的对照——精度 71.7% 对 70.6%、乘加量 4866M 对 569M、参数 29.3M 对 4.2M；约 1.1 个百分点的精度差对应约 8.5 倍的乘加缩减，实际幅度依赖任务与规模。</li>
 <li>KDA 段的结论对应 GLM-5.3-Flash 的实现；其他线性注意力实现（如卷积核尺寸、是否因果）可能不同。</li>
 </ul>
 

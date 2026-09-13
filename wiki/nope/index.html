@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="不对 query/key 施加任何显式位置编码。因果掩码隐式编码位置。K3 对所有 MLA 层用 NoPE，位置感由 KDA 循环状态提供，8K→1M 外推无需 RoPE 插值。基于 NoPE 论文（Kazemnejad 2023）+ K3 报告 §2.1.2/§3.4 核对。">
+  <meta name="description" content="不对 query/key 施加任何显式位置编码。因果掩码隐式编码位置。K3 对所有 MLA 层用 NoPE，位置感由 KDA 循环状态提供，上下文 8K→64K 预训练、256K→1M cooldown 逐段扩展，无需 RoPE 插值。基于 NoPE 论文（Kazemnejad 2023）+ K3 报告 §2.1.2/§3.4 核对。">
   <meta name="dojo:summary" content="不对 query/key 施加任何显式位置编码，位置顺序由因果掩码隐式提供。K3 在所有 MLA 层使用 NoPE，位置感主要由 KDA 的循环状态补充。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制">
@@ -114,10 +114,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：NoPE 论文（Kazemnejad, Padhi, Ramamurthy, Das, Reddy, "The Impact of Positional Encoding on Length Generalization in Transformers", NeurIPS 2023, arXiv:2305.19466）；Kimi K3 技术报告 §2.1.2（Gated MLA）、§3.4（Long-Context Extension）。</p>
+<p><b>主要依据</b>：NoPE 论文（Kazemnejad, Padhi, Ramamurthy, Das, Reddy, "The Impact of Positional Encoding on Length Generalization in Transformers", NeurIPS 2023, arXiv:2305.19466）；Kimi K3 技术报告 §2.1.1（Kimi Delta Attention）、§2.1.2（Gated MLA）、§3.4（Long-Context Extension）。</p>
 </blockquote>
 
-<p>位置编码有四类主流方案，NoPE 是其中"什么都不做"的那个。Transformer 要预测下一个词，就得知道"现在处理到第几个词"。可如果在注意力计算里什么都不加——不给位置嵌入、不加距离偏置、不旋转 query/key——模型还能分清词序吗？NoPE（No Position Encoding，无位置编码）的回答是：在 decoder-only 的因果注意力里，能。本页要回答的核心问题是：什么都不加，顺序从哪来，这样做效果如何，以及在 Kimi K3 中怎么用。</p>
+<p>位置编码有三类显式方案，加上"什么都不做"的 NoPE 构成四种选择。Transformer 要预测下一个词，就得知道"现在处理到第几个词"。可如果在注意力计算里什么都不加——不给位置嵌入、不加距离偏置、不旋转 query/key——模型还能分清词序吗？NoPE（No Position Encoding，无位置编码）的回答是：在 decoder-only 的因果注意力里，能。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -130,7 +130,7 @@
       </details>
     </li>
     <li>
-      <p>为什么完全不加位置编码，decoder-only Transformer 的因果注意力仍然能区分词序？</p>
+      <p>为什么完全不加位置编码，decoder-only Transformer（只看左侧 token、逐步预测下一个词的自回归模型）的因果注意力仍然能区分词序？</p>
       <details>
         <summary>解答：因果掩码使每个位置的可见集合不同</summary>
         <p>因果掩码让位置 $t$ 只能看到前 $t$ 个 token：位置 1 只见 {1}，位置 2 见 {1,2}，位置 3 见 {1,2,3}。可见 token 集合随位置变化，注意力输出是可见 value 的加权和，因此不同位置的输出天然不同——位置信息被结构隐式编码，不需要人工注入。双向注意力没有这个性质，交换顺序后输出不变（排列等变）。完整手算论证见「为什么去掉位置编码仍能区分词序」一章。</p>
@@ -140,27 +140,27 @@
       <p>NoPE 在长度泛化任务上相比显式位置编码表现如何，理论给出什么解释？</p>
       <details>
         <summary>解答：优于显式方法且无额外计算，可表示绝对/相对 PE</summary>
-        <p>NoPE 论文摘要结论：最常用的位置编码方法（ALiBi、RoPE、APE）并不适合长度外推，NoPE 优于这些显式方法，且不引入额外计算开销。理论上 NoPE 可以表示绝对位置编码和相对位置编码两种形式；用 SGD 训练时，它学到的注意力模式主要类似 T5 的相对位置编码。NoPE 没有与训练长度绑定的参数，因此外推不需要插值或重缩放。详见「NoPE 在长度泛化上的表现」一章。</p>
+        <p>NoPE 论文摘要结论：在长度泛化的下游任务上，最常用的位置编码方法（ALiBi、RoPE、APE）并不适合外推，NoPE 优于这些显式方法，且不引入额外计算开销。理论上 NoPE 可以表示绝对位置编码和相对位置编码两种形式；用 SGD 训练时，它学到的注意力模式主要类似 T5 的相对位置编码。NoPE 没有与训练长度绑定的参数，因此外推不需要插值或重缩放。详见「NoPE 在长度泛化上的表现」一章。</p>
       </details>
     </li>
     <li>
       <p>在 Kimi K3 的混合架构中，NoPE 用在哪些层、为什么能这样用，位置信息由谁提供？</p>
       <details>
         <summary>解答：所有 MLA 层用 NoPE，KDA 提供位置</summary>
-        <p>K3 对所有 MLA 层使用 NoPE，即不给 MLA 的 query 和 key 施加任何显式位置编码。位置信息由相邻的 KDA 层提供：KDA 的循环门控与衰减机制使循环状态偏好近期 token 并随位置累积变化。MLA 只负责全局内容交互。由于没有与长度绑定的位置参数，K3 从 8K 训练上下文直接外推到 1M，无需 RoPE 重缩放或 YaRN 插值。详见「在 Kimi K3 中怎么用 NoPE」一章。</p>
+        <p>K3 对所有 MLA（Multi-head Latent Attention，多头潜在注意力）层使用 NoPE，即不给 MLA 的 query 和 key 施加任何显式位置编码。位置信息由相邻的 KDA 层提供：KDA 的循环门控与衰减机制使循环状态偏好近期 token 并随位置累积变化。MLA 只负责全局内容交互。由于没有与长度绑定的位置参数，K3 的上下文窗口按 8K→64K（预训练）、256K→1M（cooldown）逐段扩展，全程无需修改位置编码（RoPE 重缩放或 YaRN 插值）。详见「在 Kimi K3 中怎么用 NoPE」一章。</p>
       </details>
     </li>
     <li>
       <p>NoPE 在什么条件下可能不成立（适用边界）？</p>
       <details>
-        <summary>解答：依赖因果掩码，K3 场景还依赖 KDA</summary>
+        <summary>解答：依赖因果掩码；在 K3 中还依赖 KDA 提供位置</summary>
         <p>NoPE 的隐式位置信号以因果掩码为必要前提：在双向注意力中，无位置编码会排列等变、无法区分顺序。其次位置信号是隐式的、靠训练学习，任务不适配或数据不足时可能学不到足够的信号。K3 的用法还额外依赖 KDA 层提供位置敏感的序列混合，纯 NoPE 堆叠不保证等价效果。详见「NoPE 的适用边界」一章。</p>
       </details>
     </li>
   </ol>
 </section>
 
-<p><a href="../../wiki/positional-encoding/index.html">位置编码</a>是 NoPE 的对立面——NoPE 是其方案集合中"什么都不做"的选项；<a href="../../wiki/rope/index.html">旋转位置编码 RoPE</a>是最常见的显式位置编码之一，后文以其作对照；<a href="../../wiki/causal-mask/index.html">因果掩码</a>——位置 $t$ 只能看到前 $t$ 个 token 的遮挡规则——是 NoPE 能工作的结构前提。K3 的位置信息由 <a href="../../wiki/kda/index.html">KDA</a> 提供，后者属于 <a href="../../wiki/linear-attention/index.html">线性注意力</a>一类。</p>
+<p><a href="../positional-encoding/index.html">位置编码</a>是 NoPE 的对立面——NoPE 是其方案集合中"什么都不做"的选项；<a href="../rope/index.html">旋转位置编码 RoPE</a>是最常见的显式位置编码之一，后文以其作对照；<a href="../causal-mask/index.html">因果掩码</a>——位置 $t$ 只能看到前 $t$ 个 token 的遮挡规则——是 NoPE 能工作的结构前提。K3 的位置信息由 <a href="../kda/index.html">KDA</a> 提供，后者属于 <a href="../linear-attention/index.html">线性注意力</a>一类。</p>
 
 <p>一个贯穿全文的问题：三个内容不同的 token 喂给一个不加任何位置编码的注意力，三个位置的输出会一样吗？这个问题会在"为什么去掉位置编码仍能区分词序"一章用手算回答。</p>
 
@@ -168,11 +168,11 @@
 
 <p>标准注意力做的事情是"用 query 和 key 做匹配，按匹配程度对 value 加权求和"。它只关心两个 token 的内容像不像，不关心它们各自在第几位。这就引出一个问题：如果模型不知道 token 的位置，它还能区分"甲在前、乙在后"和"乙在前、甲在后"吗？</p>
 
-<p>要回答它，需要先考察注意力本身的一个性质。如果注意力是<strong>双向</strong>的（每个位置都能看到所有位置），并且不给任何位置信息，那么交换输入顺序后，每个位置仍然看到同样的一组 token、按同样的内容匹配得到同样的权重——只是输出跟着挪了位置，而每个位置上的输出值不变。这种现象叫<strong>排列等变</strong>：模型对"谁先谁后"没有真正的区分能力。</p>
+<p>要回答它，需要先考察注意力本身的一个性质。如果注意力是<strong>双向</strong>的（每个位置都能看到所有位置），并且不给任何位置信息，那么交换输入顺序后，每个位置仍然看到同样的一组 token、按同样的内容匹配得到同样的权重——输出随 token 一起置换，每个 token 携带的输出值不变，因此模型无法据此判断顺序。这种现象叫<strong>排列等变</strong>：模型对"谁先谁后"没有真正的区分能力。</p>
 
 <p class="chapter-summary">可以把双向注意力暂时理解成"只看一桌菜的合影，不分谁坐哪"。这个类比只帮助理解"内容匹配不等于位置感知"。它不适用于因果注意力（下一章会看到因果掩码改变了这件事）；正式判断仍以注意力的定义为准。</p>
 
-<p>正因如此，主流做法是主动注入位置信息——这就是<strong><a href="../../wiki/positional-encoding/index.html">位置编码</a></strong>。常见的显式位置编码大致分三类，各自"做了什么"不同：</p>
+<p>正因如此，主流做法是主动注入位置信息——这就是<strong><a href="../positional-encoding/index.html">位置编码</a></strong>。常见的显式位置编码大致分三类，各自"做了什么"不同：</p>
 
 <div class="table-scroll">
 <table>
@@ -180,7 +180,7 @@
 <tbody>
 <tr><td>绝对位置编码（APE）</td><td>给输入嵌入加一个与绝对位置绑定的向量</td></tr>
 <tr><td>相对位置编码（如 T5 相对 PE、ALiBi）</td><td>给注意力分数加一个与两个位置距离绑定的偏置</td></tr>
-<tr><td><a href="../../wiki/rope/index.html">旋转位置编码（RoPE）</a></td><td>根据绝对位置旋转 query 和 key</td></tr>
+<tr><td><a href="../rope/index.html">旋转位置编码（RoPE）</a></td><td>根据绝对位置旋转 query 和 key</td></tr>
 <tr><td>NoPE</td><td>三者都不做——不施加任何显式位置编码</td></tr>
 </tbody>
 </table>
@@ -205,7 +205,7 @@
     </details>
   </li>
 </ol>
-<p>本章说明注意力本身只做内容匹配，主流方案通过注入位置信息解决这一问题。但 NoPE 什么都不加——下一章讲清楚 NoPE 到底去掉了什么。</p>
+<p>注意力只做内容匹配，这是主流方案主动注入位置信息的原因。NoPE 把三类显式操作全部去掉，剩下的隐式位置信号是什么，需要先明确 NoPE 的定义。</p>
 
 <h2 id="what-is-nope">2. NoPE 是什么——去掉所有显式位置编码</h2>
 
@@ -234,21 +234,28 @@
     </details>
   </li>
 </ol>
-<p>本章定义了 NoPE——去掉所有显式位置编码。但把位置信息全去掉后模型还能区分词序吗——下一章讲因果掩码如何隐式提供位置信号。</p>
+<p>NoPE 去掉的是全部显式位置编码，人工机制不再注入任何位置信息。剩下的问题是：完全没有位置编码时，模型靠什么区分词序。</p>
 
 <h2 id="causal-mask-implicit-position">3. 为什么去掉位置编码仍能区分词序——因果掩码的隐式位置信号</h2>
 
-<p>要回答"顺序从哪来"，先需要<a href="../../wiki/causal-mask/index.html">因果掩码</a>这个结构前提。因果掩码是 decoder-only Transformer 中的一个遮挡规则：位置 $t$ 只能 attend 到位置 $1,2,\ldots,t$，看不到未来的 token。这是为了让模型自回归地预测下一个词——预测第 $t+1$ 个词时不能偷看它。</p>
+<p>要回答"顺序从哪来"，先需要<a href="../causal-mask/index.html">因果掩码</a>这个结构前提。因果掩码是 decoder-only Transformer 中的一个遮挡规则：位置 $t$ 只能 attend 到位置 $1,2,\ldots,t$，看不到未来的 token。这是为了让模型自回归地预测下一个词——预测第 $t+1$ 个词时不能偷看它。</p>
 
 <p>关键在于，因果掩码让每个位置可见的 token <strong>集合</strong>不同：位置 1 只看到 {1}，位置 2 看到 {1,2}，位置 3 看到 {1,2,3}。即使没有任何位置编码，不同位置因为可见的 token 数量不同，注意力输出也会不同——位置信息被结构隐式地编码了。<sup>[C2]</sup></p>
 
-<p>用公式把这个机制写清楚。位置 $t$ 的注意力输出是对它可见的 value 加权求和：</p>
+<p>位置 $t$ 的注意力输出是对它可见的 value 加权求和：</p>
 
 $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_i)}{\sum_{j=1}^{t}\exp(q_t^\top k_j)}.$$
 
-<p>这里 $q_t,k_i,v_i$ 分别是 query、key、value，都只来自内容，不含任何位置项（NoPE）。求和的上界是 $t$ 而不是序列长度——这正是因果掩码的体现：位置 $t$ 只对 $1,\ldots,t$ 求和。因此 $o_t$ 的取值范围依赖于 $t$，位置进入了计算。<sup>[F1]</sup></p>
+<ul>
+  <li>$o_t$：位置 $t$ 的注意力输出，是位置 $t$ 可见 value 的加权平均。</li>
+  <li>$q_t$：当前查询位置 $t$ 的 query；$k_i$、$v_i$：位置 $i$ 的 key 与 value。三者都只来自内容，不含任何位置项（NoPE）。</li>
+  <li>$\alpha_{t,i}$：位置 $t$ 对位置 $i$ 的注意力权重，由 $q_t^\top k_i$ 经 softmax 归一化得到。</li>
+  <li>$i=1,\ldots,t$：求和范围是位置 $t$ 可见的 $1$ 到 $t$，上界为 $t$ 而非序列长度，由因果掩码决定。</li>
+</ul>
 
-<p>现在回到贯穿全文的问题，把它手算出来。</p>
+<p>因为求和上界 $t$ 随位置变化，$o_t$ 的取值依赖于 $t$，位置进入了计算。<sup>[F1]</sup></p>
+
+<p>用一个构造示例回答贯穿全文的问题。</p>
 
 <p>构造示例。为了把因果掩码的作用从内容匹配中隔离出来，构造这样一个情形：三个 token 的注意力分数两两相等（于是 softmax 在可见 token 上均匀分配），但 value 取不同值 $v_1=2,\,v_2=4,\,v_3=6$（教学构造，不代表真实模型参数），以便观察输出差异。NoPE（$q,k$ 不含位置项），因果掩码：</p>
 
@@ -258,7 +265,7 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
   <li>位置 3：看到 {1,2,3}，权重各 $1/3$，输出 $o_3=(v_1+v_2+v_3)/3=(2+4+6)/3=4$。</li>
 </ul>
 
-<p>三个位置的输出是 $2,3,4$，各不相同。注意全程没有加任何位置编码——$q,k$ 只来自内容，没有位置嵌入、没有距离偏置、没有旋转。这里三个 token 的 value 不同（$v_1=2,v_2=4,v_3=6$），所以不同位置的加权平均不同；位置信息完全来自"位置 $t$ 只看前 $t$ 个"这件事。</p>
+<p>三个位置的输出是 $2,3,4$，各不相同。全程没有加任何位置编码——$q,k$ 只来自内容，没有位置嵌入、没有距离偏置、没有旋转。这里三个 token 的 value 不同（$v_1=2,v_2=4,v_3=6$），所以不同位置的加权平均不同；位置信息完全来自"位置 $t$ 只看前 $t$ 个"这件事。</p>
 
 <figure class="stack-diagram" role="img" aria-label="因果掩码下三个位置的可见 token 堆叠：位置 1 只见 v1，位置 2 见 v1 和 v2，位置 3 见 v1、v2、v3，可见集合随位置变化">
   <div class="stack-col">
@@ -312,24 +319,24 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     <p>因果求和公式 $o_t=\sum_{i=1}^{t}\alpha_{t,i}v_i$ 中，哪个部分体现了"位置进入了计算"。</p>
     <details>
       <summary>解答：求和上界 $t$ 依赖位置</summary>
-      <p>求和的上界 $t$。位置 $t$ 只对 $1,\ldots,t$ 求和而不是整个序列，这是因果掩码的体现；因此 $o_t$ 的取值范围依赖于 $t$ 本身，位置通过可见范围进入了计算，即使 $q$、$k$、$v$ 都不含位置项。</p>
+      <p>求和的上界 $t$。位置 $t$ 只对 $1,\ldots,t$ 求和而不是整个序列，这是因果掩码的体现；因此 $o_t$ 的取值依赖于 $t$ 本身，位置通过可见范围进入了计算，即使 $q$、$k$、$v$ 都不含位置项。</p>
     </details>
   </li>
 </ol>
-<p>本章用因果掩码的手算证明了 NoPE 能区分词序。但能工作不等于好用——下一章讲 NoPE 在长度泛化上的表现与理论解释。</p>
+<p>因果掩码的手算说明，没有显式位置编码时模型仍能区分词序。能区分不等于够好用，长度泛化上的表现和理论解释是下一个检验点。</p>
 
 <h2 id="length-generalization-and-theory">4. NoPE 在长度泛化上的表现——优于显式方法且无需调参</h2>
 
 <p>机制上 NoPE 能工作，那它到底好不好？NoPE 论文用<strong>长度泛化</strong>来检验。长度泛化指：在短序列上训练，在更长的序列上测试（外推）——训练时只见过长度 50 的序列，测试时给长度 100 甚至更长，看模型还能不能正确处理。</p>
 
-<p>论文在推理与数学任务上比较了五种方案（APE、T5 相对 PE、ALiBi、RoPE、NoPE）。结论（来自论文摘要）是：最常用的位置编码方法（ALiBi、RoPE、APE）并不适合长度外推；NoPE 优于这些显式位置编码方法，且不引入额外计算开销（NoPE 本来就什么都不加）。<sup>[C4]</sup></p>
+<p>论文在推理与数学任务上比较了五种方案（APE、T5 相对 PE、ALiBi、RoPE、NoPE）。结论（来自论文摘要）是：在长度泛化的下游任务上，最常用的位置编码方法（ALiBi、RoPE、APE）并不适合外推；NoPE 优于这些显式位置编码方法，且不引入额外计算开销（NoPE 本来就什么都不加）。<sup>[C4]</sup></p>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th>方案</th><th>长度泛化表现（论文摘要结论）</th><th>额外计算</th></tr></thead>
 <tbody>
 <tr><td>APE</td><td>不适合长度外推（摘要：与 ALiBi、RoPE 并列不佳）</td><td>有（位置嵌入）</td></tr>
-<tr><td>T5 相对 PE</td><td>不如 NoPE</td><td>有（相对偏置，训练/推理更慢）</td></tr>
+<tr><td>T5 相对 PE</td><td>不如 NoPE</td><td>有（相对偏置）</td></tr>
 <tr><td>ALiBi</td><td>不适合长度外推</td><td>有（距离偏置）</td></tr>
 <tr><td>RoPE</td><td>不适合长度外推</td><td>有（旋转）</td></tr>
 <tr class="highlight-row"><td>NoPE</td><td>优于上述显式方法</td><td>无</td></tr>
@@ -337,11 +344,9 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
 </table>
 </div>
 
-<p class="chapter-summary">来源：NoPE 论文摘要。本文不引用论文正文中的具体数值指标（如排名分数），因未从论文正文逐字核实，仅使用摘要直接支持的定性结论。</p>
-
 <p>论文还给了一个理论解释，回答了"NoPE 凭什么能表示位置"。理论上 NoPE 可以表示绝对位置编码和相对位置编码两种形式——也就是说，"不加位置编码"并不意味着"模型无法编码位置"，而是把编码位置的能力交给注意力权重去隐式学习。更进一步，论文发现用 SGD（随机梯度下降）训练时，NoPE 学到的注意力模式主要<strong>类似</strong> T5 的相对位置编码——模型自己学出了一套类似相对 PE 的模式，而不需要人工注入。<sup>[C3]</sup></p>
 
-<p>这就解释了为什么 NoPE 利于外推。显式位置编码常带有与训练长度绑定的参数——比如 RoPE 的频率基数决定了旋转角随位置增长的速率，当测试序列超过训练长度时，这些参数没见过的范围就需要插值或重缩放（如 YaRN 之类的方法）。NoPE 没有这类与长度绑定的参数，因此外推时不需要调整位置编码。这个类比只解释"为什么显式位置编码的外推需要调参"。它不保证 NoPE 在所有任务和所有长度上都最优，也不覆盖训练数据不足或任务本身不适用的情形；正式判断仍以论文结论为准。</p>
+<p>这就解释了为什么 NoPE 利于外推。显式位置编码常带有与训练长度绑定的参数——比如 RoPE 的频率基数决定了旋转角随位置增长的速率，当测试序列超过训练长度时，这些参数没见过的范围就需要插值或重缩放（如 YaRN 这类 RoPE 长度外推的插值方法）。NoPE 没有这类与长度绑定的参数，因此外推时不需要调整位置编码。这个类比只解释"为什么显式位置编码的外推需要调参"。它不保证 NoPE 在所有任务和所有长度上都最优，也不覆盖训练数据不足或任务本身不适用的情形；正式判断仍以论文结论为准。</p>
 
 <h3 id="length-generalization-and-theory-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -349,7 +354,7 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     <p>NoPE 论文在长度泛化上，NoPE 相比 ALiBi、RoPE、APE 的结论是什么？是否有额外计算开销。</p>
     <details>
       <summary>解答：NoPE 优于显式方法，无额外计算</summary>
-      <p>论文摘要结论：最常用的位置编码方法（ALiBi、RoPE、APE）并不适合长度外推，NoPE 优于这些显式位置编码方法。计算开销方面 NoPE 为零——它本来就什么都不加，而相对偏置、旋转等显式方案都引入额外计算。</p>
+      <p>论文摘要结论：在长度泛化的下游任务上，最常用的位置编码方法（ALiBi、RoPE、APE）并不适合外推，NoPE 优于这些显式位置编码方法。计算开销方面 NoPE 为零——它本来就什么都不加，而相对偏置、旋转等显式方案都引入额外计算。</p>
     </details>
   </li>
   <li>
@@ -363,38 +368,36 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     <p>为什么显式位置编码（如 RoPE）在外推时常需要插值或重缩放，而 NoPE 不需要。</p>
     <details>
       <summary>解答：显式方案有与训练长度绑定的参数</summary>
-      <p>显式位置编码常带有与训练长度绑定的参数——例如 RoPE 的频率基数决定旋转角随位置增长的速率，测试序列超过训练长度后，这些参数没见过的范围就需要插值或重缩放（如 YaRN）。NoPE 没有这类与长度绑定的位置参数，外推时不需要调整任何位置编码。需要注意这只说明外推无需调参，不保证 NoPE 在所有任务和长度上都最优。</p>
+      <p>显式位置编码常带有与训练长度绑定的参数——例如 RoPE 的频率基数决定旋转角随位置增长的速率，测试序列超过训练长度后，这些参数没见过的范围就需要插值或重缩放（如 YaRN）。NoPE 没有这类与长度绑定的位置参数，外推时不需要调整任何位置编码。该推理只覆盖「外推无需调参」，不覆盖「NoPE 在所有任务和长度上最优」。</p>
     </details>
   </li>
 </ol>
-<p>本章说明 NoPE 在长度泛化上优于显式方法且无需调参。但学术结论只是开始——下一章讲 NoPE 在 Kimi K3 中的实际应用。</p>
+<p>长度泛化上的优势来自受控任务，前沿大模型里的实际用法是另一回事：K3 把 NoPE 只用在一类层上，位置感由另一类层提供。</p>
 
 <h2 id="nope-in-kimi-k3">5. 在 Kimi K3 中怎么用 NoPE——MLA 用 NoPE、KDA 提供位置</h2>
 
-<p>NoPE 不只是受控任务上的学术结论，它被用在前沿大模型里。Kimi K3 就是一个例子。K3 采用<strong>混合注意力架构</strong>：两类层交替堆叠——KDA（循环、线性注意力一类，提供位置敏感的序列混合）和 Gated MLA（全局注意力，提供 token 间的全局内容交互）。KDA 与线性注意力的完整机制见 <a href="../../wiki/kda/index.html">KDA</a> 与 <a href="../../wiki/linear-attention/index.html">线性注意力</a>，这里只说它们在 NoPE 语境里的职责。</p>
+<p>NoPE 不只是受控任务上的学术结论，它被用在前沿大模型里。Kimi K3 就是一个例子。K3 采用<strong>混合注意力架构</strong>：两类层按 3:1 配比堆叠——每 3 层 KDA（循环、线性注意力一类，提供位置敏感的序列混合）接 1 层 Gated MLA（全局注意力，提供 token 间的全局内容交互），骨干末尾另加 1 层 Gated MLA。KDA 与线性注意力的完整机制见 <a href="../kda/index.html">KDA</a> 与 <a href="../linear-attention/index.html">线性注意力</a>，这里只说它们在 NoPE 语境里的职责。</p>
 
-<p>K3 对所有 MLA 层使用 NoPE，也就是不给 MLA 的 query 和 key 施加任何显式位置编码。这和 Kimi K2 / K2.5 不同——后两者用了显式位置编码（具体方案 K3 报告未说明）。位置信息由相邻的 KDA 层提供：KDA 的循环门控与衰减机制提供位置敏感与近因感知的序列混合，MLA 则提供不受限的全局内容交互。两者职责分开。<sup>[C5]</sup></p>
+<p>K3 对所有 MLA 层使用 NoPE，也就是不给 MLA 的 query 和 key 施加任何显式位置编码。这和 Kimi K2 / K2.5 不同——K3 报告只说明后两者未对 MLA 层使用 NoPE，未说明其具体方案。位置信息由相邻的 KDA 层提供：KDA 的循环门控与衰减机制提供位置敏感与近因感知的序列混合，MLA 则提供不受限的全局内容交互。两者职责分开。<sup>[C5]</sup></p>
 
-<figure class="arch-diagram" role="img" aria-label="K3 混合注意力：KDA 与 Gated MLA 交替堆叠，MLA 层施加 NoPE">
+<figure class="arch-diagram" role="img" aria-label="K3 混合注意力：每 3 层 KDA 后接 1 层 Gated MLA，MLA 层施加 NoPE">
   <span class="arch-dots">…</span>
   <span class="arch-node">KDA</span>
   <span class="arch-arrow">→</span>
-  <span class="arch-node nope">MLA</span>
+  <span class="arch-node">KDA</span>
   <span class="arch-arrow">→</span>
   <span class="arch-node">KDA</span>
   <span class="arch-arrow">→</span>
   <span class="arch-node nope">MLA</span>
-  <span class="arch-arrow">→</span>
-  <span class="arch-node">KDA</span>
   <span class="arch-dots">…</span>
 </figure>
-<p class="diagram-note">K3 混合注意力：KDA 与 Gated MLA 交替堆叠。MLA 层不给 $q$、$k$ 加位置编码（NoPE），位置信息由相邻 KDA 的循环门控与衰减隐式提供，MLA 只负责全局内容交互。</p>
+<p class="diagram-note">K3 混合注意力：每 3 层 KDA 接 1 层 Gated MLA（3:1），骨干末尾另加 1 层 Gated MLA。MLA 层不给 $q$、$k$ 加位置编码（NoPE），位置信息由相邻 KDA 的循环门控与衰减隐式提供，MLA 只负责全局内容交互。</p>
 
-<p>KDA 怎么携带位置感？它的循环状态随每一步更新，并用一个衰减因子压缩历史。K3 中衰减因子的对数 $g$ 被限制在有界范围内（下界 $g_{\min}=-5$），衰减因子 $\alpha=\exp(g)\in(e^{g_{\min}},1)$ 恒小于 1。这意味着越早的 token 在循环状态里被压缩得越多，循环状态自然偏好近期 token 并随位置累积变化——位置感由此而来。完整推导见 <a href="../../wiki/kda/index.html">KDA</a>。<sup>[F2]</sup></p>
+<p>KDA 怎么携带位置感？它的循环状态随每一步更新，并用一个衰减因子压缩历史。K3 中衰减因子的对数 $g$ 被限制在有界范围内（下界 $g_{\min}=-5$），衰减因子 $\lambda=\exp(g)\in(e^{g_{\min}},1)$ 恒小于 1。这意味着越早的 token 在循环状态里被压缩得越多，循环状态自然偏好近期 token 并随位置累积变化——位置感由此而来。完整推导见 <a href="../kda/index.html">KDA</a>。<sup>[F2, N2]</sup></p>
 
-<p>这种"MLA 用 NoPE、KDA 提供位置"的分工带来一个直接好处：扩展上下文长度时不需要调整任何位置编码参数。K3 报告说，由于 MLA 层用 NoPE，模型直接外推到 1M token 上下文，不需要 RoPE 频率基数重缩放或 YaRN 插值。训练上下文从 8K 起步，逐步扩展到 1M（8K→64K→256K→1M）。<sup>[C6, N1]</sup></p>
+<p>这种"MLA 用 NoPE、KDA 提供位置"的分工带来一个直接好处：扩展上下文长度时不需要调整任何位置编码参数。K3 报告说，由于 MLA 层用 NoPE，模型直接外推到 1M token 上下文，不需要 RoPE 频率基数重缩放或 YaRN 插值。预训练阶段从 8K 扩展到 64K，cooldown 阶段从 256K 扩展到 1M。<sup>[C6, N1]</sup></p>
 
-<p>这里要澄清一个容易产生的误解：K3 用 NoPE 不等于"K3 没有位置信息"。K3 只是在 MLA 层不显式注入位置编码；位置信息由 KDA 的循环门控与衰减机制隐式提供。整个模型仍然有位置感知能力，只是这个能力不在 MLA 层显式实现。</p>
+<p>K3 用 NoPE 不等于"K3 没有位置信息"。K3 只是在 MLA 层不显式注入位置编码；位置信息由 KDA 的循环门控与衰减机制隐式提供。整个模型仍然有位置感知能力，只是这个能力不在 MLA 层显式实现。</p>
 
 <h3 id="nope-in-kimi-k3-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -402,14 +405,14 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     <p>K3 对哪类层用 NoPE？位置信息由谁提供。</p>
     <details>
       <summary>解答：所有 MLA 层，位置由 KDA 提供</summary>
-      <p>K3 对所有 MLA 层使用 NoPE，不给 MLA 的 query 和 key 施加任何显式位置编码。位置信息由相邻的 KDA 层提供：KDA 的循环门控与衰减机制提供位置敏感与近因感知的序列混合，MLA 则提供不受限的全局内容交互，两者职责分开。这与使用显式位置编码的 Kimi K2 / K2.5 不同。</p>
+      <p>K3 对所有 MLA 层使用 NoPE，不给 MLA 的 query 和 key 施加任何显式位置编码。位置信息由相邻的 KDA 层提供：KDA 的循环门控与衰减机制提供位置敏感与近因感知的序列混合，MLA 则提供不受限的全局内容交互，两者职责分开。这与 Kimi K2 / K2.5 不同——K3 报告只说明后两者未对 MLA 层使用 NoPE，未说明其具体方案。</p>
     </details>
   </li>
   <li>
     <p>为什么 K3 在 MLA 层用 NoPE 后，扩展上下文长度不需要调位置编码参数。</p>
     <details>
       <summary>解答：没有与长度绑定的位置参数</summary>
-      <p>MLA 层没有与训练长度绑定的位置编码参数，位置信息由 KDA 的循环状态隐式提供，因此扩展上下文长度时不需要调整任何位置编码参数。K3 报告称模型直接外推到 1M token 上下文，无需 RoPE 频率基数重缩放或 YaRN 插值；训练上下文从 8K 起步逐步扩展到 1M（8K→64K→256K→1M）。</p>
+      <p>MLA 层没有与训练长度绑定的位置编码参数，位置信息由 KDA 的循环状态隐式提供，因此扩展上下文长度时不需要调整任何位置编码参数。K3 报告称模型直接外推到 1M token 上下文，无需 RoPE 频率基数重缩放或 YaRN 插值；预训练阶段从 8K 扩展到 64K，cooldown 阶段从 256K 扩展到 1M。</p>
     </details>
   </li>
   <li>
@@ -420,11 +423,11 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     </details>
   </li>
 </ol>
-<p>本章说明 K3 在 MLA 层用 NoPE、由 KDA 提供位置，从而直接外推到 1M 上下文。但 NoPE 并非万能——下一章讲 NoPE 的适用边界。</p>
+<p>K3 在 MLA 层用 NoPE、由 KDA 提供位置，才能把上下文直接外推到 1M。这套做法有前提，条件不成立时结论也会失效。</p>
 
 <h2 id="boundaries">6. NoPE 的适用边界——因果掩码是必要前提</h2>
 
-<p>NoPE 的隐式位置信号有一个必要前提：因果掩码。前面因果掩码一章的对照已经显示，因果掩码打破了排列对称性，才让不同位置的输出不同。在双向（非因果）注意力中，没有位置编码会导致排列等变、无法区分顺序——因果掩码一章改成双向的那个手算例子就是证明：三个位置输出全是 4。所以 NoPE"能去掉位置编码"的结论是在 decoder-only / 因果注意力上成立的，不能推广到任意注意力设置。<sup>[C2]</sup></p>
+<p>NoPE 的隐式位置信号有一个必要前提：因果掩码。前面因果掩码一章的对照已经显示，因果掩码打破了排列对称性，才让不同位置的输出不同。在双向（非因果）注意力中，没有位置编码会导致排列等变、无法区分顺序——因果掩码一章改成双向的那个手算例子就是证明：三个位置输出均为 $(v_1+v_2+v_3)/3=4$。所以 NoPE"能去掉位置编码"的结论是在 decoder-only / 因果注意力上成立的，不能推广到任意注意力设置。<sup>[C2]</sup></p>
 
 <div class="table-scroll">
 <table>
@@ -436,9 +439,9 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
 </table>
 </div>
 
-<p>其次，NoPE 的位置信号是<strong>隐式</strong>的、由模型结构与训练共同塑造，不像显式编码那样直接、可控。因果掩码一章的手算例子里，位置信号表现为"可见 token 集合不同"，但具体的注意力模式要靠训练去学。论文也发现 NoPE 学到的模式"主要类似" T5 相对 PE——是"主要类似"而非完全等价。<sup>[C3]</sup>在某些任务或训练数据不足的情况下，NoPE 可能学不到足够的位置信号。本文不把单任务结论推广为"NoPE 在一切场景都最优"。</p>
+<p>另一条边界在位置信号本身：它是<strong>隐式</strong>的、由模型结构与训练共同塑造，不像显式编码那样直接、可控。因果掩码一章的手算例子里，位置信号表现为"可见 token 集合不同"，但具体的注意力模式要靠训练去学。论文也发现 NoPE 学到的模式"主要类似" T5 相对 PE——是"主要类似"而非完全等价。<sup>[C3]</sup>在某些任务或训练数据不足的情况下，NoPE 可能学不到足够的位置信号。本文不把单任务结论推广为"NoPE 在一切场景都最优"。</p>
 
-<p>最后，K3 的应用还有一个额外条件：K3 的 NoPE 之所以可用，依赖相邻 KDA 层提供位置敏感的序列混合。K3 不是"纯 NoPE 堆叠"，而是"NoPE 的 MLA + 提供位置的 KDA"的混合。如果换成缺少这种位置提供者的纯 NoPE 堆叠，不保证有等价效果——这超出 NoPE 论文的保证范围。</p>
+<p>K3 的应用还有一个额外条件：K3 的 NoPE 之所以可用，依赖相邻 KDA 层提供位置敏感的序列混合。K3 不是"纯 NoPE 堆叠"，而是"NoPE 的 MLA + 提供位置的 KDA"的混合。如果换成缺少这种位置提供者的纯 NoPE 堆叠，不保证有等价效果——这超出 NoPE 论文的保证范围。</p>
 
 <h3 id="boundaries-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -446,7 +449,7 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     <p>NoPE 能工作的必要结构前提是什么？在双向注意力中无位置编码会怎样。</p>
     <details>
       <summary>解答：前提是因果掩码，双向会排列等变</summary>
-      <p>必要前提是因果掩码。因果掩码让每个位置的可见 token 集合不同，打破了排列对称性，隐式位置信号才有来源。双向注意力中所有位置看到相同的 token 集合，无位置编码时输出排列等变、无法区分顺序——构造示例改成双向后三个位置输出全为 4 就是证明。因此"NoPE 能去掉位置编码"只在 decoder-only / 因果注意力上成立。</p>
+      <p>必要前提是因果掩码。因果掩码让每个位置的可见 token 集合不同，打破了排列对称性，隐式位置信号才有来源。双向注意力中所有位置看到相同的 token 集合，无位置编码时输出排列等变、无法区分顺序——构造示例改成双向后三个位置输出全为 $(v_1+v_2+v_3)/3=4$ 就是证明。因此"NoPE 能去掉位置编码"只在 decoder-only / 因果注意力上成立。</p>
     </details>
   </li>
   <li>
@@ -464,7 +467,7 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
     </details>
   </li>
 </ol>
-<p>至此本页回答了开篇的核心问题：什么都不加，顺序由因果掩码隐式提供；这样做在长度泛化上优于显式方法，在 K3 中让 MLA 直接外推到 1M 上下文。NoPE 的适用边界也很清楚：依赖因果掩码，依赖 KDA 提供位置（在 K3 中），不是万能方案。</p>
+<p>什么都不加，顺序由因果掩码隐式提供；这样做在长度泛化上优于显式方法，在 K3 中让上下文无需修改位置编码即可扩展到 1M。NoPE 的适用边界也很清楚：依赖因果掩码，依赖 KDA 提供位置（在 K3 中），不是万能方案。</p>
 
 <h2 id="sources-and-scope">来源与范围说明</h2>
 
@@ -473,7 +476,7 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
   <li><b>C1（NoPE 定义）</b>：NoPE 论文——Kazemnejad, Padhi, Ramamurthy, Das, Reddy, "The Impact of Positional Encoding on Length Generalization in Transformers", NeurIPS 2023, arXiv:2305.19466，摘要（将 NoPE 列为"Transformers without positional encoding"）；K3 报告 §2.1.2（"applies No Position Encoding (NoPE) to all MLA layers ... no explicit positional encoding is applied to their queries or keys"）。</li>
   <li><b>C2（因果掩码打破排列对称）</b>：NoPE 论文摘要——"explicit position embeddings are not essential for decoder-only Transformers to generalize well to longer sequences"；"We theoretically demonstrate that NoPE can represent both absolute and relative PEs"。摘要未出现"因果掩码使 NoPE 可表示位置"的因果归因；因果掩码打破排列对称、从而隐式编码位置的机制，是本文"因果掩码的隐式位置信号"一章手算构造的论证，不归因到论文理论部分。</li>
   <li><b>C3（NoPE 可表示绝对/相对 PE，SGD 下主要类似 T5 相对 PE）</b>：NoPE 论文摘要——"We theoretically demonstrate that NoPE can represent both absolute and relative PEs, but when trained with SGD, it mostly resembles T5's relative PE attention patterns."</li>
-  <li><b>C4（NoPE 长度泛化优于显式方法，无额外计算）</b>：NoPE 论文摘要——"the most commonly used positional encoding methods, such as ALiBi, Rotary, and APE, are not well suited for length generalization ... NoPE outperforms other explicit positional encoding methods while requiring no additional computation."</li>
+  <li><b>C4（NoPE 长度泛化优于显式方法，无额外计算）</b>：NoPE 论文摘要——"the most commonly used positional encoding methods, such as ALiBi, Rotary, and APE, are not well suited for length generalization in downstream tasks. NoPE outperforms other explicit positional encoding methods while requiring no additional computation."</li>
   <li><b>C5（K3 对 MLA 用 NoPE，KDA 提供位置）</b>：K3 报告 §2.1.2——"The intervening KDA layers provide position-sensitive and recency-aware sequence mixing, while the MLA layers provide unrestricted global content interaction."</li>
   <li><b>C6（K3 直接外推到 1M，无需 RoPE 重缩放/YaRN）</b>：K3 报告 §2.1.2 与 §3.4——"the model extrapolates directly to 1M-token contexts without any positional-encoding modification, such as RoPE rescaling or interpolation."</li>
 </ul>
@@ -481,14 +484,14 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
 <h3>公式与来源（F）</h3>
 <ul>
   <li><b>F1（因果注意力输出）</b>：标准 scaled dot-product attention 的因果形式（Vaswani et al. 2017 的因果变体），用于"因果掩码的隐式位置信号"一章构造示例，非外部新结论。</li>
-  <li><b>F2（KDA 衰减因子）</b>：K3 报告 §2.1.2 Eq.(5)——$g_t^h=g_{\min}\mathrm{Sigmoid}(e^{A_h}z_t^h)\in(g_{\min},0)^{d_k}$，$\alpha_t^h=\exp(g_t^h)\in(e^{g_{\min}},1)^{d_k}$，$g_{\min}=-5$。本文只取"$\alpha&lt;1$ 偏好近因、随位置累积携带位置感"的结论。</li>
+  <li><b>F2（KDA 衰减因子）</b>：K3 报告 §2.1.1 Eq.(5)——$g_t^h=g_{\min}\mathrm{Sigmoid}(e^{A_h}z_t^h)\in(g_{\min},0)^{d_k}$，其中 $g_{\min}=-5$；衰减因子（报告记作 $\alpha_t^h$，本文正文记作 $\lambda$）$\exp(g_t^h)\in(e^{g_{\min}},1)^{d_k}$ 恒小于 1。本文只取"$\lambda&lt;1$ 偏好近因、随位置累积携带位置感"的结论。</li>
 </ul>
 
 <h3>外部数字与实验条件（N）</h3>
 <ul>
   <li><b>N1（K3 上下文 8K→1M）</b>：K3 报告 §3.4——预训练从 8K 起，扩展到 64K；cooldown 阶段从 256K 扩展到 1M。</li>
-  <li><b>N2（K3 $g_{\min}=-5$）</b>：K3 报告 §2.1.2，KDA 衰减对数下界固定为 $-5$。本文仅作"衰减有界"的佐证。</li>
-  <li>注：NoPE 论文正文中的具体数值指标（如各方案的排名分数）本文未引用，因未从论文正文逐字核实，仅使用摘要直接支持的定性结论。</li>
+  <li><b>N2（K3 $g_{\min}=-5$）</b>：K3 报告 §2.1.1，KDA 衰减对数下界固定为 $-5$。本文仅作"衰减有界"的佐证。</li>
+  <li>注：NoPE 论文正文中的具体数值指标（如各方案的排名分数）本文未引用，仅使用摘要直接支持的定性结论。</li>
 </ul>
 
 <h3>构造示例</h3>
@@ -508,7 +511,7 @@ $$o_t=\sum_{i=1}^{t}\alpha_{t,i}\,v_i,\qquad \alpha_{t,i}=\frac{\exp(q_t^\top k_
   <li><b>假设注意力分数两两相等</b>：简化做法。可推出：因果掩码使可见集合随位置变化，从而隐式编码位置。不可推出：真实注意力权重总是均匀（真实分数由内容决定、一般不等，但"可见集合随位置变化"这一核心机制不变）。</li>
   <li><b>value 取固定值 $v_1=2,v_2=4,v_3=6$</b>：简化做法。可推出：不同位置的加权平均不同，位置被隐式编码。不可推出：真实模型的 value 分布（这是便于手算的构造，不代表真实数据分布）。</li>
   <li><b>单头、未写缩放因子</b>：简化做法。可推出：因果掩码提供位置信号的结论。不可推出：真实模型为多头且带 $\sqrt{d_k}$ 缩放时的具体数值（省略多头与缩放不影响结论）。</li>
-  <li><b>KDA 机制只取结论</b>：简化做法。可推出：KDA 衰减因子 $\alpha&lt;1$ 使循环状态偏好近因并随位置累积，为 MLA 提供位置信息。不可推出：KDA 的分块计算、门控与 Tensor Core 优化细节（完整机制见 <a href="../../wiki/kda/index.html">KDA</a>）。</li>
+  <li><b>KDA 机制只取结论</b>：简化做法。可推出：KDA 衰减因子 $\lambda&lt;1$ 使循环状态偏好近因并随位置累积，为 MLA 提供位置信息。不可推出：KDA 的分块计算、门控与 Tensor Core 优化细节（完整机制见 <a href="../kda/index.html">KDA</a>）。</li>
 </ul>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

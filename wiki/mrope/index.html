@@ -63,7 +63,7 @@
 </blockquote>
 
 <p>一句「请描述这张图」的提示词里，文本 token 一字排开、天然有序；图像 token 却来自一张 $28\times28$ 的网格——排在同一行的两个 patch 相邻，排在同一列的两个 patch 也相邻，把它们拉平塞进一条一维位置轴，这两个方向就再也分不出来了。MRoPE（多模态旋转位置编码）的答案是：把位置编号从一个数变成三个数。旋转本身仍是 <a href="../rope/">RoPE</a>，位置编码家族的背景见<a href="../positional-encoding/">位置编码</a>。</p>
-<p>本文的学习路线：先看一维位置轴在多模态下缺什么；再看三个分量怎么取值、三种模态各怎么分配；然后看三条位置轴怎么共用同一组旋转频率（分段与交错两种排布）；最后算一笔「位置轴上的省账」——多模态输入让位置编号走得慢多少，换来什么。</p>
+<p>多模态位置编码要回答四件事：一维位置轴在网格输入下缺什么；三个分量怎么取值、三种模态各怎么分配；三条位置轴怎么共用同一组旋转频率（分段与交错两种排布）；多模态输入让位置编号走得慢多少。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -163,15 +163,15 @@
 
 <p>文本三值相同意味着 MRoPE 在纯文本序列上功能等价于 1D-RoPE<sup>[C2]</sup>——退化是无损的。视觉段的生成式<sup>[F1]</sup>（论文正文以图示与文字呈现规则、无显式公式，此处取自官方实现源码）：</p>
 
-$$T=\mathrm{arange}(t)\cdot\text{interval}+s,\qquad H=\mathrm{arange}(h/\text{merge})+s,\qquad W=\mathrm{arange}(w/\text{merge})+s$$
+$$T=\mathrm{arange}(n_t)\cdot\text{interval}+s,\qquad H=\mathrm{arange}(g_h/\text{merge})+s,\qquad W=\mathrm{arange}(g_w/\text{merge})+s$$
 
 <ul>
-<li>$s$：该视觉块在位置轴上的起始值；$t$ 为时间片数（源码中每 2 帧合成一个时间片），interval 为片间隔（默认取 1）。</li>
-<li>$h,w$：网格高宽（patch 数）；$\text{merge}=2$ 是空间合并因子——相邻 $2\times2$ 的 patch 已被合并成单个 token，网格坐标相应折半。</li>
-<li>图像是单帧（$t=1$），$T$ 退化为常数 $s$；视频 $t&gt;1$ 时 $T$ 逐帧递增，与上表「视频 $t$ 逐帧递增」一行一致。</li>
+<li>$s$：该视觉块在位置轴上的起始值；$n_t$ 为帧数（时间维每帧递增一步），interval 为帧间隔（默认取 1）。</li>
+<li>$g_h,g_w$：网格高宽（patch 数）；$\text{merge}=2$ 是空间合并因子——相邻 $2\times2$ 的 patch 已被合并成单个 token，网格坐标相应折半。</li>
+<li>图像是单帧（$n_t=1$），$T$ 退化为常数 $s$；视频 $n_t&gt;1$ 时 $T$ 逐帧递增，与上表「视频 $t$ 逐帧递增」一行一致。</li>
 </ul>
 
-<p>跨模态衔接规则：每个模态的位置编号从前一模态最大位置 id 加一开始<sup>[C7]</sup>。视觉 token 的最大位置 id 是 $s+\max(h,w)/\text{merge}-1$，因此「加一」等价于图像块结束后位置轴推进 $\max(h,w)/\text{merge}$——这条规则的两面在「位置轴上的省账」一章展开。</p>
+<p>跨模态衔接规则：每个模态的位置编号从前一模态最大位置 id 加一开始<sup>[C7]</sup>。视觉 token 的最大位置 id 是 $s+\max(g_h,g_w)/\text{merge}-1$，因此「加一」等价于图像块结束后位置轴推进 $\max(g_h,g_w)/\text{merge}$——这条规则的两面在「位置轴上的省账」一章展开。</p>
 
 <p>构造示例。 序列 = 8 个文本 token + 一张 $(1,28,28)$ 的图（196 个视觉 token）+ 5 个文本 token。视觉段 $\text{merge}=2$ 后网格为 $14\times14$：</p>
 
@@ -279,7 +279,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 
 <p>分段排布（qwen2_vl 一系实现）是另一种分法：把 cos/sin 沿维度切成三段，每段独占。以 Qwen2-VL 官方模型配置（Qwen2-VL-7B 的 config.json，rope_scaling.mrope_section）为例：mrope_section $=[16,24,24]$，频率槽位共 64 个，$T$ 独占槽位 $[0,15]$（cos/sin 维度 $[0,31]$）、$H$ 独占 $[16,39]$、$W$ 独占 $[40,63]$。源码写法是 <code>mrope_section*2</code> 得 $[32,48,48]$ 后按 <code>i%3</code> 取段<sup>[C8]</sup>。</p>
 
-<p>频率槽位的方向需要注意：RoPE 的 inv_freq 随槽位下标递减，槽位 0 是最高频、末位槽位是最低频（分层含义见<a href="../rope/">RoPE</a>）。因此上述分段里 $T$ 独占的是最高频段、$W$ 独占的是最低频段；交错排布则让三个分量都以 3 为步长穿插在从高频到低频的全部槽位上，每个分量都覆盖完整频率范围。分段的代价是每个分量只对自己那段距离尺度有分辨率；交错的代价是配额只能近似均分（$W$ 少一档）。</p>
+<p>RoPE 的 inv_freq 随槽位下标递减，槽位 0 是最高频、末位槽位是最低频（分层含义见<a href="../rope/">RoPE</a>）。因此上述分段里 $T$ 独占的是最高频段、$W$ 独占的是最低频段；交错排布则让三个分量都以 3 为步长穿插在从高频到低频的全部槽位上，每个分量都覆盖完整频率范围。分段的代价是每个分量只对自己那段距离尺度有分辨率；交错的代价是配额只能近似均分（$W$ 少一档）。</p>
 
 <details>
 <summary>补充：为什么 32 个槽位对应 64 个旋转维</summary>
@@ -324,7 +324,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 
 <p>论文把这归为 MRoPE 的实际收益：M-RoPE 降低了图像与视频的位置 id 取值，使模型能在推理时外推到更长序列<sup>[C6]</sup>。两个支撑数字<sup>[N1, N2]</sup>：其一，Qwen2-1.5B + ViT-L 骨干的消融显示 M-RoPE 在多数基准上优于 1D-RoPE、视频基准提升最明显（如 NextQA 46.0 对 43.9、STAR 57.9 对 55.5；个别基准如 RWQ、InfoVQA 小幅下降），论文的措辞是「更好的整体表现，尤其视频基准」；其二，训练时每个视频最多 16K token，推理到 80K token 仍保持性能（Figure 5 语境为 Qwen2-VL-72B 在 Video-MME 中等时长视频）。</p>
 
-<p>回到贯穿示例收尾：8 个文本 + 一张 $(1,28,28)$ 图 + 5 个文本的序列，token 数 209，而位置轴只用到 $22+5-1=26$。若把这张图换成 $(1,84,84)$，token 数变 1777，位置轴仍是 $8+42+5-1=54$——序列长了一处，位置轴几乎没动。这就是「位置轴预算」视角的全部含义。Qwen3.8-Flash-Next 的完整配置与上下文占比实测见<a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>。Qwen3.5-397B-A17B 的 MRoPE 配置与此逐项相同（rotary_dim 64、mrope_section $[11,11,10]$、$\theta=10^7$），其视觉 token 位置推进与长上下文开销见<a href="../qwen3-5-dataflow/index.html">Qwen3.5-397B-A17B 前向数据流</a>。</p>
+<p>回到贯穿示例收尾：8 个文本 + 一张 $(1,28,28)$ 图 + 5 个文本的序列，token 数 209，而位置轴只用到 $22+5-1=26$。若把这张图换成 $(1,84,84)$，token 数变 1777，位置轴仍是 $8+42+5-1=54$——序列长了一处，位置轴几乎没动。token 数与位置轴范围由此解耦。Qwen3.8-Flash-Next 的完整配置与上下文占比实测见<a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>。Qwen3.5-397B-A17B 的 MRoPE 配置与此逐项相同（rotary_dim 64、mrope_section $[11,11,10]$、$\theta=10^7$），其视觉 token 位置推进与长上下文开销见<a href="../qwen3-5-dataflow/index.html">Qwen3.5-397B-A17B 前向数据流</a>。</p>
 
 <h3 id="position-budget-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -332,7 +332,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
     <p>「前一模态最大位置 id 加一」和「推进 $\max(h,w)/\text{merge}$」是什么关系？</p>
     <details>
       <summary>解答：同一规则的两种表述</summary>
-      <p>视觉 token 的 $h/w$ 各自从起始值 $s$ 遍历到 $s+\text{边长}/\text{merge}-1$，$t$ 恒为 $s$，因此块内最大位置 id 是 $s+\max(h,w)/\text{merge}-1$；「下一个模态从最大 id 加一开始」即从 $s+\max(h,w)/\text{merge}$ 开始。论文用前一种表述，实现源码算后一种，数值相同。</p>
+      <p>视觉 token 的高、宽分量各自从起始值 $s$ 遍历到 $s+g_h/\text{merge}-1$ 与 $s+g_w/\text{merge}-1$，时间分量恒为 $s$，因此块内最大位置 id 是 $s+\max(g_h,g_w)/\text{merge}-1$；「下一个模态从最大 id 加一开始」即从 $s+\max(g_h,g_w)/\text{merge}$ 开始。论文用前一种表述，实现源码算后一种，数值相同。</p>
     </details>
   </li>
   <li>
@@ -353,7 +353,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 <p>F1 视觉段三维生成式：qwen4_exp L1980-2030 get_vision_position_ids（论文正文无显式公式，以 Figure 3 与文字描述呈现，本页公式取自官方实现并标注这一对应）。F2 交错槽位分配：qwen4_exp L150-154，本机实测复现。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>N1 消融数字（NextQA 46.0/43.9、STAR 57.9/55.5 等）：论文 §3.3.2 Table 8，Qwen2-1.5B + ViT-L 预训练骨干。N2 16K 训练 / 80K 推理：§3.3.2，Video-MME（Figure 5）。N3/N4 推进量与构造序列实测：本机运行，脚本见本页代码块与数据流页 research/。</p>
+<p>N1 消融数字（NextQA 46.0/43.9、STAR 57.9/55.5 等）：论文 §3.3.2 Table 8，Qwen2-1.5B + ViT-L 预训练骨干。N2 16K 训练 / 80K 推理：§3.3.2，Video-MME（Figure 5）。N3/N4 推进量与构造序列实测：本机运行，脚本见本页代码块。</p>
 
 <h3>构造示例</h3>
 <p>「8 文本 + $(1,28,28)$ 图 + 5 文本」序列及其 token id 均为构造；网格尺寸与 merge 取真实量级；两张槽位表为本机按源码规则复算的真实输出。</p>

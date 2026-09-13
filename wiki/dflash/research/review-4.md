@@ -1,0 +1,57 @@
+<!-- review-meta
+round: 4
+page: wiki/dflash/index.html
+reviewed_content_sha256: 8d0c2c65e1c4fff3
+-->
+# DFlash 审查记录（第 4 轮）
+
+- 页面版本：index.html 工作树哈希 d9b70ee21d47e5886276fc39a8dad0e1af0544dd（sha256 548648e17e822296fed17b5afdaf926fa77037d6adecc6904a1ad34852d51105）
+- 论文版本：arXiv:2602.06036v2（2026-05-28，cs.CL；HTML 全文核对，含 Figure/Table 编号与附录 A）
+- 外部来源：Inco AI 官方博客《DFlash 2 发布》(https://inco.ai/blog/dflash2/，2026-08-18)
+- 审查时间：2026-09-13 19:35
+- 审查者：独立子代理（未参与写作与前序轮次）
+- 已完整阅读章节：核心问题（5 题）→ 1 起草为什么慢 + 本章问题 → 2 推理管线 + 本章问题 → 3 训练（3.1–3.5）+ 本章问题 → 4 实验（4.1–4.6）+ 本章问题 → 5 方法评价 + 本章问题 → 来源与范围说明（含全部折叠块、图注与 alt 文本）
+- 机械验证：`python3 .dojo/scripts/validate.py wiki/dflash/index.html` → validation ok
+
+## 问题
+
+- [阻断·技术] §1 正文与图注（L138 与 L142）：同一张「起草延迟」图在正文里被标为「论文 Figure 4」，紧随其后的图注却写「论文 Figure 3」。论文中该图确为 Figure 3；Figure 4 是训练注意力图。同一页对同一张图给出两个互斥编号，读者无法判断引用哪一个。｜引文依据：论文 §3.2 Eq.(3) 之后原文「Figure 3 : Draft cost of 1, 3, 5-layer DFlash and 1-layer EAGLE-3.」｜修复要求：L138「下图是论文 Figure 4 给出的一组实测对比」改为「论文 Figure 3」；图注 L142 保持 Figure 3 不变。｜修复：｜复验：
+- [阻断·技术] §3.2 正文与图注（L281 与 L285）+ 4.6/来源表（L538、L543）：训练稀疏掩码图编号同样错位且自相矛盾。正文写「论文 Figure 3 把这块稀疏掩码画出来」，图注写「论文 Figure 4：……」却又在「原文位置」里写「Figure 3 标题为『DFlash training attention』」——同一图注内出现两个编号，且「原文位置」里的编号与论文不符（论文该图为 Figure 4）。｜引文依据：论文 §4.2 原文「Figure 4 : DFlash training attention. The target model provides context features (blue) … Tokens attend bidirectionally within the same block …」；同页 §3.2 之后的 Figure 3 标题为「Draft cost of 1, 3, 5-layer DFlash and 1-layer EAGLE-3.」｜修复要求：L281 全身改为「论文 Figure 4」；L285 图注「原文位置：§4.2 Training，Figure 3 标题为……」中的编号改为 Figure 4；同时核对引用 Tab./Fig. 编号位置（C9 的 Fig. 5、C6 的 §4.1 等）全文一致。｜修复：｜复验：
+- [阻断·技术] 头部 description（L6）、正文导语（L70）、4.1 正文（L362）：EAGLE-3 提升倍数在页内三处互相矛盾，且与官方材料的 headline 数字不符。description 写「相对 EAGLE-3 高 2.5×」；dojo:summary 与导语写「2.4×」；L362 更把它称作「论文最常被引用的 headline 数字」。论文的 headline 是 2.5×（摘要与 Figure 1 图注），页内 Table 4.1 自身对 Qwen3-8B 也给出 T=0 2.8×、T=1 2.4×，导语却把 2.4× 单独挂在「Qwen3-8B」名下。｜引文依据：摘要「delivering up to 2.5× higher speedup than the state-of-the-art speculative decoding method EAGLE-3」；Figure 1 图注「Overall, DFlash achieves more than 2.5× higher speedup than EAGLE-3.」；§1「is nearly 2.5× faster than the state-of-the-art EAGLE-3 across most benchmarks」；页内 Table 4.1 Qwen3-4B/8B T=0 比值 4.91/1.81=2.71、4.86/1.76=2.76｜修复要求：统一为论文口径——导语与 summary 写「相对 EAGLE-3 高 2.5×（论文 headline；按 Tab. 1 各行折算为 2.4–2.8×）」，删除「2.4× 是论文 headline 数字」的表述，并把 description 与 summary 的数字对齐。｜修复：｜复验：
+- [重要·技术] 1 章符号表（L125）、3.3 损失公式（L292、L296）、核心问题 3 解答（L95）：符号 γ 全页不是单义。L125 定义「$\gamma$：周期内草稿 token 数」，L296 又把同一字形定义为「$\gamma$：衰减率超参，块 16 取 7」，且两处对同一个「块 16」给出 γ=16 与 γ=7 两个值。读者按 F6 代入 γ=16 会得到完全不同的权重。｜引文依据：论文 Eq.(2) 用 γ 表示 speculation budget（「Drafting costs therefore grow linearly with the speculation budget γ」），Eq.(4) 的 w_k=exp(−(k−1)/γ) 又用 γ 表示 decay rate（A.1「The hyperparameter γ for the loss decay in Equation 4 is set to 7 for block size 16」）——论文原稿存在同形复用，页面照搬未消歧。｜修复要求：F6 处把衰减率改写为独立符号（如 $\gamma_w$ 或直接写「衰减率 $\gamma_w=7$」），并在 F6 符号表注明「与 F1/F2 的 γ（块大小）不是同一个量」。｜修复：｜复验：
+- [重要·技术] 2 章「单步并行起草意味着什么」段（L208）：「代价是块内不连贯——位置之间互不可见」与同页两处图注/alt 及论文均矛盾。同页 L213 alt 写「一起进入 Draft Layer 1 的双向注意力」，L284/L285 写「块内 mask 位置互相可见」，论文 §4.2 明写块内双向注意。位置之间并非互不可见，单步并行的代价来自「没有多轮去噪修正」，不是可见性。｜引文依据：论文 §4.2「Tokens attend bidirectionally within the same block and to the corresponding injected target context features」；Figure 2 图内标注「Bidirectional Attention」｜修复要求：删去「位置之间互不可见」，改为「代价是块内没有多轮去噪修正、无法互相校正（位置之间仍可按双向注意互相看到）」，或整句降级为标注的分析性推断。｜修复：｜复验：
+- [重要·技术] 4.3 SGLang 段（L394）与核心问题 4 解答（L109）：并发 32 的加速区间与本页表格不符。L394 写「并发 32 时仍 2.3–3.1×」，本页表 conc 32 列为 2.9/2.2/2.8/2.4/3.1/2.3/3.1，最小值是 2.2×（Qwen3-4B HumanEval），不是 2.3×；L109 写「并发 32 SGLang 仍 2.8–2.9×」，该区间只覆盖数学两项，与整表不符。｜引文依据：论文 Table 3 并发 32 列 Qwen3-4B Math500 2.9×、HumanEval 2.2×、Qwen3-8B Math500 2.8×、HumanEval 2.4×、Qwen3-Coder HumanEval 3.1×、LCB 2.3×、MBPP 3.1×｜修复要求：L394 改为「并发 32 时仍 2.2–3.1×」；L109 改为「并发 32 SGLang 仍 2.2–3.1×（数学任务 2.8–2.9×）」。｜修复：｜复验：
+- [重要·技术] 5 章本章问题 2 解答（L516）：出现未定义术语与跨任务/跨模型的失当比较。「5L+conv」「8L+conv」全页只此一处，论文任何表格都没有 conv 变体；随后拿 DFlash 5 层 Math500 的 τ=5.99 与 EAGLE-3(60) GSM8K 的 τ=3.77 并列称「相近」，两者分属不同模型、不同任务，不构成比较；论文原话是 DFlash 的接受长度与 EAGLE-3-5L 相当（同表同任务），页面误写成 EAGLE-3(60) 并换了任务。｜引文依据：论文 §5.5.5「DFlash achieves acceptance length comparable to EAGLE-3-5L, but obtains much higher speedup」；全文检索无「convolution」「depthwise」，Table 6 只有 3-L/5-L/8-L；Table 1 中 3.77 是 Qwen3-4B EAGLE-3(60) 的 GSM8K τ｜修复要求：删去「+conv」；改为「Table 9 中块扩散+KV 注入的 τ（4.2/4.0/3.0）与 EAGLE-3-5L（4.2/4.3/3.1）同档，但加速比高得多（3.3×/3.2×/2.2× vs 2.1×/2.2×/1.4×）」。｜修复：｜复验：
+- [重要·技术] 5 章评价表「训练效率」行（L488）：引文定位错，且引文与结论的因果关系被改写。页面把引语标为「论文 §4.2」，该句实际位于 §5.4（Long Context Adaptation）的「Efficient long-context training」段；「DFlash 的 anchor 随机采样 + 稀疏掩码无此开销」是页面的解读（论文原句说的是「fixing the number of masked blocks per sequence and randomly sampling anchor positions for each sequence at every epoch」），页面已在括号内标了「分析性推断」，但引语定位错误使该推断无法按标注位置核对。｜引文依据：论文 §5.4「Training speculative draft models on long contexts is challenging for methods such as EAGLE-3 due to their costly training-time test. DFlash achieves efficient long-context training by fixing the number of masked blocks per sequence and randomly sampling anchor positions for each sequence at every epoch.」｜修复要求：把该行引语来源由「§4.2」改为「§5.4」，并把「无 test-time test 开销」明确写成基于该段的分析性推断。｜修复：｜复验：
+- [重要·技术] 来源与范围说明（L531、L550）与正文 C16 用法（L373、L394、L488、L509、L523）：论断编号体系不一致，编号与定义不符。L531 称「核心论断 C1–C17」，但下表只定义到 C16；被定义的 C16 是「高并发收益缩水的机制解释」，正文却把 [C16] 用作至少五处不同推断的依据——思考链对草稿器不友好（L373）、绝对数字差异源于 batch 调度（L394）、KV 注入对 MoE 目标有效（L394）、批处理填满空闲算力（L490）、单卡环境限制（L523）、无 test-time test 开销（L488）。｜引文依据：页面 L531「核心论断 C1–C17 编号见正文与下表」与 L550「C16（高并发收益缩水的机制解释——分析性推断）」（定义范围与用法不匹配）｜修复要求：或把 C16 的定义扩写为「本文全部分析性推断的集合」，或为每类推断单列编号（C16 高并发、C17 思考链、C18 后端差异…）并把 L531 的上界改为与实际定义一致。｜修复：｜复验：
+- [重要·技术] 4.4 vLLM 段（L412）：「同一对模型的 Transformers 后端数字未单列，但 SGLang vs vLLM 数字可推断 vLLM 落后约 0.5–1×」——页面的 SGLang 主表用的是 Qwen3-4B/8B/Coder-30B，vLLM 用的是 Qwen3.5-9B，不存在「同一对模型」；而论文里确实存在同模型同并发的可比数据（Tab. 11 SGLang 并发 8 vs Tab. 12 vLLM 并发 8，均为 Qwen3.5-9B），实测差距是 0.0–0.3×，不是 0.5–1×。｜引文依据：论文 Table 11 Qwen3.5-9B 并发 8：Math500 3.5×、HumanEval 3.4×、MT-Bench 2.5×；Table 12 并发 8：3.2×/3.4×/2.2×｜修复要求：改「同一对模型」为「同为 Qwen3.5-9B 时（Tab. 11 并发 8 vs Tab. 12 并发 8）差 0.0–0.3×」，或删去 0.5–1× 的量化推断并标为推断。｜修复：｜复验：
+- [重要·事实] 5 章本章问题 3 解答（L523）：「生态集成（vLLM/llama.cpp）尚处 PR 分支」无来源支持，且与两处已引来源矛盾——论文 A.4 直接给出 vLLM 上的完整实验表（Table 12），Inco AI 官方博客写明「it now runs in SGLang, vLLM, TensorRT-LLM, and llama.cpp」。｜引文依据：论文 A.4「We also evaluate DFlash in vLLM on Qwen3.5-9B. Table 12 reports throughput and speedup …」；Inco AI 博客「it now runs in SGLang, vLLM, TensorRT-LLM, and llama.cpp.」｜修复要求：删去「尚处 PR 分支」，改为「已集成到 SGLang、vLLM、TensorRT-LLM、llama.cpp（Inco AI 官方博客 2026-08-18；vLLM 上的实测见论文 Tab. 12）」，或为该状态断言补可核对的来源位置。｜修复：｜复验：
+- [重要·技术] 2 章补充折叠块（L223）：「这条设计简化了梯度流（只更新 K/V 路径的梯度），也避免了『target 特征改写 draft 内部表示』导致的训练不稳」——论文只说明 target 特征不进 Q 投影/输出投影/自注意更新/FFN，未做此归因；页面把两条无来源的机制解释写成结论，且与前文 C10「draft 只更新 transformer 层」（Q、输出投影、FFN 权重都在更新）字面冲突。｜引文依据：论文 A.3「They bypass the draft model's Q projection, output projection, self-attention update, and FFN.」（无梯度流或训练稳定性的论述）；页面 L316「draft 只更新 transformer 层」｜修复要求：删去「简化了梯度流…」与「避免了…训练不稳」两句，或改写为明确标注的分析性推断，并去掉与 C10 冲突的「只更新 K/V 路径」。｜修复：｜复验：
+- [轻微·格式] 来源与范围说明「辅助解释与类比边界」（L570）：该段为不存在的类比设边界。「正文将『起草成本』类比于『起跑前的发力——力的方向对、但每一步都要从零蓄力，因此被线性拖慢』」——全页检索无「起跑」「蓄力」，正文（L132、L145）并无此类比。｜引文依据：不适用｜修复要求：删除该段，或在 §1 正文补回该类比并把边界说明留在原处。｜修复：｜复验：
+- [轻微·技术] 来源与范围说明 N13（L564）：「N13（长上下文）：§5.5 Tab. 4」定位错。Tab. 4（Long Context Adaptation）在 §5.4，不在 §5.5（§5.5 是 Ablation Study）。｜引文依据：论文目录「5.4 Long Context Adaptation」「5.5 Ablation Study」；Table 4 图注「Acceptance length of the base Qwen3.5-27B DFlash drafter (Base) and the drafter fine-tuned …」位于 §5.4｜修复要求：N13 的位置标签改为 §5.4 Tab. 4。｜修复：｜复验：
+- [轻微·技术] 5 章评价表「未做」行（L494）：「未与 TiDAR / DiffuSpec / SpecDiff-2 实验对比（开源实现缺失）<sup>[C15]</sup>」的依据编号错。该结论出自 §5.1 的 Baselines 段，C15 定义的是 §5.5.1 Tab. 5（LLaMA 同数据对照）。｜引文依据：论文 §5.1「We did not include comparisons with other dLLM-based speculative decoding methods (Liu et al., 2025; Samragh et al., 2025; Li et al., 2025a; Sandler et al., 2025) due to lack of open-source implementation.」｜修复要求：该处依据标签改为「§5.1 Baselines」（可在来源表新增 C17 或改引 §5.1），并在依据列同步。｜修复：｜复验：
+- [轻微·格式] L373、L509、L516、L6：正文出现未经 KaTeX 渲染的 Unicode 乘号。「roughly 4.5× and 3.9×」（L373）、「4–6×」「2.75–2.85×」「1.3×」（L509）、「0.5–0.9×」（L516）、description 中的「6×」（L6）都是裸 ×，与全页 `$...\times$` 的写法不一致（validate.py 的裸数学字符表未含 ×，故未报错）。｜引文依据：不适用｜修复要求：这些 × 一律改为 `$\times$`（description 为纯文本，可改写为「6 倍」以避免 Unicode 数学字符）。｜修复：｜复验：
+- [轻微·表述] L72、L344：元话语/路线图句。「本文按论文结构解析：先拆解起草慢的根源（§1），再讲…最后做方法评价（§5）」「下面按主表、SGLang、vLLM、消融、负结果的顺序给关键数字」属于「本页将…／下面来看…」式自我指代与元话语，check.md 2.2(14) 列为不合格表述。｜引文依据：不适用｜修复要求：删去「本文按论文结构解析：先…再…」与「下面按…的顺序给关键数字」，直接进入内容（章节标题已承担导航）。｜修复：｜复验：
+- [轻微·技术] Figure 1 图注（L365 alt + L366 图注）：alt 里「EAGLE-3 绿色柱在 1.6-2.2× 区间」与图不符。图中绿色柱为 GSM8K 2.23、Math500 2.05、AIME25 2.05、HumanEval 2.17、MBPP 1.93、LiveCodeBench 1.81、MT-Bench 1.90，即 1.81–2.23×；且这组数值对应论文 Table 1 的 EAGLE-3(60)（Qwen3-8B），图注未说明图中 EAGLE-3 的树大小，读者会误以为是 4.1 表里对照的 EAGLE-3(16)。｜引文依据：论文 Table 1 Q3-8B T=0 EAGLE-3(60) 行 2.23/2.05/2.05/2.17/1.93/1.81/1.90；页面 assets/img-01.webp 柱上标注与之一致｜修复要求：alt 改为「EAGLE-3 绿色柱在 1.8–2.2× 区间」，图注补「图中 EAGLE-3 为树大小 60 配置（对应 Tab. 1 EAGLE-3(60) 行）」。｜修复：｜复验：
+- [轻微·表述] 5 章「方法定位」段（L501）：同一段两次标注「（Conclusion 原文意译）」（段首与段尾各一次）。｜引文依据：不适用｜修复要求：保留段首一处标注，删去段尾重复。｜修复：｜复验：
+- [轻微·技术] 2 章正文与核心问题 2 解答（L206、L257）：「消融表显示这让 $\tau$ 随 draft 层数增加持续提升<sup>[C4, N7]</sup>」的 N7 指向 Tab. 9（KV vs 输入融合，固定 5 层），而支持「τ 随层数提升」的是 Tab. 6（层数消融，N8：3L/5L/8L 的 τ 为 5.64/5.99/6.33）。｜引文依据：论文 Table 9 为「Qwen3-4B with 5-layer draft models and draft block size 8」；Table 6 为 3-L/5-L/8-L 的 τ=5.64/5.99/6.33（Math500）｜修复要求：该句依据改为「[C4, N8]」。｜修复：｜复验：
+
+## 已核对通过的项目（本轮无问题）
+
+- 表 4.1 主结果（Qwen3-4B/8B、T=0/T=1 的 4.91/4.24/4.86/4.03× 与 τ 6.54/5.69/6.49/5.48、EAGLE-3 树 16/60 全部数值）与论文 Table 1 逐格一致；逐基准最高 6.09×（Qwen3-4B Math500、T=0）亦有 Table 1 支持。
+- 4.3 SGLang 表（基线 316/312/230/229/229/220/228 tok/s、各并发倍数、τ 8.01/6.63/8.01/6.50/8.09/6.42/7.23）与论文 Table 3 逐格一致；「最高 5.1×（Qwen3-8B Math500 并发 1）」与 §5.3 原文一致。
+- 4.4 vLLM 表（4.0/4.6/3.0、3.2/3.4/2.2、2.5/2.7/1.7、1.9/2.1/1.3）与论文 Table 12 逐格一致。
+- 4.5 LLaMA-3.1-8B 表 27 个格与论文 Table 5 逐格一致（含 EAGLE-3(60) 在并发 16/32 的 0.9×/0.6×）；「SGLang with Spec-v1，因 Spec-v2 不支持 EAGLE 树验证」为论文原话。
+- 4.6 三个消融：层数（Tab. 6）、块大小（Tab. 8：6.33/5.09/5.02/5.21）、KV 注入 vs 输入融合（Tab. 9 的 4.2/2.1× 等 12 组数值）与论文逐格一致。
+- 负结果：纯块扩散 2.83/3.73/3.43/3.35×（T=0）与论文 Table 10 一致。
+- 2 章工程开销（W_c 5×2048×2048×2≈42 MB、激活 40 MB/8 MB、<400 KB）与论文 A.3、公式 5×2048×2048×2≈42 MB 一致；A.1 训练配置（800K、6 epochs、AdamW、lr 6×10⁻⁴、clip 1.0、cosine、warmup 0.04、3072/4096、512 anchor、γ=7/5/4）逐项一致；online/offline 训练描述与 A.1 一致。
+- 3.3 loss decay 权重表 16 个数值手算复算全部正确（exp(−(k−1)/7)），「位置 1 约为位置 16 的 8.5 倍」正确。
+- 长上下文：4K 训练 base→16K hotpotqa 4.91→3.61、1.6K LongAlign 3 epochs→6.05 与论文 §5.4/Table 4 一致。
+- 生态数字（NVIDIA Blackwell 最高 15×、Google TPU 3×、3.5M+ 下载、已集成 SGLang/vLLM/TensorRT-LLM/llama.cpp、DFlash 2 的路径选择器与两抽头动态卷积修块内连贯性）与 Inco AI 官方博客一致，且已标注「厂商宣称」。
+- 四个前置概念链接（speculative-decoding、standard-attention、block-diffusion、eagle-speculative）与后续页 dflash2 均真实存在，无「（待生成）」占位；overview.html 与 index.html 互链；dojo:topics=训练与优化 在固定大类内，dojo:tag=推理加速 在封闭词表内。
+- 未发现会话指代（我/我们/你）、调试与复现踩坑叙事、临场评价；核心问题 5 题与各章「本章问题」均有解答折叠块，核心问题答案均指明确切章节。
+
+## 结论
+
+- 统计：阻断 2 / 重要 9 / 轻微 8
+- 处置：返回修复后复验。两条阻断（图号错位与自相矛盾、EAGLE-3 headline 数字 2.4× 与官方 2.5× 及页内 description 互相矛盾）与全部重要问题必须关闭；轻微问题需逐条修复或给出接受理由。修复范围限于问题位置及直接受影响的引用位置，数字修改后重新对照 arXiv:2602.06036v2，完成后运行 `.dojo/scripts/validate.py`。

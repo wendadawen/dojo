@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="vLLM 框架全景地图：进程架构（API Server / EngineCore / GPU Worker / DP Coordinator）、五层代码分层（入口/引擎/执行/模型/编译）、跨层子系统（采样/推测解码/结构化输出/KV传输/LoRA 等）、关键设计决策与官方设计文档索引，附走读路线与进度基准。">
-  <meta name="dojo:summary" content="vLLM 由五层组成：入口层（entrypoints/renderers/multimodal）、引擎层（两进程架构、调度、KV 管理）、执行层（executor/worker/attention 后端）、模型层（200+ 模型、28 种量化、10 种加载器）、编译层（torch.compile 与 cudagraph），外加采样、推测解码、结构化输出、KV 跨机传输等跨层子系统。进程上按 API Server + EngineCore + GPU Worker + DP Coordinator 划分，单机 TP=4 共 6 个进程。关键设计：VllmConfig 全局配置对象、统一模型构造签名、分片与量化在初始化时完成。本页是源码走读的总索引与进度基准。">
+  <meta name="description" content="vLLM 框架全景地图：进程架构（API Server / EngineCore / GPU Worker / DP Coordinator）、五层代码分层（入口/引擎/执行/模型/编译）、跨层子系统（采样/推测解码/结构化输出/KV传输/LoRA 等）、关键设计决策与官方设计文档索引，以及请求生命周期。">
+  <meta name="dojo:summary" content="vLLM 由五层组成：入口层（entrypoints/renderers/multimodal）、引擎层（两进程架构、调度、KV 管理）、执行层（executor/worker/attention 后端）、模型层（约 290 个模型文件、25 种量化方法、7 种加载器）、编译层（torch.compile 与 cudagraph），外加采样、推测解码、结构化输出、KV 跨机传输等跨层子系统。进程上按 API Server + EngineCore + GPU Worker + DP Coordinator 划分，单机 TP=4 共 6 个进程。关键设计：VllmConfig 全局配置对象、统一模型构造签名、分片与量化在初始化时完成。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
   <meta name="dojo:tag" content="推理系统">
@@ -88,7 +88,7 @@
 
 <h1 class="title">vLLM 框架全景</h1>
 <p class="page-lead">vLLM 的进程按 API Server、EngineCore、GPU Worker、DP Coordinator 四类划分；代码按入口、引擎、执行、模型、编译五层组织，外加采样、推测解码、结构化输出、KV 传输等跨层子系统。</p>
-<p class="page-meta">更新于 2026-08-21 · 类型：框架总览（vLLM 0.22.2.dev）</p>
+<p class="page-meta">更新于 2026-08-21 · 类型：框架总览（vLLM 0.23.1rc0）</p>
 <p class="reading-time" id="readingTime"></p>
 
 <h2 id="proc">1. 进程架构</h2>
@@ -151,16 +151,16 @@
       <tr><th>目录</th><th>内容</th></tr>
       <tr><td><code>v1/executor/</code></td><td>UniProc（TP=1 同进程）/ Multiproc（每卡一进程）/ Ray</td></tr>
       <tr><td><code>v1/worker/</code></td><td>Worker、WorkerWrapper、GPUModelRunner（输入准备、forward、输出）</td></tr>
-      <tr><td><code>v1/attention/</code></td><td>backend 选择器（与 platforms 联动）+ 约 22 种后端：flash_attn / flashinfer / triton / gdn / mamba / mla / rocm 等</td></tr>
+      <tr><td><code>v1/attention/</code></td><td>backend 选择器（与 platforms 联动）+ 多个后端：flash_attn / flashinfer / triton / gdn / mamba / mla / rocm 等</td></tr>
     </table>
 
     <h3>模型层</h3>
     <table>
       <tr><th>目录</th><th>内容</th></tr>
-      <tr><td><code>model_executor/models/</code></td><td>约 300 个模型文件 + registry 注册表（架构名 → 类）</td></tr>
+      <tr><td><code>model_executor/models/</code></td><td>约 290 个模型文件 + registry 注册表（架构名 → 类）</td></tr>
       <tr><td><code>model_executor/layers/</code></td><td>公共层：linear、rotary（RoPE）、MLA、mamba、fused_moe、vocab_parallel_embedding、activation</td></tr>
-      <tr><td><code>model_executor/layers/quantization/</code></td><td>约 28 种量化：fp8 / gptq / awq / modelopt / bitsandbytes / compressed_tensors / experts_int8 等；在模型初始化时介入而非加载后</td></tr>
-      <tr><td><code>model_executor/model_loader/</code></td><td>约 10 种加载器：default / sharded_state / runai_streamer / tensorizer / gguf / bitsandbytes / dummy</td></tr>
+      <tr><td><code>model_executor/layers/quantization/</code></td><td>约 25 种量化方法（另有 6 个 online 简写）：fp8 / gptq / awq / modelopt / bitsandbytes / compressed_tensors / experts_int8 等；在模型初始化时介入而非加载后</td></tr>
+      <tr><td><code>model_executor/model_loader/</code></td><td>7 种加载器：default / sharded_state / runai_streamer / tensorizer / bitsandbytes / dummy / modelexpress</td></tr>
     </table>
 
     <h3>编译层</h3>
@@ -173,7 +173,7 @@
     <table>
       <tr><th>子系统</th><th>位置</th><th>内容</th></tr>
       <tr><td>采样</td><td><code>v1/sample/</code></td><td>sampler、logits 处理器、拒绝采样（推测解码用）、思考预算状态</td></tr>
-      <tr><td>推测解码</td><td><code>v1/spec_decode/</code></td><td>EAGLE、ngram（含 GPU 版）、medusa、draft model、suffix decoding 等约 14 个模块</td></tr>
+      <tr><td>推测解码</td><td><code>v1/spec_decode/</code></td><td>EAGLE、ngram（含 GPU 版）、medusa、draft model、suffix decoding 等约 16 个模块</td></tr>
       <tr><td>结构化输出</td><td><code>v1/structured_output/</code></td><td>4 种 grammar 后端：xgrammar / guidance / outlines / lm_format_enforcer</td></tr>
       <tr><td>KV 卸载与传输</td><td><code>v1/kv_offload/</code>、<code>distributed/kv_transfer/</code></td><td>KV connector 体系：mooncake / nixl / lmcache / hf3fs / moriio / flexkv 等（PD 分离、KV 复用）</td></tr>
       <tr><td>分布式并行</td><td><code>distributed/</code></td><td>TP/PP/DP/EP 状态管理、EPLB 专家负载均衡、自定义 all-reduce、CUDA IPC、无状态协调器</td></tr>
@@ -227,7 +227,7 @@
     </ol>
 
     <h2 id="docs">5. 官方设计文档索引</h2>
-    <p>仓库 <code>docs/design/</code> 共 30 篇设计文档，按主题归类：</p>
+    <p>仓库 <code>docs/design/</code> 共 29 篇设计文档，按主题归类：</p>
     <table>
       <tr><th>主题</th><th>文档</th></tr>
       <tr><td>架构总览</td><td>arch_overview（进程模型、类层次、设计决策）</td></tr>
@@ -238,52 +238,14 @@
       <tr><td>扩展</td><td>plugin_system、endpoint_plugins、io_processor_plugins、lora_resolver_plugins、huggingface_integration</td></tr>
     </table>
 
-    <h2 id="roadmap">6. 走读路线与进度基准</h2>
-    <h3>生命周期主线</h3>
-    <p>① 请求进来（前端预处理）→ ② ZMQ 交给 EngineCore → ③ 主循环收请求进调度器 → ④ 调度选批 → ⑤ 模型 forward → ⑥ 采样出新 token → ⑦ 更新 KV cache → ⑧ 新 token 回下一轮 → ⑨ 结果回 API Server。</p>
-
-    <h3>三段式路线</h3>
-    <table>
-      <tr><th>段</th><th>内容</th><th>目的</th></tr>
-      <tr>
-        <td>第一段</td>
-        <td>走完生命周期主线：_preprocess 剩余三函数 → _model_forward → postprocess → 采样（v1/sample）→ KV cache 管理（block_pool / kv_cache_manager）→ 循环收尾</td>
-        <td>打通一次请求的完整闭环</td>
-      </tr>
-      <tr>
-        <td>第二段</td>
-        <td>框架支柱：attention 后端选择器（v1/attention/selector + platforms 联动）→ 编译层全流程（torch_compile 设计文档对照）→ 模型层骨架（公共层体系、量化初始化介入、加载器）</td>
-        <td>理解框架的三大支柱机制</td>
-      </tr>
-      <tr>
-        <td>第三段</td>
-        <td>按兴趣选：推测解码（eagle）/ 结构化输出 / KV 跨机传输（PD 分离）/ LoRA / pooling</td>
-        <td>扩展视野</td>
-      </tr>
-    </table>
-
-    <h3>进度基准表</h3>
-    <p>本表随走读推进更新，作为个人的进度仪表盘：</p>
-    <table>
-      <tr><th>模块</th><th>进度</th><th>深度</th><th>对应笔记</th></tr>
-      <tr><td>入口层（render / tokenize / 图片预处理）</td><td>✅ 完成</td><td>深（含实测）</td><td>图片两段处理 note</td></tr>
-      <tr><td>引擎层（两进程 / 忙等循环 / 调度选批）</td><td>✅ 完成</td><td>深</td><td>框架总览 note</td></tr>
-      <tr><td>执行层 executor / Worker</td><td>✅ 完成</td><td>深</td><td>框架总览 note</td></tr>
-      <tr><td>GPUModelRunner.execute_model</td><td>🟡 约 80%（_preprocess 四函数余 3）</td><td>中</td><td>inputs embeds note</td></tr>
-      <tr><td>KV cache 管理（block_pool / manager / prefix 哈希）</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
-      <tr><td>采样（v1/sample）</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
-      <tr><td>attention 后端选择</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
-      <tr><td>模型层（公共层 / 量化 / 加载器）</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
-      <tr><td>编译层</td><td>🟡 cudagraph 专题已走，compile 流程未走</td><td>中</td><td>inputs embeds note（部分）</td></tr>
-      <tr><td>spec_decode / structured_output / kv_transfer / lora / pool</td><td>⬜ 未走</td><td>—</td><td>—</td></tr>
-      <tr><td>平台抽象（platforms）</td><td>✅ 专题已走（探测机制）</td><td>中</td><td>—</td></tr>
-    </table>
-    <p>生命周期主线的当前位置：⑤（模型 forward），下一站为 _preprocess 剩余三函数（_gather_mm_embeddings、embed_input_ids、_prepare_mm_inputs）。</p>
+    <h2 id="lifecycle">6. 请求生命周期</h2>
+    <p>一次生成请求依次经过九个环节：① 请求进来（前端预处理）→ ② ZMQ 交给 EngineCore → ③ 主循环收请求进调度器 → ④ 调度选批 → ⑤ 模型 forward → ⑥ 采样出新 token → ⑦ 更新 KV cache → ⑧ 新 token 回下一轮 → ⑨ 结果回 API Server。</p>
+    <p>其中前端的预处理集中在 <code>v1/worker/gpu_model_runner.py</code> 的 <code>_preprocess</code>（含 <code>_gather_mm_embeddings</code>、<code>embed_input_ids</code>、<code>_prepare_mm_inputs</code> 等函数）与 <code>v1/sample/</code> 的采样器；原理在关联笔记（图片两段处理、inputs embeds 与 cudagraph）中展开。</p>
 
     <h2 id="ref">来源与范围说明</h2>
     <ul>
-      <li>本地代码库扫描（vLLM 0.22.2.dev）：各层目录结构、模块计数（约 22 种 attention 后端、28 种量化方法、300 个模型文件、14 个 v1 侧 KV connector 及 mooncake/nixl 等子目录实现、14 个推测解码模块）</li>
-      <li>官方设计文档：仓库 docs/design/ 目录（arch_overview、paged_attention、prefix_caching、multiprocessing、cuda_graphs、torch_compile、model_runner_v2、vllm_ir 等 30 篇）</li>
+      <li>本地代码库扫描（本地检出 v0.23.1rc0-1383-g95e073e17）：各层目录结构、模块计数（约 290 个模型文件、25 种量化方法、7 种模型加载器、16 个推测解码模块、14 个 v1 侧 KV connector 及 mooncake/nixl 等子目录实现）</li>
+      <li>官方设计文档：仓库 docs/design/ 目录（arch_overview、paged_attention、prefix_caching、multiprocessing、cuda_graphs、torch_compile、model_runner_v2、vllm_ir 等 29 篇）</li>
       <li>进程数量公式与设计决策摘自 arch_overview.md；fork/spawn 取舍详见 multiprocessing.md</li>
       <li>模块机制在关联笔记中展开（两进程架构、图片两段处理、inputs embeds 与 cudagraph）</li>
     </ul>

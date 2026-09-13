@@ -5,13 +5,13 @@
 
 | 文件 | 体积 | 说明 |
 |---|---|---|
-| `_loader.py` | 0.0 KB | 实测脚本 |
-| `config-kimi-k3.json` | 0.0 KB | 配置或中间数据 |
-| `measured-output.txt` | 0.0 KB | 提取的文本材料 |
-| `modeling_kimi_k3.py` | 0.1 KB | 实测脚本 |
-| `modeling_kimi_linear.py` | 0.0 KB | 实测脚本 |
-| `probe1_vision.py` | 0.0 KB | 实测脚本 |
-| `probe2_fusion.py` | 0.0 KB | 实测脚本 |
-| `probe3_memcost.py` | 0.0 KB | 实测脚本 |
-| `render-check-output.txt` | 0.0 KB | 提取的文本材料 |
-| `render_check.py` | 0.0 KB | 实测脚本 |
+| `_loader.py` | 2.2 KB | 实测脚本 |
+| `config-kimi-k3.json` | 6.8 KB | 官方 config 快照 |
+| `measured-output.txt` | 6.7 KB | 提取的文本材料 |
+| `modeling_kimi_k3.py` | 52.2 KB | 官方源码快照 |
+| `modeling_kimi_linear.py` | 50.3 KB | 官方源码快照 |
+| `probe1_vision.py` | 11.4 KB | 实测脚本 |
+| `probe2_fusion.py` | 5.9 KB | 实测脚本 |
+| `probe3_memcost.py` | 3.2 KB | 实测脚本 |
+| `render-check-output.txt` | 1.2 KB | 提取的文本材料 |
+| `render_check.py` | 4.7 KB | 实测脚本 |

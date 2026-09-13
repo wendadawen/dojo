@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="K3 用 KDA+AttnRes+Stable LatentMoE 在序列/深度/宽度三维度扩展信息流，2.8T 参数、104B 激活、1M 上下文，约 2.5× scaling 效率提升。完整精读覆盖架构动机、各组件机制、训练、后训练、基础设施、性能与独立评价。基于 arXiv:2607.24653v1 技术报告、官方 config.json 与源码三层核对。">
+  <meta name="description" content="K3 用 KDA+AttnRes+Stable LatentMoE 在序列/深度/宽度三维度扩展信息流，2.8T 参数、104B 激活、1M 上下文，约 2.5× scaling 效率提升。完整精读覆盖架构动机、各组件机制、训练、后训练、基础设施、性能与独立评价。基于 arXiv:2607.24653v2 技术报告、官方 config.json 与源码三层核对。">
   <meta name="dojo:summary" content="K3 通过 KDA、AttnRes 与 Stable LatentMoE，在序列、深度和宽度三个维度扩展信息流。模型包含 2.8T 参数、每 token 激活 104B 参数，并支持 1M 上下文。">
   <meta name="dojo:type" content="paper">
   <meta name="dojo:topics" content="模型结构">
@@ -54,16 +54,6 @@
     .flow-diagram .fd-sub { color: var(--text-light); font-size: var(--fs-caption); margin-top: 0.2rem; }
     .flow-diagram .fd-note { grid-column: 1 / -1; text-align: center; color: var(--text-light); }
     .flow-diagram { grid-template-columns: 1fr; }
-    .diagram {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      background: var(--bg-code);
-      padding: 1rem;
-      overflow-x: auto;
-      border-radius: 6px;
-      line-height: 1.5;
-      margin: 1.5rem 0;
-    }
     </style>
 </head>
 <body>
@@ -94,7 +84,7 @@
   <div class="lightbox-caption" id="lightboxCaption"></div>
 </div>
 
-<h1 class="title">Kimi K3：三维度扩展信息流的开源 3T 级模型</h1>
+<h1 class="title">Kimi K3：三维度扩展信息流的开源 3T 级（2.78T 参数）模型</h1>
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
@@ -105,7 +95,7 @@
 <p><b>代码</b>：<a href="https://huggingface.co/moonshotai/Kimi-K3">huggingface.co/moonshotai/Kimi-K3</a> · <a href="https://github.com/MoonshotAI/Kimi-K3">github.com/MoonshotAI/Kimi-K3</a></p>
 </blockquote>
 
-<p>2.8 万亿参数、104B 激活、1M token 上下文——Kimi K3 把开源模型的规模推到新前沿<sup>[C1]</sup>。但 K3 的核心问题不是把模型做大，而是如何在万亿参数下让信息高效流动。论文把这个问题分解为三个互补维度：序列长度（token 间混合）、网络深度（层间信息传递）、模型宽度（通道间混合）<sup>[C2]</sup>。本文逐维度拆解 K3 的架构设计——KDA+MLA 混合注意力管序列，Block AttnRes 管深度，Stable LatentMoE 管宽度——以及支撑约 2.5× scaling 效率<sup>[C7]</sup>的训练与基础设施。</p>
+<p>2.8 万亿参数、104B 激活、1M token 上下文——Kimi K3 把开源模型的规模推到新前沿<sup>[C1]</sup>。但 K3 的核心问题不是把模型做大，而是如何在万亿参数下让信息高效流动。论文把这个问题分解为三个互补维度：序列长度（token 间混合）、网络深度（层间信息传递）、模型宽度（通道间混合）<sup>[C2]</sup>。K3 的架构设计围绕这三个维度展开——KDA+MLA 混合注意力管序列，Block AttnRes 管深度，Stable LatentMoE 管宽度——并由训练与基础设施支撑约 2.5× scaling 效率<sup>[C7]</sup>。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -118,8 +108,8 @@
     </li>
     <li><p>Block AttnRes 如何让 93 层深网络避免信息稀释，代价与边界是什么。</p>
       <details>
-        <summary>解答：跨 block 选择性检索，块内仍是标准残差</summary>
-        <p>标准残差把所有前层信息压进单个状态，93 层深度下早期信息逐层稀释。Block AttnRes 把 93 层分为 8 个 block，块内输出求和为单个表示，跨 block 用可学习伪查询做选择性检索，跨层检索开销随 block 数而非层数增长。代价是块内 12 层仍走标准残差、仍有局部稀释，且论文未提供 K3 规模下不同 block size 的消融。完整论证见「3. 深度维度——Block AttnRes」。</p>
+        <summary>解答：每层对块级表征做选择性检索，代价是候选粒度降为块级</summary>
+        <p>标准残差把所有前层信息压进单个状态，93 层深度下早期信息逐层稀释。Block AttnRes 把 93 层分为 8 个 block：每层用可学习伪查询对「embedding ＋此前各 block 的汇总表示 ＋当前 block 的 partial sum」做选择性检索（当前 block 的 partial sum 从块内第 2 层起计入候选），跨层检索开销随 block 数而非层数增长。相对全 AttnRes，代价是把候选粒度从单层输出降为块级表征、块内单层输出不再可被单独检索，且论文未提供 K3 规模下不同 block size 的消融。完整论证见「3. 深度维度——Block AttnRes」。</p>
       </details>
     </li>
     <li><p>Stable LatentMoE 如何在 896 专家、56× 稀疏度下保持训练稳定，三件稳定化各解决什么。</p>
@@ -131,7 +121,7 @@
     <li><p>K3 的训练方法如何共同支撑约 2.5× scaling 效率。</p>
       <details>
         <summary>解答：架构、数据与训练配方的联合效果，未分解单因素</summary>
-        <p>2.5× 指在 OOD 验证 loss 上达到 K2 相同水平所需 FLOPs 减半多。论文用 collectively 一词，将其归因于 KDA+AttnRes+LatentMoE 架构、四域数据配方、cosine decay、Per-Head Muon、NoPE 外推与四阶段上下文扩展的共同作用，未提供移除单个改进的消融。见「6. 训练——数据、scaling law、Muon、长上下文扩展」。</p>
+        <p>2.5× 指在 OOD（分布外）验证 loss 上达到 K2 相同水平所需 FLOPs 减半多；OOD loss 用训练分布外的留出数据评估，衡量泛化而非记忆。论文用 collectively 一词，将其归因于 KDA+AttnRes+LatentMoE 架构、四域数据配方、cosine decay、Per-Head Muon、NoPE 外推与四阶段上下文扩展的共同作用，未提供移除单个改进的消融。见「6. 训练——数据、scaling law、Muon、长上下文扩展」。</p>
       </details>
     </li>
     <li><p>K3 的性能定位与边界，相对 Claude Fable 5、GPT-5.6 Sol 和前代 K2 的位置。</p>
@@ -147,7 +137,7 @@
 
 <p>K3 的架构围绕一个核心问题设计：<strong>如何让信息在万亿参数模型中高效流动</strong>。论文 §2 把这个问题分解为三个互补维度——序列长度（token 间混合）、网络深度（层间信息传递）、模型宽度（通道间混合）。这不是简单地把模型做大，而是系统性地重新设计每个维度的信息流机制。</p>
 
-<p>本页先从 <strong>Table 1</strong>（§3.2）看 K2 到 K3 变了什么。这张表是理解整篇论文的入口：</p>
+<p><strong>Table 1</strong>（§3.2）列出 K2 到 K3 的架构变化，是理解整篇论文的入口：</p>
 
 <div class="table-scroll">
 <table>
@@ -177,7 +167,7 @@
 </table>
 </div>
 
-<p><b>表（原文 Table 1）</b>：K2 与 K3 的架构对比<sup>[N1]</sup>。注意三个关键变化：注意力机制从纯 MLA 重构为 KDA–MLA 混合（序列维度），层数从 61 增至 93 需要新的深度信息流机制（深度维度），路由专家从 384 扩展到 896 需要新的稳定化（宽度维度）。config.json 的 <code>num_hidden_layers=93</code>、<code>num_experts=896</code>、<code>num_experts_per_token=16</code> 确认这些数值。</p>
+<p><b>表（原文 Table 1）</b>：K2 与 K3 的架构对比<sup>[N1]</sup>。「变化」列按百分比与变化性质归类，不等同原文 Table 1 的 $\Delta$ 列（原文对注意力机制、激活函数、注意力层组成、Latent MoE 维度四行的 $\Delta$ 列均标「–」）。三个关键变化：注意力机制从纯 MLA 重构为 KDA–MLA 混合（序列维度），层数从 61 增至 93 需要新的深度信息流机制（深度维度），路由专家从 384 扩展到 896 需要新的稳定化（宽度维度）。config.json 的 <code>num_hidden_layers=93</code>、<code>num_experts=896</code>、<code>num_experts_per_token=16</code> 确认这些数值。</p>
 
 <p>把三个维度画在一起，K3 的信息流可以这样理解：</p>
 
@@ -198,9 +188,9 @@
   <div class="fd-note">一个 block（4 层）重复 23 次 + 1 层末尾 MLA = 93 层；每层注意力后接 Stable LatentMoE</div>
 </div>
 
-<p>这三维度不是独立改进，而是互相支撑：KDA 让长序列可负担（序列），AttnRes 让 93 层不稀释（深度），Stable LatentMoE 让 896 专家可训练（宽度）。论文 §1 声称这些改进<strong>共同</strong>（collectively）带来约 <strong>2.5× scaling efficiency</strong><sup>[C7]</sup>——即在 OOD 验证 loss 上达到 K2 相同水平所需 FLOPs 减半多（§3.2，Fig.7）。论文原文用 collectively 一词，明确把 2.5× 归因于架构、数据与训练配方的联合效果，未分解各因素贡献<sup>[N5]</sup>。</p>
+<p>这三维度不是独立改进，而是互相支撑：KDA 让长序列可负担（序列），AttnRes 让 93 层不稀释（深度），Stable LatentMoE 让 896 专家可训练（宽度）。论文 §1 声称这些改进<strong>共同</strong>（collectively）带来约 <strong>2.5× scaling efficiency</strong><sup>[C7]</sup>——即在 OOD 验证 loss 上达到 K2 相同水平所需 FLOPs 减半多（§3.2，Fig.7）。论文原文用 collectively 一词，明确把 2.5× 归因于架构、数据与训练配方的联合效果，未分解各因素贡献<sup>[N3]</sup>。</p>
 
-<p>接下来逐一展开每个维度。构造示例。想象一个 token 从 embedding 出发，流经 93 层，在序列维度被 KDA/MLA 混合处理，在深度维度可检索前层表示，在宽度维度被 896 个稀疏专家之一变换。这个视角贯穿后续每个维度章节。</p>
+<p>一个具体视角可以贯穿后续每个维度章节：想象一个 token 从 embedding 出发，流经 93 层，在序列维度被 KDA/MLA 混合处理，在深度维度可检索前层表示，在宽度维度被 896 个稀疏专家之一变换。</p>
 
 <h3 id="overview-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -224,13 +214,13 @@
   </li>
 </ol>
 
-<p>本章给出三维度框架与 K2→K3 的参数变化。但每个维度的机制还需展开——下一章讲序列维度的 KDA+MLA 混合。</p>
+<p>三维度框架与 K2→K3 的参数变化如上；序列维度的机制决定了 1M 上下文能否负担，也是最先展开的维度。</p>
 
 <h2 id="sequence-dimension">2. 序列维度——KDA + 混合注意力</h2>
 
 <p>K3 的序列维度设计是 <strong>3:1 混合注意力</strong>：每个 block 含 3 层 <a href="../../wiki/kda/index.html">Kimi Delta Attention（KDA）</a> + 1 层 <a href="../../wiki/mla/index.html">Gated MLA</a>，骨干末尾额外加 1 层 MLA（§2.1）<sup>[C3]</sup>。93 层中共 69 层 KDA + 24 层 MLA<sup>[N2]</sup>。</p>
 
-<p><strong>KDA</strong> 用固定大小递归状态替代增长的 KV cache，提供高效的长序列 token 混合——它的核心是 channel-wise forget gate + delta rule（<a href="../../wiki/kda/index.html">KDA 概念页</a>已讲清完整机制，包括 lower-bounded decay 和 full-rank gate）。<strong>MLA</strong> 用低秩潜在向量压缩 KV，在周期性层提供不受限的全局 token 间注意力（<a href="../../wiki/mla/index.html">MLA 概念页</a>已讲清低秩压缩机制）。</p>
+<p><strong>KDA</strong> 用固定大小递归状态替代增长的 KV cache，提供高效的长序列 token 混合——它的核心是 channel-wise forget gate + delta rule（<a href="../../wiki/kda/index.html">KDA 概念页</a>已讲清完整机制，包括 lower-bounded decay 和 full-rank gate）<sup>[F1, F2]</sup>。<strong>MLA</strong> 用低秩潜在向量压缩 KV，在周期性层提供不受限的全局 token 间注意力（<a href="../../wiki/mla/index.html">MLA 概念页</a>已讲清低秩压缩机制）。</p>
 
 <p>为什么是 3:1 而非全 KDA 或全 MLA？两者职责分离：</p>
 <ul>
@@ -247,10 +237,10 @@
 <p><strong>full_attn_layers（MLA，24个）</strong>：4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 93</p>
 <p>其中 4, 8, ..., 92 是 23 个周期性 MLA 层（每 block 第 4 层），93 是末尾额外 MLA 层。</p>
 <p><strong>kda_layers（KDA，69个）</strong>：1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 27, 29, 30, 31, 33, 34, 35, 37, 38, 39, 41, 42, 43, 45, 46, 47, 49, 50, 51, 53, 54, 55, 57, 58, 59, 61, 62, 63, 65, 66, 67, 69, 70, 71, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89, 90, 91</p>
-<p>每 3 个 KDA 一组，对应一个 block 的前 3 层。层号从 1 开始（layer 0 是 dense 层，<code>first_k_dense_replace=1</code>）。</p>
+<p>每 3 个 KDA 一组，对应一个 block 的前 3 层。层号从 1 开始（0-indexed 的 layer 0，即 1-indexed 位置 1，FFN 为 dense 而非 MoE，注意力仍为 KDA；<code>first_k_dense_replace=1</code>）。</p>
 </details>
 
-<p>构造示例。一个 token 在序列维度的处理——进入 block 后，前 3 层 KDA 把历史信息累加到固定递归状态中（状态不随序列增长），第 4 层 MLA 用全局注意力重新审视所有 token 的内容。这个"3 层局部 + 1 层全局"的节奏在 23 个 block 中重复，最后第 93 层 MLA 做最终全局汇聚。</p>
+<p>一个 token 在序列维度的处理——进入 block 后，前 3 层 KDA 把历史信息累加到固定递归状态中（状态不随序列增长），第 4 层 MLA 用全局注意力重新审视所有 token 的内容。这个"3 层局部 + 1 层全局"的节奏在 23 个 block 中重复，最后第 93 层 MLA 做最终全局汇聚。</p>
 
 <h3 id="sequence-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -274,25 +264,25 @@
   </li>
 </ol>
 
-<p>本章讲序列维度的 KDA+MLA 混合。但 93 层深网络如何避免信息稀释——下一章讲深度维度的 Block AttnRes。</p>
+<p>序列混合解决了 token 间的信息流动，93 层深网络的信息稀释则由 Block AttnRes 处理。</p>
 
 <h2 id="depth-dimension">3. 深度维度——Block AttnRes</h2>
 
 <p>93 层比 K2 的 61 层多了 52%（Table 1）。标准残差连接把所有先前信息压缩到单个状态 <code>h_l</code>——论文 §2.2 把这比作"RNN 在时间上的瓶颈"。93 层的深度下，早期信息会被逐层稀释。</p>
 
-<p><a href="../../wiki/block-attnres/index.html">Attention Residuals（AttnRes）</a>的思路是把注意力的方法论从序列维度用到深度维度：每层用可学习伪查询 <code>q_l = w_l</code> 对所有前层输出做选择性检索，而非均匀累加（§2.2 Eq.8-9）。<a href="../../wiki/block-attnres/index.html">Block AttnRes 概念页</a>已讲清完整机制，包括 pseudo-query、softmax kernel 和 online softmax 合并。</p>
+<p><a href="../../wiki/block-attnres/index.html">Attention Residuals（AttnRes）</a>的思路是把注意力的方法论从序列维度用到深度维度：每层用可学习伪查询 <code>q_l = w_l</code> 对所有前层输出做选择性检索，而非均匀累加（§2.2 Eq.8-9）<sup>[F3]</sup>。<a href="../../wiki/block-attnres/index.html">Block AttnRes 概念页</a>已讲清完整机制，包括 pseudo-query、softmax kernel 和 online softmax 合并。</p>
 
-<p>全 AttnRes 的 <code>O(L²d)</code> 算术在 <code>L &lt; 100</code> 时可负担，但 <code>O(Ld)</code> 内存和流水线通信开销大（要保存所有层输出）。<strong>Block AttnRes</strong> 将 93 层分为 <strong>8 个 block</strong>（7 个 12 层完整 block + 1 个 9 层部分 block = 93 层，block size = 12，config.json <code>attn_res_block_size=12</code>），块内层输出求和为单个表示，跨 block 做全注意力。开销从 <code>O(Ld)</code> 降到 <code>O(Nd)</code>（N=8），论文 §2.2 引 [57] 称"$N \approx 8$ recovers most of the benefit across model scales"。</p>
+<p>全 AttnRes 的 $O(L^2d)$ 算术在 <code>L &lt; 100</code> 时可负担，但 $O(Ld)$ 内存和流水线通信开销大（要保存所有层输出）。<strong>Block AttnRes</strong> 将 93 层分为 <strong>8 个 block</strong>（7 个 12 层完整 block + 1 个 9 层部分 block = 93 层，block size = 12，config.json <code>attn_res_block_size=12</code>），块内层输出求和为单个表示，跨 block 做全注意力。开销从 $O(Ld)$ 降到 $O(Nd)$（N=8），论文 §2.2 引 [60] 称"$N \approx 8$ recovers most of the benefit across model scales"。</p>
 
 <details>
 <summary>补充：93 层如何分为 8 个 block（含部分末尾 block）</summary>
 <p>93 / 12 = 7.75，即 7 个完整 12 层 block（层 1-12, 13-24, ..., 73-84）+ 1 个 9 层部分 block（层 85-93）。论文 §2.2 说"giving a partial final block and 9 total blocks when counting the embedding layer"——embedding 层 <code>b_0</code> 始终作为 AttnRes 的源，加上 8 个内容 block，共 9 个。</p>
-<p>注意：block 划分是针对 AttnRes 的跨层检索结构，与 KDA/MLA 的 4 层混合 block 不同。AttnRes block 每 12 层一个检索边界，KDA/MLA 每 4 层一个注意力类型切换。</p>
+<p>block 划分针对 AttnRes 的跨层检索结构，与 KDA/MLA 的 4 层混合 block 不同。AttnRes block 每 12 层一个检索边界，KDA/MLA 每 4 层一个注意力类型切换。</p>
 </details>
 
-<p><strong>代价与边界</strong>：Block AttnRes 只在跨 block 时做选择性检索，块内层仍走标准残差——信息在 12 层的块内仍有稀释，只是每 12 层有一次跨 block 的"信息重置"。论文 §2.2 引 [57] 给出 $N \approx 8$ 在多模型规模下够用的经验结论<sup>[C4]</sup>，但未提供 K3 规模下不同 block size 的消融实验。</p>
+<p><strong>代价与边界</strong>：块内 12 层中每一层的输入都是对「embedding ＋此前各 block 汇总表示 ＋当前 block partial sum」的 softmax 加权检索（当前 block partial sum 从块内第 2 层起计入候选）——即每层都能跨 block 检索前序表示。相对全 AttnRes，Block AttnRes 的代价是把候选粒度从单层输出降为块级表征、块内单层输出不再可被单独检索。论文 §2.2 引 [60] 给出 $N \approx 8$ 在多模型规模下够用的经验结论<sup>[C4]</sup>，但未提供 K3 规模下不同 block size 的消融实验。</p>
 
-<p>构造示例。一个 token 在深度维度的处理——在 block 内的 12 层中，信息通过标准残差逐层传递；当进入新 block 的第一层时，该层可以"回头看"前 7 个 block 的汇总表示和 embedding，选择性检索需要的信息。这让 93 层深网络不会因为层数多而丢失早期信息。</p>
+<p>一个 token 在深度维度的处理——block 内的 12 层中，每一层都"回头看"embedding 与此前各 block 的汇总表示，按内容选择性检索需要的信息；从块内第 2 层起，当前 block 已累加的 partial sum 也加入候选。这让 93 层深网络不会因为层数多而丢失早期信息。</p>
 
 <h3 id="depth-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -310,13 +300,13 @@
   </li>
   <li><p>块内层还能做跨层检索吗。</p>
     <details>
-      <summary>解答：不能，块内走标准残差</summary>
-      <p>块内 12 层仍走标准残差，存在局部稀释；只有进入新 block 的层才能对前序 block 的汇总表示和 embedding 做选择性检索，相当于每 12 层一次跨块信息重置。</p>
+      <summary>解答：能，每层的候选含全部前序 block 汇总表示</summary>
+      <p>能。块内 12 层中每一层的输入都是对「embedding ＋此前各 block 汇总表示 ＋当前 block partial sum」的 softmax 加权检索，当前 block partial sum 从块内第 2 层起计入候选。相对全 AttnRes，Block AttnRes 的差别只是候选粒度降为块级表征、块内单层输出不再可被单独检索，而非块内层无法检索前序块。</p>
     </details>
   </li>
 </ol>
 
-<p>本章讲深度维度的 Block AttnRes。但 896 专家的极端稀疏如何保持训练稳定——下一章讲宽度维度的 Stable LatentMoE。</p>
+<p>深度维度控制层间信息传递，宽度维度的 896 专家稀疏则依赖 Stable LatentMoE 的稳定化机制。</p>
 
 <h2 id="width-dimension">4. 宽度维度——Stable LatentMoE</h2>
 
@@ -332,15 +322,15 @@
 
 <p>Stable LatentMoE 用<strong>三件稳定化</strong>分别解决这两个问题：</p>
 
-<p><strong>稳定化 1 — RMSNorm</strong>（解决激活爆炸）：在路由专家聚合后、上投影 <code>W↑</code> 前插入 RMSNorm（§2.3.1 Eq.11，config.json <code>latent_moe_use_norm=true</code>）。这降低路由分支对尺度变化的敏感度，在与全宽共享分支合并前先归一化。<a href="../../wiki/stable-latent-moe/index.html">Stable LatentMoE 概念页</a>已讲清此机制。</p>
+<p><strong>稳定化 1 — RMSNorm</strong>（解决激活爆炸）：在路由专家聚合后、上投影 <code>W↑</code> 前插入 RMSNorm（§2.3.1 Eq.11，config.json <code>latent_moe_use_norm=true</code>）<sup>[F4]</sup>。这降低路由分支对尺度变化的敏感度，在与全宽共享分支合并前先归一化。<a href="../../wiki/stable-latent-moe/index.html">Stable LatentMoE 概念页</a>已讲清此机制。</p>
 
-<p><strong>稳定化 2 — SiTU-GLU</strong>（解决激活爆炸）：用 <a href="../../wiki/situ-glu/index.html">Sigmoid Tanh Unit GLU</a> 替换 SwiGLU。SwiGLU 的两个乘法因子都无界，大坐标重合时产生激活异常值。SiTU-GLU 用 <code>softcap(x, β) = β tanh(x/β)</code> 约束两个因子，输出界 $|f| \le \beta_1\beta_2 = 100$（$\beta_1=4$、$\beta_2=25$，§2.3.2 Eq.12，config.json <code>activation_situ_beta=4.0, activation_situ_linear_beta=25.0</code>），同时保留原点附近 Swish 的线性响应。<a href="../../wiki/situ-glu/index.html">SiTU-GLU 概念页</a>已讲清局部展开和输出界推导。</p>
+<p><strong>稳定化 2 — SiTU-GLU</strong>（解决激活爆炸）：用 <a href="../../wiki/situ-glu/index.html">Sigmoid Tanh Unit GLU</a> 替换 SwiGLU。SwiGLU 的两个乘法因子都无界，大坐标重合时产生激活异常值。SiTU-GLU 用 $\text{softcap}(x, \beta) = \beta \tanh(x/\beta)$ 约束两个因子，输出界 $|f| \le \beta_1\beta_2 = 100$（$\beta_1=4$、$\beta_2=25$，§2.3.2 Eq.12，config.json <code>activation_situ_beta=4.0, activation_situ_linear_beta=25.0</code>）<sup>[F5]</sup>，同时保留原点附近 Swish 的线性响应。<a href="../../wiki/situ-glu/index.html">SiTU-GLU 概念页</a>已讲清局部展开和输出界推导。</p>
 
-<p><strong>稳定化 3 — Quantile Balancing</strong>（解决负载失衡）：从 router score 分位数直接设定每个专家 bias，使每专家恰好获得目标负载 <code>q = mk/n</code>（§2.3.3 Eq.14）。相比 DeepSeek-V3 的固定步长 sign 更新（需要学习率 $\gamma$ 且在 896 专家下收敛慢），QB 跳到对偶问题的精确坐标最小值，无需学习率超参，几步内均衡。<a href="../../wiki/quantile-balancing/index.html">Quantile Balancing 概念页</a>已讲清对偶推导和直方图估计。</p>
+<p><strong>稳定化 3 — Quantile Balancing</strong>（解决负载失衡）：从 router score 分位数直接设定每个专家 bias，使每专家恰好获得目标负载 <code>q = mk/n</code>（§2.3.3 Eq.14）<sup>[F6]</sup>。相比 DeepSeek-V3 的固定步长 sign 更新（需要学习率 $\gamma$ 且在 896 专家下收敛慢），QB 跳到对偶问题的精确坐标最小值，无需学习率超参，几步内均衡。<a href="../../wiki/quantile-balancing/index.html">Quantile Balancing 概念页</a>已讲清对偶推导和直方图估计。</p>
 
 <p><strong>三件稳定化的分工</strong>：RMSNorm 和 SiTU-GLU 解决激活爆炸（稳定化 1+2），QB 解决负载失衡（稳定化 3）<sup>[C6]</sup>。论文 §2.3 只描述组合效果，未提供 896 专家规模下移除单个稳定化的消融实验。三件稳定化作用于不同失效路径：RMSNorm 降低尺度敏感性、SiTU-GLU 约束激活上界、QB 保证负载均衡。</p>
 
-<p>构造示例。一个 token 在宽度维度的处理——经过注意力层后，token 被投影到 3584 维潜在空间，router（sigmoid 激活）选出 16 个路由专家；16 个专家在潜在空间各自变换后加权聚合，经 RMSNorm 归一化，再由 <code>W↑</code> 升回 7168 维，最后与 2 个共享专家的全宽输出相加。</p>
+<p>一个 token 在宽度维度的处理——经过注意力层后，token 被投影到 3584 维潜在空间，router（sigmoid 激活）选出 16 个路由专家；16 个专家在潜在空间各自变换后加权聚合，经 RMSNorm 归一化，再由 <code>W↑</code> 升回 7168 维，最后与 2 个共享专家的全宽输出相加。</p>
 
 <h3 id="width-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -364,7 +354,7 @@
   </li>
 </ol>
 
-<p>本章讲宽度维度的 Stable LatentMoE。但 K3 是原生多模态模型，视觉如何接入——下一章讲原生视觉 MoonViT-V2。</p>
+<p>架构之外，K3 的原生视觉由 MoonViT-V2 编码器接入共享骨干。</p>
 
 <h2 id="native-vision">5. 原生视觉——MoonViT-V2</h2>
 
@@ -390,17 +380,17 @@
   </li>
 </ol>
 
-<p>本章讲原生视觉 MoonViT-V2。但架构之外，训练方法如何支撑 2.5× 效率——下一章讲训练数据、scaling law、Muon 与长上下文扩展。</p>
+<p>视觉与架构之外，约 2.5× 效率还依赖训练数据、scaling law、Muon 与长上下文扩展。</p>
 
 <h2 id="training">6. 训练——数据、scaling law、Muon、长上下文扩展</h2>
 
-<p>约 2.5× scaling efficiency 是架构、数据、训练配方共同作用的结果。本节回答这些训练方法如何共同支撑这一效率。</p>
+<p>约 2.5× scaling efficiency 是架构、数据、训练配方共同作用的结果，训练侧的支撑来自数据配方、scaling law、优化器与长上下文扩展。</p>
 
 <h3 id="training-data">6.1 数据与 scaling law</h3>
 
 <p>预训练数据覆盖四类文本域——Web Text、Code、Mathematics、Knowledge——加上大规模视觉语料（captions、图文交错、OCR、感知（perception）、视频、视觉编程数据，§3.1）。每个域用规则启发式、分类器质量评分和去重过滤，域特定采样率由小模型消融确定。知识数学语料用风格和视角多样 prompting 重述（rephrasing recipe，继承 K2）。</p>
 
-<p>Scaling law 研究（§3.2）独立搜索了 cosine decay 和 WSD（Warmup Stable Decay）各自的最优超参——论文发现两者最优 peak learning rate 和 batch size 差异很大，用共享超参比较不公平。在各自最优设置下，<strong>cosine decay 始终达到更低 final loss</strong>（§3.2）<sup>[C8]</sup>。据此 K3 采用 cosine + 1% linear warmup + weight decay 0.1（§3.3）。Fig.7 的 scaling-law 曲线显示 K3 达到 K2 相同 validation loss 所需 FLOPs 减半多，即约 2.5× 效率<sup>[N5]</sup>。</p>
+<p>Scaling law 研究（§3.2）独立搜索了 cosine decay 和 WSD（Warmup Stable Decay）各自的最优超参——论文发现两者最优 peak learning rate 和 batch size 差异很大，用共享超参比较不公平。在各自最优设置下，<strong>cosine decay 始终达到更低 final loss</strong>（§3.2）<sup>[C8]</sup>。据此 K3 采用 cosine + 1% linear warmup + weight decay 0.1（§3.3）。Fig.7 的 scaling-law 曲线显示 K3 达到 K2 相同 validation loss 所需 FLOPs 减半多，即约 2.5× 效率<sup>[N3]</sup>。</p>
 
 <h3 id="per-head-muon">6.2 Per-Head Muon</h3>
 
@@ -415,7 +405,7 @@
 </ul>
 <p>将昂贵的长序列计算集中在总训练预算的小部分，保持课程经济性的同时让模型逐步适应更长的依赖。长上下文数据经过专门清洗（exact/fuzzy 去重、视频帧感知哈希、质量过滤、结构验证），并通过排列和拼接多模态文档合成需要关注完整 1M 上下文才能解决的任务（§3.4）。</p>
 
-<p>论文用 collectively 描述 2.5× 的来源，未分解架构、数据、训练各贡献多少<sup>[N5]</sup>。Table 1 量化了架构变化（61→93 层，MLA→混合，SwiGLU→SiTU-GLU，384→896 专家），数据只定性描述为 refined 未给量化指标。论文未提供移除单个改进的消融，因此各因素的相对贡献未能从论文核实。</p>
+<p>论文用 collectively 描述 2.5× 的来源，未分解架构、数据、训练各贡献多少<sup>[N3]</sup>。Table 1 量化了架构变化（61→93 层，MLA→混合，SwiGLU→SiTU-GLU，384→896 专家），数据只定性描述为 refined 未给量化指标。论文未提供移除单个改进的消融，因此各因素的相对贡献未能从论文核实。</p>
 
 <h3 id="training-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -439,21 +429,21 @@
   </li>
 </ol>
 
-<p>本章讲训练方法。但预训练之外，后训练如何塑造 K3 的能力——下一章讲 SFT→RL→MOPD 三阶段、QAT 与 EAGLE。</p>
+<p>预训练之外，后训练（SFT→RL→MOPD 三阶段、QAT、EAGLE）塑造 K3 的最终能力。</p>
 
 <h2 id="post-training">7. 后训练——SFT→RL→MOPD 三阶段、QAT、EAGLE</h2>
 
-<p>K3 的后训练遵循<strong>三阶段范式</strong>（§4.1）：SFT 建立冷启动能力 → RL 发展多域多努力级别专家 → MOPD 蒸馏整合为统一模型<sup>[C10]</sup>。</p>
+<p>K3 的后训练遵循<strong>三阶段范式</strong>（§4.1）：监督微调（SFT）建立冷启动能力 → 强化学习（RL）发展多域多努力级别专家 → MOPD 蒸馏整合为统一模型<sup>[C10]</sup>。</p>
 
 <p><strong>SFT</strong>（§4.1.1）扩展了 K2/K2.5 的 SFT 数据集，大幅增加复杂 agentic 轨迹覆盖。用前代 Kimi 模型合成数据轨迹，经多阶段验证和人工标注。所有数据用 XTML chat template（附录 F）序列化。</p>
 
 <p><strong>RL</strong>（§4.1.2）跨三域 × 三努力级别：<strong>三域</strong> = (i) 通用任务、(ii) 通用智能体、(iii) 编程智能体；<strong>三努力</strong> = {low, high, max}。交叉得到 <strong>9 个专家模型</strong>。RL 用 partial rollout（部分轨迹完成即优化）减少长尾延迟，配合可恢复沙箱基础设施（§5.3.2）。reasoning effort 通过 per-problem budget control 实现：超预算轨迹得 -1 奖励。</p>
 
-<p><strong>MOPD</strong>（§4.1.3，Multi-Teacher On-Policy Distillation）将九个域×努力专家整合为统一模型。对给定域 d 和努力 e，由对应教师 <code>π_teacher</code> 指导学生 <code>π_θ</code>，per-token OPD reward 用 stop-gradient + clip 约束（Eq.15）。MOPD 的核心是在策略蒸馏，学生模型在自己生成的轨迹上学习，教师提供 dense reward 信号，整合多个专家能力到一个模型。完整机制见 <a href="../../wiki/mopd/index.html">MOPD 概念页</a>。</p>
+<p><strong>MOPD</strong>（§4.1.3，Multi-Teacher On-Policy Distillation）将九个域×努力专家整合为统一模型。对给定域 d 和努力 e，由对应教师 $\pi_{\text{teacher}}$ 指导学生 $\pi_\theta$，per-token OPD reward 用 stop-gradient + clip 约束（Eq.15）<sup>[F7]</sup>。MOPD 的核心是在策略蒸馏，学生模型在自己生成的轨迹上学习，教师提供 dense reward 信号，整合多个专家能力到一个模型。完整机制见 <a href="../../wiki/mopd/index.html">MOPD 概念页</a>。</p>
 
-<p><strong>QAT</strong>（§4.1.4）从 SFT 阶段开始贯穿整个后训练，MXFP4 权重 + MXFP8 激活，只量化 MoE 专家权重（注意力、共享专家、latent MoE 投影（W↓/W↑）、MoE router、lm_head、视觉塔、多模态投影器保持高精度，config.json <code>quantization_config.ignore</code> 确认）<sup>[C11]</sup>。RL 时 rollout 和训练共享同一量化方案，消除训练-推理失配。<a href="../../wiki/mxfp4-qat/index.html">MXFP4 QAT 概念页</a>已讲清量化机制。</p>
+<p><strong>QAT（量化感知训练，Quantization-Aware Training）</strong>（§4.1.4）从 SFT 阶段开始贯穿整个后训练，MXFP4 权重 + MXFP8 激活，只量化 MoE 专家权重（注意力、共享专家、latent MoE 投影（W↓/W↑）、MoE router、lm_head、视觉塔、多模态投影器保持高精度，config.json <code>quantization_config.ignore</code> 确认）<sup>[C11]</sup>。RL 时 rollout 和训练共享同一量化方案，消除训练-推理失配。<a href="../../wiki/mxfp4-qat/index.html">MXFP4 QAT 概念页</a>已讲清量化机制。</p>
 
-<p><strong>EAGLE-3 draft model</strong>（§4.1.4）：K3 预训练时有一个 MTP（Multi-Token Prediction）层，结构匹配 backbone block。EAGLE-3 的 draft model 是单层 decoder，结构匹配 MTP 层，因此 K3 把预训练 MTP 层微调为 EAGLE-3 风格 draft model（target model 冻结，只更新 draft 层和 feature-fusion 投影）。draft 输入融合低/中/高层特征（第 1、4、最终 AttnRes block 的输出），训练时展开 7 步。直接优化 LK loss（Eq.16，接受率的负对数）而非 KL 代理。EAGLE-3 是投机解码方法，小模型先草拟 token，大模型批量验证，加速推理；K3 用 MTP 层改造而非从零训练 draft model。完整机制见 <a href="../../wiki/eagle-speculative/index.html">EAGLE-3 概念页</a>。</p>
+<p><strong>EAGLE-3 draft model</strong>（§4.1.4）：K3 预训练时有一个 MTP（Multi-Token Prediction）层，结构匹配 backbone block。EAGLE-3 的 draft model 是单层 decoder，结构匹配 MTP 层，因此 K3 把预训练 MTP 层微调为 EAGLE-3 风格 draft model（target model 冻结，只更新 draft 层和 feature-fusion 投影）。draft 输入融合低/中/高层特征（第 1、4、最终 AttnRes block 的输出），训练时展开 7 步。直接优化 LK loss（Eq.16，接受率的负对数）<sup>[F8]</sup>而非 KL 代理。EAGLE-3 是投机解码方法，小模型先草拟 token，大模型批量验证，加速推理；K3 用 MTP 层改造而非从零训练 draft model。完整机制见 <a href="../../wiki/eagle-speculative/index.html">EAGLE-3 概念页</a>。</p>
 
 <h3 id="post-training-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -477,11 +467,11 @@
   </li>
 </ol>
 
-<p>本章讲后训练。但 3T 训练 + 1M RL 需要什么系统支撑——下一章讲基础设施创新。</p>
+<p>后训练依赖 3T 训练与 1M RL 的系统支撑，基础设施是下一层。</p>
 
 <h2 id="infrastructure">8. 基础设施——3T 训练 + 1M RL + 推理</h2>
 
-<p>K3 面临三个罕见地同时出现的系统挑战：混合 KDA 注意力、3T 级稀疏多模态训练、百万 token 智能体工作负载（§5）。本节简述各类基础设施创新，完整工程细节是独立工作。</p>
+<p>K3 面临三个罕见地同时出现的系统挑战：混合 KDA 注意力、3T 级稀疏多模态训练、百万 token 智能体工作负载（§5）。基础设施按 KDA 系统、专家并行、RL 系统与推理服务四类展开，完整工程细节是独立工作。</p>
 
 <h3 id="infra-kda">8.1 KDA 系统协同</h3>
 
@@ -489,7 +479,7 @@
 
 <h3 id="infra-moe">8.2 MoonEP：完美均衡专家并行</h3>
 
-<p><strong>MoonEP</strong>（§5.2.1）实现完美负载均衡的专家并行：每 rank 恰好收到 <code>S×K</code> token，计算形状静态已知。关键证明：<code>E/R</code> 个 redundant expert 总是够用（附录 E 定理 1），且这个上界基本紧。零拷贝通信（planning kernel 预计算目的地，token 直接发送到远程 rank 的专家分组位置）。静态形状消除每层 MoE host 同步。完整机制见 <a href="../../wiki/moonep/index.html">MoonEP 概念页</a>。</p>
+<p><strong>MoonEP</strong>（§5.2.1）实现完美负载均衡的专家并行：每 rank 恰好收到 <code>S×K</code> 个 token（S=序列长度，K=每 token 激活专家数=16），计算形状静态已知。关键证明：<code>E/R</code> 个 redundant expert 总是够用（附录 E 定理 1），且这个上界基本紧。零拷贝通信（planning kernel 预计算目的地，token 直接发送到远程 rank 的专家分组位置）。静态形状消除每层 MoE host 同步。完整机制见 <a href="../../wiki/moonep/index.html">MoonEP 概念页</a>。</p>
 
 <h3 id="infra-rl">8.3 1M 智能体 RL 系统</h3>
 
@@ -515,7 +505,7 @@
   </li>
 </ol>
 
-<p>本章讲基础设施。但架构与训练的最终效果如何——下一章讲性能与评价。</p>
+<p>架构、训练与基础设施的最终效果体现在 benchmark 与成本效率上。</p>
 
 <h2 id="performance">9. 性能与评价</h2>
 
@@ -536,7 +526,7 @@
 </table>
 </div>
 
-<p><b>表（原文 Table 2 节选）</b>：编程 benchmark。K3 在 ProgramBench（77.8）和 SWE-Marathon（42.0，+7 over Fable 5）取得第一，Terminal-Bench 88.3 接近 GPT-5.6 Sol 的 88.8。但 DeepSWE 落后 Fable 5 和 Sol。注意 SWE-Marathon 用 H20-calibrated 分支，Fable 5 在 35% 任务上触发 fallback（§6.1.3）。</p>
+<p><b>表（原文 Table 2 节选）</b>：编程 benchmark。K3 在 ProgramBench（77.8）和 SWE-Marathon（42.0，+7 over Fable 5）取得第一，Terminal-Bench 88.3 接近 GPT-5.6 Sol 的 88.8。但 DeepSWE 落后 Fable 5 和 Sol。SWE-Marathon 用 H20-calibrated 分支，Fable 5 在 35% 任务上触发 fallback（§6.1.3）。</p>
 
 <h3 id="perf-agentic">9.2 智能体</h3>
 
@@ -574,7 +564,7 @@
 
 <h3 id="perf-third-party">9.4 第三方评估与成本效率</h3>
 
-<p>第三方评估（§6.3，Table 5，as of July 23, 2026）：</p>
+<p>第三方评估（§6.3，Table 5，as of July 23, 2026）<sup>[N5]</sup>：</p>
 <ul>
   <li><strong>Artificial Analysis</strong>：Intelligence Index v4.1 = 57.1，#4/580（第三如果 GPT-5.6 Sol 努力变体算一个）</li>
   <li><strong>Vals AI</strong>：Vals Index = 74.7%，#2/39</li>
@@ -586,7 +576,7 @@
 
 <details>
 <summary>补充：benchmark 条件与 harness 差异（影响分数解读）</summary>
-<p><strong>harness 差异</strong>：编程 benchmark 用 Kimi Code / Claude Code / Codex 三种 harness 之一。Terminal-Bench 2.1 报 best across harnesses（§6.1.3 明确）；其他编程 benchmark 各模型使用三种 harness 之一（§6.1.3 未逐一说明每项选择）。例如 Terminal-Bench 2.1 K3 报 88.3（best across harnesses），但 Artificial Analysis 报更低分数（不同来源/条件，§6.3 第三方评估中 AA 仅覆盖 Intelligence Index v4.1，未涉及 Terminal-Bench；AA 官网具体数字以官网为准）。DeepSWE K3 报 67.5（v1.1 tasks），mini-SWE-agent harness 下 67.3。</p>
+<p><strong>harness 差异</strong>：编程 benchmark 用 Kimi Code / Claude Code / Codex 三种 harness（智能体运行框架，决定工具接口、系统提示与上下文管理，同一模型在不同 harness 下分数不同）之一。Terminal-Bench 2.1 报 best across harnesses（§6.1.3 原文"we report the best score across harnesses for all models"）；其他编程 benchmark 各模型使用三种 harness 之一（§6.1.3 未逐一说明每项选择）。Terminal-Bench 2.1 的 88.3 因此是三 harness 取最优。DeepSWE K3 报 67.5（v1.1 tasks），mini-SWE-agent harness 下 67.3。</p>
 <p><strong>Fable 5 含 fallback</strong>：所有 Fable 5 结果含 potential fallback behaviors（Fig.1 注释）。<strong>GPT-5.6 Sol 含 cyberguard</strong>：所有 Sol 结果含 potential cyberguards。</p>
 <p><strong>SWE-Marathon</strong>：基于 H20-calibrated 分支（July 9, 2026，v1.1 发布前），Docker images/performance gates/recalibrated for H20。Fable 5 在 35% 任务上触发 fallback。</p>
 <p><strong>BrowseComp</strong>：300K token 触发 context compaction；1M 全上下文无压缩时 K3 得 90.4%（仍领先 Opus 4.8/GPT-5.5）。</p>
@@ -609,16 +599,16 @@
   <li><p>harness 差异如何影响 Terminal-Bench 分数解读。</p>
     <details>
       <summary>解答：官方 88.3 是 best across harnesses</summary>
-      <p>官方 Terminal-Bench 2.1 报 best across harnesses（Kimi Code/Claude Code/Codex 中取最优）得 88.3，Artificial Analysis 在不同来源与条件下报更低分数。直接比较绝对分数需考虑 harness 选择的影响，纯模型能力差距可能与 Table 2 显示的不同。</p>
+      <p>官方 Terminal-Bench 2.1 报 best across harnesses（Kimi Code/Claude Code/Codex 中取最优）得 88.3，绝对分数因此包含 harness 选择的影响；跨来源直接比较需考虑这一点，纯模型能力差距可能与 Table 2 显示的不同。</p>
     </details>
   </li>
 </ol>
 
-<p>本章讲性能数据。但分数之外，K3 的系统性设计、开源意义与边界在哪——下一章讲独立评价。</p>
+<p>分数之外，K3 的系统性设计、开源意义与边界需要独立判断。</p>
 
 <h2 id="independent-evaluation">10. 独立评价——系统性设计、开源里程碑与边界</h2>
 
-<p>本章是本文对 K3 的独立评价，内容属于解读者判断而非论文结论。</p>
+<p>以下评价属于解读者判断，而非论文结论。</p>
 
 <h3 id="evaluation-strengths">10.1 优点</h3>
 
@@ -634,17 +624,17 @@
 
 <p><strong>研究级推理仍落后</strong>。CritPt 23.4 落后三个闭源模型，HLE-Full 43.5/56.0 落后 Fable 5 的 53.3/63.0。论文 §6.1.4 自己承认"research-level reasoning remains a key direction for improvement"。这表明 K3 的优势在工程化和 agentic 能力，而非最硬的推理。</p>
 
-<p><strong>benchmark harness 差异使绝对分数需谨慎</strong>。Terminal-Bench 官方 88.3 vs AA 报更低分数、Fable 5 含 fallback、GPT-5.6 Sol 含 cyberguard——直接比分数可能误导。论文 §6.1.3 明确 Terminal-Bench 报 best across harnesses<sup>[N6]</sup>，因此 K3 的编程分数包含 harness 选择的影响，纯模型能力差距与 Table 2 显示的可能不同。</p>
+<p><strong>benchmark harness 差异使绝对分数需谨慎</strong>。Terminal-Bench 的官方 88.3 是 best across harnesses、Fable 5 含 fallback、GPT-5.6 Sol 含 cyberguard——直接比分数可能误导。论文 §6.1.3 明确 Terminal-Bench 报 best across harnesses<sup>[N4]</sup>，因此 K3 的编程分数包含 harness 选择的影响，纯模型能力差距与 Table 2 显示的可能不同。</p>
 
-<p><strong>2.5× scaling efficiency 未分解单因素</strong>。论文只给 collectively 的 2.5×，未分解架构/数据/训练各贡献多少<sup>[N5]</sup>。这使得其他团队难以判断哪些改进值得复用。</p>
+<p><strong>2.5× scaling efficiency 未分解单因素</strong>。论文只给 collectively 的 2.5×，未分解架构/数据/训练各贡献多少<sup>[N3]</sup>。这使得其他团队难以判断哪些改进值得复用。</p>
 
 <p><strong>视觉"从零训练匹配 SigLIP"的结论依赖特定规模</strong>。论文 §2.4 的结论基于 K3 的 2.8T 规模，未在更小规模下验证，SigLIP 初始化的优势是否在更小规模下保持，未能从论文核实<sup>[C13]</sup>。</p>
 
-<h3 id="evaluation-applicability">10.3 适用场景与位置</h3>
+<h3 id="evaluation-applicability">10.3 适用条件与位置</h3>
 
 <p><strong>什么情况下值得用 K3</strong>：长上下文 agentic 任务（1M 上下文 + partial rollout）、成本敏感部署（BrowseComp $2.03/任务）、开源研究（完整权重可复现）、需要原生视觉的任务（非事后对齐）。</p>
 
-<p><strong>什么情况下不适合</strong>：需要最强研究级推理（CritPt/HLE 场景应选 Fable 5 或 GPT-5.6 Sol）、需要闭源模型的 cyberguard/fallback 安全层。</p>
+<p><strong>什么情况下不适合</strong>：需要最强研究级推理（CritPt/HLE 这类任务应选 Fable 5 或 GPT-5.6 Sol）、需要闭源模型的 cyberguard/fallback 安全层。</p>
 
 <p><strong>与相邻工作的位置</strong>：K3 是 K2 的直接升级（Table 1 量化了每个维度变化）。在架构路线上，KDA+MLA 混合注意力是与纯注意力（GPT/Claude）不同的路线——用线性注意力承担大部分序列混合，softmax 注意力只周期性出现。Stable LatentMoE 的 LatentMoE 路线（潜在空间路由）与传统全宽 MoE 路线也不同。这些选择是否成为主流有待后续工作验证。</p>
 
@@ -664,10 +654,10 @@
       <p>研究级推理仍落后（CritPt 23.4、HLE-Full 43.5/56.0）；benchmark harness 差异使绝对分数需谨慎；2.5× 效率只有 collectively 结论未分解单因素；"从零训练匹配 SigLIP"的结论依赖 2.8T 规模，更小规模未验证。</p>
     </details>
   </li>
-  <li><p>什么场景适合用 K3，什么场景不适合。</p>
+  <li><p>什么条件下适合用 K3，什么条件下不适合。</p>
     <details>
-      <summary>解答：长上下文 agentic 与成本敏感场景适合，最硬推理不适合</summary>
-      <p>适合：长上下文 agentic 任务（1M 上下文加 partial rollout）、成本敏感部署、开源研究、需要原生视觉的任务。不适合：需要最强研究级推理的场景（应选 Fable 5 或 GPT-5.6 Sol）、需要闭源模型 cyberguard/fallback 安全层的场景。</p>
+      <summary>解答：长上下文 agentic 与成本敏感条件适合，最硬推理不适合</summary>
+      <p>适合：长上下文 agentic 任务（1M 上下文加 partial rollout）、成本敏感部署、开源研究、需要原生视觉的任务。不适合：需要最强研究级推理的用途（应选 Fable 5 或 GPT-5.6 Sol）、需要闭源模型 cyberguard/fallback 安全层的用途。</p>
     </details>
   </li>
 </ol>
@@ -695,21 +685,21 @@
 <ul>
   <li>F1（KDA 递归 Eq.1）：§2.1.1 — 子页面 kda 讲清</li>
   <li>F2（lower-bounded decay Eq.5）：§2.1.1 — 子页面 kda 讲清</li>
-  <li>F5（Block AttnRes Eq.8-10）：§2.2 — 子页面 block-attnres 讲清</li>
-  <li>F6（Stable LatentMoE Eq.11）：§2.3 — 子页面 stable-latent-moe 讲清</li>
-  <li>F7（SiTU-GLU Eq.12）：§2.3.2 — 子页面 situ-glu 讲清</li>
-  <li>F8（QB Eq.14）：§2.3.3 — 子页面 quantile-balancing 讲清</li>
-  <li>F9（MOPD Eq.15）：§4.1.3</li>
-  <li>F10（LK loss Eq.16）：§4.1.4</li>
+  <li>F3（Block AttnRes Eq.8-10）：§2.2 — 子页面 block-attnres 讲清</li>
+  <li>F4（Stable LatentMoE Eq.11）：§2.3 — 子页面 stable-latent-moe 讲清</li>
+  <li>F5（SiTU-GLU Eq.12）：§2.3.2 — 子页面 situ-glu 讲清</li>
+  <li>F6（QB Eq.14）：§2.3.3 — 子页面 quantile-balancing 讲清</li>
+  <li>F7（MOPD Eq.15）：§4.1.3</li>
+  <li>F8（LK loss Eq.16）：§4.1.4</li>
 </ul>
 
 <h3>外部数字与实验条件</h3>
 <ul>
   <li>N1（2.78T/104.2B）：Table 1</li>
   <li>N2（93 层 = 69 KDA + 24 MLA）：Table 1；config.json</li>
-  <li>N5（2.5×）：Fig.7，OOD 验证 loss，collectively</li>
-  <li>N6-N9（benchmark）：Table 2，harness 差异见 §6.1.3</li>
-  <li>N10（第三方）：Table 5，as of July 23, 2026</li>
+  <li>N3（2.5×）：Fig.7，OOD 验证 loss，collectively</li>
+  <li>N4（benchmark）：Table 2，harness 差异见 §6.1.3</li>
+  <li>N5（第三方）：Table 5，as of July 23, 2026</li>
 </ul>
 
 <h3>构造示例</h3>

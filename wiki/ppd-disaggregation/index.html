@@ -136,14 +136,15 @@
 
 <p>第一个约束是<strong>单向协议</strong>。canonical PD 设计中 KV 传输严格单向：P 是 KV 生产者、D 是消费者，没有从 D 回到 P 的反向通道<sup>[C1]</sup>。这条契约被所有主流生产引擎保留——它最简化 KV 传输路径，代价是 D 上生成的 KV 永远到不了 P。在多轮场景下，这意味着每当用户发来下一轮请求，P 节点必须接收整段历史（此前所有轮次的回复 + 新的输入）、重新 prefill 一次生成 KV、再传回 D<sup>[C3, C4]</sup>。CachedAttention 在真实聊天负载上的测量发现该重算可占多轮 prefill 成本高达 99%<sup>[C4]</sup>（本文引用 gao2024 的结论，非本文实测）。</p>
 
-<p>第二个约束是<strong>KV 传输量的规模</strong>。每次 Turn 2+ 都要把整段历史对应的 KV 走完一次 P→D 网络路径。对于 Llama-3.1-8B（BF16、GQA 8 KV heads、32 layers（GQA 对 KV cache 压缩的机制见 <a href="../mqa-gqa/index.html">MQA 与 GQA</a>）），每 token 占用 $s_{\text{kv}} = 128\,\text{KiB}$ 的 KV 存储（详见来源与范围说明中的构造验证计算 F4）<sup>[F4]</sup>；一个 2K token 上下文对应单次传输约 256 MB<sup>[N14, F5]</sup>。高负载下这种规模的传输每轮重复发生，链路饱和、排队、超时、服务降级（2P_2D 与 3P_1D 在 $x{=}0$ 下大量 QPS 点成功率跌到 95% 以下，详见第 5 章）<sup>[N9]</sup>。</p>
+<p>第二个约束是<strong>KV 传输量的规模</strong>。每次 Turn 2+ 都要把整段历史对应的 KV 走完一次 P→D 网络路径。对于 Llama-3.1-8B（BF16、GQA 8 KV heads、32 layers（GQA 对 KV cache 压缩的机制见 <a href="../mqa-gqa/index.html">MQA 与 GQA</a>）），每 token 占用 $s_{\text{kv}} = 128\,\text{KiB}$ 的 KV 存储（详见来源与范围说明中的构造验证计算 F4）<sup>[F4]</sup>；一个 2K token 上下文对应单次传输约 256 MiB（论文记为 ~256 MB）<sup>[N14, F5]</sup>。高负载下这种规模的传输每轮重复发生，链路饱和、排队、超时、服务降级（2P_2D 与 3P_1D 在 $x{=}0$ 下大量 QPS 点成功率跌到 95% 以下，详见第 5 章）<sup>[N9]</sup>。</p>
 
 <figure class="diagram">
   <svg viewBox="0 0 660 230" role="img" aria-label="x=0 模式下多轮对话的请求路径：D 上的响应 KV 被无视，全历史送 P 重算，KV 传回 D">
-    <rect class="dg-box" x="200" y="40" width="120" height="48" rx="8"/>
-    <text x="260" y="70" text-anchor="middle" class="dg-text">客户端</text>
-    <text x="260" y="100" text-anchor="middle" class="dg-text">第 2 轮请求</text>
-    <text x="260" y="120" text-anchor="middle" class="dg-text">（追加 50 token）</text>
+    <text x="330" y="20" text-anchor="middle" class="dg-text">D 上明明已有第 1 轮回复的 KV，但 P 看不到，不得不再算一遍</text>
+    <rect class="dg-box" x="200" y="40" width="120" height="78" rx="8"/>
+    <text x="260" y="68" text-anchor="middle" class="dg-text">客户端</text>
+    <text x="260" y="90" text-anchor="middle" class="dg-text">第 2 轮请求</text>
+    <text x="260" y="112" text-anchor="middle" class="dg-text">（追加 50 token）</text>
     <rect class="dg-box" x="60" y="160" width="100" height="50" rx="8"/>
     <text x="110" y="190" text-anchor="middle" class="dg-text">P 节点</text>
     <rect class="dg-box" x="500" y="160" width="100" height="50" rx="8"/>
@@ -157,7 +158,6 @@
     <line class="dg-line" x1="500" y1="200" x2="491.3" y2="196.5"/>
     <line class="dg-line" x1="500" y1="200" x2="491.3" y2="203.5"/>
     <text x="330" y="196" text-anchor="middle" class="dg-text">重算后的 KV 传回 D</text>
-    <text x="330" y="90" text-anchor="middle" class="dg-text">D 上明明已有第 1 轮回复的 KV，但 P 看不到，不得不再算一遍</text>
   </svg>
   <figcaption class="diagram-caption">$x{=}0$（传统 PD）下第 2 轮请求的完整路径（构造示例）。第 1 轮回复的 KV 留在 D 上、对 P 不可达；新请求把整套历史送往 P 重算，再经网络传回 D。整段重算与一次完整 KV 传输是「两个代价」的具体形态，与第 4 章的 PPD 路径形成对照。</figcaption>
 </figure>
@@ -170,7 +170,7 @@
     <p>第 2 轮的 1250 token 里有哪部分是重复计算？</p>
     <details>
       <summary>解答：第 1 轮输入 1000 token 与第 1 轮回复 200 token 本可由 D 上已有 KV 复用，实际却仍被 P 重新计算</summary>
-      <p>第 1 轮的 1000 token 输入与 200 token 回复在 P 上早已处理过、KV 已传到 D；它们在第 2 轮属于"已知信息"。但因 D 上的 KV 对 P 不可达（单向协议）<sup>[C1]</sup>，P 只能整段重算 1250 token，只有末尾追加的 50 token 是真正的新内容<sup>[C3]</sup>。构造示例：1250 token 在 1P_3D 上需要约 156 MB KV 传输（详见第 5 章类似换算）。</p>
+      <p>第 1 轮的 1000 token 输入与 200 token 回复在 P 上早已处理过、KV 已传到 D；它们在第 2 轮属于"已知信息"。但因 D 上的 KV 对 P 不可达（单向协议）<sup>[C1]</sup>，P 只能整段重算 1250 token，只有末尾追加的 50 token 是真正的新内容<sup>[C3]</sup>。构造示例：1250 token 在 1P_3D 上需要约 156 MiB KV 传输（详见第 5 章类似换算）。</p>
     </details>
   </li>
   <li>
@@ -183,8 +183,8 @@
   <li>
     <p>这些 KV 传输有多重、对网络的要求是什么？</p>
     <details>
-      <summary>解答：Llama-3.1-8B 每 token 128 KiB，2K 上下文约 256 MB 单次传输</summary>
-      <p>Llama-3.1-8B（BF16、GQA 8 KV heads、32 layers（GQA 对 KV cache 压缩的机制见 <a href="../mqa-gqa/index.html">MQA 与 GQA</a>））每 token 占用 $s_{\text{kv}}=128\,\text{KiB}$ 的 KV 存储<sup>[F4]</sup>。2K token 上下文对应单次约 256 MB<sup>[N14]</sup>。WildChat 真实负载 P90 上下文 5115 token 时单次传输约 670 MB，NVLink 上约 4.5 ms，IB HDR 约 27 ms，100GbE 约 67 ms<sup>[N15]</sup>。每轮一次、跨所有并发会话，是带宽饱和的根因。</p>
+      <summary>解答：Llama-3.1-8B 每 token 128 KiB，2K 上下文约 256 MiB 单次传输</summary>
+      <p>Llama-3.1-8B（BF16、GQA 8 KV heads、32 layers（GQA 对 KV cache 压缩的机制见 <a href="../mqa-gqa/index.html">MQA 与 GQA</a>））每 token 占用 $s_{\text{kv}}=128\,\text{KiB}$ 的 KV 存储<sup>[F4]</sup>。2K token 上下文对应单次约 256 MiB（论文记为 ~256 MB）<sup>[N14]</sup>。WildChat 真实负载 P90 上下文 5115 token 时单次传输约 670 MB（论文十进制口径），NVLink 上约 4.5 ms，IB HDR 约 27 ms，100GbE 约 67 ms<sup>[N15]</sup>。每轮一次、跨所有并发会话，是带宽饱和的根因。</p>
     </details>
   </li>
 </ol>
@@ -213,11 +213,11 @@
 
 <p>下图展示 decode batch size 在 10 到 250 之间，三种配置（仅 decode、与 1 个 full prefill 同卡、与 1 个 append-prefill 同卡）的平均 TPOT。蓝线（decoding-only）与绿线（+1 append-prefill）几乎重合，全程偏差不超过 2%；红线（+1 full prefill）从 batch 50 开始显著抬升，到 batch 200 处 TPOT 抬升约 48%。</p>
 
-<p>图中需要关注的是 batch 200 处的标注：full prefill +48%、append-prefill +2%。</p>
+<p>两线差距在 batch 200 处达到一个数量级：full prefill +48%、append-prefill +2%。</p>
 <img src="assets/img-06.webp" alt="单 H100 上 Llama-3.1-8B 干扰微基准：full prefill 让 decode TPOT 在 batch 200 处上升 48%，append-prefill 仅上升 2%">
 <p><b>图（原文 Figure 2）</b>：单卡 H100、Llama-3.1-8B、共卡运行下的 decode TPOT 随 batch size 的变化。蓝线为 decoding-only 基线；绿线为与 1 个 append-prefill 共卡；红线为与 1 个 full prefill 共卡。Full prefill 在 batch 200 处让 TPOT 减速约 48%，append-prefill 仅约 2%，差距一个数量级<sup>[N1]</sup>。该图是「让 D 节点本地处理 append-prefill 几乎不付代价」的实证基础——直接支撑全文 PPD 决策的微观合法性。4 并发 prefill 的更激进版本（full +57% vs append +21%）见原文 Fig.A1<sup>[N2]</sup>，上下文敏感性（full 32K 时达 3–4×、append 64K 时仍 &lt;25%）见原文 Fig.A2<sup>[N3]</sup>。</p>
 
-<p>把这套数字翻成机制结论：full prefill 让同卡 decode 的延迟近乎翻倍，而 append-prefill 在 batch 200 内几乎无感。「所有 prefill 都必须物理隔离」的旧前提被精细化——对 Turn 1 仍然成立，对 Turn 2+ 的 append-prefill 几乎不成立。这是论文的方法论起点：让 D 节点本地处理 Turn 2+ 的代价，远低于直觉。</p>
+<p>把这套数字翻成机制结论：full prefill 让同卡 decode 的 TPOT 抬升约 48%（约 1.5 倍），而 append-prefill 在 batch 200 内几乎无感。「所有 prefill 都必须物理隔离」的旧前提被精细化——对 Turn 1 仍然成立，对 Turn 2+ 的 append-prefill 几乎不成立。这是论文的方法论起点：让 D 节点本地处理 Turn 2+ 的代价，远低于直觉。</p>
 
 <h3 id="interference-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -276,7 +276,7 @@
 </table>
 </div>
 
-<p>三组对比读起来很清晰：</p>
+<p>各配置类别的胜场结构：</p>
 
 <ul>
 <li><strong>Replica 拿下 TTFT 的 63.3%</strong>——零网络传输、本地前缀缓存，可 Turn 2 延迟最低；代价是 prefill 干扰 decode，缺乏 PD 隔离带来的 TPOT 与吞吐几乎为零胜场。</li>
@@ -308,8 +308,8 @@
   <li>
     <p>$x{=}1$ 到底改善多少 Turn 2 TTFT？</p>
     <details>
-      <summary>解答：合成扫描 48–73%；P 越稀缺、QPS 越高收益越大</summary>
-      <p>表 1 全表<sup>[N5]</sup>：1P_3D 高 QPS 降幅 73.3%，2P_2D 高 QPS 56.2%，3P_1D 高 QPS 24.9%。两个模式：C14——QPS 越高传输排队越严重、本地缓存越有价值；P 越稀缺时 $x{=}1$ 完全绕过 P 节点，收益越大。整段合成扫描范围 48–73%，真实负载另算（详见第 5 章）。</p>
+      <summary>解答：P 稀缺配置（1P_3D/2P_2D）合成扫描 48–73%，P 充裕的 3P_1D 仅 24.9–44.3%；P 越稀缺、QPS 越高收益越大</summary>
+      <p>表 1 全表<sup>[N5]</sup>：1P_3D 高 QPS 降幅 73.3%，2P_2D 高 QPS 56.2%，3P_1D 高 QPS 24.9%。两个模式：C14——QPS 越高传输排队越严重、本地缓存越有价值；P 越稀缺时 $x{=}1$ 完全绕过 P 节点，收益越大。论文给出的汇总区间 48–73% 对应 P 稀缺配置（1P_3D 与 2P_2D）；P 充裕的 3P_1D 是同一扫描下的反例，三档只有 24.9–44.3%。真实负载另算（详见第 5 章）。</p>
     </details>
   </li>
   <li>
@@ -348,7 +348,7 @@
 
 <p>决策规则：$S>0$ 则本地处理（$x{=}1$），否则走 P（$x{=}0$）。Turn 1 恒 $x{=}0$（无缓存 KV 可复用）<sup>[C6]</sup>。两个边界条件：传统 PD 是 $x{\equiv}0$ 特例；权重极端化（$w_{\text{tpot}}$ 很大）可回收 $x{=}0$，$w_{\text{ttft}}$ 很大则锁向 $x{=}1$<sup>[C8]</sup>。</p>
 
-<p>应注意：吞吐不在打分函数内——它是 KV 传输量下降的系统级副产物<sup>[C9]</sup>。把多目标路由硬塞进单个目标函数的做法不可行；该形式只显式优化 TTFT 与 TPOT 的可调权重组合，把吞吐作为外部约束的隐式解。</p>
+<p>吞吐不在打分函数内——它是 KV 传输量下降的系统级副产物<sup>[C9]</sup>。把多目标路由硬塞进单个目标函数的做法不可行；该形式只显式优化 TTFT 与 TPOT 的可调权重组合，把吞吐作为外部约束的隐式解。</p>
 
 <p>用开篇 1250 token 第 2 轮请求作为构造示例代入。论文 Eq.1 抽象地使用 $\Delta_{\text{ttft}}$（"the relative TTFT improvement"）与 $\Delta_{\text{tpot}}$（TPOT 相对退化），两者在下列代入中均取正值表示本地更优：$\Delta_{\text{ttft}}=+0.6$（本地 TTFT 比走 P 低 60%）、$\Delta_{\text{tpot}}=+0.08$（本地 TPOT 比走 P 慢 8%）。</p>
 
@@ -404,7 +404,7 @@
 <p>在 vLLM 的标准 disaggregated serving 之上加一层路由代理（不修改 KV 传输协议）<sup>[C13]</sup>：</p>
 <ul>
 <li>P 节点：vLLM 标准配置 <code>kv_role=kv_producer</code>，生成 KV 后通过 ZeroMQ 发送；Turn 1 与被路由回 P（$x{=}0$）的 Turn 2+ 请求都触发 KV 传输。</li>
-<li>D 节点：vLLM 标准配置（缓存以整页粒度匹配、跨请求复用 KV 的机制见 <a href="../prefix-caching/index.html">前缀缓存</a>） <code>kv_role=kv_consumer</code>，接收到的 KV 存入本地前缀缓存（prefix cache）供后续轮次复用；Turn 2+ 请求若决策为 $x{=}1$，在本地用该缓存做 append-prefill。 而当请求被路由回 P（$x{=}0$）时，D 侧已命中的头部块可免于重传——把命中块数回传、P 侧只发增量即可（见 <a href="../increase-kv/index.html">增量 KV 传输</a>）。</li>
+<li>D 节点：vLLM 标准配置（缓存以整页粒度匹配、跨请求复用 KV 的机制见 <a href="../prefix-caching/index.html">前缀缓存</a>） <code>kv_role=kv_consumer</code>，接收到的 KV 存入本地前缀缓存（prefix cache）供后续轮次复用；Turn 2+ 请求若决策为 $x{=}1$，在本地用该缓存做 append-prefill。</li>
 <li>会话管理：路由代理维护内存字典 <code>session_table[conv_hash] = {turn_count, assigned_pd, last_access}</code>，会话标识由首条用户消息的 MD5 哈希生成，空闲 60 分钟逐出（对齐 vLLM prefix cache 默认 TTL）。</li>
 <li>服务发现：后端每 10 秒经 ZeroMQ 心跳，30 秒无心跳标记移除，支持动态扩缩容与故障转移。</li>
 <li>代理实现：Quart（async Flask），职责包括请求解析、会话查表、转发、流式回传、决策与延迟统计采集。</li>
@@ -484,7 +484,7 @@
 <summary>补充：带宽模拟的延迟注入公式</summary>
 <p>对每个 PD 路由请求（约等于 $x{=}0$ 路径），在 vLLM P2P NCCL connector 的解码侧接收路径注入延迟</p>
 <p>$$\Delta t = \max\!\left(0,\; \frac{B(\psi)}{\beta_{\text{target}}} - t_{\text{NVLink}}\right),$$</p>
-<p>其中 $B(\psi) = n_{\text{tokens}}\cdot s_{\text{kv}}$，$s_{\text{kv}}=128\,\text{KiB/token}$<sup>[F4]</sup>，$\beta_{\text{target}}$ 是模拟目标带宽，$t_{\text{NVLink}}$ 是 NVLink 实际传输时间（扣除避免重复计数）<sup>[F3, C21]</sup>。PPD 的本地 append-prefill 路径不注入。WildChat P90 上下文 5115 token 时 Turn 2+ 传输约 670 MB，NVLink ~4.5 ms、HDR ~27 ms、100GbE ~67 ms<sup>[N15]</sup>。</p>
+<p>其中 $B(\psi) = n_{\text{tokens}}\cdot s_{\text{kv}}$，$s_{\text{kv}}=128\,\text{KiB/token}$<sup>[F4]</sup>，$\beta_{\text{target}}$ 是模拟目标带宽，$t_{\text{NVLink}}$ 是 NVLink 实际传输时间（扣除避免重复计数）<sup>[F3, C21]</sup>。PPD 的本地 append-prefill 路径不注入。WildChat P90 上下文 5115 token 时 Turn 2+ 传输约 670 MB（论文十进制口径），NVLink ~4.5 ms、HDR ~27 ms、100GbE ~67 ms<sup>[N15]</sup>。</p>
 </details>
 
 <h3 id="weight-knob">5.4 权重旋钮：单参数控制 TTFT-TPOT 取舍</h3>
@@ -500,7 +500,7 @@
 <p>真实负载整体结论：PPD 把 Turn 2+ TTFT 平均降低约 68%<sup>[N13]</sup>，TPOT 保持竞争力，每请求查询开销 &lt; 1 ms。在 2–16 轮会话与 8B/14B/30B 模型上 Turn 2+ TTFT 改善稳定在约 70%<sup>[N17]</sup>——收益来自架构性质，不可归因于特定模型。失败率（30 秒超时阈值）随 $x{=}1$ 替代 $x{=}0$ 而显著下降（附录表失败率全表<sup>[N16]</sup>）。</p>
 
 <details>
-<summary>展开：高 QPS 下失败率全表（附录 Table A2）</summary>
+<summary>展开：高 QPS 下失败率全表（附录 Table 5）</summary>
 <div class="table-scroll">
 <table>
 <thead><tr><th>配置</th><th>QPS=8</th><th>QPS=12</th><th>QPS=16</th><th>QPS=20</th></tr></thead>
@@ -566,7 +566,7 @@
 <li><strong>离线表漂移</strong>：决策表基于离线校准；硬件或负载分布远离婚线校准集时表会优雅降级但次优<sup>[C17]</sup>。论文承认未提供自适应更新机制——可与 AMPD（基于实时队列状态的并发工作）组合补齐<sup>[C17]</sup>。</li>
 <li><strong>单节点实验</strong>：主实验在 4×H100 NVLink 单节点上，跨节点慢链路只做了带宽注入模拟<sup>[C21, N11]</sup>。真实多节点部署的可移植性需更多验证。</li>
 <li><strong>主模型 8B 与初始化开销</strong>：replica 对照要求模型单卡放得下，主实验以 Llama-3.1-8B 为主<sup>[N17]</sup>；每个配置切换需要完整 server restart，17×180 测试矩阵在更大模型上成本 prohibitive（附录 C.3）。</li>
-<li><strong>缓存竞争未深入</strong>：多会话竞争 D 节点 KV 槽位时本地处理优势可能被缓存抖动抵消——论文未深入讨论该现象（与 prefix caching 本身的逐出约束相关，本页写作范围内未展开）。</li>
+<li><strong>缓存竞争未深入</strong>：多会话竞争 D 节点 KV 槽位时本地处理优势可能被缓存抖动抵消——论文未深入讨论该现象。</li>
 <li><strong>PPD 是 routing actuator</strong>：它不强制端到端 SLO 界（那是闭环准入控制+批调度的事）；只暴露一个可预测的权重旋钮<sup>[C18]</sup>。若部署需要硬 SLO 约束，需要上层控制器依据观测 P99 驱动 $\mathbf{w}$。</li>
 </ul>
 
@@ -605,7 +605,7 @@
 <h2 id="ppd-concept-figure">7. 附：PPD 架构概念图</h2>
 <p>下图展示三种架构在多轮对话下的请求路径对比。Replica（左）：所有 prefill 与 decode 都在本地 R 节点，无 KV 传输但无隔离；PD（中）：每个 turn 都把 KV 从 P 传到 D，每轮重复传输；PPD（右）：PPD Router 根据 SLO 权重、负载估计、节点配动态决定 Turn 1 走 P、T2+ 走 D 或 P，Turn 2+ 路径尽量复用本地 KV。</p>
 <img src="assets/img-01.webp" alt="Replica / PD / PPD 三种架构的多轮对话路径对比">
-<p><b>图（原文 Figure 3）</b>：架构对比示意图<sup>[G2]</sup>。Replica（左）：本地同时处理 prefill 与 decode，无 KV 传输、无干扰隔离；PD（中）：每个 turn 都把 KV 从 P 传到 D，T1 KV 与 T2+ KV 都走 P→D 通道（红色实线）；PPD（右）：新增 PPD Router 节点，根据 User SLO、Workload、Node Config 动态决定 T1 走 P、T2+ 走 D 或 P（虚线表示动态决策）。三种架构里"Last Turn's KV"（红虚线）始终在 D 上，对 P 不可达——PPD 的关键贡献是把"是否复用该 KV"从系统级约束变成按请求决策。</p>
+<p><b>图（原文 Figure 3）</b>：架构对比示意图<sup>[G2]</sup>。Replica（左）：本地同时处理 prefill 与 decode，无 KV 传输、无干扰隔离；PD（中）：每个 turn 都把 KV 从 P 传到 D，T1 KV 与 T2+ KV 都走 P→D 通道（红色实线）；PPD（右）：新增 PPD Router 节点，根据 User SLO、Workload、Node Config 动态决定 T1 走 P、T2+ 走 D 或 P（虚线表示动态决策）。PD 与 PPD 两幅中“Last Turn's KV”（红虚线）始终在 D 上，对 P 不可达——PPD 的关键贡献是把"是否复用该 KV"从系统级约束变成按请求决策。</p>
 
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
@@ -654,7 +654,7 @@
 <tr><td>N2</td><td>4 并发 prefill 时 full +57%、append +21%</td><td>§4.1 Fig.A1</td></tr>
 <tr><td>N3</td><td>full prefill 干扰 32K 时 3–4×；append 64K 时 <25%</td><td>§4.1 Fig.A2</td></tr>
 <tr><td>N4</td><td>17 配置 × 18 负载 × 10 QPS = 3060 数据点</td><td>§4.2</td></tr>
-<tr><td>N5</td><td>1P_3D 高 QPS -73.3%、2P_2D -56.2%、3P_1D -24.9%；总 48–73%</td><td>Tab.1</td></tr>
+<tr><td>N5</td><td>P 稀缺配置 1P_3D 高 QPS -73.3%、2P_2D -56.2%（汇总 48–73%）；3P_1D 仅 -24.9%</td><td>Tab.1</td></tr>
 <tr><td>N6</td><td>92.2%（负载, QPS）组合中 TTFT 与 TPOT 最优配置不同</td><td>§4.4</td></tr>
 <tr><td>N7</td><td>winner 分布：Replica 63.3/0.6/0%；$x{=}0$ 0/38.3/4.4%；$0<x<1$ 3.3/33.3/27.8%；$x{=}1$ 27.2/15.6/38.3%</td><td>Tab.2</td></tr>
 <tr><td>N8</td><td>1P_3D ShareGPT 平均查询延迟 $x{=}0$ 之上再降 15–25%</td><td>§6.2</td></tr>
@@ -663,7 +663,7 @@
 <tr><td>N11</td><td>四档互连 PD 143.7→170.6 ms（+18.7%）；PPD 恒 ~51 ms；相对 64%→70%</td><td>§6.4 Fig.5</td></tr>
 <tr><td>N12</td><td>$w_{\text{tpot}}$=1/3/6 → 95%/50%/20% D-local；$x{=}1$ 端 94–96% TTFT 降、7–12% TPOT 退化</td><td>§6.5 Fig.6</td></tr>
 <tr><td>N13</td><td>真实负载 Turn 2+ TTFT 平均降低约 68%</td><td>abstract、§8</td></tr>
-<tr><td>N14</td><td>Llama-3.1-8B 2K context 单次 KV 传输 ~256 MB</td><td>§2.2</td></tr>
+<tr><td>N14</td><td>Llama-3.1-8B 2K context 单次 KV 传输 ~256 MB（论文 1024 口径，即 256 MiB）</td><td>§2.2</td></tr>
 <tr><td>N15</td><td>$s_{\text{kv}}$=128 KiB/token；WildChat P90 5115 token → ~670 MB；NVLink ~4.5 ms / IB HDR ~27 ms / 100GbE ~67 ms</td><td>App.B.6</td></tr>
 <tr><td>N16</td><td>3P_1D $x{=}0$ 失败率 11/44/61/89% @QPS8-20；$x{=}1$ 6/22/44/67%</td><td>App.C.4</td></tr>
 <tr><td>N17</td><td>2–16 轮、8B/14B/30B 模型上 Turn 2+ TTFT 改善稳定 ~70%</td><td>§4.3、App.C.3</td></tr>
@@ -693,7 +693,7 @@
 <p>开篇 5 轮客服对话（输入 1000/追加 50 token、回复 200 token）：数字为构造示例，目的在于让两个代价在第一个场景中可见。第 2 章 1250/1200/50 计算量比、$O(n^2)$ 与 $O(m(n+m))$ 例子：构造示例。$s_{\text{kv}}=128$ KiB 构成推导：构造验证计算，验证论文数字自洽。Eq.1 的 $\Delta$ 代入（balanced、TPOT 强调、TTFT 强化三种权重下 S 的符号变化）：构造示例，展示决策对权重的依赖。</p>
 
 <h3>辅助解释与类比边界</h3>
-<p>第 1 章自绘 SVG（"x=0 下多轮请求路径"）展示两个代价的物理形态：辅助说明，不引入新机制声明。第 4 章 interp 文字"把多目标路由硬塞进单个目标函数的做法不可行"是分析性判断延伸（论文未明说）。</p>
+<p>第 1 章自绘 SVG（"x=0 下多轮请求路径"）展示两个代价的物理形态：辅助说明，不引入新机制声明。第 4 章该段文字"把多目标路由硬塞进单个目标函数的做法不可行"是分析性判断延伸（论文未明说）。</p>
 
 <h3>简化条件及其限制</h3>
 <p>其一，单节点实验：跨节点慢链路只用带宽注入模拟，真实多节点部署的可移植性未验证<sup>[N11, C21]</sup>。其二，离线表依赖负载网格校准——硬件更替或负载分布漂移时表需重新校准，论文未给出自适应更新机制<sup>[C17]</sup>。其三，主模型 8B——replica 对照要求模型单卡放得下，更大模型需权衡初始化开销<sup>[N17]</sup>。其四，缓存槽位竞争未深入——多会话争用 D 节点 KV 槽位时本地处理优势可能被抖动抵消，论文未量化该现象。其五，PPD 是 routing actuator，不强制端到端 SLO 界——硬 SLO 需上层控制器引入<sup>[C18]</sup>。</p>

@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="基于 Newton-Schulz 正交化的矩阵参数优化器：对动量矩阵做正交化后再更新，使各方向更新尺度均衡。K3 的 Per-Head Muon 是其按头切分改进。">
-  <meta name="dojo:summary" content="对动量矩阵做 Newton-Schulz 正交化后再更新参数，使不同方向上的更新尺度更均衡。K3 的 Per-Head Muon 将正交化从整块投影矩阵改为逐头执行。">
+  <meta name="description" content="基于 Newton-Schulz 正交化的矩阵参数优化器：对动量矩阵做正交化后再更新，使各方向更新尺度均衡。">
+  <meta name="dojo:summary" content="对动量矩阵做 Newton-Schulz 正交化后再更新参数，使不同方向上的更新尺度更均衡。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="训练与优化">
   <meta name="dojo:tag" content="优化器">
@@ -78,7 +78,7 @@
 <p><b>主要依据</b>：Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客）；Moonshot AI《Muon is Scalable for LLM Training》（2025，RMS 对齐缩放因子）；PyTorch <code>torch.optim.Muon</code> 官方实现（2.9 起内置，<code>adjust_lr_fn='match_rms_adamw'</code> 提供 RMS 对齐选项）。</p>
 </blockquote>
 
-<p>训练 transformer 时，某个隐藏层权重矩阵的动量更新经 SVD 分解后发现：最大的几个奇异值方向拿走了更新的绝大部分"能量"，而很多奇异值很小的方向几乎不被更新。Muon（MomentUm Orthogonalized by Newton-Schulz）由 Keller Jordan 等于 2024 年提出，专门针对隐藏层二维权重矩阵，对动量更新做 Newton-Schulz 正交化后再作为更新方向，让每一个奇异值方向获得均等的更新尺度；标量/向量参数、embedding 层、输出层仍用 AdamW。本文回答四个问题：正交化为什么能改善更新、Newton-Schulz 迭代如何只用矩阵乘法逼近正交化、Muon 与 SGD-momentum 和 AdamW 的几何区别、Muon 的适用边界在哪里。<sup>[C1]</sup></p>
+<p>训练 transformer 时，某个隐藏层权重矩阵的动量更新经 SVD 分解后发现：最大的几个奇异值方向拿走了更新的绝大部分"能量"，而很多奇异值很小的方向几乎不被更新。Muon（MomentUm Orthogonalized by Newton-Schulz）由 Keller Jordan 等于 2024 年提出<sup>[N12]</sup>，专门针对隐藏层二维权重矩阵，对动量更新做 Newton-Schulz 正交化后再作为更新方向，让每一个奇异值方向获得均等的更新尺度；标量/向量参数、embedding 层、输出层仍用 AdamW。本文回答四个问题：正交化为什么能改善更新、Newton-Schulz 迭代如何只用矩阵乘法逼近正交化、Muon 与 SGD-momentum 和 AdamW 的几何区别、Muon 的适用边界在哪里。<sup>[C1]</sup></p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -87,7 +87,7 @@
       <p>Muon 每一步对动量更新矩阵做了什么，为什么这样能改善二维权重矩阵的更新？</p>
       <details>
         <summary>解答：正交化动量更新</summary>
-        <p>Muon 先按 Nesterov momentum 累积动量得到 $M_t$，再对 $M_t$ 做 Newton-Schulz 正交化，把所有奇异值拉平到接近 1，最后以正交化结果 $O_t \approx UV^\top$ 作为更新方向。改善的关键机制：SGD-momentum 产生的动量更新矩阵通常条件数很高，少数大奇异值方向拿走绝大部分更新能量，小奇异值方向几乎不被更新；正交化使每个奇异值方向获得均等的更新尺度。完整论证见「1. 动量更新矩阵为什么需要正交化」与「2. Newton-Schulz 迭代如何近似正交化」。</p>
+        <p>Muon 先按 Nesterov momentum 累积动量得到前瞻动量 $\tilde{M}_t$，再对 $\tilde{M}_t$ 做 Newton-Schulz 正交化，把所有奇异值拉平到接近 1，最后以正交化结果 $O_t \approx UV^\top$ 作为更新方向。改善的关键机制：SGD-momentum 产生的动量更新矩阵通常条件数很高，少数大奇异值方向拿走绝大部分更新能量，小奇异值方向几乎不被更新；正交化使每个奇异值方向获得均等的更新尺度。完整论证见「1. 动量更新矩阵为什么需要正交化」与「2. Newton-Schulz 迭代如何近似正交化」。</p>
       </details>
     </li>
     <li>
@@ -118,7 +118,7 @@
   <h2>最容易误解</h2>
   <ul>
     <li>Muon 不是"更好的 Adam 平替"——它改变的是更新方向的几何结构，仅适用于隐藏层二维权重矩阵，收益与模型结构和参数类型相关。</li>
-    <li>Newton-Schulz 迭代是近似正交化而非精确——调优系数允许奇异值在 $[0.7,\ 1.3]$ 区间内波动，关键是"拉平"而非"精确求解"。</li>
+    <li>Newton-Schulz 迭代是近似正交化而非精确——调优系数下奇异值在 $[0.7,\ 1.3]$ 附近波动，关键是"拉平"而非"精确求解"。</li>
     <li>Muon 不适用于所有二维参数——embedding 和输出层虽是二维矩阵，但仍应用 AdamW。</li>
   </ul>
 </section>
@@ -133,7 +133,7 @@
 
 <p>对二维矩阵 $M_t$ 做奇异值分解 $M_t = U S V^\top$：$U$、$V$ 是正交矩阵，$S$ 是对角矩阵，对角元素 $s_i$ 称为奇异值，衡量更新在各个奇异值方向上的"幅度"。（矩阵的 SVD 与奇异值是理解本文的前置知识，完整讲解见 <a href="../newton-schulz/index.html">Newton-Schulz 正交化</a>；SVD 基础见 <a href="../svd/index.html">奇异值分解</a>。）</p>
 
-<p>Keller Jordan 在主源博客中报告了一项经验观察：SGD-momentum 和 Adam 产生的二维参数更新矩阵<strong>通常条件数很高</strong>，近似低秩——所有神经元的更新被少数几个方向主导。<sup>[C4]</sup> 条件数定义为最大奇异值与最小奇异值之比；条件数高意味着各方向更新幅度悬殊。</p>
+<p>Keller Jordan 在主源博客中报告了一项经验观察：依据对训练所得更新矩阵的人工检查，transformer 网络中 SGD-momentum 和 Adam 产生的二维参数更新矩阵<strong>通常条件数很高</strong>，近似低秩——所有神经元的更新被少数几个方向主导。<sup>[C4]</sup> 条件数定义为最大奇异值与最小奇异值之比；条件数高意味着各方向更新幅度悬殊。</p>
 
 <div class="callout callout-yellow">
 <p><b>构造示例</b>。 假设某个隐藏层权重矩阵的动量更新 $M_t$ 经 SVD 后奇异值为 $(0.9,\ 0.1)$，即 $M_t$ 在两个奇异值方向上的更新幅度相差 9 倍（条件数 $0.9/0.1 = 9$）。大奇异值方向拿走了绝大部分更新能量，小奇异值方向几乎不被更新。这里的数字是为便于手算构造的教学数字，不代表真实训练数据。</p>
@@ -141,11 +141,11 @@
 
 <p>直接用这样的 $M_t$ 更新参数，等于只优化了少数方向。作者推测，正交化能有效放大那些在更新中幅度很小但对学习重要的"稀有方向"，抑制过度主导的少数方向。<sup>[C5]</sup></p>
 
-<p>正交化的数学目标是找到与 $M_t$ 最近的半正交矩阵：<sup>[F4]</sup></p>
+<p>正交化的数学目标是找到与 $M_t$ 最近的半正交矩阵（行数 $\ne$ 列数时只能满足单侧正交条件）：<sup>[F4]</sup></p>
 
 <p>$$\operatorname{Ortho}(G) = \arg\min_O \{\|O - G\|_F : O^\top O = I \text{ 或 } OO^\top = I\}.$$</p>
 
-<p>设 $G = USV^\top$，则这个最近半正交矩阵就是 $UV^\top$——把所有奇异值全置 1、保留奇异向量方向。对上面的 $(0.9,\ 0.1)$，正交化目标是把奇异值拉平到接近 $(1,\ 1)$，使两个方向获得均等的更新尺度。$O^\top O = I$ 表示列正交（用于行数 $\ge$ 列数的矩阵），$OO^\top = I$ 表示行正交。</p>
+<p>其中 $\|\cdot\|_F$ 为 Frobenius 范数（矩阵所有元素平方和的平方根）。设 $G = USV^\top$，则这个最近半正交矩阵就是 $UV^\top$——把所有奇异值全置 1、保留奇异向量方向。对上面的 $(0.9,\ 0.1)$，正交化目标是把奇异值拉平到接近 $(1,\ 1)$，使两个方向获得均等的更新尺度。$O^\top O = I$ 表示列正交（用于行数 $\ge$ 列数的矩阵），$OO^\top = I$ 表示行正交。</p>
 
 <p>本章解释了动量更新矩阵条件数高、正交化把奇异值拉平的动机。但直接做 SVD 取 $UV^\top$ 太慢——下一章讲 Newton-Schulz 迭代如何只用矩阵乘法逼近正交化。</p>
 
@@ -155,7 +155,7 @@
     <p>"动量更新矩阵条件数高"意味着什么？</p>
     <details>
       <summary>解答：条件数高的含义</summary>
-      <p>条件数是最大奇异值与最小奇异值之比。条件数高说明动量更新矩阵 $M_t = USV^\top$ 的各奇异值 $s_i$ 悬殊，更新近似低秩：少数大奇异值方向拿走绝大部分更新能量，很多小奇异值方向几乎不被更新。<sup>[C4]</sup> 例如奇异值为 $(0.9,\ 0.1)$ 时条件数为 $0.9/0.1 = 9$，两个方向的更新幅度相差 9 倍。这一观察的经验范围是 SGD-momentum 和 Adam 产生的二维参数更新矩阵。</p>
+      <p>条件数是最大奇异值与最小奇异值之比。条件数高说明动量更新矩阵 $M_t = USV^\top$ 的各奇异值 $s_i$ 悬殊，更新近似低秩：少数大奇异值方向拿走绝大部分更新能量，很多小奇异值方向几乎不被更新。<sup>[C4]</sup> 例如奇异值为 $(0.9,\ 0.1)$ 时条件数为 $0.9/0.1 = 9$，两个方向的更新幅度相差 9 倍。这一观察的经验范围是 transformer 网络中 SGD-momentum 和 Adam 产生的二维参数更新矩阵，其依据是作者对训练所得更新矩阵的人工检查，而非理论证明。</p>
     </details>
   </li>
   <li>
@@ -197,18 +197,18 @@
 <p>最后一步用了 $S$ 对角因此与 $I$ 可交换、$S^2 \cdot S = S^3$ 等。结果就是对角矩阵 $aS + bS^3 + cS^5 = \phi(S)$，每个对角元素为 $\phi(s_i)$。</p>
 </details>
 
-<p>应用 $N$ 步 NS 迭代的输出为 $U\,\phi^N(S)\,V^\top$，其中 $\phi^N$ 表示对 $S$ 的对角元素重复施加 $\phi$ 共 $N$ 次。<sup>[F3]</sup> 只要 $\phi$ 把区间 $[0,1]$ 上的点都映射到接近 1，多次迭代后所有奇异值就都被拉平。</p>
+<p>应用 $N$ 步 NS 迭代的输出为 $U\,\phi^N(S)\,V^\top$，其中 $\phi^N$ 表示对 $S$ 的对角元素重复施加 $\phi$ 共 $N$ 次（$N$ 即 NS 迭代步数，默认取 5；后文记号 $T$ 表示同一量）。<sup>[F3]</sup> 只要 $\phi$ 把区间 $[0,1]$ 上的点都映射到接近 1，多次迭代后所有奇异值就都被拉平。</p>
 
 <p>这里有一个前提：初始奇异值必须落在 $\phi$ 的收敛域内。NS 迭代前先做<strong>谱范数归一化预处理</strong>：<sup>[F5]</sup></p>
 
 <p>$$X = \frac{G}{\|G\|_F + \varepsilon},\qquad \varepsilon = 10^{-7}.$$</p>
 
-<p>其中 $\|G\|_F$ 是 Frobenius 范数（矩阵所有元素平方和的平方根）。归一化后所有奇异值落在 $[0,1]$，因为最大奇异值不超过 $\|G\|_F$。这个缩放是良性的：正交化满足 $\operatorname{Ortho}(cG) = \operatorname{Ortho}(G)$（对任意非零常数 $c$），所以缩放不改变正交化结果。<sup>[N4]</sup> 此外，若 $G$ 的行数大于列数（$m > n$），先对 $G$ 做转置再迭代，迭代完成后再转回来，使迭代始终在 $m \le n$ 的矩阵上运行以减少计算量。</p>
+<p>其中 $\|G\|_F$ 是 Frobenius 范数（矩阵所有元素平方和的平方根）。归一化后所有奇异值落在 $[0,1]$，因为最大奇异值不超过 $\|G\|_F$。这个缩放是良性的：正交化满足 $\operatorname{Ortho}(cG) = \operatorname{Ortho}(G)$（对任意非零常数 $c$），所以缩放不改变正交化结果。<sup>[N4]</sup> 此外，若 $G$ 的行数大于列数（$m > n$），先对 $G$ 做转置再迭代，迭代完成后再转回来，使迭代始终在行数不超过列数（$m \le n$）的矩阵上运行以减少计算量。</p>
 
-<p>系数 $(a,b,c)$ 有两组常用取值。<sup>[N1, N2, N3, N5]</sup> 基线系数 $(a,b,c) = (2,\ -1.5,\ 0.5)$ 来自经典五阶 NS 格式，多次迭代后奇异值收敛到 1。调优系数 $(a,b,c) = (3.4445,\ -4.7750,\ 2.0315)$ 是 Muon 公开实现的默认值，调优原则有两条：让 $a$ 尽量大，因为 $\phi'(0) = a$ 控制小奇异值的初始增长速率；以及对所有 $x \in [0,1]$，允许 $\lim_{N\to\infty}\phi^N(x) \in [0.7,\ 1.3]$，即奇异值不必精确收敛到 1，误差约 0.3 即可不影响训练损失曲线。默认迭代步数 $T = 5$。</p>
+<p>系数 $(a,b,c)$ 有两组常用取值。<sup>[N1, N2, N3, N5]</sup> 基线系数 $(a,b,c) = (2,\ -1.5,\ 0.5)$ 是主源博客给出的简单基线，多次迭代后奇异值收敛到 1。调优系数 $(a,b,c) = (3.4445,\ -4.7750,\ 2.0315)$ 是 Muon 公开实现的默认值，调优原则有两条：让 $a$ 尽量大，因为 $\phi'(0) = a$ 控制小奇异值的初始增长速率；以及让 $\phi^N(x)$ 的长期取值落入期待区间 $[0.7,\ 1.3]$（这是设计目标，在 $x$ 接近 0 或个别区间上并不严格成立），即奇异值不必精确收敛到 1，误差约 0.3 即可不影响训练损失曲线。默认迭代步数 $T = 5$。</p>
 
 <div class="callout callout-purple">
-<p><b>调优系数的目标是"快速进入容忍区间"，不是"精确收敛到 1"</b>。调优系数的 $\phi'(0)=3.4445$ 大于基线的 $2$，使小奇异值第一步增长更快；但大系数也让接近 1 的奇异值产生振荡，最终在 $[0.7,\ 1.3]$ 区间内波动而非收敛到 1。这种"不精确"是设计选择——正交化的关键是把奇异值谱拉平，不是精确求解。</p>
+<p><b>调优系数的目标是"快速进入容忍区间"，不是"精确收敛到 1"</b>。调优系数的 $\phi'(0)=3.4445$ 大于基线的 $2$，使小奇异值第一步增长更快；但大系数也让接近 1 的奇异值产生振荡，最终在 $[0.7,\ 1.3]$ 附近波动而非收敛到 1。这种"不精确"是设计选择——正交化的关键是把奇异值谱拉平，不是精确求解。</p>
 </div>
 
 <p>NS 迭代的另一个工程优势是<strong>可在 bfloat16 精度下稳定运行</strong>。<sup>[C8]</sup> 对比之下，SVD 太慢，Shampoo 使用的 coupled Newton iteration 需要至少 float32 精度才能避免数值不稳定。NS 迭代只用矩阵乘法，而现代 GPU 有 bfloat16 专用张量核心，这使得它在工程上可行。</p>
@@ -219,23 +219,23 @@
 
 <p>用基线系数 $\phi(x) = 2x - 1.5x^3 + 0.5x^5$ 做第一步。对大奇异值 $s_1 = 0.9939$：</p>
 
-<p>$$\phi(0.9939) = 2(0.9939) - 1.5(0.9939)^3 + 0.5(0.9939)^5 \approx 1.0001.$$</p>
+<p>$$\phi(0.9939) = 2(0.9939) - 1.5(0.9939)^3 + 0.5(0.9939)^5 \approx 1.0000.$$</p>
 
 <p>对小奇异值 $s_2 = 0.1104$：</p>
 
 <p>$$\phi(0.1104) = 2(0.1104) - 1.5(0.1104)^3 + 0.5(0.1104)^5 \approx 0.2189.$$</p>
 
-<p>第一步后奇异值从 $(0.9939,\ 0.1104)$ 变为 $(1.0001,\ 0.2189)$：大奇异值已逼近 1，小奇异值从 0.11 提升到 0.22。第二步对小奇异值再施加 $\phi$：$\phi(0.2189) \approx 0.4222$。完整 5 步后两个奇异值都逼近 1。</p>
+<p>第一步后奇异值从 $(0.9939,\ 0.1104)$ 变为 $(1.0000,\ 0.2189)$：大奇异值已逼近 1，小奇异值从 0.11 提升到 0.22。第二步对小奇异值再施加 $\phi$：$\phi(0.2189) \approx 0.4222$。完整 5 步后两个奇异值都逼近 1。</p>
 
 <details>
 <summary>展开：完整 5 步手算过程（基线系数）</summary>
-<p>构造示例。 初始（谱归一化后）奇异值 $(0.9939,\ 0.1104)$，基线系数 $\phi(x)=2x-1.5x^3+0.5x^5$。</p>
+<p>构造示例。 初始（谱归一化后）奇异值 $(0.9939,\ 0.1104)$，基线系数 $\phi(x)=2x-1.5x^3+0.5x^5$。表中数值按全精度初值 $0.9/\sqrt{0.82} \approx 0.99388$、$0.1/\sqrt{0.82} \approx 0.11043$ 逐位迭代后取四位小数。</p>
 <div class="table-scroll">
 <table>
 <thead><tr><th>步数</th><th>大奇异值 $s_1$</th><th>小奇异值 $s_2$</th></tr></thead>
 <tbody>
 <tr><td>初始</td><td>0.9939</td><td>0.1104</td></tr>
-<tr><td>第 1 步</td><td>1.0001</td><td>0.2189</td></tr>
+<tr><td>第 1 步</td><td>1.0000</td><td>0.2189</td></tr>
 <tr><td>第 2 步</td><td>1.0000</td><td>0.4222</td></tr>
 <tr><td>第 3 步</td><td>1.0000</td><td>0.7383</td></tr>
 <tr><td>第 4 步</td><td>1.0000</td><td>0.9826</td></tr>
@@ -350,7 +350,7 @@ print(f"基线 O^T O =\n{np.round(O_base.T @ O_base, 4)} (应接近 I)")
 
 <ol>
   <li>计算当前梯度 $G_t = \nabla_W \mathcal{L}(W_t)$。</li>
-  <li>用 Nesterov momentum 累积动量。先构造前瞻动量 $\tilde{M}_t = G_t + \beta\, M_{t-1}$，再更新 $M_t = \beta\, M_{t-1} + G_t$（$M_0 = 0$）。Muon 默认用 Nesterov 版本，因为作者报告它在他们测试过的所有情况中都略优于普通 SGD-momentum。<sup>[C3]</sup> <strong>动量在正交化之前加入</strong>。</li>
+  <li>用 Nesterov momentum 累积动量。先更新动量缓冲 $M_t = \beta\, M_{t-1} + G_t$（$M_0 = 0$），再以前瞻动量 $\tilde{M}_t = G_t + \beta\, M_t$ 作为被正交化的对象。Muon 默认用 Nesterov 版本，因为作者报告它在他们测试过的所有情况中都略优于普通 SGD-momentum。<sup>[C3]</sup> <strong>动量在正交化之前加入</strong>。</li>
   <li>对动量矩阵做谱范数归一化预处理 $X = \tilde{M}_t / (\|\tilde{M}_t\|_F + \varepsilon)$。</li>
   <li>做 5 步 NS 迭代正交化，得到 $O_t \approx U V^\top$（奇异值接近 1）。</li>
   <li>参数更新 $W_{t+1} = W_t - \eta\, O_t$。</li>
@@ -365,8 +365,8 @@ print(f"基线 O^T O =\n{np.round(O_base.T @ O_base, 4)} (应接近 I)")
 状态：动量缓冲 M（初始为 0）
 
 # 第 1 步：Nesterov 前瞻动量
-M̃_t ← G_t + β · M_{t-1}        # 前瞻动量（用于正交化）
-M_t ← β · M_{t-1} + G_t        # 更新动量缓冲（供下一步使用）
+M_t ← β · M_{t-1} + G_t        # 先更新动量缓冲（供下一步使用）
+M̃_t ← G_t + β · M_t            # 前瞻动量（用于正交化）
 
 # 第 2 步：谱范数归一化
 X ← M̃_t / (‖M̃_t‖_F + ε)
@@ -409,7 +409,7 @@ W_{t+1} ← W_t - η · O_t
 
 <h3 id="shampoo-relation">3.2 与 Shampoo 的关系</h3>
 
-<p>Muon 可视为"无累积 Shampoo"。Shampoo 是二阶预条件优化器，去除其 preconditioner accumulation 后，更新经 SVD 展开等价于正交化梯度：<sup>[C6]</sup></p>
+<p>关闭动量时，Muon 的更新方向可视为"无累积 Shampoo"。Shampoo 是二阶预条件优化器，去除其 preconditioner accumulation 后，更新经 SVD 展开等价于正交化梯度（Bernstein &amp; Newhouse 2024 观察到该等价）：<sup>[C6]</sup></p>
 
 <p>$$(G_t G_t^\top)^{-1/4} G_t (G_t^\top G_t)^{-1/4} = UV^\top.$$</p>
 
@@ -423,11 +423,11 @@ W_{t+1} ← W_t - η · O_t
 <p>中间用了 $U^\top U = I$、$V^\top V = I$（正交矩阵性质）以及 $S^{-1/2} \cdot S \cdot S^{-1/2} = I$（对角矩阵可交换）。结果就是奇异值全置 1 的 $UV^\top$，与正交化目标一致。</p>
 </details>
 
-<p>所以 Muon 与无累积 Shampoo 的更新方向在数学上等价。<sup>[F6]</sup> 区别在于：Muon 在正交化<strong>之前</strong>加入 momentum（Shampoo 不加）；Muon 用 Newton-Schulz 迭代替代 Shampoo 的逆四次根 $(GG^\top)^{-1/4}$ 计算，从而更高效、可在 bfloat16 下运行。</p>
+<p>所以关闭动量时，Muon 与无累积 Shampoo 的更新方向在数学上等价。<sup>[F6]</sup> 区别在于：Muon 在正交化<strong>之前</strong>加入 momentum（Shampoo 不加）；Muon 用 Newton-Schulz 迭代替代 Shampoo 的逆四次根 $(GG^\top)^{-1/4}$ 计算，从而更高效、可在 bfloat16 下运行。</p>
 
 <h3 id="engineering-cost">3.3 工程开销与外部证据</h3>
 
-<p>NS 迭代的 FLOP 开销很低。对 $n \times m$ 矩阵（$m \le n$），每步 NS 迭代约需 $2(2nm^2 + m^3)$ matmul FLOPs，总开销上界为 $T \cdot m / B$（$T=5$ 为迭代步数，$B$ 为 batch size）。在典型 LM 训练场景下 FLOP 开销低于 1%：<sup>[N8]</sup> NanoGPT speedrun（$m=768$，$B=524288$）约 0.7%，Llama 405B（$m=16384$，$B=16\text{M}$）约 0.5%。</p>
+<p>NS 迭代的 FLOP 开销很低。对 $m \times n$ 矩阵（$m \le n$，即行数 $m$ 不超过列数 $n$），每步 NS 迭代约需 $2(2nm^2 + m^3)$ matmul FLOPs（该估计由 Bernstein、You、Cesista 从原始的 $6nm^2$ 改进为 $4nm^2 + 2m^3$，见主源博客），总开销上界为 $T \cdot m / B$（$T=5$ 为迭代步数，$B$ 为 batch size）。在典型 LM 训练场景下 FLOP 开销低于 1%：<sup>[N8]</sup> NanoGPT speedrun（$m=768$，$B=524288$）约 0.7%，Llama 405B（$m=16384$，$B=16\text{M}$）约 0.5%。</p>
 
 <p>Muon 的主要外部证据来自竞争性训练任务 NanoGPT speedrun（以 FineWeb 数据集训练 NanoGPT 达到 val loss 3.28 为目标）：<sup>[N6, N7]</sup> 2024-10-15 从 AdamW 切换到 Muon 首次创造训练速度记录，提速 35%；此后产生的 12 个新记录由 7 位不同研究者创造，Muon 在所有记录中保持为优化器选择。扩展验证中，用 8 张 H100 训练 1.5B 参数 transformer 达到 GPT-2 XL 级 HellaSwag 性能，Muon 需 10 小时而 AdamW 需 13.3 小时；<sup>[N9]</sup> CIFAR-10 训练至 94% 准确率的速度记录从 3.3 A100-seconds 提升到 2.6 A100-seconds。<sup>[N10]</sup> 这些是外部事实数字，说明 Muon 在竞争性任务中的表现，不直接构成机制结论。</p>
 
@@ -439,7 +439,7 @@ W_{t+1} ← W_t - η · O_t
     <p>按顺序说出 Muon 一步更新的五个步骤。</p>
     <details>
       <summary>解答：一步更新的完整流程</summary>
-      <p>（1）计算当前梯度 $G_t = \nabla_W \mathcal{L}(W_t)$；（2）用 Nesterov momentum 累积动量，先构造前瞻动量 $\tilde{M}_t = G_t + \beta M_{t-1}$，再更新动量缓冲 $M_t = \beta M_{t-1} + G_t$；（3）对动量矩阵做谱范数归一化 $X = \tilde{M}_t / (\|\tilde{M}_t\|_F + \varepsilon)$；（4）做 5 步 NS 迭代正交化，得到 $O_t \approx UV^\top$；（5）参数更新 $W_{t+1} = W_t - \eta O_t$。</p>
+      <p>（1）计算当前梯度 $G_t = \nabla_W \mathcal{L}(W_t)$；（2）用 Nesterov momentum 累积动量，先更新动量缓冲 $M_t = \beta M_{t-1} + G_t$，再以前瞻动量 $\tilde{M}_t = G_t + \beta M_t$ 作为被正交化的对象；（3）对动量矩阵做谱范数归一化 $X = \tilde{M}_t / (\|\tilde{M}_t\|_F + \varepsilon)$；（4）做 5 步 NS 迭代正交化，得到 $O_t \approx UV^\top$；（5）参数更新 $W_{t+1} = W_t - \eta O_t$。</p>
     </details>
   </li>
   <li>
@@ -487,16 +487,16 @@ W_{t+1} ← W_t - η · O_t
 
 <p>$$\gamma = 0.2 \cdot \sqrt{\max(m, n)}.$$</p>
 
-<p>更新式变为 $W_{t+1} = W_t - \eta\, \gamma\, O_t$。这个缩放因子的来源是正交化矩阵的 RMS 性质。矩阵 $W \in \mathbb{R}^{n \times m}$ 的 RMS 定义为 $\|W\|_F / \sqrt{nm}$。对满秩矩阵 $UV^\top$（秩 $r = \min(m,n)$）：</p>
+<p>更新式变为 $W_{t+1} = W_t - \eta\, \gamma\, O_t$。这个缩放因子的来源是正交化矩阵的 RMS 性质。矩阵 $W \in \mathbb{R}^{m \times n}$ 的 RMS 定义为 $\|W\|_F / \sqrt{nm}$。对满秩矩阵 $UV^\top$（秩 $r = \min(m,n)$）：</p>
 
 <p>$$\operatorname{RMS}(UV^\top) = \frac{\|UV^\top\|_F}{\sqrt{nm}} = \sqrt{\frac{r}{nm}} = \sqrt{\frac{1}{\max(m,n)}}.$$</p>
 
 <details>
 <summary>补充：$\operatorname{RMS}(UV^\top) = \sqrt{1/\max(m,n)}$</summary>
-<p>设 $U \in \mathbb{R}^{n \times r}$，$V \in \mathbb{R}^{m \times r}$，$U^\top U = I$，$V^\top V = I$（列正交），$r = \min(m,n)$。则 $UV^\top \in \mathbb{R}^{n \times m}$，其 Frobenius 范数平方为：</p>
-<p>$$\|UV^\top\|_F^2 = \sum_{i=1}^{n}\sum_{j=1}^{m} (UV^\top)_{ij}^2 = \sum_{i,j} \left(\sum_{k=1}^{r} U_{ik} V_{jk}\right)^2.$$</p>
+<p>设 $U \in \mathbb{R}^{m \times r}$，$V \in \mathbb{R}^{n \times r}$，$U^\top U = I$，$V^\top V = I$（列正交），$r = \min(m,n)$。则 $UV^\top \in \mathbb{R}^{m \times n}$，其 Frobenius 范数平方为：</p>
+<p>$$\|UV^\top\|_F^2 = \sum_{i=1}^{m}\sum_{j=1}^{n} (UV^\top)_{ij}^2 = \sum_{i,j} \left(\sum_{k=1}^{r} U_{ik} V_{jk}\right)^2.$$</p>
 <p>展开平方并交换求和顺序：</p>
-<p>$$= \sum_{k=1}^{r} \sum_{l=1}^{r} \left(\sum_{i=1}^{n} U_{ik} U_{il}\right) \left(\sum_{j=1}^{m} V_{jk} V_{jl}\right).$$</p>
+<p>$$= \sum_{k=1}^{r} \sum_{l=1}^{r} \left(\sum_{i=1}^{m} U_{ik} U_{il}\right) \left(\sum_{j=1}^{n} V_{jk} V_{jl}\right).$$</p>
 <p>由 $U^\top U = I$ 知 $\sum_i U_{ik} U_{il} = \delta_{kl}$（克罗内克 $\delta$），同理 $\sum_j V_{jk} V_{jl} = \delta_{kl}$。所以：</p>
 <p>$$= \sum_{k=1}^{r} \delta_{kk} \cdot \delta_{kk} = \sum_{k=1}^{r} 1 = r.$$</p>
 <p>因此 $\|UV^\top\|_F = \sqrt{r}$，$\operatorname{RMS}(UV^\top) = \sqrt{r}/\sqrt{nm} = \sqrt{r/(nm)}$。满秩时 $r = \min(m,n)$，化简得 $\sqrt{1/\max(m,n)}$。</p>
@@ -552,7 +552,7 @@ W_{t+1} ← W_t - η · O_t
 <p>C1（Muon 定义）、C2（仅隐藏层 2D，embedding/输出层用 AdamW）、C3（动量在正交化前加入，Nesterov 默认）、C4（更新矩阵条件数高）、C5（正交化放大稀有方向）、C6（与 Shampoo 关系）、C7（QKV 分开）、C8（bfloat16 稳定）：均来自 Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客 https://kellerjordan.github.io/posts/muon/）。C2 中 embedding 用 AdamW 的理论依据为 modular norm theory（Large et al. 2024《Scalable Optimization in the Modular Norm》，arXiv:2405.14813），本文只引用结论。</p>
 
 <h3>公式与来源（F）</h3>
-<p>F1（NS 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$）、F2（SVD 下 $U\phi(S)V^\top$）、F3（N 步复合 $U\phi^N(S)V^\top$）、F4（正交化目标 $\arg\min\|O-G\|_F$ 等价 $UV^\top$）、F5（谱范数归一化与 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$）、F6（Shampoo 无累积 = $UV^\top$）：均来自 Keller Jordan 2024 博客。F7（RMS 对齐缩放因子 $\gamma=0.2\sqrt{\max(m,n)}$ 与 $\operatorname{RMS}(UV^\top)=\sqrt{1/\max(m,n)}$）：来自 Moonshot AI《Muon is Scalable for LLM Training》（2025），推导参考苏剑林博客（kexue.fm）。F1–F5 由主源直接给出；F6 由主源给出 SVD 展开步骤，本页折叠块补全过程；F7 由 Moonshot 给出结论，本页折叠块补全 RMS 推导。</p>
+<p>F1（NS 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$）、F2（SVD 下 $U\phi(S)V^\top$）、F3（N 步复合 $U\phi^N(S)V^\top$）、F4（正交化目标 $\arg\min\|O-G\|_F$ 等价 $UV^\top$）、F5（谱范数归一化与 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$）、F6（Shampoo 无累积 = $UV^\top$）：来自 Keller Jordan 2024 博客，博客注明该等价由 Bernstein &amp; Newhouse (2024) 观察到（另见 Anil 2024a）。F7（RMS 对齐缩放因子 $\gamma=0.2\sqrt{\max(m,n)}$ 与 $\operatorname{RMS}(UV^\top)=\sqrt{1/\max(m,n)}$）：来自 Moonshot AI《Muon is Scalable for LLM Training》（2025），推导参考苏剑林博客（kexue.fm）。F1–F5 由主源直接给出；F6 由主源给出 SVD 展开步骤，完整推导见上文折叠块；F7 由 Moonshot 给出结论，RMS 推导由上文折叠块补全。</p>
 
 <h3>外部数字与实验条件（N）</h3>
 <p>N1（调优系数 $(3.4445, -4.7750, 2.0315)$）、N2（基线系数 $(2, -1.5, 0.5)$）、N3（迭代步数 5）、N4（$\varepsilon=10^{-7}$）、N5（允许 $\phi^N(x)\in[0.7,1.3]$）、N8（FLOP 开销 NanoGPT 0.7% / Llama 405B 0.5%）、N9（1.5B transformer 10 vs 13.3 H100-hours）、N10（CIFAR-10 3.3→2.6 A100-seconds）：来自 Keller Jordan 2024 博客。N6（2024-10-15 首次记录，提速 35%）、N7（12 个记录，7 位研究者）：来自同一博客。N11（PyTorch <code>torch.optim.Muon</code> 默认 lr=1e-3, weight_decay=0.1, momentum=0.95, nesterov=True, ns_steps=5, adjust_lr_fn 默认 'original'）：来自 PyTorch 官方文档 <code>torch.optim.Muon</code>（2.9 起内置，<code>adjust_lr_fn='match_rms_adamw'</code> 提供 Moonshot RMS 对齐选项）。N12（贡献者 Jordan、Jin、Boza、You、Cesista、Newhouse、Bernstein）：来自博客 Citation。</p>
@@ -561,7 +561,7 @@ W_{t+1} ← W_t - η · O_t
 <p>构造示例 $G = \operatorname{diag}(0.9,\ 0.1)$ 为人为构造的教学数字，目的是让奇异值拉平过程可手算：条件数 9（少数方向主导），谱归一化后 $(0.9939,\ 0.1104)$，5 步基线系数 NS 后逼近 $(1,\ 1)$。不代表真实训练数据或工程推荐值。可运行代码用 numpy float64 复现，便于读者独立验证。</p>
 
 <h3>辅助解释与类比边界</h3>
-<p>"正交化把奇异值拉平到接近 1"只解释 SVD 下奇异值被多项式映射这一局部关系，不保证正交化对任意矩阵都收敛——收敛要求初始奇异值落在 $\phi$ 的收敛域（由谱范数归一化保证）。"放大稀有方向、抑制主导方向"是作者推测（speculate），不作为已证结论。"无累积 Shampoo"的定位只解释 Muon 与去除累积的 Shampoo 在更新方向上的等价性，不覆盖 Shampoo 的完整 preconditioner accumulation 机制。</p>
+<p>"正交化把奇异值拉平到接近 1"只解释 SVD 下奇异值被多项式映射这一局部关系，不保证正交化对任意矩阵都收敛——收敛要求初始奇异值落在 $\phi$ 的收敛域（由谱范数归一化保证）。"放大稀有方向、抑制主导方向"是作者推测（speculate），不作为已证结论。"无累积 Shampoo"的定位只解释关闭动量时 Muon 与去除累积的 Shampoo 在更新方向上的等价性，不覆盖 Shampoo 的完整 preconditioner accumulation 机制。</p>
 
 <h3>简化条件及其限制</h3>
 <p>简化做法是用 numpy 的 float64 计算。可推出：NS 迭代的奇异值拉平机制与计算精度无关。不可推出：bfloat16 下的精确数值行为与 float64 完全一致（真实工程用 bfloat16 在 GPU 上运行，精度行为有差异但机制一致）。</p>

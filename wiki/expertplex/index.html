@@ -34,16 +34,6 @@
     .chapter-questions > li:last-child { margin-bottom: 0; }
     .chapter-questions > li > p { margin-bottom: 0.5rem; }
     .chapter-questions > li > details { margin: 0.5rem 0 0; }
-    .diagram {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      background: var(--bg-code);
-      padding: 1rem;
-      overflow-x: auto;
-      border-radius: 6px;
-      line-height: 1.5;
-      margin: 1.5rem 0;
-    }
     </style>
 </head>
 <body>
@@ -131,7 +121,7 @@
 
 <p>前置知识：<a href="../moe-serving/index.html">MoE 推理与服务基础</a>（prefill/decode、EP、goodput、PD 分离/合设）与 <a href="../gpu-execution-model/index.html">GPU 执行模型</a>（SM/CTA/cluster、kernel、CUDA Graph、Green Context）。</p>
 
-<p>先立一个贯穿全文的具体场景：一台 8 卡 H800 服务器跑 MiniMax-M2.7，来了一条 16K token 的长输入要 prefill，同时几十个已开始的请求正以每 50 毫秒一个 token 的速度 decode（这个 50ms 是 MiniMax-M2.7 在 ShareGPT 上的 TPOT SLO，见「6. 实验：提升多少，在什么条件下成立」的设置表）。论文实测，在 EP4（4 路专家并行）下这种模型的 decode 专家计算只要 17.7–34.7 微秒，而 16K token 的 prefill 专家计算要 1.8–2.9 毫秒——<strong>长 84–101 倍</strong> [C5]。同一张 GPU 上，一个 2 毫秒的大活和一个 30 微秒的小活抢资源，这就是全部故事的起点。</p>
+<p>以一台 8 卡 H800 服务器跑 MiniMax-M2.7 为例，来了一条 16K token 的长输入要 prefill，同时几十个已开始的请求正以每 50 毫秒一个 token 的速度 decode（这个 50ms 是 MiniMax-M2.7 在 ShareGPT 上的 TPOT SLO，见「6. 实验：提升多少，在什么条件下成立」的设置表）。论文实测，在 EP4（4 路专家并行）下这种模型的 decode 专家计算只要 17.7–34.7 微秒，而 16K token 的 prefill 专家计算要 1.8–2.9 毫秒——<strong>长 84–101 倍</strong> [C5]。同一张 GPU 上，一个 2 毫秒的大活和一个 30 微秒的小活在抢资源。</p>
 
 <h2 id="ch1-two-paths">1. 两条现有路线，各自的死结</h2>
 
@@ -160,7 +150,7 @@
 
 <p>下图展示 PD 合设在固定切分下的两种失败：prefill 占了太多 SM 时，就绪的 decode 被挡住（队头阻塞）；为 decode 留的 SM 没活干时，prefill 又用不上（资源气泡）。</p>
 <img src="assets/img-06.webp" alt="PD 合设的两种失败模式：队头阻塞与资源气泡">
-<p><b>图（原文 Figure 2）</b>：左侧是 head-of-line blocking——一个不可抢占的长 prefill kernel 占着 SM，延迟敏感的 decode 只能等；右侧是 resource bubble——为 decode 预留的 SM 在它没就绪工作时闲置，prefill 想用也用不上。论文给的数量级差距很关键：prefill kernel 能跑几十到几百毫秒，decode kernel 只要几百微秒，差好几个数量级 [C4]。把贯穿场景代进去：那个 2 毫秒的 prefill GEMM 如果挡住 decode，decode 要白白等 84–101 倍于自己执行的时间 [C5]。</p>
+<p><b>图（原文 Figure 2）</b>：左侧是 head-of-line blocking——一个不可抢占的长 prefill kernel 占着 SM，延迟敏感的 decode 只能等；右侧是 resource bubble——为 decode 预留的 SM 在它没就绪工作时闲置，prefill 想用也用不上。论文给的数量级差距很关键：prefill kernel 能跑几十到几百毫秒，decode kernel 只要几百微秒，差好几个数量级 [C4]。代入以上数字：那个 2 毫秒的 prefill GEMM 如果挡住 decode，decode 要白白等 84–101 倍于自己执行的时间 [C5]。</p>
 
 <p>合设还有个没解决的毛病：每张 GPU 都被切分，每个阶段拿到的本地资源更少，要达到同样的延迟目标就得用更宽的并行度，通信更多，而 prefill 和 decode 的 dispatch/combine 还挤在同一条网络上互相干扰 [C3]。</p>
 
@@ -183,7 +173,7 @@
     </details>
   </li>
   <li>
-    <p>贯穿场景里，固定切分下 decode 最坏要等 prefill 多少倍于自己的执行时间？</p>
+    <p>上文那个场景里，固定切分下 decode 最坏要等 prefill 多少倍于自己的执行时间？</p>
     <details>
     <summary>解答：84–101 倍</summary>
     <p>论文实测，EP4 下 MiniMax-M2.7 的 decode 专家计算只要 17.7–34.7 微秒，而 16K token 的 prefill 专家计算要 1.8–2.9 毫秒，长 84–101 倍。固定切分下不可抢占的长 prefill kernel 占着 SM 时，就绪的 decode 只能等完这段比自己长两个数量级的时间——这就是队头阻塞。</p>
@@ -238,7 +228,7 @@
 
 <h2 id="ch3-apk">3. APK：在 tile 边界上调度 GPU</h2>
 
-<p>共享一张 MoE GPU，最怕的就是贯穿场景里那个 2 毫秒的 prefill GEMM 把 30 微秒的 decode GEMM 顶在后面。CUDA stream 优先级不能打断已运行的 kernel；Green Context 在 kernel 期间固定；MPS 不能在运行中的 kernel 内部按 tile 时间复用——这些机制在 <a href="../gpu-execution-model/index.html">GPU 执行模型</a>页都对照过。APK 要补齐的是一个现有机制都缺的能力组合。</p>
+<p>共享一张 MoE GPU，最怕的就是那个 2 毫秒的 prefill GEMM 把 30 微秒的 decode GEMM 顶在后面。CUDA stream 优先级不能打断已运行的 kernel；Green Context 在 kernel 期间固定；MPS 不能在运行中的 kernel 内部按 tile 时间复用——这些机制见 <a href="../gpu-execution-model/index.html">GPU 执行模型</a>页。APK 要补齐的是一个现有机制都缺的能力组合。</p>
 
 <h3 id="ch3-five-props">3.1 共享机制需要五个性质</h3>
 
@@ -255,13 +245,13 @@
 </tbody>
 </table>
 </div>
-<p>逐个对照现有机制：API 拦截只有启动边界的时间复用，缺图兼容、空间复用和有界抢占；CUDA stream 有图兼容和启动排序，但启动后无空间隔离也无有界交接；MPS 和 Green Context 有图兼容的空间复用，但 kernel 期间固定，缺运行内时间复用和有界抢占/重分配；MIG 硬隔离但档位死（H100 只暴露 1g/2g/3g/4g/7g 五档，唯一能让两阶段合用满卡算力的两路划分是 3g–4g）、无时间复用、重配置延迟无界 [C7][C19]。APK 是表中唯一五条全占的。</p>
+<p>逐个对照现有机制：API 拦截只有启动边界的时间复用，缺图兼容、空间复用和有界抢占；CUDA stream 有图兼容和启动排序，但启动后无空间隔离也无有界交接；MPS 和 Green Context 有图兼容的空间复用，但 kernel 期间固定，缺运行内时间复用和有界抢占/重分配；MIG 硬隔离但档位死（H100 只暴露 1g/2g/3g/4g/7g 五档，唯一能让两阶段合用满卡算力的两路划分是 3g–4g）、无时间复用、重配置延迟无界 [C7][C19]。APK 是上述机制中唯一五条全占的。</p>
 
 <h3 id="ch3-tile">3.2 为什么选 tile 当调度单位</h3>
 
 <p>APK 选的调度单位是 <strong>tile</strong>——GEMM 类 kernel 内部最小可独立完成的计算块 [C7]。关键是它的尺寸由寄存器、shared memory、TMA buffer 和 Tensor Core 形状决定，<strong>输入变长只是让 tile 数变多，单个 tile 的大小不变</strong>。论文实测，MiniMax-M2.7 的 MoE 操作里 tile 边界每 2.2–25.3 微秒出现一次，GEMM 的 tile 间隔更是低于 10.7 微秒，而且<strong>与操作总长度无关</strong> [C7]。</p>
 
-<p>这正好治贯穿场景的病：那个 2 毫秒的 prefill GEMM 被 decode 抢占时，最长等一个 tile（约 10 微秒级）就能切走，而不是等完整个 2 毫秒。APK 只在当前 tile 提交后切阶段——这个边界上没有还在用的累加器、TMA 事务或 shared memory buffer，切换不需要 checkpoint、restore 或重算 [C7]。</p>
+<p>这就解决了上文那个问题：那个 2 毫秒的 prefill GEMM 被 decode 抢占时，最长等一个 tile（约 10 微秒级）就能切走，而不是等完整个 2 毫秒。APK 只在当前 tile 提交后切阶段——这个边界上没有还在用的累加器、TMA 事务或 shared memory buffer，切换不需要 checkpoint、restore 或重算 [C7]。</p>
 
 <h3 id="ch3-preempt">3.3 有界抢占：一次协作决策，不让流水线卡死</h3>
 
@@ -289,7 +279,7 @@
     <p>列出共享机制需要的五个性质，并指出 Green Context 缺哪几个。</p>
     <details>
     <summary>解答：五性质列出；Green Context 缺三个</summary>
-    <p>五个性质：CUDA Graph 兼容、空间复用、时间复用、有界抢占、有界重分配。Green Context（与 MPS 同类）有图兼容的空间复用，但 SM 分区在 kernel 期间固定，缺运行内时间复用、有界抢占与有界重分配；APK 是表中唯一五条全占的机制。</p>
+    <p>五个性质：CUDA Graph 兼容、空间复用、时间复用、有界抢占、有界重分配。Green Context（与 MPS 同类）有图兼容的空间复用，但 SM 分区在 kernel 期间固定，缺运行内时间复用、有界抢占与有界重分配；APK 是上述机制中唯一五条全占的机制。</p>
     </details>
   </li>
   <li>
@@ -339,7 +329,7 @@
 <p><b>图（原文 Figure 5）</b>：去掉 MoE 侧通信 kernel 后，APK 能让一阶段的通信与另一阶段的计算重叠——例如 prefill tile 与 decode 的 combine 并行、或 decode tile 与 prefill 的 dispatch 并行。这种重叠不受 TBO/SBO 那种阶段内依赖链的限制，只要有活就能让 SM 忙着 [C8]。</p>
 
 <div class="callout callout-yellow">
-<p><b>误解澄清</b>：「一侧通信会牺牲通信效率」不完全对。「6.3 三个微基准」显示，normal 模式下 dispatch/combine 与 DeepEP v1 只差约 5%，低延迟模式差也在约 45 微秒以内 [C17]。去掉协调换来的是 MoE 服务器 SM 全部可用于另一阶段计算，整体更划算。</p>
+<p><b>误解澄清</b>：「一侧通信会牺牲通信效率」不完全对。「6.3 四个微基准」显示，normal 模式下 dispatch/combine 与 DeepEP v1 只差约 5%，低延迟模式差也在约 45 微秒以内 [C17]。去掉协调换来的是 MoE 服务器 SM 全部可用于另一阶段计算，整体更划算。</p>
 </div>
 
 <h3 id="ch4-isolation">4.3 分层 prefill 路径与流量隔离</h3>
@@ -386,11 +376,11 @@
 
 <h2 id="ch5-opt">5. 跨栈优化器：从 tile 建模到集群</h2>
 
-<p>上面三个机制给了足够的控制旋钮，但它们是耦合的——改 prefill 服务器数量会同时改变并行度、KV cache 容量和通信路径。孤立地优化布局、重叠或 GPU 共享，都可能挑出局部高效、组合起来却违反 SLO 的配置。ExpertPlex 把 attention/MoE 并行度、服务器布局、重叠策略和 APK 共享策略<strong>联合搜索</strong> [C9]。</p>
+<p>上面三个机制给了足够的控制旋钮，但它们是耦合的——改 prefill 服务器数量会同时改变并行度、KV cache 容量和通信路径。孤立地优化布局、重叠或 GPU 共享，都可能挑出局部高效、组合起来却违反 SLO 的配置。ExpertPlex 把 attention/MoE 并行度、服务器布局、重叠策略和 APK 共享策略<strong>联合搜索</strong> [C21]。</p>
 
 <h3 id="ch5-goodput">5.1 goodput：为什么取 min</h3>
 
-<p>一个配置 $(\ell,q)$ 下，设 $B_p$、$B_d$ 是满足各自 SLO 的最大 prefill/decode batch，$T_p$、$T_d$ 是两阶段迭代延迟，$\bar{O}$ 是平均输出长度。请求级 goodput 定义为 [C9]：</p>
+<p>一个配置 $(\ell,q)$ 下，设 $B_p$、$B_d$ 是满足各自 SLO 的最大 prefill/decode batch，$T_p$、$T_d$ 是两阶段迭代延迟，$\bar{O}$ 是平均输出长度。请求级 goodput 定义为 [C21]：</p>
 <p>$$G(\ell,q)=\min\left(\frac{B_p}{T_p},\frac{B_d}{T_d\bar{O}}\right)$$</p>
 <p>取 min 是因为流水线平衡：每个请求消耗 1 次 prefill 迭代，但 $\bar{O}$ 次 decode 迭代。只优化一个阶段会让另一阶段成为瓶颈，所以只保留两阶段 SLO 都满足的候选，再在这些候选里最大化 $G$。</p>
 
@@ -401,20 +391,20 @@
 
 <h3 id="ch5-tilemodel">5.2 tile 感知延迟模型：token 数不够</h3>
 
-<p>关键观察是：MoE 计算延迟不跟「token 数」走，而跟「执行的 tile 数」走。若专家 $e$ 收到 $m_e$ 个 token 行、kernel 的 tile 高是 $M_t$，MoE 的 tile 足迹是 [C9]：</p>
+<p>关键观察是：MoE 计算延迟不跟「token 数」走，而跟「执行的 tile 数」走。若专家 $e$ 收到 $m_e$ 个 token 行、kernel 的 tile 高是 $M_t$，MoE 的 tile 足迹是 [C21]：</p>
 <p>$$x_{\mathrm{moe}}=\sum_{e\mid m_e>0}\left\lceil\frac{m_e}{M_t}\right\rceil$$</p>
 <p>因为每个激活专家至少触发一个 tile 的元数据、权重搬运和计算，哪怕只来几个 token。下图实证这一点：</p>
 <img src="assets/img-02.png" alt="MoE grouped GEMM 延迟随激活专家数和 token 数的变化">
-<p><b>图（原文 Figure 6）</b>：token 数相同的 batch，激活的专家数不同，延迟就不同——激活专家越多，tile 越多，延迟越高 [C9]。这是 tiled MoE kernel 的本质特性，不是某个模型或 GPU 特有的。所以模型不靠全集群实测每个布局，而是用少量 GPU 拟合组件延迟、预测每专家 token 向量后在 $x_{\mathrm{moe}}$ 上插值 [C9]。</p>
+<p><b>图（原文 Figure 6）</b>：token 数相同的 batch，激活的专家数不同，延迟就不同——激活专家越多，tile 越多，延迟越高 [C21]。这是 tiled MoE kernel 的本质特性，不是某个模型或 GPU 特有的。所以模型不靠全集群实测每个布局，而是用少量 GPU 拟合组件延迟、预测每专家 token 向量后在 $x_{\mathrm{moe}}$ 上插值 [C21]。</p>
 
 <details>
 <summary>补充：组件延迟拟合式与 MoE 为何取 $s=1$</summary>
-<p>对每个被测组件 $c$，用少量样本拟合 $\hat{t}_c(x,s)=\alpha_c+\beta_c x+\gamma_c xs+\delta_c xs^2$，attention 里 $x$ 是本地 batch、$s$ 是序列长度；MoE 用 $x=x_{\mathrm{moe}}$、$s=1$（tile 足迹已经吸收了规模信息）。网络时间不需 GPU 实测，直接由 routed 字节数、测得的 RDMA/NVLink 带宽和「4. 通信：让 attention 侧发起一切」的分层路径算出 [C9]。</p>
+<p>对每个被测组件 $c$，用少量样本拟合 $\hat{t}_c(x,s)=\alpha_c+\beta_c x+\gamma_c xs+\delta_c xs^2$，attention 里 $x$ 是本地 batch、$s$ 是序列长度；MoE 用 $x=x_{\mathrm{moe}}$、$s=1$（tile 足迹已经吸收了规模信息）。网络时间不需 GPU 实测，直接由 routed 字节数、测得的 RDMA/NVLink 带宽和「4. 通信：让 attention 侧发起一切」的分层路径算出 [C21]。</p>
 </details>
 
 <h3 id="ch5-search">5.3 离线搜索 + 在线重分配</h3>
 
-<p>离线搜索枚举所有布局 $\ell$，先用 <code>FitsMemory</code> 砍掉放不下权重或 KV cache 的；对剩下的每个 $(\ell,q)$，用上面的模型二分搜索每个阶段满足 SLO 的最大 batch，只保留两阶段都可行的，选 $G$ 最大的 [C9]。这个配置一并定下并行度、布局、重叠策略和 decode SM 预算 $q$。</p>
+<p>离线搜索枚举所有布局 $\ell$，先用 <code>FitsMemory</code> 砍掉放不下权重或 KV cache 的；对剩下的每个 $(\ell,q)$，用上面的模型二分搜索每个阶段满足 SLO 的最大 batch，只保留两阶段都可行的，选 $G$ 最大的 [C21]。这个配置一并定下并行度、布局、重叠策略和 decode SM 预算 $q$。</p>
 <p>在线运行时，APK 把 $q$ 解释成竞争策略而非静态分区，按「3. APK：在 tile 边界上调度 GPU」的 $q'$ 公式随实时负载调整——离线给期望，在线追实际。</p>
 
 <h3>本章问题</h3>
@@ -472,13 +462,13 @@
 </tbody>
 </table>
 </div>
-<p>数字来自论文 §7.2 及 Figure 7–10 [C12][C13][C14]。注意一个反例：在 GLM-5.1-FP8 + ShareGPT 上，ExpertPlex 与 PDMux 持平在约 1.5 req/s/node——PDMux 的 TP attention 给短请求更多并行度，TTFT 占优，但它无视 MoE 稀疏性分配资源；到了 LooGLE 长请求，这个优势消退，ExpertPlex 反超 1.66× [C14]。</p>
+<p>数字来自论文 §7.2 及 Figure 7–10 [C12][C13][C14]。一个反例是：在 GLM-5.1-FP8 + ShareGPT 上，ExpertPlex 与 PDMux 持平在约 1.5 req/s/node——PDMux 的 TP attention 给短请求更多并行度，TTFT 占优，但它无视 MoE 稀疏性分配资源；到了 LooGLE 长请求，这个优势消退，ExpertPlex 反超 1.66× [C14]。</p>
 
 <div class="callout callout-red">
 <p><b>误解澄清</b>：「2.01× 是全面碾压」是错的。2.01× 只是 MiniMax+ShareGPT 上对 PDD 的单点数字；对 PDMux 在 GLM+ShareGPT 上是持平。Abstract 只报最优数字，读实验要连同成立条件一起看。</p>
 </div>
 
-<h3 id="ch6-micro">6.3 三个微基准：机制各自的收益</h3>
+<h3 id="ch6-micro">6.3 四个微基准：机制各自的收益</h3>
 
 <p><b>APK 共享机制（单 GPU，GLM-5.1-FP8 形状 GEMM，decode 128 token / prefill 8192 token / 8 激活专家，decode 晚 10 微秒启动）[C15]：</b></p>
 <div class="table-scroll">
@@ -494,7 +484,7 @@
 </div>
 <p>下图是这条 Pareto 前沿：APK 是唯一既进入 decode 低延迟区、又保持 prefill 高性能的机制 [C10][C15]。</p>
 <img src="assets/img-01.webp" alt="GPU 共享机制的 Pareto 前沿">
-<p><b>图（原文 Figure 11）</b>：横轴 prefill 性能、纵轴 decode 延迟。CUDA stream 优先级让 decode 大幅劣化；MPS 和 Green Context 保住了 decode 但拖慢 prefill；只有 APK 同时落在「decode 低延迟 + prefill 高性能」的左下区域 [C10][C15]。</p>
+<p><b>图（原文 Figure 11）</b>：横轴 decode 延迟、纵轴 prefill 延迟。CUDA stream 优先级让 decode 大幅劣化；MPS 和 Green Context 保住了 decode 但拖慢 prefill；只有 APK 同时落在「decode 低延迟 + prefill 高性能」的左下区域 [C10][C15]。</p>
 
 <p><b>tile 调度开销 [C16]：</b>对照 DeepGEMM，prefill 的 contiguous 布局调度开销 &lt;12%；decode 的 masked 布局开销 &lt;20 微秒（激活专家多时相对开销 &lt;10%）。</p>
 
@@ -569,7 +559,7 @@
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（权重占比 95%+/96%/98%）§2.1；C2（PDD 部署单元 32P+320D 等）§1/§2.4；C3（Green Context kernel 期间固定）§1/§2.5；C4（prefill 数十至数百毫秒 vs decode 数百微秒）§2.5；C5（EP4 MiniMax decode 17.7–34.7 微秒 vs prefill 16K 1.8–2.9 毫秒，84–101×）§4.1；C6（共享专家+分离 attention 架构）§3/Figure 3；C7（APK tile 调度、边界 2.2–25.3 微秒、有界抢占上界、$q'$ 公式）§4.2/§4.3/§6.4；C8（一侧 push/pull、WaitDone）§5.1/§5.2；C9（分层 prefill 路径、虚拟通道优先级）§5.3；C10（APK 唯一进入低延迟区）§7.3/Figure 11；C11（APK 预分配 buffer 是一侧通信前提）§5.2；C12（MiniMax+ShareGPT 11.3 及各倍数）§7.2；C13（MiniMax+LooGLE 倍数、ChunkedPrefill 无法满足 SLO）§7.2；C14（GLM 各组倍数、ShareGPT 持平、LooGLE 1.66×）§7.2；C15（CUDA stream +13.79×、MPS 3.33×、Green Context 4.07×、APK +8%/1.12×）§7.3/Figure 12；C16（调度开销 &lt;12%/&lt;20 微秒）§7.4/Figure 13；C17（通信差 ~5%/~45 微秒）§7.5/Figure 14；C18（间隔 &lt;25.3 微秒/GEMM &lt;10.7 微秒、REEF 35 微秒）§7.6/Figure 15；C19（H100 MIG 1g/2g/3g/4g/7g，3g-4g 唯一用满）§4.1；C20（H800 NVLink 160GB/s vs IB 50GB/s，3.2×）§5.1。</p>
+<p>C1（权重占比 95%+/96%/98%）§2.1；C2（PDD 部署单元 32P+320D 等）§1/§2.4；C3（Green Context kernel 期间固定）§1/§2.5；C4（prefill 数十至数百毫秒 vs decode 数百微秒）§2.5；C5（EP4 MiniMax decode 17.7–34.7 微秒 vs prefill 16K 1.8–2.9 毫秒，84–101×）§4.1；C6（共享专家+分离 attention 架构）§3/Figure 3；C7（APK tile 调度、边界 2.2–25.3 微秒、有界抢占上界、$q'$ 公式）§4.2/§4.3/§6.4；C8（一侧 push/pull、WaitDone）§5.1/§5.2；C9（分层 prefill 路径、虚拟通道优先级）§5.3；C10（APK 唯一进入低延迟区）§7.3/Figure 11；C11（APK 预分配 buffer 是一侧通信前提）§5.2；C12（MiniMax+ShareGPT 11.3 及各倍数）§7.2；C13（MiniMax+LooGLE 倍数、ChunkedPrefill 无法满足 SLO）§7.2；C14（GLM 各组倍数、ShareGPT 持平、LooGLE 1.66×）§7.2；C15（CUDA stream +13.79×、MPS 3.33×、Green Context 4.07×、APK +8%/1.12×）§7.3/Figure 12；C16（调度开销 &lt;12%/&lt;20 微秒）§7.4/Figure 13；C17（通信差 ~5%/~45 微秒）§7.5/Figure 14；C18（间隔 &lt;25.3 微秒/GEMM &lt;10.7 微秒、REEF 35 微秒）§7.6/Figure 15；C19（H100 MIG 1g/2g/3g/4g/7g，3g-4g 唯一用满）§4.1；C20（H800 NVLink 160GB/s vs IB 50GB/s，3.2×）§5.1；C21（跨栈联合搜索、tile 感知延迟模型、离线二分搜索）§6.1–§6.4。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1 goodput $G(\ell,q)=\min(B_p/T_p,\,B_d/(T_d\bar O))$ §6.1 Eq.(1)；F2 延迟拟合 $\hat t_c=\alpha+\beta x+\gamma xs+\delta xs^2$ §6.2 Eq.(2)；F3 tile 足迹 $x_{\mathrm{moe}}=\sum\lceil m_e/M_t\rceil$ §6.2 Eq.(3)；F4 在线重分配 $q'=\min(Q_{\max},\lceil q\,x_{\mathrm{moe}}/x_{\mathrm{moe}}^\star\rceil_c)$ §6.4 Eq.(4)。</p>
@@ -578,10 +568,10 @@
 <p>N1 MiniMax-M2.7（230GB FP8、256 路由专家 top-8、每 token ~7.0B、full attention）§7.1；N2 GLM-5.1-FP8（756GB FP8、724.8B 路由参数、每 token ~22.6B、DSA）§7.1；N3 四组 SLO §7.1；N4 硬件与基线 §7.1。所有倍数与 req/s 数字均来自论文 §7.2，实验条件见上表。</p>
 
 <h3>原图与原文对应</h3>
-<p>Figure 2（PD colocation 局限）→「1. 两条现有路线，各自的死结」；Figure 3（架构）→「2. ExpertPlex 的架构：共享专家，分离注意力」；Figure 4（tile 抢占机制）→「3. APK：在 tile 边界上调度 GPU」；Figure 5（跨阶段重叠）→「4. 通信：让 attention 侧发起一切」；Figure 6（MoE GEMM 延迟 vs 激活专家/token）→「5. 跨栈优化器：从 tile 建模到集群」；Figure 11（共享机制 Pareto 前沿）→「6. 实验：提升多少，在什么条件下成立」。均对应论文同名 Figure，图片存于本页 assets/ 目录。</p>
+<p>Figure 2（PD colocation 局限）→「1. 两条现有路线，各自的死结」；Figure 3（架构）→「2. ExpertPlex 的架构：共享专家，分离注意力」；Figure 4（tile 抢占机制）→「3. APK：在 tile 边界上调度 GPU」；Figure 5（跨阶段重叠）→「4. 通信：让 attention 侧发起一切」；Figure 6（MoE GEMM 延迟 vs 激活专家/token）→「5. 跨栈优化器：从 tile 建模到集群」；Figure 11（共享机制 Pareto 前沿）→「6. 实验：提升多少，在什么条件下成立」。均对应论文同名 Figure，图片存于 assets/ 目录。</p>
 
 <h3>论文事实与解读者推断</h3>
-<p>正文 C/F/N 编号引用全部为论文事实；「7. 独立评价：三机制互相使能，但验证边界要看清」全章为解读者推断；贯穿场景里的「2 毫秒 / 30 微秒」量级取自论文 §4.1 实测数字 [C5]，用于构造反差的教学叙述。</p>
+<p>正文 C/F/N 编号引用全部为论文事实；「7. 独立评价：三机制互相使能，但验证边界要看清」全章为解读者推断；上文具体场景里的「2 毫秒 / 30 微秒」量级取自论文 §4.1 实测数字 [C5]，用于构造反差的教学叙述。</p>
 
 <h3>构造示例</h3>
 <p>goodput 取 min 的手算（$B_p=8, B_d=64, T_p=0.5, T_d=0.05, \bar O=20$）为人为构造，目的是说明 min 防止单阶段过配，不是论文实验数据。</p>

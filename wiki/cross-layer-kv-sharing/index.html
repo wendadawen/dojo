@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="让多层共用同一份全局 KV：上段各层不再自算全局 KV，缓存复杂度从 O(LND) 降到 O((N+L)D)，prefill 可提前退出；并区分共享 KV 与复用索引两级（Full/Reindex/Reuse），含运行期共享分组实测。">
-  <meta name="dojo:summary" content="上段各层复用下段末层隐状态投影出的全局 KV：$\hat K = \mathrm{LN}(X^{L/2})W_K$、$\hat V = \mathrm{LN}(X^{L/2})W_V$，缓存复杂度从 $\mathcal{O}(LND)$ 降到 $\mathcal{O}((N+L)D)$；共享 KV 与复用索引是两件事，实测共享分组为 2-7 / 8-13 / 14-19 / 20-39。">
+  <meta name="description" content="让多层共用同一份全局 KV：上段各层不再自算全局 KV，缓存复杂度从 O(LND) 降到 O((N+L)D)，prefill 可提前退出；并区分共享 KV 与复用索引两级（Full/Reindex/Reuse），含官方配置声明的共享分组。">
+  <meta name="dojo:summary" content="上段各层复用下段末层隐状态投影出的全局 KV：$\hat K = \mathrm{LN}(X^{L/2})W_K$、$\hat V = \mathrm{LN}(X^{L/2})W_V$，缓存复杂度从 $\mathcal{O}(LND)$ 降到 $\mathcal{O}((N+L)D)$；共享 KV 与复用索引是两件事，官方配置声明的共享分组为 2-7 / 8-13 / 14-19 / 20-39。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制,内存与缓存">
   <meta name="dojo:tag" content="KV cache">
@@ -59,7 +59,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：YOCO（Sun et al., arXiv:2405.05254v2）§2、Eq.(2)、Table 1–3；DeepSeek-V4.1-Flash 技术报告 §2.2、§2.3.1；官方推理配置与参考实现（<code>inference/config.json</code>、<code>inference/model.py</code>）。共享关系的运行期实测见文末来源说明。</p>
+<p><b>主要依据</b>：YOCO（Sun et al., arXiv:2405.05254v2）§2、Eq.(2)、Table 1–3；DeepSeek-V4.1-Flash 技术报告 §2.2、§2.3.1 与官方发布说明；官方推理配置。</p>
 </blockquote>
 
 <div class="callout callout-blue">
@@ -73,7 +73,7 @@
       <p>多层共用的那份 KV 是从哪一层来的？</p>
       <details>
         <summary>解答：下段末层隐状态投影而来，上段各层不再自算全局 KV</summary>
-        <p>把层分成下段（自解码器）与上段（交叉解码器）。下段逐层计算，其末层隐状态 $X^{L/2}$ 经投影得到唯一的全局键值 $\hat K = \mathrm{LN}(X^{L/2})W_K$、$\hat V = \mathrm{LN}(X^{L/2})W_V$；上段各层通过交叉注意力复用它，不再从本层隐状态生成全局 KV。因此全局 KV 的份数从"每层一份"变成"每段一份"。注意"只缓存一次"指的是全局 KV；下段自身的局部缓存仍需保留，只是其大小有界、相对全局项可忽略<sup>[C7]</sup>。完整机制见第 1 章。</p>
+        <p>把层分成下段（自解码器）与上段（交叉解码器）。下段逐层计算，其末层隐状态 $X^{L/2}$ 经投影得到唯一的全局键值 $\hat K = \mathrm{LN}(X^{L/2})W_K$、$\hat V = \mathrm{LN}(X^{L/2})W_V$；上段各层通过交叉注意力复用它，不再从本层隐状态生成全局 KV。因此全局 KV 的份数从"每层一份"变成"每段一份"。注意"只缓存一次"指的是全局 KV；下段自身的局部缓存仍需保留，只是其大小有界、相对全局项可忽略<sup>[C6]</sup>。完整机制见第 1 章。</p>
       </details>
     </li>
     <li>
@@ -94,7 +94,7 @@
       <p>复用的前提是什么？为什么不能所有层共用一份？</p>
       <details>
         <summary>解答：同组压缩比必须一致；不同压缩比的组各有一份</summary>
-        <p>共用一份 KV 要求同组层的压缩比相同——条目覆盖的 token 数不同就无法共用。实测 DeepSeek-V4.1-Flash 的共享分组是层 2–7、8–13、14–19、20–39，source 层分别是 2、8、14、20，每个压缩层读到的 cache 都来自组内 source 层。代价是上段各层不再有各自的全局 KV，表达能力损失由训练补偿。完整前提与边界见第 4 章。</p>
+        <p>共用一份 KV 要求同组层的压缩比相同——条目覆盖的 token 数不同就无法共用。DeepSeek-V4.1-Flash 的配置声明的共享分组是层 2–7、8–13、14–19、20–39，source 层分别是 2、8、14、20，每个压缩层读到的 cache 都来自组内 source 层。代价是上段各层不再有各自的全局 KV。完整前提与边界见第 4 章。</p>
       </details>
     </li>
   </ol>
@@ -103,7 +103,7 @@
 <section class="misconceptions">
   <h2>常见误解</h2>
   <ul>
-    <li>「跨层复用就是所有层共用一份 KV」——是"同组共用一份"；不同压缩比的组各有一份，实测有 4 个 source 层。</li>
+    <li>「跨层复用就是所有层共用一份 KV」——是"同组共用一份"；不同压缩比的组各有一份，配置声明的 source 层有 4 个。</li>
     <li>「复用索引与复用 KV 总是一起发生」——CSA2 把两者解耦：Reindex 层复用 KV 但自算索引。</li>
     <li>「复用了 KV，所有层看到的内容就一样了」——各层仍用自己的 query 与本层窗口 KV，只是全局部分来自同一份条目。</li>
     <li>「复用后缓存复杂度是常数」——被消掉的是层维度，全局 KV 仍随序列长度增长；局部窗口 KV 也仍按层存在。</li>
@@ -120,7 +120,7 @@ $$\hat K = \mathrm{LN}(X^{L/2})\,W_K,\qquad \hat V = \mathrm{LN}(X^{L/2})\,W_V$$
 
 <ul>
 <li>$X^{L/2}$：自解码器末层的隐状态（整段上下文的摘要）；</li>
-<li>$W_K, W_V \in \mathbb{R}^{d\times d}$：可学习的投影权重。YOCO 用一份共享权重从 $X^{L/2}$ 投出全局 KV；DeepSeek-V4.1-Flash 的 CED 各层用逐层权重 $W_l^{KV}, W_l^{Z}$ 从同一份 $H^{L/2}$ 各自投影出各自的 $C^l, Z^l$，CED 层面共享的是<b>输入</b> $H^{L/2}$ 而不是投影结果（跨层共享派生缓存是 CSA2 的行为，见第 3 章）<sup>[F4]</sup>；</li>
+<li>$W_K, W_V \in \mathbb{R}^{D\times D}$：可学习的投影权重（$D$ 为隐藏维，即 YOCO Eq.(2) 中的 $d$）。YOCO 用一份共享权重从 $X^{L/2}$ 投出全局 KV；DeepSeek-V4.1-Flash 的 CED 各层用逐层权重 $W_l^{KV}, W_l^{Z}$ 从同一份 $H^{L/2}$ 各自投影出各自的 $C^l, Z^l$，CED 层面共享的是<b>输入</b> $H^{L/2}$ 而不是投影结果（跨层共享派生缓存是 CSA2 的行为，见第 3 章）<sup>[F4]</sup>；</li>
 <li>$\hat K, \hat V$：被上段所有层复用的全局键与值；</li>
 <li>$\mathrm{LN}$：层归一化。</li>
 </ul>
@@ -163,7 +163,7 @@ $$\hat K = \mathrm{LN}(X^{L/2})\,W_K,\qquad \hat V = \mathrm{LN}(X^{L/2})\,W_V$$
   </li>
 </ol>
 
-<h2 id="savings">2. 省下多少：层维度被消掉</h2>
+<h2 id="savings">2. 省下多少——层维度被消掉</h2>
 
 <p>复用的直接后果是缓存里不再有"每层一份"这个维度。YOCO 给出的复杂度对照是<sup>[C2, F2]</sup>：</p>
 
@@ -214,7 +214,7 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
   </li>
 </ol>
 
-<h2 id="two-levels">3. 两级复用：共享 KV 与复用索引</h2>
+<h2 id="two-levels">3. 两级复用——共享 KV 与复用索引</h2>
 
 <p>"跨层复用"在实践中分成两件可以独立开关的事，这一点容易被混为一谈：</p>
 
@@ -276,9 +276,9 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
   </li>
 </ol>
 
-<h2 id="preconditions">4. 前提与边界：同组才能共用</h2>
+<h2 id="preconditions">4. 前提与边界——同组才能共用</h2>
 
-<p>共用一份 KV 不是无条件的。前提之一是<b>同组层的压缩比一致</b>：一个压缩条目覆盖 $r$ 个 token，$r$ 不同的层无法共用同一批条目<sup>[C6]</sup>。但压缩比一致只是必要条件、不是分组依据——层 2–19 的压缩比全为 2，却被拆成 2–7、8–13、14–19 三个组。真正的分组由配置里的生产层列表 <code>kv_source_layers=[2,8,14,20]</code> 直接声明，组内由一个 source 层负责生产、其余层读取<sup>[C6, N2]</sup>。</p>
+<p>共用一份 KV 不是无条件的。前提之一是<b>同组层的压缩比一致</b>：一个压缩条目覆盖 $r$ 个 token，$r$ 不同的层无法共用同一批条目<sup>[C5]</sup>。但压缩比一致只是必要条件、不是分组依据——层 2–19 的压缩比全为 2，却被拆成 2–7、8–13、14–19 三个组。真正的分组由配置里的生产层列表 <code>kv_source_layers=[2,8,14,20]</code> 直接声明，组内由一个 source 层负责生产、其余层读取<sup>[C5, N2]</sup>。</p>
 
 <div class="table-scroll">
 <table>
@@ -292,14 +292,14 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 </table>
 </div>
 
-<p>这张表的层区间由官方配置声明<sup>[C6]</sup>，共享关系由运行期实测确认<sup>[C5, N2]</sup>：把每一层实际读到的 KV cache 对象回溯到它的属主，可以确认每个压缩层读到的 cache 都来自组内的 source 层，source 层读到的则是自己刚发布的那一份。分组边界与配置中声明的生产层列表（<code>kv_source_layers</code>）完全一致<sup>[N3]</sup>——这也说明分组是配置给定的，不能从压缩比推出。</p>
+<p>表中的层区间、source 层与压缩比由官方配置声明<sup>[C5, N2, N3]</sup>：配置为各层给出压缩比 <code>compress_ratios</code> 与生产层列表 <code>kv_source_layers</code>，组内由 source 层发布主 KV，其余层读取这一份。分组边界即这份列表给出的区间——分组由配置给定，不能从压缩比推出。</p>
 
 <details>
-<summary>补充：运行期怎么确认"谁读了谁的 cache"</summary>
-<p>做法是把每层的 KV cache 张量按对象标识登记成"属主与层号的对应关系"的表，然后在注意力前向里记录"本次读到的 cache 属于哪个层"。这样得到的是运行期的实际归属关系，而不是从配置推断的关系。实测输出：每个压缩层读到的 cache 都来自其组内 source 层，源层读到自己刚发布的 cache。</p>
+<summary>补充：分组与 source 层是怎么定的</summary>
+<p>配置为每个压缩层指定一个静态模式：Full 层自己计算主 KV 与索引器 K 并发布，Reindex 与 Reuse 层则读取最近一个 Full 层发布的 KV<sup>[C4]</sup>。因此每组的生产者就是该组的首个 Full 层，也就是配置在 <code>kv_source_layers</code> 中声明的 source 层；分组边界由这份列表直接决定，而不是从压缩比推出。</p>
 </details>
 
-<p>代价方面，上段各层不再拥有各自的全局 KV，这意味着它们的全局可见性是"共享的"，表达能力损失需要在训练中补偿。此外，序列很短时（$N$ 与 $L$ 同量级）局部缓存的常量项与全局项体量相当，复用的收益不明显。</p>
+<p>代价方面，上段各层不再拥有各自的全局 KV，它们的全局可见性因此是"共享的"。此外，序列很短时（$N$ 与 $L$ 同量级）局部缓存的常量项与全局项体量相当，复用的收益不明显。</p>
 
 <h3 id="preconditions-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -314,7 +314,7 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
     <p>复用会不会让模型"记住"得更少？</p>
     <details>
       <summary>解答：全局可见性被共享，但可见范围不变，代价在表达能力</summary>
-      <p>复用的不是"可见范围"，而是"用于全局注意力的那份条目的来源"。上段各层仍然能看到同样的全局位置集合（由 Top-K 选择决定），只是这些位置对应的 KV 条目来自下段末层隐状态的投影，而不是各层自己的隐状态。因此代价是各层失去了"用自己的隐状态表示全局上下文"的能力，需要训练补偿；这不等同于上下文变短。</p>
+      <p>复用的不是"可见范围"，而是"用于全局注意力的那份条目的来源"。上段各层仍然能看到同样的全局位置集合（由 Top-K 选择决定），只是这些位置对应的 KV 条目来自下段末层隐状态的投影，而不是各层自己的隐状态。因此代价是各层失去了"用自己的隐状态表示全局上下文"的能力；这不等同于上下文变短。</p>
     </details>
   </li>
 </ol>
@@ -322,29 +322,28 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>[C1] YOCO（Sun et al., arXiv:2405.05254v2）Abstract 与 §2：「a cross-decoder stacked upon a self-decoder. The self-decoder efficiently encodes global key-value (KV) caches that are reused by the cross-decoder via cross-attention.」；「YOCO is stacked with L layers, where the first L/2 layers are self-decoder while the rest modules are cross-decoder.」；「The KV caches K̂, V̂ are reused by all the L/2 cross-decoder modules」。</p>
+<p>[C1] YOCO（Sun et al., arXiv:2405.05254v2）Abstract 与 §2：「a cross-decoder stacked upon a self-decoder. The self-decoder efficiently encodes global key-value (KV) caches that are reused by the cross-decoder via cross-attention.」；「YOCO is stacked with L blocks, where the first L/2 layers are self-decoder while the rest modules are cross-decoder.」；「The KV caches K̂, V̂ are reused by all the L/2 cross-decoder modules」。</p>
 <p>[C2] 同上 §2.3 与 Table 2：「the number of caches is O(N+CL) ... about O(N) caches are required, i.e., you only cache once.」；「Transformer decoders have to store $N\times L$ keys and values during inference. So YOCO roughly saves L times GPU memory for caches compared to Transformer decoders.」</p>
 <p>[C3] 同上 §2.3 与 Table 1/3：「we can exit early before entering the cross-decoder during the prefill stage.」；「First, only half the layers are needed for forward computation, i.e., at least half prefilling latency reduction.」</p>
-<p>[C4] DeepSeek-V4.1-Flash 技术报告 §2.3.1（对应 <code>tech_report.txt</code> 行 490–545）：「Full Mode. The layer computes its own main KV and indexer Q, projects indexer K from that main KV, and runs the indexer to produce fresh Top-K indices.」；「Reindex Mode. The layer reuses the most recent available main KV from a preceding layer together with its corresponding indexer K.」；「Reuse Mode. ... performs attention using this selection without computing indexer Q or evaluating index scores.」；「When CSA2 is combined with CED, the decoder layer assigned to Full Mode computes its own global KV from the hidden state of the (L/2)-th layer」。参考实现：<code>model.py</code> 中 <code>Indexer.__init__</code> 的 <code>owns_k</code> / <code>is_candidate_source</code> / <code>uses_candidates</code> 判定与 <code>Attention._compress_kv</code> 的发布-读取顺序。</p>
-<p>[C5] 运行期共享关系：<code>wiki/deepseek-v4-1/research/verify_csa2_modes.py</code> 与其存档 <code>ckpt/verify_csa2_modes.out</code>，输出「每个压缩层读到的 cache 都来自其组内 source 层: True」「源层读到自己刚发布的 cache: True」，分组为 2–7 / 8–13 / 14–19 / 20–39。</p>
-<p>[C6] 压缩比与分组：官方推理配置 <code>compress_ratios</code>（层 2–19 为 2、层 20–39 为 1）与 <code>kv_source_layers=[2,8,14,20]</code>；参考实现 <code>Compressor.__init__</code> 按 <code>compress_ratios[layer_id]</code> 取压缩比。</p>
-<p>[C7] YOCO 脚注 1：「The word 'once' refers to global KV cache. Strictly, self-decoder also needs to store a certain number of caches. As the self-decoder utilizes an efficient attention module, the cache size is bounded to a constant, which can be ignored compared to global caches when the sequence length is large.」</p>
+<p>[C4] DeepSeek-V4.1-Flash 技术报告 §2.3.1：「Full Mode. The layer computes its own main KV and indexer Q, projects indexer K from that main KV, and runs the indexer to produce fresh Top-K indices.」；「Reindex Mode. The layer reuses the most recent available main KV from a preceding layer together with its corresponding indexer K.」；「Reuse Mode. ... performs attention using this selection without computing indexer Q or evaluating index scores.」；「When CSA2 is combined with CED, the decoder layer assigned to Full Mode computes its own global KV from the hidden state of the (L/2)-th layer」。</p>
+<p>[C5] 压缩比与分组：官方推理配置 <code>compress_ratios</code>（层 2–19 为 2、层 20–39 为 1）与生产层列表 <code>kv_source_layers=[2,8,14,20]</code>；组内由列表给出的 source 层发布主 KV，其余层读取这一份。</p>
+<p>[C6] YOCO 脚注 1：「The word 'once' refers to global KV cache. Strictly, self-decoder also needs to store a certain number of caches. As the self-decoder utilizes an efficient attention module, the cache size is bounded to a constant, which can be ignored compared to global caches when the sequence length is large.」</p>
 
 <h3>公式与来源（F）</h3>
-<p>[F1] $\hat K = \mathrm{LN}(X^{L/2})W_K$、$\hat V = \mathrm{LN}(X^{L/2})W_V$：YOCO Eq.(2) 及其说明「where $W_K, W_V \in \mathbb{R}^{d\times d}$ are learnable weights」。</p>
+<p>[F1] $\hat K = \mathrm{LN}(X^{L/2})W_K$、$\hat V = \mathrm{LN}(X^{L/2})W_V$：YOCO Eq.(2) 及其说明「where $W_K, W_V \in \mathbb{R}^{d\times d}$ are learnable weights」（该处 $d$ 即本页的隐藏维 $D$）。</p>
 <p>[F2] 缓存复杂度对照 $\mathcal{O}(LND)$ vs $\mathcal{O}((N+L)D)$：YOCO Table 2 与 §2.3；该表表注说明 $N, L, D$ 分别为序列长度、层数、隐藏维。</p>
 <p>[F3] prefill 复杂度对照 $\mathcal{O}(LN^2D)$ vs $\mathcal{O}(LND)$：YOCO Table 3 与 §2.3。</p>
-<p>[F4] CED 上段的逐层投影权重：技术报告 §2.2（<code>tech_report.txt</code> 行 389–396）「the KV entries are not derived from their respective hidden states H_l. Instead, they are projected directly from the hidden state of the (L/2)-th layer, H_{L/2}, using layer-dependent projection weights (W_l^{KV} and W_l^{Z})」。</p>
+<p>[F4] CED 上段的逐层投影权重：技术报告 §2.2「the KV entries are not derived from their respective hidden states H_l. Instead, they are projected directly from the hidden state of the (L/2)-th layer, H_{L/2}, using layer-dependent projection weights (W_l^{KV} and W_l^{Z})」。</p>
 
 <h3>外部数字与实验条件（N）</h3>
 <p>[N1] YOCO 宣称 65B 模型下 KV cache 显存可减少约 80 倍（「the memory of KV caches can be reduced by about 80× for 65B models.」，见 §1 Introduction），并给出「128K token 用 1GB 显存」的例子（「YOCO can serve 128K tokens with 1GB GPU memory ... at 65B model size.」，见 §4.4）。属论文实验条件下的测量，本页只登记不推导。</p>
-<p>[N2] DeepSeek-V4.1-Flash 的共享分组与 source 层：2–7 / 8–13 / 14–19 / 20–39，source 为 2 / 8 / 14 / 20。来源：运行期实测（<code>verify_csa2_modes.py</code>），维度等比缩小以在本机运行，验证的是共享关系。</p>
+<p>[N2] DeepSeek-V4.1-Flash 的共享分组与 source 层：2–7 / 8–13 / 14–19 / 20–39，source 为 2 / 8 / 14 / 20。来源：官方推理配置 <code>kv_source_layers=[2,8,14,20]</code>；组内首个 Full 模式层即 source 层。</p>
 <p>[N3] 分组压缩比：层 2–19 为 2、层 20–39 为 1。来源：官方推理配置 <code>compress_ratios</code>（与 HF 配置 <code>text_config.compress_ratios</code> 一致）。</p>
-<p>[N4] 报告称 CED 让 prefill 计算接近减半（「This nearly halves prefill computation」）。来源：技术报告 §2.1（<code>tech_report.txt</code> 行 327–330）。属报告宣称；参考实现是单栈逐层执行，不含该提前退出优化。</p>
-<p>[N5] 每 token 全局 KV 缓存 890 字节：技术报告 §1（<code>tech_report.txt</code> 行 16–19；§6 Conclusion 有同义重述）「DeepSeek-V4.1-Flash combines cross-layer KV cache reuse in Compressed Sparse Attention 2 (CSA2) with FP4 KV caching. These designs reduce its global KV cache footprint (always in HBM) to 890 bytes per token, roughly 1/4 of the corresponding footprint of DeepSeek-V4-Flash.」报告把成因列为「跨层复用 + FP4 KV 缓存」两项并列。</p>
+<p>[N4] 报告称 CED 让 prefill 计算接近减半（「This nearly halves prefill computation」）。来源：技术报告 §2.1。属报告宣称。</p>
+<p>[N5] 每 token 全局 KV 缓存 890 字节：技术报告 §1（§6 Conclusion 有同义重述）「DeepSeek-V4.1-Flash combines cross-layer KV cache reuse in Compressed Sparse Attention 2 (CSA2) with FP4 KV caching. These designs reduce its global KV cache footprint (always in HBM) to 890 bytes per token, roughly 1/4 of the corresponding footprint of DeepSeek-V4-Flash.」报告把成因列为「跨层复用 + FP4 KV 缓存」两项并列。</p>
 
 <h3>构造示例</h3>
-<p>分组表中的层区间由官方配置 <code>kv_source_layers=[2,8,14,20]</code> 声明，运行期实测（等比缩小维度的模型）确认共享关系与分组边界与之完全一致。运行期实测输出为实际运行结果；缩放模型只影响维度、不影响共享关系。</p>
+<p>分组表中的层区间与 source 层由官方配置 <code>kv_source_layers=[2,8,14,20]</code> 声明：列表中的每个值即该组的首个层，也就是发布主 KV 的 source 层；组内其余层按静态模式读取它发布的 KV。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>本页的辅助解释是「多层共用一份全局 KV」这一份数关系本身：它说明全局 KV 的份数从"每层一份"变成"每组一份"。边界：它只覆盖全局 KV，每层仍需自己的窗口 KV；也不说明复用对质量没有代价。</p>
@@ -352,7 +351,6 @@ $$\text{标准 Transformer: }\mathcal{O}(LND)\qquad\text{跨层复用: }\mathcal
 <h3>简化条件及其限制</h3>
 <ul>
 <li>份数账按"每个 source 层各一份主 KV 与一份索引器 K"计算，不含局部窗口 KV、压缩器残态与运行时缓冲。</li>
-<li>运行期实测使用等比缩小维度的模型（dim 64），验证的是共享关系而非真实体量的性能表现。</li>
 <li>论文的 80 倍 与加速数字按原值登记，本页不重跑实验、不据此比较架构优劣。</li>
 <li>本页不展开压缩条目的池化方式与训练补偿策略，只使用"条目覆盖 $r$ 个 token"这一属性。</li>
 </ul>

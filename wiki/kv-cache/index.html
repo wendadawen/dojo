@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="KV cache 是什么：推理时缓存的注意力 key/value 张量如何让每个新 token 免于重算全部历史，prefill 与 decode 两阶段如何写入和使用缓存，每 token 128 KB 的大小公式，以及它为何成为显存瓶颈。来源：vLLM SOSP 2023 §1/§2/§3、SGLang NeurIPS 2024 §3.2、Strata OSDI 2026 §1/§2.1。">
+  <meta name="description" content="KV cache 是什么：推理时缓存的注意力 key/value 张量如何让每个新 token 免于重算全部历史，prefill 与 decode 两阶段如何写入和使用缓存，每 token 128 KB 的大小公式，以及它为何成为显存瓶颈。来源：vLLM SOSP 2023 §1、§3、SGLang NeurIPS 2024 §1、§3、Strata OSDI 2026 §1、§2.1。">
   <meta name="dojo:summary" content="KV cache 缓存每个 token 在每层的注意力 $k/v$ 向量：$k_i = x_i W_K$ 与查询无关，算一次可跨步复用，把生成 $n$ 个 token 的 $O(n^2)$ 量级重算降为 $n$ 次计算加纯读取。prefill 批量写入、decode 每步追加一个 token；大小为 $2 \cdot L \cdot H_{\mathrm{kv}} \cdot d_{\mathrm{head}} \cdot b$ 字节每 token，Llama-3.1-8B 即 128 KB，20K token 手册约 2.4 GB、128K 窗口单请求 16 GB——线性增长乘并发数再与权重争显存，是分页、前缀缓存与分层存储全部机制的定量起点。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制, 推理系统, 内存与缓存">
@@ -62,9 +62,9 @@
 <p><b>主要依据</b>：Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention"（SOSP 2023, arXiv:2309.06180）§1、§3；Xie et al., "Strata: Hierarchical Context Caching for Long Context Language Model Serving"（OSDI 2026, arXiv:2508.18572v2）§1、§2.1；Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs"（NeurIPS 2024, arXiv:2312.07104）§1、§3。</p>
 </blockquote>
 
-<p>一个客服模型读完 20,000 token 的产品手册后回答了一个问题。紧接着第二个问题到来，仍然以这本手册开头。回答第二个问题时，模型还需要手册 20,000 个 token 的哪些中间结果？从头再算一遍，还是留在显存里备用？如果留下，要留多少、够不够放？本文回答四个问题：注意力计算为什么需要全部历史 token 的 K/V，缓存到底省了什么计算；prefill 与 decode 两阶段各自怎么产生和使用缓存；一份上下文的 KV cache 有多大；以及为什么它会成为显存瓶颈。后两个问题的答案，是理解一切 KV cache 管理机制（分页、前缀复用、分层存储）的定量基础。</p>
+<p>一个客服模型读完 20,000 token 的产品手册后回答了一个问题。紧接着第二个问题到来，仍然以这本手册开头。回答第二个问题时，模型还需要手册 20,000 个 token 的哪些中间结果？从头再算一遍，还是留在显存里备用？如果留下，要留多少、够不够放？这四个问题依次是：注意力计算为什么需要全部历史 token 的 K/V，缓存到底省了什么计算；prefill 与 decode 两阶段各自怎么产生和使用缓存；一份上下文的 KV cache 有多大；以及为什么它会成为显存瓶颈。后两个问题的答案，是理解一切 KV cache 管理机制（分页、前缀复用、分层存储）的定量基础。</p>
 
-<p>本文讨论的是推理阶段的 KV cache。注意力计算本身（缩放点积、多头结构）见 <a href="../standard-attention/index.html">标准 Transformer 注意力</a>，本文直接使用其结论，不重复推导。</p>
+<p>本文讨论的是推理阶段的 KV cache。注意力计算本身（缩放点积、多头结构）见 <a href="../standard-attention/index.html">标准 Transformer 注意力</a>，其结论直接使用，不重复推导。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -184,7 +184,7 @@ $$k_i=x_i W_K,\qquad v_i=x_i W_V,$$
 
 <p>沿用手册场景：prefill 处理 20,100 个输入 token，缓存从 0 涨到 20,100 token；decode 生成回答的每个 token 都让缓存多 1 token——回答 200 token，缓存最终 20,300 token。多轮对话时，下一轮请求的输入等于「上一轮全部输入 + 上一轮输出 + 新问题」，其前 20,300 token 的缓存恰好已经存在，这正是前缀复用的基础（见 <a href="../prefix-caching/index.html">前缀缓存</a>）。</p>
 
-<p>两个阶段的资源特征不同，这个差别贯穿后续所有 serving 机制的分析。prefill 是一次大矩阵乘：全部输入 token 并行过模型，计算量大、每字节访存的计算量高，属于计算密集。decode 每步只处理 1 个 token：计算量很小，但注意力要读取全部缓存（$20{,}000\times 128\,\text{KB}\approx 2.44\,\text{GB}$），属于访存密集。因此优化 prefill 与 decode 的手段不同，部署形态上也衍生出把它们分开调度的方案。</p>
+<p>两个阶段的资源特征不同，这个差别贯穿后续所有 serving 机制的分析。prefill 是一次大矩阵乘：全部输入 token 并行过模型，计算量大、每字节访存的计算量高，属于计算密集。decode 每步只处理 1 个 token：计算量很小，但注意力要读取全部缓存（$20{,}100\times 128\,\text{KB}\approx 2.45\,\text{GB}$），属于访存密集。因此优化 prefill 与 decode 的手段不同，部署形态上也衍生出把它们分开调度的方案（见 <a href="../hetero-pd/index.html">异构 PD 分离</a>）。</p>
 
 <h3 id="two-phases-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -199,7 +199,7 @@ $$k_i=x_i W_K,\qquad v_i=x_i W_V,$$
     <p>为什么说两阶段"计算密集"与"访存密集"不同？</p>
     <details>
       <summary>解答：prefill 大并行矩阵乘，decode 小步读全量缓存</summary>
-      <p>prefill 把 20,100 个 token 并行送入模型，是大型矩阵乘，计算量与输入长度成正比且高度并行，瓶颈在算力。decode 每步只算 1 个 token 的 q/k/v（计算量极小），但注意力必须读取全部 2.44 GB 缓存，瓶颈在显存带宽。资源特征不同意味着两阶段的优化手段与部署考量不同（例如后续机制按阶段区分调度），本文不展开部署形态。</p>
+      <p>prefill 把 20,100 个 token 并行送入模型，是大型矩阵乘，计算量与输入长度成正比且高度并行，瓶颈在算力。decode 每步只算 1 个 token 的 q/k/v（计算量极小），但注意力必须读取全部 2.45 GB 缓存，瓶颈在显存带宽。资源特征不同意味着两阶段的优化手段与部署考量不同（例如后续机制按阶段区分调度），本文不展开部署形态。</p>
     </details>
   </li>
 </ol>
@@ -214,13 +214,13 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 <li>$2$：K 与 V 各一份；</li>
 <li>$L_{\text{layers}}$：Transformer 层数，每层各存一套；</li>
 <li>$H_{\text{kv}}$：KV 头（组）数——每个注意力头的 $q$ 都要与各 KV 头的 $k,v$ 交互；</li>
-<li>$d_{\text{head}}$：每个头的向量维度；</li>
+<li>$d_{\text{head}}$：每个头的向量维度（与第 1 章的 $d_k$ 同义）；</li>
 <li>$b$：每个元素的存储字节数，bf16/FP16 为 2，FP8 为 1。</li>
 </ul>
 
-<p>本页 KB/GB 按存储行业惯例换算：$1\,\text{KB}=1{,}024$ 字节、$1\,\text{GB}=2^{30}$ 字节。按此口径 128 KB/token 下，20,000 token 手册约 2.44 GB，128K 窗口单请求恰为 16 GB。</p>
+<p>本文 KB/GB 按存储行业惯例换算：$1\,\text{KB}=1{,}024$ 字节、$1\,\text{GB}=2^{30}$ 字节。按此口径 128 KB/token 下，20,000 token 手册约 2.44 GB，128K 窗口单请求恰为 16 GB。</p>
 
-<p>$H_{\text{kv}}$ 的取值区分两种注意力结构。MHA（多头注意力）中 KV 头数等于查询头数，$H_{\text{kv}}=H_q$；GQA（分组查询注意力）中多组查询头共享一组 KV 头，$H_{\text{kv}}&lt;H_q$——KV cache 直接缩小为 MHA 的 $H_{\text{kv}}/H_q$。多数现代开源模型（Llama 3、Qwen2.5 等）采用 GQA 省下的正是这份显存。</p>
+<p>$H_{\text{kv}}$ 的取值区分两种注意力结构。MHA（多头注意力）中 KV 头数等于查询头数，$H_{\text{kv}}=H_q$；GQA（分组查询注意力）中查询头分成 $H_{\text{kv}}$ 组、每组共享一个 KV 头，$H_{\text{kv}}&lt;H_q$——KV cache 直接缩小为 MHA 的 $H_{\text{kv}}/H_q$。多数现代开源模型（Llama 3、Qwen2.5 等）采用 GQA 省下的正是这份显存。</p>
 
 <p>两个算例对照。构造示例。Llama-3.1-8B（GQA）：32 层、$H_{\text{kv}}=8$、$d_{\text{head}}=128$、bf16（bfloat16，每元素 2 字节）<sup>[N2]</sup>，代入公式 $2\times 32\times 8\times 128\times 2=131{,}072$ 字节 = 128 KB/token。20,000 token 的手册共 $20{,}000\times 131{,}072\,\text{B}\approx 2.44\,\text{GB}$。文献算例。OPT-13B（MHA）：40 层、隐藏维 5120（即 $H_{\text{kv}}\cdot d_{\text{head}}=5120$）、FP16，得 $2\times 5120\times 40\times 2=800$ KB/token<sup>[N1]</sup>，单请求最长（2048 token）达 1.6 GB——这是 vLLM 论文给出的原始数字。GQA 的效果直接可见：Llama-3.1-8B 的 $H_{\text{kv}}/H_q=8/32=1/4$，若它是 MHA 结构，每 token 将是 512 KB。</p>
 
@@ -294,14 +294,14 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
-<p>C1/C3（KV cache 定义与 K/V 来源）：Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023（arXiv:2309.06180）§1；C2（两阶段）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v2）§2.1；C4（显存分布）、C5（完成后丢弃缓存，SGLang §1/§3、vLLM §4.2）：vLLM 论文 §1 与 SGLang 论文（Zheng et al., NeurIPS 2024, arXiv:2312.07104）§3.2。"K/V 与查询无关"（C3 标注推断）由注意力公式结构直接得出：$k_i=x_i W_K$ 只依赖第 $i$ 个 token 的输入与参数。$O(n^2)$ 重算量标注为推断（自回归结构直接推论）。</p>
+<h3>论断与来源（C）</h3>
+<p>C3（KV cache 可复用的依据：K/V 与查询无关）：Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023（arXiv:2309.06180）§1；C2（两阶段）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v2）§2.1；C4（显存分布）、C5（完成后丢弃缓存，SGLang §1、§3、vLLM §4.3）：vLLM 论文 §1 与 SGLang 论文（Zheng et al., NeurIPS 2024, arXiv:2312.07104）§3。"K/V 与查询无关"（C3 标注推断）由注意力公式结构直接得出：$k_i=x_i W_K$ 只依赖第 $i$ 个 token 的输入与参数。$O(n^2)$ 重算量标注为推断（自回归结构直接推论）。</p>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <p>F1（每 token 字节数 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$）：MHA 形式与 vLLM 论文 §3 的 OPT-13B 算式（$2\times 5120\times 40\times 2=800$ KB）一致；GQA 推广形式（用 $H_{\text{kv}}\cdot d_{\text{head}}$ 替代 $d_{\text{hidden}}$）为对多头结构的直接推广，标注推断，经 Llama-3.1-8B 算例复算验证。</p>
 
 <h3>外部数字与实验条件</h3>
-<p>N1（OPT-13B 800 KB/token、单请求 1.6 GB）：vLLM 论文 §3。N2（Llama-3.1-8B 配置 32 层/8 KV 头/head_dim 128/128K 窗口/bf16）：HuggingFace 模型配置（meta-llama/Llama-3.1-8B-Instruct config.json）。N3（65%/30% 显存分布）：vLLM 论文 §1 Figure 1（13B 模型、A100 40GB）。N4（40GB $\approx$ 0.3M token）：Strata 论文 §1（Llama-8B 口径，与本页 F1 复算一致）。N5（128K $\to$ 16 GB）：F1$\times$N2 推算。</p>
+<p>N1（OPT-13B 800 KB/token、单请求 1.6 GB）：vLLM 论文 §3。N2（Llama-3.1-8B 配置 32 层/8 KV 头/head_dim 128/128K 窗口/bf16）：HuggingFace 模型配置（meta-llama/Llama-3.1-8B-Instruct config.json）。N3（65%/30% 显存分布）：vLLM 论文 §1 Figure 1（13B 模型、A100 40GB）。N4（40GB $\approx$ 0.3M token）：Strata 论文 §1（Llama-8B 口径，与本文 F1 复算一致）。N5（128K $\to$ 16 GB）：F1$\times$N2 推算。</p>
 
 <h3>构造示例</h3>
 <p>「今天/天气/很/好」4 token 序列（第 1、2 章）：展示每步新算与复用的 K/V 组数，便于手算，不代表真实负载。20,000 token 手册（第 2–4 章）：规模算例，数字为构造选择（与长上下文评测负载的平均规模同量级，见 Strata 一文实验部分），计算本身可复算。</p>
@@ -310,7 +310,7 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 <p>本文未使用类比解释机制；"纯读取"表述指不再执行矩阵乘、只访存，不暗示读取零成本（decode 每步读全部缓存正是访存瓶颈的来源，见第 2 章）。</p>
 
 <h3>简化条件及其限制</h3>
-<p>其一，公式假设标准 MHA/GQA 注意力与逐层独立 K/V；sliding window、层内稀疏注意力或 MLA（latent 压缩）等结构不适用，本文未覆盖。其二，$b$ 按存储精度取值（bf16/FP16=2、FP8=1），KV 量化只改 $b$ 不改公式结构，量化方法本身未展开。其三，示例忽略 batching 对显存占用的次要影响（激活值），不影响量级结论。其四，GQA 只给最小定义（多组查询头共享一组 KV 头），其训练动机与收敛性影响不在本文范围。
+<p>其一，公式假设标准 MHA/GQA 注意力与逐层独立 K/V；sliding window、层内稀疏注意力或 MLA（latent 压缩）等结构不适用，本文未覆盖。其二，$b$ 按存储精度取值（bf16/FP16=2、FP8=1），KV 量化只改 $b$ 不改公式结构，量化方法本身未展开。其三，示例忽略 batching 对显存占用的次要影响（激活值），不影响量级结论。其四，GQA 只给最小定义（查询头分成 $H_{\text{kv}}$ 组、每组共享一个 KV 头），其训练动机与收敛性影响不在本文范围。
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

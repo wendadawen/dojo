@@ -73,7 +73,7 @@
 <p>为什么一个长 prefill 会拖慢同机所有进行中的 decode（generation stall）？</p>
 <details>
 <summary>解答：连续批处理混批迭代，prefill 迭代时长被上千 token 主导</summary>
-<p>连续批处理中 prefill 与 decode 混在同一次迭代里执行。prefill 并行处理全部输入 token、是 compute-bound，一个 512 token 的请求即可饱和单卡算力；decode 每次迭代每请求只处理一个 token、是 memory-bound，小批量下每 token 成本可达 prefill 的约 200 倍。若调度器优先完成 prefill（vLLM 类做法），进行中的 decode 在整个长 prefill 迭代期间不产出 token，token 间隔被拉长到秒级（实测可持续数秒）。完整论证见第 1 章。</p>
+<p>连续批处理中 prefill 与 decode 混在同一次迭代里执行。prefill 并行处理全部输入 token、是 compute-bound，LLaMA-13B 在 A6000 上，512 token 的请求即可饱和单卡算力；decode 每次迭代每请求只处理一个 token、是 memory-bound，小批量下每 token 成本可达 prefill 的约 200 倍。若调度器优先完成 prefill（vLLM 类做法），进行中的 decode 在整个长 prefill 迭代期间不产出 token，token 间隔被拉长到秒级（实测可持续数秒）。完整论证见第 1 章。</p>
 </details>
 </li>
 <li>
@@ -109,7 +109,7 @@
 
 <h2 id="generation-stall">1. 长 prefill 为什么卡住所有人</h2>
 
-<p>先建立两类迭代的负载画像。prefill 迭代并行处理输入的全部 token：一次 8000 token 的 prefill 是一个巨大的矩阵乘，算力直接打满——Sarathi 的实测显示 LLaMA-13B 在 A6000 上一个 512 token 的 prefill 请求（批大小仅为 1）即可饱和 GPU 算力<sup>[C3, N2]</sup>。decode 迭代相反：每个请求每次只处理一个 token（上一个迭代自己生成的），计算量极小，时间几乎全花在从显存读模型权重上——memory-bound。小批量下 decode 的每 token 成本可达 prefill 的约 200 倍<sup>[C2, N1]</sup>。两类迭代的详细对比见下表：</p>
+<p>prefill 迭代并行处理输入的全部 token：一次 8000 token 的 prefill 是一个巨大的矩阵乘，算力直接打满——Sarathi 的实测显示 LLaMA-13B 在 A6000 上一个 512 token 的 prefill 请求（批大小仅为 1）即可饱和 GPU 算力<sup>[C3, N2]</sup>。decode 迭代相反：每个请求每次只处理一个 token（上一个迭代自己生成的），计算量极小，时间几乎全花在从显存读模型权重上——memory-bound。小批量下 decode 的每 token 成本可达 prefill 的约 200 倍<sup>[C2, N1]</sup>。两类迭代的详细对比见下表：</p>
 
 <div class="table-scroll">
 <table>
@@ -123,7 +123,7 @@
 </table>
 </div>
 
-<p>现在看 stall 怎么发生。连续批处理（continuous batching，Orca 提出的迭代级调度：每次迭代可加入新请求、移除完成请求）把 prefill 与 decode 混在同一个批里迭代。Sarathi-Serve 观察到：prefill 优先的调度器（如 vLLM 的做法——新请求的 prefill 被尽快执行）会让一次迭代装进整个长 prompt，这次迭代因为上千 token 的计算量而持续很久；期间同批所有进行中的 decode 一个 token 都不产出<sup>[C9]</sup>。对正在看输出的用户来说，token 间隔从毫秒级跳到秒级——Sarathi-Serve 在 vLLM 上实测到持续数秒的 generation stall<sup>[C9]</sup>。</p>
+<p>连续批处理（continuous batching，Orca 提出的迭代级调度：每次迭代可加入新请求、移除完成请求）把 prefill 与 decode 混在同一个批里迭代。Sarathi-Serve 观察到：prefill 优先的调度器（如 vLLM 的做法——新请求的 prefill 被尽快执行）会让一次迭代装进整个长 prompt，这次迭代因为上千 token 的计算量而持续很久；期间同批所有进行中的 decode 一个 token 都不产出<sup>[C9]</sup>。对正在看输出的用户来说，token 间隔从毫秒级跳到秒级——Sarathi-Serve 在 vLLM 上实测到持续数秒的 generation stall<sup>[C9]</sup>。</p>
 
 <figure class="diagram">
   <div class="dg-flow">
@@ -165,7 +165,7 @@
 
 <h2 id="chunk-mechanism">2. 把长 prefill 切成块：机制与代价</h2>
 
-<p>chunked prefill 的核心动作：把一个 prefill 请求切成近似等计算量的块（chunk），每块包含固定数量的输入 token，逐块执行<sup>[C4]</sup>。8000 token 的 prompt 按 512 一块切成 16 块后，单次迭代最多装一块——迭代时长从"整个 prompt"降到"一个块"，第 1 章的 stall 结构被拆掉了（数字为构造示例的整数化设定）。</p>
+<p>chunked prefill 的核心动作：把一个 prefill 请求切成近似等计算量的块（chunk），每块包含固定数量的输入 token，逐块执行<sup>[C4]</sup>。8000 token 的 prompt 按 512 一块切成 16 块（末块 320 token）后，单次迭代最多装一块——迭代时长从"整个 prompt"降到"一个块"，第 1 章的 stall 结构被拆掉了（数字为构造示例的整数化设定）。</p>
 
 <h3 id="chunk-dependency">2.1 块间依赖：只靠 KV cache 衔接</h3>
 
@@ -191,7 +191,7 @@
   <line class="dg-line" x1="150" y1="155" x2="228" y2="120"/>
   <line class="dg-line" x1="380" y1="105" x2="448" y2="105"/>
 </svg>
-<figcaption class="diagram-caption">chunked prefill 的块间数据流（构造示例：8000 token 切 16 块，图中画前 2 块）。左侧两个块各自独立过全部 $L$ 层；实线箭头是唯一的块间依赖——chunk 1 产生的 KV 进入 cache，chunk 2 的 attention 读取它（见<a href="../causal-mask/index.html">因果掩码</a>）。不存在"chunk 1 的层输出流向 chunk 2"的箭头。</figcaption>
+<figcaption class="diagram-caption">chunked prefill 的块间数据流（构造示例：8000 token 切 16 块，图中画前 2 块）。左侧两个块各自独立过全部层；实线箭头是唯一的块间依赖——chunk 1 产生的 KV 进入 cache，chunk 2 的 attention 读取它（见<a href="../causal-mask/index.html">因果掩码</a>）。不存在"chunk 1 的层输出流向 chunk 2"的箭头。</figcaption>
 </figure>
 
 <h3 id="chunk-cost">2.2 切块的三个代价</h3>
@@ -334,7 +334,7 @@
 
 <h2 id="boundary">6. 边界与相邻工作</h2>
 
-<p>chunked prefill 改善的是延迟结构与批内负载均衡，不改善单请求的 prefill 速度：总计算量不变（FFN 不变）甚至微升（KV 重复读、固定开销）<sup>[C5, C13]</sup>。它的收益依赖场景：chunk 要够大以饱和算力（搭车论证的前提<sup>[C3]</sup>）；架构敏感性上 MLA 的重复投影开销<sup>[C17]</sup>、宽松延迟目标与生成密集流量下 chunking 更有利（Beyond the Buzz 的结论）都是边界条件。</p>
+<p>chunked prefill 改善的是延迟结构与批内负载均衡，不改善单请求的 prefill 速度：总计算量不变（FFN 不变），访存量与固定开销微升<sup>[C5, C13]</sup>。它的收益依赖场景：chunk 要够大以饱和算力（搭车论证的前提<sup>[C3]</sup>）；架构敏感性上 MLA 的重复投影开销<sup>[C17]</sup>、宽松延迟目标与生成密集流量下 chunking 更有利（Beyond the Buzz 的结论）都是边界条件。</p>
 
 <p>与 PD 分离的关系：chunked prefill 是 co-located 部署内部的批构造优化——prefill 与 decode 仍在同一实例上，只是不再互相卡住；PD 分离则把两阶段放到不同实例、各自独立优化（动机见 <a href="../moe-serving/index.html">MoE Serving</a>）。两条路线是竞争关系也是互补基线：Beyond the Buzz 论文正是把 piggybacked co-located（本文机制）作为分离式部署的对照基线，系统回答"什么条件下该走哪条路"——见 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页。</p>
 
@@ -356,10 +356,10 @@
 <h3>论断与来源（C）</h3>
 <ul>
 <li>C1–C4、C7、C8、N1、N2、N6：SARATHI（Agrawal et al., "SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills", 2023, arXiv:2308.16369）摘要、§1、§3、§4。</li>
-<li>C5（含 N-1/N-2 计数与"compute-bound 可容忍"）、C9–C13、F1 依据、N3、N5：Sarathi-Serve（Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve", 2024, arXiv:2403.02310）§2、§3、§4.2–4.3。KV 重复读计数在 Sarathi 原文为 N 次、Sarathi-Serve 为 N-1 次（是否计入首次读取的表述差异），本页采用 Sarathi-Serve 的计数。</li>
+<li>C5（含 N-1/N-2 计数与"compute-bound 可容忍"）、C9–C13、F1 依据、N3：Sarathi-Serve（Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve", 2024, arXiv:2403.02310）§2、§3、§4.2–4.3。KV 重复读计数在 Sarathi 原文为 N 次、Sarathi-Serve 为 N-1 次（是否计入首次读取的表述差异），本页采用 Sarathi-Serve 的计数。</li>
 <li>C6：由因果注意力结构（causal-mask 页）与 Sarathi 数据流图推出的推断，正文已标注。</li>
 <li>C14、N4：SARATHI 摘要与流水线实验（GPT-3）。</li>
-<li>C15：Sarathi-Serve 摘要（相对 vLLM 的服务容量提升）。</li>
+<li>C15、N5：Sarathi-Serve 摘要（相对 vLLM 的服务容量提升）。</li>
 <li>C16、C17：Beyond the Buzz（Mitra et al., 2025, arXiv:2506.05508）§4（CPP 最优策略、MLA 重复投影开销）。</li>
 </ul>
 
@@ -380,7 +380,7 @@
 
 <h3>构造示例</h3>
 <ul>
-<li>8000 token prompt / 512 每块 / 16 块 / 64 个 decode 请求：贯穿示例的整数化设定，说明切块与搭车机制，非实测工作负载。</li>
+<li>8000 token prompt / 512 每块 / 16 块（末块 320 token）/ 64 个 decode 请求：贯穿示例的整数化设定，说明切块与搭车机制，非实测工作负载。</li>
 <li>4096 token 切 8 块（28 块次）vs 4 块（6 块次）：验证 F1 的平方量级增长。</li>
 <li>$\tau = 512$、64 decode + 448 chunk 的迭代构成：说明 token budget 机制。</li>
 </ul>

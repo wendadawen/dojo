@@ -133,7 +133,7 @@
 <tbody>
 <tr><td>2-bit 对齐</td><td>2.00</td><td>1（逐权重）</td><td>对齐</td><td>比理论下限多花约四分之一</td></tr>
 <tr><td>1.67-bit（3 权重 / 5 bit）</td><td>约 1.67</td><td>3</td><td>不对齐，解码需位重排</td><td>实测常慢于 2-bit</td></tr>
-<tr><td>2:4 稀疏三值</td><td>约 1.25（模式用不满）</td><td>4</td><td>对齐但码本用不满</td><td>50% 稀疏度伤精度</td></tr>
+<tr><td>2:4 稀疏三值</td><td>约 1.0（4 bit 索引 12/16 未用满）</td><td>4</td><td>对齐但码本用不满</td><td>50% 稀疏度伤精度</td></tr>
 <tr class="highlight-row"><td>Sherry 3:4 稀疏三值</td><td>1.25</td><td>4</td><td>对齐且码本恰好填满</td><td>又小又规整（「3:4 稀疏三值」一章起展开）</td></tr>
 </tbody>
 </table>
@@ -299,7 +299,7 @@
 <p>格式只决定「能表示什么」；量化误差的大小取决于两个决策：缩放系数 $d$ 取多少，以及组内哪个权重置零。围绕这两个决策有三套做法，分别对应论文的训练侧、llama.cpp 上游量化器和 AngelSlim 为 Hy4 写的训练后编码器。</p>
 
 <div class="callout callout-yellow">
-<p>三套做法对应不同场景，不要混用结论：Sparse-AbsMean 是论文在量化感知训练（QAT）中使用的缩放规则；llama.cpp 上游量化器面向「已经落在三值网格上」的 QAT 产物做格式转换；AngelSlim 编码器面向训练后量化（PTQ），直接把浮点权重压进 STQ1_0，Hy4 轻量版走的就是这条路。</p>
+<p>三种做法的适用条件不同，各自的结论不能互相套用：Sparse-AbsMean 是论文在量化感知训练（QAT）中使用的缩放规则；llama.cpp 上游量化器面向「已经落在三值网格上」的 QAT 产物做格式转换；AngelSlim 编码器面向训练后量化（PTQ），直接把浮点权重压进 STQ1_0，Hy4 轻量版走的就是这条路。</p>
 </div>
 
 <h3 id="decisions-scale">4.1 缩放系数的三种选法</h3>
@@ -342,11 +342,11 @@
   <li>括号内是「保留它的净收益」乘上重要性 $w_j$；净收益最小的位置被置零。</li>
 </ul>
 
-<p>一个容易看漏的事实：当重要性全为 1 时，两种规则完全等价——此时代价化简为 $2|x_j|d - d^2$，随 $|x_j|$ 单调递增，取最小的就是 argmin。只有 imatrix 非均匀时，第二种规则才会选出不同的零位（下面的代码实测验证了这两点）。</p>
+<p>当重要性全为 1 时，两种规则完全等价：此时代价化简为 $2|x_j|d - d^2$，随 $|x_j|$ 单调递增，取最小的就是 argmin。只有 imatrix 非均匀时，第二种规则才会选出不同的零位；4.3 节的代码对这两点做了实测验证。</p>
 
 <h3 id="decisions-measure">4.3 误差实测：三种做法差多少</h3>
 
-<p>下面的代码对一个构造的 256 权重块完整实现三种做法：amax 加 argmin 零位（上游量化器）、加权最小二乘加 argmin 零位、加权最小二乘加 imatrix 零位交替 3 轮（AngelSlim 编码器），并打印各自的加权平方误差。代码还验证了「重要性全 1 时两种零位规则等价」和「STQ1_0 字节布局」一章的字节账。结论先行：构造块上 amax 的加权平方误差约为加权最小二乘的 6 倍（$117.51$ 对 $19.60$），零位选择再降到 $17.75$；官方在 1200 行真实专家权重上的对应数字是仅换缩放即降 $89.7\%$、imatrix 零位再降剩余部分的 $4.1\%$<sup>[N5]</sup>。</p>
+<p>代码对一个构造的 256 权重块完整实现三种做法：amax 加 argmin 零位（上游量化器）、加权最小二乘加 argmin 零位、加权最小二乘加 imatrix 零位交替 3 轮（AngelSlim 编码器），并打印各自的加权平方误差，同时验证「重要性全 1 时两种零位规则等价」与「STQ1_0 字节布局」一章的字节账。构造块上，amax 的加权平方误差约为加权最小二乘的 6 倍（$117.51$ 对 $19.60$），零位选择再降到 $17.75$；官方在 1200 行真实专家权重上的对应数字是仅换缩放即降 $89.7\%$、imatrix 零位再降剩余部分的 $4.1\%$<sup>[N5]</sup>。</p>
 
 <details class="code-details">
 <summary>代码：三种量化决策的加权平方误差对比</summary>
@@ -482,7 +482,7 @@ bpw = 42*8/256 = 1.3125</code></pre>
 
 <h3 id="speed-benchmark">5.2 实测数字</h3>
 
-<p>第一组实测来自 STQ1_0 内核的 PR：在 Apple M4 Pro 上，把同一个社区复现的 Sherry-1B checkpoint 统一转成 bf16 再分别量化为四种格式，纯 CPU 8 线程跑 llama-bench<sup>[C13, N2]</sup>（PR 未给出 Q1_0 的 bpw，表中以「—」表示）：</p>
+<p>第一组实测来自 STQ1_0 内核的 PR：在 Apple M4 Pro 上，把同一个社区复现的 Sherry-1B checkpoint 统一转成 bf16 后重新量化为三种三值格式（STQ1_0 / TQ1_0 / TQ2_0），并另列 llama.cpp 的 1-bit 基线 Q1_0 作参照，纯 CPU 8 线程跑 llama-bench<sup>[C13, N2]</sup>（PR 未给出 Q1_0 的 bpw，表中以「—」表示）：</p>
 
 <div class="table-scroll">
 <table>
@@ -516,7 +516,7 @@ bpw = 42*8/256 = 1.3125</code></pre>
 </table>
 </div>
 
-<p>1.67-bit 的 TL2 再次慢于 2-bit 的 I2_S，而 Sherry 在 bit 最低的同时速度最快。精度方面，LLaMA-3.2 1B 上 Sherry 与 1.67-bit 的 SOTA 方法 Tequila 平均精度持平（0.519 对 0.519，五个零样本任务），bit 数少 25%；3B 上 0.567 对 0.576；在推理密集型的 ARC-Challenge 上 Sherry 两个规模都反超 Tequila<sup>[C14, N4]</sup>。在 Hy4 的官方算子对比中，STQ1_0 在 bit 最低的同时速度与 IQ1_M 基本持平、明显快于同样冲低比特的 IQ1_S<sup>[C15]</sup>。</p>
+<p>1.67-bit 的 TL2 再次慢于 2-bit 的 I2_S，而 Sherry 在 bit 最低的同时速度最快。精度方面，LLaMA-3.2 1B 上 Sherry 与 1.67-bit 的 SOTA 方法 Tequila 平均精度持平（0.519 对 0.519，五个零样本任务），bit 数少 25%；3B 上 0.567 对 0.576；在推理密集型的 ARC-Challenge 上 Sherry 两个规模都反超 Tequila<sup>[C14, N4]</sup>。</p>
 
 <h3 id="speed-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -536,9 +536,9 @@ bpw = 42*8/256 = 1.3125</code></pre>
   </li>
 </ol>
 
-<h2 id="training-side">6. 训练侧的 weight trapping 与 Arenas——本页边界</h2>
+<h2 id="training-side">6. 训练侧的 weight trapping 与 Arenas——为什么 Hy4 轻量版用不到</h2>
 
-<p>Sherry 论文还有一半内容在训练侧，本页只给出最小说明并划定边界。论文观察到：硬性的 3:4 稀疏约束会让训练梯度同质化，权重分布退化成类似二值的形态，无法利用三值集合的表达能力，称为 weight trapping；用有效秩衡量，3:4 稀疏训练的梯度矩阵有效秩低于 750（总维度 4096），坍缩程度与二值量化相当<sup>[C12]</sup>。</p>
+<p>Sherry 论文还有一半内容在训练侧，本章给出最小说明。论文观察到：硬性的 3:4 稀疏约束会让训练梯度同质化，权重分布退化成类似二值的形态，无法利用三值集合的表达能力，称为 weight trapping；用有效秩衡量，3:4 稀疏训练的梯度矩阵有效秩低于 750（总维度 4096），坍缩程度与二值量化相当<sup>[C12]</sup>。</p>
 
 <p>论文的对策是 Arenas（退火残差通路）：训练时给三值线性层并联一条带退火系数的全精度通路</p>
 
@@ -569,7 +569,7 @@ bpw = 42*8/256 = 1.3125</code></pre>
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>Sherry 论文 <em>Sherry: Hardware-Efficient 1.25-Bit Ternary Quantization via Fine-grained Sparsification</em>，arXiv:2601.07892v1（2026-01-12；其被 ACL 2026 接收一事出自 llama.cpp PR #22836 的述及，arXiv 页未标注）：C1 见 §2.1（三值约束定义）；C2 见 §2.3 与 §3.1（1.67-bit 打包的缺陷与速度）；C3 见 §2.3（理论下限 $\log_2 3 \approx 1.58$）；C4 见 §3.1（附录 A 给 5-bit 结构、附录 C 给 16 模式折算与 2:4 对比）；C5 见附录 A/C；C6 见 §3.1 与附录 C.1/C.2（LUT 约束、2:4 的 12 状态与稀疏加速单元限定）；C9/F4 见方法节与附录 D；C12 见方法与实验节；C14/N3/N4 见 Table 1、Table 4。llama.cpp PR #22836「ggml-cpu: add STQ1_0 ternary quantization with ARM NEON vec_dot kernel」：C5、C7、C8、C13、N2 见引言、Stride-16 节、Performance 节，TQ1_0 的 1.6875 bpw 亦出自其引言。HuggingFace AngelSlim/Hy4-preview-GGUF 模型卡（2026-08 读取）：C10、C11、F5、F6、N5 见「Our encoder」节。腾讯混元官方技术文章「Hy4 preview 轻量版」（2026-09-01）：C15 与 N6 中「1.5 TB / 214 GB」概数，其中算子速度对比仅作定性引用；N6 中文件名与 bpw 出自模型卡文件表。</p>
+<p>Sherry 论文 <em>Sherry: Hardware-Efficient 1.25-Bit Ternary Quantization via Fine-grained Sparsification</em>，arXiv:2601.07892v1（2026-01-12；其被 ACL 2026 接收一事出自 llama.cpp PR #22836 的述及，arXiv 页未标注）：C1 见 §2.1（三值约束定义）；C2 见 §2.3 与 §3.1（1.67-bit 打包的缺陷与速度）；C3 见 §2.3（理论下限 $\log_2 3 \approx 1.58$）；C4 见 §3.1（附录 A 给 5-bit 结构、附录 C 给 16 模式折算与 2:4 对比）；C5 见附录 A/C；C6 见 §3.1 与附录 C.1/C.2（LUT 约束、2:4 的 12 状态与稀疏加速单元限定）；C9/F4 见方法节与附录 D；C12 见方法与实验节；C14/N3/N4 见 Table 1、Table 4。llama.cpp PR #22836「ggml-cpu: add STQ1_0 ternary quantization with ARM NEON vec_dot kernel」：C5、C7、C8、C13、N2 见引言、Stride-16 节、Performance 节，TQ1_0 的 1.6875 bpw 亦出自其引言。HuggingFace AngelSlim/Hy4-preview-GGUF 模型卡（2026-08 读取）：C10、C11、F5、F6、N5 见「Our encoder」节。腾讯混元官方技术文章「Hy4 preview 轻量版」（2026-09-01）：N6 中「1.5 TB / 214 GB」概数；N6 中文件名与 bpw 出自模型卡文件表。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1（$\binom{4}{3}\times 2^3=32$）：论文 §3.1（附录 A 给 5-bit 打包结构、附录 C 给 16 模式折算 $\binom{4}{3}\times 2^{3-1}=16$ 即 F2），组合计数可直接复算。F3（42 字节账）：由 PR #22836 与模型卡给出的布局描述直接换算。F4（平均绝对值缩放）：论文方法节，附录 D 给出 L2 最优性证明；本页写为组内形式，论文原文按输出通道给出，二者同义。F5、F6（加权最小二乘缩放、imatrix 增量代价零位）：模型卡「Our encoder」节原文公式。</p>
@@ -581,7 +581,7 @@ bpw = 42*8/256 = 1.3125</code></pre>
 <p>「3:4 稀疏三值」与「量化决策」两章的手算组 $x=(0.6,-0.1,0.5,-0.7)$ 与 $d=0.6$：为便于复算而构造，用于展示编码与缩放系数对误差的影响，不代表真实权重分布。「量化决策」一章代码中的 256 个伪随机权重与伪随机 imatrix：固定种子构造，用于对比三种量化决策的误差方向，其数值不可外推到真实模型。</p>
 
 <h3>简化条件及其限制</h3>
-<p>本页的量化演示以单个 256 权重块为单位、按概念上的连续分组进行；真实编码器面向整个专家矩阵逐块处理，内核存储按 stride-16 分组（不影响量化决策结论）。代码中的 imatrix 为构造数据，真实 imatrix 来自校准集统计，因此代码误差数字只说明方向，官方测量以 N5 为准。M4 Pro 与论文 CPU 的速度数字绑定各自硬件与线程条件，不可跨硬件直接比较。N4 的精度结论在 QAT 条件下成立；PTQ 场景的精度表现取决于编码器质量（「量化决策」一章）与逐层比特分配（见 MIX-STQ1_0 页），不能由本页数字直接推出。</p>
+<p>本页的量化演示以单个 256 权重块为单位、按概念上的连续分组进行；真实编码器面向整个专家矩阵逐块处理，内核存储按 stride-16 分组（不影响量化决策结论）。代码中的 imatrix 为构造数据，真实 imatrix 来自校准集统计，因此代码误差数字只说明方向，官方测量以 N5 为准。M4 Pro 与论文 CPU 的速度数字绑定各自硬件与线程条件，不可跨硬件直接比较。N4 的精度结论在 QAT 条件下成立；PTQ 的精度表现取决于编码器质量（「量化决策」一章）与逐层比特分配（见 MIX-STQ1_0 页），不能由本页数字直接推出。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

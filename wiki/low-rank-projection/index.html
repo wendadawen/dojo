@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="把大矩阵 W≈AB（r≪min(m,n)）用两个小矩阵近似。SVD 最优性。LLM 中用于 LoRA 微调、MLA KV 压缩、KDA 衰减门低秩生成。基于线性代数教材 + LoRA 论文核对。">
-  <meta name="dojo:summary" content="用两个小矩阵的乘积近似大矩阵：$W\approx AB$，其中 $r\ll\min(m,n)$。SVD 给出最优低秩近似；在 LLM 中，这一结构用于 LoRA、MLA KV 压缩和 KDA 衰减门生成。">
+  <meta name="description" content="把大矩阵 W≈AB（r≪min(m,n)）用两个小矩阵近似。SVD 最优性。LLM 中用于 LoRA 微调、MLA KV 压缩，以及 KDA/K3 输出门由 low-rank 改 full-rank 的实例。基于 LoRA 论文、DeepSeek-V2 论文与 Wikipedia SVD / Low-rank approximation 条目核对。">
+  <meta name="dojo:summary" content="用两个小矩阵的乘积近似大矩阵：$W\approx AB$，其中 $r\ll\min(m,n)$。SVD 给出最优低秩近似；在 LLM 中，这一结构用于 LoRA 与 MLA 的 KV 压缩，K3 则把注意力输出门由 low-rank 改为 full-rank。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="数学基础">
   <meta name="dojo:tag" content="数学与数值">
@@ -112,7 +112,7 @@
 <p><b>主要依据</b>：LoRA 论文（Hu et al., arXiv:2106.09685v2, §1/§4）；DeepSeek-V2 论文（arXiv:2405.04434v2, §2.1.2）；Wikipedia "Singular value decomposition" 与 "Low-rank approximation"（Eckart-Young-Mirsky 定理与误差公式）。</p>
 </blockquote>
 
-<p>GPT-3 的隐藏维度 $d = 12288$，单个 $d \times d$ 权重矩阵约 1.5 亿参数，全量微调每个任务都要存一份完整权重；标准注意力推理时每个 token 要缓存 K 和 V，长上下文下 KV cache 占满显存。但如果"权重更新量"只需要极少的数字就能表达，缓存的 K/V 可以用一个小向量重建呢？这两个问题的答案都指向同一个工具——<strong>低秩分解</strong>：把一个大矩阵 $W$ 拆成两个小矩阵 $A, B$ 的乘积 $W \approx AB$，用 $r(m+n)$ 个参数代替 $mn$ 个参数。本文从"大矩阵为什么贵"出发，讲清秩与可压缩性、SVD 给出的最优低秩近似及其误差公式，再落到 LoRA 微调和 MLA 的 KV 压缩两个 LLM 实际应用，最后说明适用边界。</p>
+<p>GPT-3 的隐藏维度 $d = 12288$，单个 $d \times d$ 权重矩阵约 1.5 亿参数，全量微调每个任务都要存一份完整权重；标准注意力推理时每个 token 要缓存 K 和 V，长上下文下 KV cache 占满显存。但如果"权重更新量"只需要极少的数字就能表达，缓存的 K/V 可以用一个小向量重建呢？这两个问题的答案都指向同一个工具——<strong>低秩分解</strong>：把一个大矩阵 $W$ 拆成两个小矩阵 $A, B$ 的乘积 $W \approx AB$，用 $r(m+n)$ 个参数代替 $mn$ 个参数。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -157,9 +157,9 @@
 
 <h2 id="why-expensive">1. 大矩阵为什么贵——参数与存储的成本</h2>
 
-<p>神经网络的一层线性变换写成 $h = Wx$：输入向量 $x$ 乘以权重矩阵 $W$ 得到输出 $h$。这里"$Wx$"表示用矩阵 $W$ 对向量 $x$ 做一次线性变换——$W$ 的每一行与 $x$ 做内积，得到 $h$ 的一个分量。一个 $W \in \mathbb{R}^{m \times n}$ 的矩阵有 $m \times n$ 个元素，每个元素都是一个要存储和训练的参数<sup>[F5]</sup>。</p>
+<p>神经网络的一层线性变换写成 $h = Wx$：输入向量 $x$ 乘以权重矩阵 $W$ 得到输出 $h$。这里"$Wx$"表示用矩阵 $W$ 对向量 $x$ 做一次线性变换——$W$ 的每一行与 $x$ 做内积，得到 $h$ 的一个分量。一个 $W \in \mathbb{R}^{m \times n}$ 的矩阵有 $m \times n$ 个元素，这 $mn$ 个元素都是参数，都要存储。</p>
 
-<p>代入 LLM 的规模感受一下。GPT-3 的隐藏维度 $d = 12288$，一个 $d \times d$ 的方阵权重有</p>
+<p>代入 LLM 的规模：GPT-3 的隐藏维度 $d = 12288$，一个 $d \times d$ 的方阵权重有</p>
 
 $$d^2 = 12288^2 = 150{,}994{,}944 \approx 1.5 \times 10^8$$
 
@@ -220,13 +220,13 @@ $$W = AB \quad \Longrightarrow \quad \mathrm{rank}(W) \le r.$$
 
 <p>现在算参数。原矩阵 $W \in \mathbb{R}^{m \times n}$ 有 $mn$ 个参数；分解成 $AB$ 后有 $mr + rn = r(m+n)$ 个参数<sup>[F5]</sup>。当 $r \ll \min(m, n)$ 时，$r(m+n)$ 远小于 $mn$。</p>
 
-<p>代入 LLM 规模：$m = n = 12288$、$r = 2$（LoRA 论文指出 rank 可以低至 1 或 2 就足够<sup>[N2]</sup>）：</p>
+<p>代入 LLM 规模：$m = n = 12288$、$r = 2$（LoRA 论文在 GPT-3 175B 上指出 rank 可以低至 1 或 2 就足够<sup>[N2]</sup>）：</p>
 
 $$mn = 12288^2 \approx 1.5 \times 10^8, \qquad r(m+n) = 2 \times 24576 = 49152.$$
 
-<p>比例 $49152 / 150994944 \approx 0.033\%$——从一亿五千万降到不到五万。这就是低秩分解的威力。</p>
+<p>比例 $49152 / 150994944 \approx 0.033\%$——参数量从一亿五千万降到不到五万。</p>
 
-<p>但这里有个根本限制：只有当矩阵<strong>真的低秩</strong>时，$W = AB$ 才是精确的。现实中 LLM 的权重矩阵几乎都是满秩的（$d \times d$ 矩阵秩为 $d$），无法无损分解。所以实际用的不是"精确分解"，而是"近似"——找一个秩 $\le r$ 的矩阵 $\hat{W}$ 使它尽量接近 $W$。如何找到这个最好的 $\hat{W}$？SVD 给出答案。</p>
+<p>但这里有个根本限制：只有当矩阵<strong>真的低秩</strong>时，$W = AB$ 才是精确的。一般 $d \times d$ 矩阵几乎必然是满秩的（秩为 $d$），无法无损分解。所以实际用的不是"精确分解"，而是"近似"——找一个秩 $\le r$ 的矩阵 $\hat{W}$ 使它尽量接近 $W$。如何找到这个最好的 $\hat{W}$？SVD 给出答案。</p>
 
 <h3 id="ch2-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -261,7 +261,7 @@ $$mn = 12288^2 \approx 1.5 \times 10^8, \qquad r(m+n) = 2 \times 24576 = 49152.$
 
 $$W = U \Sigma V^\top,$$
 
-<p>其中 $U$ 是 $m \times m$ 正交矩阵，$V$ 是 $n \times n$ 正交矩阵，$\Sigma$ 是 $m \times n$ 对角矩阵，对角线上的非负实数 $\sigma_1 \ge \sigma_2 \ge \cdots \ge \sigma_{\min(m,n)} \ge 0$ 按从大到小排序，称为<strong>奇异值</strong><sup>[F2]</sup>。用 $u_i, v_i$ 分别记 $U, V$ 的第 $i$ 列，SVD 也可以写成：</p>
+<p>其中 $U$ 是 $m \times m$ 正交矩阵、$V$ 是 $n \times n$ 正交矩阵（正交矩阵 $Q$ 满足 $Q^\top Q = I$，即列向量两两正交且为单位长度），$\Sigma$ 是 $m \times n$ 对角矩阵，对角线上的非负实数 $\sigma_1 \ge \sigma_2 \ge \cdots \ge \sigma_{\min(m,n)} \ge 0$ 按从大到小排序，称为<strong>奇异值</strong><sup>[F2]</sup>。用 $u_i, v_i$ 分别记 $U, V$ 的第 $i$ 列，SVD 也可以写成：</p>
 
 $$W = \sum_{i=1}^{\min(m,n)} \sigma_i \, u_i v_i^\top.$$
 
@@ -287,7 +287,7 @@ $$\|W - W_k\|_F = \sqrt{\sigma_{k+1}^2 + \sigma_{k+2}^2 + \cdots}, \qquad \|W - 
 </details>
 
 <details>
-<summary>展开：3×3 对角矩阵的秩-1、秩-2 近似与误差</summary>
+<summary>展开：$3 \times 3$ 对角矩阵的秩-1、秩-2 近似与误差</summary>
 <p>构造示例。取对角矩阵 $W = \mathrm{diag}(3, 1, 0.5)$，即对角线为 $3, 1, 0.5$、其余为 $0$ 的 $3 \times 3$ 矩阵。选对角矩阵是为了让 SVD 平凡：$U = V = I$，$\Sigma = W$，奇异值 $\sigma_1 = 3, \sigma_2 = 1, \sigma_3 = 0.5$，这样本页可以直接套误差公式而不用先算 SVD。</p>
 <p><strong>秩-1 近似</strong>：保留 $\sigma_1 = 3$，$W_1 = \mathrm{diag}(3, 0, 0)$。</p>
 <p>Frobenius 误差：$\|W - W_1\|_F = \sqrt{\sigma_2^2 + \sigma_3^2} = \sqrt{1^2 + 0.5^2} = \sqrt{1.25} \approx 1.118$。</p>
@@ -295,7 +295,7 @@ $$\|W - W_k\|_F = \sqrt{\sigma_{k+1}^2 + \sigma_{k+2}^2 + \cdots}, \qquad \|W - 
 <p><strong>秩-2 近似</strong>：保留 $\sigma_1, \sigma_2$，$W_2 = \mathrm{diag}(3, 1, 0)$。</p>
 <p>Frobenius 误差：$\|W - W_2\|_F = \sqrt{\sigma_3^2} = 0.5$。</p>
 <p>谱范数误差：$\|W - W_2\|_2 = \sigma_3 = 0.5$。</p>
-<p>从秩-1 到秩-2，Frobenius 误差从 $1.118$ 降到 $0.5$——多保留一个奇异值，误差减小。这个矩阵的奇异值 $3 \gg 1 \gg 0.5$ 衰减明显，所以秩-2 近似已经很好（只丢掉 $0.5$）。若奇异值是 $3, 2.9, 2.8$ 这样平坦分布，秩-1 近似会丢掉 $\sqrt{2.9^2 + 2.8^2} \approx 4.04$，误差大得多。</p>
+<p>从秩-1 到秩-2，Frobenius 误差从 $1.118$ 降到 $0.5$——多保留一个奇异值，误差减小。这个矩阵的奇异值 $3 \gg 1 \gg 0.5$ 衰减明显，所以秩-2 近似已经很好（只丢掉 $0.5$）。若奇异值是 $3, 2.9, 2.8$ 这样平坦分布，秩-1 近似会丢掉 $\sqrt{2.9^2 + 2.8^2} \approx 4.03$，误差大得多。</p>
 </details>
 
 <h3 id="ch3-questions">本章问题</h3>
@@ -337,7 +337,7 @@ $$\Delta W = BA, \qquad B \in \mathbb{R}^{d \times r}, \quad A \in \mathbb{R}^{r
 
 $$h = W_0 x + \Delta W x = W_0 x + BAx.$$
 
-<p>预训练权重 $W_0$ 冻结不训练，只训练 $A$ 和 $B$。参数量从 $d^2$ 降为 $2dr$（$B$ 有 $dr$ 个、$A$ 有 $rd$ 个）。</p>
+<p>预训练权重 $W_0$ 冻结不训练，只训练 $A$ 和 $B$。参数量从 $d^2$ 降为 $2dr$（$B$ 有 $dr$ 个、$A$ 有 $rd$ 个）。符号上这里沿用 LoRA 原文的记法 $\Delta W = BA$：$B$（$d \times r$）是左因子、$A$（$r \times d$）是右因子；与「2. 矩阵的秩」的 $W = AB$ 相比，$A, B$ 的左右角色互换，指的都是同一个"左因子 $\times$ 右因子、内维为 $r$"的低秩结构。</p>
 
 <div class="flow-diagram">
   <p class="flow-note" style="margin-top: 0;">LoRA 前向：冻结预训练权重，只训练低秩更新量</p>
@@ -371,7 +371,7 @@ $$d^2 = 150{,}994{,}944, \qquad 2dr = 2 \times 12288 \times 2 = 49{,}152.$$
 </table>
 </div>
 
-<p>这里要区分一个容易混淆的点：LoRA <strong>不是在对 $W_0$ 做低秩近似</strong>。$W_0$ 是冻结的预训练权重，完整保留。LoRA 做的是把"要学的更新量 $\Delta W$"用低秩形式 $BA$ 参数化——$A, B$ 学到什么就是什么，没有"近似 $W_0$"这一步。低秩约束限制了 $\Delta W$ 能表达的方向数（最多 $r$ 个），这是基于"权重更新的内在秩低"这一假设<sup>[C1]</sup>。</p>
+<p>LoRA <strong>不是在对 $W_0$ 做低秩近似</strong>。$W_0$ 是冻结的预训练权重，完整保留。LoRA 做的是把"要学的更新量 $\Delta W$"用低秩形式 $BA$ 参数化——$A, B$ 学到什么就是什么，没有"近似 $W_0$"这一步。低秩约束限制了 $\Delta W$ 能表达的方向数（最多 $r$ 个），这是基于"权重更新的内在秩低"这一假设<sup>[C1]</sup>。</p>
 
 <h3 id="ch4-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -440,7 +440,7 @@ $$k_t^C = W^{UK} c_t^{KV}, \qquad v_t^C = W^{UV} c_t^{KV}, \qquad W^{UK}, W^{UV}
 
 $$\text{MHA 缓存} = 2 n_h d_h = 2 \times 128 \times 128 = 32768, \qquad \text{MLA 潜向量} = d_c = 512.$$
 
-<p>潜向量维度只有 MHA 缓存的 $512 / 32768 = 1/64$。<strong>注意上面的 1/64 是 DeepSeek-V2 同配置下单层、忽略解耦 RoPE 项 $d_h^R$ 的理论比例</strong>。论文报告的 Table 7 是不同层级的整体对比：110.6K→15.6K（Small MoE，减少 85.9%）、860.2K→34.6K（Large MoE，减少 96.0%）是 DeepSeek-V2 MoE 与不同 MHA 基线（含 DeepSeek 67B 等）的整体对照，基线的 $n_h, d_h, d_c$、层数与模型规模均不同，因此这些减少比例不能直接与同配置单层的 1/64 对照（1/64 对应 98.4% 减少，残留约 1.56%，而 15.6/110.6 残留约 14.1%）；整体相比 DeepSeek 67B 减少 93.3%<sup>[N4]</sup>。</p>
+<p>潜向量维度只有 MHA 缓存的 $512 / 32768 = 1/64$。这里的 1/64 是 DeepSeek-V2 同配置下单层、忽略解耦 RoPE 项 $d_h^R$ 的理论比例。论文附录 C.2 的 Table 7 给出模型级对照：同一 MoE 骨干分别配 MHA 与 MLA（层数相同、仅注意力机制不同，MHA 变体的注意力头配置与 MLA 不同），Small MoE 的每 token KV cache 从 110.6K 降至 15.6K（减少 85.9%），Large MoE 从 860.2K 降至 34.6K（减少 96.0%）。这些是含多层与解耦 RoPE 项的全模型统计，不能与同配置单层的 1/64 直接等价（1/64 对应 98.4% 减少、残留约 1.56%，而 15.6/110.6 残留约 14.1%）；MLA 相比 DeepSeek 67B 整体减少 KV cache 93.3%<sup>[N4]</sup>。</p>
 
 <div class="table-scroll">
 <table>
@@ -449,12 +449,12 @@ $$\text{MHA 缓存} = 2 n_h d_h = 2 \times 128 \times 128 = 32768, \qquad \text{
 <tr><td>每 token 每层缓存</td><td>$2 n_h d_h = 32768$</td><td>$d_c = 512$（潜向量）</td></tr>
 <tr><td>缓存的是什么</td><td>K 和 V 本身</td><td>压缩后的潜向量 $c_t^{KV}$</td></tr>
 <tr><td>K/V 怎么来</td><td>直接由 $W^K h_t, W^V h_t$ 生成</td><td>由 $W^{UK} c_t^{KV}, W^{UV} c_t^{KV}$ 重建</td></tr>
-<tr><td>等价权重秩</td><td>满秩（$d_h n_h$）</td><td>秩 $\le d_c$（经过 $d_c$ 维瓶颈）</td></tr>
+<tr><td>等价权重秩</td><td>满秩（$\le \min(d_h n_h, d)$）</td><td>秩 $\le d_c$（经过 $d_c$ 维瓶颈）</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>这里要强调一点：MLA 的低秩压缩是<strong>有损的</strong>。重建出的 $k_t^C, v_t^C$ 与 MHA 直接投影的 $k_t, v_t$ 在形状上一致但数值不等价——它们是从 $d_c$ 维子空间投影回来的，丢掉了 $d_h n_h - d_c$ 个方向的信息<sup>[C3]</sup>。$d_c$ 越小压缩越大，但丢的信息也越多；$d_c$ 的选择是压缩率与表达力的权衡。MLA 的完整机制（解耦 RoPE、矩阵吸收等进一步优化）见<a href="../../wiki/mla/index.html">MLA</a>概念页，本页只讲它的低秩压缩部分。</p>
+<p>MLA 的低秩压缩是<strong>有损的</strong>：重建出的 $k_t^C, v_t^C$ 与 MHA 直接投影的 $k_t, v_t$ 在形状上一致但数值不等价——它们是从 $d_c$ 维子空间投影回来的，丢掉了 $d_h n_h - d_c$ 个方向的信息。这一有损性由低秩瓶颈直接推得（论文只陈述低秩联合压缩这一机制<sup>[C3]</sup>）。$d_c$ 越小压缩越大，但丢的信息也越多；本页据此推断 $d_c$ 的取值是在压缩率与表达力之间折中，论文未展开这一权衡。MLA 的完整机制（解耦 RoPE、矩阵吸收等进一步优化）见<a href="../../wiki/mla/index.html">MLA</a>概念页，本页只讲它的低秩压缩部分。</p>
 
 <h3 id="ch5-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -489,7 +489,7 @@ $$\text{MHA 缓存} = 2 n_h d_h = 2 \times 128 \times 128 = 32768, \qquad \text{
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>奇异值分布</th><th>秩-k 近似效果</th><th>典型场景</th></tr></thead>
+<thead><tr><th>奇异值分布</th><th>秩-k 近似效果</th><th>典型例子</th></tr></thead>
 <tbody>
 <tr><td>快速衰减（如 $3, 1, 0.5$）</td><td>好——前几个方向集中大部分能量</td><td>低秩矩阵、有结构的权重</td></tr>
 <tr><td>平坦（如 $3, 2.9, 2.8$）</td><td>差——每个方向都重要，截断丢得多</td><td>满秩随机矩阵、白噪声</td></tr>
@@ -497,11 +497,11 @@ $$\text{MHA 缓存} = 2 n_h d_h = 2 \times 128 \times 128 = 32768, \qquad \text{
 </table>
 </div>
 
-<p>LoRA 的假设是"权重更新的内在秩低"<sup>[C1]</sup>。如果某个任务需要高秩更新——权重变化跨很多方向——那么小的 $r$ 就不够，LoRA 效果会受限。论文的实验显示 rank 可以低至 1 或 2<sup>[N2]</sup>，但这针对的是自然语言微调任务；对需要大幅改变模型行为的任务，更小的 $r$ 是否足够尚需按任务验证——这是低秩假设边界的直接推论，论文未给出 $r$ 上限的一般建议。</p>
+<p>LoRA 的假设是"权重更新的内在秩低"<sup>[C1]</sup>。如果某个任务需要高秩更新——权重变化跨很多方向——那么小的 $r$ 就不够，LoRA 效果会受限。论文在 GPT-3 175B 上的实验显示 rank 可以低至 1 或 2<sup>[N2]</sup>，但这针对的是自然语言微调任务；对需要大幅改变模型行为的任务，更小的 $r$ 是否足够尚需按任务验证——这是低秩假设边界的直接推论，论文未给出 $r$ 上限的一般建议。</p>
 
-<p>MLA 的低秩压缩是有损的<sup>[C3]</sup>。$d_c$ 太小会丢掉 K/V 的信息，影响注意力质量。DeepSeek-V2 选 $d_c = 512$ 是在压缩率和表达力之间权衡的结果。</p>
+<p>MLA 的低秩压缩是有损的（机制见「5. MLA」）。$d_c$ 太小会丢掉 K/V 的信息，影响注意力质量。本页据此推断 DeepSeek-V2 取 $d_c = 512$ 是在压缩率与表达力之间的折中，论文只给出该取值、未展开这一权衡。</p>
 
-<p>一个来自 K3 的真实教训<sup>[C4]</sup>：Kimi Linear 的注意力门控用 low-rank 形式（$W_g$ 低秩分解），K3 把它改为 full-rank（配置项 <code>use_full_rank_gate = true</code>），正是因为低秩门控的表达力不足——每个输出通道没有独立的门控信号。这是"低秩不够用就回到满秩"的实例。完整机制见<a href="../../wiki/kda/index.html">KDA</a>概念页。</p>
+<p>K3 的实例<sup>[C4]</sup>：Kimi Linear 的注意力门控用 low-rank 形式（$W_g$ 低秩分解），K3 通过配置项 <code>use_full_rank_gate = true</code> 把它改为 full-rank。本页推断改动动机是低秩门控表达力不足——低秩瓶颈使门控取值被限制在低维子空间，表达力受限；配置项本身只表明改用了 full-rank。这是"低秩不够用就回到满秩"的实例。完整机制见<a href="../../wiki/kda/index.html">KDA</a>概念页。</p>
 
 <div class="callout callout-yellow">
 <p><b>核心边界</b>：低秩分解不是无损压缩。它有效的条件是目标矩阵奇异值快速衰减（或权重更新内在秩低）。条件不满足时，近似误差大、表达力受损。选择低秩前要看奇异值分布或靠实验验证；$r$（或 $d_c$）是误差与成本的权衡，不是越小越好也不是越大越好。</p>
@@ -519,20 +519,20 @@ $$\text{MHA 缓存} = 2 n_h d_h = 2 \times 128 \times 128 = 32768, \qquad \text{
   <li>
     <p>K3 为什么把注意力门控从 low-rank 改成 full-rank？</p>
     <details>
-    <summary>解答：低秩门控表达力不足，通道缺独立门控信号</summary>
-    <p>Kimi Linear 的注意力门控原用 low-rank 形式（$W_g$ 低秩分解），低秩瓶颈使每个输出通道得不到独立的门控信号，表达力不足；K3 通过配置项 <code>use_full_rank_gate = true</code> 改回 full-rank，让每个通道拥有独立门控。这是"低秩不够用就回到满秩"的直接实例，说明低秩假设必须按组件验证。</p>
+    <summary>解答：低秩门控取值被限制在低维子空间，表达力受限（本页推断）</summary>
+    <p>Kimi Linear 的注意力门控原用 low-rank 形式（$W_g$ 低秩分解），低秩瓶颈使门控取值被限制在低维子空间，表达力受限；K3 通过配置项 <code>use_full_rank_gate = true</code> 改回 full-rank，让每个输出通道可以拥有独立的门控值。改动动机为表达力不足是本页的推断（配置项本身只表明改用了 full-rank）；这是"低秩不够用就回到满秩"的直接实例，说明低秩假设必须按组件验证。</p>
     </details>
   </li>
   <li>
     <p>MLA 的低秩压缩是有损还是无损？损失从哪里来？</p>
     <details>
     <summary>解答：有损，损失来自 $d_c$ 维瓶颈截掉的方向</summary>
-    <p>重建的 $k_t^C, v_t^C$ 从 $d_c$ 维子空间投影回来，丢掉了 $d_h n_h - d_c$ 个方向的信息，与 MHA 直接投影的 K/V 数值不等价。$d_c$ 越小压缩越大、丢得越多；DeepSeek-V2 选 $d_c = 512$ 是压缩率与表达力之间的权衡结果。</p>
+    <p>重建的 $k_t^C, v_t^C$ 从 $d_c$ 维子空间投影回来，丢掉了 $d_h n_h - d_c$ 个方向的信息，与 MHA 直接投影的 K/V 数值不等价。$d_c$ 越小压缩越大、丢得越多；本页据此推断 DeepSeek-V2 取 $d_c = 512$ 是压缩率与表达力之间的折中，论文只给出该取值、未展开这一权衡。</p>
     </details>
   </li>
 </ol>
 
-<p>回顾全文：大矩阵之所以贵是因为每个元素都要存（$d=12288$ 时单矩阵 1.5 亿参数）；秩衡量可压缩量，秩 $r$ 的矩阵可无损写成 $AB$ 用 $r(m+n)$ 个参数；SVD 的截断近似由 Eckart-Young 定理保证最优，误差等于被截掉的奇异值；LoRA 把权重更新量 $\Delta W = BA$ 参数化为低秩，参数从 $d^2$ 降到 $2dr$（GPT-3 175B 下可低至原模型 $0.01\%$）；MLA 把 KV 压成 $d_c$ 维潜向量缓存，DeepSeek-V2 下约为 MHA 同配置的 1/64；但低秩有效的前提是奇异值快速衰减或权重更新内在秩低，条件不满足时近似误差大、表达力受损（K3 把 low-rank 门控改回 full-rank 即是实例）。</p>
+<p>大矩阵之所以贵是因为每个元素都要存（$d=12288$ 时单矩阵 1.5 亿参数）；秩衡量可压缩量，秩 $r$ 的矩阵可无损写成 $AB$ 用 $r(m+n)$ 个参数；SVD 的截断近似由 Eckart-Young 定理保证最优，误差等于被截掉的奇异值；LoRA 把权重更新量 $\Delta W = BA$ 参数化为低秩，参数从 $d^2$ 降到 $2dr$（GPT-3 175B 下可低至原模型 $0.01\%$）；MLA 把 KV 压成 $d_c$ 维潜向量缓存，DeepSeek-V2 下约为 MHA 同配置的 1/64；但低秩有效的前提是奇异值快速衰减或权重更新内在秩低，条件不满足时近似误差大、表达力受损（K3 把 low-rank 门控改回 full-rank 即是实例）。</p>
 
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
@@ -554,7 +554,7 @@ $$\text{MHA 缓存} = 2 n_h d_h = 2 \times 128 \times 128 = 32768, \qquad \text{
 <p><b>[N1]</b> LoRA 在 GPT-3 175B 上可训练参数低至原模型 $0.01\%$、约一万倍减少。来源：arXiv:2106.09685v2, §2（$0.01\%$）与 §1（10,000 times）。实验条件：GPT-3 175B 特定 rank 配置。</p>
 <p><b>[N2]</b> rank $r$ 可低至 1 或 2，满秩 $d$ 高达 12288。来源：arXiv:2106.09685v2, §1："a very low rank (i.e., $r$ in Figure 1 can be one or two) suffices even when the full rank (i.e., $d$) is as high as 12,288"。实验条件：GPT-3 175B。</p>
 <p><b>[N3]</b> DeepSeek-V2 配置 $n_h=128, d_h=128, d_c=512$。来源：arXiv:2405.04434v2, §3.1.2："we set the number of attention heads $n_h$ to 128 and the per-head dimension $d_h$ to 128. The KV compression dimension $d_c$ is set to 512"。</p>
-<p><b>[N4]</b> MLA 减少 KV cache 93.3%；Table 7 对照 Small MoE 110.6K→15.6K、Large MoE 860.2K→34.6K。来源：arXiv:2405.04434v2 摘要（93.3%）与 §2.1.4 Table 7。93.3% 为相比 DeepSeek 67B 的整体降幅（含解耦 RoPE 项与多层）。</p>
+<p><b>[N4]</b> MLA 减少 KV cache 93.3%；附录 C.2 Table 7 对照同一 MoE 骨干分别配 MHA 与 MLA：Small MoE 的每 token KV cache 从 110.6K 降至 15.6K、Large MoE 从 860.2K 降至 34.6K。来源：arXiv:2405.04434v2 摘要（93.3%）与附录 C.2 Table 7。93.3% 为相比 DeepSeek 67B 的整体降幅（含解耦 RoPE 项与多层）；Table 7 数值为全模型多层统计，与单层 1/64 口径不同。</p>
 
 <h3>构造示例</h3>
 <p><b>[N5]</b> 构造矩阵 $W = \mathrm{diag}(3, 1, 0.5)$。人为构造，目的是让 SVD 平凡（$U = V = I$）以便手算误差公式。奇异值 $\sigma_1=3, \sigma_2=1, \sigma_3=0.5$；秩-1 近似 Frobenius 误差 $\sqrt{1.25} \approx 1.118$、谱误差 $1$；秩-2 近似 Frobenius 误差 $0.5$、谱误差 $0.5$。不代表真实权重数据。</p>

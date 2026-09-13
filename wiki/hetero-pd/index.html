@@ -138,12 +138,12 @@
       <figcaption>图 1：入口拓扑。实线是 HTTP 请求路径，虚线是建连与 KV 传输路径。</figcaption>
     </figure>
 
-    <p><strong>必须打 proxy 8000，不能直接打 8021</strong>。打错的表现完全不同，而且都很隐蔽：</p>
+    <p>入口是 proxy 的 8000 端口，<strong>直连任一侧的 8021 不会进入 PD 链路</strong>。两种错误入口的表现不同，且都不易察觉：</p>
 
     <table>
       <tr><th>错误入口</th><th>实际发生什么</th><th>表现</th></tr>
       <tr><td>直接打 P:8021</td><td>P 单机跑完全部 token，PD 完全没参与</td><td><code>request_decode_time_seconds=0</code>、<code>kv_transfer_e2e_time_ms=0</code>、<code>kv_transfer_params=null</code>；返回结果完全正常，<strong>极易误判为 PD 已生效</strong></td></tr>
-      <tr><td>直接打 D:8021 并手动塞 kv_transfer_params</td><td>D 挂起等 KV，但没有 proxy 通知 P 做 prefill</td><td>等满 120 s（<code>VLLM_TRANSFER_TIME_OUT</code>）后 KV transfer timeout，<code>finish_reason=abort</code>，只吐 1 个 token</td></tr>
+      <tr><td>直接打 D:8021 并手动塞 kv_transfer_params</td><td>D 挂起等 KV，但没有 proxy 通知 P 做 prefill</td><td>等满 120 s（<code>VLLM_TRANSFER_TIME_OUT</code>）后 KV transfer timeout，<code>finish_reason=abort</code>，只产出 1 个 token</td></tr>
     </table>
 
     <h2>2. 建连：三层握手</h2>
@@ -173,7 +173,7 @@
 
     <h3>第 3 层：RoCE 网卡自动选路（异构的关键）</h3>
     <p>NIXL 走 Mooncake 后端时，创建 agent 前自动扫 <code>/sys/class/infiniband</code>，只保留满足三个条件的网卡：RoCE v2、IPv4 映射 GID、网卡 IP 不等于管控 IP（管理网卡没有到对端的 RoCE 通路）。筛选结果写进 <code>MC_TE_FILTERS</code>。两侧各筛出 8 张数据面网卡，正好对应 8 个 TP rank——尽管两边网卡命名体系完全不同（NVIDIA 的 <code>mlx5_bond_*</code> 与 AMD 的 <code>bnxt_re_bond*</code>）。</p>
-    <p>没有这份白名单时，Mooncake 会退化去用管理网卡，报 <code>Process failed for slice</code>；一张可用网卡都找不到时直接抛异常，代码注释的原话是「Failing loudly here beats a silent KV transfer timeout later」——宁可启动就响，不要事后静默超时。</p>
+    <p>没有这份白名单时，Mooncake 会退化去用管理网卡，报 <code>Process failed for slice</code>；一张可用网卡都找不到时直接抛异常，代码注释的原话是「Failing loudly here beats a silent KV transfer timeout later」，即启动阶段直接失败，优于事后静默超时。</p>
 
     <figure>
       <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三层握手时序">
@@ -242,9 +242,9 @@
     $$1351680 = \underbrace{2}_{K,V} \times \underbrace{64}_{\text{block\_size}} \times \underbrace{1}_{\text{KV head/rank}} \times \underbrace{132}_{128\ \text{head\_size} + 4} \times \underbrace{80}_{\text{层数}} = 16896\ \text{B/层} \times 80\ \text{层}$$
 
     <ul>
-      <li><strong>KV head 每 rank 1 个</strong>：模型 GQA 共 8 个 KV head（64 个 Q head 共享 8 个 KV head，8:1），TP=8 切下来每 rank 恰好 1 个。</li>
-      <li><strong>132 = 128 + 4</strong>：每行 128 字节数据加 4 个元素的 scale 尾部。K 的 scale 是动态值（per-token-per-head 量化，每 32 个 token 一组 fp32），必须随数据走，内嵌在 block 尾部；V 的 scale 是静态 per-head 值，直接从 checkpoint 的 <code>_v_scale</code> 读，不进 cache，槽位空置（约 3% 浪费）。</li>
-      <li><strong>D 侧读取用零拷贝视图</strong>：<code>split_hyvl_kv_cache()</code> 把 (64, 132) reshape 成 (66, 128)——前 64 行是 KV 数据，后 2 行是 scale（64/32=2 组），不搬数据。</li>
+      <li><strong>KV head 每 rank 1 个</strong>：模型采用 GQA，共 8 个 KV head，TP=8 切下来每 rank 恰好 1 个。</li>
+      <li><strong>132 = 128 + 4</strong>：每行 128 字节数据加 4 字节尾部。K 的 scale 是动态值（per-token-per-head 量化，每个 token 一个 fp32），必须随数据走，内嵌在 block 尾部；V 的 scale 是静态 per-head 值，直接从 checkpoint 的 <code>_v_scale</code> 读，不进 cache，槽位空置（约 3% 浪费）。</li>
+      <li><strong>D 侧读取用零拷贝视图</strong>：<code>split_hyvl_kv_cache()</code> 把 (64, 132) reshape 成 (66, 128)——前 64 行是 KV 数据，每行尾部的 4 B scale 收拢成后 2 行（64 个 fp32，共 256 B），不搬数据。</li>
     </ul>
 
     <figure>
@@ -252,25 +252,35 @@
         <defs>
           <marker id="arr3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--text-light)"/></marker>
         </defs>
-        <text x="380" y="26" text-anchor="middle" font-family="var(--font-ui)" font-size="13" fill="var(--text)">1 层 × 1 KV head = 16896 B（分配视角 2 × 64 × 132）</text>
+        <foreignObject x="60" y="10" width="640" height="22">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:13px/1.5 var(--font-ui);color:var(--text);text-align:center;">1 层 × 1 KV head = 16896 B（分配视角 $2 \times 64 \times 132$）</div>
+        </foreignObject>
 
         <rect x="70" y="46" width="290" height="34" fill="var(--bg-soft)" stroke="var(--border)"/>
-        <text x="215" y="68" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--text)">K 数据 · int8 · 64 行 × 128 B</text>
+        <foreignObject x="72" y="52" width="286" height="22">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:12px/1.6 var(--font-mono);color:var(--text);text-align:center;">K 数据 · int8 · 64 行 × 128 B</div>
+        </foreignObject>
         <rect x="70" y="84" width="290" height="20" fill="var(--bg)" stroke="var(--blue)" stroke-dasharray="4 3"/>
-        <text x="215" y="99" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--text-light)">K scale · fp32 · 2 行（每 32 token 一组，动态）</text>
+        <foreignObject x="72" y="87" width="286" height="16">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.45 var(--font-mono);color:var(--text-light);text-align:center;">K scale · fp32 · 2 行（64 个，每 token 一个，动态）</div>
+        </foreignObject>
 
         <rect x="400" y="46" width="290" height="34" fill="var(--bg-soft)" stroke="var(--border)"/>
         <foreignObject x="404" y="52" width="282" height="22">
           <div xmlns="http://www.w3.org/1999/xhtml" style="font:12px/1.5 var(--font-mono);color:var(--text);text-align:center;">V 数据 · fp8_e4m3 · 64 行 × 128 B</div>
         </foreignObject>
         <rect x="400" y="84" width="290" height="20" fill="var(--bg)" stroke="var(--border)" stroke-dasharray="4 3"/>
-        <text x="545" y="99" text-anchor="middle" font-family="var(--font-mono)" font-size="11" fill="var(--text-light)">V scale 槽位 · 空置（静态值在 checkpoint）</text>
+        <foreignObject x="402" y="87" width="286" height="16">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.45 var(--font-mono);color:var(--text-light);text-align:center;">V scale 槽位 · 空置（静态值在 checkpoint）</div>
+        </foreignObject>
 
         <path d="M215,112 C215,140 190,146 190,164" fill="none" stroke="var(--text-light)" stroke-width="1.2" marker-end="url(#arr3)"/>
         <path d="M545,112 C545,140 570,146 570,164" fill="none" stroke="var(--text-light)" stroke-width="1.2" marker-end="url(#arr3)"/>
 
         <rect x="120" y="170" width="520" height="40" rx="8" fill="var(--bg-soft)" stroke="var(--border)"/>
-        <text x="380" y="188" text-anchor="middle" font-family="var(--font-mono)" font-size="12.5" fill="var(--text)">1 个 block = 80 层 × 16896 B = 1351680 B</text>
+        <foreignObject x="122" y="176" width="516" height="24">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:12.5px/1.6 var(--font-mono);color:var(--text);text-align:center;">1 个 block = $80 \times 16896 = 1351680$ B</div>
+        </foreignObject>
         <foreignObject x="130" y="192" width="500" height="16">
           <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.4 var(--font-mono);color:var(--text-light);text-align:center;">6 blocks × 64 slot = 384 $\geq$ 362 prompt token；8 rank 并行共 61.9 MiB</div>
         </foreignObject>
@@ -278,7 +288,7 @@
       <figcaption>图 3：block 内布局。K 半块与 V 半块各 66 行（64 行数据 + 2 行 scale 位），每半块 8448 B。</figcaption>
     </figure>
 
-    <p>实测速率：关闭前缀缓存后单 rank 传输 8110080 B 用时 4.4 ms（约 1.70 GB/s，热路径）；冷路径 17.8 ms（约 0.42 GB/s）。日志中 GB/s 按 $10^9$ 基数计算。</p>
+    <p>实测速率（关闭前缀缓存，单 rank 传输 8110080 B）：热路径 4.4 ms（约 1.70 GB/s），冷路径 17.8 ms（约 0.42 GB/s）。日志沿用 GB/s 字样，基数实为 $2^{30}$（GiB）。第 3 节前缀缓存命中那次的 6.9 ms / 1.09 GB/s 同此口径，属另一次运行，条件不同，不与本节直接对比。</p>
 
     <h2>5. 异构可行的条件与脆弱性</h2>
 
@@ -297,26 +307,26 @@
 
     <p>约束来自零拷贝 reshape：cache 按 (block_size, head_size+elems) 分配、运行时 reshape 成 (pad_total_rows, head_size)，元素总数必须守恒，所以 elems × block_size 必须能被 head_size 整除。代入 block_size=64、head_size=128：$\gcd(64,128)=64$，unit = 2，elems = 4——与 D 侧固定值恰好一致，两侧每层每 block 同为 16896 B。</p>
 
-    <p><strong>这个一致是脆弱的、靠参数组合碰上的</strong>。反例：head_size=192、block_size=64 时 $\gcd=64$、unit=3、elems=6 $\neq$ 4，两侧布局就不再匹配；而第 2 节说过 <code>compat_hash</code> 只报告不阻止——布局错配会变成静默的数据损坏风险，只能在观测侧发现。</p>
+    <p><strong>这个一致是脆弱的，由具体参数组合决定</strong>。反例：head_size=192、block_size=64 时 $\gcd=64$、unit=3、elems=6 $\neq$ 4，两侧布局就不再匹配；而第 2 节说过 <code>compat_hash</code> 只报告不阻止——布局错配会变成静默的数据损坏风险，只能在观测侧发现。</p>
 
     <p>另有两处「允许不同」：一是 <code>block_stride</code>，P 若走 cross-layer split KV 则 stride=2，D 的 backend 不 split 则 stride=1，两侧各用各自的 stride 计算索引（descriptor 长度建链时已按对端参数算好）；二是 D 侧代码注释明确 HYVL_INT8_ATTN 不能加进 K/V-outer 布局的 backend 集合——它是 NHD 序且 scale 内嵌在每个 head 尾部，属于另一套布局约定（NHD 与 HND 两种排法的取舍见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>）。</p>
 
     <h2>6. 失败路径与可观测点</h2>
 
     <table>
-      <tr><th>场景</th><th>行为</th></tr>
+      <tr><th>失败情形</th><th>行为</th></tr>
       <tr><td>NIXL 传输失败</td><td><code>check_xfer_state(handle) != "DONE"</code> → 记 error、加入 failed_agents、尝试 <code>reconnect_remote_agent()</code>；重连失败则该 agent 置 None 后续跳过</td></tr>
       <tr><td>D 收不到 KV</td><td>scheduler 检查 <code>VLLM_TRANSFER_TIME_OUT</code>（默认 120 s）超时 → 广播 kv_timeout → worker 清理待发送块 → 请求 abort</td></tr>
       <tr><td>P 侧 prefill 失败</td><td>主动发 <code>prefill_failed</code> 通知 D，D 立即释放请求，不用等满 120 s</td></tr>
       <tr><td>kv_load_failure_policy 不一致</td><td>P 配了 recompute 但 D 启动命令没给该参数、实际生效 fail → D 没有 recompute 兜底，拿不到 KV 只能超时 abort</td></tr>
     </table>
 
-    <p>D 侧超时日志（ttft 恰好 120.010 s、只吐 1 个 token 是特征）：</p>
+    <p>D 侧超时日志（ttft 恰好 120.010 s、只产出 1 个 token 是特征）：</p>
     <pre><code>[scheduler.py] KV transfer timeout for requests: ['96e84c9bb06d25ca']
 [flexible_connector.py] KV timeout for [...], no need to send kvcache!
 Finished request: ... finish_reason=abort, ttft=120.010s, output_tokens=1</code></pre>
 
-    <p>排障时直接搜这些日志字符串（P 侧发送 / D 侧接收 / 建连 / 选路 / 失败）：</p>
+    <p>以下日志字符串分别对应 P 侧发送、D 侧接收、建连、选路与失败：</p>
     <pre><code>L=&lt;service.log 路径&gt;   # 注意 grep -a：日志含二进制字符
 
 grep -a "\[Prefill Worker\] KV send done"  $L   # P 侧 KV 发送
@@ -329,25 +339,25 @@ grep -a "KV transfer timeout\|NIXL transfer failed\|prefill_failed"   $L</code><
 
     <h2>7. 实测结论：传输不是瓶颈</h2>
 
-    <p>关掉前缀缓存后的干净数据（cached_tokens=0，362 prompt / 64 output）：</p>
+    <p>关闭前缀缓存后的实测数据（<code>cached_tokens=0</code>，362 prompt token / 64 output token）：</p>
 
     <table>
       <tr><th>阶段</th><th>耗时</th><th>占比</th></tr>
       <tr><td>proxy 分发 + P prefill</td><td>约 150 ms</td><td>4%</td></tr>
       <tr><td>KV RDMA 传输</td><td>4.4 ms</td><td><strong>0.12%</strong></td></tr>
-      <tr><td>D decode（64 token @ 17.3 tok/s）</td><td>3.48 s</td><td><strong>96%</strong></td></tr>
+      <tr><td>D decode（64 token）</td><td>3.48 s</td><td><strong>96%</strong></td></tr>
     </table>
 
-    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么（D 侧把本地命中的头部块数回传、P 侧据此只发增量的设计能进一步压低这部分传输，见 <a href="../increase-kv/index.html">增量 KV 传输</a>）；单请求吞吐上，走 PD（20.3 tok/s）比 D 本机跑全程（23.5 tok/s）略慢，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
+    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么（D 侧把本地命中的头部块数回传、P 侧据此只发增量的设计能进一步压低这部分传输，见 <a href="../increase-kv/index.html">增量 KV 传输</a>）；单请求吞吐上，走 PD 的端到端为 64 token / 3.63 s（约 17.6 tok/s），低于 D 本机跑全程的 23.5 tok/s，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
 
-    <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。多请求并发下的整体吞吐才是 PD 的收益所在，单请求对比体现不出来。</p>
+    <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。<strong>该收益为推断</strong>：本页只实测了单请求链路，多请求并发下的整体吞吐未测，单请求对比无法体现这一收益。</p>
 
     <h3>复现要点</h3>
     <ul>
       <li>入口必须走 proxy 的 8000 端口，不要直连任一侧的 8021。</li>
-      <li>关前缀缓存两侧注入方式不同：一侧写系统 environment 文件即可生效（启动脚本经 <code>ssh bash -l</code> 拉起、只透传白名单变量，但 ssh 层会 source 它）；另一侧的启动脚本 source 的平台环境文件里硬编码 <code>VLLM_ENABLE_PREFIX_CACHING="1"</code> 且只读，只能在 source 之后再 export 覆盖。</li>
+      <li>关闭前缀缓存需在两侧都注入 <code>VLLM_ENABLE_PREFIX_CACHING=0</code>，并确认它覆盖了启动环境中的既有取值；两侧环境注入方式不同，需分别验证生效，否则缓存命中会掩盖真实传输量。</li>
       <li>验证 PD 生效：两侧分别 grep <code>KV send done</code> / <code>KV recv done</code>。</li>
-      <li>重启前确认显存归零（NVIDIA 侧 <code>nvidia-smi --query-gpu=memory.used</code>，AMD 侧 <code>rocm-smi</code>），否则 OOM；清残留进程时不要用 <code>pkill -f "VLLM::"</code> 全局名字匹配——会误伤平台管控进程（实测曾把一台节点打成不可达），应先定位 <code>vllm serve</code> 主进程再按进程树 kill。</li>
+      <li>重启前确认两侧显存已归零（NVIDIA 侧 <code>nvidia-smi --query-gpu=memory.used</code>，AMD 侧 <code>rocm-smi</code>），否则会 OOM；清理残留进程时按进程树精确定位，避免误伤其他管控进程。</li>
     </ul>
 
     <h2>来源与范围说明</h2>

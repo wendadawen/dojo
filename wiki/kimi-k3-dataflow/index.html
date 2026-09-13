@@ -82,15 +82,15 @@
 </div>
 
 <h1 class="title">Kimi K3 前向数据流</h1>
-<p class="page-lead">Kimi K3 是一个 2.78T 参数的 MoE 模型：93 层主干中，第 0 层为 KDA + Dense FFN，第 1–90 层按 KDA $\times$ 3 : Gated MLA $\times$ 1 循环混合，末尾第 91、92 层连续 MLA；FFN 全部是 Stable Latent MoE（896 路由专家 top-16 + 2 共享专家），并用 Block AttnRes 做跨块加权残差、SiTU-GLU 有界激活保证稳定；全模型无位置编码（NoPE），上下文 1M，每 token 激活 104.2B 参数。多模态输入时，27 层 <a href="../moonvit-v2/">MoonViT-V2</a> 视觉塔把像素变成 7168 宽 token（个数与帧数无关），经占位符扩展融入同一序列，此后与文本共享全部 93 层。</p>
-<p class="page-meta">更新于 2026-08-05 · 2026-08-07 按官方源码修订 Block AttnRes · 2026-09-03 补充视觉编码器、多模态融合与长上下文开销（含 research/ 本机实测）· 来源：官方 config.json、官方实现源码与本机实测 · 数值与公式逐项核对</p>
+<p class="page-lead">Kimi K3 是一个 2.78T 参数的 MoE 模型：93 层主干中，第 0 层为 KDA + Dense FFN，第 0–90 层按 [3 KDA + 1 MLA] 分块（块首 0,4,…,84），末尾第 91、92 层连续 MLA；第 1 层起的 FFN 全部是 Stable Latent MoE（896 路由专家 top-16 + 2 共享专家），并用 Block AttnRes 做跨块加权残差、SiTU-GLU 有界激活保证稳定；语言主干无位置编码（NoPE），上下文 1M，每 token 激活 104.2B 参数。多模态输入时，27 层 <a href="../moonvit-v2/">MoonViT-V2</a> 视觉塔把像素变成 7168 宽 token（个数与帧数无关），经占位符扩展融入同一序列，此后与文本共享全部 93 层。</p>
+<p class="page-meta">更新于 2026-09-03 · 来源：官方 config.json、官方实现源码与本机实测</p>
 <p class="reading-time" id="readingTime"></p>
 
   <h2 id="specs">1. 关键规格</h2>
   <table>
     <tr><th>规模</th><td>总参数 2.78T；每 token 激活 104.2B；上下文 1,048,576</td></tr>
     <tr><th>主干</th><td>93 层 = 69 层 KDA + 24 层 Gated MLA；hidden=7168；96 头；KDA head_dim=128</td></tr>
-    <tr><th>层分布</th><td>第 0 层（KDA + Dense FFN，first_k_dense_replace=1）；第 1–90 层 KDA $\times$ 3 : MLA $\times$ 1 循环（MLA 在 3,7,…,87）；第 91、92 层连续 MLA</td></tr>
+    <tr><th>层分布</th><td>第 0 层（KDA + Dense FFN，first_k_dense_replace=1）；第 0–90 层按 [3 KDA + 1 MLA] 分块（块首 0,4,…,84；MLA 在 3,7,…,87）；第 91、92 层连续 MLA</td></tr>
     <tr><th>MoE</th><td>896 路由专家，每 token 激活 16 个（稀疏度 $56\times$）；另有 2 个共享专家</td></tr>
     <tr><th>Latent MoE</th><td>routed_expert_hidden_size=3584（隐空间）；moe_intermediate_size=3072；latent_moe_use_norm=true</td></tr>
     <tr><th>MLA</th><td>q_lora_rank=1536；kv_lora_rank=512；qk_nope_head_dim=128；qk_rope_head_dim=64；v_head_dim=128；mla_use_output_gate=true；mla_use_nope=true（实现强制保留非旋转分量，源码 <code>assert use_nope</code>）</td></tr>
@@ -98,15 +98,15 @@
     <tr><th>AttnRes</th><td>attn_res_block_size=12；8 个历史块快照（第 1 个即 embedding）+ 当前残差流 = 9 个候选；每层 attention 前与 MLP 前各加权一次，模型末尾再加权一次</td></tr>
     <tr><th>激活</th><td>SiTU-GLU：activation_situ_beta=4.0，activation_situ_linear_beta=25.0，输出坐标上界 100</td></tr>
     <tr><th>词表</th><td>vocab_size=163840；tie_word_embeddings=false（lm_head 独立权重）</td></tr>
-    <tr><th>位置编码</th><td>全模型 NoPE（MLA 不施加 RoPE，rotary_emb=None）</td></tr>
+    <tr><th>位置编码</th><td>语言主干（93 层）NoPE（MLA 不施加 RoPE，rotary_emb=None；视觉塔除外，见第 4 节）</td></tr>
     <tr><th>视觉</th><td><a href="../moonvit-v2/">MoonViT-V2</a>：27 层、vt_hidden=1024、12 头 $\times$ 128（qkv_hidden_size=1536，头维 $\ne$ hidden/heads）、patch=14、RMSNorm、GELU(tanh) MLP2（1024→4096→1024）、可学习 64×64 位置嵌入 + 4 帧时间 sincos、2D RoPE（网格上限 512×512）；merger sd2_tpool 时间全池化 + 2×2 合并、PatchMergerMLPV2 4096→4096→7168；塔 401,214,464 参数（技术报告 401M 吻合）+ merger 46,144,512</td></tr>
     <tr><th>多模态融合</th><td>media_placeholder_token_id=163605（<code>&lt;|kimi_image_placeholder|&gt;</code>）占位符扩展：$T' = T - \#\mathrm{PH} + \sum_i n_i$，序列变长（LLaVA 式，非原地替换）；视觉 token 数 $n_i=(h_i/2)(w_i/2)$ 与帧数无关（$t \le 4$）</td></tr>
-    <tr><th>MTP</th><td>num_nextn_predict_layers=0，无 MTP 草稿层</td></tr>
-    <tr><th>其他</th><td>RMSNorm eps=1e-5；routed_scaling_factor=1.0；moe_renormalize=true；MXFP4 权重量化（QAT；范围=路由专家权重+embedding，attn/共享专家/lm_head/视觉塔豁免）</td></tr>
+    <tr><th>MTP</th><td>num_nextn_predict_layers=0（HF 配置未含 NextN 层）；技术报告 Table 1 与 §4.1.4 称 K3 预训练含 1 层 MTP 并微调为 EAGLE-3 草稿模型——两个官方来源在此分歧，配置中未体现</td></tr>
+    <tr><th>其他</th><td>RMSNorm eps=1e-5；routed_scaling_factor=1.0；moe_renormalize=true；MXFP4 权重量化（QAT；范围=路由专家的 w1/w2/w3 权重；豁免：embedding、lm_head、self_attn、共享专家、latent MoE 投影、MoE 路由器、视觉塔、mm_projector）</td></tr>
   </table>
 
   <h2 id="viz">2. 交互式数据流</h2>
-  <p>八个视图，从整体总览开始；黄色双线框节点可点击下钻。节点两行 = 算子名 / 输入维→输出维；边上标数据名与维度；悬停节点查看公式。机制解释见下方要点。</p>
+  <p>八个视图，从整体总览开始；黄色双线框节点可点击下钻。节点两行 = 算子名 / 输入维→输出维；边上标数据名与维度；悬停节点查看公式。</p>
   <div class="viz">
     <div class="viz-head">
       <div class="tabs" id="tabs"></div>
@@ -115,6 +115,134 @@
     <div id="cy"></div>
     <div class="legend" id="legend"></div>
   </div>
+<noscript>
+<p>交互视图由脚本绘制；脚本不可用时，各视图的节点、维度与公式逐一列在下面。</p>
+<h4>整体总览 (93 层)</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>像素 patch / (仅多模态)</td><td><code>[n_patch, 3,14,14] + grid_thw</code></td><td>$\mathrm{grid\_thw} = (t,h,w)$</td></tr>
+<tr><td>占位符扩展融合 / 序列变长</td><td><code>文本 [·,7168] + 视觉 [sum  n,7168] -&gt; [·,T',7168]</code></td><td>$T' = T - \#\mathrm{PH} + \textstyle\sum_i n_i$</td></tr>
+<tr><td>embed / id → 7168</td><td><code>token id [2,8] -&gt; [2,8,7168]</code></td><td>$x = \mathrm{Embedding}(\mathrm{ids})$</td></tr>
+<tr><td>Layer 0 KDA+Dense / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$h_0 = \mathrm{DecoderLayer}_0(x)$</td></tr>
+<tr><td>Layers 1..90 / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$\text{68 KDA} + \text{22 MLA}$</td></tr>
+<tr><td>KDA 层 / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$\text{linear attn}$</td></tr>
+<tr><td>MLA 层 / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$\text{full attn}$</td></tr>
+<tr><td>MoE FFN / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$\text{896 experts, top-16}$</td></tr>
+<tr><td>Layers 91,92 MLA / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$2\times\mathrm{MLA}$</td></tr>
+<tr><td>Block AttnRes ▸ / 93 层</td><td><code>贯穿 93 层</code></td><td>$h = \sum_j p_j\, v_j,\; p=\mathrm{softmax}(s)$</td></tr>
+<tr><td>final norm / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$\mathrm{RMSNorm}(h)$</td></tr>
+<tr><td>output AttnRes / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$h = \sum_j p_j\, v_j$</td></tr>
+<tr><td>lm_head / 7168 → 163840</td><td><code>[2,8,7168] -&gt; [2,8,163840]</code></td><td>$\mathrm{logits} = h\, W_{lm}^{\top}$</td></tr>
+<tr><td>logits / → 163840</td><td><code>[2, 8, 163840]</code></td><td>$\mathrm{logits}$</td></tr>
+</table>
+<p>边：pix→fuse（[n_vis,7168]）；emb→fuse（[·,7168]）；fuse→l0（7168）；l0→blk（7168）；blk→kdaL（×68）；blk→mlaL（×22）；kdaL→moeL（7168）；mlaL→moeL（7168）；moeL→ltail（7168）；blk→attnres（每12层快照）；ltail→ores（7168）；ores→fnorm（7168）；fnorm→head（7168）；head→out（163840）</p>
+<h4>Dense FFN 内部 (第 0 层, KimiMLP)</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>输入 / 7168</td><td><code>[2,8,7168]</code></td><td>$x$</td></tr>
+<tr><td>gate_proj / 7168 → 33792</td><td><code>[2,8,7168] -&gt; [2,8,33792]</code></td><td>$g = x W_{gate}$</td></tr>
+<tr><td>up_proj / 7168 → 33792</td><td><code>[2,8,7168] -&gt; [2,8,33792]</code></td><td>$u = x W_{up}$</td></tr>
+<tr><td>SiTU-GLU / 33792 → 33792</td><td><code>g,u [.,33792] -&gt; [.,33792]</code></td><td>$\begin{aligned} &amp; \mathrm{SiTU}(g)\odot \tilde u \\[4pt] &amp; \mathrm{SiTU}(g)=\beta\tanh\!\frac{g}{\beta}\,\sigma(g) \\[4pt] &amp; \tilde u=\beta_l\tanh\!\frac{u}{\beta_l} \end{aligned}$</td></tr>
+<tr><td>down_proj / 33792 → 7168</td><td><code>[2,8,33792] -&gt; [2,8,7168]</code></td><td>$y = (\cdot) W_{down}$</td></tr>
+<tr><td>输出 / 7168</td><td><code>[2,8,7168]</code></td><td>$y$</td></tr>
+</table>
+<p>边：x→gp（7168）；x→upp（7168）；gp→act（g 33792）；upp→act（u 33792）；act→dp（33792）；dp→out（7168）</p>
+<h4>Block AttnRes (每层两次加权 + 块级快照)</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>机制概览</td><td><code>背景</code></td><td>$p = x_L + a + m$</td></tr>
+<tr><td>当前残差流 / 7168</td><td><code>[2,8,7168]</code></td><td>$p = \text{current residual stream}$</td></tr>
+<tr><td>历史块快照 / N×7168</td><td><code>[num_tokens, N, 7168]</code></td><td>$\{v_1,...,v_8\}$</td></tr>
+<tr><td>堆叠 / → 9×7168</td><td><code>-&gt; [num_tokens, 9, 7168]</code></td><td>$v = [\,v_1,...,v_8,\; p\,]$</td></tr>
+<tr><td>RMSNorm+打分 / 9×7168 → 9</td><td><code>[.,9,7168] -&gt; [.,9]</code></td><td>$\begin{aligned} &amp; k = \frac{v}{\sqrt{\mathrm{mean}(v^2)+\epsilon}} \\[4pt] &amp; s = \sum_d (k\odot w_{norm}\odot w_{proj}) \end{aligned}$</td></tr>
+<tr><td>softmax 加权 / 9 → 7168</td><td><code>[.,9] -&gt; [2,8,7168]</code></td><td>$\begin{aligned} &amp; p_j=\frac{e^{s_j}}{\sum_i e^{s_i}} \\[4pt] &amp; h = \sum_{j=1}^{9} p_j\, v_j \end{aligned}$</td></tr>
+<tr><td>加权结果 / 7168</td><td><code>[2,8,7168]</code></td><td>$h$</td></tr>
+</table>
+<p>边：cur→stack（p）；blks→stack（v_1..v_8）；stack→norm（9 个向量）；norm→soft（分数 s）；stack→soft（候选 v）；soft→out（7168）</p>
+<h4>KDA 层内部 (token mixing)</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>输入 / 7168</td><td><code>[2,8,7168]</code></td><td>$x$</td></tr>
+<tr><td>q_proj / 7168 → 12288</td><td><code>[2,8,7168] -&gt; [2,8,12288]</code></td><td>$q = x W_q$</td></tr>
+<tr><td>k_proj / 7168 → 12288</td><td><code>[2,8,7168] -&gt; [2,8,12288]</code></td><td>$k = x W_k$</td></tr>
+<tr><td>v_proj / 7168 → 12288</td><td><code>[2,8,7168] -&gt; [2,8,12288]</code></td><td>$v = x W_v$</td></tr>
+<tr><td>q_conv1d / 12288 → 12288</td><td><code>[2,8,12288] -&gt; [2,8,12288]</code></td><td>$\begin{aligned} &amp; q = \mathrm{silu}(\mathrm{DWConv1d}(q)) \\[3pt] &amp; q'_{c,t}=\sum_{j=0}^{3} w_{c,j} q_{c,t-3+j} \end{aligned}$</td></tr>
+<tr><td>k_conv1d / 12288 → 12288</td><td><code>[2,8,12288] -&gt; [2,8,12288]</code></td><td>$k = \mathrm{silu}(\mathrm{DWConv1d}(k))$</td></tr>
+<tr><td>v_conv1d / 12288 → 12288</td><td><code>[2,8,12288] -&gt; [2,8,12288]</code></td><td>$v = \mathrm{silu}(\mathrm{DWConv1d}(v))$</td></tr>
+<tr><td>rearrange q / 12288 → 96×128</td><td><code>[2,8,12288] -&gt; [2,8,96,128]</code></td><td>$12288 = 96 \times 128$</td></tr>
+<tr><td>rearrange k / 12288 → 96×128</td><td><code>[2,8,12288] -&gt; [2,8,96,128]</code></td><td>$12288 = 96 \times 128$</td></tr>
+<tr><td>rearrange v / 12288 → 96×128</td><td><code>[2,8,12288] -&gt; [2,8,96,128]</code></td><td>$12288 = 96 \times 128$</td></tr>
+<tr><td>f_a_proj / 7168 → 128</td><td><code>[2,8,7168] -&gt; [2,8,128]</code></td><td>$a = x W_{fa}$</td></tr>
+<tr><td>f_b_proj / 128 → 12288</td><td><code>[2,8,128] -&gt; [2,8,12288]</code></td><td>$g = a W_{fb}$</td></tr>
+<tr><td>rearrange g / 12288 → 96×128</td><td><code>[2,8,12288] -&gt; [2,8,96,128]</code></td><td>$12288 = 96 \times 128$</td></tr>
+<tr><td>b_proj / 7168 → 96</td><td><code>[2,8,7168] -&gt; [2,8,96]</code></td><td>$\beta_w = \sigma(x W_b)$</td></tr>
+<tr><td>chunk_kda / q,k,v,g → 96×128</td><td><code>q,k,v,g,beta_w,A_log,dt_bias -&gt; o [2,8,96,128]</code></td><td>$\begin{aligned} &amp; \hat q = \frac{q}{\lVert q\rVert},\; \hat k = \frac{k}{\lVert k\rVert} \\[4pt] &amp; \log\alpha_t = -5\,\sigma\!\left(e^{A_{\log}}(g_t + \mathrm{dt\_bias})\right) \\[4pt] &amp; S_t = (I - \beta_w\hat k\hat k^{\top})\, \mathrm{diag}(\alpha_t)\, S_{t-1} + \beta_w\, \hat k\, v^{\top} \\[4pt] &amp; o_t = \tfrac{1}{\sqrt{128}}\, S_t^{\top} \hat q_t \end{aligned}$</td></tr>
+<tr><td>g_proj / 7168 → 12288</td><td><code>[2,8,7168] -&gt; [2,8,12288]</code></td><td>$g_2 = x W_{g}$</td></tr>
+<tr><td>o_norm / o,g2 → 96×128</td><td><code>o, g2 -&gt; [2,8,96,128]</code></td><td>$\begin{aligned} &amp; \mathrm{RMSNorm}(o)\odot \sigma(g_2) \\[4pt] &amp; \mathrm{RMSNorm}(o)=\frac{o}{\sqrt{\mathrm{mean}(o^2)+\epsilon}}\gamma \end{aligned}$</td></tr>
+<tr><td>rearrange o / 96×128 → 12288</td><td><code>[2,8,96,128] -&gt; [2,8,12288]</code></td><td>$96 \times 128 = 12288$</td></tr>
+<tr><td>o_proj / 12288 → 7168</td><td><code>[2,8,12288] -&gt; [2,8,7168]</code></td><td>$y = o W_o$</td></tr>
+<tr><td>输出 / 7168</td><td><code>[2,8,7168]</code></td><td>$y$</td></tr>
+</table>
+<p>边：x→qproj（7168）；x→kproj（7168）；x→vproj（7168）；x→faproj（7168）；x→bproj（7168）；x→gaproj（7168）；qproj→qconv（12288）；kproj→kconv（12288）；vproj→vconv（12288）；qconv→qhead（12288）；kconv→khead（12288）；vconv→vhead（12288）；faproj→fbproj（128）；fbproj→ghead（12288）；qhead→kda（q）；khead→kda（k）；vhead→kda（v）；ghead→kda（g）；bproj→kda（beta_w）；kda→onorm（o）；gaproj→onorm（g2）；onorm→omerge（[..96,128]）；omerge→oproj（12288）；oproj→out（7168）</p>
+<h4>MLA 层内部 (Multi-head Latent Attention)</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>输入 / 7168</td><td><code>[2,8,7168]</code></td><td>$x$</td></tr>
+<tr><td>q_a_proj / 7168 → 1536</td><td><code>[2,8,7168] -&gt; [2,8,1536]</code></td><td>$x W_{qa}$</td></tr>
+<tr><td>q_a_layernorm / 1536 → 1536</td><td><code>[2,8,1536] -&gt; [2,8,1536]</code></td><td>$\mathrm{RMSNorm}$</td></tr>
+<tr><td>q_b_proj / 1536 → 18432</td><td><code>[2,8,1536] -&gt; [2,8,18432]</code></td><td>$q = (\cdot) W_{qb}$</td></tr>
+<tr><td>split q / 96×192 → 128+64</td><td><code>[2,8,96,192] -&gt; pass128 + rot64</code></td><td>$q \to (q_{pass}, q_{rot})$</td></tr>
+<tr><td>kv_a_proj(MQA) / 7168 → 576</td><td><code>[2,8,7168] -&gt; [2,8,576]</code></td><td>$x W_{kva}$</td></tr>
+<tr><td>split kv / 576 → 512+64</td><td><code>[2,8,576] -&gt; ckv512 + krot64</code></td><td>$\to (c_{kv}, k_{rot})$</td></tr>
+<tr><td>kv_a_layernorm / 512 → 512</td><td><code>[2,8,512] -&gt; [2,8,512]</code></td><td>$\mathrm{RMSNorm}(c_{kv})$</td></tr>
+<tr><td>kv_b_proj / 512 → 96×256</td><td><code>[2,8,512] -&gt; [2,8,96,256]</code></td><td>$(\cdot) W_{kvb}$</td></tr>
+<tr><td>split k/v / 96×256 → 128+128</td><td><code>[2,8,96,256] -&gt; knope128 + v128</code></td><td>$\to (k_{nope}, v)$</td></tr>
+<tr><td>rot 分量 / 64</td><td><code>rot64</code></td><td>$q_{rot},\, k_{rot}$</td></tr>
+<tr><td>cat q / → 96×192</td><td><code>-&gt; [2,8,96,192]</code></td><td>$q = [q_{pass}; q_{rot}]$</td></tr>
+<tr><td>cat k / → 96×192</td><td><code>-&gt; [2,8,96,192]</code></td><td>$k = [k_{nope}; k_{rot}]$</td></tr>
+<tr><td>attention / q,k,v → 96×128</td><td><code>q,k,v -&gt; [2,8,96,128]</code></td><td>$\mathrm{softmax}\!\left(\frac{q k^{\top}}{\sqrt{192}}\right) v$</td></tr>
+<tr><td>reshape / 96×128 → 12288</td><td><code>[2,8,96,128] -&gt; [2,8,12288]</code></td><td>$96\times128=12288$</td></tr>
+<tr><td>output gate / 7168 → 12288</td><td><code>x -&gt; [2,8,12288]</code></td><td>$g = \sigma(x W_g),\; o = o \odot g$</td></tr>
+<tr><td>o_proj / 12288 → 7168</td><td><code>[2,8,12288] -&gt; [2,8,7168]</code></td><td>$y = o W_o$</td></tr>
+<tr><td>输出 / 7168</td><td><code>[2,8,7168]</code></td><td>$y$</td></tr>
+</table>
+<p>边：x→qa（7168）；qa→qan（1536）；qan→qb（1536）；qb→qsplit（96×192）；x→kva（7168）；kva→kvsplit（576）；kvsplit→kvn（ckv 512）；kvn→kvb（512）；kvb→kvbsplit（96×256）；qsplit→krope（q_rot 64）；kvsplit→krope（k_rot 64）；qsplit→qcat（q_pass 128）；krope→qcat（q_rot）；kvbsplit→kcat（k_nope 128）；krope→kcat（k_rot）；qcat→attn（q）；kcat→attn（k）；kvbsplit→attn（v 128）；attn→amerge（96×128）；amerge→gate（12288）；x→gate（g=sigmoid(xWg)）；gate→oproj（12288）；oproj→out（7168）</p>
+<h4>Stable Latent MoE 内部</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>输入 / 7168</td><td><code>[2,8,7168]</code></td><td>$x$</td></tr>
+<tr><td>KimiMoEGate / 7168 → top16</td><td><code>[T,7168] -&gt; top16 idx+权重</code></td><td>$\begin{aligned} &amp; s = \sigma(x W_g) \\[3pt] &amp; \text{select:}\; \mathrm{top}\text{-}16(s + b_{corr}) \\[3pt] &amp; w = \frac{s_{top}}{\sum s_{top}}\cdot \gamma \end{aligned}$</td></tr>
+<tr><td>down_proj / 7168 → 3584</td><td><code>[T,7168] -&gt; [T,3584]</code></td><td>$\tilde x = x W_{down}$</td></tr>
+<tr><td>dispatch / 3584 → 各专家</td><td><code>[T,3584] -&gt; 各专家</code></td><td>$\text{dispatch by top-16}$</td></tr>
+<tr><td>routed experts / 3584 → 3584</td><td><code>[.,3584] -&gt; [.,3584]</code></td><td>$\begin{aligned} &amp; y_e = \big(\mathrm{SiTU}(x W_1)\odot \tilde u_e\big)\, W_2 \\[4pt] &amp; \mathrm{SiTU}(g)=\beta\tanh\!\frac{g}{\beta}\,\sigma(g),\quad \tilde u_e=\beta_l\tanh\!\frac{x W_3}{\beta_l} \end{aligned}$</td></tr>
+<tr><td>combine / → 3584</td><td><code>-&gt; [T,3584]</code></td><td>$y = \sum_{e\in top16} w_e\, \mathrm{expert}_e(\tilde x)$</td></tr>
+<tr><td>routed norm / 3584 → 3584</td><td><code>[T,3584] -&gt; [T,3584]</code></td><td>$\mathrm{RMSNorm}$</td></tr>
+<tr><td>up_proj / 3584 → 7168</td><td><code>[T,3584] -&gt; [T,7168]</code></td><td>$y_r = (\cdot) W_{up}$</td></tr>
+<tr><td>shared expert / 7168 → 7168</td><td><code>[2,8,7168] -&gt; [2,8,7168]</code></td><td>$y_s = \mathrm{SiTU\text{-}GLU}(x;\,7168\!\to\!6144\!\to\!7168)$</td></tr>
+<tr><td>y_r + y_s / → 7168</td><td><code>-&gt; [2,8,7168]</code></td><td>$y = y_r + y_s$</td></tr>
+<tr><td>输出 / 7168</td><td><code>[2,8,7168]</code></td><td>$y$</td></tr>
+</table>
+<p>边：x→gate（7168）；x→down（7168）；x→shared（7168）；gate→route（top16）；down→route（3584）；route→exp（分发）；exp→combine（各专家out）；gate→combine（权重）；combine→rnorm（3584）；rnorm→up（3584）；up→add（7168 (y_r)）；shared→add（7168 (y_s)）；add→out（7168）</p>
+<h4>视觉编码器 MoonViT-V2 内部 (27 层)</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>时空 patch / (仅多模态输入)</td><td><code>[n_patch, 3,14,14] + grid_thw</code></td><td>$\mathrm{grid\_thw}=(t,h,w)$</td></tr>
+<tr><td>patch_embed Conv2d / 3×14×14 → 1024</td><td><code>[n_patch,3,14,14] -&gt; [n_patch,1024]</code></td><td>$x = \mathrm{Conv2d}_{k=s=14}(x)$</td></tr>
+<tr><td>divided_fixed 位置嵌入 / 64×64 可学习 + 时间 sincos</td><td><code>[n_patch,1024] -&gt; [n_patch,1024]</code></td><td>$x \leftarrow x + \mathrm{bilinear}(P_{64\times64}) + T_t$</td></tr>
+<tr><td>2D RoPE / (h,w) 交错</td><td><code>(h,w) -&gt; cos/sin [n,64]</code></td><td>$\mathrm{cis}[h,w,2i] = e^{jw\theta_i},\;\mathrm{cis}[h,w,2i{+}1] = e^{jh\theta_i}$</td></tr>
+<tr><td>27 层 ViT block / pre-norm 残差</td><td><code>[n_patch,1024] -&gt; [n_patch,1024]</code></td><td>$x \leftarrow x + \mathrm{Attn}(\mathrm{RMSNorm}(x))$</td></tr>
+<tr><td>final RMSNorm / 1024</td><td><code>[n_patch,1024] -&gt; [n_patch,1024]</code></td><td>$\mathrm{RMSNorm}(x)$</td></tr>
+<tr><td>时间全池化 / mean(dim=t)</td><td><code>[t·h·w,1024] -&gt; [h·w,·]</code></td><td>$\bar{x} = \tfrac{1}{t}\textstyle\sum_{i=1}^{t} x_i$</td></tr>
+<tr><td>2×2 空间合并 / → (n,4,1024)</td><td><code>[h·w,1024] -&gt; [(h/2)(w/2), 4, 1024]</code></td><td>$(h/2)\times(w/2)\ \mathrm{tokens}$</td></tr>
+<tr><td>PatchMergerMLPV2 / 4096 → 4096 → 7168</td><td><code>[n,4,1024] -&gt; [n,4096] -&gt; [n,7168]</code></td><td>$\mathrm{RMSNorm}\big(W_2\,\mathrm{GELU}(W_1\,x)\big)$</td></tr>
+<tr><td>视觉 token / [n_vis, 7168]</td><td><code>[n_vis, 7168]</code></td><td>$n_{vis} = (h/2)(w/2)$</td></tr>
+</table>
+<p>边：px→pconv（patch）；pconv→posemb（1024）；posemb→blk（1024）；px→rope（(h,w)）；rope→blk（cos/sin）；blk→fnorm（×27）；fnorm→tpool（时间均值）；tpool→mg2（2×2）；mg2→pmv2（(n,4096)）；pmv2→vtok（7168）</p>
+<h4>多模态融合：占位符扩展（序列变长，非原地替换）</h4>
+<table><tr><th>节点</th><th>维度</th><th>公式</th></tr>
+<tr><td>input_ids / 含 163605 占位符</td><td><code>[1,T]</code></td><td>$\mathrm{media\_placeholder\_token\_id} = 163605$</td></tr>
+<tr><td>文本 embedding / [1,T,7168]</td><td><code>[1,T] -&gt; [1,T,7168]</code></td><td>$x = \mathrm{Embedding}(\mathrm{ids})$</td></tr>
+<tr><td>视觉特征 / 各图 [n_i,7168]</td><td><code>list of [n_i,7168]</code></td><td>$n_i = (h_i/2)(w_i/2)$</td></tr>
+<tr><td>occupation 表 / 占位符位记 n_i</td><td><code>[1,T] -&gt; [1,T]</code></td><td>$\mathrm{occ}_j = n_i\ (\mathrm{ids}_j{=}\mathrm{PH}),\; 1\ (\text{else})$</td></tr>
+<tr><td>cumsum 新位置 / 文本位后移</td><td><code>-&gt; [1,T']</code></td><td>$\mathrm{pos} = \mathrm{cumsum}(\mathrm{occ}) - 1$</td></tr>
+<tr><td>交错填充 / 文本位 / 视觉位</td><td><code>-&gt; [1,T',7168]</code></td><td>$e[\mathrm{text\_pos}] = x,\quad e[\mathrm{vis\_pos}] = f$</td></tr>
+<tr><td>融合后 embedding / 序列变长后</td><td><code>[1,T',7168] -&gt; 语言主干</code></td><td>$T' = T - \#\mathrm{PH} + \textstyle\sum_i n_i$</td></tr>
+</table>
+<p>边：ids→temb（[1,T]）；temb→fill（文本位）；vfeat→fill（各图特征）；ids→occ（占位符位置）；occ→csum（occ）；csum→fill（新位置）；fill→out（变长）</p>
+</noscript>
   <div id="tip"></div>
 
   <h2 id="points">3. 要点</h2>
@@ -123,7 +251,7 @@
   <ul>
     <li><b>沿序列</b>：69 层 KDA 做低成本、固定状态的长序列混合，每 3 层插入 1 层 Gated MLA 保留全局注意力，共 24 层 MLA；末两层（91、92）连续 MLA 收尾。</li>
     <li><b>沿深度</b>：Block AttnRes 在等权累加的残差流上叠加块级加权：每层在 attention 前、MLP 前各加权一次（两套独立可学习参数），模型末尾 final norm 前再加权一次，让每层可按内容选择此前块级快照的信息。</li>
-    <li><b>沿宽度</b>：Stable LatentMoE 把路由专家放进 3584 维隐空间，扩到 896 个专家而通信/显存不随专家数线性增长。</li>
+    <li><b>沿宽度</b>：Stable LatentMoE 把路由专家放进 3584 维隐空间扩到 896 个；每 token 只激活 16 个，token 级通信量与激活显存不随专家数增长，专家权重仍随专家数线性增长。</li>
     <li>KDA 与 MLA 均无显式位置编码（NoPE）：位置感由 KDA 的循环状态、衰减与短卷积隐式提供，扩展上下文无需 RoPE 插值。</li>
   </ul>
 
@@ -132,7 +260,7 @@
     <li>q/k/v 各自投影到 12288（$96 \times 128$）后过核长 4 的深度可分离因果短卷积 + silu；q/k 再 L2 归一。</li>
     <li>衰减信号 g 由 f_a_proj（7168→128）与 f_b_proj（128→12288）低秩生成，每 token/头/维一个；dt_bias 每头每维偏置；A_log 每头一个尺度。</li>
     <li>衰减率（K3 用 safe_gate）：$\log\alpha = -5\,\sigma\!\left(e^{A_{\log}}\cdot(g + \mathrm{dt\_bias})\right)$，即 lower-bound sigmoid，值域 $(-5, 0)$，每步衰减 $\exp(-5)\approx 0.0067$ 下限——不是非安全版本的 softplus 形式。</li>
-    <li>delta 规则：$S_t = (I - \beta_w\hat k\hat k^\top)\,\mathrm{diag}(\alpha)\,S_{t-1} + \beta_w\,\hat k\,v^\top$，写强度 $\beta_w$ 由 b_proj（7168→96，每头一标量）sigmoid 得到；输出 $o = S^\top\hat q$。</li>
+    <li>delta 规则：$S_t = (I - \beta_w\hat k\hat k^\top)\,\mathrm{diag}(\alpha)\,S_{t-1} + \beta_w\,\hat k\,v^\top$，写强度 $\beta_w$ 由 b_proj（7168→96，每头一标量）sigmoid 得到；输出 $o_t = \frac{1}{\sqrt{128}}S_t^\top\hat q_t$。</li>
     <li>输出门为<b>全秩</b>（use_full_rank_gate=true）：g_proj 7168→12288，FusedRMSNormGated 先 RMSNorm(o) 再与 $\sigma(g)$ 逐元素相乘。</li>
   </ul>
 
@@ -166,7 +294,7 @@
   </ul>
 
   <h2 id="vision">4. 视觉编码器与多模态融合</h2>
-  <p>视觉侧是一个 27 层的独立 <a href="../moonvit-v2/">MoonViT-V2</a>：参数 401,214,464（技术报告称 MoonViT-V2 401M），加 merger 的 46,144,512 共 447.4M，占全模型约 0.16%。它的职责是把像素变成 7168 宽 token；融合之后视觉与文本在同一序列里共享全部 93 层，不存在贯穿深度的独立视觉分支。「视觉编码器」与「多模态融合」两个视图给出完整路径。</p>
+  <p>视觉侧是一个 27 层的独立 <a href="../moonvit-v2/">MoonViT-V2</a>：参数 401,214,464（技术报告称 MoonViT-V2 401M），加 merger 的 46,144,512 共 447.4M，占全模型约 0.016%。它的职责是把像素变成 7168 宽 token；融合之后视觉与文本在同一序列里共享全部 93 层，不存在贯穿深度的独立视觉分支。「视觉编码器」与「多模态融合」两个视图给出完整路径。</p>
 
   <h3>4.1 patch 投影：一次 Conv2d</h3>
   <p><code>patch_embed</code> 是 Conv2d，kernel 与 stride 都等于 patch_size=14，因此每个 patch 独立映射、互不重叠，等价于对展平后的 $3\times14\times14=588$ 维向量做一次 $588\to1024$ 的线性变换；无 bias（patch_embed_proj_bias=false）。权重形状 $[1024,3,14,14]$，共 602,112 参数。像素边长非 14 整数倍时由 processor 先 resize；视频沿时间维分组，每组 t 帧，$t\le 4$（位置嵌入时间表仅 4 帧，源码 assert）。patch 数 $=t\cdot h\cdot w$。</p>
@@ -186,8 +314,8 @@
     <tr><td>注意力</td><td>双向、变长打包（cu_seqlens）、12 头 × 128（头维 $=$ qkv_hidden/heads $\ne$ hidden/heads $=85.3$）</td><td>KDA 96×128 因果 / MLA 96 头 NoPE 因果</td></tr>
     <tr><td>FFN</td><td>稠密 MLP2：1024→4096→1024，GELU(tanh)</td><td>Stable Latent MoE / 第 0 层 Dense，SiTU-GLU</td></tr>
     <tr><td>位置编码</td><td>2D RoPE + 可学习方格</td><td>NoPE</td></tr>
-    <tr><td>量化</td><td>vision_tower 与 mm_projector 均豁免 MXFP4</td><td>路由专家权重 + embedding 量化</td></tr>
-    <tr><td>参数占比</td><td>447.4M（0.16%）</td><td>其余 99.84%</td></tr>
+    <tr><td>量化</td><td>vision_tower 与 mm_projector 均豁免 MXFP4</td><td>路由专家的 w1/w2/w3 权重量化；embedding、lm_head、self_attn、共享专家、latent MoE 投影、MoE 路由器、mm_projector 豁免</td></tr>
+    <tr><td>参数占比</td><td>447.4M（0.016%）</td><td>其余 99.984%</td></tr>
   </table>
   <p>归一化两侧一致（RMSNorm、无 bias）。多图输入时同一图像内所有 patch 互相可见、跨图不互注意——本机实测两图拼接跑与分开跑输出逐元素一致（max diff &lt; 1e-5），印证 cu_seqlens 块对角掩码。</p>
 
@@ -206,7 +334,7 @@
   <h3>4.5 融合：占位符扩展，序列变长</h3>
   <p>融合发生在 embedding 之后、第 0 层之前，核心是 <code>_merge_input_ids_with_image_features</code> 的三步：① 全 1 的 occupation 表把每个占位符位置（media_placeholder_token_id=163605）改写为该图的 $n_i$；② cumsum − 1 得到所有 token 的新位置，占位符之后的文本整体后移；③ 文本 embedding 与视觉特征交错写入长度为 $T'=T-\#\mathrm{PH}+\textstyle\sum_i n_i$ 的新序列。</p>
   <p>本机实测（官方方法原样调用）：6 位序列含 1 个占位符加 5 个视觉 token，输出 10 位，文本落在 0–2 与 8–9、视觉特征按序落在 3–7，position_ids 连续 0..9；两占位符两图（3+2 token）输出 8 位，交错序列 [文本, 图1×3, 文本, 图2×2, 文本] 逐元素正确；视觉段 labels 填 ignore_index=-100。</p>
-  <p>三个边界行为：占位符数必须等于输入图数（段多于占位符在 occupation 表 broadcast 处即报错，占位符多于段在填充校验处抛 ValueError）；纯文本输入不进融合函数（官方 forward 有 pixel_values 非空守卫）；decode 单步（len(ids)==1 且带 KV cache）不重跑融合，只按 cache 痕迹修补 attention_mask。</p>
+  <p>三个边界行为：占位符数必须等于输入图数（段多于占位符在 occupation 表 broadcast 处即报错，占位符多于段在填充校验处抛 ValueError）；纯文本输入不进融合函数（官方 forward 有 pixel_values 非空守卫）；decode 单步（len(ids)==1、带 KV cache，且本次仍传入 pixel_values）不重跑融合，只按 cache 痕迹修补 attention_mask。</p>
   <p>这是 LLaVA 式<b>扩展</b>融合，与 <a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next</a> 的 masked_scatter <b>原地替换</b>（processor 预先填充等量占位符、序列长度不变）是两种方案。扩展式让 tokenizer 层面的序列长度与实际进入主干的长度解耦；替换式把对齐责任前移到 processor。</p>
 
   <h2 id="memcost">5. 长上下文开销的来源</h2>
@@ -219,11 +347,11 @@
     <tr><td>256K</td><td>360.000 GiB</td><td>6.750 GiB</td><td>0.216 GiB</td><td>360.216 GiB</td></tr>
     <tr><td>1M</td><td>1440.000 GiB</td><td>27.000 GiB</td><td>0.216 GiB</td><td>1440.216 GiB</td></tr>
   </table>
-  <p>两个口径分开陈述。<b>参考实现口径</b>：官方 HF 参考实现缓存的是 kv_b_proj 展开后的 96 头 K(192)+V(128)，即 60 KiB/token/层——不利用 MLA 的潜空间压缩。若 93 层全为这种 MLA，1M 上下文需 5.45 TiB；层型 24/93 使其降到 25.8%。<b>潜压缩口径</b>：每 token 只存压缩潜向量 ckv(512)+k_rot(64)=576（1.125 KiB/token/层，kv_b_proj 权重可吸收进查询投影），1M 上下文 24 层共 27 GiB——生产部署按此理解 1M 上下文的可行性，参考口径只用来读出层型比例的结构意义。KDA 侧每层固定递归状态 3.0 MiB（96×128×128）加短卷积状态 216 KiB（q/k/v 三个 12288×3 滑窗），69 层合计 0.216 GiB，与序列长度完全无关。</p>
+  <p><b>参考实现口径</b>：官方 HF 参考实现缓存的是 kv_b_proj 展开后的 96 头 K(192)+V(128)，即 60 KiB/token/层——不利用 MLA 的潜空间压缩。若 93 层全为这种 MLA，1M 上下文需 5.45 TiB；层型 24/93 使其降到 25.8%。<b>潜压缩口径</b>：每 token 只存压缩潜向量 ckv(512)+k_rot(64)=576（1.125 KiB/token/层，kv_b_proj 权重可吸收进查询投影），1M 上下文 24 层共 27 GiB——生产部署按此理解 1M 上下文的可行性，参考口径只用来读出层型比例的结构意义。KDA 侧每层固定递归状态 3.0 MiB（96×128×128）加短卷积状态 216 KiB（q/k/v 三个 12288×3 滑窗），69 层合计 0.216 GiB，与序列长度完全无关。</p>
   <p>多模态输入对开销的影响集中在 MLA 层：一张 448×448 图贡献 256 个视觉 token，24 层 MLA 参考口径新增 KV 360 MiB（prefill 一次性）；视觉塔本身的 447.4M 参数对所有输入恒定加载。</p>
 
   <h2 id="verify">6. 核对方式</h2>
-  <p>结构与维度以官方 <code>config.json</code> 与 <code>modeling_kimi_k3.py</code>、<code>modeling_kimi_linear.py</code> 源码为准，两个文件与 config 的快照存于 <code>research/</code>。视觉与融合机制直接加载官方源码组件实测：<code>probe1_vision.py</code> 覆盖 patch 投影、位置嵌入（含 t=3 展开与 t&gt;4 报错）、2D RoPE（槽位归属、保范数、512 上限）、27 层 block（含两图拼接与分开跑的等价性）、时间池化均值、PatchMergerMLPV2 形状链与参数量，共 40 项断言；<code>probe2_fusion.py</code> 以 unbound 方式调用官方 <code>_merge_input_ids_with_image_features</code>，覆盖单/双占位符扩展落位、position_ids、报错边界与 decode 守卫，共 16 项断言；<code>probe3_memcost.py</code> 按官方 config 精确计算第 5 节开销表。原始输出见 <code>research/measured-output.txt</code>。</p>
+  <p>结构与维度以官方 <code>config.json</code> 与 <code>modeling_kimi_k3.py</code>、<code>modeling_kimi_linear.py</code> 源码为准。视觉与融合机制直接加载官方源码组件实测：patch 投影、位置嵌入（含 t=3 展开与 t&gt;4 报错）、2D RoPE（槽位归属、保范数、512 上限）、27 层 block（含两图拼接与分开跑的等价性）、时间池化均值、PatchMergerMLPV2 形状链与参数量；融合部分以 unbound 方式调用官方 <code>_merge_input_ids_with_image_features</code>，覆盖单/双占位符扩展落位、position_ids、报错边界与 decode 守卫；第 5 节开销表按官方 config 精确计算。实测脚本与运行输出不随仓库分发，清单记在 <code>research/measured.md</code>。</p>
   <p>关键实测结论：视觉塔参数 401,214,464 与技术报告的 401M 吻合（27 层每层 14,682,112 + patch 602,112 + 位置表 4,194,304 + final norm 1,024）；两图拼接跑与分开跑输出逐元素一致（max diff &lt; 1e-5）；时间池化恰为均值；RoPE 偶数槽编码宽、奇数槽编码高（源码 docstring 与实现相反，以代码为准）；融合扩展 6 位→10 位、交错落位逐元素正确；KDA 69 层固定状态 0.216 GiB、MLA 参考口径 1M 上下文 1440 GiB / 潜压缩口径 27 GiB。</p>
 
   <h2 id="sources">来源与范围说明</h2>
@@ -231,12 +359,12 @@
     <tr><th>项目</th><th>依据</th></tr>
     <tr><td>全部 config 数值（层数、维度、专家数、beta 等）</td><td>官方 <code>config.json</code>：huggingface.co/moonshotai/Kimi-K3</td></tr>
     <tr><td>KDA/MLA/MoE/AttnRes 数据流与公式</td><td>官方实现 <code>modeling_kimi_linear.py</code>（chunk_kda 来自 flash-linear-attention 库）</td></tr>
-    <tr><td>技术报告（2026-07-28，47 页）</td><td>Moonshot AI 官方 Kimi K3 Technical Report（架构动机、Quantile Balancing、SiTU、NoPE、Block AttnRes、MoonViT-V2 401M）</td></tr>
-    <tr><td>视觉编码器、merger、多模态融合数据流</td><td>官方 <code>modeling_kimi_k3.py</code>（KimiK3ForConditionalGeneration / MoonViT3dPretrainedModel / PatchMergerMLPV2 / _merge_input_ids_with_image_features），快照存 <code>research/</code></td></tr>
-    <tr><td>视觉/融合行为、参数量与开销数字</td><td>本机实测（官方组件直跑 + unbound 方法调用），脚本与原始输出见 <code>research/</code>（probe1~3、measured-output.txt）</td></tr>
+    <tr><td>技术报告（arXiv:2607.24653，2026-07-27，47 页）</td><td>Moonshot AI 官方 Kimi K3 Technical Report：架构动机 §2.1（3 KDA : 1 Gated MLA）、Block Attention Residuals §2.2、Stable LatentMoE §2.3、SiTU §2.3.2、Quantile Balancing §2.3.3、MoonViT-V2 401M §2.4、NoPE §3.4</td></tr>
+    <tr><td>视觉编码器、merger、多模态融合数据流</td><td>官方 <code>modeling_kimi_k3.py</code>（KimiK3ForConditionalGeneration / MoonViT3dPretrainedModel / PatchMergerMLPV2 / _merge_input_ids_with_image_features）</td></tr>
+    <tr><td>视觉/融合行为、参数量与开销数字</td><td>本机实测（官方组件直跑 + unbound 方法调用）</td></tr>
     <tr><td>总参数 2.78T / 激活 104.2B</td><td>技术报告 Table 1</td></tr>
   </table>
-  <p style="color:var(--text-light);font-size:14px">核对说明：config 数值与公式均以官方 config.json、官方实现源码（含 fla chunk_kda 算子）为准逐项核实；2026-08-07 按源码修订 Block AttnRes 数据流（每层 attention 前与 MLP 前各一次加权、块快照取进入层时的输入、模型末尾 output AttnRes 第三次加权）。KDA 写门 $W_\beta$ 与遗忘门低秩投影的具体维度官方未披露，页面标注按官方实现展示。视觉与融合部分（2026-09-03 补充）除源码核对外均经本机实测， MLA 长上下文开销同时给出参考实现与潜压缩两个口径，规范约束与实现取值分开陈述；2D RoPE 的槽位归属以代码实测为准（源码 docstring 标注与实现相反）。本页覆盖语言主干、视觉编码器与多模态融合的完整前向数据流；训练方案与后训练流程不在范围内。</p>
+  <p style="color:var(--text-light);font-size:14px">核对说明：config 数值与公式以官方 config.json、官方实现源码（含 fla chunk_kda 算子）为准。KDA 写门 $W_\beta$ 与遗忘门低秩投影的具体维度官方未披露，按官方实现展示。视觉与融合部分除源码核对外均经本机实测；MLA 长上下文开销同时给出参考实现与潜压缩两个口径；2D RoPE 的槽位归属以代码实测为准（源码 docstring 标注与实现相反）。覆盖范围：语言主干、视觉编码器与多模态融合的完整前向数据流；训练方案与后训练流程不在范围内。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
@@ -449,10 +577,10 @@ overview: {
   legend:[['#1f9d6b','输入/输出'],['#7a45c9','KDA 层(可下钻)'],['#c0392b','MLA 层(可下钻)'],['#3f6fd0','MoE / Dense FFN(可下钻)'],['#556070','Norm / 采样'],['#16a085','视觉编码器(可下钻)']],
   nodes:{
     pix:   {label:'像素 patch\n(仅多模态)', t:'vis', drill:'vision', io:'[n_patch, 3,14,14] + grid_thw', f:'\\mathrm{grid\\_thw} = (t,h,w)', d:'图像/视频路径，仅多模态输入时激活。27 层 MoonViT-V2 视觉塔经 merger 输出 7168 宽视觉 token，个数 $n_{vis}=(h/2)(w/2)$ 与帧数无关。点击下钻看视觉编码器内部。'},
-    fuse:  {label:'占位符扩展融合\nT → T′', t:'shp', drill:'fusion', io:'文本 [·,7168] + 视觉 [Σn,7168] -> [·,T′,7168]', f:'T\' = T - \\#\\mathrm{PH} + \\textstyle\\sum_i n_i', d:'序列中每个 media_placeholder_token_id=163605 占位符扩展成该图 $n_i$ 个视觉 token，序列变长（LLaVA 式扩展，非原地替换）。此后视觉与文本在同一序列共享全部 93 层。点击下钻看融合机制。'},
+    fuse:  {label:'占位符扩展融合\n序列变长', t:'shp', drill:'fusion', io:'文本 $[\\cdot,7168]$ + 视觉 $[\\Sigma n,7168]$ -> $[\\cdot,T\',7168]$', f:'T\' = T - \\#\\mathrm{PH} + \\textstyle\\sum_i n_i', d:'序列中每个 media_placeholder_token_id=163605 占位符扩展成该图 $n_i$ 个视觉 token，序列变长（LLaVA 式扩展，非原地替换）。此后视觉与文本在同一序列共享全部 93 层。点击下钻看融合机制。'},
     emb:   {label:'embed\nid → 7168', t:'io', io:'token id [2,8] -> [2,8,7168]', f:'x = \\mathrm{Embedding}(\\mathrm{ids})', d:'词嵌入。vocab=163840, hidden=7168。把 token id 查表成 7168 维向量；占位符位置先正常查表、融合时被视觉特征覆盖。'},
     l0:    {label:'Layer 0 KDA+Dense\n7168 → 7168', t:'moe', drill:'dense', io:'[2,8,7168] -> [2,8,7168]', f:'h_0 = \\mathrm{DecoderLayer}_0(x)', d:'第0层(0-based):token mixing 用 KDA,FFN 是稠密 KimiMLP(不是 MoE)。config: first_k_dense_replace=1,只有这一层用 Dense FFN。点击下钻看内部。'},
-    blk:   {label:'Layers 1..90\n7168 → 7168', t:'grp', io:'[2,8,7168] -> [2,8,7168]', f:'\\text{68 KDA} + \\text{22 MLA}', d:'主干 93 层中,第 1..90 层按 3:1 混合:每 4 层前 3 层是 KDA(线性注意力,长序列 token mixing),第 4 层是 MLA(全注意力)。MLA 在 0-based 层 3,7,...,87(即官方 full_attn_layers 的 1-based 4,8,...,88),共 22 个;全模型 24 个 MLA 中另 2 个在末尾 ltail。'},
+    blk:   {label:'Layers 1..90\n7168 → 7168', t:'grp', io:'[2,8,7168] -> [2,8,7168]', f:'\\text{68 KDA} + \\text{22 MLA}', d:'主干 93 层中,第 0..90 层按 [3 KDA + 1 MLA] 分块(块首 0,4,...,84):每块前 3 层是 KDA(线性注意力,长序列 token mixing),第 4 层是 MLA(全注意力)。本节点覆盖第 1..90 层(第 0 层单列),含 68 KDA + 22 MLA。MLA 在 0-based 层 3,7,...,87(即官方 full_attn_layers 的 1-based 4,8,...,88),共 22 个;全模型 24 个 MLA 中另 2 个在末尾 ltail。'},
     kdaL:  {label:'KDA 层\n7168 → 7168', t:'kda', drill:'kda', io:'[2,8,7168] -> [2,8,7168]', f:'\\text{linear attn}', d:'代表性 KDA 层。全模型 69 层(blk 内 68 + 第 0 层 1 个)。点击下钻看 KDA token-mixing 内部数据流。'},
     mlaL:  {label:'MLA 层\n7168 → 7168', t:'mla', drill:'mla', io:'[2,8,7168] -> [2,8,7168]', f:'\\text{full attn}', d:'代表性 MLA 层(Multi-head Latent Attention)。全模型 24 层(blk 内 22 + ltail 2)。点击下钻看 MLA 内部。'},
     moeL:  {label:'MoE FFN\n7168 → 7168', t:'moe', drill:'moe', io:'[2,8,7168] -> [2,8,7168]', f:'\\text{896 experts, top-16}', d:'代表性 Stable Latent MoE 层,除第0层外所有层的 FFN。点击下钻看路由与专家内部。'},
@@ -480,7 +608,7 @@ dense: {
     x:    {label:'输入\n7168', t:'nrm', io:'[2,8,7168]', f:'x', d:'post_attention_layernorm 的输出(= RMSNorm(残差 + KDA 输出))。first_k_dense_replace=1 使第0层 FFN 用稠密 KimiMLP,不做稀疏路由。'},
     gp:   {label:'gate_proj\n7168 → 33792', t:'lin', io:'[2,8,7168] -> [2,8,33792]', f:'g = x W_{gate}', d:'门投影,升到 intermediate_size=33792(稠密层用全宽的大 FFN,比 MoE 单专家 3072 宽得多)。无偏置。'},
     upp:  {label:'up_proj\n7168 → 33792', t:'lin', io:'[2,8,7168] -> [2,8,33792]', f:'u = x W_{up}', d:'值投影,同样升到 33792。'},
-    act:  {label:'SiTU-GLU\n33792 → 33792', t:'core', io:'g,u [.,33792] -> [.,33792]', f:'\\begin{aligned} & \\mathrm{SiTU}(g)\\odot \\tilde u \\\\[4pt] & \\mathrm{SiTU}(g)=\\beta\\tanh\\!\\frac{g}{\\beta}\\,\\sigma(g) \\\\[4pt] & \\tilde u=\\beta_l\\tanh\\!\\frac{u}{\\beta_l} \\end{aligned}', d:'有界门控激活(hidden_act=situ)。门支 g 过 SiTU($\beta=4$),值支 u 过 tanh 限幅($\beta_l=25$),两者逐元素相乘。两因子均平滑饱和,输出坐标上界 $\beta\cdot\beta_l=100$,防止激活爆炸——K3 "Stable" 设计核心之一。注意此 $\beta=4$ 是激活尺度,与 KDA 写入强度 $\beta_w$ 是不同符号。'},
+    act:  {label:'SiTU-GLU\n33792 → 33792', t:'core', io:'g,u [.,33792] -> [.,33792]', f:'\\begin{aligned} & \\mathrm{SiTU}(g)\\odot \\tilde u \\\\[4pt] & \\mathrm{SiTU}(g)=\\beta\\tanh\\!\\frac{g}{\\beta}\\,\\sigma(g) \\\\[4pt] & \\tilde u=\\beta_l\\tanh\\!\\frac{u}{\\beta_l} \\end{aligned}', d:'有界门控激活(hidden_act=situ)。门支 g 过 SiTU($\beta=4$),值支 u 过 tanh 限幅($\beta_l=25$),两者逐元素相乘。两因子均平滑饱和,输出坐标上界 $\beta\cdot\beta_l=100$,防止激活爆炸——K3 "Stable" 设计核心之一。此 $\beta=4$ 为激活尺度,与 KDA 写入强度 $\beta_w$ 是两个不同符号。'},
     dp:   {label:'down_proj\n33792 → 7168', t:'lin', io:'[2,8,33792] -> [2,8,7168]', f:'y = (\\cdot) W_{down}', d:'降回 hidden=7168。'},
     out:  {label:'输出\n7168', t:'nrm', io:'[2,8,7168]', f:'y', d:'Dense FFN 输出,回残差累加。'},
   },
@@ -518,7 +646,7 @@ kda: {
   rankSep:50, nodeSep:24,
   legend:[['#3f6fd0','投影 Linear'],['#d9639a','短卷积 ShortConv'],['#e0922f','整形 rearrange'],['#7a45c9','核心 chunk_kda'],['#556070','门控/归一']],
   nodes:{
-    x:      {label:'输入\n7168', t:'io', io:'[2,8,7168]', f:'x', d:'DecoderLayer 里 self_attn 的输入,已过 input_layernorm。下面分六路投影。'},
+    x:      {label:'输入\n7168', t:'io', io:'[2,8,7168]', f:'x', d:'DecoderLayer 里 self_attn 的输入,已过 input_layernorm,分六路投影。'},
     qproj:  {label:'q_proj\n7168 → 12288', t:'lin', io:'[2,8,7168] -> [2,8,12288]', f:'q = x W_q', d:'查询投影。12288 = head_dim(128) × num_heads(96)。无偏置。'},
     kproj:  {label:'k_proj\n7168 → 12288', t:'lin', io:'[2,8,7168] -> [2,8,12288]', f:'k = x W_k', d:'键投影。'},
     vproj:  {label:'v_proj\n7168 → 12288', t:'lin', io:'[2,8,7168] -> [2,8,12288]', f:'v = x W_v', d:'值投影。'},
@@ -531,8 +659,8 @@ kda: {
     faproj: {label:'f_a_proj\n7168 → 128', t:'lin', io:'[2,8,7168] -> [2,8,128]', f:'a = x W_{fa}', d:'衰减输入 g 的低秩下投影(降到 head_dim=128)。'},
     fbproj: {label:'f_b_proj\n128 → 12288', t:'lin', io:'[2,8,128] -> [2,8,12288]', f:'g = a W_{fb}', d:'衰减输入 g 的低秩上投影。g 是数据相关的原始衰减信号(每 token/头/维一个),进核后经 safe_gate 变换成真正衰减率。低秩=先压128再升12288,省参数。'},
     ghead:  {label:'rearrange g\n12288 → 96×128', t:'shp', io:'[2,8,12288] -> [2,8,96,128]', f:'12288 = 96 \\times 128', d:'整形成每头每维,喂给 chunk_kda。它是随内容变化的"该记还是该忘"信号。'},
-    bproj:  {label:'b_proj\n7168 → 96', t:'lin', io:'[2,8,7168] -> [2,8,96]', f:'\\beta_w = \\sigma(x W_b)', d:'delta 规则写入强度 $\beta_w$,每头一标量(96头)。核内 sigmoid 压 0~1。注意与 SiTU 激活的 $\beta=4$ 是不同符号。'},
-    kda:    {label:'chunk_kda\nq,k,v,g → 96×128', t:'core', io:'q,k,v,g,β_w,A_log,dt_bias -> o [2,8,96,128]', f:'\\begin{aligned} & \\hat q = \\frac{q}{\\lVert q\\rVert},\\; \\hat k = \\frac{k}{\\lVert k\\rVert} \\\\[4pt] & \\log\\alpha_t = -5\\,\\sigma\\!\\left(e^{A_{\\log}}(g_t + \\mathrm{dt\\_bias})\\right) \\\\[4pt] & S_t = (I - \\beta_w\\hat k\\hat k^{\\top})\\, \\mathrm{diag}(\\alpha_t)\\, S_{t-1} + \\beta_w\\, \\hat k\\, v^{\\top} \\\\[4pt] & o_t = \\tfrac{1}{\\sqrt{128}}\\, S_t^{\\top} \\hat q_t \\end{aligned}', d:'KDA 核心。①q/k 做 L2Norm;②衰减率:safe_gate 用 lower-bound sigmoid(-5),即 $\log\alpha = -5\,\sigma(e^{A_{\log}}(g+\mathrm{dt\_bias}))$,值域(-5,0),每步衰减 $\exp(-5)\approx 0.0067$ 下限——不是非安全版本的 softplus 形式;③delta 规则:记忆 S 先按 $\alpha$ 逐通道衰减,再沿 $\hat k$ 方向擦除旧值、用 $\beta_w$ 写入新关联;④读出前注意力分数乘 $1/\sqrt{128}$。g 数据相关、A_log 每头尺度、dt_bias 每头每维偏置。'},
+    bproj:  {label:'b_proj\n7168 → 96', t:'lin', io:'[2,8,7168] -> [2,8,96]', f:'\\beta_w = \\sigma(x W_b)', d:'delta 规则写入强度 $\beta_w$,每头一标量(96头)。核内 sigmoid 压 0~1。与 SiTU 激活的 $\beta=4$ 是两个不同符号。'},
+    kda:    {label:'chunk_kda\nq,k,v,g → 96×128', t:'core', io:'q,k,v,g,$\\beta_w$,$A_{\\log}$,$\\mathrm{dt\\_bias}$ -> o $[2,8,96,128]$', f:'\\begin{aligned} & \\hat q = \\frac{q}{\\lVert q\\rVert},\\; \\hat k = \\frac{k}{\\lVert k\\rVert} \\\\[4pt] & \\log\\alpha_t = -5\\,\\sigma\\!\\left(e^{A_{\\log}}(g_t + \\mathrm{dt\\_bias})\\right) \\\\[4pt] & S_t = (I - \\beta_w\\hat k\\hat k^{\\top})\\, \\mathrm{diag}(\\alpha_t)\\, S_{t-1} + \\beta_w\\, \\hat k\\, v^{\\top} \\\\[4pt] & o_t = \\tfrac{1}{\\sqrt{128}}\\, S_t^{\\top} \\hat q_t \\end{aligned}', d:'KDA 核心。①q/k 做 L2Norm;②衰减率:safe_gate 用 lower-bound sigmoid(-5),即 $\log\alpha = -5\,\sigma(e^{A_{\log}}(g+\mathrm{dt\_bias}))$,值域(-5,0),每步衰减 $\exp(-5)\approx 0.0067$ 下限——不是非安全版本的 softplus 形式;③delta 规则:记忆 S 先按 $\alpha$ 逐通道衰减,再沿 $\hat k$ 方向擦除旧值、用 $\beta_w$ 写入新关联;④读出前注意力分数乘 $1/\sqrt{128}$。g 数据相关、A_log 每头尺度、dt_bias 每头每维偏置。'},
     gaproj: {label:'g_proj\n7168 → 12288', t:'lin', io:'[2,8,7168] -> [2,8,12288]', f:'g_2 = x W_{g}', d:'输出门,use_full_rank_gate=true 时为全秩(7168→12288),不是低秩。每个 token 独立控制读出结果的各通道。'},
     onorm:  {label:'o_norm\no,g2 → 96×128', t:'gate', io:'o, g2 -> [2,8,96,128]', f:'\\begin{aligned} & \\mathrm{RMSNorm}(o)\\odot \\sigma(g_2) \\\\[4pt] & \\mathrm{RMSNorm}(o)=\\frac{o}{\\sqrt{\\mathrm{mean}(o^2)+\\epsilon}}\\gamma \\end{aligned}', d:'FusedRMSNormGated:o 先 RMSNorm,再用输出门 g2 的 sigmoid 逐元素门控相乘。'},
     omerge: {label:'rearrange o\n96×128 → 12288', t:'shp', io:'[2,8,96,128] -> [2,8,12288]', f:'96 \\times 128 = 12288', d:'合并回 12288。'},
@@ -544,7 +672,7 @@ kda: {
     ['qproj','qconv','12288'],['kproj','kconv','12288'],['vproj','vconv','12288'],
     ['qconv','qhead','12288'],['kconv','khead','12288'],['vconv','vhead','12288'],
     ['faproj','fbproj','128'],['fbproj','ghead','12288'],
-    ['qhead','kda','q'],['khead','kda','k'],['vhead','kda','v'],['ghead','kda','g'],['bproj','kda','β_w'],
+    ['qhead','kda','q'],['khead','kda','k'],['vhead','kda','v'],['ghead','kda','g'],['bproj','kda','beta_w'],
     ['kda','onorm','o'],['gaproj','onorm','g2'],
     ['onorm','omerge','[..96,128]'],['omerge','oproj','12288'],['oproj','out','7168'],
   ],
@@ -584,7 +712,7 @@ mla: {
     ['qsplit','qcat','q_pass 128'],['krope','qcat','q_rot'],
     ['kvbsplit','kcat','k_nope 128'],['krope','kcat','k_rot'],
     ['qcat','attn','q'],['kcat','attn','k'],['kvbsplit','attn','v 128'],
-    ['attn','amerge','96×128'],['amerge','gate','12288'],['x','gate','g=σ(xWg)'],
+    ['attn','amerge','96×128'],['amerge','gate','12288'],['x','gate','g=sigmoid(xWg)'],
     ['gate','oproj','12288'],['oproj','out','7168'],
   ],
 },
@@ -596,12 +724,12 @@ moe: {
   legend:[['#556070','门控 Gate'],['#3f6fd0','投影(隐空间)'],['#e0922f','路由/合并'],['#16a085','路由专家'],['#c0392b','共享专家']],
   nodes:{
     x:     {label:'输入\n7168', t:'nrm', io:'[2,8,7168]', f:'x', d:'MoE 的输入。分三路:门控打分、路由专家、共享专家。'},
-    gate:  {label:'KimiMoEGate\n7168 → top16', t:'gt', io:'[16,7168] -> top16 idx+权重', f:'\\begin{aligned} & s = \\sigma(x W_g) \\\\[3pt] & \\text{select:}\\; \\mathrm{top}\\text{-}16(s + b_{corr}) \\\\[3pt] & w = \\frac{s_{top}}{\\sum s_{top}}\\cdot \\gamma \\end{aligned}', d:'门控三步。①打分:线性投影后过 sigmoid(moe_router_activation_func=sigmoid),得每个专家一个 0~1 分数 s。②选谁:在 s 上加可学习偏置 score_correction_bias(代码名沿用 DeepSeek-V3 的 e_score_correction_bias)再取 top-16——偏置只影响"选哪16个专家",不进最终权重。③定权重:选中专家用原始分数 s(不含偏置)renormalize 到和为1(moe_renormalize=true),再乘 routed_scaling_factor(此处=1.0)。共 896 专家、每 token 选 16。负载均衡:训练时按技术报告用 Quantile Balancing 更新该偏置(取 margin 的 1-k/n 分位数一步到位,无 sign-update 学习率),推理冻结;开源推理代码不含该更新逻辑(训练路径未开源),偏置名与结构沿用 DeepSeek-V3。'},
+    gate:  {label:'KimiMoEGate\n7168 → top16', t:'gt', io:'[T,7168] -> top16 idx+权重', f:'\\begin{aligned} & s = \\sigma(x W_g) \\\\[3pt] & \\text{select:}\\; \\mathrm{top}\\text{-}16(s + b_{corr}) \\\\[3pt] & w = \\frac{s_{top}}{\\sum s_{top}}\\cdot \\gamma \\end{aligned}', d:'门控三步。①打分:线性投影后过 sigmoid(moe_router_activation_func=sigmoid),得每个专家一个 0~1 分数 s。②选谁:在 s 上加可学习偏置 score_correction_bias(代码名沿用 DeepSeek-V3 的 e_score_correction_bias)再取 top-16——偏置只影响"选哪16个专家",不进最终权重。③定权重:选中专家用原始分数 s(不含偏置)renormalize 到和为1(moe_renormalize=true),再乘 routed_scaling_factor(此处=1.0)。共 896 专家、每 token 选 16。负载均衡:训练时按技术报告用 Quantile Balancing 更新该偏置(取 margin 的 1-k/n 分位数一步到位,无 sign-update 学习率),推理冻结;开源推理代码不含该更新逻辑(训练路径未开源),偏置名与结构沿用 DeepSeek-V3。'},
     down:  {label:'down_proj\n7168 → 3584', t:'lin', io:'[T,7168] -> [T,3584]', f:'\\tilde x = x W_{down}', d:'"Latent":把 token 压到隐空间 routed_expert_hidden_size=3584,路由专家全在这个压缩空间里算 -> 省通信/显存。这是 Latent MoE 名字由来。'},
     route: {label:'dispatch\n3584 → 各专家', t:'rt', io:'[T,3584] -> 各专家', f:'\\text{dispatch by top-16}', d:'每个 token 按门控选中的 16 个专家索引,分发到对应专家。896 个路由专家,每 token 只激活 16 个(稀疏度 56×)。'},
-    exp:   {label:'routed experts\n3584 → 3584', t:'rexp', io:'[.,3584] -> [.,3584]', f:'\\begin{aligned} & y_e = \\big(\\mathrm{SiTU}(x W_1)\\odot \\tilde u_e\\big)\\, W_2 \\\\[4pt] & \\mathrm{SiTU}(g)=\\beta\\tanh\\!\\frac{g}{\\beta}\\,\\sigma(g),\\quad \\tilde u_e=\\beta_l\\tanh\\!\\frac{x W_3}{\\beta_l} \\end{aligned}', d:'被选中的路由专家(KimiBlockSparseMLP):w1=gate、w3=up、w2=down。在隐空间里 3584 -> moe_intermediate_size=3072 -> 3584。激活是 SiTU-GLU:门支过 SiTU($\beta=4$)、值支经 tanh 限幅($\beta_l=25$)得 $\tilde u_e$,两者逐元素相乘后再 down。有界激活防爆炸,是 Stable 补丁之一。这里 $\beta=4$ 是激活尺度,与 KDA 写入强度 $\beta_w$ 是不同符号。'},
+    exp:   {label:'routed experts\n3584 → 3584', t:'rexp', io:'[.,3584] -> [.,3584]', f:'\\begin{aligned} & y_e = \\big(\\mathrm{SiTU}(x W_1)\\odot \\tilde u_e\\big)\\, W_2 \\\\[4pt] & \\mathrm{SiTU}(g)=\\beta\\tanh\\!\\frac{g}{\\beta}\\,\\sigma(g),\\quad \\tilde u_e=\\beta_l\\tanh\\!\\frac{x W_3}{\\beta_l} \\end{aligned}', d:'被选中的路由专家(KimiBlockSparseMLP):w1=gate、w3=up、w2=down。在隐空间里 3584 -> moe_intermediate_size=3072 -> 3584。激活是 SiTU-GLU:门支过 SiTU($\beta=4$)、值支经 tanh 限幅($\beta_l=25$)得 $\tilde u_e$,两者逐元素相乘后再 down。有界激活防爆炸,是 Stable 设计的一环。这里 $\beta=4$ 为激活尺度,与 KDA 写入强度 $\beta_w$ 是两个不同符号。'},
     combine:{label:'combine\n→ 3584', t:'rt', io:'-> [T,3584]', f:'y = \\sum_{e\\in top16} w_e\\, \\mathrm{expert}_e(\\tilde x)', d:'把 16 个专家输出按门控权重加权求和。'},
-    rnorm: {label:'routed norm\n3584 → 3584', t:'nrm', io:'[T,3584] -> [T,3584]', f:'\\mathrm{RMSNorm}', d:'latent_moe_use_norm=True:上投影前对隐空间聚合结果归一(Stable 补丁之一,隔离 expert mixture 尺度变化)。'},
+    rnorm: {label:'routed norm\n3584 → 3584', t:'nrm', io:'[T,3584] -> [T,3584]', f:'\\mathrm{RMSNorm}', d:'latent_moe_use_norm=True:上投影前对隐空间聚合结果归一(隔离 expert mixture 尺度变化,是 Stable 设计的一环)。'},
     up:    {label:'up_proj\n3584 → 7168', t:'lin', io:'[T,3584] -> [T,7168]', f:'y_r = (\\cdot) W_{up}', d:'从隐空间 3584 升回 hidden 7168。'},
     shared:{label:'shared expert\n7168 → 7168', t:'sexp', io:'[2,8,7168] -> [2,8,7168]', f:'y_s = \\mathrm{SiTU\\text{-}GLU}(x;\\,7168\\!\\to\\!6144\\!\\to\\!7168)', d:'共享专家:对所有 token 恒激活(不经路由),走全宽 hidden=7168。实现是 KimiMLP,中间宽度=moe_intermediate_size × num_shared_experts = 3072 × 2 = 6144(等效于把 2 个专家的宽度合并成一个 MLP)。激活同为 SiTU-GLU。承载所有 token 都需要的通用能力,和稀疏路由专家的专才能力互补。'},
     add:   {label:'y_r + y_s\n→ 7168', t:'rt', io:'-> [2,8,7168]', f:'y = y_r + y_s', d:'路由专家输出 + 共享专家输出,得 MoE 最终输出。'},
@@ -622,16 +750,16 @@ vision: {
   rankSep:48, nodeSep:24,
   legend:[['#1f9d6b','输入/输出'],['#d9639a','patch 卷积'],['#e0922f','位置信息'],['#7a45c9','注意力/MLP'],['#3f6fd0','merger 投影'],['#556070','归一/合并']],
   nodes:{
-    px:   {label:'时空 patch\n(仅多模态输入)', t:'io', io:'[n_patch, 3,14,14] + grid_thw', f:'\\mathrm{grid\\_thw}=(t,h,w)', d:'图像按 patch=14 切块（processor 预切展平）；视频沿时间分组，t ≤ 4（init_pos_emb_time=4，源码 assert）。patch 数 = t·h·w。像素不为 14 整除时 processor 先 resize。'},
+    px:   {label:'时空 patch\n(仅多模态输入)', t:'io', io:'[n_patch, 3,14,14] + grid_thw', f:'\\mathrm{grid\\_thw}=(t,h,w)', d:'图像按 patch=14 切块（processor 预切展平）；视频沿时间分组，$t \le 4$（init_pos_emb_time=4，源码 assert）。patch 数 = t·h·w。像素不为 14 整除时 processor 先 resize。'},
     pconv:{label:'patch_embed Conv2d\n3×14×14 → 1024', t:'conv', io:'[n_patch,3,14,14] -> [n_patch,1024]', f:'x = \\mathrm{Conv2d}_{k=s=14}(x)', d:'kernel=stride=14，每个 patch 独立映射互不重叠，等价于 588→1024 的逐 patch 线性变换；无 bias（patch_embed_proj_bias=false）。权重 [1024,3,14,14] 共 602,112 参数。'},
     posemb:{label:'divided_fixed 位置嵌入\n64×64 可学习 + 时间 sincos', t:'shp', io:'[n_patch,1024] -> [n_patch,1024]', f:'x \\leftarrow x + \\mathrm{bilinear}(P_{64\\times64}) + T_t', d:'可学习 64×64 方格按每张图实际 (h,w) 双线性插值（位置信息跟随真实长宽比，不要求 resize 成固定尺寸）；t>1 时 2D 嵌入重复 t 份再加冻结的 1D sincos 时间嵌入（非持久 buffer，仅 4 帧）。表参数 4,194,304。实测 t=3 时输出 = 2D 重复 3 份 + time_weight[0:3] 逐元素相加。'},
     rope: {label:'2D RoPE\n(h,w) 交错', t:'shp', io:'(h,w) -> cos/sin [n,64]', f:'\\mathrm{cis}[h,w,2i] = e^{jw\\theta_i},\\;\\mathrm{cis}[h,w,2i{+}1] = e^{jh\\theta_i}', d:'Rope2DPosEmbRepeated，作用在注意力头维 128 上：相邻频率槽交错编码宽 w（偶数槽）与高 h（奇数槽），θ 基 10000，网格硬上限 512×512。源码 docstring 把 h/w 标注写反，此处按代码实测行为记录；旋转严格保范数（实测 33.935440 → 33.935440）。'},
-    blk:  {label:'27 层 ViT block\npre-norm 残差', t:'core', io:'[n_patch,1024] -> [n_patch,1024]', f:'x \\leftarrow x + \\mathrm{Attn}(\\mathrm{RMSNorm}(x))', d:'每层两段：RMSNorm→wqkv 1024→4608（12 头 × 128，头维≠hidden/heads=85.3）→RoPE→双向注意力（变长打包 cu_seqlens，跨图不互注意，实测两图拼接跑与分开跑逐元素一致 max diff <1e-5）→wo 1536→1024；再 RMSNorm→MLP2 1024→4096→1024（GELU tanh）。全部无 bias；归一用 RMSNorm 与语言塔一致（区别于 Qwen3.8-Flash-Next 视觉塔的 LayerNorm）。'},
+    blk:  {label:'27 层 ViT block\npre-norm 残差', t:'core', io:'[n_patch,1024] -> [n_patch,1024]', f:'x \\leftarrow x + \\mathrm{Attn}(\\mathrm{RMSNorm}(x))', d:'每层两段：RMSNorm→wqkv 1024→4608（12 头 × 128，头维 $\ne$ hidden/heads=85.3）→RoPE→双向注意力（变长打包 cu_seqlens，跨图不互注意，实测两图拼接跑与分开跑逐元素一致 max diff <1e-5）→wo 1536→1024；再 RMSNorm→MLP2 1024→4096→1024（GELU tanh）。全部无 bias；归一用 RMSNorm 与语言塔一致（区别于 Qwen3.8-Flash-Next 视觉塔的 LayerNorm）。'},
     fnorm:{label:'final RMSNorm\n1024', t:'nrm', io:'[n_patch,1024] -> [n_patch,1024]', f:'\\mathrm{RMSNorm}(x)', d:'塔末端归一，输出进入 merger。'},
-    tpool:{label:'时间全池化\nmean(dim=t)', t:'shp', io:'[t·h·w,1024] -> [h·w,·]', f:'\\bar{x} = \\tfrac{1}{t}\\textstyle\\sum_{i=1}^{t} x_i', d:'sd2_tpool：t 帧沿时间维全部平均（实测第 1/2/3 帧填 1/2/3，合并后处处 = 2.0）。因此视觉 token 数与帧数无关：一张 448×444 无论 1 帧还是 4 帧都是同样多 token。与 tpool 同一函数内完成 2×2 空间合并（下节点）。'},
+    tpool:{label:'时间全池化\nmean(dim=t)', t:'shp', io:'[t·h·w,1024] -> [h·w,·]', f:'\\bar{x} = \\tfrac{1}{t}\\textstyle\\sum_{i=1}^{t} x_i', d:'sd2_tpool：t 帧沿时间维全部平均（实测第 1/2/3 帧填 1/2/3，合并后处处 = 2.0）。因此视觉 token 数与帧数无关：一张 448×448 无论 1 帧还是 4 帧都是同样多 token。与 tpool 同一函数内完成 2×2 空间合并（下节点）。'},
     mg2:  {label:'2×2 空间合并\n→ (n,4,1024)', t:'nrm', io:'[h·w,1024] -> [(h/2)(w/2), 4, 1024]', f:'(h/2)\\times(w/2)\\ \\mathrm{tokens}', d:'空间相邻 2×2 的 4 个 patch 捆成一个 token 的 4 份特征（不相加，留给投影层自行混合）。'},
     pmv2: {label:'PatchMergerMLPV2\n4096 → 4096 → 7168', t:'lin', io:'[n,4,1024] -> [n,4096] -> [n,7168]', f:'\\mathrm{RMSNorm}\\big(W_2\\,\\mathrm{GELU}(W_1\\,x)\\big)', d:'两层 Linear 均无 bias（4096×4096 + 4096×7168），输出接 RMSNorm(7168, eps=1e-5)。V1 的 pre_norm（LayerNorm@1024）在 V2 已移除。输出宽 7168 = 语言主干 hidden，是两侧能直接拼接的前提。参数 46,144,512。'},
-    vtok: {label:'视觉 token\n[n_vis, 7168]', t:'io', io:'[n_vis, 7168]', f:'n_{vis} = (h/2)(w/2)', d:'实算：448×448→256；896×896→1024；1344×1344→2304；1820×1008→2340；4 帧 448×448 视频→仍 256（时间已全池化）。视觉塔 401,214,464 参数（技术报告称 MoonViT-V2 401M，吻合）+ merger 46,144,512 = 447.4M。vision_tower 与 mm_projector 均在 MXFP4 量化豁免名单。'},
+    vtok: {label:'视觉 token\n[n_vis, 7168]', t:'io', io:'[n_vis, 7168]', f:'n_{vis} = (h/2)(w/2)', d:'实算：448×448→256；896×896→1024；1344×1344→2304；1820×1008→2340；4 帧 448×448 视频→仍 256（时间已全池化）。视觉塔 401,214,464 参数（技术报告称 MoonViT-V2 401M，吻合）+ merger 46,144,512 = 447.4M。视觉塔与 mm_projector 均在 MXFP4 量化豁免名单，量化范围仅路由专家的 w1/w2/w3 权重（embedding、lm_head、self_attn、共享专家、latent MoE 投影、MoE 路由器同样豁免）。'},
   },
   edges:[
     ['px','pconv','patch'],['pconv','posemb','1024'],['posemb','blk','1024'],
@@ -651,14 +779,14 @@ fusion: {
     temb: {label:'文本 embedding\n[1,T,7168]', t:'io', io:'[1,T] -> [1,T,7168]', f:'x = \\mathrm{Embedding}(\\mathrm{ids})', d:'占位符位置也会被正常查表，其值随后在融合中被覆盖。'},
     vfeat:{label:'视觉特征\n各图 [n_i,7168]', t:'vis', io:'list of [n_i,7168]', f:'n_i = (h_i/2)(w_i/2)', d:'每张图一段，段长 = 该图视觉 token 数（来自"视觉编码器"视图末端）。各图长度可以不同。'},
     occ:  {label:'occupation 表\n占位符位记 n_i', t:'shp', io:'[1,T] -> [1,T]', f:'\\mathrm{occ}_j = n_i\\ (\\mathrm{ids}_j{=}\\mathrm{PH}),\\; 1\\ (\\text{else})', d:'全 1 表，把每个占位符位置改写为对应图的 token 数 n_i——占位符"占 n_i 格"。'},
-    csum: {label:'cumsum 新位置\n文本位后移', t:'shp', io:'-> [1,T′]', f:'\\mathrm{pos} = \\mathrm{cumsum}(\\mathrm{occ}) - 1', d:'占位符之后的文本 token 新位置整体后移 n_i−1。实测 6 位序列含 1 个占位符 + 5 视觉 token：新位置映射 [0,1,2,7,8,9]，输出长度 10 = 6 − 1 + 5。'},
-    fill: {label:'交错填充\n文本位 / 视觉位', t:'gt', io:'-> [1,T′,7168]', f:'e[\\mathrm{text\\_pos}] = x,\\quad e[\\mathrm{vis\\_pos}] = f', d:'文本 token 的 embedding 写入各自新位置；其余位置按序填入各图视觉特征。实测交错落位逐元素正确（两占位符两图序列 [文本,图1×3,文本,图2×2,文本] 全对）、position_ids 连续 0..T′−1、视觉段 labels 填 ignore_index=-100。'},
-    out:  {label:'融合后 embedding\n[1,T′,7168]', t:'io', io:'[1,T′,7168] -> 语言主干', f:'T\' = T - \\#\\mathrm{PH} + \\textstyle\\sum_i n_i', d:'序列比原 input_ids 变长——LLaVA 式扩展融合，与 Qwen3.8-Flash-Next 的 masked_scatter 原地替换（processor 预填等量占位符、长度不变）是两种不同方案。此后视觉与文本共享全部 93 层，不存在贯穿深度的独立视觉分支。decode 单步（len(ids)==1 且带 KV cache）不再重跑融合，只按 cache 痕迹修补 attention_mask。'},
+    csum: {label:'cumsum 新位置\n文本位后移', t:'shp', io:'-> $[1,T\']$', f:'\\mathrm{pos} = \\mathrm{cumsum}(\\mathrm{occ}) - 1', d:'占位符之后的文本 token 新位置整体后移 n_i−1。实测 6 位序列含 1 个占位符 + 5 视觉 token：新位置映射 [0,1,2,7,8,9]，输出长度 10 = 6 − 1 + 5。'},
+    fill: {label:'交错填充\n文本位 / 视觉位', t:'gt', io:'-> $[1,T\',7168]$', f:'e[\\mathrm{text\\_pos}] = x,\\quad e[\\mathrm{vis\\_pos}] = f', d:'文本 token 的 embedding 写入各自新位置；其余位置按序填入各图视觉特征。实测交错落位逐元素正确（两占位符两图序列 [文本,图1×3,文本,图2×2,文本] 全对）、position_ids 连续 0..T′−1、视觉段 labels 填 ignore_index=-100。'},
+    out:  {label:'融合后 embedding\n序列变长后', t:'io', io:'$[1,T\',7168]$ -> 语言主干', f:'T\' = T - \\#\\mathrm{PH} + \\textstyle\\sum_i n_i', d:'序列比原 input_ids 变长——LLaVA 式扩展融合，与 Qwen3.8-Flash-Next 的 masked_scatter 原地替换（processor 预填等量占位符、长度不变）是两种不同方案。此后视觉与文本共享全部 93 层，不存在贯穿深度的独立视觉分支。decode 单步（len(ids)==1、带 KV cache，且本次仍传入 pixel_values）不再重跑融合，只按 cache 痕迹修补 attention_mask。'},
   },
   edges:[
     ['ids','temb','[1,T]'],['temb','fill','文本位'],['vfeat','fill','各图特征'],
     ['ids','occ','占位符位置'],['occ','csum','occ'],['csum','fill','新位置'],
-    ['fill','out','[1,T′,7168]'],
+    ['fill','out','变长'],
   ],
 },
 };
@@ -701,6 +829,7 @@ function nl(s){return esc(s).replace(/\n/g,'<br>');}
 function renderTeX(t){try{return katex.renderToString(t,{throwOnError:false,displayMode:true,strict:false});}catch(e){return '<code>'+esc(t)+'</code>';}}
 function renderInline(t){try{return katex.renderToString(t,{throwOnError:false,displayMode:false,strict:false});}catch(e){return '<code>'+esc(t)+'</code>';}}
 function renderD(s){var parts=String(s).split(/\$([^$]+)\$/g),out='';for(var i=0;i<parts.length;i++){if(i%2===1)out+=renderInline(parts[i]);else out+=esc(parts[i]);}return out;}
+function renderIo(s){var parts=String(s).split(/\$([^$]+)\$/g),out='';for(var i=0;i<parts.length;i++){if(i%2===1)out+=renderInline(parts[i]);else out+=nl(parts[i]);}return out;}
 if (window.renderMathInElement) { renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false}); }
 
 var curView='overview';
@@ -730,7 +859,7 @@ document.getElementById('tabs').innerHTML=TABS.map(function(t){
 
 cy.on('mouseover','node',function(ev){
   var o=VIEWS[curView].nodes[ev.target.id()];if(!o)return;
-  var h='<h4>'+esc(o.label.replace(/\n/g,' · '))+'</h4><div class="k">维度</div><div class="io b">'+nl(o.io)+'</div>';
+  var h='<h4>'+esc(o.label.replace(/\n/g,' · '))+'</h4><div class="k">维度</div><div class="io b">'+renderIo(o.io)+'</div>';
   if(o.f) h+='<div class="k">公式</div><div class="fx">'+renderTeX(o.f)+'</div>';
   if(o.drill) h+='<div class="hint">▸ 点击此节点下钻进内部</div>';
   tip.innerHTML=h;tip.classList.add('show');

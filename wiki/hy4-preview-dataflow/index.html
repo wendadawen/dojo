@@ -101,7 +101,7 @@
     <tr><th>项目</th><th>取值</th><th>config 键 / 核对方式</th></tr>
     <tr><td>总参数量</td><td>779,960,992,733（779.96B）</td><td>131 个分片共 2006 个张量头逐一累加</td></tr>
     <tr><td>官方「770B」口径</td><td>769.91B</td><td>总量剔除 MTP 草稿层 10.05B 后的值</td></tr>
-    <tr><td>单 token 激活</td><td>47.57B（不含 embedding 与 lm_head）</td><td>按结构规则累加：78 组注意力（每组 265,685,568）+ 21 个 full 索引器（每个 9,371,904）+ 78 组 iHC（每组 393,236）+ hc_head 98,309 + 77 层 top-8 MoE（每层 341,311,744）+ 首层 dense</td></tr>
+    <tr><td>单 token 激活</td><td>47.57B（不含 embedding 与 lm_head）</td><td>按结构规则累加：78 组注意力（每组 265,685,568）+ 21 个 full 索引器（每个 9,371,904）+ 78 组 iHC（每组 393,236）+ hc_head 98,309 + 77 层 top-8 MoE（每层 341,311,744）+ 首层 dense；加上 embedding 与 lm_head 各 0.742B 得 49.06B，即官方 README「49B are activated per token」的口径</td></tr>
     <tr><td>层数与层型</td><td>78 层，全部 <code>deepseek_sparse_attention</code></td><td><code>layer_types</code>；全层均含 <code>self_attn.*</code> 与 MLA 投影</td></tr>
     <tr><td>FFN 分布</td><td>第 0 层 dense（中间维 18432），其余 77 层 MoE</td><td><code>mlp_layer_types</code>；张量头仅首层有 <code>mlp.gate_proj</code>，其余层有 <code>mlp.experts.*</code></td></tr>
     <tr><td>隐藏维 / 头数</td><td>6144 / 64 头</td><td><code>hidden_size</code> / <code>num_attention_heads</code></td></tr>
@@ -167,7 +167,7 @@
       其中 $W_{proj}$ 是 <code>weights_proj</code>（6144 → 32）。ReLU 让单个头的负相关无法抵消其他头的正相关。等比缩小模型实测：头分数矩阵中精确为 0 的比例 47.8%，聚合分数中正数占 23.4%。</li>
     <li><b>top-k 取 min(2048, 可见长度)</b>：短序列时退化为全可见，不发生稀疏化。因果性通过给不可见位置加 $-\infty$ 掩码保证，因此 top-k 不会选出未来 token。</li>
     <li><b>跨层复用零成本</b>：shared 层的 <code>indexer</code> 为 <code>None</code>（等比模型实测 <code>layer2.self_attn.indexer is None</code> 为 True），直接用 DecoderLayer 向上传递的 <code>prev_topk_indices</code>。57 个 shared 层的索引计算量与缓存都省掉。</li>
-    <li><b>手工复算对撞</b>：用独立实现的 RoPE 与打分公式复算第 1 层索引分数，top-16 集合与官方实现完全一致（等比模型 24 token 场景）。</li>
+    <li><b>手工复算对撞</b>：用独立实现的 RoPE 与打分公式复算第 1 层索引分数，top-16 集合与官方实现完全一致（等比模型 24 token 下的复算）。</li>
   </ul>
 
   <h3>MLA 注意力：潜向量展开 + sink + 逐元素门</h3>
@@ -215,7 +215,7 @@
   <p>索引器缓存独立于主 cache：21 个 full 层各存每 token 128 维索引键（vLLM 用 FP8 存储并按 128 值一组附带 scale，约 2772 B/token；transformers eager 为 BF16，5376 B/token），shared 层不缓存。1M 上下文下索引器缓存约 2.7–5.3 GiB。</p>
 
   <h2 id="impl">4. 实现对照：同一 checkpoint 的三种消费方式</h2>
-  <p>Hy4-Preview 的发布 checkpoint、transformers 参考实现与 vLLM/SGLang 部署实现之间存在两处容易踩坑的不一致，本节逐项给出证据。</p>
+  <p>Hy4-Preview 的发布 checkpoint、transformers 参考实现与 vLLM/SGLang 部署实现之间存在两处容易踩坑的不一致。</p>
 
   <h3>RoPE 布局：checkpoint 是交错式，transformers 参考实现是半分式</h3>
   <p>「<a href="../rope/">旋转维内部如何配对</a>」有两种约定：<b>交错式</b>（相邻两维 $(x_{2i}, x_{2i+1})$ 组成复数，DeepSeek 血统的 Megatron 训练布局）与<b>半分式</b>（前半与后半配对，即 <code>rotate_half</code>，Llama 系约定）。两种配对对同一份权重互斥。各实现的取值为：</p>
@@ -234,7 +234,7 @@
     <li><b>命名一一对应 vLLM</b>：张量名如 <code>hc_attn_layer.hc_pre.hc_fn</code>、<code>self_attn.learnable_sink_param</code>、<code>self_attn.linear_gate.weight</code>、<code>mlp.experts.gate_up_proj</code>（3D 融合、无 <code>.weight</code> 后缀）与 vLLM 模块命名一一对应；vLLM 的 <code>load_weights</code> 直接按此命名加载。transformers 期望的命名（<code>attn_hc.*</code>、<code>sinks</code>、<code>gate_proj</code> 等）与之不同。</li>
     <li><b>只有 hc_pre、没有 hc_post</b>：checkpoint 中每个 iHC 模块只有一组 <code>hc_pre.{hc_fn[8,24576], hc_base[8], hc_scale[2]}</code>。结构上这是自洽的：pre 与 post 两套门控由同一模块计算——hc_fn 的 8 行中前 4 行算 pre logits、后 4 行算 post logits，hc_base 的 8 个元素与 hc_scale 的 2 个元素同样按前后半区分属 pre/post。</li>
     <li><b>hub 的微调补丁只做改名</b>：仓库内的 <code>finetune/llama_factory_support/hy_v4_patches.py</code> 只执行 <code>mlp.router.gate.</code> → <code>mlp.gate.</code> 之类的键名映射与专家权重融合，不含任何 RoPE 置换。</li>
-    <li><b>F32 小张量是运行时精度的实存证据</b>：626 个 F32 张量恰为 iHC 门控、主干 sink、主干路由偏置与 hc_head——对应 transformers <code>_keep_in_fp32_modules_strict</code> 清单的核心项，但 k_norm 与 lm_head 在文件中仍是 BF16，即「fp32 计算」发生在加载后而非存储时。</li>
+    <li><b>F32 小张量是运行时精度的实存证据</b>：626 个 F32 张量恰为 iHC 门控、主干 sink、主干路由偏置与 hc_head——对应 transformers <code>_keep_in_fp32_modules_strict</code> 清单的核心项，但 k_norm、weights_proj 与 lm_head 在文件中仍是 BF16，即「fp32 计算」发生在加载后而非存储时。</li>
   </ul>
 
   <h2 id="mtp">5. MTP 草稿层</h2>
@@ -245,11 +245,11 @@
     <li><b>自带 full 索引器</b>：MTP 层有完整的 <code>self_attn.indexer.*</code>（wq_b [4096, 2048]、wk [128, 6144]、weights_proj [32, 6144]），不依赖主干的 top-k。等比缩小模型实测：MTP 块选出的 top-k 与主干第 1 层不同（独立选择）。</li>
     <li><b>结构同构但有差异</b>：注意力侧同样有 sink 与逐元素门（<code>learnable_sink_param</code>、<code>linear_gate</code>），MoE 同为 256+1 top-8；但 sink 与路由偏置在文件中存 BF16（主干为 F32）。真实权重形态佐证 MTP 确实训练过：MTP 层 sink 实值均值 0.950（范围 $[-2.375, 2.922]$，源码初始化为 0）、路由偏置中位数 0.00737，均明显偏离初始化。</li>
     <li><b>收尾</b>：<code>final_layernorm</code> 后接主干 lm_head——checkpoint 中 MTP 无自己的输出头，vLLM 加载时把主干 <code>lm_head.weight</code> 映射为 MTP 的 shared head。等比模型实测两者 <code>data_ptr</code> 相同（同一份权重对象）。</li>
-    <li><b>decode 场景的边界处理</b>：vLLM 实现在位置 0 处把输入 embedding 置零（此时还没有可用的「下一个 token」），主干隐藏态承担全部信息。</li>
+    <li><b>decode 时的边界处理</b>：vLLM 实现在位置 0 处把输入 embedding 置零（此时还没有可用的「下一个 token」），主干隐藏态承担全部信息。</li>
   </ul>
 
   <h2 id="verify">6. 核对方式</h2>
-  <p>本页数字分四类来源，各自的取得方式如下。</p>
+  <p>数字来源分四类：</p>
   <p><b>结构与维度</b>：用 HTTP Range 请求读取全部 131 个 safetensors 分片的 JSON 文件头，得到 2006 个张量的名称、形状与 dtype，与 config 及源码推导交叉验证（层数与层型、索引层分布、MoE 形状、iHC 参数形状、MTP 构成、F32 清单等）。</p>
   <p><b>公式与数值行为</b>：把官方 <code>modeling_hy_v4.py</code> 原样 exec（架构代码零改动，仅以等义桩替换 transformers 框架侧装饰器），构造保留全部结构特征的等比缩小模型（10 层、隐藏维 512、8 头、16 专家 top-8、4 条流、24 token），用 forward hook 捕获官方实现的中间张量，再以独立手写公式复算对撞。iHC 混合与门控、索引器打分与 top-k、MLA 全链路（含 sink softmax 与门）、MoE 路由与专家、dense FFN 均逐张量对撞通过（最大差 0 至 $7.3\times10^{-10}$）；prefill/decode 等价性以五步证据链闭合。MTP 按官方 vLLM 实现的语义拼装缩小版跑通。</p>
   <p><b>checkpoint 小张量实值</b>：按 <code>data_offsets</code> 用 Range 请求精确下载 sink、路由偏置、hc_base / hc_scale、hc_head、k_norm 等小张量（F32 与 BF16 均按位模式正确解码），覆盖第 0 / 40 / 77 层与 MTP 层。</p>
@@ -262,7 +262,7 @@
     <tr><td>数据流路径、各算子公式、缓存布局</td><td>transformers <code>src/transformers/models/hy_v4/</code>（2026-09 快照，commit <code>cbc1651a</code>）；vLLM <code>vllm/models/hy_v4/</code>（main 分支 2026-09-08，commit <code>385dce3</code>）；SGLang <code>hunyuan_v4</code> 支持（commit <code>55bf338</code>）</td></tr>
     <tr><td>张量形状、dtype、层型分布、参数量</td><td>真实 checkpoint 的 safetensors 文件头（HTTP Range 读取，131 个分片、2006 个张量）</td></tr>
     <tr><td>sink / 路由偏置 / hc 门控 / hc_head / k_norm 的训练后数值</td><td>真实 checkpoint 的小张量实值（按 <code>data_offsets</code> 精确下载）</td></tr>
-    <tr><td>公式对撞、等价性、门控范围、MTP 结构验证</td><td>本机实测，脚本与原始输出见 <code>research/</code></td></tr>
+    <tr><td>公式对撞、等价性、门控范围、MTP 结构验证</td><td>本机实测得到（清单记在 <code>research/measured.md</code>）</td></tr>
   </table>
   <p style="color:var(--text-light);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方表述的 770B 参数已独立复现（剔除 MTP 后 769.91B）。等比缩小模型的实测数字用于验证计算规则本身（随机初始化权重），真实权重的行为以 checkpoint 小张量实值为准，两者在页面上分开标注。RoPE 布局与 checkpoint 格式归属两节结论的证据性质为「官方部署实现的源码一致性」，已在正文标注。本页覆盖语言主干与 MTP 草稿层的完整前向数据流；训练方案、推理调度（如 MTP 的投机采样策略）、量化与部署性能不在范围内。</p>
 
@@ -476,7 +476,7 @@ overview: {
     exp:  {label:'残差流扩展\n6144 → 4×6144', t:'grp', drill:'ihc', io:'[1,T,6144] -> [1,T,4,6144]', f:'x.\\mathrm{unsqueeze}(2).\\mathrm{expand}(-1,-1,4,-1)', d:'入口把 embedding 复制成 4 条流（视图引用，非参数拷贝）。等比缩小模型实测：第 0 层输入处四条流与 embeddings 逐位相等。此后整个主干残差宽度为 $4\\times 6144=24576$。点击下钻看 iHC。'},
     l0:   {label:'Layer 0\ndense FFN 18432', t:'gdn', drill:'layer', io:'[1,T,4,6144] -> [1,T,4,6144]', f:'\\mathrm{DSA} + \\mathrm{dense\\ SwiGLU}', d:'唯一的全连接 FFN 层（中间维 18432，参数 339,738,624）。注意力同其他层：DSA + MLA + sink + 门。索引器 full。点击下钻层内部。'},
     l1:   {label:'Layer 1\nMoE（full 索引）', t:'qsa', drill:'layer', io:'[1,T,4,6144] -> [1,T,4,6144]', f:'\\mathrm{DSA} + \\mathrm{MoE}', d:'第 1 层是 full 索引层，2–4 层复用它的 top-k。'},
-    grp:  {label:'Layers 2..76\nshared 层复用 top-k', t:'qsa', drill:'layer', io:'[1,T,4,6144] -> [1,T,4,6144]', f:'(\\mathrm{full} + 3\\,\\mathrm{shared}) \\times 19', d:'full 索引层在 0,1,5,9,…,73 共 21 个，其余 57 层直接复用前一个 full 层的 top-k。FFN 均为 256 专家 top-8。'},
+    grp:  {label:'Layers 2..76\n18 full + 57 shared', t:'qsa', drill:'layer', io:'[1,T,4,6144] -> [1,T,4,6144]', f:'(\\mathrm{full} + 3\\,\\mathrm{shared}) \\times 19', d:'full 索引层在 0,1,5,9,…,77 共 21 个，其余 57 层直接复用前一个 full 层的 top-k。本区间（2..76）内含 5…73 的 18 个 full 层与全部 57 个 shared 层。FFN 均为 256 专家 top-8。'},
     l77:  {label:'Layer 77\nMoE（full 索引）', t:'qsa', drill:'layer', io:'[1,T,4,6144] -> [1,T,4,6144]', f:'\\mathrm{DSA} + \\mathrm{MoE}', d:'最后一层重新自选索引（74–76 复用 73 之后）。'},
     hh:   {label:'hc_head\n4 流收束 → 6144', t:'out', drill:'ihc', io:'[1,T,4,6144] -> [1,T,6144]', f:'\\tilde{x} = \\textstyle\\sum_i (\\sigma(g_i s + b_i)+\\epsilon)\\,x_i', d:'末端收束，参数全模型仅一份：hc_head_fn [4,24576]、hc_head_base [4]（F32 实值 [-1.144,-1.151,-1.212,-0.972]，初始 $-\\log 3$）、hc_head_scale [1]（实值 0.105，初始 0.01）。'},
     fn:   {label:'final RMSNorm', t:'out', io:'[1,T,6144] -> [1,T,6144]', f:'\\mathrm{RMSNorm}(\\cdot)', d:'先 hc_head 再 norm——这个顺序与常见实现相反，源码为 self.norm(self.hc_head(hidden_states))。'},
@@ -617,7 +617,7 @@ mtp: {
   rankSep:42, nodeSep:22,
   legend:[['#e0922f','融合入口'],['#7a45c9','单流块'],['#3f6fd0','MoE'],['#556070','输出']],
   nodes:{
-    e:    {label:'下一 token\nembedding', t:'ple', io:'[1,T,6144]', f:'e = \\mathrm{Embed}(\\mathrm{ids}_{+1})', d:'草稿目标的 embedding。decode 场景下位置 0 尚无可用输入，vLLM 实现把该处 embedding 置零。'},
+    e:    {label:'下一 token\nembedding', t:'ple', io:'[1,T,6144]', f:'e = \\mathrm{Embed}(\\mathrm{ids}_{+1})', d:'草稿目标的 embedding。decode 时位置 0 尚无可用输入，vLLM 实现把该处 embedding 置零。'},
     h:    {label:'主干末态隐藏\nprevious_hidden', t:'ple', io:'[1,T,6144]', f:'h = \\mathrm{norm}(\\mathrm{hc\\_head}(\\cdot))', d:'主干的 last_hidden_state（hc_head 收束 + final norm 之后），由 proposer 传入。'},
     en:   {label:'enorm / hnorm', t:'ple', io:'×2 [1,T,6144]', f:'\\mathrm{RMSNorm}', d:'两个独立的 RMSNorm 分别作用于 embedding 与主干隐藏。'},
     eh:   {label:'eh_proj\n12288 → 6144', t:'ple', io:'[1,T,12288] -> [1,T,6144]', f:'x = W_{eh}[\\mathrm{enorm}(e);\\ \\mathrm{hnorm}(h)]', d:'拼接后一次投影融合两路信息。真实权重 eh_proj.weight [6144, 12288]，BF16。'},

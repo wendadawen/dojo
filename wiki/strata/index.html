@@ -61,15 +61,15 @@
 <blockquote class="meta">
 <p><b>论文</b>：Strata: Hierarchical Context Caching for Long Context Language Model Serving</p>
 <p><b>作者</b>：Zhiqiang Xie（Stanford &amp; NVIDIA）、Ziyi Xu（上海交通大学）、Mark Zhao（CU Boulder）、Yuwei An（CMU）、Vikram Sharma Mailthody（NVIDIA）、Scott Mahlke（NVIDIA &amp; 密歇根大学）、Michael Garland（NVIDIA）、Christos Kozyrakis（NVIDIA &amp; Stanford）</p>
-<p><b>发表</b>：OSDI 2026（USENIX Symposium on Operating Systems Design and Implementation，Track 1 "KV Cache and Long Context" session；<a href="https://www.usenix.org/conference/osdi26/technical-sessions">USENIX OSDI'26 技术场次</a>）；arXiv:2508.18572v2（2025-08-27 提交的 TeX 源码，<a href="https://arxiv.org/abs/2508.18572">arXiv</a>）</p>
+<p><b>发表</b>：OSDI 2026（USENIX Symposium on Operating Systems Design and Implementation，Track 1 "KV Cache and Long Context" session；<a href="https://www.usenix.org/conference/osdi26/technical-sessions">USENIX OSDI'26 技术场次</a>）；arXiv:2508.18572v1（2025-08-26 提交的 TeX 源码，<a href="https://arxiv.org/abs/2508.18572">arXiv</a>）</p>
 <p><b>链接</b>：<a href="https://arxiv.org/abs/2508.18572">https://arxiv.org/abs/2508.18572</a></p>
 </blockquote>
 
-<p>长上下文 LLM 服务面对一对矛盾：模型能处理的上下文越来越长（128K、1M token 已成主流），但 GPU 显存装不下这么多 KV cache，生产系统不得不把缓存分层到 CPU 内存和 SSD。问题出在"搬回来"这一步——把缓存从 CPU 内存搬回 GPU 的带宽利用率惨不忍睹：一份 8192 token 的 Llama-3.1-8B KV cache 加载只达到 PCIe 5.0 理论带宽的约 22%，GH200 上更跌到约 5%。原因有两类：分页布局让一个序列的缓存散布在大量不连续的页中，传输粒度只有几 KB（打不满带宽）；现有调度器按"prefill 计算能掩盖加载时间"的旧假设组批，长上下文下加载时间反超计算，系统变成 loading-bound（74% prefill 时间阻塞在 I/O，吞吐降 4 倍）。</p>
+<p>长上下文 LLM 服务面对一对矛盾：模型能处理的上下文越来越长（128K、1M token 已成主流），但 GPU 显存装不下这么多 KV cache，生产系统不得不把缓存分层到 CPU 内存和 SSD。问题出在"搬回来"这一步——把缓存从 CPU 内存搬回 GPU 的带宽利用率远低于硬件上限：一份 8192 token 的 Llama-3.1-8B KV cache 加载只达到 PCIe 5.0 理论带宽的约 22%，GH200 上更跌到约 5%。原因有两类：分页布局让一个序列的缓存散布在大量不连续的页中，传输粒度只有几 KB（打不满带宽）；现有调度器按"prefill 计算能掩盖加载时间"的旧假设组批，长上下文下加载时间反超计算，系统变成 loading-bound（74% prefill 时间阻塞在 I/O，吞吐降 4 倍）。</p>
 
 <p>Strata 用三个机制回应这两个原因。<b>GPU-assisted I/O</b>用 CUDA kernel 代替传统的 cudaMemcpyAsync 传输——数千线程各搬一小块数据，并发与传输粒度都大幅改善；用少量大 block 把 kernel 关进少数 SM 不影响计算；让 GPU 保持 layer-first 计算布局，host 与存储用 page-first 传输布局，布局转换由 I/O kernel 内一次算术完成。<b>Cache-aware 调度</b>把 PCIe 带宽当成一等资源：transient node 标记避免 delay hit（同一缓存"正在计算中"时的重复 prefill），均衡组批（load/compute 比例阈值 100）避免 loading-bound，bubble filling 在不可避免的空泡里插入 decode 批填充。H200 上的实验显示，对比 vLLM+LMCache 吞吐最多提升 5 倍、对比 TensorRT-LLM 最多 3.75 倍，短上下文不退化<sup>[C26]</sup>。</p>
 
-<p>本文假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿场景：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.5 GB——已超出单请求显存预算，分层与跨层搬运不可避免。</p>
+<p>阅读前假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿示例：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.56 GB——已超出单请求显存预算，分层与跨层搬运不可避免。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -78,7 +78,7 @@
       <p>把缓存的 KV cache 从 CPU 搬回 GPU 为什么会成为主要瓶颈？</p>
       <details>
         <summary>解答：分页碎片化传输 + 调度器忽略加载延迟</summary>
-        <p>两个独立来源。其一，PagedAttention 为显存管理把页切到 1–32 token，一个序列的 KV cache 散布在大量不连续页中（页 1 的页里只有 KB 级数据，TensorRT-LLM 32、vLLM 16、SGLang 1），跨内存层传输粒度只有几 KB——打满 PCIe 5.0 需 1–2 MB 传输，实测 8192 token 加载只达约 22% 带宽、GH200 上约 5%。其二，现有调度器假设 prefill 计算能掩盖加载延迟，长上下文下该假设失效（加载量大、新 token 少），系统 loading-bound——LooGLE 上 74% prefill 时间阻塞在 I/O，吞吐降 4 倍。加大页改善 I/O 但 hit rate 与 TTFT 显著恶化（页 1$\to$1024，TTFT 最多 2x、P90 2.9x），是根本性权衡。完整论证见第 1 章。</p>
+        <p>两个独立来源。其一，PagedAttention 为显存管理把页切到 1–32 token，一个序列的 KV cache 散布在大量不连续页中（页 1 的页里只有 KB 级数据，TensorRT-LLM 32、vLLM 16、SGLang 1），跨内存层传输粒度只有几 KB——达到 PCIe 5.0 约 75–80% 带宽需 1–2 MB 传输，实测 8192 token 加载只达约 22% 带宽、GH200 上约 5%。其二，现有调度器假设 prefill 计算能掩盖加载延迟，长上下文下该假设失效（加载量大、新 token 少），系统 loading-bound——LooGLE 上 74% prefill 时间阻塞在 I/O，吞吐降 4 倍。加大页改善 I/O 但 hit rate 与 TTFT 显著恶化（页 1$\to$1024，TTFT 最多 2x、P90 2.9x），是根本性权衡。完整论证见第 1 章。</p>
       </details>
     </li>
     <li>
@@ -136,27 +136,27 @@
 
 <h2 id="bottleneck">1. 瓶颈定位：分层缓存为什么救不了长上下文的响应时间</h2>
 
-<p>分层缓存解决了"存得下"，但搬回来"成为"了新的瓶颈。本章用两层证据（机制 + 实验数字）回答两个具体问题：为什么分页让传输打不满带宽，为什么加大页不解决问题反而引入新问题；以及为什么现有调度器把这一困境再放大一层。</p>
+<p>分层缓存解决了"存得下"，但搬回来"成为"了新的瓶颈。瓶颈的成因分成两层，由机制与实验数字共同支撑：为什么分页让传输打不满带宽，为什么加大页不解决问题反而引入新问题；以及为什么现有调度器把这一困境再放大一层。</p>
 
 <h3 id="capacity-math">1.1 分层缓存成为标配——容量账</h3>
 
 <p>KV cache 的大小随 token 数线性增长（<a href="../kv-cache/index.html">KV cache</a> 第 3 章）：每 token 占 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 字节。以 Llama-3.1-8B 为例（32 层、8 KV 头、head_dim 128、bf16），每 token 128 KB（按公式 F3 复算，配置来自 Llama-3.1-8B 模型卡）。一份 20,000 token 的手册缓存 $20{,}000\times 128\,\text{KB}\approx 2.56\,\text{GB}$——已经是单一请求独占的相当份额。<span class="callout-inline">一句话账：40 GB HBM 对 Llama-8B 只够缓存约 0.3M token<sup>[N1, N2]</sup>（$=40\,\text{GB}/128\,\text{KB}\approx 0.31\,\text{M}$）。</span></p>
 
-<p>一份手册已经吃掉 0.02M，生产中几十份文档或几百轮对话就耗尽显存。生产系统不得不把缓存分层到 CPU 内存、本地 SSD、远端内存池<sup>[C1]</sup>（如 Pensieve 用 CPU、CachedAttention 用 SSD、Mooncake/MemServe 用分布式池），用更大的容量换 KV cache 不被丢弃的收益。代价是访问成本：CPU 内存在 PCIe 一侧、SSD 在 NVMe 一侧、远端内存池在 NIC 一侧，访问延时递增而带宽并不成比例扩大。当请求触发需要时，系统要把缓存从这些慢的存储层搬回 GPU 才能继续生成——<b>"搬回来"就是本章要分析的瓶颈</b>。</p>
+<p>一份手册已经吃掉 0.02M，生产中几十份文档或几百轮对话就耗尽显存。生产系统不得不把缓存分层到 CPU 内存、本地 SSD、远端内存池<sup>[C1]</sup>（如 Pensieve 用 CPU、CachedAttention 用 SSD、Mooncake/MemServe 用分布式池），用更大的容量换 KV cache 不被丢弃的收益。代价是访问成本：CPU 内存在 PCIe 一侧、SSD 在 NVMe 一侧、远端内存池在 NIC 一侧，访问延时递增而带宽并不成比例扩大。当请求触发需要时，系统要把缓存从这些慢的存储层搬回 GPU 才能继续生成——<b>"搬回来"正是瓶颈所在</b>。</p>
 
 <details>
 <summary>展开：20,000 token 手册的完整容量与传输账</summary>
-<p>构造示例（与本文贯穿场景对齐）。Llama-3.1-8B 下手册每 token 128 KB，总 $20{,}000\times 128\,\text{KB}\approx 2.56\,\text{GB}$——单一请求独占已占 40 GB HBM 的 6.4%。按页 32 切分：$\lceil 20{,}000/32\rceil=625$ 页，每页 $32\times 128\,\text{KB}=4\,\text{MB}$。手册在 CPU 内存中的 625 页散布在互不相邻的物理位置。</p>
-<p><b>为什么 4 MB 的"大页"仍然打不满 PCIe？</b>答案在 layer-first 布局（详见第 3 章）：GPU 内存里同页的 K/V 是按"层优先"而非"页优先"排列——同一页 32 token 的 K/V 在 32 层上各占一段，跨内存层搬运时，一次只能拉取一页的某一层，单次传输单元是"页内单层片段"= 4 MB / 32 层 = 128 KB，远低于打满 PCIe 5.0 64 GB/s 所需的 1–2 MB 阈值<sup>[C8, N3]</sup>。更小的模型（小 head 数 $\times$ 小 head_dim）或更小的页（页 1/页 16）下，单层片段可低至几 KB——这正是论文引言所述"sometimes only a few kilobytes"的来源<sup>[C3]</sup>。搬运粒度由页大小<b>和</b>布局共同决定，单看页大小会漏掉这一关键约束。 这里说的是层与页的先后；页内维度的排法（token 与 KV 头谁在外层，即 NHD 与 HND）是决定单头取数是否连续的另一层，见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>。</p>
+<p>构造示例（与贯穿示例对齐）。Llama-3.1-8B 下手册每 token 128 KB，总 $20{,}000\times 128\,\text{KB}\approx 2.56\,\text{GB}$——单一请求独占已占 40 GB HBM 的 6.4%。按页 32 切分：$\lceil 20{,}000/32\rceil=625$ 页，每页 $32\times 128\,\text{KB}=4\,\text{MB}$。手册在 CPU 内存中的 625 页散布在互不相邻的物理位置。</p>
+<p><b>为什么 4 MB 的"大页"仍然打不满 PCIe？</b>答案在 layer-first 布局（详见第 3 章）：GPU 内存里同页的 K/V 是按"层优先"而非"页优先"排列——同一页 32 token 的 K/V 在 32 层上各占一段，跨内存层搬运时，一次只能拉取一页的某一层，单次传输单元是"页内单层片段"= 4 MB / 32 层 = 128 KB，远低于达到 PCIe 5.0（64 GB/s）约 75–80% 带宽所需的 1–2 MB 阈值<sup>[C8, N3]</sup>。更小的模型（小 head 数 $\times$ 小 head_dim）或更小的页（页 1/页 16）下，单层片段可低至几 KB——这正是论文引言所述"sometimes only a few kilobytes"的来源<sup>[C3]</sup>。搬运粒度由页大小<b>和</b>布局共同决定，单看页大小会漏掉这一关键约束。 这里说的是层与页的先后；页内维度的排法（token 与 KV 头谁在外层，即 NHD 与 HND）是决定单头取数是否连续的另一层，见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>。</p>
 </details>
 
 <h3 id="bandwidth-utilization">1.2 瓶颈一：分页带来的碎片化传输</h3>
 
-<p>PagedAttention（<a href="../paged-attention/index.html">PagedAttention</a>）把 KV cache 切成固定 token 数的页，逻辑顺序连续、物理上页可散布在显存任意位置。三个引擎的页大小取值：TensorRT-LLM 32、vLLM 16、SGLang 1 token<sup>[C2, N2]</sup>——都是为显存利用率选的小页（小页内部碎片小、按页匹配的前缀缓存粒度细）。代价在跨内存层传输时显现：把一个序列的缓存从 CPU 内存搬回 GPU，每次只能按页发起。Llama-3.1-8B 页 32 下每页仅 4 MB——是几 KB 至几十 MB 量级的小传输。</p>
+<p>PagedAttention（<a href="../paged-attention/index.html">PagedAttention</a>）把 KV cache 切成固定 token 数的页，逻辑顺序连续、物理上页可散布在显存任意位置。三个引擎的页大小取值：TensorRT-LLM 32、vLLM 16、SGLang 1 token<sup>[C2, N2]</sup>（引擎背景默认值；5.1 节实验为对齐先前工作把 vLLM 页设为 32）——都是为显存利用率选的小页（小页内部碎片小、按页匹配的前缀缓存粒度细）。代价在跨内存层传输时显现：把一个序列的缓存从 CPU 内存搬回 GPU，每次只能按页发起。Llama-3.1-8B 页 32 下每页 4 MB，但 layer-first 布局把同页数据按层打散，单次连续传输单元只有 128 KB 级——远低于达到约 75–80% 带宽所需的 1–2 MB（机制见 1.1 节折叠块）。</p>
 
-<p>为什么小传输打不满带宽？先把承载"数据传输"的公式摆出来。Little's Law 告诉我们稳定状态下：</p>
+<p>为什么小传输打不满带宽？关键在承载"数据传输"的公式。由 Little's Law，稳定状态下：</p>
 
-$$C=\lambda\cdot L,\qquad X=\lambda\cdot S,$$
+$$C=\lambda\cdot L,\qquad X=\lambda\cdot S,$$<sup>[F1]</sup>
 
 <p>其中 $\lambda$ 是 I/O 操作到达率、$C$ 是平均并发 I/O 操作数、$L$ 是平均每次操作延迟、$X$ 是持续数据吞吐、$S$ 是平均每次传输的数据量。代入合并：</p>
 
@@ -167,10 +167,8 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>实测后果明显。8192 token（页 32、Llama-3.1-8B）从 CPU 加载到 GPU 的带宽利用率仅约 22%<sup>[C8, N3]</sup>；带宽更高的平台反而利用率更低——GH200 把 PCIe 换成 NVLink、峰值带宽是 PCIe 的 6 倍，但实测利用率跌到约 5%<sup>[N3]</sup>（同样的页布局导致同样的小传输，但相对目标带宽更高，所以相对比例更低）。换言之，硬件升级无法挽救布局带来的带宽浪费。</p>
 
 <p>图 1 显示 Strata 在 LooGLE + Qwen2.5-14B 上的表现：</p>
-
-<p>图 1（原文 Figure 1）展示了 prefill 批的 Load/Compute Ratio 分布（右轴为 I/O stall 占比）——优化 I/O 前 74% prefill 时间阻塞在 KV 传输、优化 I/O 后仍有 24% 阻塞在缓存加载。</p>
 <img src="assets/img-14.webp" alt="图（原文 Figure 1）：LooGLE + Qwen2.5-14B 上 Load/Compute Ratio 的 CDF 与 I/O stall 占比">
-<p><b>图（原文 Figure 1）</b>：横轴为每批的 Load/Compute Ratio（从 CPU 加载的 token 数 / 新输入 token 数），左轴为 CDF、右轴为 I/O stall 占 prefill 时间的百分比。红色曲线（基线 SGLang offload）显示 I/O stall 占比可超过 74%，绿色曲线（Strata 优化 I/O 后）即使移除小页传输开销，仍有高达 24% prefill 时间阻塞在 cache 加载——说明调度器已把 I/O 优化后仍可能无法完全隐藏加载延迟，是第二类瓶颈的征兆<sup>[C7, N2]</sup>。</p>
+<p><b>图（原文 Figure 1）</b>：横轴为每批的 Load/Compute Ratio（从 CPU 加载的 token 数 / 新输入 token 数），左轴为 CDF、右轴为 I/O stall 占 prefill 时间的百分比。红色曲线（基线 SGLang offload）显示 I/O stall 占比可超过 74%，绿色曲线（Strata 优化 I/O 后）即使移除小页传输开销，仍有高达 24% prefill 时间阻塞在 cache 加载——说明即使优化 I/O 之后，调度器仍可能无法完全隐藏加载延迟，是第二类瓶颈的征兆<sup>[C7, N2]</sup>。</p>
 
 <p>图 3 给出多平台实测带宽利用率。</p>
 <img src="assets/img-13.webp" alt="图（原文 Figure 3）：不同平台加载 8192 token KV cache 的延迟与带宽利用率">
@@ -178,11 +176,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h3 id="page-size-cost">1.3 大页不是出路</h3>
 
-<p>直觉上的"修"是放大页大小：单次传输变大、$S$ 变大、利用率上升。但放大页同时改了三个目标的方向，而且两个反向。</p>
+<p>直觉上的"修"是放大页大小：单次传输变大、$S$ 变大、利用率上升。但放大页同时改变了传输效率与缓存命中率两个目标的方向，而且两者相反——传输效率上升、命中率下降。</p>
 
 <p>图 2 的实验：ShareGPT、Mistral-24B、H200、SGLang 上把页大小从 1 扫到 1024：</p>
-
-<p>图 2 显示页大小对缓存命中率与 TTFT 的影响——页越大命中率越低，TTFT 上升最多 2 倍（P90 2.9 倍）。</p>
 <img src="assets/img-12.webp" alt="图（原文 Figure 2）：ShareGPT + Mistral-24B 上页大小对缓存命中率与 TTFT 的影响">
 <p><b>图（原文 Figure 2）</b>：页大小从 1 增至 1024 时，缓存命中率随页增大显著下降，平均 TTFT 最多上升 2 倍、P90 上升 2.9 倍<sup>[C6, N4]</sup>。原因是按页匹配（<a href="../paged-attention/index.html">PagedAttention</a>）：共享前缀不是页大小整数倍时，末尾不足一页的 token 全部落空（页面尾部对齐损失是按页匹配机制的直接推论，标注为推断：论文 §3.1 L39–42 仅指出"cache matching is performed on a per-page basis"是命中率下降原因，未展开尾部对齐的具体量化）；页越大、按页匹配的粒度越粗，命中率越低。</p>
 
@@ -211,7 +207,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
     <p>Little's Law 怎么解释小传输打不满带宽？</p>
     <details>
       <summary>解答：吞吐 = 并发 $\times$ 传输大小 / 延迟，三杠杆下小 S 难调</summary>
-      <p>稳定状态下 $X=C\cdot S/L$，三个杠杆：并发 $C$、每次传输大小 $S$、每次延迟 $L$。CPU-GPU 场景下 $C$ 受 CPU 侧并行度与驱动队列限制、$L$ 由硬件决定，Strata 之前的杠杆只剩 $S$——但分页布局让 $S$ 只有几 KB 到几 MB，远低于打满 PCIe 5.0 所需的 1–2 MB 阈值。实测 8192 token 加载仅约 22% 利用率、GH200 上约 5%，带宽越高相对比例越低。</p>
+      <p>稳定状态下 $X=C\cdot S/L$，三个杠杆：并发 $C$、每次传输大小 $S$、每次延迟 $L$。CPU-GPU 场景下 $C$ 受 CPU 侧并行度与驱动队列限制、$L$ 由硬件决定，Strata 之前的杠杆只剩 $S$——但分页布局让 $S$ 只有几 KB 到几 MB，远低于达到 PCIe 5.0 约 75–80% 带宽所需的 1–2 MB 阈值。实测 8192 token 加载仅约 22% 利用率、GH200 上约 5%，带宽越高相对比例越低。</p>
     </details>
   </li>
   <li>
@@ -232,7 +228,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h2 id="gpu-assisted-io">2. GPU-assisted I/O：让 GPU 自己的线程搬运碎片数据</h2>
 
-<p>第 1 章把矛盾定位在三杠杆 $X=C\cdot S/L$ 中只有 $S$ 可调却被分页布局锁死。Strata 在数据面提出一个反直觉的杠杆：<b>把 $C$ 拿来调</b>——不再让 CPU 端的并发去驱动 I/O，而是用 GPU 自己的数千线程搬数据。本章讲机制、代价与控制。</p>
+<p>第 1 章把矛盾定位在三杠杆 $X=C\cdot S/L$ 中只有 $S$ 可调却被分页布局锁死。Strata 在数据面提出一个反直觉的杠杆：<b>把 $C$ 拿来调</b>——不再让 CPU 端的并发去驱动 I/O，而是用 GPU 自己的数千线程搬数据，再用少量大 block 控制它带来的干扰。</p>
 
 <h3 id="io-mechanism">2.1 机制：I/O kernel 代替 cudaMemcpyAsync</h3>
 
@@ -254,8 +250,6 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>具体做法：<b>少量大 CUDA block</b>。把 I/O kernel 设计成 2 个 CUDA block、每个 1024 线程<sup>[C10, N5]</sup>。少 block 让硬件调度器把它们装进同一两个 SM（可低至 1 个），剩下的一百多个 SM 留给计算 kernel。再配合绕过 cache 的底层指令（cache-bypass loads/stores）减少 cache 污染。</p>
 
-<p>图 5 的微基准（H200 上 I/O kernel 与 prefill/decode 同跑）：</p>
-
 <p>图 5 显示资源配额对 I/O kernel 干扰的影响——2 个 1024 线程 block 是兼顾吞吐与干扰的甜点。</p>
 <img src="assets/img-11.webp" alt="图（原文 Figure 5）：I/O kernel 资源配额 vs prefill/decode 干扰">
 <p><b>图（原文 Figure 5）</b>：横轴是 I/O kernel 占用的 CUDA block 数与每 block 线程数，纵轴是同跑场景下的吞吐（数据传输、prefill、decode）与互相干扰百分比。仅用 2 个 1024 线程 block 时，Strata 达到约 50 GB/s 传输吞吐、prefill 性能损失 <5%、decode 损失约 10%<sup>[N5]</sup>。这一组数字决定了默认配额：CPU$\to$GPU 加载用 2 block（关键路径），GPU$\to$CPU 备份用 1 block（非关键路径，备份带宽本就够用）。</p>
@@ -264,7 +258,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <details>
 <summary>补充：为什么少量大 block 能把 kernel 关进少数 SM</summary>
-<p>GPU 硬件调度器按 CUDA block 为单位把 block 分配到 SM（详见 <a href="../gpu-execution-model/index.html">GPU 执行模型</a> 第 2 章）：SM 上一个 block 一旦占据不会主动让位，少量 block 意味着少量 SM 会被占用。但单 block 内的 1024 个线程可以填满单个 SM 的所有 warp 与寄存器。block 太大不行（每个 SM 同时能跑的 block 数有限），太小也不行（不够填满 SM 导致利用率低）。所以"少 block + 大 thread per block"是兼顾的甜点——硬件调度器把 block 调度到尽可能少的 SM，I/O 的资源占用就被局限在这一两个 SM 上。</p>
+<p>GPU 硬件调度器按 CUDA block 为单位把 block 分配到 SM（详见 <a href="../gpu-execution-model/index.html">GPU 执行模型</a> 第 2 章）：SM 上一个 block 一旦占据不会主动让位，少量 block 意味着少量 SM 会被占用。但单 block 的 1024 线程约占单个 SM 一半的线程槽（H100/H200 每 SM 上限 2048 线程 / 64 warp，1024 线程 = 32 warp）。block 太大不行（每个 SM 能同时容纳的 block 数有限），太小也不行（线程太少则单 block 并行度不足）。所以"少 block + 大 thread per block"是兼顾的甜点——占用 SM 数由 block 数决定，论文称可低至 1 个，I/O 的资源占用就被局限在少数 SM 上。</p>
 </details>
 
 <h3 id="io-questions">本章问题</h3>
@@ -279,8 +273,8 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
   <li>
     <p>为什么 Strata 默认用 2 个 1024 线程 block？这数字与硬件能力的关系是什么？</p>
     <details>
-      <summary>解答：少 block 让硬件调度器把 I/O 关进少数 SM；2 block + 1024 thread 兼顾了占用少与填满 SM</summary>
-      <p>把 I/O kernel 设计成 2 个 block、每 block 1024 线程：少量 block 占用少量 SM（其余 SM 给计算 kernel），1024 线程足以填满单个 SM 的 warp 与寄存器。微基准显示这一组数字给出约 50 GB/s 吞吐、prefill 损失 <5%、decode 损失 10%，端到端整体影响 <5%——是兼顾 I/O 效率与干扰的甜点。CPU$\to$GPU 加载（关键路径）用 2 block、GPU$\to$CPU 备份（非关键路径）用 1 block。</p>
+      <summary>解答：少 block 让硬件调度器把 I/O 关进少数 SM；2 block + 1024 thread 兼顾了占用少与单 block 并行度</summary>
+      <p>把 I/O kernel 设计成 2 个 block、每 block 1024 线程：少量 block 占用少量 SM（论文称可低至 1 个，其余 SM 给计算 kernel），1024 线程约占单个 SM 一半的线程槽（1024/2048）。微基准显示这一组数字给出约 50 GB/s 吞吐、prefill 损失 <5%、decode 损失 10%，端到端整体影响 <5%——是兼顾 I/O 效率与干扰的甜点。CPU$\to$GPU 加载（关键路径）用 2 block、GPU$\to$CPU 备份（非关键路径）用 1 block。</p>
     </details>
   </li>
 </ol>
@@ -290,8 +284,6 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>GPU-assisted I/O 的第三个优点是"布局灵活"——内核内做一次轻量算术几乎免费。这让分层存储的两端可以各自选对各自最优的内存布局，不必再为另一端妥协。</p>
 
 <h3 id="two-layouts">3.1 两种布局的职责</h3>
-
-<p>图 6 对比 layer-first 与 page-first 两种布局。</p>
 
 <p>图 6 显示 layer-first（GPU 计算友好）与 page-first（传输友好）布局的差别。</p>
 <img src="assets/img-10.webp" alt="图（原文 Figure 6）：layer-first 布局与 page-first 布局对比">
@@ -304,14 +296,12 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>GPU-assisted I/O 给出一条出路：I/O 线程读源数据时，对偏移多做一次算术运算即可算出目的地址——把"读旧布局 $\to$ 写新布局"内嵌在 I/O 流程里，开销可忽略<sup>[C11]</sup>。结果：GPU 保留 layer-first（不破坏计算），host/存储用 page-first（不损失传输），I/O 时做一次布局转换。</p>
 
 <p>图 12 的微基准：同样页 32、8192 token，从本地磁盘加载到 CPU 内存时，page-first 布局的延迟最多降低 4 倍（vs layer-first）<sup>[C11, N9]</sup>。这是布局解耦在存储层的具体收益。</p>
-
-<p>图 12 给出磁盘加载下 page-first 与 layer-first 布局的延迟对比。</p>
 <img src="assets/img-09.webp" alt="图（原文 Figure 12）：磁盘加载 8192 token 不同布局的延迟">
 <p><b>图（原文 Figure 12）</b>：8192 token KV cache（页 32、不同模型）从本地磁盘加载到 CPU 内存时，page-first 布局的延迟显著低于 layer-first，最多 4 倍<sup>[N9]</sup>。</p>
 
 <details>
 <summary>展开：2 层 $\times$ 4 token 的最小布局算例</summary>
-<p>构造示例（不依赖真实模型）。一个 2 层 4 token 的微型 KV cache，每 token 每层有 K 与 V 各一份：layer-first 下字节序列是 $\text{layer}_0\text{ token}_0 K/V, \text{layer}_0\text{ token}_1 K/V, \text{layer}_0\text{ token}_2 K/V, \text{layer}_0\text{ token}_3 K/V, \text{layer}_1 \ldots$；page-first（页大小 4）下字节序列是 $\text{page}_0 \text{ token}_0 K/V \text{ layer}_0, \text{token}_0 K/V \text{ layer}_1, \text{token}_1 K/V \text{ layer}_0, \text{token}_1 K/V \text{ layer}_1, \ldots$。从磁盘加载"第 0 个 token 全部数据"：layer-first 下页首位置与 token 0 的 layer 0 K/V 重合，1 次大读可取齐；page-first 下页首位置仍如此，但页内连续排也使 1 次大读可取齐——差异在中段访问模式。差异真正显现于"搬整页：layer-first 一次只取到一页某一层，page-first 一次取到整页所有层"。这就是图 12 的延迟差异来源。本例的关键观察：page-first 与 layer-first 在 GPU 计算侧的间接寻址代价是常数级别（每页页表多一次寻址），与数据量无关；传输侧的收益则随数据量放大。</p>
+<p>构造示例（不依赖真实模型）。一个 2 层 4 token 的微型 KV cache，每 token 每层有 K 与 V 各一份：layer-first 下字节序列是 $\text{layer}_0\text{ token}_0 K/V, \text{layer}_0\text{ token}_1 K/V, \text{layer}_0\text{ token}_2 K/V, \text{layer}_0\text{ token}_3 K/V, \text{layer}_1 \ldots$；page-first（页大小 4）下字节序列是 $\text{page}_0 \text{ token}_0 K/V \text{ layer}_0, \text{token}_0 K/V \text{ layer}_1, \text{token}_1 K/V \text{ layer}_0, \text{token}_1 K/V \text{ layer}_1, \ldots$。本例只有 2 层，整份缓存恰好等于一页，两种布局从页首一次大读都能取齐——差异不在页首，而在层与页的交错程度：真实模型层数（几十层）远多于页内 token 数（32），layer-first 下同一页的各层数据被其余层的数据段隔开，page-first 下则彼此相邻。这就是图 12 的延迟差异来源。本例的关键观察：page-first 与 layer-first 在 GPU 计算侧的间接寻址代价是常数级别（每页页表多一次寻址），与数据量无关；传输侧的收益则随数据量放大。</p>
 </details>
 
 <h3 id="storage-prefetch">3.3 存储层的预取</h3>
@@ -338,11 +328,9 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h2 id="scheduler">4. Cache-aware 调度：把 PCIe 带宽当一等资源</h2>
 
-<p>第 2、3 章解决了"搬得快"，但"搬的同时 GPU 不闲着、不重复搬"是控制面的问题。本章先给系统全景，再依次讲三阶段调度策略：delay hit 延迟执行、均衡 batch、bubble filling。</p>
+<p>第 2、3 章解决了"搬得快"，但"搬的同时 GPU 不闲着、不重复搬"是控制面的问题。三阶段调度策略逐一回应：delay hit 延迟执行、均衡 batch、bubble filling<sup>[C13]</sup>。</p>
 
 <h3 id="system-overview">4.1 系统全景</h3>
-
-<p>图 4 为架构图。</p>
 
 <p>图 4 展示 Strata 的数据流——请求$\to$Scheduler$\to$GPU Executor + Cache Controller（GPU HBM / CPU DRAM / External Storage），HiRadixTree 作为页表与元数据。</p>
 <img src="assets/img-08.webp" alt="图（原文 Figure 4）：Strata 系统架构">
@@ -409,7 +397,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>为什么 decode 与加载不冲突？两个操作的资源占用几乎正交：decode 注意力读全部缓存（饱和 HBM 带宽），加载数据从 host 经 PCIe 到 GPU（饱和 PCIe 带宽）<sup>[C16]</sup>。把 decode 批放在 loading 的等待窗口里，GPU 不空转、加载不间断。</p>
 
-<p>论文提到也可插入 prefill 批来填充空泡——这适用于 P-D 分离部署（论文未实验）<sup>[C16]</sup>。本文讨论的 P-D co-location 下，decode 是最安全的填空选项。</p>
+<p>论文提到也可插入 prefill 批来填充空泡——这适用于 P-D 分离部署（论文未实验）<sup>[C16]</sup>。在 P-D co-location 下，decode 是最安全的填空选项。</p>
 
 <p>图 7 的 Stall Hiding 标注：G 单独一请求的加载（下方 PCIe IO 行的 G 块）期间，Strata 在上方插入 Decoding 批——G PCIe 加载与 Decoding 并行进行。</p>
 
@@ -465,14 +453,14 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
     <p>bubble filling 中 decode 为什么不与加载冲突？</p>
     <details>
       <summary>解答：decode 饱和 HBM 带宽、加载饱和 PCIe 带宽，资源正交</summary>
-      <p>decode 每步读全部缓存做注意力（饱和 HBM 带宽），KV cache 加载数据从 host 经 PCIe 到 GPU（饱和 PCIe 带宽）。两条不同总线上的传输彼此独立，GPU 不需要为另一操作让位。GPU 的算力（SM）也基本不冲突：I/O kernel 已被关进 2 个 SM（2 block + 1024 thread，详见第 2 章），剩下一百多个 SM 可用于 decode。decode 填进 loading 的空泡里，GPU 不空转、加载不间断，整体资源利用率接近全量。</p>
+      <p>decode 每步读全部缓存做注意力（饱和 HBM 带宽），KV cache 加载数据从 host 经 PCIe 到 GPU（饱和 PCIe 带宽）。两条不同总线上的传输彼此独立，GPU 不需要为另一操作让位。GPU 的算力（SM）也基本不冲突：I/O kernel 已被关进少数 SM（2 block + 1024 thread 使占用 SM 数可低至 1 个，详见第 2 章），其余 SM 可用于 decode。decode 填进 loading 的空泡里，GPU 不空转、加载不间断，整体资源利用率接近全量。</p>
     </details>
   </li>
 </ol>
 
 <h2 id="experiments">5. 实验验证：收益数字与成立条件</h2>
 
-<p>本章报全量端数据。先讲清实验设置（否则数字难解释），再分四组：① 端到端全套数字（含 abstract 5x/3.75x 的来源）② 消融各机制贡献 ③ 页大小负担与 cache distance ④ GH200 新硬件。短上下文（ShareGPT）单列。</p>
+<p>实验结果分四组：① 端到端全套数字（含 abstract 5x/3.75x 的来源）② 消融各机制贡献 ③ 页大小负担与 cache distance ④ GH200 新硬件；短上下文（ShareGPT）单列。实验设置是理解这些数字的前提，列在最前。</p>
 
 <h3 id="setup">5.1 实验设置</h3>
 
@@ -487,8 +475,6 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <h3 id="e2e-results">5.2 端到端结果</h3>
 
 <p>图 8 为全景（H200）：</p>
-
-<p>图 8 给出 H200 上三模型四数据集的吞吐-TTFT 全景。曲线越靠右上越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。</p>
 <img src="assets/img-06.webp" alt="图（原文 Figure 8）：H200 上三模型四数据集端到端吞吐-TTFT 对比">
 <p><b>图（原文 Figure 8）</b>：每行一个数据集，纵轴 Average TTFT (s)、横轴 Throughput (output tokens/s)，曲线终点由请求率驱动。曲线越靠右下越好——同 TTFT 下吞吐更高，或同吞吐下 TTFT 更低。Strata 在所有长上下文（前三行）上显著领先 short context（ShareGPT，末行）上各系统接近。LooGLE 上 Strata 对 Llama-70B 达到 abstract 的 5x vs vLLM-LMCache 与 3.75x vs TensorRT-LLM（详见下表）。</p>
 
@@ -569,7 +555,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
     <p>为什么 SGLang-HiCache 把页调到最优的 512 也只能达到 Strata-IO 的 93%？</p>
     <details>
       <summary>解答：页大虽改善 I/O 但命中率下降 2.4%，传输优化被 Strata-IO 摘出</summary>
-      <p>页 512 的 I/O 传输单元大（更接近打满 PCIe 的 1–2 MB），但 SGLang-HiCache@512 的 cache 命中率比 Strata-IO 低 2.4%（按页匹配的尾部落空变大；2.4% 与 93% 同出自 §5.3.2 L154）。两个相反因素在某个页大小下取最优——但页 32/64/128/256/512 全段都输 Strata-IO，因为 Strata-IO 的 GPU-assisted I/O 把 I/O 效率从页大小权衡中摘出（传输效率不依赖页大小），所以 Strata-IO 的相对优势来自"摘出"而非"调参"。尾部落空（共享前缀不是页大小整数倍时，末尾不足一页的 token 全部落空）是按页匹配机制的直接推论（标注为推断：论文仅指出按页匹配粒度变粗导致命中率下降，未展开尾部对齐损失的具体量化）<sup>[C6]</sup>。</p>
+      <p>页 512 的 I/O 传输单元大（更接近达到 PCIe 约 75–80% 带宽的 1–2 MB），但 SGLang-HiCache@512 的 cache 命中率比 Strata-IO 低 2.4%（按页匹配的尾部落空变大；2.4% 与 93% 同出自 §5.3.2 L154）。两个相反因素在某个页大小下取最优——但页 32/128/256/512/1024 全段都输 Strata-IO，因为 Strata-IO 的 GPU-assisted I/O 把 I/O 效率从页大小权衡中摘出（传输效率不依赖页大小），所以 Strata-IO 的相对优势来自"摘出"而非"调参"。尾部落空（共享前缀不是页大小整数倍时，末尾不足一页的 token 全部落空）是按页匹配机制的直接推论（标注为推断：论文仅指出按页匹配粒度变粗导致命中率下降，未展开尾部对齐损失的具体量化）<sup>[C6]</sup>。</p>
     </details>
   </li>
   <li>
@@ -590,11 +576,11 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>Strata 的设计选择体现了一条贯穿主线——<b>把 I/O 路径与调度同时纳入带宽资源模型</b>。三杠杆 $X=C\cdot S/L$ 框架贯穿：I/O kernel 解决 $C$ 与 $S$ 的双重受限，cache-aware 调度把带宽作为调度器的一等资源（均衡 batch 的 ratio、bubble filling 的资源正交）。这不是把已有技巧堆叠，而是先识别瓶颈的杠杆、再对每一杠杆出招——这是论文设计连贯性所在。布局解耦（GPU layer-first、host/存储 page-first）是另一个体现"先识别约束再解耦"的设计选择：原本要权衡的两难被免费的 I/O 线程算术消除，方法干净。</p>
 
-<p>工程上：基于 SGLang 实现且已在一家领先 AI 公司生产部署<sup>[C25]</sup>——production grade 不是口号。ROCm 后端兼容 AMD GPU<sup>[C26]</sup>，跨平台部署可行。基线版本固定（vLLM v0.8.5、LMCache v0.2.1、TensorRT-LLM v0.17.0、SGLang v0.4.5）使数字可比。</p>
+<p>工程上：基于 SGLang 实现且已在一家领先 AI 公司生产部署<sup>[C25]</sup>。ROCm 后端兼容 AMD GPU<sup>[C26]</sup>，跨平台部署可行。基线版本固定（vLLM v0.8.5、LMCache v0.2.1、TensorRT-LLM v0.17.0、SGLang v0.4.5）使数字可比。</p>
 
 <h3 id="limits">6.2 局限</h3>
 
-<p>三个真实但可接受的代价。其一，I/O kernel 占用 SM 与算力。2 block $\times$ 1024 thread 的方案给 prefill 留 <5% 损失、decode 留 10%<sup>[N5, C10]</sup>——非零，长上下文收益（5$\times$ 量级）远超代价，但部署在 decode 主导的短上下文负载上仍净亏。其二，多个阈值依赖 tuning：loading_bound 比例阈值 100（论文 §4.3.2 L162 说该阈值硬件/模型相关、可分别 profiling）；transient node 匹配阈值 100（论文 §4.3.1 L115 给出默认值，未指定硬件相关性）<sup>[C14, C15]</sup>。文中给出的阈值在 Llama-70B + LooGLE 等具体配置下有效，未给出自动调整算法，部署到不同平台或模型需重做 profiling。其三，端到端实验中 disk 未纳入（基线系统对 disk 支持有限）<sup>[N19]</sup>，机制描述（最佳努力预取）有但实验缺失；SSD 缓存的实际收益未量化。</p>
+<p>三个真实但可接受的代价。其一，I/O kernel 占用 SM 与算力。2 block $\times$ 1024 thread 的方案给 prefill 留 <5% 损失、decode 留 10%<sup>[N5, C10]</sup>——非零，长上下文收益（5$\times$ 量级）远超代价。其二，多个阈值依赖 tuning：loading_bound 比例阈值 100（论文 §4.3.2 L162 说该阈值硬件/模型相关、可分别 profiling）；transient node 匹配阈值 100（论文 §4.3.1 L115 给出默认值，未指定硬件相关性）<sup>[C14, C15]</sup>。文中给出的阈值在 Llama-70B + LooGLE 等具体配置下有效，未给出自动调整算法，部署到不同平台或模型需重做 profiling。其三，端到端实验中 disk 未纳入（基线系统对 disk 支持有限）<sup>[N19]</sup>，机制描述（最佳努力预取）有但实验缺失；SSD 缓存的实际收益未量化。</p>
 
 <p>更本质的边界：方法解决的是"单机内的搬运与调度"。它不解决 KV cache 容量本身的物理限制、不解决跨实例的全局协调（Mooncake/MemServe 方向）、不替代近似缓存（CacheGen/CacheBlend）。论文 §7 Conclusion 的展望段提及未来可能集成专用 on-chip 内存 I/O 加速器<sup>[C28]</sup>。</p>
 
@@ -617,7 +603,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
     <p>Strata 的三个主要代价或局限是什么？</p>
     <details>
     <summary>解答：SM 占用、阈值调优与实验边界</summary>
-    <p>其一，I/O kernel 占用 SM 与算力（prefill 留不到 5% 损失、decode 留 10%），decode 主导的短上下文负载上净亏；其二，多个阈值依赖按硬件/模型 profiling，未给自动调整算法；其三，端到端实验未纳入 disk，SSD 缓存收益未量化。更本质的边界：方法只解决单机内的搬运与调度，不解决 KV cache 容量物理限制与跨实例全局协调。</p>
+    <p>其一，I/O kernel 占用 SM 与算力（prefill 留不到 5% 损失、decode 留 10%）；其二，多个阈值依赖按硬件/模型 profiling，未给自动调整算法；其三，端到端实验未纳入 disk，SSD 缓存收益未量化。更本质的边界：方法只解决单机内的搬运与调度，不解决 KV cache 容量物理限制与跨实例全局协调。</p>
     </details>
   </li>
   <li>
@@ -632,10 +618,10 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>核心论断与原文定位</h3>
-<p>全部核心论断对应 arXiv:2508.18572v2 TeX 源码（2025-08-27 提交）。C1–C8（瓶颈与机制）见 §1、§2.2、§3.1、§3.2、§4.2；C9（GPU-assisted I/O 三优点）见 §4.2 L33–36；C10（干扰控制）见 §4.2 L48–54；C11（布局解耦）见 §4.2.1 L79–86；C12（存储层机会性预取）见 §4.2.1 L73–76；C13–C16（调度三阶段）见 §4.3 L101–106、§4.3.1 L111–115、§4.3.2 L150–167、§4.3.3 L169–174；C17（P-D co-location）见 §4.1 L23–25；C18（系统架构）见 §4.1 L19–26 与图 4；C19（分层缓存必要性）见 §5.2.1 L86–87；C20（消融归因）见 §5.3.1 L126–138；C21（页大小负担）见 §5.3.2 L150–154；C22（cache distance）见 §5.3.3 L157–168；C23（GH200）见 §5.4 L212–225；C24（短上下文）见 §5.2.3 L106–111；C25（生产部署）见 §1 L46；C26（ROCm 兼容）见 §4.2 L55；C27（相关工作定位）见 §6 L2–21。F1、F2 见 §3.1；F3 为 KV cache 页定义、本文沿用。</p>
+<p>全部核心论断对应 arXiv:2508.18572v1 TeX 源码（2025-08-26 提交）。C1–C8（瓶颈与机制）见 §1、§2.2、§3.1、§3.2、§4.2；C9（GPU-assisted I/O 三优点）见 §4.2 L33–36；C10（干扰控制）见 §4.2 L48–54；C11（布局解耦）见 §4.2.1 L79–86；C12（存储层机会性预取）见 §4.2.1 L73–76；C13–C16（调度三阶段）见 §4.3 L101–106、§4.3.1 L111–115、§4.3.2 L150–167、§4.3.3 L169–174；C17（P-D co-location）见 §4.1 L23–25；C18（系统架构）见 §4.1 L19–26 与图 4；C19（分层缓存必要性）见 §5.2.1 L86–87；C20（消融归因）见 §5.3.1 L126–138；C21（页大小负担）见 §5.3.2 L150–154；C22（cache distance）见 §5.3.3 L157–168；C23（GH200）见 §5.4 L212–225；C24（短上下文）见 §5.2.3 L106–111；C25（生产部署）见 §1 L46；C26（ROCm 兼容）见 §4.2 L55；C27（相关工作定位）见 §6 L2–21；C28（Conclusion 展望）见 §7 L2。F1、F2 见 §3.1；F3 为 KV cache 页定义、本解析沿用。</p>
 
 <h3>核心公式与原文定位</h3>
-<p>F1（Little's Law $C=\lambda L$）见 §3.1 L26–27；F2（$X=\lambda S=C\cdot S/L$）见 §3.1 L28。F3（KV cache 每 token 字节数）见 <a href="../kv-cache/index.html">KV cache</a> F1，本页沿用：$2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$，Llama-3.1-8B 32 层/8 KV 头/head_dim 128/bf16 得 128 KB/token，20,000 token 手册约 2.56 GB。</p>
+<p>F1（Little's Law $C=\lambda L$）见 §3.1 L26–27；F2（$X=\lambda S=C\cdot S/L$）见 §3.1 L28。F3（KV cache 每 token 字节数）见 <a href="../kv-cache/index.html">KV cache</a> F1，定义沿用如下：$2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$，Llama-3.1-8B 32 层/8 KV 头/head_dim 128/bf16 得 128 KB/token，20,000 token 手册约 2.56 GB。</p>
 
 <h3>外部数字与实验条件</h3>
 <p>N1（40 GB HBM $\approx$ Llama-8B 0.3M token）见 §1 L10。N2（页大小 32/16/1 token）见 §2.2 L14、§3.1 L48。N3（8192 token 加载约 22% PCIe 5.0 带宽、GH200 约 5%）见 §3.1 L47–49。N4（页 1$\to$1024 TTFT 最多 2x、P90 2.9x）见 §3.1 L41–42。N5（2 block $\times$ 1024 thread $\to$ 50 GB/s、prefill <5%、decode 10%）见 §4.2 L56–59。N6（128 字节粒度）见 §4.2 L35。N7（transient node 阈值 100）见 §4.3.1 L115。N8（loading_bound 阈值 100）见 §4.3.2 L162。N9（磁盘 page-first 延迟最多降 4x）见 §5.3.4 L186–190。N10–N20（端到端全套与设置）见 §5.1 与 §5.2 表。</p>
@@ -653,7 +639,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>"搬得动 / 搬得快 / 搬的同时 GPU 不闲着"是辅助解释，服务的局部关系："搬得动"指分层缓存容量；"搬得快"指 I/O 机制；"不闲着"指调度。不构成对三机制完整独立性的判定。OS 分页类比（块-页、token-字节、请求-进程）借自 vLLM 论文，对应关系在 KV cache 与 OS 页之间一致，在淘汰/页错误/硬件支持等机制上不对应。</p>
 
 <h3>简化条件及其限制</h3>
-<p>其一，1TB pinned DRAM（GH200 400GB）是实验配的硬件条件，迁移到生产需重做内存规划。其二，disk 未纳入端到端；机制层描述有，量化收益缺。其三，SGLang-HiCache 是作者自建基线（非社区版 HiCache），与 SGLang 社区版 HiCache 不可混为一谈。其四，部分阈值（transient 匹配 100、loading_bound 100）依赖具体硬件/模型，迁移时建议复做 profiling。其五，P-D co-location 是本文唯一部署形态，P-D 分离仅在 bubble filling 中顺带提及，无对应实验。
+<p>其一，1TB pinned DRAM（GH200 400GB）是实验配的硬件条件，迁移到生产需重做内存规划。其二，disk 未纳入端到端；机制层描述有，量化收益缺。其三，SGLang-HiCache 是作者自建基线（非社区版 HiCache），与 SGLang 社区版 HiCache 不可混为一谈。其四，部分阈值（transient 匹配 100、loading_bound 100）依赖具体硬件/模型，迁移时建议复做 profiling。其五，P-D co-location 是本解析唯一部署形态，P-D 分离仅在 bubble filling 中顺带提及，无对应实验。
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
