@@ -113,14 +113,14 @@
 <p>KV cache 传输要多大带宽，现有数据中心网络够不够？</p>
 <details>
 <summary>解答：现有带宽足够，egress 随 ISL 增大而降低、ingress 随 OSL 增大而降低</summary>
-<p>逐层产 KV、与 prefill 计算重叠——egress 公式 $BW_{egress} = \frac{N_{layers} \cdot BS_{prefill} \cdot ISL \cdot d_{head} \cdot N_{kv\_heads} \cdot bytes_{element}}{FTL \cdot NumGPU_{prefill}}$；decode 侧在 TTL$\times$OSL 时间内收完——ingress 公式 $BW_{ingress} = \frac{N_{layers} \cdot BS_{decode} \cdot ISL \cdot d_{head} \cdot N_{kv\_heads} \cdot bytes_{element}}{TTL \cdot OSL \cdot NumGPU_{decode}}$。趋势：egress 随 ISL 增大而降低（FTL 超线性 vs KV 线性）；ingress 与 ISL 无关（两线性抵消）但随 OSL 增大而降低；TTL 收紧 → 更多 decode GPU → 每卡 ingress 需求降低。更大模型（MLA）egress 反而可能更小。DeepSeek-R1 模拟显示约 0.4–1.8 GBps/GPU，远低于现代 NVLink。完整论证见第 4 章。</p>
+<p>逐层产 KV、与 prefill 计算重叠——egress 公式 $BW_{egress} = \frac{N_{layers} \cdot BS_{prefill} \cdot ISL \cdot d_{head} \cdot N_{kv\_heads} \cdot bytes_{element}}{FTL \cdot NumGPU_{prefill}}$；decode 侧在 TTL$\times$OSL 时间内收完——ingress 公式 $BW_{ingress} = \frac{N_{layers} \cdot BS_{decode} \cdot ISL \cdot d_{head} \cdot N_{kv\_heads} \cdot bytes_{element}}{TTL \cdot OSL \cdot NumGPU_{decode}}$。趋势：egress 随 ISL 增大而降低（FTL 超线性 vs KV 线性）；ingress 与 ISL 无关（两线性抵消）但随 OSL 增大而降低；TTL 收紧 → 更多 decode GPU → 每卡 ingress 需求降低。更大模型（MLA）egress 反而可能更小。DeepSeek-R1 模拟显示约 0.4–1.8 GBps/GPU，远低于现有数据中心已配置的带宽。完整论证见第 4 章。</p>
 </details>
 </li>
 <li>
 <p>对部署者最可操作的结论清单是什么，哪些条件不成立时要小心？</p>
 <details>
 <summary>解答：清单与边界并存，模拟器与归一化数字限制直接迁移</summary>
-<p>清单：①流量/模型画像先行决定分与不分（prefill-heavy + 大模型 → 分；小模型/生成密集 → 谨慎）；②若分：动态 rate matching + 弹性伸缩是必需件不是可选项；③prefill 池优先 CPP（深 PP 压 FTL、保持吞吐）；④decode 池预留 TP 升级空间（紧 TTL 下用更激进的高 TP）；⑤NVLink 域越大越好（更宽 EP/TP 的自由度）；⑥带宽规划不必焦虑（现有供给内）；⑦co-located 用户：MLA 注意 chunking 开销、宽松延迟 + 生成密集时 chunking 最有利。边界：模拟器性质、归一化数字、Blackwell + FP4 语境、P50 近似、未覆盖 KV 复用/投机解码。完整论证见第 5 章。</p>
+<p>清单：流量画像与模型大小先行决定分与不分（prefill-heavy + 大模型 → 分；小模型/生成密集 → 谨慎）；若分，动态 rate matching 与弹性伸缩是必需件不是可选项；prefill 池优先 CPP（深 PP 压 FTL、保持吞吐）；decode 池预留 TP 升级空间（紧 TTL 下用更激进的高 TP）；NVLink 域越大越好（更宽 EP/TP 的自由度）；带宽规划不必焦虑（现有供给内）；co-located 用户需注意 MLA 在 chunking 下的开销。边界：模拟器性质、归一化数字、Blackwell + FP4 语境、P50 近似、未覆盖 KV 复用/投机解码。完整论证见第 5 章。</p>
 </details>
 </li>
 </ol>
@@ -132,7 +132,7 @@
 
 <p>关键边界是模拟器性质——它不是真实集群实测。论文明确了几条假设与排除：模拟假设数据中心有足够 GPU 与到达请求使 rate-matched 部署满载，且 prefill 池每层产生的 KV cache 在可用时立即传给生成池并与后续层计算重叠<sup>[C8]</sup>；FTL>10s（宽松但实用的上限）的设计点被排除<sup>[C7, N3]</sup>；分析聚焦现代 Blackwell 系统与 FP4 精度<sup>[C6]</sup>。所有图均归一化呈现，目的是传达趋势而非具体性能声明<sup>[C9]</sup>。这些边界共同把"结论的迁移范围"标在了模拟研究这一格内：纸面数字不能直接当某集群的预期吞吐，需要用自己的工作负载与硬件再验证。</p>
 
-<p>为什么选择模拟而非实测？论文给出的理由隐含在研究目标的两个特征中：①设计空间维度极多（模型 $\times$ 切分 $\times$ 批 $\times$ 比例 $\times$ 流量 $\times$ 硬件），真实集群只能测其中一小撮，无法支撑系统性的"何时分离有利"判断；②分离的核心效益对比对象（合设部署）本身需要同等细粒度的对照—— piggybacked co-located 与非 piggybacked co-located 同时评估<sup>[C16]</sup>，模拟器才能一致地做这件事。模拟研究的代价是失去了真实系统的小细节（如碎片、调度异常），收益是第一次能在统一方法下看到整个 Pareto 前沿的形状。</p>
+<p>为什么选择模拟而非实测？论文未说明理由；从研究目标可推断两个特征：①设计空间维度极多（模型 $\times$ 切分 $\times$ 批 $\times$ 比例 $\times$ 流量 $\times$ 硬件），真实集群只能测其中一小撮，无法支撑系统性的"何时分离有利"判断；②分离的核心效益对比对象（合设部署）本身需要同等细粒度的对照—— piggybacked co-located 与非 piggybacked co-located 同时评估<sup>[C16]</sup>，模拟器才能一致地做这件事。模拟研究的代价是失去了真实系统的小细节（如碎片、调度异常），收益是第一次能在统一方法下看到整个 Pareto 前沿的形状。</p>
 
 <p>图 1 给出了论文的标志性结果——DeepSeek-R1 在两种流量设置下的吞吐-交互性 Pareto：左侧 prefill-heavy（ISL 16k OSL 2k）分离显著优于 piggybacked co-located，右侧 generation-heavy（ISL 1k OSL 32k）两者差距小得多。</p>
 
@@ -251,11 +251,11 @@
 <li>对每个候选 decode 配置（含 TTL）：先算 decode_request_throughput = decode_throughput / (OSL − 1)<sup>[App.B, line 46]</sup>（每个请求除首 token 外的总生成 token 数），用整数求解器求近似整数比 $\alpha$=best_prefill_throughput / decode_request_throughput（按 tolerance=0.03 取整为分数 num/den），分配 num $\times$ G_dec 个 prefill GPU 与 den $\times$ G_prefill 个 decode GPU；记录该配置下的系统总吞吐。</li>
 </ol>
 
-<p>该算法给出的"最优 ctx:gen GPU 比例"随模型与目标延迟大幅变化。图 9 用 ISL 16k OSL 2k 的设置画四个模型：LLaMa-8B 几乎水平$\approx$0.4；LLaMa-70B 从约 0.95（低 TPS）缓慢降到约 0.45（高 TPS）；LLaMa-405B 从约 2.1 降到约 0.3；DeepSeek-R1 从约 3.6 降到约 0.05，跨度极大<sup>[C20, G6]</sup>。</p>
+<p>该算法给出的"最优 ctx:gen GPU 比例"随模型与目标延迟大幅变化。图 9 用 ISL 16k OSL 2k 的设置画四个模型：LLaMa-8B 几乎水平$\approx$0.4；LLaMa-70B 从约 0.95（低 TPS）缓慢降到约 0.45（高 TPS）；LLaMa-405B 从约 2.1 降到约 0.2；DeepSeek-R1 从约 3.6 降到约 0.05，跨度极大<sup>[C20, G6]</sup>。</p>
 
-<img src="assets/img-03.webp" alt="Fig.9 ISL 16k OSL 2k 下四个模型的最优 Ctx:Gen GPU 比例随 tokens/s/user 变化。LLaMa-8B 几乎水平、约 0.4；LLaMa-70B 从约 0.95 降到约 0.45；LLaMa-405B 从约 2.1 降到约 0.3；DeepSeek-R1 从约 3.6 降到约 0.05（变化最剧烈）。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
+<img src="assets/img-03.webp" alt="Fig.9 ISL 16k OSL 2k 下四个模型的最优 Ctx:Gen GPU 比例随 tokens/s/user 变化。LLaMa-8B 几乎水平、约 0.4；LLaMa-70B 从约 0.95 降到约 0.45；LLaMa-405B 从约 2.1 降到约 0.2；DeepSeek-R1 从约 3.6 降到约 0.05（变化最剧烈）。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
-<p>这条曲线的物理含义：随延迟收紧（高 TPS 端），decode 池的每 GPU 吞吐上升（批小、TTL 紧），prefill 池的处理能力相对需要更少 GPU；比例随之下移。变化剧烈的原因是不同模型的 TP/EP 调整能力差异——DeepSeek-R1 的 EP 可调性高，所以比例跨度大。结论：通用分离系统必须内置动态 rate matching，不能预编译一个固定比例<sup>[C20]</sup>。</p>
+<p>这条曲线的物理含义：随延迟收紧（高 TPS 端），decode 池的每 GPU 吞吐上升（批小、TTL 紧），prefill 池的处理能力相对需要更少 GPU；比例随之下移。论文未解释不同模型的跨度为何差异巨大；一种页面推断是各模型的 TP/EP 可调整能力不同——EP 可调性更高的模型（如 DeepSeek-R1）比例跨度更大（页面推断，论文未给出该机制）。结论：通用分离系统必须内置动态 rate matching，不能预编译一个固定比例<sup>[C20]</sup>。</p>
 
 <p>固定比例的退化如图 10。DeepSeek-R1、ISL 16k OSL 2k 下：比例 0.5 在低 tokens/s/user（宽松延迟）端被卡在约 0.4 的吞吐（无法满足低 TPS 区的请求量），但在高 TPS 端（紧延迟）相对较好；比例 3.5 在低 TPS 端接近 Optimal Rate Matching，但在高 TPS 端退化明显<sup>[C21, G7]</sup>。Optimal Rate Matching（动态调整比例）蓝线在全区间都最高——证明动态性不可省。</p>
 
@@ -324,9 +324,9 @@
 
 <p>模型规模也有间接影响：FTL 随活跃参数数线性增长，但 KV 大小不随参数量同比例增长<sup>[F5]</sup>；带优化注意力（MLA）的更大模型 egress 需求可能低于注意力架构低效的小模型<sup>[F5, 推断]</sup>。MLA 在合设下有额外开销（§2.3），但在带宽维度反而可能更有利（KV 头数少，egress 量低）——两条机制方向相反。</p>
 
-<p>论文的模拟结果（图 12）：DeepSeek-R1、(ISL 16k, OSL 2k) 与 (ISL 1M, OSL 2k) 两组序列长度组合、多档 TTL 下，egress/ingress 带宽需求约在 0.4–1.8 GB/s/GPU 之间<sup>[C8, N8, G8]</sup>。具体观察：</p>
+<p>论文的模拟结果（图 12）：DeepSeek-R1、(ISL 16k, OSL 2k) 与 (ISL 1M, OSL 2k) 两组序列长度组合、多档 TTL 下，egress 与 ingress 两者较大者的带宽需求约在 0.4–1.8 GB/s/GPU 之间（图 12 纵轴取 egress 与 ingress 的较大值，原图注为 "Maximum of egress and ingress bandwidth across various TTLs"）<sup>[C8, N8, G8]</sup>。具体观察：</p>
 
-<img src="assets/img-01.webp" alt="Fig.12 DeepSeek-R1 KV Transfer Requirements：x 轴 Normalized Tokens/s/user，y 轴 Bandwidth/GPU (GBps/GPU)。蓝线 (ISL 16k, OSL 2k) 范围约 0.4–1.2；红线 (ISL 1M, OSL 2k) 范围约 1.0–1.8。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
+<img src="assets/img-01.webp" alt="Fig.12 DeepSeek-R1 KV Transfer Requirements：x 轴 Normalized Tokens/s/user，y 轴 Bandwidth/GPU (GBps/GPU)，取 egress 与 ingress 的较大值。蓝线 (ISL 16k, OSL 2k) 范围约 0.4–1.2；红线 (ISL 1M, OSL 2k) 范围约 1.0–1.8。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
 <p>论文据此判断带宽不是分离的根本瓶颈："Our analysis indicates that existing provisioned datacenter bandwidth is sufficient to support KV cache transfer without becoming a bottleneck"——模拟所需的每卡带宽落在现有数据中心已配置的供给能力之内<sup>[C8]</sup>。</p>
 
@@ -384,7 +384,7 @@
 <p>论文的"首次系统研究"价值来自方法的一致性，但也受方法本身的限制。读者把论文结论迁移到自己的系统时需要明确以下边界<sup>[C9, C19, C23, C25]</sup>：</p>
 
 <ul>
-<li><b>模拟器性质</b>。所有数据来自专有模拟器，非真实集群实测<sup>[C5]</sup>。模拟器内部建模方法（如何估计注意力时间、显存压力、调度开销）未公开；论文承认缺乏细节的"小细节"（如显存碎片、调度异常）可能被忽略。</li>
+<li><b>模拟器性质</b>。所有数据来自专有模拟器，非真实集群实测<sup>[C5]</sup>。模拟器内部建模方法（如何估计注意力时间、显存压力、调度开销）未公开；论文未说明模拟器如何处理显存碎片、调度异常等真实系统细节，这些细节可能未被建模（页面推断，论文未作此表述）。</li>
 <li><b>归一化数字</b>。所有图归一化呈现<sup>[C9]</sup>，不能直接当某配置的预期吞吐；要拿到绝对数字需要用自己的工作负载与硬件配置在模拟器上重跑（论文模拟器未公开）或实测。</li>
 <li><b>硬件语境</b>。聚焦现代 Blackwell 系统与 FP4 精度<sup>[C6]</sup>；外推到 H100/A100 或其他精度时需重新验证。</li>
 <li><b>流量模型</b>。常数 ISL/OSL 的 P50 近似，已在附录 C 验证<sup>[C19, G9]</sup>；极端多峰分布（如长尾高度倾斜）未在论文验证范围内。</li>
@@ -406,7 +406,7 @@
 </details>
 </li>
 <li>
-<p>论文的方法有什么关键限制，结论能直接外推到我的系统吗？</p>
+<p>论文的方法有什么关键限制，结论能否直接外推到其他系统？</p>
 <details>
 <summary>解答：模拟器、归一化、Blackwell+FP4、P50 近似；不能直接外推绝对数字</summary>
 <p>四个直接限制：①模拟器性质（无实测、内部建模未公开）<sup>[C5]</sup>；②归一化数字（无绝对值）<sup>[C9]</sup>；③硬件语境是 Blackwell + FP4<sup>[C6]</sup>；④流量用常数 ISL/OSL 的 P50 近似<sup>[C19]</sup>。结论能外推什么：①趋势性论断（prefill-heavy 收益大、动态 rate matching 关键、带宽足够）——这些是机制性结论，与具体硬件相关性较低，可以外推到相似的分离式部署；②配置性数字（最优 ctx:gen 比例、具体 TP 维度）——这些强依赖模拟器的硬件与流量假设，外推到其他硬件/工作负载时数字可能不同。结论不能外推什么：①绝对吞吐数字（归一化无意义）；②FTL&gt;10s 场景（不在搜索空间）<sup>[C7]</sup>；③超大规模或极端多峰分布（未在论文验证）。要拿绝对数字需要用自己的配置实测或在更细的模拟上重跑。</p>

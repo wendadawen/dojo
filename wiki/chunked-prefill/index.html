@@ -249,7 +249,7 @@
 
 <p>注意"最多低一个数量级"不是零：搭车 decode 仍占批容量与少量计算，说"完全免费"是错的<sup>[C7]</sup>。这个论证的前提是 chunk 够大以饱和算力——512 token 在 A6000/LLaMA-13B 上就够<sup>[C3, N2]</sup>，chunk 远小于饱和点时"免费"程度弱化。</p>
 
-<p>chunked prefill 与 piggybacking 是相互成就的：一个 prefill 只有一次，但切成 $N$ 块就有 $N$ 个搭车机会。不切块时，批里要么是纯 prefill（decode 停摆）、要么是纯 decode（算力闲置）；切块后每个 chunk 迭代都能带上 decode<sup>[C8]</sup>。</p>
+<p>chunked prefill 与 piggybacking 是相互成就的：一个 prefill 只有一次，但切成 $N$ 块就有 $N$ 个搭车机会。不切块时，一次 prefill 只能构造一次混合批次——那一次迭代装下整个 prompt，同批 decode 在这段长迭代里停摆；切块后每个 chunk 迭代都能带上 decode，搭车机会从 1 次变成 $N$ 次<sup>[C8]</sup>。</p>
 
 <h3 id="stall-free">3.2 stall-free：token budget 上界</h3>
 
@@ -310,7 +310,7 @@
 
 <p>前面几章都在单卡（或单实例）语境下讨论。当部署是流水线并行（PP）时，chunked prefill 顺带解决了另一个问题：流水线气泡。</p>
 
-<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，流水线被均匀地填满，双重气泡都被压缩<sup>[C14]</sup>。Sarathi 在 GPT-3 流水线部署上实测气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。CPP 均的是块与块之间的时长；流水线各 stage 的忙闲不均还有更一般的两类对策（token 维切分与 batch 维配平），整理见 <a href="../pp-load-balancing/index.html">PP 负载均衡</a>。</p>
+<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，负载性气泡（时长不均）被消除<sup>[C14]</sup>；切块同时使 micro-batch 数增多，结构性的填充期/排空期气泡随之被摊薄（基于证据的推断：由 micro-batch 数增加推出）。Sarathi 在 GPT-3 流水线部署上实测气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。CPP 均的是块与块之间的时长；流水线各 stage 的忙闲不均还有更一般的两类对策（token 维切分与 batch 维配平），整理见 <a href="../pp-load-balancing/index.html">PP 负载均衡</a>。</p>
 
 <p>CPP 在 Beyond the Buzz 论文（PD 分离设计的系统性研究）中成为 prefill 池的标准答案：分离部署里 FTL（First Token Latency，首 token 延迟）约束只作用于 prefill 池，DeepSeek-R1 在 ISL（Input Sequence Length，输入序列长度）256K、64 GPU（EP（Expert Parallelism，专家并行）$\times$ PP = 64）的模拟中，增大 PP 维度持续降低 FTL 而吞吐基本保持——CPP 是严格 FTL SLA 下兼顾高吞吐的最优策略<sup>[C16]</sup>。同一论文还发现 co-located 基线里的 piggybacking 对注意力架构敏感：DeepSeek-R1 的 MLA（Multi-head Latent Attention，多头潜在注意力）在 chunked piggyback 下每个块都要重算 down/up 投影，产生额外开销（可临时缓存上投影 KV 缓解）<sup>[C17]</sup>——这是第 2 章"切块代价"在特定架构上的又一实例。完整讨论见 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页。</p>
 
@@ -320,7 +320,7 @@
 <p>为什么等大的块能消掉流水线气泡，而"不等大的原始请求"不能？</p>
 <details>
 <summary>解答：气泡的第二来源是 micro-batch 时长不均，等大块把它抹平</summary>
-<p>PP 气泡有两个来源：一是结构性的填充期/排空期（见模型并行页，靠增大 micro-batch 数摊薄）；二是负载性的时长不均——不同请求的 prompt 长短不一、prefill 与 decode 迭代耗时差几个数量级，一个长 micro-batch 会让后面所有 stage 的节奏被拖住，短 micro-batch 让 stage 空等。chunked prefill 把一切长 prefill 切成等计算量的块，每个 slot 的耗时近乎一致，第二重气泡被消除，第一重也被均匀的 micro-batch 流压缩——Sarathi 实测 GPT-3 流水线部署气泡缩小 6.29 倍、吞吐提升 1.91 倍<sup>[C14, N4]</sup>。原始请求直接当 micro-batch 时长短不一，两重气泡都占。</p>
+<p>PP 气泡有两个来源：一是结构性的填充期/排空期（见模型并行页，靠增大 micro-batch 数摊薄）；二是负载性的时长不均——不同请求的 prompt 长短不一、prefill 与 decode 迭代耗时差几个数量级，一个长 micro-batch 会让后面所有 stage 的节奏被拖住，短 micro-batch 让 stage 空等。chunked prefill 把一切长 prefill 切成等计算量的块，每个 slot 的耗时近乎一致，第二重气泡被消除<sup>[C14]</sup>，第一重也被均匀的 micro-batch 流压缩（基于证据的推断：切块后 micro-batch 数增多，填充期/排空期被摊薄）——Sarathi 实测 GPT-3 流水线部署气泡缩小 6.29 倍、吞吐提升 1.91 倍<sup>[C14, N4]</sup>。原始请求直接当 micro-batch 时长短不一，两重气泡都占。</p>
 </details>
 </li>
 <li>
@@ -380,7 +380,7 @@
 
 <h3>构造示例</h3>
 <ul>
-<li>8000 token prompt / 512 每块 / 16 块（末块 320 token）/ 64 个 decode 请求：贯穿示例的整数化设定，说明切块与搭车机制，非实测工作负载。</li>
+<li>8000 token prompt 按 512 一块切成 16 块（末块 320 token）：第 2 章的整数化构造示例，说明切块机制，非实测工作负载。</li>
 <li>4096 token 切 8 块（28 块次）vs 4 块（6 块次）：验证 F1 的平方量级增长。</li>
 <li>$\tau = 512$、64 decode + 448 chunk 的迭代构成：说明 token budget 机制。</li>
 </ul>

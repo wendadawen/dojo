@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="MoE 权重占参数 95%+，跨阶段共享专家消除冗余、分离 attention 保住本地算力；APK 在 tile 边界（2.2–25.3 微秒、与序列长度无关）有界抢占与重分配；attention 发起的一侧通信去掉 MoE 侧协调、消除跨阶段死锁。goodput 达 PD 分离 2.01×、PD 合设 1.66×。基于 arXiv:2607.18002v2 原文逐条核对。">
+  <meta name="description" content="MoE 权重占参数 95%+，跨阶段共享专家消除冗余、分离 attention 保住本地算力；APK 在 tile 边界（2.2–25.3 微秒、与序列长度无关）有界抢占与重分配；attention 发起的一侧通信去掉 MoE 侧协调、消除跨阶段死锁。goodput 达 PD 分离 2.01×、对 PDMux 1.66×。基于 arXiv:2607.18002v2 原文逐条核对。">
   <meta name="dojo:summary" content="让 prefill 与 decode 共享 MoE 专家、分别保留 attention 资源。Adaptive Persistent Kernel 在 tile 边界完成有界抢占与重分配，并通过单侧通信消除跨阶段协调与死锁。">
   <meta name="dojo:type" content="paper">
   <meta name="dojo:topics" content="推理系统">
@@ -113,7 +113,7 @@
       <p>ExpertPlex 的 goodput 提升有多大，结论在什么条件下成立？</p>
       <details>
       <summary>解答：对 PDD 最高 2.01×，条件绑定栈与规模</summary>
-      <p>最优数字是 MiniMax-M2.7 + ShareGPT 上的 11.3 req/s/node：对 ChunkedPrefill 5.65×、对 Colocated 2.72×、对 PDD 2.01×、对 PDMux 1.41×；PD 合设口径下（GLM-5.1-FP8 + LooGLE）为 1.66×。成立条件：SGLang + DeepGEMM + DeepEP v1 栈、8×H800、至多 3 节点、四组 SLO 与 P90 goodput 口径；GLM + ShareGPT 上对 PDMux 持平是必须记住的反例。完整论证见「6. 实验：提升多少，在什么条件下成立」。</p>
+      <p>最优数字是 MiniMax-M2.7 + ShareGPT 上的 11.3 req/s/node：对 ChunkedPrefill 5.65×、对 Colocated 2.72×、对 PDD 2.01×、对 PDMux 1.41×；GLM-5.1-FP8 + LooGLE 上对 PDMux 为 1.66×。成立条件：SGLang + DeepGEMM + DeepEP v1 栈、8×H800、至多 3 节点、四组 SLO 与 P90 goodput 口径；GLM + ShareGPT 上对 PDMux 持平是必须记住的反例。完整论证见「6. 实验：提升多少，在什么条件下成立」。</p>
       </details>
     </li>
   </ol>
@@ -144,13 +144,13 @@
 
 <p><strong>PD 合设（colocation）</strong>反过来：两阶段共享同一实例，省掉副本。为避免互相干扰，现有系统用 NVIDIA 的 <a href="../gpu-execution-model/index.html">Green Context</a> 在一张卡里按阶段圈定各自的 SM [C3]。</p>
 
-<p>Green Context 的限制在 GPU 执行模型页讲过：SM 分区在创建时固定，<strong>kernel 运行期间不能重新划分</strong>，要改得销毁重建 [C3]。但 MoE 的负载是动态的，沿三个维度变：第一，EP 下每层每张卡激活的专家数和 token 数都在变；第二，同一层里 attention 和 MoE 的资源需求不同；第三，一个 MoE 模块内部在 dispatch、专家计算、combine 之间切换，瓶颈在通信和计算之间漂移。固定切分追不上这些变化 [C3]。</p>
+<p>Green Context 的限制在 GPU 执行模型页讲过：SM 分区在创建时固定，<strong>kernel 运行期间不能重新划分</strong>，改配额需要 CPU 介入、且要等 kernel 结束，因此只能在 prefill 层边界重划分 [C3]。但 MoE 的负载是动态的，沿三个维度变：第一，EP 下每层每张卡激活的专家数和 token 数都在变；第二，同一层里 attention 和 MoE 的资源需求不同；第三，一个 MoE 模块内部在 dispatch、专家计算、combine 之间切换，瓶颈在通信和计算之间漂移。固定切分追不上这些变化 [C3]。</p>
 
 <p>固定切分会产生两种失败模式：</p>
 
 <p>下图展示 PD 合设在固定切分下的两种失败：prefill 占了太多 SM 时，就绪的 decode 被挡住（队头阻塞）；为 decode 留的 SM 没活干时，prefill 又用不上（资源气泡）。</p>
 <img src="assets/img-06.webp" alt="PD 合设的两种失败模式：队头阻塞与资源气泡">
-<p><b>图（原文 Figure 2）</b>：左侧是 head-of-line blocking——一个不可抢占的长 prefill kernel 占着 SM，延迟敏感的 decode 只能等；右侧是 resource bubble——为 decode 预留的 SM 在它没就绪工作时闲置，prefill 想用也用不上。论文给的数量级差距很关键：prefill kernel 能跑几十到几百毫秒，decode kernel 只要几百微秒，差好几个数量级 [C4]。代入以上数字：那个 2 毫秒的 prefill GEMM 如果挡住 decode，decode 要白白等 84–101 倍于自己执行的时间 [C5]。</p>
+<p><b>图（原文 Figure 2）</b>：左面板是切分总览——每张卡被切成 Prefill 2/3 与 Decode 1/3，每个阶段拿到的本地资源随之减少，要达到同样的延迟目标就得用更高的并行度（图内标注 Larger DoP!：prefill 1.5×、decode 2×），两阶段的 dispatch/combine 还会互相干扰（Network Interference!）。右面板是单卡时间线：prefill 占位时，就绪的 decode 启动点被挡在它后面（Blocking!）；为 decode 预留的 SM 在它没就绪工作时闲置，在时间线右端形成斜纹的 resource bubble（Bubble!）——两种失败模式都发生在右侧这条时间线面板里。论文给的数量级差距很关键：prefill kernel 能跑几十到几百毫秒，decode kernel 只要几百微秒，差好几个数量级 [C4]。代入以上数字：那个 2 毫秒的 prefill GEMM 如果挡住 decode，decode 要白白等 84–101 倍于自己执行的时间 [C5]。</p>
 
 <p>合设还有个没解决的毛病：每张 GPU 都被切分，每个阶段拿到的本地资源更少，要达到同样的延迟目标就得用更宽的并行度，通信更多，而 prefill 和 decode 的 dispatch/combine 还挤在同一条网络上互相干扰 [C3]。</p>
 
@@ -169,7 +169,7 @@
     <p>Green Context 为什么追不上 MoE 的动态负载？列出负载变化的三个维度。</p>
     <details>
     <summary>解答：分区在 kernel 期间固定，负载沿三个维度变</summary>
-    <p>Green Context 的 SM 分区在创建时固定，kernel 运行期间不能重新划分，要改就得销毁重建。而 MoE 负载沿三个维度动态变化：EP 下每层每张卡激活的专家数和 token 数在变；同一层里 attention 和 MoE 的资源需求不同；一个 MoE 模块内部在 dispatch、专家计算、combine 之间切换，瓶颈在通信和计算之间漂移。固定切分对这三个维度都无响应。</p>
+    <p>Green Context 的 SM 分区在创建时固定，kernel 运行期间不能重新划分，改配额需要 CPU 介入、且要等 kernel 结束，因此只能在 prefill 层边界重划分。而 MoE 负载沿三个维度动态变化：EP 下每层每张卡激活的专家数和 token 数在变；同一层里 attention 和 MoE 的资源需求不同；一个 MoE 模块内部在 dispatch、专家计算、combine 之间切换，瓶颈在通信和计算之间漂移。固定切分对这三个维度都无响应。</p>
     </details>
   </li>
   <li>
@@ -245,7 +245,7 @@
 </tbody>
 </table>
 </div>
-<p>逐个对照现有机制：API 拦截只有启动边界的时间复用，缺图兼容、空间复用和有界抢占；CUDA stream 有图兼容和启动排序，但启动后无空间隔离也无有界交接；MPS 和 Green Context 有图兼容的空间复用，但 kernel 期间固定，缺运行内时间复用和有界抢占/重分配；MIG 硬隔离但档位死（H100 只暴露 1g/2g/3g/4g/7g 五档，唯一能让两阶段合用满卡算力的两路划分是 3g–4g）、无时间复用、重配置延迟无界 [C7][C19]。APK 是上述机制中唯一五条全占的。</p>
+<p>逐个对照现有机制：API 拦截只有启动边界的时间复用，缺图兼容、空间复用、有界抢占和有界重分配；CUDA stream 有图兼容和启动排序，但启动后无空间隔离也无有界交接；MPS 和 Green Context 有图兼容的空间复用，但 kernel 期间固定，缺运行内时间复用和有界抢占/重分配；MIG 硬隔离但档位死（H100 只暴露 1g/2g/3g/4g/7g 五档，唯一能让两阶段合用满卡算力的两路划分是 3g–4g）、无时间复用、重配置延迟无界 [C7][C19]。APK 是上述机制中唯一五条全占的。</p>
 
 <h3 id="ch3-tile">3.2 为什么选 tile 当调度单位</h3>
 
@@ -559,7 +559,7 @@
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（权重占比 95%+/96%/98%）§2.1；C2（PDD 部署单元 32P+320D 等）§1/§2.4；C3（Green Context kernel 期间固定）§1/§2.5；C4（prefill 数十至数百毫秒 vs decode 数百微秒）§2.5；C5（EP4 MiniMax decode 17.7–34.7 微秒 vs prefill 16K 1.8–2.9 毫秒，84–101×）§4.1；C6（共享专家+分离 attention 架构）§3/Figure 3；C7（APK tile 调度、边界 2.2–25.3 微秒、有界抢占上界、$q'$ 公式）§4.2/§4.3/§6.4；C8（一侧 push/pull、WaitDone）§5.1/§5.2；C9（分层 prefill 路径、虚拟通道优先级）§5.3；C10（APK 唯一进入低延迟区）§7.3/Figure 11；C11（APK 预分配 buffer 是一侧通信前提）§5.2；C12（MiniMax+ShareGPT 11.3 及各倍数）§7.2；C13（MiniMax+LooGLE 倍数、ChunkedPrefill 无法满足 SLO）§7.2；C14（GLM 各组倍数、ShareGPT 持平、LooGLE 1.66×）§7.2；C15（CUDA stream +13.79×、MPS 3.33×、Green Context 4.07×、APK +8%/1.12×）§7.3/Figure 12；C16（调度开销 &lt;12%/&lt;20 微秒）§7.4/Figure 13；C17（通信差 ~5%/~45 微秒）§7.5/Figure 14；C18（间隔 &lt;25.3 微秒/GEMM &lt;10.7 微秒、REEF 35 微秒）§7.6/Figure 15；C19（H100 MIG 1g/2g/3g/4g/7g，3g-4g 唯一用满）§4.1；C20（H800 NVLink 160GB/s vs IB 50GB/s，3.2×）§5.1；C21（跨栈联合搜索、tile 感知延迟模型、离线二分搜索）§6.1–§6.4。</p>
+<p>C1（权重占比 95%+/96%/98%）§2.1；C2（PDD 部署单元 32P+320D 等）§1/§2.4；C3（Green Context kernel 期间固定）§1/§2.5；C4（prefill 数十至数百毫秒 vs decode 数百微秒）§2.5；C5（EP4 MiniMax decode 17.7–34.7 微秒 vs prefill 16K 1.8–2.9 毫秒，84–101×）§4.1；C6（共享专家+分离 attention 架构）§3/Figure 3；C7（五个共享性质与 Table 1 机制对照、APK tile 调度、边界 2.2–25.3 微秒、有界抢占上界、$q'$ 公式）§4.1/§4.2/§4.3/§6.4；C8（一侧 push/pull、WaitDone）§5.1/§5.2；C9（分层 prefill 路径、虚拟通道优先级）§5.3；C10（APK 唯一进入低延迟区）§7.3/Figure 11；C11（APK 预分配 buffer 是一侧通信前提）§5.2；C12（MiniMax+ShareGPT 11.3 及各倍数）§7.2；C13（MiniMax+LooGLE 倍数、ChunkedPrefill 无法满足 SLO）§7.2；C14（GLM 各组倍数、ShareGPT 持平、LooGLE 1.66×）§7.2；C15（CUDA stream +13.79×、MPS 3.33×、Green Context 4.07×、APK +8%/1.12×）§7.3/Figure 12；C16（调度开销 &lt;12%/&lt;20 微秒）§7.4/Figure 13；C17（通信差 ~5%/~45 微秒）§7.5/Figure 14；C18（间隔 &lt;25.3 微秒/GEMM &lt;10.7 微秒、REEF 35 微秒）§7.6/Figure 15；C19（H100 MIG 1g/2g/3g/4g/7g，3g-4g 唯一用满）§4.1；C20（H800 NVLink 160GB/s vs IB 50GB/s，3.2×）§5.1；C21（跨栈联合搜索、tile 感知延迟模型、离线二分搜索）§6.1–§6.4。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1 goodput $G(\ell,q)=\min(B_p/T_p,\,B_d/(T_d\bar O))$ §6.1 Eq.(1)；F2 延迟拟合 $\hat t_c=\alpha+\beta x+\gamma xs+\delta xs^2$ §6.2 Eq.(2)；F3 tile 足迹 $x_{\mathrm{moe}}=\sum\lceil m_e/M_t\rceil$ §6.2 Eq.(3)；F4 在线重分配 $q'=\min(Q_{\max},\lceil q\,x_{\mathrm{moe}}/x_{\mathrm{moe}}^\star\rceil_c)$ §6.4 Eq.(4)。</p>

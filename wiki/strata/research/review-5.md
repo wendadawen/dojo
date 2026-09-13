@@ -27,11 +27,11 @@ reviewed_content_sha256: 860c4519b81b083f
 
 ## 问题
 
-- [重要·技术] 第 70 行（导言"三个机制"段末）："短上下文不退化"标注 `<sup>[C26]</sup>`，但本页来源说明（第 621 行）把 C26 定义为"ROCm 兼容 见 §4.2 L55"，与短上下文无关；同一论断在第 543 行用的是 [C24]（§5.2.3 L106–111），自相矛盾。｜引文依据：论文 §5.2.3 "underlying SGLang engine exhibits a slight performance disadvantage compared to the base engines of vLLM and TensorRT-LLM on the Llama-8B and -70B models due to kernel differences"（短上下文证据）；§4.2 L55 为 ROCm 后端兼容声明。｜修复要求：将第 70 行的 [C26] 改为 [C24]。｜修复：｜复验：
+- [重要·技术] 第 70 行（导言"三个机制"段末）："短上下文不退化"标注 `<sup>[C26]</sup>`，但本页来源说明（第 621 行）把 C26 定义为"ROCm 兼容 见 §4.2 L55"，与短上下文无关；同一论断在第 543 行用的是 [C24]（§5.2.3 L106–111），自相矛盾。｜引文依据：论文 §5.2.3 "underlying SGLang engine exhibits a slight performance disadvantage compared to the base engines of vLLM and TensorRT-LLM on the Llama-8B and -70B models due to kernel differences"（短上下文证据）；§4.2 L55 为 ROCm 后端兼容声明。｜修复要求：将第 70 行的 [C26] 改为 [C24]。｜修复：已把导言"三个机制"段末短上下文论断的来源标注由 [C26] 改为 [C24]（C24 对应 §5.2.3 短上下文证据，定义见第 621 行），与第 543 行一致。｜复验：已复跑 `.dojo/scripts/validate.py wiki/strata/index.html`（exit 0）并核对第 70 行。
 
-- [轻微·格式] 全文倍数写法不统一：表格与部分正文用 ASCII "x"（如第 102、479、487–491、496、500、513、548、551 行，共 43 处 "Nx"），同一句内又与 KaTeX `$\times$` 混用——第 102 行"分别 3.2$\times$/2.6$\times$/1.9$\times$；…调度单独 1.8x、I/O 单独 2.3x"；站内其他论文页（如 kv-cache 全用 `\times`）无此写法，本页为孤例，与 check.md #11"同一写法全页一致"不符。｜引文依据：不适用。｜修复要求：把正文与表格中的 "Nx" 统一改写为 `$N\times$`。｜修复：｜复验：
+- [轻微·格式] 全文倍数写法不统一：表格与部分正文用 ASCII "x"（如第 102、479、487–491、496、500、513、548、551 行，共 43 处 "Nx"），同一句内又与 KaTeX `$\times$` 混用——第 102 行"分别 3.2$\times$/2.6$\times$/1.9$\times$；…调度单独 1.8x、I/O 单独 2.3x"；站内其他论文页（如 kv-cache 全用 `\times`）无此写法，本页为孤例，与 check.md #11"同一写法全页一致"不符。｜引文依据：不适用。｜修复要求：把正文与表格中的 "Nx" 统一改写为 `$N\times$`。｜修复：已把正文与表格中全部 43 处 "Nx" 改写为 `$N\times$`（含第 81、101、102、463、479、487–491、496、500、513、548、551、627 行），全文已无 "Nx" 残留，与站内其它论文页写法一致。｜复验：已复跑 `.dojo/scripts/validate.py wiki/strata/index.html`（exit 0）。
 
-- [轻微·可读性] 第 139 行引号错位："分层缓存解决了"存得下"，但搬回来"成为"了新的瓶颈"——引号落在"成为"上，破坏了与"存得下"的并列（同页第 145 行正确写法为"搬回来"正是瓶颈所在）。｜引文依据：不适用。｜修复要求：改为"…但"搬回来"成为了新的瓶颈"。｜修复：｜复验：
+- [轻微·可读性] 第 139 行引号错位："分层缓存解决了"存得下"，但搬回来"成为"了新的瓶颈"——引号落在"成为"上，破坏了与"存得下"的并列（同页第 145 行正确写法为"搬回来"正是瓶颈所在）。｜引文依据：不适用。｜修复要求：改为"…但"搬回来"成为了新的瓶颈"。｜修复：已把第 139 行"但搬回来"成为"了新的瓶颈"改为"但"搬回来"成为了新的瓶颈"。｜复验：已复跑 `.dojo/scripts/validate.py wiki/strata/index.html`（exit 0）并核对第 139 行。
 
 ## 结论
 

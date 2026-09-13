@@ -63,7 +63,7 @@
 </blockquote>
 
 <div class="callout callout-blue">
-<p>DFlash 的草稿块一次前向就写完，但块里 8 个位置是「各写各的」——每个位置独立挑自己最可能的 token，两个相邻位置可能挑出同一个词（stutter），验证时整块被截断。DFlash 2 是 2026-08-18 Inco AI 发布的第二代草稿器：<b>不放弃并行</b>，把「挑」和「稳」分开修——加一个路径选择器把「独立 top-1」的失败串成连贯路径，加一个两抽头动态卷积把块末端的准确率衰减补上来。两个组件总共 <code>+1.3%</code> 循环延迟，换来 <code>16–25%</code> 的接受长度提升。</p>
+<p>DFlash 的草稿块一次前向就写完，但块内各位置是「各写各的」——每个位置独立挑自己最可能的 token，两个相邻位置可能挑出同一个词（stutter），验证时整块被截断。DFlash 2 是 2026-08-18 Inco AI 发布的第二代草稿器：<b>不放弃并行</b>，把「挑」和「稳」分开修——加一个路径选择器把「独立 top-1」的失败串成连贯路径，加一个两抽头动态卷积把块末端的准确率衰减补上来。两个组件总共 <code>+1.3%</code> 循环延迟，换来 <code>16–25%</code> 的接受长度提升。</p>
 </div>
 
 <p>DFlash 2 不是一篇新论文、不是新独立语言模型——它是一份草稿器的工程迭代，由博客 + 两份开源草稿模型权重（Qwen3.8-27B-DFlash2、Muse-Glimmer-30B-DFlash2）发布；它构建在 DFlash 的单步并行起草之上，加两个轻量组件修复 DFlash 剩下的两个问题。本文围绕这两个组件的机制、证据和边界展开，DFlash 自身的 KV 注入、单步起草、训练方法见 <a href="../dflash/index.html">DFlash 论文解析</a>，块扩散范式本身见 <a href="../block-diffusion/index.html">块扩散</a>。</p>
@@ -91,14 +91,14 @@
       <p>后缀衰减为什么是局部问题，两抽头卷积怎么修？</p>
       <details>
         <summary>解答：块内依赖主要是相邻短程；两抽头卷积 $\mathrm{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}$ 让当前位置看到前一位，首位读已验证 token</summary>
-        <p>证据链——3L/5L/15L DFlash 在首位几乎相同（85.21/85.39/86.42%）、沿块逐渐拉开（末位 64.97/72.86/78.73%），深度帮助后段但 indiscriminate<sup>[C8, N3]</sup>；块内注意力份额从第 1 层约 30% 掉到第 5 层约 8%，且集中于少数头——注意力的两份工作（读上下文 vs 建块内依赖）失衡<sup>[C9]</sup>。修法：在每层每个 attention 与 FFN 子层前后插两抽头动态深度卷积 $\mathrm{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}$<sup>[F2, C10]</sup>，系数由学习基核+当前隐状态的小修正组成（每 16 通道共享一个修正）；首位读上一个已验证 token 的表示<sup>[C10]</sup>。<code>+16.5M</code> 参数（<code>3%</code>）、<code>+0.7%</code> 循环延迟；五层+卷积接近十五层效果，第 4–5 层块内注意力平均份额从 9.4% 降到 0.5%<sup>[C11, N3]</sup>。详见「3. 两抽头卷积——给块末端补上「看见前一位」的通道」。</p>
+        <p>证据链——3L/5L/15L DFlash 在首位几乎相同（85.21/85.39/86.42%）、沿块逐渐拉开（末位 64.97/72.86/78.73%），深度帮助后段但无差别<sup>[C8, N3]</sup>；块内注意力份额从第 1 层约 30% 掉到第 5 层约 8%，且集中于少数头——注意力的两份工作（读上下文 vs 建块内依赖）失衡<sup>[C9]</sup>。修法：在每层每个 attention 与 FFN 子层前后插两抽头动态深度卷积 $\mathrm{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}$<sup>[F2, C10]</sup>，系数由学习基核+当前隐状态的小修正组成（每 16 通道共享一个修正）；首位读上一个已验证 token 的表示<sup>[C10]</sup>。<code>+16.5M</code> 参数（<code>3%</code>）、<code>+0.7%</code> 循环延迟；五层+卷积接近十五层效果，第 4–5 层块内注意力平均份额从 9.4% 降到 0.5%<sup>[C11, N3]</sup>。详见「3. 两抽头卷积——给块末端补上「看见前一位」的通道」。</p>
       </details>
     </li>
     <li>
       <p>两个组件合起来收益多少、开销多大？</p>
       <details>
         <summary>解答：Qwen3.5-4B 均值 5.97 vs 4.92（+21%），三个目标模型一致领先；合计 +1.3% 延迟</summary>
-        <p>Qwen3.5-4B（thinking 开启、T=1.0、top-p 0.95、top-k 20、presence penalty 1.5、无损拒绝采样）五项基准平均接受长度：DFlash 2 为 5.97，DFlash 4.92（+21%/+1.05 token）、DSpark 5.49、MTP 4.54；逐基准全面领先<sup>[N4]</sup>。Qwen3.8-27B（块 8）均值 4.80 vs MTP 4.28、DSpark 3.62<sup>[N6]</sup>；Muse Glimmer（块 16）5.70 vs 官方 DFlash 4.44、DSpark 4.48<sup>[N7]</sup>。MATH-500 逐位置条件接受率：DFlash 2 稳在约 86% 到末位，各基线末位低 6–9 个百分点<sup>[N5]</sup>。两个组件合计 <code>+1.3%</code> 循环延迟（选择器 <code>+0.6%</code> + 卷积 <code>+0.7%</code>）<sup>[C12]</sup>。详见「4. 组合效果——每次验证多一个 token 的账」。</p>
+        <p>Qwen3.5-4B（thinking 开启、T=1.0、top-p 0.95、top-k 20、presence penalty 1.5、无损拒绝采样）五项基准平均接受长度：DFlash 2 为 5.97，DFlash 4.92（+21%/+1.05 token）、DSpark 5.49、MTP（multi-token prediction，模型内置的多 token 预测路径）4.54；逐基准全面领先<sup>[N4]</sup>。Qwen3.8-27B（块 8）均值 4.80 vs MTP 4.28、DSpark 3.62<sup>[N6]</sup>；Muse Glimmer（块 16）5.70 vs 官方 DFlash 4.44、DSpark 4.48<sup>[N7]</sup>。MATH-500 逐位置条件接受率：DFlash 2 稳在约 86% 到末位，各基线末位低 6–9 个百分点<sup>[N5]</sup>。两个组件合计 <code>+1.3%</code> 循环延迟（选择器 <code>+0.6%</code> + 卷积 <code>+0.7%</code>）<sup>[C12]</sup>。详见「4. 组合效果——每次验证多一个 token 的账」。</p>
       </details>
     </li>
     <li>
@@ -113,7 +113,7 @@
 
 <h2 id="two-remaining-problems">1. 两个剩余问题——候选池里有答案、块末端在漏气</h2>
 
-<p>DFlash 的块扩散草稿器一次前向写出整块——但每位置独立挑自己最可能的 token，没有「这块要读起来像一句话」的全局协调。这一设计取舍换来并行性（见 <a href="../dflash/index.html">DFlash</a>第 2 章），代价是块内不连贯。DFlash 2 诊断出两个独立问题，分别用不同组件修：</p>
+<p>DFlash 的块扩散草稿器一次前向写出整块——但每位置独立挑自己最可能的 token，没有「这块要读起来像一句话」的全局协调。这一设计取舍换来并行性（见 <a href="../dflash/index.html#inference-pipeline">DFlash 论文解析的「推理管线——KV 注入与单步并行起草」章</a>），代价是块内不连贯。DFlash 2 诊断出两个独立问题，分别用不同组件修：</p>
 
 <p><b>问题一：选择空间未被利用</b>。五层 Qwen3-4B DFlash 在 GSM8K 上、给定前文全对时，块内逐位置的「top-1 正确率」<code>Recall@1</code> 与「top-16 命中率」<code>Recall@16</code> 表现如下<sup>[C4, N2]</sup>：</p>
 
@@ -129,19 +129,19 @@
 
 <p>读法：top-1 选对的概率约 73–85%，但正确 token 几乎都在 top-16 里（87.8–99.5%）。oracle（总是从 top-16 中选对）能把接受长度从 4.27 提到 6.79<sup>[N2]</sup>——纯选择空间就有约 1.6× token 的余量。问题不在「模型不知道正确答案」，而在「怎么从候选里串出一条连贯的路径」。DFlash 2 用「路径选择器」修这件事：保持每位置多候选、只打分不预测，沿相邻对分数走路径。</p>
 
-<p><b>问题二：后缀衰减是骨干问题</b>。注意上表的 Recall@16 同样在沿块下降——从 99.5% 掉到 87.8%<sup>[C4, N2]</sup>。oracle 也会衰减，说明候选池本身在后段变差，<b>选择器修不了</b><sup>[C7]</sup>。进一步看层数对照：3L/5L/15L DFlash 在首位几乎相同（85.21/85.39/86.42%）、沿块逐渐拉开（末位 64.97/72.86/78.73%）<sup>[C8, N3]</sup>。深度帮助后段但 indiscriminate：15 层 3× 参数、<code>+15.2%</code> 循环延迟才有 78.73% 末位。诊断是 attention 同时承担两份工作（读上文 + 建模块内依赖），块内依赖被欠配——块内注意力份额从第 1 层 30% 掉到第 5 层 8%，且集中于少数头<sup>[C9]</sup>。DFlash 2 用「两抽头动态卷积」修这件事：在 attention 与 FFN 子层前后插一个只覆盖「当前位 + 前一位」的局部算子，把建模块内依赖的工作从 attention 抽出来。</p>
+<p><b>问题二：后缀衰减是骨干问题</b>。注意上表的 Recall@16 同样在沿块下降——从 99.5% 掉到 87.8%<sup>[C4, N2]</sup>。oracle 也会衰减，说明候选池本身在后段变差，<b>选择器修不了</b><sup>[C7]</sup>。进一步看层数对照：3L/5L/15L DFlash 在首位几乎相同（85.21/85.39/86.42%）、沿块逐渐拉开（末位 64.97/72.86/78.73%）<sup>[C8, N3]</sup>。深度帮助后段但无差别：15 层 3× 参数、<code>+15.2%</code> 循环延迟才有 78.73% 末位。诊断是 attention 同时承担两份工作（读上文 + 建模块内依赖），块内依赖被欠配——块内注意力份额从第 1 层 30% 掉到第 5 层 8%，且集中于少数头<sup>[C9]</sup>。DFlash 2 用「两抽头动态卷积」修这件事：在 attention 与 FFN 子层前后插一个只覆盖「当前位 + 前一位」的局部算子，把建模块内依赖的工作从 attention 抽出来。</p>
 
 <div class="table-scroll">
 <table>
 <thead><tr><th>问题</th><th>证据</th><th>归属</th><th>DFlash 2 修法</th></tr></thead>
 <tbody>
-<tr><td>选择空间未用</td><td>Recall@1 85.4% vs Recall@16 99.5%；oracle 4.27→6.79</td><td>选择侧（候选池没坏）</td><td>路径选择器（第 2 章）</td></tr>
-<tr><td>后缀衰减</td><td>Recall@16 也沿块下降；oracle 衰减；15 层加深度才显著补</td><td>骨干侧（候选池本身变差）</td><td>两抽头卷积（第 3 章）</td></tr>
+<tr><td>选择空间未用</td><td>Recall@1 85.4% vs Recall@16 99.5%；oracle 4.27→6.79</td><td>选择侧（候选池没坏）</td><td>『路径选择器——在候选之间打分，而不是重新预测』</td></tr>
+<tr><td>后缀衰减</td><td>Recall@16 也沿块下降；oracle 衰减；15 层加深度才显著补</td><td>骨干侧（候选池本身变差）</td><td>『两抽头卷积——给块末端补上「看见前一位」的通道』</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>贯穿示例用 3 位置 × top-2 候选的构造网格，演示两个问题在最小例子里长什么样（构造数据，token 内容与分数均为人为设定）：</p>
+<p>贯穿示例用 3 位置 × top-2 候选的构造网格，演示两个问题在最小例子里长什么样（构造数据，token 内容与分数均为人为设定）。表中「DFlash 独立 top-1」列的数字为 $U_t$（draft 自身的 logit），「路径选择器输出」列的数字为 $S_t$（含相邻对双线性项）；两列量纲不同，不对数值作横向比较（分解见 2.4 节）。</p>
 
 <div class="table-scroll">
 <table>
@@ -169,7 +169,7 @@
     <p>后缀衰减为什么选择器修不了？</p>
     <details>
       <summary>解答：Recall@16 也衰减；oracle 自身从 99.5% 掉到 87.8%——候选池本身在后段变差</summary>
-      <p>候选池本身在后段变差：oracle（总能从 top-16 选对）也只从首位 99.5% 衰减到末位 87.8%<sup>[C7, N2]</sup>。选择器只在给定候选池里挑路径——候选池坏到一定程度，挑得再准也没用。诊断因此指向骨干：attention 同时承担读上文和建模块内依赖两份工作，块内依赖被欠配<sup>[C9]</sup>。修法必须改骨干，不在选择侧（见第 3 章）。</p>
+      <p>候选池本身在后段变差：oracle（总能从 top-16 选对）也只从首位 99.5% 衰减到末位 87.8%<sup>[C7, N2]</sup>。选择器只在给定候选池里挑路径——候选池坏到一定程度，挑得再准也没用。诊断因此指向骨干：attention 同时承担读上文和建模块内依赖两份工作，块内依赖被欠配<sup>[C9]</sup>。修法必须改骨干，不在选择侧（见『两抽头卷积——给块末端补上「看见前一位」的通道』）。</p>
     </details>
   </li>
 </ol>
@@ -248,7 +248,7 @@ $$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle.$$
 
 <p>从最后已验证 token 出发贪心走路径（bonus 即验证顺带产出的下一 token；本节不区分验证 bonus 与拒绝修正 token 的来源）：</p>
 <ul>
-<li>位置 1：取 $U_1$ 最高的 <code>decoding</code>（$U_1=0.85$，单位置无前驱，按 logit 选）。</li>
+<li>位置 1：取 $U_1$ 最高的 <code>decoding</code>（$U_1=0.85$；本例未设定已验证前缀，首位按 $U_1$ 选取；实际机制中首位的前驱是最后已验证 token，见 2.2 节）。</li>
 <li>位置 2：$S_2(\text{decoding},\text{decoding})=0.25$ vs $S_2(\text{decoding},\text{is})=0.60$ → 选 <code>is</code>。</li>
 <li>位置 3：$S_3(\text{is},\text{parallel})=0.85$ vs $S_3(\text{is},\text{now})=0.20$ → 选 <code>parallel</code>。</li>
 </ul>
@@ -282,7 +282,7 @@ $$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle.$$
 <p>选择器修不了后缀衰减的根因是 <b>候选池坏到一定程度</b>。证据链：</p>
 
 <ul>
-<li><b>深度帮助后段但 indiscriminate</b><sup>[C8, N3]</sup>。3L/5L/15L DFlash 在首位几乎相同（85.21/85.39/86.42%），沿块逐渐拉开（末位 64.97/72.86/78.73%）。15 层比 5 层在末位多约 5.9 点，但用了 3× 参数和 <code>+15.2%</code> 循环延迟——为了末段好一点，整个网络都加了容量。</li>
+<li><b>深度帮助后段但无差别</b><sup>[C8, N3]</sup>。3L/5L/15L DFlash 在首位几乎相同（85.21/85.39/86.42%），沿块逐渐拉开（末位 64.97/72.86/78.73%）。15 层比 5 层在末位多约 5.9 点，但用了 3× 参数和 <code>+15.2%</code> 循环延迟——为了末段好一点，整个网络都加了容量。</li>
 <li><b>注意力的两份工作失衡</b><sup>[C9]</sup>。attention 同时负责「读上文」与「建模块内依赖」。块内注意力份额从第 1 层约 30% 掉到第 5 层约 8%，且集中于少数头——后面几层把几乎所有注意力都放到读上文上，块内依赖被欠配。</li>
 </ul>
 
@@ -337,13 +337,13 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
   <!-- 前一位抽头（虚线，dg-line + dasharray）从前一个位置指向当前 Conv 输出 -->
   <line x1="250" y1="80" x2="370" y2="160" class="dg-line" style="stroke-dasharray: 4,3;"/>
   <line x1="250" y1="160" x2="370" y2="240" class="dg-line" style="stroke-dasharray: 4,3;"/>
-  <!-- 首位的前一位来自上一周期已验证 token（作为 Conv(x)_1 的前一位输入） -->
-  <line x1="130" y1="180" x2="370" y2="80" class="dg-line" style="stroke-dasharray: 4,3;"/>
-  <text x="240" y="115" style="font-size: 11px; text-anchor: middle;">首位的前驱 = 上一周期目标 token</text>
+  <!-- 首位的前一位来自上一周期已验证 token，作为 Conv(x)_1 的前一位输入 -->
+  <polyline points="80,200 80,300 410,300 410,100" class="dg-line" style="stroke-dasharray: 4,3;"/>
+  <text x="245" y="292" style="font-size: 11px; text-anchor: middle;">位置 1 的前一位 = 已验证 token（上一周期目标模型产出）</text>
   <text x="306" y="132" style="font-size: 11px;">自身（实线）+ 前一位（虚线）</text>
   
 </svg>
-<figcaption class="diagram-caption">两抽头卷积结构：每个位置取两个抽头——一个来自自身（实线，accent）、一个来自前一个位置（虚线，dg-line + dasharray）。位置 1 的前驱是上一周期目标模型产出的已验证 token（蓝色）。当前位置「看见前一位」由卷积直接提供，不需要 attention 横跨整个块；attention 因此能更专注于读上文。</figcaption>
+<figcaption class="diagram-caption">两抽头卷积结构：每个位置取两个抽头——一个来自自身（实线，accent）、一个来自前一个位置（虚线，dg-line + dasharray）。位置 1 的前一位输入是已验证 token（上一周期目标模型产出；图中蓝色）。当前位置「看见前一位」由卷积直接提供，不需要 attention 横跨整个块；attention 因此能更专注于读上文。</figcaption>
 </figure>
 
 <h3 id="conv-effect">3.3 效果：接近 15 层、无差别容量提升</h3>
@@ -393,7 +393,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 
 <h3 id="qwen35-4b">4.1 Qwen3.5-4B（thinking 开启）</h3>
 
-<p>实验条件：Qwen3.5-4B、thinking 开启、采样温度 1.0、top-p 0.95、top-k 20、presence penalty 1.5、无损拒绝采样<sup>[N4]</sup>。各方法的平均接受长度：</p>
+<p>实验条件：Qwen3.5-4B、thinking 开启、采样温度 1.0、top-p 0.95、top-k 20、presence penalty 1.5、无损拒绝采样<sup>[N4]</sup>。对比方法的草稿器来源：DFlash 与 DSpark 草稿器为作者在匹配设置下自训，MTP 为模型内置；Qwen3.8-27B 上的 DSpark 为社区草稿器（RadixArk）<sup>[C17]</sup>。各方法的平均接受长度：</p>
 
 <div class="table-scroll">
 <table>
@@ -485,7 +485,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 <p>几个要点：</p>
 <ul>
 <li>DFlash 2 在所有并发、所有任务上都跑赢 MTP 与 DSpark。</li>
-<li>并发 1 数学 3.43× → 并发 8 数学 2.84× → 并发 32 数学 1.45×——加速随并发下降但仍为正。</li>
+<li>并发 1 GSM8K 3.43× → 并发 8 GSM8K 2.84× → 并发 32 GSM8K 1.45×——加速随并发下降但仍为正。</li>
 <li><b>并发 32 时 MTP 与 DSpark 多数任务降到 1× 以下（最差的 MT-Bench 0.74–0.77×）</b>——这些方法在批处理填满空闲算力后变成纯浪费，不能用。DFlash 2 即使在最低格子也保持 1.01×（MT-Bench），与基线持平不亏。</li>
 </ul>
 
@@ -502,8 +502,8 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 <li><b>低并发结构化任务</b>（数学、代码）收益最大（3×+）。</li>
 <li><b>高并发对话类</b>（MT-Bench 类）收益趋近 1，但至少不亏（DFlash 2 vs MTP）。</li>
 <li><b>需要为每个目标模型训练配套草稿器</b>（不是通用插件）——当前已发布 Qwen3.8-27B、Muse Glimmer 两款<sup>[C13]</sup>。</li>
-<li><b>引擎支持状态</b>：SGLang 稳定支持；vLLM 与 llama.cpp 的 DFlash 2 支持位于 PR 分支（vLLM PR #52816、llama.cpp PR #27342）<sup>[C16]</sup>，未进稳定版本。</li>
-<li><b>数字环境</b>：所有数字来自厂商自测（单卡 H200），第三方独立复测尚少。</li>
+<li><b>引擎支持状态</b>：SGLang 稳定支持；oMLX（Apple Silicon 端）在博客 Run It Now 中给出安装说明；vLLM 与 llama.cpp 的 DFlash 2 支持位于 PR 分支（vLLM PR #52816、llama.cpp PR #27342）<sup>[C16]</sup>，未进稳定版本。</li>
+<li><b>数字环境</b>：吞吐数字来自单卡 H200 的模型卡自测，接受长度数字来自博客自测（未注明硬件）；允许来源中未见第三方独立复现。</li>
 </ul>
 
 <p>生态一句：DFlash（一代）已集成 SGLang、vLLM、TensorRT-LLM、llama.cpp；Inco AI 宣称 Hugging Face 下载超 350 万次（2026-08）、NVIDIA 在 Blackwell 上测得最高 15×、Google 在 TPU 上 3×<sup>[C15]</sup>。这些数字属厂商自测，非第三方独立复现，本页只作背景带过。</p>
@@ -513,15 +513,15 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
   <li>
     <p>吞吐加速在什么并发/任务下是多少？</p>
     <details>
-      <summary>解答：Qwen3.8-27B SGLang H200 bs1 数学 3.43×、MT-Bench 2.67×；bs8 数学 2.84×；bs32 数学 1.45×、MT-Bench 1.01×</summary>
-      <p>Qwen3.8-27B + SGLang + H200 + FA3 + 块 8 + 推荐采样：并发 1 数学 3.43× / MT-Bench 2.67×；并发 8 数学 2.84× / MT-Bench 2.27×；并发 32 数学 1.45× / MT-Bench 1.01×<sup>[N8]</sup>。Muse Glimmer 并发 1 区间 3.1–4.6×<sup>[N9]</sup>。MTP 同条件并发 32 部分任务降到 1× 以下（MT-Bench 0.77×、MATH-500 0.94×），DFlash 2 仍持平或正收益。</p>
+      <summary>解答：Qwen3.8-27B SGLang H200 bs1 GSM8K 3.43×、MT-Bench 2.67×；bs8 GSM8K 2.84×；bs32 GSM8K 1.45×、MT-Bench 1.01×</summary>
+      <p>Qwen3.8-27B + SGLang + H200 + FA3 + 块 8 + 推荐采样：并发 1 GSM8K 3.43× / MT-Bench 2.67×；并发 8 GSM8K 2.84× / MT-Bench 2.27×；并发 32 GSM8K 1.45× / MT-Bench 1.01×<sup>[N8]</sup>。Muse Glimmer 区间 3.1–4.6×（博客未注明并发条件）<sup>[N9]</sup>。MTP 同条件并发 32 部分任务降到 1× 以下（MT-Bench 0.77×、MATH-500 0.94×），DFlash 2 仍持平或正收益。</p>
     </details>
   </li>
   <li>
     <p>什么时候不该用、部署时注意什么？</p>
     <details>
       <summary>解答：低并发结构化任务用、高并发对话类收益趋近 1 但不亏；vLLM/llama.cpp 集成在 PR 分支，数字来自厂商自测</summary>
-      <p>适用边界：低并发结构化输出（数学、代码）收益最大；高并发对话类收益趋近 1，但至少不亏（DFlash 2 vs MTP 在并发 32 仍优）<sup>[N8]</sup>。部署注意：①为每个目标模型训练或选择配套草稿器（不是通用插件）；②vLLM（PR #52816）和 llama.cpp（PR #27342）支持位于 PR 分支，不是稳定版本<sup>[C16]</sup>；③数字全部来自厂商自测环境（H200/B200、SGLang、推荐采样），第三方独立复测尚少；④高并发收益缩水的机制是批处理填满空闲算力后草稿-验证不再搭免费周期，错误草稿变成挤占算力的浪费（分析性推断）<sup>[C14]</sup>。</p>
+      <p>适用边界：低并发结构化输出（数学、代码）收益最大；高并发对话类收益趋近 1，但至少不亏（DFlash 2 vs MTP 在并发 32 仍优）<sup>[N8]</sup>。部署注意：①为每个目标模型训练或选择配套草稿器（不是通用插件）；②vLLM（PR #52816）和 llama.cpp（PR #27342）支持位于 PR 分支，不是稳定版本<sup>[C16]</sup>；③数字来自厂商自测：吞吐为单卡 H200 + SGLang + 推荐采样，接受长度为博客自测（未注明硬件）；允许来源中未见第三方独立复现；④高并发收益缩水的机制是批处理填满空闲算力后草稿-验证不再搭免费周期，错误草稿变成挤占算力的浪费（分析性推断）<sup>[C14]</sup>。</p>
     </details>
   </li>
 </ol>
@@ -545,7 +545,8 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 <li>C13（已发布两款草稿器）：博客 "Two Drafters, Out Today" + HF 模型卡。</li>
 <li>C14（高并发收益缩水的机制解释——分析性推断）：综合 HF 模型卡并发趋势（DFlash 2 从 3.43× 掉到 1.01×、MTP 掉到 0.77×）与投机解码资源利用直觉。Inco AI 博客未明确给出该机制分析，本节为推断。</li>
 <li>C15（生态一句带过：DFlash 一代下载 350 万、NVIDIA 15×、Google 3×——厂商宣称）：博客开头段落。标注为厂商宣称。</li>
-<li>C16（vLLM PR #52816、llama.cpp PR #27342 集成状态）：博客 Run It Now 代码块（<code>vllm @ git+...refs/pull/52816/head</code>、<code>git fetch origin pull/27342/head</code>）。</li>
+<li>C16（引擎集成状态：vLLM PR #52816、llama.cpp PR #27342、oMLX）：博客 Run It Now 代码块与安装说明（<code>vllm @ git+...refs/pull/52816/head</code>、<code>git fetch origin pull/27342/head</code>；oMLX 安装步骤）。</li>
+<li>C17（对比方法的草稿器来源）：博客 "We trained the DFlash and DSpark drafters ourselves under matched setups, while MTP ships with the model"；HF 模型卡将 Qwen3.8-27B 上的 DSpark 记为社区草稿器 <code>RadixArk/Qwen3.8-27B-DSpark</code>。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
@@ -554,7 +555,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 <li>F2（两抽头动态卷积 $\mathrm{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}$）：博客 "A Lightweight Local Convolution" 节。</li>
 </ul>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>N1（选择器 vs DSpark 修正头开销与接受长度）：博客 Table 2。条件：五层 Qwen3-4B、GSM8K，T=0/T=1。N2（Recall 逐位置数据）：博客 Table 1，条件同上。N3（层数与卷积对照 Recall@1）：博客 Figure 2 数据表，Qwen3-4B GSM8K T=0 无选择器。N4（Qwen3.5-4B 五项基准均值）：博客 Table 3，条件 thinking 开启、T=1.0、top-p 0.95、top-k 20、presence penalty 1.5、无损拒绝采样。N5（MATH-500 逐位置条件接受率）：博客 Figure 5 数据表。N6（Qwen3.8-27B 接受长度）：博客 Table 4 + HF 模型卡 Acceptance Length，块 8、官方默认采样。N7（Muse Glimmer 接受长度）：博客 Table 5，块 16、官方默认采样。N8（Qwen3.8-27B SGLang 完整并发×任务吞吐）：HF 模型卡 Throughput 表，条件 SGLang + H200 + FA3 + 块 8 + 推荐采样 + xhigh reasoning + 最大 4096 token。N9（Muse Glimmer 吞吐区间 3.1–4.6×）：博客末段。N10（DFlash 接受长度提升 16–25%）：博客 "Across benchmarks the gain runs 16–25%"。生态数字（C15）：博客开头段，标注为厂商宣称。</p>
 
 <h3>构造示例</h3>
@@ -564,7 +565,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 <p>「选比预测便宜」的说法用于解释路径选择器相对 DSpark 修正头的成本优势（参数 1/40、延迟 1/16、接受长度更高）。该说法只解释「打分并行、走路径串行」这层结构对成本的贡献，不覆盖完整草稿器的端到端开销（prefill、KV 注入、目标模型验证等仍按各自方式计）。正式判断仍以 N1 的实测数字为准。「针对性小算子替代全面加深」用于解释两抽头卷积相对 15 层 DFlash 的设计选择（参数 3% vs 3×、延迟 0.7% vs 15.2%、末位 Recall 77.61% vs 78.73%）。该说法只解释「卷积专门修后段」这一层设计意图，不覆盖完整骨干的容量配置（5 层是经验最优，论文另有层数消融）。</p>
 
 <h3>简化条件及其限制</h3>
-<p>①所有接受长度数字依赖特定的采样配置（温度、top-p、top-k、presence penalty、reasoning effort）。这些参数对接受长度有显著影响——例如 Qwen3.5-4B 的数字是在 thinking 开启、presence penalty 1.5、推荐采样下得到；其他采样配置下的接受长度需自行测试。②吞吐数字全部来自单卡 H200 与 SGLang 后端；其他显卡、vLLM、llama.cpp 的实际吞吐会因 batch 调度与 overlap 实现差异而不同。③DFlash 2 路径选择器与卷积组件在 vLLM 与 llama.cpp 上的实现尚处 PR 阶段（vLLM #52816、llama.cpp #27342），未经充分稳定性测试。④构造示例中的 token 内容与分数为人为设定，仅用于演示两个组件的工作方式；任何在真实模型上的行为需直接看 N 编号引用的实测数据。⑤HF 模型卡 N8 的并发表是厂商自测，未给出第三方独立复现；社区初步复测（llama.cpp PR 构建等）的数据点有限且与厂商环境不同。⑥本页面所有「分析性推断」均已显式标注为推断，不当作论文事实呈现。</p>
+<p>①所有接受长度数字依赖特定的采样配置（温度、top-p、top-k、presence penalty、reasoning effort）。这些参数对接受长度有显著影响——例如 Qwen3.5-4B 的数字是在 thinking 开启、presence penalty 1.5、推荐采样下得到；其他采样配置下的接受长度需自行测试。②吞吐数字全部来自单卡 H200 与 SGLang 后端；其他显卡、vLLM、llama.cpp 的实际吞吐会因 batch 调度与 overlap 实现差异而不同。③DFlash 2 路径选择器与卷积组件在 vLLM 与 llama.cpp 上的实现尚处 PR 阶段（vLLM #52816、llama.cpp #27342），未经充分稳定性测试。④构造示例中的 token 内容与分数为人为设定，仅用于演示两个组件的工作方式；任何在真实模型上的行为需直接看 N 编号引用的实测数据。⑤HF 模型卡 N8 的并发表是厂商自测，允许来源中未见第三方独立复现。⑥本页面所有「分析性推断」均已显式标注为推断，不当作论文事实呈现。</p>
 
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

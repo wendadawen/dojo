@@ -67,7 +67,7 @@
 
 <p>一块 80 GB 的 GPU 放不下 405B 参数的模型——哪怕只算权重本身。要让这类模型跑起来，必须把模型切开、分布到多块 GPU 上协同完成每一次前向计算。切法只有两条基本路径：按层内矩阵的维度切（张量并行，Tensor Parallelism，TP），或按层堆叠的深度切（流水线并行，Pipeline Parallelism，PP）。两条路径的通信结构完全不同，因此适合部署在不同的互联拓扑上，实际系统几乎总是组合使用。</p>
 
-<p>"模型并行"在部分文献（如 Megatron-LM）中狭义地指层内切分，与"流水线并行"并列；本页取广义用法，把两者都算作模型并行。本文讨论的是推理 serving 场景；前置概念：多头注意力结构见 <a href="../standard-attention/index.html">标准注意力</a>，all-reduce 等集合通信与 NVLink/跨机网络分层见 <a href="../gpu-communication/index.html">GPU 通信</a>，prefill/decode 两阶段与 KV cache 见 <a href="../moe-serving/index.html">MoE Serving</a>。</p>
+<p>"模型并行"在部分文献（如 Megatron-LM）中狭义地指层内切分，与"流水线并行"并列；本页取广义用法，把两者都算作模型并行。本页讨论的是推理 serving 场景；前置概念：多头注意力结构见 <a href="../standard-attention/index.html">标准注意力</a>，all-reduce 等集合通信与 NVLink/跨机网络分层见 <a href="../gpu-communication/index.html">GPU 通信</a>，prefill/decode 两阶段与 KV cache 见 <a href="../moe-serving/index.html">MoE Serving</a>。</p>
 
 <section class="learning-goals">
 <h2>核心问题</h2>
@@ -156,14 +156,14 @@
 <summary>展开：上面构造示例的完整手算</summary>
 <p>构造示例（数字自设，目的是验证切分等价性，不代表真实模型）。取 $X = [1,1,1,1]$、$A$ 为上面同一块对角矩阵、$B = A$。记 $G(\cdot)$ 为任意逐元素函数（GeLU 即其一例）。第一步，$XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；按列切后 GPU 1 拿 $A_1$（$A$ 的前两列），算得 $XA_1 = [3, 3]$；GPU 2 拿 $A_2$（$A$ 的后两列），算得 $XA_2 = [7, 7]$。两段拼接恰好是 $[3, 3, 7, 7]$——列切的直接效果就是输出按列分段。第二步，关键观察：$G$ 逐元素作用，所以 $G(XA)$ 按列分段等于各段分别过 $G$，即 $G(XA) = [G(XA_1),\ G(XA_2)]$。单卡结果可改写为</p>
 <p>$$G(XA)\,B = [G(XA_1),\ G(XA_2)] \begin{bmatrix} B_1 \\ B_2 \end{bmatrix} = G(XA_1)B_1 + G(XA_2)B_2,$$</p>
-<p>第二个等号是分块乘法恒等式。而等式右边的两项正好是 GPU 1、GPU 2 各自本地算出的部分积——两卡各算一项，all-reduce 求和即得单卡结果。注意这个论证对任何逐元素函数 $G$ 都成立，不需要代入 GeLU 的具体数值；等价性的全部来源是"列切让逐元素函数可分段作用 + 行切让分块乘法可拆成部分积之和"。</p>
+<p>第二个等号是分块乘法恒等式。而等式右边的两项正好是 GPU 1、GPU 2 各自本地算出的部分积——两卡各算一项，all-reduce 求和即得单卡结果。这个论证对任何逐元素函数 $G$ 都成立，不需要代入 GeLU 的具体数值；等价性的全部来源是"列切让逐元素函数可分段作用 + 行切让分块乘法可拆成部分积之和"。</p>
 </details>
 
 <h3 id="tp-attention">1.2 Attention：按头切，通信藏在投影里</h3>
 
 <p>多头注意力天然适合切分：每个注意力头有自己独立的 Q/K/V 投影和输出投影，头与头之间本来就不交换中间结果（详见<a href="../standard-attention/index.html">标准注意力</a>）。TP 把 Q/K/V 三个投影矩阵按列切，使每个头的矩阵乘完整落在一张卡上；attention 输出后的线性投影按行切，直接消费本地各头的输出<sup>[C3]</sup>。整个过程与 FFN 的结构同构：列切第一段、行切第二段，attention 子块前向同样只需 1 次 all-reduce（把各卡的部分输出求和）<sup>[C3, C4]</sup>。</p>
 
-<p>值得强调的是切分粒度的对齐：切在头的边界上，每张卡拿到整数个头。若卡数超过头数，头无法再分，这就是 TP 与 KV 头数关系（KV 复制因子）的一种来源（基于 TP 切分粒度对齐头数与 KV 头数之比的推断，论文未明文论述）——该机制在 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页的带宽公式中有直接应用。</p>
+<p>切分粒度的对齐：切在头的边界上，每张卡拿到整数个头。若卡数超过头数，头无法再分，这就是 TP 与 KV 头数关系（KV 复制因子）的一种来源（基于 TP 切分粒度对齐头数与 KV 头数之比的推断，论文未明文论述）——该机制在 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页的带宽公式中有直接应用。</p>
 
 <h3 id="tp-comm-count">1.3 一层两次通信</h3>
 
@@ -198,7 +198,7 @@
 
 <p>第 1 章把一层切开分给多卡；另一种切法保持每层完整，把层堆叠的方向切开：第 1–16 层放卡 A（第一个 stage），第 17–32 层放卡 B，依此类推。数据像流水线一样流过各 stage，每个 stage 只算自己那段层、把输出激活值传给下一个 stage——这就是流水线并行（PP）<sup>[C5]</sup>。卡间通信只发生在相邻 stage 的边界上，每个 micro-batch 传一次激活值<sup>[C5]</sup>。</p>
 
-<p>这里出现一个问题：模型有 $p$ 个 stage、一次要处理 $m$ 个 micro-batch（micro-batch 是为填满流水线而把小批次切成的更小单元），卡与卡之间怎么协作？答案是一起跑同一个"step"：第 1 个 micro-batch 从 stage 1 进入，逐级前进；它走到哪，后面的 stage 才有活干。反过来，最后一个 micro-batch 离开 stage 1 后，stage 1 就闲下来了，要等整个 step 结束。</p>
+<p>模型有 $p$ 个 stage、一次要处理 $m$ 个 micro-batch（micro-batch 是为填满流水线而把小批次切成的更小单元），各 stage 一起跑同一个"step"：第 1 个 micro-batch 从 stage 1 进入，逐级前进；它走到哪，后面的 stage 才有活干。反过来，最后一个 micro-batch 离开 stage 1 后，stage 1 就闲下来了，要等整个 step 结束。</p>
 
 <h3 id="pp-derivation">2.1 气泡占比 $(p-1)/(m+p-1)$ 的推导</h3>
 
@@ -284,7 +284,7 @@
 
 <details>
 <summary>补充：气泡占比的两种极端与反向传播的影响</summary>
-<p>两个极端检查公式：$m=1$ 时占比 $(p-1)/p$，趋近 1——单个 micro-batch 时流水线几乎全程空转，PP 完全退化；$p=1$ 时占比为 0，无流水线则无气泡。训练场景中反向传播沿同一流水线反向进行，GPipe 的同步 step 结构下填充期与排空期在前向和反向各出现一次，但 slot 计数结构不变，公式量级仍成立；本页聚焦推理，只要求读者知道训练推导是公式的出处（GPipe §2.3）。推理时各请求的 prefill/decode 迭代时长不均，会让"每个 slot 等长"的假设近似失效，实际气泡可能更大——Sarathi 论文对此有分析，机制链接见 <a href="../chunked-prefill/index.html">chunked prefill</a> 页。</p>
+<p>两个极端检查公式：$m=1$ 时占比 $(p-1)/p$，趋近 1——单个 micro-batch 时流水线几乎全程空转，PP 完全退化；$p=1$ 时占比为 0，无流水线则无气泡。训练场景中反向传播沿同一流水线反向进行，GPipe 的同步 step 结构下填充期与排空期在前向和反向各出现一次，但 slot 计数结构不变，公式量级仍成立；本页聚焦推理，训练场景的推导是公式出处（GPipe §2.3），本页不重复。推理时各请求的 prefill/decode 迭代时长不均，会让"每个 slot 等长"的假设近似失效，实际气泡可能更大——Sarathi 论文对此有分析，机制链接见 <a href="../chunked-prefill/index.html">chunked prefill</a> 页。</p>
 </details>
 
 <h3 id="pp-split-questions">本章问题</h3>
@@ -348,7 +348,7 @@
       <span class="dg-layer-body">GPU 4–7：TP 4（NVLink 域内），承载 stage 2 的全部层；与节点 1 之间按 PP 传边界激活</span>
     </div>
   </div>
-  <figcaption class="diagram-caption">TP 4 $\times$ PP 2 = 8 的组合部署（构造示例）：机内每层做张量并行（高频 all-reduce 走 NVLink），机间做流水线并行（低频边界激活传输走跨机网络）。自下而上是数据流方向：请求先流经节点 1 的 stage，再进入节点 2。</figcaption>
+  <figcaption class="diagram-caption">TP 4 $\times$ PP 2 = 8 的组合部署（构造示例）：机内每层做张量并行（高频 all-reduce 走 NVLink），机间做流水线并行（低频边界激活传输走跨机网络）。自上而下是数据流方向：请求先流经节点 1 的 stage，再进入节点 2。</figcaption>
 </figure>
 
 <h3 id="dp-ep-note">3.3 与数据并行、专家并行的边界</h3>

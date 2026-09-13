@@ -62,7 +62,7 @@
 <p><b>主要依据</b>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §3.2.1 缩放点积注意力、§3.2.2 多头注意力、§3.2.3 因果遮罩、§4 复杂度对比。</p>
 </blockquote>
 
-<p>处理一个 2048 token 的序列时，传统 RNN 要让第 1 个 token 的信息经过 2047 步非线性变换才能传到最后一个 token——路径长度 $O(n)$、且整个序列无法并行。Vaswani et al. 2017 提出的标准 Transformer 注意力让任意两个位置直接交互：用查询向量与键向量的点积算相似度，除以 $\sqrt{d_k}$ 稳定数值，softmax 归一化为权重，对值向量加权求和——路径降到 $O(1)$、全序列可并行。这一"缩放点积 + softmax + 多头"的基础操作是 MLA、Flash Attention、Linear Attention、RoPE 等所有变体的共同前置。下面依次讨论四个问题：标准注意力解决什么问题、公式每步为何如此设计、$O(n^2)$ 瓶颈在哪、哪些问题它本身不解决。</p>
+<p>处理一个 2048 token 的序列时，传统 RNN 要让第 1 个 token 的信息经过 2047 步非线性变换才能传到最后一个 token——路径长度 $O(n)$、且整个序列无法并行。Vaswani et al. 2017 提出的标准 Transformer 注意力让任意两个位置直接交互：用查询向量与键向量的点积算相似度，除以 $\sqrt{d_k}$ 稳定数值，softmax 归一化为权重，对值向量加权求和——路径降到 $O(1)$、全序列可并行。这一"缩放点积 + softmax + 多头"的基础操作是 MLA、Flash Attention、Linear Attention、RoPE 等所有变体的共同前置。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -110,7 +110,7 @@
 
 <h2 id="why-attention">1. 注意力要解决什么问题——从 RNN 的"逐步传递"到"直接查询"</h2>
 
-<p>读一句话"The cat sat on the mat because it was tired."——这里的"it"指什么？人类一眼看出指"cat"，但模型怎么知道？传统 RNN 把"cat"的信息编码进第 1 步的隐状态 $h_1$，再传递给 $h_2$、$h_3$……直到"it"所在的第 8 步才读到。这条路径有两个问题：</p>
+<p>读一句话"The cat sat on the mat because it was tired."——这里的"it"指什么？人类一眼看出指"cat"，但模型怎么知道？传统 RNN 把"cat"的信息编码进第 2 步的隐状态 $h_2$，再经 $h_3,\dots,h_8$ 传递，直到"it"所在的第 8 步才读到。这条路径有两个问题：</p>
 
 <ul>
   <li><strong>路径长 $O(n)$</strong>：信息要经过 $n-1$ 个 RNN 单元才能从第 1 个 token 传到第 $n$ 个，每一步的非线性变换都会稀释或覆盖原始信息；长程依赖难以建立。</li>
@@ -319,7 +319,7 @@
 <p>本推导依赖三个假设：$q,k$ 分量独立（独立性使方差可加）；均值 0（批归一化 BN／层归一化 LN 后基本成立）；方差 1（标准初始化基本成立）。训练后期这些假设可能不严格成立，但通常仍可用，因为 LN 把激活控制在单位量级。</p>
 </details>
 
-<p><strong>不缩放的后果</strong><sup>[C4]</sup>。$d_k=64$ 时 $\text{std}(q\cdot k)=8$，$n$ 个 key 中最大 logit 与典型值的差值约 $E[\max]\approx 8\sqrt{2\ln n}$（$n=8$ 时约 16，$n=256$ 时约 27）。$e^{16}\approx 8.89\times 10^6$，让某个 key 几乎独占权重。softmax 输出近 one-hot 后梯度也近零：</p>
+<p><strong>不缩放的后果</strong><sup>[C4]</sup>。$d_k=64$ 时 $\text{std}(q\cdot k)=8$，$n$ 个 key 中最大 logit 与典型值的差值约 $8\sqrt{2\ln n}$（高斯极值的渐近主项；按 $q,k$ 各分量独立取自 $N(0,1)$ 复算，$n=8$ 时约 11，$n=256$ 时约 23）。$e^{23}\approx 9.7\times 10^9$，让某个 key 几乎独占权重。softmax 输出近 one-hot 后梯度也近零：</p>
 
 <details>
 <summary>补充：softmax 雅可比 $\partial p_i/\partial z_j=p_i(\delta_{ij}-p_j)$ 与梯度消失</summary>
@@ -497,7 +497,7 @@
 
 <h2 id="complexity-and-boundaries">5. 复杂度、瓶颈与边界——标准注意力不能做什么</h2>
 
-<p>知道机制后，接着看它在哪里会失效、为什么需要变体。</p>
+<p>标准注意力的失效点决定了哪些问题必须由后续变体解决。</p>
 
 <p><strong>复杂度拆解</strong>。单层自注意力的计算分三部分：</p>
 
@@ -517,9 +517,9 @@
 <p><strong>瓶颈位置</strong>：$QK^\top$ 这一步产生 $n\times n$ 矩阵，时间和空间都随序列长度 $n$ 二次增长。这是 Linear Attention、Flash Attention、Sparse Attention 的共同动机。但三者解决方式不同，需要区分：</p>
 
 <div class="callout callout-purple">
-<p><strong>Flash vs Linear 的区分</strong>（下面只讨论瓶颈，机制由对应变体章节承担；以下为 Vaswani 2017 之后的后续工作概括，非原论文论断）：</p>
+<p><strong>Flash vs Linear 的区分</strong>（这里只比较两者对瓶颈的处理，机制见对应变体章节；以下为 Vaswani 2017 之后的后续工作概括，非原论文论断）：</p>
 <ul>
-<li><strong>Flash Attention</strong>（Dao et al. 2022, FlashAttention）：<em>公式不变</em>，只改 GPU 上的 IO 实现（分块读写 HBM 与 SRAM，避免把 $n\times n$ 中间矩阵全部写回显存）。结果与标准注意力数值等价，但快 2-4 倍。属工程优化。</li>
+<li><strong>Flash Attention</strong>（Dao et al. 2022, FlashAttention）：<em>公式不变</em>，只改 GPU 上的 IO 实现（分块读写 HBM 与 SRAM，避免把 $n\times n$ 中间矩阵全部写回显存）。结果与标准注意力数值等价，在常见序列长度（128–2K）上最多约 3 倍快于标准注意力实现（训练端到端另有 15% 提速）。属工程优化。</li>
 <li><strong>Linear Attention</strong>（Katharopoulos et al. 2020）：<em>改公式</em>。把 $\exp(q\cdot k)$ 替换为核分解 $\phi(q)\phi(k)$，使 $QK^\top V$ 可重排为 $\phi(Q)(\phi(K)^\top V)$，复杂度从 $O(n^2 d)$ 降到 $O(n\cdot d^2)$。代价是丢失 softmax 的精确性，表达力下降。属公式变体。</li>
 </ul>
 <p>两者都"解决" $O(n^2)$ 瓶颈但方式完全不同：Flash 是"算得更快但算的是同一件事"，Linear 是"算一件近似的事"。</p>
@@ -567,7 +567,7 @@
     <p>Flash Attention 与 Linear Attention 的区别是什么？</p>
     <details>
       <summary>解答：一个改实现，一个改公式</summary>
-      <p>Flash Attention 公式不变，只改 GPU 上的分块 IO 实现（HBM 与 SRAM 间分块读写，避免把 $n\times n$ 中间矩阵全部写回显存），结果与标准注意力数值等价、快 2-4 倍，属工程优化。Linear Attention 改公式，用核分解 $\phi(q)\phi(k)$ 替代 $\exp(q\cdot k)$，把复杂度降到 $O(n\cdot d^2)$，代价是丢失 softmax 的精确性、表达力下降，属公式变体。</p>
+      <p>Flash Attention 公式不变，只改 GPU 上的分块 IO 实现（HBM 与 SRAM 间分块读写，避免把 $n\times n$ 中间矩阵全部写回显存），结果与标准注意力数值等价、在常见序列长度（128–2K）上最多约 3 倍快于标准注意力实现，属工程优化。Linear Attention 改公式，用核分解 $\phi(q)\phi(k)$ 替代 $\exp(q\cdot k)$，把复杂度降到 $O(n\cdot d^2)$，代价是丢失 softmax 的精确性、表达力下降，属公式变体。</p>
     </details>
   </li>
 </ol>
