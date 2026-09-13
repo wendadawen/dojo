@@ -69,7 +69,7 @@
 
 <p>Strata 用三个机制回应这两个原因。<b>GPU-assisted I/O</b>用 CUDA kernel 代替传统的 cudaMemcpyAsync 传输——数千线程各搬一小块数据，并发与传输粒度都大幅改善；用少量大 block 把 kernel 关进少数 SM 不影响计算；让 GPU 保持 layer-first 计算布局，host 与存储用 page-first 传输布局，布局转换由 I/O kernel 内一次算术完成。<b>Cache-aware 调度</b>把 PCIe 带宽当成一等资源：transient node 标记避免 delay hit（同一缓存"正在计算中"时的重复 prefill），均衡组批（load/compute 比例阈值 100）避免 loading-bound，bubble filling 在不可避免的空泡里插入 decode 批填充。H200 上的实验显示，对比 vLLM+LMCache 吞吐最多提升 5 倍、对比 TensorRT-LLM 最多 3.75 倍，短上下文不退化<sup>[C24]</sup>。</p>
 
-<p>阅读前假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿示例：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.56 GB——已超出单请求显存预算，分层与跨层搬运不可避免。</p>
+<p>阅读前假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿示例：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.44 GB——已超出单请求显存预算，分层与跨层搬运不可避免。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -140,13 +140,13 @@
 
 <h3 id="capacity-math">1.1 分层缓存成为标配——容量账</h3>
 
-<p>KV cache 的大小随 token 数线性增长（<a href="../kv-cache/index.html">KV cache</a> 第 3 章）：每 token 占 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 字节。以 Llama-3.1-8B 为例（32 层、8 KV 头、head_dim 128、bf16），每 token 128 KB（按公式 F3 复算，配置来自 Llama-3.1-8B 模型卡）。一份 20,000 token 的手册缓存 $20{,}000\times 128\,\text{KB}\approx 2.56\,\text{GB}$——已经是单一请求独占的相当份额。<span class="callout-inline">一句话账：40 GB HBM 对 Llama-8B 只够缓存约 0.3M token<sup>[N1, N2]</sup>（$=40\,\text{GB}/128\,\text{KB}\approx 0.31\,\text{M}$）。</span></p>
+<p>KV cache 的大小随 token 数线性增长（<a href="../kv-cache/index.html">KV cache</a> 第 3 章）：每 token 占 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 字节。以 Llama-3.1-8B 为例（32 层、8 KV 头、head_dim 128、bf16），每 token 128 KB（按公式 F3 复算，配置来自 Llama-3.1-8B 模型卡）。一份 20,000 token 的手册缓存 $20{,}000\times 128\,\text{KB}\approx 2.44\,\text{GB}$——已经是单一请求独占的相当份额。<span class="callout-inline">一句话账：40 GB HBM 对 Llama-8B 只够缓存约 0.3M token<sup>[N1, N2]</sup>（$=40\,\text{GB}/128\,\text{KB}\approx 0.33\,\text{M}$）。</span></p>
 
 <p>一份手册已经吃掉 0.02M，生产中几十份文档或几百轮对话就耗尽显存。生产系统不得不把缓存分层到 CPU 内存、本地 SSD、远端内存池<sup>[C1]</sup>（如 Pensieve 用 CPU、CachedAttention 用 SSD、Mooncake/MemServe 用分布式池），用更大的容量换 KV cache 不被丢弃的收益。代价是访问成本：CPU 内存在 PCIe 一侧、SSD 在 NVMe 一侧、远端内存池在 NIC 一侧，访问延时递增而带宽并不成比例扩大。当请求触发需要时，系统要把缓存从这些慢的存储层搬回 GPU 才能继续生成——<b>"搬回来"正是瓶颈所在</b>。</p>
 
 <details>
 <summary>展开：20,000 token 手册的完整容量与传输账</summary>
-<p>构造示例（与贯穿示例对齐）。Llama-3.1-8B 下手册每 token 128 KB，总 $20{,}000\times 128\,\text{KB}\approx 2.56\,\text{GB}$——单一请求独占已占 40 GB HBM 的 6.4%。按页 32 切分：$\lceil 20{,}000/32\rceil=625$ 页，每页 $32\times 128\,\text{KB}=4\,\text{MB}$。手册在 CPU 内存中的 625 页散布在互不相邻的物理位置。</p>
+<p>构造示例（与贯穿示例对齐）。Llama-3.1-8B 下手册每 token 128 KB，总 $20{,}000\times 128\,\text{KB}\approx 2.44\,\text{GB}$——单一请求独占已占 40 GB HBM 的约 6.1%。按页 32 切分：$\lceil 20{,}000/32\rceil=625$ 页，每页 $32\times 128\,\text{KB}=4\,\text{MB}$。手册在 CPU 内存中的 625 页散布在互不相邻的物理位置。</p>
 <p><b>为什么 4 MB 的"大页"仍然打不满 PCIe？</b>答案在 layer-first 布局（详见第 3 章）：GPU 内存里同页的 K/V 是按"层优先"而非"页优先"排列——同一页 32 token 的 K/V 在 32 层上各占一段，跨内存层搬运时，一次只能拉取一页的某一层，单次传输单元是"页内单层片段"= 4 MB / 32 层 = 128 KB，远低于达到 PCIe 5.0（64 GB/s）约 75–80% 带宽所需的 1–2 MB 阈值<sup>[C8, N3]</sup>。更小的模型（小 head 数 $\times$ 小 head_dim）或更小的页（页 1/页 16）下，单层片段可低至几 KB——这正是论文引言所述"sometimes only a few kilobytes"的来源<sup>[C3]</sup>。搬运粒度由页大小<b>和</b>布局共同决定，单看页大小会漏掉这一关键约束。 这里说的是层与页的先后；页内维度的排法（token 与 KV 头谁在外层，即 NHD 与 HND）是决定单头取数是否连续的另一层，见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>。</p>
 </details>
 
@@ -190,7 +190,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>图 1 的 24% 即是优化 I/O 后仍存在的 stall——剩下来这部分无法靠传输加速解决，必须靠调度：让 batch 在加载与计算间取得平衡、把不可避免的等待与有用计算重叠起来。</p>
 
-<p>第二个调度问题是<b>delay hit</b><sup>[C7]</sup>：多个请求在同一上下文缓存 miss 尚未解决期间到达，编入同一批则各自做一次 prefill，但缓存的 miss 只需要被解析一次——后到的请求浪费了 prefill。异步调度器（提前准备下一批）把 miss 解析窗口拉长到整批执行时间，加剧此现象。这是分层缓存后命中率虽高（实测约 95%<sup>[C19]</sup>）但"缓存还没准备好"的请求也能命中瞬时不到位的缓存的来源。</p>
+<p>第二个调度问题是<b>delay hit</b><sup>[C7]</sup>：多个请求在同一上下文缓存 miss 尚未解决期间到达，编入同一批则各自做一次 prefill，但缓存的 miss 只需要被解析一次——后到的请求浪费了 prefill。异步调度器（提前准备下一批）把 miss 解析窗口拉长到整批执行时间，加剧此现象。分层缓存下实测命中率虽高（约 95%<sup>[C19]</sup>），但该统计只覆盖已就绪的缓存；缓存尚在计算中的请求仍会落空，这正是 delay hit 的来源。</p>
 
 <p>这两类瓶颈分别由 GPU-assisted I/O（I/O 路径，第 2 章）与 cache-aware 调度（控制面，第 4 章）回应——但统一在第 1 章给出的"长上下文$\to$loading-bound"的图景之下。</p>
 
@@ -200,7 +200,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
     <p>为什么长上下文的 KV cache 必须分层存储？不分层会怎样？</p>
     <details>
       <summary>解答：单请求独占就吃掉相当份额显存，多请求直接耗尽</summary>
-      <p>Llama-3.1-8B 下 20,000 token 手册缓存约 2.56 GB，已经占 40 GB HBM 的 6.4%。当多个客服同时服务各自的 20K token 文档（如产品手册、技术支持手册等多份文档同时在缓存），加上多轮对话累积的缓存，几十份就耗尽。论文 LooGLE 实验验证：非分层系统"迅速耗尽 GPU 显存容量、导致 prefill 频繁 miss、反复重算、低吞吐高延迟"<sup>[C19]</sup>。分层到 CPU/SSD/远端内存池是必要的容量扩展。</p>
+      <p>Llama-3.1-8B 下 20,000 token 手册缓存约 2.44 GB，已经占 40 GB HBM 的约 6.1%。当多个客服同时服务各自的 20K token 文档（如产品手册、技术支持手册等多份文档同时在缓存），加上多轮对话累积的缓存，几十份就耗尽。论文 LooGLE 实验验证：非分层系统"迅速耗尽 GPU 显存容量、导致 prefill 频繁 miss、反复重算、低吞吐高延迟"<sup>[C19]</sup>。分层到 CPU/SSD/远端内存池是必要的容量扩展。</p>
     </details>
   </li>
   <li>
@@ -621,7 +621,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <p>全部核心论断对应 arXiv:2508.18572v1 TeX 源码（2025-08-26 提交）。C1–C8（瓶颈与机制）见 §1、§2.2、§3.1、§3.2、§4.2；C9（GPU-assisted I/O 三优点）见 §4.2 L33–36；C10（干扰控制）见 §4.2 L48–54；C11（布局解耦）见 §4.2.1 L79–86；C12（存储层机会性预取）见 §4.2.1 L73–76；C13–C16（调度三阶段）见 §4.3 L101–106、§4.3.1 L111–115、§4.3.2 L150–167、§4.3.3 L169–174；C17（P-D co-location）见 §4.1 L23–25；C18（系统架构）见 §4.1 L19–26 与图 4；C19（分层缓存必要性）见 §5.2.1 L86–87；C20（消融归因）见 §5.3.1 L126–138；C21（页大小负担）见 §5.3.2 L150–154；C22（cache distance）见 §5.3.3 L157–168；C23（GH200）见 §5.4 L212–225；C24（短上下文）见 §5.2.3 L106–111；C25（生产部署）见 §1 L46；C26（ROCm 兼容）见 §4.2 L55；C27（相关工作定位）见 §6 L2–21；C28（Conclusion 展望）见 §7 L2。F1、F2 见 §3.1；F3 为 KV cache 页定义、本解析沿用。</p>
 
 <h3>核心公式与原文定位</h3>
-<p>F1（Little's Law $C=\lambda L$）见 §3.1 L26–27；F2（$X=\lambda S=C\cdot S/L$）见 §3.1 L28。F3（KV cache 每 token 字节数）见 <a href="../kv-cache/index.html">KV cache</a> F1，定义沿用如下：$2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$，Llama-3.1-8B 32 层/8 KV 头/head_dim 128/bf16 得 128 KB/token，20,000 token 手册约 2.56 GB。</p>
+<p>F1（Little's Law $C=\lambda L$）见 §3.1 L26–27；F2（$X=\lambda S=C\cdot S/L$）见 §3.1 L28。F3（KV cache 每 token 字节数）见 <a href="../kv-cache/index.html">KV cache</a> F1，定义沿用如下：$2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$，Llama-3.1-8B 32 层/8 KV 头/head_dim 128/bf16 得 128 KB/token，20,000 token 手册约 2.44 GB。</p>
 
 <h3>外部数字与实验条件</h3>
 <p>N1（40 GB HBM $\approx$ Llama-8B 0.3M token）见 §1 L10。N2（页大小 32/16/1 token）见 §2.2 L14、§3.1 L48。N3（8192 token 加载约 22% PCIe 5.0 带宽、GH200 约 5%）见 §3.1 L47–49。N4（页 1$\to$1024 TTFT 最多 $2\times$、P90 $2.9\times$）见 §3.1 L41–42。N5（2 block $\times$ 1024 thread $\to$ 50 GB/s、prefill <5%、decode 10%）见 §4.2 L56–59。N6（128 字节粒度）见 §4.2 L35。N7（transient node 阈值 100）见 §4.3.1 L115。N8（loading_bound 阈值 100）见 §4.3.2 L162。N9（磁盘 page-first 延迟最多降 $4\times$）见 §5.3.4 L186–190。N10–N20（端到端全套与设置）见 §5.1 与 §5.2 表。</p>

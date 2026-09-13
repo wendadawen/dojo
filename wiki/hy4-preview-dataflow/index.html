@@ -155,7 +155,7 @@
       初始 post 门 $=2\,\sigma(0)=1.0$，即标准恒等残差——实测 min 0.9975 / max 1.0029 / mean 0.9999。</li>
     <li><b>末端收束顺序</b>：先 hc_head（4 条流加权求和，单一 $s$ 标量与 4 维 $b$，初始门同样 $\approx0.25$，实测 mean 0.2499），再过共享 RMSNorm，最后 lm_head。hc_head 的参数（<code>hc_head_fn</code> [4, 24576]、<code>hc_head_base</code> [4]、<code>hc_head_scale</code> [1]）全模型只有一份。</li>
     <li><b>真实权重的门控参数已显著训练</b>：按 <code>data_offsets</code> 精确下载的 F32 小张量显示，第 0 层 attn 的 hc_base 前 4 个（pre 半区）为 $[-0.886, -0.879, -0.718, -0.910]$，仍围绕初始值 $-\log 3\approx-1.099$；后 4 个（post 半区）为 $[-1.518, -1.418, -1.398, -0.486]$，从初始 0 大幅移出。而最后一层（77）的 post 半区为 $[0.012, 0.003, 0.012, 0.208]$，几乎保持初值——门控的训练强度沿深度差异很大。hc_scale 同样分化：第 0 层 attn $[0.250, 0.0058]$，第 77 层 $[0.258, 0.184]$。hc_head 的 base 为 $[-1.144, -1.151, -1.212, -0.972]$、scale 0.105（初始 0.01，放大十倍）。</li>
-    <li><b>半区归属的独立印证</b>：checkpoint 中 hc_base 前 4 个围绕 $-\log3$、后 4 个围绕 0，与源码初始化「前半 pre、后半 post」的切分顺序一一对应——这是除源码之外的第二重证据。</li>
+    <li><b>半区归属的独立印证</b>：hc_base 的前 4 个元素（pre 半区）停在初始值 $-\log3$ 附近，后 4 个元素（post 半区）的初值为 0；第 77 层后 4 个几乎未动（$[0.012, 0.003, 0.012, 0.208]$），第 0 层后 4 个已从 0 移出至约 $-1.4$。这种前后半区的差异与源码初始化「前半 pre、后半 post」的切分顺序对应，是除源码之外的第二重证据，但它只支持半区归属的顺序，不表示 checkpoint 中的后半区仍停在 0 附近。</li>
   </ul>
 
   <h3>DSA 索引器：fp32 打分、ReLU、跨层复用</h3>
@@ -212,7 +212,7 @@
     <tr><td>transformers eager：展开 K/V</td><td>64 头 × (256 + 256) = 32768 元素 = 65536 B</td><td>4.88 MiB</td><td>约 4.88 TiB（不可用）</td></tr>
     <tr><td>vLLM：潜向量 MQA</td><td>512 + 64 = 576 元素 = 1152 B，另 64 个 per-head sink 常驻</td><td>87.8 KiB</td><td>约 87.8 GiB</td></tr>
   </table>
-  <p>索引器缓存独立于主 cache：21 个 full 层各存每 token 128 维索引键（vLLM 用 FP8 存储并按 128 值一组附带 scale，约 2772 B/token；transformers eager 为 BF16，5376 B/token），shared 层不缓存。1M 上下文下索引器缓存约 2.7–5.3 GiB。</p>
+  <p>索引器缓存独立于主 cache：21 个 full 层各存每 token 128 维索引键（vLLM 用 FP8 存储并按 128 值一组附带 scale，约 2772 B/token；transformers eager 为 BF16，5376 B/token），shared 层不缓存。1M 上下文下索引器缓存约 2.7–5.2 GiB。</p>
 
   <h2 id="impl">4. 实现对照：同一 checkpoint 的三种消费方式</h2>
   <p>Hy4-Preview 的发布 checkpoint、transformers 参考实现与 vLLM/SGLang 部署实现之间存在两处不一致。</p>
@@ -264,7 +264,7 @@
     <tr><td>sink / 路由偏置 / hc 门控 / hc_head / k_norm 的训练后数值</td><td>真实 checkpoint 的小张量实值（按 <code>data_offsets</code> 精确下载）</td></tr>
     <tr><td>公式对撞、等价性、门控范围、MTP 结构验证</td><td>本机实测得到（清单记在 <code>research/measured.md</code>）</td></tr>
   </table>
-  <p style="color:var(--text-light);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方表述的 770B 参数已独立复现（剔除 MTP 后 769.91B）。等比缩小模型的实测数字用于验证计算规则本身（随机初始化权重），真实权重的行为以 checkpoint 小张量实值为准，两者在页面上分开标注。RoPE 布局与 checkpoint 格式归属两节结论的证据性质为「官方部署实现的源码一致性」，已在正文标注。本页覆盖语言主干与 MTP 草稿层的完整前向数据流；训练方案、推理调度（如 MTP 的投机采样策略）、量化与部署性能不在范围内。</p>
+  <p style="color:var(--text-light);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方表述的 770B 参数已独立复现（剔除 MTP 后 769.91B）。等比缩小模型的实测数字用于验证计算规则本身（随机初始化权重），真实权重的行为以 checkpoint 小张量实值为准，两者在页面上分开标注。RoPE 布局与 checkpoint 格式归属两节结论的证据性质为「官方部署实现的源码一致性」，已在正文标注。覆盖范围：语言主干与 MTP 草稿层的完整前向数据流；训练方案、推理调度（如 MTP 的投机采样策略）、量化与部署性能不在范围内。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 
@@ -645,7 +645,7 @@ cache: {
     vlm:  {label:'vLLM：直接缓存潜向量\n576 元素 = 1152 B', t:'buf', io:'[T,576] + sink[64]', f:'576 \\times 2\\,\\mathrm{B}', d:'MQA 式存储：每个 token 每层只存 576 个 bf16 元素，另 64 个 per-head sink 常驻（一次性）。解码时在 Kernel 内展开。78 层合计 87.8 KiB/token；1M 上下文约 87.8 GiB。'},
     hf:   {label:'eager：缓存展开 K/V\n32768 元素 = 65536 B', t:'rexp', io:'K[64,T,256] V[64,T,256]', f:'64\\times(256+256)', d:'把潜向量经 kv_b_proj 展开成每头独立的 K/V 后缓存。78 层合计 4.88 MiB/token；1M 上下文约 4.88 TiB——这是参考实现口径，部署不可用，也是潜向量口径存在的理由。'},
     ratio:{label:'体积比\n56.89×', t:'gt', io:'', f:'32768/576', d:'两种口径存的是同一份信息（kv_b_proj 可逆展开），差距全在「何时展开」。'},
-    ix:   {label:'索引器缓存\n21 层 × 128 维', t:'ple', io:'[T,128] × 21', f:'21 \\times 128\\ \\mathrm{dims}', d:'独立于主 cache：只有 full 层需要（57 个 shared 层不缓存）。vLLM FP8 约 2772 B/token（128 值一组附 4 字节 scale）；eager BF16 5376 B/token。1M 上下文约 2.7–5.3 GiB。'},
+    ix:   {label:'索引器缓存\n21 层 × 128 维', t:'ple', io:'[T,128] × 21', f:'21 \\times 128\\ \\mathrm{dims}', d:'独立于主 cache：只有 full 层需要（57 个 shared 层不缓存）。vLLM FP8 约 2772 B/token（128 值一组附 4 字节 scale）；eager BF16 5376 B/token。1M 上下文约 2.7–5.2 GiB。'},
     sum:  {label:'1M 上下文合计\n(线性估算)', t:'out', io:'', f:'\\approx 90.5\\ \\mathrm{GiB}\\ (\\mathrm{vLLM})', d:'vLLM：主 87.8 GiB + 索引器 2.7 GiB，合计 $\\approx$ 90.5 GiB。eager 口径主 cache 4.88 TiB 不可用。按每 token 线性估算，忽略块对齐开销。'},
   },
   edges:[

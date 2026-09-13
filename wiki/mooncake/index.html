@@ -59,11 +59,11 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, Xinran Xu. <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>. FAST '25 / arXiv:2407.00079v4（3 Sep 2025），23 页 13 图。</p>
+<p><b>主要依据</b>：Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, Xinran Xu. <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>. arXiv:2407.00079v4（3 Sep 2025），23 页 13 图。</p>
 <p><b>开源仓库</b>：kvcache-ai/Mooncake（论文 §1 仅声明 trace 仓库地址，本文不展开仓库内部组件命名）。</p>
 </blockquote>
 
-<p>长上下文请求涌入时，prefill 阶段要把数万 token 一次性送进模型——这在常规推理集群里常常把同 batch 上所有 decode 序列推迟一个或更多 step，拉高其 TBT。MaaS（Model as a Service，模型即服务）的用户既看首字延迟 TTFT（time to first token）也看连续解码延迟 TBT（time between tokens），两个 SLO（Service Level Objective，服务级别目标）同时被破坏。Mooncake 围绕 KVCache 重构了整套推理架构：把 prefill 与 decode 拆到不同集群<sup>[C2]</sup>，把 GPU 集群里长期闲置的 CPU/DRAM/SSD 资源经 RDMA（Remote Direct Memory Access，远程直接内存访问，一种绕过 CPU 的跨节点高带宽网络）组织成分布式 KVCache 池，再用一个全局调度器把请求路由到「缓存复用最多」与「负载最轻」同时成立的实例。当 GPU 供给受限出现过载时，它按预测的解码负载决定是否提前拒绝请求，避免算力浪费。本页解释这套架构为什么这样设计、它怎么工作、在哪些条件下收益最大。</p>
+<p>长上下文请求涌入时，prefill 阶段要把数万 token 一次性送进模型——这在常规推理集群里常常把同 batch 上所有 decode 序列推迟一个或更多 step，拉高其 TBT。MaaS（Model as a Service，模型即服务）的用户既看首字延迟 TTFT（time to first token）也看连续解码延迟 TBT（time between tokens），两个 SLO（Service Level Objective，服务级别目标）同时被破坏。Mooncake 围绕 KVCache 重构了整套推理架构：把 prefill 与 decode 拆到不同集群<sup>[C2]</sup>，把 GPU 集群里长期闲置的 CPU/DRAM/SSD 资源经 RDMA（Remote Direct Memory Access，远程直接内存访问，一种绕过 CPU 的跨节点高带宽网络）组织成分布式 KVCache 池，再用一个全局调度器把请求路由到「缓存复用最多」与「负载最轻」同时成立的实例。当 GPU 供给受限出现过载时，它按预测的解码负载决定是否提前拒绝请求，避免算力浪费。</p>
 
 <div class="callout callout-blue">
 <p><b>本页范围</b>：论文（arXiv:2407.00079v4）所述的整体架构设计——两阶段分离动机、组件与四步工作流、cache-aware 调度算法、长上下文 prefill 的 CPP 与 layer-wise 重叠、过载早拒绝与预测。Transfer Engine 的内部实现、开源仓库的组件生态、异构加速器等不展开。</p>
@@ -113,7 +113,7 @@
 <section class="misconceptions">
 <h2>常见误解</h2>
 <ul>
-<li><b>「Mooncake 等于开源的 Mooncake Transfer Engine」</b>：本页采用的 Mooncake 指 FAST'25 论文（arXiv:2407.00079v4）描述的 Kimi 服务平台整体设计；同名开源仓库（论文 §1 仅声明 trace 仓库地址，组件生态与开源版本不在本文范围）。两者相关但不同，本文以论文含义为准。</li>
+<li><b>「Mooncake 等于开源的 Mooncake Transfer Engine」</b>：本文采用的 Mooncake 指 arXiv:2407.00079v4 描述的 Kimi 服务平台整体设计；同名开源仓库（论文 §1 仅声明 trace 仓库地址，组件生态与开源版本不在本文范围）。两者相关但不同，本文以论文含义为准。</li>
 <li><b>「PD 分离就是 Mooncake 的核心创新」</b>：PD 分离此前已有 Splitwise、DistServe、TetriInfer 等并行工作。Mooncake 的核心是把 KVCache 提升为调度中心——全局 KVCache 池、cache-aware 调度、热点自动迁移、过载下的预测早拒绝。PD 分离是基础而非全部。</li>
 <li><b>「朴素早拒绝就是常规限流」</b>：常规做法按当前 decode 负载调度，但 prefill 与 decode 之间存在时滞，按当前负载决策会引发反相震荡。Mooncake 用基于系统级预测的早拒绝（假设均匀 decode 时长 $t_d$，预测 $t$ 时刻 decode 负载）来缓解。</li>
 </ul>
@@ -272,7 +272,7 @@
 </table>
 </div>
 
-<p>几个值得记下的工程要点：</p>
+<p>工作流中的三个要点：</p>
 <ul>
 <li>步骤 ② 的切块阈值 prefill_chunk 典型 &gt; 1,000 tokens；剩余输入 $≤$ 阈值时不分块（推断：避免流水线填充开销）。<sup>[N7]</sup></li>
 <li>步骤 ③ 与 ② 重叠——prefill 算到第 $L$ 层时，第 $L$ 层的 KVCache 已经在传给 decode；不等全部 prefill 完成。<sup>[C20]</sup></li>
@@ -280,7 +280,7 @@
 </ul>
 
 <details>
-<summary>辅助解释：为什么把 KVCache 放在 CPU DRAM 而不是 GPU VRAM？</summary>
+<summary>补充：为什么把 KVCache 放在 CPU DRAM 而不是 GPU VRAM？</summary>
 <p>GPU VRAM 同时要装模型权重、当前请求的 KVCache、聚合 decode batch 的 KVCache。一条 12,288 token 的请求 KVCache，以 <a href="../../wiki/kv-cache/index.html">KV cache</a> 页面的公式 $B_{\text{kv}}=2\cdot L\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 估算：取 LLaMA2-70B 配置 $L=80,\ H_{\text{kv}}=8,\ d_{\text{head}}=128,\ b=2$（fp16），$B_{\text{kv}}\approx 320\ \text{KiB/token}$，12,288 tokens 约 3.75 GiB。128k 上下文的请求就接近 40 GiB——单一请求的 KVCache 已经占满单卡 VRAM 的一半。把 KVCache 池放到 CPU DRAM/SSD 相当于把 GPU 集群里长期闲置的「邻居」容量纳为己用（推断）；同时 RDMA 互联为 KVCache 搬运提供了独立于 GPU 算力的高带宽通路（推断）。<sup>[C3]</sup></p>
 </details>
 
@@ -290,14 +290,14 @@
 <p>Mooncake 的分布式 KVCache 池与本地 KVCache 缓存（如 vLLM 的实现）相比，关键差异是什么？</p>
 <details>
 <summary>解答：把块哈希链与 LRU 复用从单节点扩展为跨节点全局池 + Messenger 跨节点传输</summary>
-<p>本地 KVCache 缓存（如 vLLM 的实现）只在一台 GPU 服务器内做块哈希链与 LRU 复用，缓存容量受单节点 VRAM 限制；命中只能帮同节点上的请求。Mooncake 的池把块哈希链与 LRU 扩展到 GPU 集群里每节点的 CPU DRAM（必要时 SSD），通过 Messenger（GPUDirect RDMA）在节点间搬运。关键差异有三：(1) 容量大幅增加（CPU DRAM 容量与带宽显著高于单卡 VRAM（推断，论文未给出具体数值））；(2) 命中能帮到任何节点上的请求，Conductor 可以把请求路由到缓存最多的节点；(3) 跨节点传输必须考虑网络拥塞，因此调度同时考虑 prefix 长度与传输代价（详见第 3 章）。</p>
+<p>本地 KVCache 缓存（如 vLLM 的实现）只在一台 GPU 服务器内做块哈希链与 LRU 复用，缓存容量受单节点 VRAM 限制；命中只能帮同节点上的请求。Mooncake 的池把块哈希链与 LRU 扩展到 GPU 集群里每节点的 CPU DRAM（必要时 SSD），通过 Messenger（GPUDirect RDMA）在节点间搬运。关键差异有三：(1) 容量大幅增加（CPU DRAM 容量显著高于单卡 VRAM（推断，论文未给出具体数值））；(2) 命中能帮到任何节点上的请求，Conductor 可以把请求路由到缓存最多的节点；(3) 跨节点传输必须考虑网络拥塞，因此调度同时考虑 prefix 长度与传输代价（详见第 3 章）。</p>
 </details>
 </li>
 <li>
 <p>为什么 Mooncake 在请求完成前就已经开始把 KVCache 传给 decode 节点，而不是等 prefill 全部完成？</p>
 <details>
 <summary>解答：让传输与 prefill 计算在时间上重叠，减少端到端 TTFT</summary>
-<p>把步骤 ②（增量 prefill）与步骤 ③（KVCache 传输）重叠：prefill 节点算到第 $L$ 层时，第 $L$ 层的 KVCache 已经由 Messenger 流式传到 decode 节点的 CPU DRAM。这样等 prefill 全部完成时，decode 节点已经在 GPU 上加载好了全量 KVCache，可以立即加入连续批处理；如果等 prefill 完成再开始传输，decode 节点的等待时间等于传输时间，会被白白浪费。这与 layer-wise prefill 的「计算与传输重叠」是同一种思路。</p>
+<p>把步骤 ②（增量 prefill）与步骤 ③（KVCache 传输）重叠：prefill 节点算到第 $L$ 层时，第 $L$ 层的 KVCache 已经由 Messenger 流式传到 decode 节点的 CPU DRAM。这样等 prefill 全部完成时，KVCache 已落在 decode 节点的 CPU DRAM（随后与解码并发地异步载入 GPU），可以立即加入连续批处理；如果等 prefill 完成再开始传输，decode 节点的等待时间等于传输时间，会被白白浪费。这与 layer-wise prefill 的「计算与传输重叠」是同一种思路。</p>
 </details>
 </li>
 </ol>
@@ -321,7 +321,7 @@
 <p>对每个 prefill 实例 $p_i$，Conductor 按 Algorithm 1 估计 TTFT：</p>
 
 <details>
-<summary>展开：Algorithm 1 完整伪代码</summary>
+<summary>代码：Algorithm 1 完整伪代码</summary>
 <pre class="language-text">输入：prefill 实例池 P，decode 实例池 D，请求 R，块大小 B
 输出：处理 R 的 (p, d)（prefill 实例，decode 实例）
 
@@ -396,7 +396,7 @@ return (p, d)
 </div>
 
 <details>
-<summary>展开：构造时间模型的含义</summary>
+<summary>补充：构造时间模型的含义</summary>
 <p>$T_{\text{prefill}}(p) = 0.5 + (12288 - p)/4000$ 表示：固定开销 0.5 秒（启动 GPU kernel 等），加上未复用 token（12288 − prefix_len）的线性 prefill 时间，系数 $1/4000 \approx 0.00025$ s/token $≈$ 4,000 tok/s。$T_{\text{transfer}}(t) = t/10000$ 表示 RDMA 链路传输速率约 10,000 tokens/s。这两个常数均为便于手算的构造值，不是论文实验数据。论文实验中 prefill 时间由 §6.1 描述的离线数据拟合预测模型估计<sup>[C24]</sup>；传输时间更难预测（论文指出它同时取决于传输数据量与当前网络状态，未给出其预测模型细节）。</p>
 </details>
 
@@ -489,7 +489,7 @@ return (p, d)
 <li><b>同时适合短/长上下文</b>：对短上下文 prefill 无显著额外开销，长上下文则切块流水线处理；不需要根据负载频繁动态调整节点划分（避免复杂的弹性 SP 机制）。<sup>[C19]</sup></li>
 </ol>
 
-<p>下面是 2 stage × 2 chunk 的最小流水线示意（实际 Mooncake 可用更多 stage）：</p>
+<p>2 stage × 2 chunk 的最小流水线示意（实际 Mooncake 可用更多 stage）：</p>
 
 <figure class="diagram">
 <svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg">
@@ -662,7 +662,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 <h2>来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>下表列出正文中所有标注 <sup>[Cx]</sup> 的论断的来源定位。来源主论文：Ruoyu Qin et al., <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>, FAST '25 / arXiv:2407.00079v4（3 Sep 2025），23 页 13 图。</p>
+<p>下表列出正文中所有标注 <sup>[Cx]</sup> 的论断的来源定位。来源主论文：Ruoyu Qin et al., <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>, arXiv:2407.00079v4（3 Sep 2025），23 页 13 图。</p>
 
 <div class="table-scroll">
 <table>
@@ -705,7 +705,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 
 <h3>公式与来源（F）</h3>
 <ul>
-<li><b>F1</b>：每 token KVCache 字节数 $B_{\text{kv}}=2\cdot L\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$（首位因子 2 对应 K 与 V 两份；$b$ 为每元素字节数，fp16 时 $b=2$）。公式来源：<a href="../../wiki/kv-cache/index.html">KV cache</a> 页面 F1（已发表概念页）。LLaMA2-70B 配置 $L=80,\ H_{\text{kv}}=8,\ d_{\text{head}}=128,\ b=2$ 来自 LLaMA2 论文 [11]，$B_{\text{kv}}\approx 320\ \text{KiB/token}$。本页面仅用于 12,288 tokens $≈$ 3.75 GiB 的辅助估算，标为「构造示例」。</li>
+<li><b>F1</b>：每 token KVCache 字节数 $B_{\text{kv}}=2\cdot L\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$（首位因子 2 对应 K 与 V 两份；$b$ 为每元素字节数，fp16 时 $b=2$）。公式来源：<a href="../../wiki/kv-cache/index.html">KV cache</a> 页面 F1（已发表概念页）。LLaMA2-70B 配置 $L=80,\ H_{\text{kv}}=8,\ d_{\text{head}}=128,\ b=2$ 来自 LLaMA2 论文，$B_{\text{kv}}\approx 320\ \text{KiB/token}$。本页面仅用于 12,288 tokens $≈$ 3.75 GiB 的辅助估算，标为「构造示例」。</li>
 <li><b>F2</b>：占用代价 $S\cdot T$（$S$ 为 KVCache 大小，$T$ 为该请求的处理时间）。来源：§5.2（"its occupation cost is $S\cdot T$"）。用于 layer-wise prefill 节省 VRAM 的论证。</li>
 </ul>
 
