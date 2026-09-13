@@ -49,6 +49,23 @@ def header_fingerprint(text: str) -> str | None:
     return field.group(1)
 
 
+OPEN_RE = re.compile(r"统计：\s*阻断\s*(\d+)\s*/\s*重要\s*(\d+)")
+
+
+def open_issues(path: Path) -> tuple[int, int]:
+    """最新一轮审查记录末尾统计里仍未关闭的阻断数与重要数。
+
+    徽章若只看「轮次够不够」，会把「审过但问题还没修」的页面显示成完整审查——
+    而 check.md 的发布条件是阻断和重要全部关闭。
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    found = OPEN_RE.findall(text)
+    if not found:
+        return (0, 0)
+    blocking, important = found[-1]
+    return int(blocking), int(important)
+
+
 def file_date(path: Path) -> str:
     result = subprocess.run(
         ["git", "log", "-1", "--format=%ad", "--date=short", "--", str(path)],
@@ -97,12 +114,18 @@ def status_of(slug: str, root: Path) -> dict:
     if fingerprint and current:
         stale = fingerprint != current
 
+    open_blocking = open_important = 0
+    if latest_path is not None:
+        open_blocking, open_important = open_issues(latest_path)
+
     return {
         "slug": slug,
         "rounds": rounds,
         "measured": measured,
         "stale": stale,
         "reviewed_at": file_date(latest_path) if latest_path else "",
+        "open_blocking": open_blocking,
+        "open_important": open_important,
     }
 
 
@@ -123,11 +146,13 @@ def main() -> int:
     full = [s for s in statuses if s["rounds"] >= 3]
     none = [s for s in statuses if s["rounds"] == 0]
     changed = [s for s in statuses if s["stale"]]
+    with_open = [s for s in statuses if s["open_blocking"] or s["open_important"]]
     print(f"页面 {len(statuses)}")
     print(f"  走完 >=3 轮: {len(full)}")
     print(f"  0 轮:        {len(none)}")
     print(f"  审查后正文被改过: {len(changed)}")
     print(f"  有实测产物:  {sum(1 for s in statuses if s['measured'])}")
+    print(f"  最后一轮仍有未关闭的阻断或重要: {len(with_open)}")
     print("\n轮次分布:")
     counts: dict[int, int] = {}
     for item in statuses:

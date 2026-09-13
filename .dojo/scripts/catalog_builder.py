@@ -199,12 +199,17 @@ def review_fields(root: Path, slug: str) -> dict:
     try:
         info = review_status.status_of(slug, root)
     except Exception:  # noqa: BLE001 - 状态算不出来不该让构建失败
-        return {"rounds": 0, "measured": False, "stale": None, "reviewed_at": ""}
+        return {
+            "rounds": 0, "measured": False, "stale": None, "reviewed_at": "",
+            "open_blocking": 0, "open_important": 0,
+        }
     return {
         "rounds": info["rounds"],
         "measured": info["measured"],
         "stale": info["stale"],
         "reviewed_at": info["reviewed_at"],
+        "open_blocking": info.get("open_blocking", 0),
+        "open_important": info.get("open_important", 0),
     }
 
 
