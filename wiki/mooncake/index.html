@@ -397,7 +397,7 @@ return (p, d)
 
 <details>
 <summary>补充：构造时间模型的含义</summary>
-<p>$T_{\text{prefill}}(p) = 0.5 + (12288 - p)/4000$ 表示：固定开销 0.5 秒（启动 GPU kernel 等），加上未复用 token（12288 − prefix_len）的线性 prefill 时间，系数 $1/4000 \approx 0.00025$ s/token $≈$ 4,000 tok/s。$T_{\text{transfer}}(t) = t/10000$ 表示 RDMA 链路传输速率约 10,000 tokens/s。这两个常数均为便于手算的构造值，不是论文实验数据。论文实验中 prefill 时间由 §6.1 描述的离线数据拟合预测模型估计<sup>[C24]</sup>；传输时间更难预测（论文指出它同时取决于传输数据量与当前网络状态，未给出其预测模型细节）。</p>
+<p>$T_{\text{prefill}}(p) = 0.5 + (12288 - p)/4000$ 表示：固定开销 0.5 秒（启动 GPU kernel 等），加上未复用 token（$12288-\text{prefix\_len}$）的线性 prefill 时间，系数 $1/4000 \approx 0.00025$ s/token $≈$ 4,000 tok/s。$T_{\text{transfer}}(t) = t/10000$ 表示 RDMA 链路传输速率约 10,000 tokens/s。这两个常数均为便于手算的构造值，不是论文实验数据。论文实验中 prefill 时间由 §6.1 描述的离线数据拟合预测模型估计<sup>[C24]</sup>；传输时间更难预测（论文指出它同时取决于传输数据量与当前网络状态，未给出其预测模型细节）。</p>
 </details>
 
 <p>对三个实例按 Algorithm 1 逐个跑：</p>
@@ -426,16 +426,16 @@ return (p, d)
 </thead>
 <tbody>
 <tr><td>纯缓存优先</td><td>选 prefix 最长的 B</td><td>9.012</td></tr>
-<tr><td>纯负载均衡</td><td>选 T_queue 最小的 C，忽略缓存</td><td>$1.0 + (12288 - 0)/4000 =$ <b>4.072</b></td></tr>
+<tr><td>纯负载均衡</td><td>选 T_queue 最小的 C，忽略缓存</td><td>$1.0 + 0.5 + (12288 - 0)/4000 =$ <b>4.572</b></td></tr>
 <tr><td>cache-aware 但不考虑传输</td><td>Algorithm 1 分支 1（选 A）</td><td>4.524</td></tr>
 <tr><td>cache-aware + balance（Algorithm 1）</td><td>选 C 并从 B 传差额</td><td><b>3.036</b></td></tr>
 </tbody>
 </table>
 </div>
 
-<p>策略对比给出的结论：纯缓存优先会让热门实例过载（9.012s）；纯负载均衡会丢失缓存复用（4.072s）；cache-aware 不考虑传输时选了一个有缓存但队列长、还不需要传的实例（4.524s）；只有 cache-aware + balance 同时权衡两者才选到 3.036s 并附带热点迁移。</p>
+<p>策略对比给出的结论：纯缓存优先会让热门实例过载（9.012s）；cache-aware 不考虑传输时选了一个有缓存但队列长、还不需要传的实例（4.524s）；纯负载均衡丢失缓存复用、导致全量重算（4.572s），反而更差；只有 cache-aware + balance 同时权衡两者才选到 3.036s 并附带热点迁移。</p>
 
-<p>真实回放实验支持这个结论。在 8 个 prefill + 8 个 decode 实例上重放 23,000 条真实请求，KVCache-centric 调度把平均 TTFT 从 random 的 92.07s 降到 6.26s，比 cache-aware（14.36s）和 load-balancing（60.41s）都低；其中只有 KVCache-centric（6.26s）与 cache-aware（14.36s）满足 SLO 线（$≈$50s）。<sup>[N8]</sup></p>
+<p>真实回放实验支持这个结论。在 8 个 prefill + 8 个 decode 实例上重放 23,000 条真实请求，KVCache-centric 调度把平均 TTFT 从 random 的 92.07s 降到 6.26s，比 cache-aware（14.36s）和 load-balancing（60.41s）都低；其中只有 KVCache-centric（6.26s）与 cache-aware（14.36s）满足 SLO 线（$≈$30s）。<sup>[N8]</sup></p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -443,14 +443,14 @@ return (p, d)
 <p>Algorithm 1 的两条分支分别适用于哪种 prefix 匹配情况？为什么需要这两条分支？</p>
 <details>
 <summary>解答：分支 1 处理「本地够用」、分支 2 处理「本地远不够、需要从最佳实例拉」</summary>
-<p>两条分支对应不同的 prefix 匹配差距。<b>分支 1（cache-aware）</b>：当 best_prefix_len/prefix_len$_i$ &lt; threshold，$p_i$ 的本地前缀与全局最佳差距不大（在阈值倍数以内）、直接本地复用的成本可控，直接用本地 prefix_len 计算 T_prefill，不传输；分支 2（cache-aware + balance）：当差距过大，$p_i$ 的本地 prefix 远逊于 best，从 $p_{\text{best}}$ 拉差额（transfer_len = best − prefix$_i$），并按传输后复用 best_prefix_len 估计 T_prefill。两条分支都需要：分支 1 避免无意义的传输浪费、分支 2 防止因「本地远不够」而把请求拒掉——同时后者也是热点自动迁移的前置条件。</p>
+<p>两条分支对应不同的 prefix 匹配差距。<b>分支 1（cache-aware）</b>：当 best_prefix_len/prefix_len$_i$ &lt; threshold，$p_i$ 的本地前缀与全局最佳差距不大（在阈值倍数以内）、直接本地复用的成本可控，直接用本地 prefix_len 计算 T_prefill，不传输；分支 2（cache-aware + balance）：当差距过大，$p_i$ 的本地 prefix 远逊于 best，从 $p_{\text{best}}$ 拉差额（$\text{transfer\_len}=\text{best}-\text{prefix}_i$），并按传输后复用 best_prefix_len 估计 T_prefill。两条分支都需要：分支 1 避免无意义的传输浪费、分支 2 防止因「本地远不够」而把请求拒掉——同时后者也是热点自动迁移的前置条件。</p>
 </details>
 </li>
 <li>
 <p>为什么 Mooncake 不能只按负载均衡（最闲的实例）调度？</p>
 <details>
 <summary>解答：可能把请求路由到无缓存实例，导致全量重算；cache 复用率直接受路由影响</summary>
-<p>单纯负载均衡选 T_queue 最小的实例——但 T_queue 小的实例其缓存可能并未集中（推断：trace 显示请求前缀复用集中于少量热点块，热点块所在实例更易进入队列）。把请求路由到无缓存实例意味着全量 prefill，TTFT 显著恶化（构造示例里纯 LB = 4.072s，比 KVCache-centric 3.036s 高 ~1s；真实回放实验 60.41s vs 6.26s）。同时 cache 命中率与路由策略强耦合：路由决策决定下次请求能命中多少。Mooncake 的解法是把 prefix 长度纳入调度（Algorithm 1），让 T_queue 与 prefix_len 共同决定 TTFT，而非只看 T_queue。</p>
+<p>单纯负载均衡选 T_queue 最小的实例——但 T_queue 小的实例其缓存可能并未集中（推断：trace 显示请求前缀复用集中于少量热点块，热点块所在实例更易进入队列）。把请求路由到无缓存实例意味着全量 prefill，TTFT 显著恶化（构造示例里纯 LB = 4.572s，比 KVCache-centric 3.036s 高 ~1.5s；真实回放实验 60.41s vs 6.26s）。同时 cache 命中率与路由策略强耦合：路由决策决定下次请求能命中多少。Mooncake 的解法是把 prefix 长度纳入调度（Algorithm 1），让 T_queue 与 prefix_len 共同决定 TTFT，而非只看 T_queue。</p>
 </details>
 </li>
 </ol>
@@ -723,7 +723,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 <tr><td>N5</td><td>LRU 在该 trace 上表现最优</td><td>§4.2</td></tr>
 <tr><td>N6</td><td>&gt; 50% 块零访问，部分块被访问数万次</td><td>§4.2；Figure 6</td></tr>
 <tr><td>N7</td><td>prefill_chunk 阈值通常 &gt; 1,000 tokens</td><td>§3</td></tr>
-<tr><td>N8</td><td>8P+8D 调度实验：KVCache-centric 6.26s、cache-aware 14.36s、load-balancing 60.41s、random 92.07s（平均 TTFT）</td><td>§6.2；Figure 8（已通过抽取 PDF 第 11 页为图像核对柱状对应）</td></tr>
+<tr><td>N8</td><td>8P+8D 调度实验：KVCache-centric 6.26s、cache-aware 14.36s、load-balancing 60.41s、random 92.07s（平均 TTFT）</td><td>§6.2；Figure 8</td></tr>
 <tr><td>N9</td><td>8P+8D $2\times$ 重放过载实验：Baseline 4183、ER 3771、ERP 3589 拒绝</td><td>Table 3；§8.2</td></tr>
 <tr><td>N10</td><td>端到端 SLO：TTFT<sub>P90</sub>=$10\times$，TBT<sub>P90</sub>=$5\times$</td><td>§2</td></tr>
 <tr><td>N11</td><td>ArXiv +20%、L-Eval +40% 吞吐提升</td><td>§8.1.1</td></tr>

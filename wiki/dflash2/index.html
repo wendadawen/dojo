@@ -66,7 +66,7 @@
 <p>DFlash 的草稿块一次前向就写完，但块内各位置是「各写各的」——每个位置独立挑自己最可能的 token，两个相邻位置可能挑出同一个词（stutter），验证时整块被截断。DFlash 2 是 2026-08-18 Inco AI 发布的第二代草稿器：<b>不放弃并行</b>，把「挑」和「稳」分开修——加一个路径选择器把「独立 top-1」的失败串成连贯路径，加一个两抽头动态卷积把块末端的准确率衰减补上来。两个组件总共 <code>+1.3%</code> 循环延迟，换来 <code>16–25%</code> 的接受长度提升。</p>
 </div>
 
-<p>DFlash 2 不是一篇新论文、不是新独立语言模型——它是一份草稿器的工程迭代，由博客 + 两份开源草稿模型权重（Qwen3.8-27B-DFlash2、Muse-Glimmer-30B-DFlash2）发布；它构建在 DFlash 的单步并行起草之上，加两个轻量组件修复 DFlash 剩下的两个问题。本文围绕这两个组件的机制、证据和边界展开，DFlash 自身的 KV 注入、单步起草、训练方法见 <a href="../dflash/index.html">DFlash 论文解析</a>，块扩散范式本身见 <a href="../block-diffusion/index.html">块扩散</a>。</p>
+<p>DFlash 2 不是一篇新论文、不是新独立语言模型——它是一份草稿器的工程迭代，由博客 + 两份开源草稿模型权重（Qwen3.8-27B-DFlash2、Muse-Glimmer-30B-DFlash2）发布；它构建在 DFlash 的单步并行起草之上，加两个轻量组件修复 DFlash 剩下的两个问题。以下按这两个组件的机制、证据和边界展开，DFlash 自身的 KV 注入、单步起草、训练方法见 <a href="../dflash/index.html">DFlash 论文解析</a>，块扩散范式本身见 <a href="../block-diffusion/index.html">块扩散</a>。</p>
 
 <p>前置概念：<a href="../speculative-decoding/index.html">投机解码</a>（draft-verify 循环与接受长度的定义）、<a href="../dflash/index.html">DFlash</a>（单步并行起草、KV 注入、训练设计）。</p>
 
@@ -141,7 +141,7 @@
 </table>
 </div>
 
-<p>贯穿示例用 3 位置 × top-2 候选的构造网格，演示两个问题在最小例子里长什么样（构造数据，token 内容与分数均为人为设定）。表中「DFlash 独立 top-1」列的数字为 $U_t$（draft 自身的 logit），「路径选择器输出」列的数字为 $S_t$（含相邻对双线性项）；两列量纲不同，不对数值作横向比较（分解见 2.4 节）。</p>
+<p>贯穿示例用 3 位置 × top-2 候选的构造网格，演示两个问题在最小例子中的形态（构造数据，token 内容与分数均为人为设定）。表中「DFlash 独立 top-1」列的数字为 $U_t$（draft 自身的 logit），「路径选择器输出」列的数字为 $S_t$（含相邻对双线性项）；两列量纲不同，不对数值作横向比较（分解见 2.4 节）。</p>
 
 <div class="table-scroll">
 <table>
@@ -202,7 +202,7 @@ $$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle.$$
 
 <h3 id="selector-cost">2.3 与 DSpark 修正头的对比</h3>
 
-<p>DSpark（相近路线）用「串行修正头」为每个位置改写一次完整的词表分布——开销大、串行多。DFlash 2 选择器的关键论据是：选择可以全并行，只有走路径是串行的，且路径长度等于块大小（线性而非按词表大小），所以「选比预测便宜」<sup>[N1]</sup>。数字对比：</p>
+<p>DSpark（相近路线）用「串行修正头」为每个位置改写一次完整的词表分布——开销大、串行多。DFlash 2 选择器的关键论据是：选择可以全并行，只有走路径是串行的；走路径每步前进一个位置，长度随块大小线性增长（此点为由机制直接得出的推断），所以「选比预测便宜」<sup>[N1]</sup>。数字对比：</p>
 
 <div class="table-scroll">
 <table>
@@ -261,7 +261,7 @@ $$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle.$$
     <p>打分公式各项是什么？为什么全并行？</p>
     <details>
       <summary>解答：$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle$；一次前向算完所有相邻对，无额外骨干或 LM head</summary>
-      <p>公式 $S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle$<sup>[F1, C6]</sup>：$U_t(b)$ 是 DFlash 自身对 $b$ 的 logit（draft 自己的偏好），第二项是 256 维嵌入在上下文门 $H(h_t)$ 下的低秩双线性匹配（衡量「$b$ 接 $a$ 有多自然」）。打分全并行：所有相邻对、所有位置一次前向算完，不需要额外骨干或 LM head 前向<sup>[C6]</sup>。唯一串行工作是最后沿分数走路径——路径长度等于块大小（线性而非按词表大小），所以「选比预测便宜」<sup>[N1]</sup>。</p>
+      <p>公式 $S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle$<sup>[F1, C6]</sup>：$U_t(b)$ 是 DFlash 自身对 $b$ 的 logit（draft 自己的偏好），第二项是 256 维嵌入在上下文门 $H(h_t)$ 下的低秩双线性匹配（衡量「$b$ 接 $a$ 有多自然」）。打分全并行：所有相邻对、所有位置一次前向算完，不需要额外骨干或 LM head 前向<sup>[C6]</sup>。唯一串行工作是最后沿分数走路径；走路径每步前进一个位置，长度随块大小线性增长（由机制得出的推断）。</p>
     </details>
   </li>
   <li>
@@ -319,15 +319,15 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
   <!-- 卷积输出（右边） -->
   <rect x="370" y="60" width="80" height="40" class="dg-box"/>
   <foreignObject x="370" y="68" width="80" height="26">
-    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align: center; font-size: 13px;">$\mathrm{Conv}(x)_1$</div>
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align: center; font-size: 13px;">$\mathrm{Conv}_k(x)_1$</div>
   </foreignObject>
   <rect x="370" y="140" width="80" height="40" class="dg-box"/>
   <foreignObject x="370" y="148" width="80" height="26">
-    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align: center; font-size: 13px;">$\mathrm{Conv}(x)_2$</div>
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align: center; font-size: 13px;">$\mathrm{Conv}_k(x)_2$</div>
   </foreignObject>
   <rect x="370" y="220" width="80" height="40" class="dg-box"/>
   <foreignObject x="370" y="228" width="80" height="26">
-    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align: center; font-size: 13px;">$\mathrm{Conv}(x)_3$</div>
+    <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label" style="text-align: center; font-size: 13px;">$\mathrm{Conv}_k(x)_3$</div>
   </foreignObject>
   <!-- 卷积输入线 -->
   <!-- 自身抽头（实线，accent）从每个位置指向自己的 Conv 输出 -->
@@ -337,7 +337,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
   <!-- 前一位抽头（虚线，dg-line + dasharray）从前一个位置指向当前 Conv 输出 -->
   <line x1="250" y1="80" x2="370" y2="160" class="dg-line" style="stroke-dasharray: 4,3;"/>
   <line x1="250" y1="160" x2="370" y2="240" class="dg-line" style="stroke-dasharray: 4,3;"/>
-  <!-- 首位的前一位来自上一周期已验证 token，作为 Conv(x)_1 的前一位输入 -->
+  <!-- 首位的前一位来自上一周期已验证 token，作为 Conv_k(x)_1 的前一位输入 -->
   <polyline points="80,200 80,300 410,300 410,100" class="dg-line" style="stroke-dasharray: 4,3;"/>
   <text x="245" y="292" style="font-size: 11px; text-anchor: middle;">位置 1 的前一位 = 已验证 token（上一周期目标模型产出）</text>
   <text x="306" y="132" style="font-size: 11px;">自身（实线）+ 前一位（虚线）</text>
@@ -418,7 +418,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 
 <h3 id="qwen38-muse">4.2 Qwen3.8-27B 与 Muse Glimmer</h3>
 
-<p>Qwen3.8-27B（块 8，官方默认采样）：DFlash 2 均值 4.80 vs MTP 4.28、DSpark 3.62<sup>[N6]</sup>。Muse Glimmer（块 16，官方默认采样）：5.70 vs 官方 DFlash 4.44、DSpark 4.48<sup>[N7]</sup>。两个目标模型上 DFlash 2 都拿到完整 token 以上的领先：</p>
+<p>Qwen3.8-27B（块 8，官方默认采样）：DFlash 2 均值 4.80 vs MTP 4.28、DSpark 3.62<sup>[N6]</sup>。Muse Glimmer（块 16，官方默认采样）：5.70 vs 官方 DFlash 4.44、DSpark 4.48<sup>[N7]</sup>。相对社区 DSpark 草稿器，两个目标模型上 DFlash 2 的平均接受长度都领先一个整 token 以上（Qwen3.8-27B +1.18、Muse Glimmer +1.22）：</p>
 
 <div class="table-scroll">
 <table>
@@ -451,7 +451,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
     <p>三个目标模型上的结论一致吗？</p>
     <details>
       <summary>解答：Qwen3.5-4B 5.97、Qwen3.8-27B 4.80、Muse Glimmer 5.70；均全面领先各基线</summary>
-      <p>三个目标模型上 DFlash 2 接受长度都拿到相对各基线的完整 token 以上领先：Qwen3.5-4B 均值 5.97（vs DFlash 4.92 / DSpark 5.49 / MTP 4.54）<sup>[N4]</sup>、Qwen3.8-27B 均值 4.80（vs MTP 4.28 / DSpark 3.62）<sup>[N6]</sup>、Muse Glimmer 均值 5.70（vs 官方 DFlash 4.44 / DSpark 4.48）<sup>[N7]</sup>。一致性支持「路径选择器 + 卷积组合可移植」这一推断——但仅在这三个模型上验证过，新模型需要重新跑对比。</p>
+      <p>三个目标模型上 DFlash 2 的接受长度都高于各基线——相对社区 DSpark 草稿器平均领先一个整 token 以上，相对各基线的领先为 +0.48 至 +1.43 token：Qwen3.5-4B 均值 5.97（vs DFlash 4.92 / DSpark 5.49 / MTP 4.54）<sup>[N4]</sup>、Qwen3.8-27B 均值 4.80（vs MTP 4.28 / DSpark 3.62）<sup>[N6]</sup>、Muse Glimmer 均值 5.70（vs 官方 DFlash 4.44 / DSpark 4.48）<sup>[N7]</sup>。一致性支持「路径选择器 + 卷积组合可移植」这一推断——但仅在这三个模型上验证过，新模型需要重新跑对比。</p>
     </details>
   </li>
 </ol>
@@ -493,7 +493,7 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 
 <h3 id="boundary-reasons">5.2 高并发收益缩水的机制</h3>
 
-<p>为什么加速随并发下降？投机解码的加速来自「草稿 + 验证搭在目标模型一次前向的空闲算力上」——单请求时 GPU 大半空闲，草稿-验证是白赚的。批处理把空闲填满后，草稿-验证不再「免费」：错误草稿变成挤占有效请求算力的浪费。Inco AI 自己的模型卡在并发 32 一行把这一面说得很清（MT-Bench 1.01×、HumanEval 1.16×、GSM8K 1.45×——任务越开放、缩短越厉害），但<strong>未在博客中给出因果分析</strong>。本节对该方向性事实给出机制解释，明确标注为分析性推断<sup>[C14]</sup>。</p>
+<p>为什么加速随并发下降？投机解码的加速来自「草稿 + 验证搭在目标模型一次前向的空闲算力上」——单请求时 GPU 大半空闲，草稿-验证是白赚的。批处理把空闲填满后，草稿-验证不再「免费」：错误草稿变成挤占有效请求算力的浪费。模型卡的并发 32 一行逐任务给出倍数（MT-Bench 1.01×、HumanEval 1.16×、GSM8K 1.45×——任务越开放、缩短越厉害），但<strong>未在博客中给出因果分析</strong>。本节对该方向性事实给出机制解释，明确标注为分析性推断<sup>[C14]</sup>。</p>
 
 <h3 id="deployment-considerations">5.3 部署注意事项</h3>
 
@@ -502,11 +502,11 @@ $$\operatorname{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}.$$
 <li><b>低并发结构化任务</b>（数学、代码）收益最大（3×+）。</li>
 <li><b>高并发对话类</b>（MT-Bench 类）收益趋近 1，但至少不亏（DFlash 2 vs MTP）。</li>
 <li><b>需要为每个目标模型训练配套草稿器</b>（不是通用插件）——当前已发布 Qwen3.8-27B、Muse Glimmer 两款<sup>[C13]</sup>。</li>
-<li><b>引擎支持状态</b>：SGLang 稳定支持；oMLX（Apple Silicon 端）在博客 Run It Now 中给出安装说明；vLLM 与 llama.cpp 的 DFlash 2 支持位于 PR 分支（vLLM PR #52816、llama.cpp PR #27342）<sup>[C16]</sup>，未进稳定版本。</li>
+<li><b>引擎支持状态</b>：SGLang 可直接运行（博客以 git main 源码方式安装）；oMLX（Apple Silicon 端）在博客 Run It Now 中给出安装说明；vLLM 与 llama.cpp 的 DFlash 2 支持位于 PR 分支（vLLM PR #52816、llama.cpp PR #27342）<sup>[C16]</sup>。</li>
 <li><b>数字环境</b>：吞吐数字来自单卡 H200 的模型卡自测，接受长度数字来自博客自测（未注明硬件）；允许来源中未见第三方独立复现。</li>
 </ul>
 
-<p>生态一句：DFlash（一代）已集成 SGLang、vLLM、TensorRT-LLM、llama.cpp；Inco AI 宣称 Hugging Face 下载超 350 万次（2026-08）、NVIDIA 在 Blackwell 上测得最高 15×、Google 在 TPU 上 3×<sup>[C15]</sup>。这些数字属厂商自测，非第三方独立复现，本页只作背景带过。</p>
+<p>生态一句：DFlash（一代）已集成 SGLang、vLLM、TensorRT-LLM、llama.cpp；Inco AI 宣称 Hugging Face 下载超 350 万次（2026-08）、NVIDIA 在 Blackwell 上测得最高 15×、Google 在 TPU 上 3×<sup>[C15]</sup>。这些数字属厂商自测，非第三方独立复现，仅作背景。</p>
 
 <h3 id="end-to-end-questions">本章问题</h3>
 <ol class="chapter-questions">
