@@ -40,6 +40,14 @@ ALLOWED_TOPICS = [
     "数学基础",
 ]
 
+# 页面类型封闭词表：dojo:type 只能从中取值。
+ALLOWED_TYPES = [
+    "concept",
+    "dataflow",
+    "note",
+    "paper",
+]
+
 # 细粒度标签封闭词表：dojo:tag 只取其一，供首页按技术筛选。
 # 与 ALLOWED_TOPICS 的分工——topics 是粗分类，一个页面可属多个；
 # tag 回答「这篇讲什么技术」，单一取值。技术栈名（vLLM、llama.cpp）属于

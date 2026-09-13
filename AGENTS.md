@@ -19,6 +19,7 @@ index.html    GitHub Pages 首页应用
 | 系统学习概念并生成 HTML | `guides/concept.md` |
 | 针对具体问题进行解释与推导 | `guides/explain.md` |
 | 将已确认的学习结论整理归档 | `guides/note.md` |
+| 推导模型前向数据流并生成 HTML | `guides/model-dataflow.md` |
 
 执行任何任务前，先完整读取对应指南，再开始动手。需求不明确时，只提出一个能够确定任务类型的必要问题。任务类型发生变化时，再读取对应指南。
 
