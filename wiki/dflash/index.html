@@ -69,7 +69,7 @@
 
 <p>投机解码让大模型一次前向验证一整段草稿，绕开了逐 token 生成的内存带宽限制。但草稿本身还是逐 token 串行写的——起草环节重新引入了它要消除的串行性，先进方法（如 EAGLE-3）也只能把加速压到 2–3 倍<sup>[C1]</sup>。DFlash（ICML 2026）的回答是：把草稿器换成块扩散模型——一次前向并行写完一整块。配合以目标模型隐藏特征为条件的 KV 注入，它在 Qwen3-8B 上拿到 6.1$\times$ 无损加速、相对 EAGLE-3 高 2.5$\times$（论文 headline；按 Tab. 1 各行折算 2.4–2.8$\times$）<sup>[C1]</sup>。</p>
 
-<p>前置概念——<a href="../speculative-decoding/index.html">投机解码循环</a>、<a href="../standard-attention/index.html">注意力中的 K/V</a>、<a href="../block-diffusion/index.html">块扩散范式</a>、<a href="../eagle-speculative/index.html">EAGLE-3 的特征级自回归起草</a>——在对应链接页已讲过，本文只引用其结论。</p>
+<p>前置概念——<a href="../speculative-decoding/index.html">投机解码循环</a>、<a href="../standard-attention/index.html">注意力中的 K/V</a>、<a href="../block-diffusion/index.html">块扩散范式</a>、<a href="../eagle-speculative/index.html">EAGLE-3 的特征级自回归起草</a>——结论已在对应链接页给出，此处直接引用。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -214,7 +214,7 @@ V_i &= \left[W_i^V H_t;\ W_i^V H_d\right]_{\mathrm{seq}}.
 <figcaption class="diagram-caption">论文 Figure 2：DFlash 推理设计。蓝色方块为目标上下文特征（由 5 层 target 隐藏态拼接过 $W_c$ 融合得到<sup>[F4]</sup>），绿色方块为 mask token（待预测位置），黄色方块为上一周期目标模型产出的干净 token（用作当前块的条件锚点）。target 特征的 K/V 被注入 draft 每层注意力<sup>[F5]</sup>。原文位置：§4.1 Inference，Figure 2 标题为「DFlash Inference Design」。</figcaption>
 </figure>
 
-<p>KV 注入的工程开销几乎可忽略。$W_c$ 是新增的「唯一参数化组件」，$D\times 5D$ 维（约 $5D^2$ 个参数），Qwen3.5-35B-A3B（$D=2048$、BF16）约 42 MB<sup>[N12]</sup>，相对 70 GB 量级的目标模型可以忽略；激活方面 batch 1、序列 2048 时投影输入/输出约 40 MB/8 MB，块 16 解码时临时激活 &lt;400 KB<sup>[N12]</sup>。</p>
+<p>KV 注入的工程开销几乎可忽略。$W_c$ 是新增的「唯一参数化组件」，$D\times 5D$ 维（约 $5D^2$ 个参数），Qwen3.5-35B-A3B（$D=2048$、BF16）约 42 MB<sup>[C11, N12]</sup>，相对 70 GB 量级的目标模型可以忽略；激活方面 batch 1、序列 2048 时投影输入/输出约 40 MB/8 MB，块 16 解码时临时激活 &lt;400 KB<sup>[N12]</sup>。</p>
 
 <p>去掉 target 特征会发生什么？消融表给了直接答案：5 层纯块扩散草稿器（无 KV 注入）在 GSM8K 上加速 2.83$\times$、Math500 3.73$\times$、AIME24 3.43$\times$、AIME25 3.35$\times$（T=0）<sup>[C5, N11]</sup>——和 EAGLE-3 同档。说明「并行起草」本身不带来显著收益，KV 注入才是 4–6$\times$ 的来源。这条负结果是 DFlash 设计的关键证据。</p>
 
@@ -272,7 +272,7 @@ V_i &= \left[W_i^V H_t;\ W_i^V H_d\right]_{\mathrm{seq}}.
 
 <h3 id="anchor-blocks">3.1 anchor 采样构块</h3>
 
-<p>推理时每个草稿块的条件是「上一周期目标模型产出的那个干净 token」（bonus 或修正）。如果训练时把序列均匀切块，每块的第一个 token 也是前一块的最后一 token——但这一 token 来自训练数据本身的「下一个 token」，而非模型自身生成。DFlash 的做法是从 response 中随机采样 anchor token，每个 anchor 作为块首、其后 block_size−1 位置遮住并行预测<sup>[C7]</sup>。</p>
+<p>推理时每个草稿块的条件是「上一周期目标模型产出的那个干净 token」（bonus 或修正）。标准块扩散训练把 response 均匀切块、块内被遮位置随机，块首并不保证是干净 token——训练条件与推理时「以模型产出的干净 token 为条件」的行为不匹配。DFlash 的做法是从 response 中随机采样 anchor token，每个 anchor 作为块首、其后 block_size−1 位置遮住并行预测<sup>[C7]</sup>。</p>
 
 <p>这样做的两个好处：①匹配推理时「以模型产出 token 为条件」的行为；②随机化 anchor 位置提供数据增广——同一序列可以用不同 anchor 切成多组训练块，提高数据效率。消融表 Tab. 13 验证了这一点：anchor 采样（Sample）对比标准均匀分块（Standard），Math500 上 $\tau$ 5.64 vs 4.94、HumanEval 4.61 vs 3.86、MT-Bench 3.18 vs 2.80<sup>[C7]</sup>。</p>
 
@@ -409,7 +409,7 @@ $$w_k=\exp\!\left(-\frac{k-1}{\gamma_w}\right),$$
 </table>
 </div>
 
-<p>MT-Bench 在 vLLM 并发 32 缩到 1.3$\times$ — 与 SGLang 上的趋势一致（对话类、低结构化、高并发更不友好）。论文里同为 Qwen3.5-9B 的可比数据（Tab. 11 SGLang 并发 8 vs Tab. 12 vLLM 并发 8：Math500 3.5$\times$ vs 3.2$\times$、HumanEval 3.4$\times$ vs 3.4$\times$、MT-Bench 2.5$\times$ vs 2.2$\times$）显示两者差 0.0–0.3$\times$ —— 差值为引擎实现差异，不改变方法结论<sup>[C16]</sup>（分析性推断）。</p>
+<p>MT-Bench 在 vLLM 并发 32 缩到 1.3$\times$ — 与 SGLang 上的趋势一致（对话类、低结构化、高并发更不友好）。论文里同为 Qwen3.5-9B 的可比数据（Tab. 11 SGLang 并发 8 vs Tab. 12 vLLM 并发 8：Math500 3.5$\times$ vs 3.2$\times$、HumanEval 3.4$\times$ vs 3.4$\times$、MT-Bench 2.5$\times$ vs 2.2$\times$）<sup>[N14]</sup>显示两者差 0.0–0.3$\times$ —— 差值为引擎实现差异，不改变方法结论<sup>[C16]</sup>（分析性推断）。</p>
 
 <h3 id="llama-eagle3">4.5 LLaMA-3.1-8B：与 EAGLE-3 同数据同配置对照</h3>
 
@@ -485,7 +485,7 @@ $$w_k=\exp\!\left(-\frac{k-1}{\gamma_w}\right),$$
 <thead><tr><th>维度</th><th>判断</th><th>依据</th><th>限定</th></tr></thead>
 <tbody>
 <tr><td><b>结构性优势</b></td><td>并行起草打破深度-延迟两难，5 层草稿器的 $\tau$ 仍能随层数扩展；KV 注入以 42 MB 额外参数（Qwen3.5-35B-A3B）<sup>[N12]</sup> 换接受长度持续提升</td><td>主表 N1–N4，KV vs 输入融合消融 N7</td><td>5 层为经验最优；8 层被自己的 $\tau$/延迟权衡卡住</td></tr>
-<tr><td><b>训练效率</b></td><td>训练无 test-time test 开销（论文 §4.2 Training「Training speculative draft models on long contexts is challenging for methods such as EAGLE-3 due to their costly training-time test」；基于该段的分析性推断：DFlash 的 anchor 随机采样 + 稀疏掩码无此开销<sup>[C16]</sup>）；与 target 共享 embedding/head 可训练参数少；anchor 采样 + 稀疏掩码支持大批次高效训练<sup>[C7, C8]</sup></td><td>§4.2 Training 与 §A.1 训练配置</td><td>需要 pre-compute target 隐藏态（offline 模式）或在线计算（online 模式）</td></tr>
+<tr><td><b>训练效率</b></td><td>训练无 training-time test 开销（论文 §4.2 Training「Training speculative draft models on long contexts is challenging for methods such as EAGLE-3 due to their costly training-time test」；基于该段的分析性推断：DFlash 的 anchor 随机采样 + 稀疏掩码无此开销<sup>[C16]</sup>）；与 target 共享 embedding/head 可训练参数少；anchor 采样 + 稀疏掩码支持大批次高效训练<sup>[C7, C8]</sup></td><td>§4.2 Training 与 §A.1 训练配置</td><td>需要 pre-compute target 隐藏态（offline 模式）或在线计算（online 模式）</td></tr>
 <tr><td><b>任务边界</b></td><td>结构化输出（数学、代码）收益最大（6$\times$），对话类（MT-Bench）收益最低（2.75–2.85$\times$ T=0）<sup>[N1]</sup></td><td>主表 N1、N2</td><td>所有数字均为论文自测环境（H200/B200）</td></tr>
 <tr><td><b>并发边界</b></td><td>加速随并发下降但仍为正；SGLang 并发 32 数学仍 2.8–2.9$\times$<sup>[N4]</sup>，vLLM 并发 32 MT-Bench 仅 1.3$\times$<sup>[N5]</sup></td><td>SGLang Tab. 3、vLLM Tab. 12</td><td>机制上：批处理填满空闲算力后草稿不再搭免费周期<sup>[C16]</sup>（分析性推断）</td></tr>
 <tr><td><b>块大小约束</b></td><td>训练与推理块大小需匹配，b16 训练可向下泛化到 b8，反向不成立<sup>[C13]</sup></td><td>Tab. 8</td><td>实际部署需要为每种推理块大小训练或选择对应 checkpoint</td></tr>
@@ -520,7 +520,7 @@ $$w_k=\exp\!\left(-\frac{k-1}{\gamma_w}\right),$$
     <p>部署时要注意什么？</p>
     <details>
       <summary>解答：单卡环境数字、训练与推理块大小需匹配、长上下文需微调</summary>
-      <p>①所有数字均来自单卡 H200/B200 实验；其他 GPU 与 batch 策略下加速比可能不同<sup>[C16]</sup>。②训练块大小与推理块大小需匹配——b16 训练可向下泛化到 b8，反向不成立<sup>[C13]</sup>。③长上下文超训练长度（如 4K→16K）需轻量微调（1.6K LongAlign 样本、3 epochs）以恢复接受长度<sup>[N13]</sup>。④已集成到 SGLang、vLLM、TensorRT-LLM、llama.cpp（Inco AI 官方博客 2026-08-18；vLLM 上的实测见论文 Tab. 12）；本文固定版本实验环境为 SGLang B200 + FA4 + Spec-v2。</p>
+      <p>①所有数字均来自单卡 H200/B200 实验；其他 GPU 与 batch 策略下加速比可能不同<sup>[C16]</sup>。②训练块大小与推理块大小需匹配——b16 训练可向下泛化到 b8，反向不成立<sup>[C13]</sup>。③长上下文超训练长度（如 4K→16K）需轻量微调（1.6K LongAlign 样本、3 epochs）以恢复接受长度<sup>[N13]</sup>。④已集成到 SGLang、vLLM、TensorRT-LLM、llama.cpp（Inco AI 官方博客 2026-08-18；vLLM 上的实测见论文 Tab. 12）；本文所依据的论文版本（v2）实验环境为 SGLang B200 + FA4 + Spec-v2。</p>
     </details>
   </li>
 </ol>

@@ -132,6 +132,119 @@
     <div id="cy"></div>
     <div class="legend" id="legend"></div>
   </div>
+  <noscript>
+  <style>.viz { display: none; }</style>
+  <p>交互视图由脚本生成；下表按标签页顺序列出八个视图的节点（列：节点 / 维度 / 公式 / 说明）与它们之间的边，禁用脚本时同样可读。</p>
+  <h4>整体总览 (78 层)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>token ids</td><td><code>[1,T]</code></td><td>$\mathrm{ids}$</td><td>词表大小 120832。</td></tr>
+  <tr><td>embed<br>id → 6144</td><td><code>[1,T] -&gt; [1,T,6144]</code></td><td>$x = \mathrm{Embedding}(\mathrm{ids})$</td><td>真实权重 embed_tokens.weight 为 BF16 [120832, 6144]，与 lm_head 各自独立存储。</td></tr>
+  <tr><td>残差流扩展<br>6144 → 4×6144</td><td><code>[1,T,6144] -&gt; [1,T,4,6144]</code></td><td>$x.\mathrm{unsqueeze}(2).\mathrm{expand}(-1,-1,4,-1)$</td><td>入口把 embedding 复制成 4 条流（视图引用，非参数拷贝）。等比缩小模型实测：第 0 层输入处四条流与 embeddings 逐位相等。此后整个主干残差宽度为 $4\times 6144=24576$。点击下钻看 iHC。</td></tr>
+  <tr><td>Layer 0<br>dense FFN 18432</td><td><code>[1,T,4,6144] -&gt; [1,T,4,6144]</code></td><td>$\mathrm{DSA} + \mathrm{dense\ SwiGLU}$</td><td>唯一的全连接 FFN 层（中间维 18432，参数 339,738,624）。注意力同其他层：DSA + MLA + sink + 门。索引器 full。点击下钻层内部。</td></tr>
+  <tr><td>Layer 1<br>MoE（full 索引）</td><td><code>[1,T,4,6144] -&gt; [1,T,4,6144]</code></td><td>$\mathrm{DSA} + \mathrm{MoE}$</td><td>第 1 层是 full 索引层，2–4 层复用它的 top-k。</td></tr>
+  <tr><td>Layers 2..76<br>18 full + 57 shared</td><td><code>[1,T,4,6144] -&gt; [1,T,4,6144]</code></td><td>$18\,\mathrm{full} + (3\,\mathrm{shared}) \times 19$</td><td>full 索引层在 0,1,5,9,…,77 共 21 个，其余 57 层直接复用前一个 full 层的 top-k。本区间（2..76）内含 5…73 的 18 个 full 层与全部 57 个 shared 层。FFN 均为 256 专家 top-8。</td></tr>
+  <tr><td>Layer 77<br>MoE（full 索引）</td><td><code>[1,T,4,6144] -&gt; [1,T,4,6144]</code></td><td>$\mathrm{DSA} + \mathrm{MoE}$</td><td>最后一层重新自选索引（74–76 复用 73 之后）。</td></tr>
+  <tr><td>hc_head<br>4 流收束 → 6144</td><td><code>[1,T,4,6144] -&gt; [1,T,6144]</code></td><td>$\tilde{x} = \textstyle\sum_i (\sigma(g_i s + b_i)+\epsilon)\,x_i$</td><td>末端收束，参数全模型仅一份：hc_head_fn [4,24576]、hc_head_base [4]（F32 实值 [-1.144,-1.151,-1.212,-0.972]，初始 $-\log 3$）、hc_head_scale [1]（实值 0.105，初始 0.01）。</td></tr>
+  <tr><td>final RMSNorm</td><td><code>[1,T,6144] -&gt; [1,T,6144]</code></td><td>$\mathrm{RMSNorm}(\cdot)$</td><td>先 hc_head 再 norm——这个顺序与常见实现相反，源码为 self.norm(self.hc_head(hidden_states))。</td></tr>
+  <tr><td>lm_head<br>6144 → 120832</td><td><code>[1,T,6144] -&gt; [1,T,120832]</code></td><td>$\mathrm{logits} = W_{lm}\,\tilde{x}$</td><td>checkpoint 存 BF16 [120832,6144]；transformers 的 fp32 严格模块清单含 lm_head（enable_lm_head_fp32=true），加载后按 fp32 计算。MTP 层复用同一份权重。</td></tr>
+  <tr><td>MTP 草稿层<br>(1 层, 10.05B)</td><td><code>embeds + last_hidden -&gt; logits</code></td><td>$\text{multi-token prediction}$</td><td>旁路草稿层：enorm/hnorm/eh_proj 融合入口，单流块（无 iHC），自带 full 索引器，复用主干 lm_head。checkpoint 中 mtp_layers.0.* 共 27 个张量、无任何 hc 参数。点击下钻。</td></tr>
+  </table>
+  <p>边：ids→emb（[1,T]）；emb→exp（6144）；exp→l0（24576）；l0→l1（24576）；l1→grp（24576）；grp→l77（24576）；l77→hh（24576）；hh→fn（6144）；fn→lm（6144）；fn→mtp（prev_hidden）；emb→mtp（embeds）</p>
+  <h4>DSA 层内部 (78 层之一)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>残差流入<br>4×6144</td><td><code>[1,T,4,6144]</code></td><td>$x = (x_1,x_2,x_3,x_4)$</td><td>四条并行残差流，每条 6144 宽。</td></tr>
+  <tr><td>attn_hc<br>pre 门控读出</td><td><code>[1,T,4,6144] -&gt; [1,T,6144]</code></td><td>$\tilde{x} = \textstyle\sum_i (\sigma(g_i^{pre}s_{pre}{+}b_i^{pre}){+}\epsilon)\,x_i$</td><td>四条流按 pre 门加权求和成单流。初始门 $\approx 0.25$（$\sigma(-\log 3)$）。等比模型实测 mean $0.2500$。同时产出 post 门供写回。点击下钻。</td></tr>
+  <tr><td>input<br>_layernorm</td><td><code>[1,T,6144]</code></td><td>$\mathrm{RMSNorm}$</td><td>子层前置归一化。</td></tr>
+  <tr><td>DSA 索引器<br>(或复用 prev)</td><td><code>-&gt; top-k [1,T,2048]</code></td><td>$\mathrm{top}\text{-}k\big(\textstyle\sum_h w_h\,\mathrm{ReLU}(q_h \cdot k)\big)$</td><td>full 层自行计算（21 层），shared 层的 indexer 为 None、直接用上一层传上来的 prev_topk_indices（57 层）。点击下钻索引器。</td></tr>
+  <tr><td>MLA 注意力<br>sink + sigmoid 门</td><td><code>[1,T,6144] -&gt; [1,T,6144]</code></td><td>$o = \big(\mathrm{softmax}([\tfrac{qk^\top}{\sqrt{256}}; s_{sink}])[:T]\,V\big) \odot \sigma(W_g x)$</td><td>潜向量注意力 + per-head sink + 逐元素 sigmoid 输出门，含 o_proj。点击下钻。</td></tr>
+  <tr><td>post 门控写回<br>外积 + 残差</td><td><code>[1,T,4,6144] + [1,T,6144]</code></td><td>$x_i \leftarrow x_i + (2\sigma(g_i^{post}s_{post}{+}b_i^{post}){+}\epsilon)\,y$</td><td>子层输出按每条流一个标量外积写回四条流。初始 post 门 $= 2\sigma(0) = 1.0$（恒等残差），实测 mean $0.9999$。</td></tr>
+  <tr><td>ffn_hc<br>pre 门控读出</td><td><code>[1,T,4,6144] -&gt; [1,T,6144]</code></td><td>$\text{同 attn\_hc}$</td><td>与 attn 侧结构相同、参数独立。每层两组 iHC。</td></tr>
+  <tr><td>post_attention<br>_layernorm</td><td><code>[1,T,6144]</code></td><td>$\mathrm{RMSNorm}$</td><td>FFN 前置归一化。</td></tr>
+  <tr><td>MoE / dense<br>256 专家 top-8</td><td><code>[1,T,6144] -&gt; [1,T,6144]</code></td><td>$\text{top-}8 + \text{shared}$</td><td>第 0 层为 dense FFN（18432），其余 77 层为 MoE。点击下钻 MoE。</td></tr>
+  <tr><td>post 门控写回</td><td><code>[1,T,4,6144]</code></td><td>$x_i \leftarrow x_i + \mathrm{post}_i\,y$</td><td>FFN 输出同样按流写回。</td></tr>
+  </table>
+  <p>边：in→hc1（24576）；hc1→ln1（6144）；ln1→idx（6144）；idx→attn（top-k 掩码）；ln1→attn（6144）；attn→post1（6144）；in→post1（残差）；post1→hc2（24576）；hc2→ln2（6144）；ln2→ffn（6144）；ffn→post2（6144）；post1→post2（残差）</p>
+  <h4>DSA 索引器：fp32 打分与 top-2048</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>子层输入<br>6144</td><td><code>[1,T,6144]</code></td><td>$\tilde{x}$</td><td>与主注意力共用同一份输入（input_layernorm 输出），但投影完全独立。</td></tr>
+  <tr><td>q_a_proj + RMSNorm<br>6144 → 2048</td><td><code>[1,T,6144] -&gt; [1,T,2048]</code></td><td>$\mathrm{RMSNorm}(W_{qa}\tilde{x})$</td><td>与主注意力的 q_a 通道是同一个模块（同一份权重），索引器复用其输出。真实权重 q_a_proj [2048, 6144]。</td></tr>
+  <tr><td>wq_b<br>2048 → 32×128</td><td><code>[1,T,2048] -&gt; [1,T,32,128]</code></td><td>$32 \times 128 = 4096$</td><td>索引器自己的查询上投影，32 个头。真实权重 indexer.wq_b.weight [4096, 2048]。</td></tr>
+  <tr><td>wk + LayerNorm<br>6144 → 128</td><td><code>[1,T,6144] -&gt; [1,T,128]</code></td><td>$\mathrm{LayerNorm}(W_{wk}\tilde{x})$</td><td>键只有一个头，32 个查询头共享。归一化保持 fp32。真实权重 indexer.wk.weight [128, 6144]；k_norm 的 gamma 实测均值 1.061、beta 均值 -0.002（LayerNorm 正常形态）。</td></tr>
+  <tr><td>每头切分<br>[64 过 | 64 旋转]</td><td><code>[·,128] -&gt; [·,64] + [·,64]</code></td><td>$\mathrm{pass} \,|\, \mathrm{rope}$</td><td>头内前 64 维直接通过、后 64 维做 RoPE，与主 MLA 的 [192 nope | 64 rope] 同构（旋转部分都在尾部）。</td></tr>
+  <tr><td>RoPE<br>theta = 1e7</td><td><code>[1,T,·,64]</code></td><td>$\text{交错配对（见第 4 章）}$</td><td>vLLM 与 SGLang 都按交错（相邻配对）消费 checkpoint 的这 64 维；transformers 参考实现按半分式，两者互斥，详见实现对照章。</td></tr>
+  <tr><td>fp32 打分<br>ReLU</td><td><code>q[1,T,32,128] × k[1,T,128] -&gt; [1,T,32,T]</code></td><td>$\mathrm{ReLU}(q_h \cdot k_t)$</td><td>分数矩阵强制 fp32（源码显式 .float()）。等比模型实测头分数精确为零的比例 47.8%——ReLU 制造大量并列零分，是 prefill/decode 边界并列现象的根源。</td></tr>
+  <tr><td>weights_proj<br>6144 → 32</td><td><code>[1,T,6144] -&gt; [1,T,32]</code></td><td>$w_h = (W_{proj}\tilde{x})_h / \sqrt{32}\sqrt{128}$</td><td>每头一个数据相关的标量权重。真实权重 indexer.weights_proj.weight [32, 6144]。</td></tr>
+  <tr><td>按头加权求和<br>+ 因果掩码</td><td><code>-&gt; [1,T,T]</code></td><td>$\text{score}_{s,t} = \textstyle\sum_{h=1}^{32} w_h\,\mathrm{ReLU}(q_h \cdot k_t)$</td><td>聚合后加加性因果掩码（不可见处 -inf）。等比模型实测聚合分数中正数占 23.4%、最大 0.0235。</td></tr>
+  <tr><td>top-2048<br>min(2048, 可见长)</td><td><code>[1,T,T] -&gt; [1,T,min(2048,T)]</code></td><td>$\mathrm{topk} = \min(2048,\ T)$</td><td>短序列时退化为全可见。输出 int32 索引 [1,T,topk]。等比模型手工复算 top-k 集合与官方完全一致。</td></tr>
+  <tr><td>索引键缓存<br>[T,128] × 21 层</td><td><code>[1,T,128]</code></td><td>$21 \times 128\ \mathrm{dims/token}$</td><td>只有 21 个 full 层缓存索引键（shared 层不缓存不计算）。vLLM 用 FP8 存储约 2772 B/token；transformers eager 为 BF16 5376 B/token。独立于主 KV cache。</td></tr>
+  <tr><td>跨层复用<br>57 个 shared 层</td><td><code>prev_topk_indices</code></td><td>$\mathrm{indexer} = \mathrm{None}$</td><td>shared 层直接用 DecoderLayer 向上传递的前一个 full 层 top-k，逐位相等（实测 torch.equal True）。索引计算与缓存都省掉。</td></tr>
+  </table>
+  <p>边：x→qa（6144）；qa→qb（2048）；qb→split（[·,128]）；x→wk（6144）；wk→split（[128]）；split→rope（64）；rope→score（q,k）；wk→cache（写入）；cache→score（读回）；x→w（6144）；score→agg（[1,T,32,T]）；w→agg（权重）；agg→topk（[1,T,T]）；topk→share（57 层复用）</p>
+  <h4>MLA 注意力：潜向量 + sink + 逐元素门</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>子层输入<br>6144</td><td><code>[1,T,6144]</code></td><td>$\tilde{x}$</td><td>input_layernorm 输出。</td></tr>
+  <tr><td>linear_gate<br>6144 → 64×256</td><td><code>[1,T,6144] -&gt; [1,T,64,256]</code></td><td>$\sigma(W_g\tilde{x})$</td><td>逐元素输出门（每头每维独立），不是每头一个标量。真实权重 linear_gate.weight [16384, 6144]。等比模型实测门值 min 0.389 / max 0.615 / mean 0.500。</td></tr>
+  <tr><td>q_a_proj → RMSNorm<br>→ q_b_proj</td><td><code>[1,T,6144] -&gt; [1,T,64,256]</code></td><td>$q = W_{qb}\,\mathrm{RMSNorm}(W_{qa}\tilde{x})$</td><td>查询低秩通道：6144 → 2048（RMSNorm）→ 64×256。真实权重 q_a_proj [2048,6144]、q_b_proj [16384,2048]。</td></tr>
+  <tr><td>每头切分<br>[192 nope | 64 rope]</td><td><code>[1,T,64,256] -&gt; [·,192]+[·,64]</code></td><td>$\mathrm{nope} \,|\, \mathrm{rope}$</td><td>与索引器的 [64|64] 切分同构，旋转部分占尾部 64 维。</td></tr>
+  <tr><td>kv_a_proj_with_mqa<br>6144 → 576</td><td><code>[1,T,6144] -&gt; [1,T,576]</code></td><td>$c = [c_{lat};\ k_{rope}] = W_{kva}\tilde{x}$</td><td>一次投影出 512 维潜向量 + 64 维共享旋转键。真实权重 kv_a_proj_with_mqa [576, 6144]。</td></tr>
+  <tr><td>kv_a_LN → kv_b_proj<br>512 → 64×448</td><td><code>[1,T,512] -&gt; k_nope[64,T,192] + v[64,T,256]</code></td><td>$W_{kvb}\,\mathrm{RMSNorm}(c_{lat})$</td><td>潜向量展开：每个头得到 192 维 nope 键与 256 维值。真实权重 kv_b_proj [28672, 512] = 64×448。旋转键 64 维所有头共享同一份。</td></tr>
+  <tr><td>RoPE（64 维）<br>theta = 1e7</td><td><code>[·,·,·,64]</code></td><td>$\text{交错配对（见第 4 章）}$</td><td>只作用于每头尾部 64 维。checkpoint 的配对方式为交错（vLLM/SGLang 口径）；transformers 参考实现为半分式。</td></tr>
+  <tr><td>KV cache<br>两种口径</td><td><code>展开 64×(256+256) 或潜向量 576</code></td><td>$32768\ \text{vs}\ 576\ \mathrm{elems/token/layer}$</td><td>transformers eager 缓存展开后的 K/V（每 token 每层 65536 B）；vLLM 缓存潜向量（1152 B）+ 常驻 per-head sink，56.89 倍差距。点击下钻对比。</td></tr>
+  <tr><td>logits + 稀疏掩码<br>按 0.0625 缩放</td><td><code>q[64,T,256] k[64,T,256] -&gt; [64,T,T]</code></td><td>$\mathrm{logits} = qk^\top/\sqrt{256} + M_{causal} + M_{topk}$</td><td>缩放 0.0625。top-k 掩码把索引器未选中的位置填 dtype 最小值。</td></tr>
+  <tr><td>拼接 sink → softmax<br>去掉 sink 列</td><td><code>[64,T,T+1] -&gt; [64,T,T]</code></td><td>$P = \mathrm{softmax}([\mathrm{logits}; s_h])[:T]$</td><td>每头一个可学习 sink 标量拼到行尾，softmax 后丢掉该列——sink 只进分母，吸收概率质量使行和 &lt; 1。等比模型实测（sink 初始 0）：吸收质量 mean 0.121 / max 0.502。真实权重第 0 层 sink 均值 0.384（范围 [-6.54, 3.18]）。</td></tr>
+  <tr><td>P · V<br>→ 逐元素门 → o_proj</td><td><code>[64,T,256] -&gt; [1,T,6144]</code></td><td>$o = (P\,V) \odot \sigma(W_g\tilde{x}),\ y = W_o\,o$</td><td>注意力输出乘门后过 o_proj [6144, 16384]。等比模型全链路独立复算与官方输出最大差为 0。</td></tr>
+  </table>
+  <p>边：x→gate（6144）；x→qa（6144）；qa→qsplit（[·,256]）；x→kva（6144）；kva→kvb（512）；qsplit→rope（64）；kva→rope（64）；rope→logits（q,k）；kvb→logits（k_nope）；kvb→av（V）；cache→logits（读回 K）；logits→sink（[64,T,T]）；sink→av（P）；gate→av（逐元素门）；av→x（输出 y）</p>
+  <h4>iHC：四条残差流的读写</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>四条残差流<br>4×6144</td><td><code>[1,T,4,6144]</code></td><td>$x = (x_1,x_2,x_3,x_4)$</td><td>入口由 expand 复制产生，四条初始相同；第一次写回后因 post 门不同而分化。</td></tr>
+  <tr><td>展平 + 逆均方根<br>24576 维</td><td><code>[1,T,4,6144] -&gt; [1,T,24576]</code></td><td>$r = \mathrm{rsqrt}(\overline{\mathrm{flat}(x)^2}+\epsilon)$</td><td>门控输入的归一化因子在整个 24576 维上取均值（UnweightedRMSNorm 只返回 rsqrt，不乘回原值）。</td></tr>
+  <tr><td>hc_fn<br>24576 → 8</td><td><code>[1,T,24576] -&gt; [1,T,8]</code></td><td>$g = W_{fn}\,\mathrm{flat}(x) \cdot r$</td><td>8 行中前 4 行算 pre logits、后 4 行算 post logits——checkpoint 里只有一个 hc_pre 模块、没有 hc_post 的结构性原因。真实权重 hc_fn [8, 24576]，F32。</td></tr>
+  <tr><td>pre 门<br>初始 0.25</td><td><code>-&gt; [1,T,4]</code></td><td>$\sigma(g^{pre} s_{pre} + b^{pre}) + \epsilon$</td><td>初始 $b = -\log 3$、$s = 0.01$，初始门 $\approx 0.25$。实测 mean $0.2500$。</td></tr>
+  <tr><td>加权求和<br>→ 单流 6144</td><td><code>[1,T,4,6144] -&gt; [1,T,6144]</code></td><td>$\tilde{x} = \textstyle\sum_i \mathrm{pre}_i\, x_i$</td><td>4 条流各乘 $\approx 0.25$ 的门后相加，不是取均值，初始量级与单条流相当。全程 fp32。</td></tr>
+  <tr><td>子层<br>(MLA / MoE)</td><td><code>[1,T,6144] -&gt; [1,T,6144]</code></td><td>$y = \mathrm{Block}(\tilde{x})$</td><td>注意力或 FFN。每层两组 iHC，分别包裹两者。</td></tr>
+  <tr><td>post 门<br>初始 1.0</td><td><code>-&gt; [1,T,4]</code></td><td>$2.0\,\sigma(g^{post} s_{post} + b^{post}) + \epsilon$</td><td>初始 b = 0，初始门 = 1.0（标准恒等残差）。幅度 2.0 来自 hc_magnitude。实测 mean 0.9999。</td></tr>
+  <tr><td>外积写回<br>残差 + post·y</td><td><code>[1,T,6144] -&gt; [1,T,4,6144]</code></td><td>$x_i \leftarrow x_i + \mathrm{post}_i\,y$</td><td>同一份子层输出按每条流一个标量写入四条流。写回在 fp32 中做加法后转回原 dtype。</td></tr>
+  <tr><td>hc_head 末端收束<br>+ final RMSNorm</td><td><code>[1,T,4,6144] -&gt; [1,T,6144]</code></td><td>$\mathrm{RMSNorm}\big(\textstyle\sum_i (\sigma(g_i s + b_i)+\epsilon)\,x_i\big)$</td><td>单 scale 标量 + 4 维 base，初始门同样 $\approx 0.25$。真实权重：base [-1.144,-1.151,-1.212,-0.972]、scale 0.105（训练后放大十倍）。先收束再过 final norm。</td></tr>
+  <tr><td>真实权重半区实证<br>(第 0 / 77 层)</td><td><code>hc_base[8], hc_scale[2]</code></td><td>$\mathrm{base}[0{:}4]\approx-\log3,\ \mathrm{base}[4{:}8]\approx0$</td><td>按 data_offsets 下载的 F32 实值：第 0 层 attn hc_base 前 4（pre）= [-0.886,-0.879,-0.718,-0.910]，后 4（post）= [-1.518,-1.418,-1.398,-0.486]；第 77 层 post 半区 = [0.012,0.003,0.012,0.208] 几乎未动。hc_scale 第 0 层 [0.250, 0.0058]、第 77 层 [0.258, 0.184]。</td></tr>
+  </table>
+  <p>边：st→flat（24576）；flat→fn（r）；fn→pre（pre logits）；fn→post（post logits）；st→mix（x_i）；pre→mix（门）；mix→sub（6144）；sub→post（y）；st→wb（残差）；post→wb（post_i）；wb→hh（24576）；init→fn（hc_base/scale）</p>
+  <h4>MoE：256 专家 top-8 + 1 共享</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>子层输入<br>6144</td><td><code>[1,T,6144]</code></td><td>$\tilde{x}$</td><td>post_attention_layernorm 输出，逐 token 展平路由。</td></tr>
+  <tr><td>router<br>6144 → 256 (fp32)</td><td><code>[T,6144] -&gt; [T,256]</code></td><td>$p = \sigma(W_r\,x)$</td><td>sigmoid 打分而非 softmax：256 个分数各自独立、不互斥。fp32 计算。真实权重 gate.weight [256, 6144]。</td></tr>
+  <tr><td>+ 偏置 → top-8<br>分组退化</td><td><code>[T,256] -&gt; [T,8]</code></td><td>$\mathrm{top8}(p + b)$</td><td>b 是 e_score_correction_bias（aux-loss-free 平衡偏置，真实值第 1 层 [-0.097, 0.032]、中位数 0.0013）。n_group=1、topk_group=1 使分组路由退化为无组限制。</td></tr>
+  <tr><td>gather p → 归一化<br>→ ×2.827</td><td><code>[T,8]</code></td><td>$w_j = p_{(j)}/\textstyle\sum p_{(j)} \times 2.827$</td><td>权重从原始 sigmoid 分数取（不含偏置），归一化后整体放大。实测 token 5：归一化和精确 1.000000，放大后各权重 0.33–0.37。</td></tr>
+  <tr><td>路由专家 ×8<br>SwiGLU 截断 ±10</td><td><code>[T,6144] -&gt; [T,6144]</code></td><td>$\mathrm{silu}(\min(g,10))\cdot\mathrm{clip}(u,-10,10)$</td><td>gate 只截上限、up 双向截断。单元实测 $\mathrm{silu}(10)\times(-7) = -69.9968$。每专家参数 37,748,736（gate_up [4096,6144] + down [6144,2048]）。</td></tr>
+  <tr><td>共享专家<br>无门控 无截断</td><td><code>[T,6144] -&gt; [T,6144]</code></td><td>$\mathrm{silu}(W_g x)\odot(W_u x)$</td><td>恒激活，与路由专家同构（中间维 2048），但无 swiglu 截断、无输出标量门，直接与路由结果相加。</td></tr>
+  <tr><td>相加输出</td><td><code>[T,8,6144] -&gt; [1,T,6144]</code></td><td>$y = \textstyle\sum_j w_j E_{(j)}(x) + \mathrm{Shared}(x)$</td><td>单层激活 341,311,744 参数（8/256 路由 + 共享 + 路由器）。路由专家合计 744.10B，占总参数 95.40%。</td></tr>
+  </table>
+  <p>边：x→r（6144）；r→sel（[T,256]）；sel→w（[T,8]）；x→e（6144）；w→e（权重）；e→out（8 份输出）；x→sh（6144）；sh→out（共享输出）；w→out（加权）</p>
+  <h4>MTP 草稿层 (1 层, 10.05B)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>下一 token<br>embedding</td><td><code>[1,T,6144]</code></td><td>$e = \mathrm{Embed}(\mathrm{ids}_{+1})$</td><td>草稿目标的 embedding。decode 时位置 0 尚无可用输入，vLLM 实现把该处 embedding 置零。</td></tr>
+  <tr><td>主干末态隐藏<br>previous_hidden</td><td><code>[1,T,6144]</code></td><td>$h = \mathrm{norm}(\mathrm{hc\_head}(\cdot))$</td><td>主干的 last_hidden_state（hc_head 收束 + final norm 之后），由 proposer 传入。</td></tr>
+  <tr><td>enorm / hnorm</td><td><code>×2 [1,T,6144]</code></td><td>$\mathrm{RMSNorm}$</td><td>两个独立的 RMSNorm 分别作用于 embedding 与主干隐藏。</td></tr>
+  <tr><td>eh_proj<br>12288 → 6144</td><td><code>[1,T,12288] -&gt; [1,T,6144]</code></td><td>$x = W_{eh}[\mathrm{enorm}(e);\ \mathrm{hnorm}(h)]$</td><td>拼接后一次投影融合两路信息。真实权重 eh_proj.weight [6144, 12288]，BF16。</td></tr>
+  <tr><td>input_layernorm</td><td><code>[1,T,6144]</code></td><td>$\mathrm{RMSNorm}$</td><td>块内前置归一化。</td></tr>
+  <tr><td>注意力<br>(单流, 自带 full 索引器)</td><td><code>[1,T,6144] -&gt; [1,T,6144]</code></td><td>$x \leftarrow x + \mathrm{Attn}(\mathrm{LN}(x))$</td><td>单流残差（无 iHC）。有完整的独立索引器（wq_b [4096,2048]、wk [128,6144]、weights_proj [32,6144]），不依赖主干 top-k——等比模型实测其 top-k 与主干第 1 层不同。同样有 sink 与逐元素门，但 checkpoint 里存 BF16（主干为 F32）。</td></tr>
+  <tr><td>post_attention<br>_layernorm</td><td><code>[1,T,6144]</code></td><td>$\mathrm{RMSNorm}$</td><td></td></tr>
+  <tr><td>MoE<br>256 专家 top-8</td><td><code>[1,T,6144] -&gt; [1,T,6144]</code></td><td>$x \leftarrow x + \mathrm{MoE}(\mathrm{LN}(x))$</td><td>与主干 MoE 同构。</td></tr>
+  <tr><td>final_layernorm</td><td><code>[1,T,6144]</code></td><td>$\mathrm{RMSNorm}(x)$</td><td></td></tr>
+  <tr><td>共享主干 lm_head<br>→ 草稿 logits</td><td><code>[1,T,6144] -&gt; [1,T,120832]</code></td><td>$\mathrm{logits} = W_{lm}\,\mathrm{fln}(x)$</td><td>checkpoint 中 MTP 无自己的输出头；vLLM 把主干 lm_head.weight 映射为 MTP 的 shared head。等比模型实测两者 data_ptr 相同（同一权重对象）。</td></tr>
+  </table>
+  <p>边：e→en（6144）；h→en（6144）；en→eh（12288）；eh→ln1（6144）；ln1→attn（6144）；attn→ln2（残差）；ln2→ffn（6144）；ffn→fln（残差）；fln→lm（6144）</p>
+  <h4>KV cache：同一份注意力的两种缓存口径</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>每 token 写入<br>MLA 潜向量</td><td><code>c [576] + k_rope 共享</code></td><td>$c = [512;\ 64]$</td><td>kv_a_proj_with_mqa 的输出。这是 MLA 的原生形态：512 维潜向量 + 64 维共享旋转键，与头数无关。</td></tr>
+  <tr><td>vLLM：直接缓存潜向量<br>576 元素 = 1152 B</td><td><code>[T,576] + sink[64]</code></td><td>$576 \times 2\,\mathrm{B}$</td><td>MQA 式存储：每个 token 每层只存 576 个 bf16 元素，另 64 个 per-head sink 常驻（一次性）。解码时在 Kernel 内展开。78 层合计 87.8 KiB/token；1M 上下文约 87.8 GiB。</td></tr>
+  <tr><td>eager：缓存展开 K/V<br>32768 元素 = 65536 B</td><td><code>K[64,T,256] V[64,T,256]</code></td><td>$64\times(256+256)$</td><td>把潜向量经 kv_b_proj 展开成每头独立的 K/V 后缓存。78 层合计 4.88 MiB/token；1M 上下文约 4.88 TiB——这是参考实现口径，部署不可用，也是潜向量口径存在的理由。</td></tr>
+  <tr><td>体积比<br>56.89×</td><td><code>—</code></td><td>$32768/576$</td><td>两种口径存的是同一份信息（kv_b_proj 可逆展开），差距全在「何时展开」。</td></tr>
+  <tr><td>索引器缓存<br>21 层 × 128 维</td><td><code>[T,128] × 21</code></td><td>$21 \times 128\ \mathrm{dims}$</td><td>独立于主 cache：只有 full 层需要（57 个 shared 层不缓存）。vLLM FP8 约 2772 B/token（128 值一组附 4 字节 scale）；eager BF16 5376 B/token。1M 上下文约 2.7–5.2 GiB。</td></tr>
+  <tr><td>1M 上下文合计<br>(线性估算)</td><td><code>—</code></td><td>$\approx 90.5\ \mathrm{GiB}\ (\mathrm{vLLM})$</td><td>vLLM：主 87.8 GiB + 索引器 2.7 GiB，合计 $\approx$ 90.5 GiB。eager 口径主 cache 4.88 TiB 不可用。按每 token 线性估算，忽略块对齐开销。</td></tr>
+  </table>
+  <p>边：tok→vlm（576）；tok→hf（展开 64×448）；hf→ratio（32768）；vlm→ratio（576）；vlm→sum（87.8 GiB）；ix→sum（2.7 GiB）；ratio→sum（口径差）</p>
+  </noscript>
   <div id="tip"></div>
 
   <h2 id="points">3. 要点</h2>

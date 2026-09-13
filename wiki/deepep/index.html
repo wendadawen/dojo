@@ -126,7 +126,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 <li>$\operatorname{FFN}^{(s)}_i$、$\operatorname{FFN}^{(r)}_i$：第 $i$ 个共享专家与第 $i$ 个路由专家的前馈网络。</li>
 </ul>
 
-<p>式中共享专家项不含门控值：共享专家对每个 token 都生效，留在本 rank 计算不参与通信，dispatch/combine 只搬运路由专家的副本（共享专家的设计见 <a href="../../wiki/deepseek-moe/index.html">DeepSeekMoE 结构</a>）。dispatch 搬的就是式中的 $\mathbf{u}_t$：按路由结果把每个 token 复制 $K$ 份发往各专家所在的 rank。combine 搬的是反方向：各专家的输出副本送回原 rank，按 $g_{i,t}$ 加权求和——上式最后一项就是 combine 的通信语义。通信量可以直接算出来：一个 token 被路由到 $K$ 个专家即复制 $K$ 份，每份载荷 $h$ 个元素；BF16 每元素 2 字节，dispatch 每 token 发送 $2Kh$ 字节；FP8 每元素 1 字节，为 $Kh$ 字节<sup>[F2]</sup>。</p>
+<p>式中共享专家项不含门控值：共享专家对每个 token 都生效。共享专家是否进入 dispatch/combine 取决于部署——decode 部署中 V3 把共享专家当作一个恒选的路由专家，每 token 在路由上选择 9 个专家、共享专家作为高负载专家始终被选中，它因此同其余路由专家一样参与 dispatch 与 combine<sup>[C28]</sup>（共享专家的设计见 <a href="../../wiki/deepseek-moe/index.html">DeepSeekMoE 结构</a>）。dispatch 搬的就是式中的 $\mathbf{u}_t$：按路由结果把每个 token 复制 $K$ 份发往各专家所在的 rank。combine 搬的是反方向：各专家的输出副本送回原 rank，按 $g_{i,t}$ 加权求和——上式最后一项就是 combine 的通信语义。通信量可以直接算出来：一个 token 被路由到 $K$ 个专家即复制 $K$ 份，每份载荷 $h$ 个元素；BF16 每元素 2 字节，dispatch 每 token 发送 $2Kh$ 字节；FP8 每元素 1 字节，为 $Kh$ 字节<sup>[F2]</sup>。</p>
 
 <p>构造示例（全文贯穿）。取 2 节点、每节点 4 GPU 的 EP 系统：rank 0-3 在节点 A，rank 4-7 在节点 B；8 个路由专家，专家 $E_e$ 放在 rank $e$ 上（每 rank 恰好 1 个本地专家）；hidden 取 $h=2$，top-$K$ 取 $K=2$。所有数字便于手算，不代表真实部署规模。rank 0 持有两个 token：$t_0=(1.0,2.0)$ 路由到 $(E_1,E_5)$、权重 $(0.6,0.4)$；$t_1=(1.0,3.0)$ 路由到 $(E_2,E_6)$、权重 $(0.5,0.5)$。发送计划为</p>
 
@@ -683,7 +683,7 @@ rank 0 两个 token 的 combine 结果：
 
 <h3 id="gin-backend">4.1 换后端：NVSHMEM 到 NCCL Gin</h3>
 
-<p>V2 从 NVSHMEM 后端切换到 NCCL Gin 后端：header-only、轻量，能复用已有的 NCCL communicator<sup>[C18]</sup>——EPv2 的通信路径建立在集群通常已部署的 NCCL 之上。注意这不是彻底移除 NVSHMEM：V2 安装仍依赖 NVSHMEM 以支持 legacy 方法（V1 路径）<sup>[C18]</sup>。全部内核经轻量 JIT 模块在运行时编译，安装时无需 CUDA 编译<sup>[C22]</sup>。</p>
+<p>V2 从 NVSHMEM 后端切换到 NCCL Gin 后端：header-only、轻量，能复用已有的 NCCL communicator<sup>[C18]</sup>——EPv2 的通信路径建立在集群通常已部署的 NCCL 之上。V2 仍依赖 NVSHMEM 以支持 legacy 方法（V1 路径），并非彻底移除 NVSHMEM<sup>[C18]</sup>。全部内核经轻量 JIT 模块在运行时编译，安装时无需 CUDA 编译<sup>[C22]</sup>。</p>
 
 <h3 id="elastic-buffer">4.2 ElasticBuffer：统一接口与更大规模</h3>
 
@@ -837,7 +837,7 @@ rank 0 两个 token 的 combine 结果：
 <li>C12、C13、C14、C15、C16、C17（低延迟内核）：初始 commit buffer.py 的 low_latency_dispatch/low_latency_combine docstring 与初始化代码注释（IBGDA 释义）；C13 的分段偏移另见初始 commit csrc/kernels/internode_ll.cu 的槽位地址计算（deepep-src-extracts.md 第 7 节）；legacy.md get_buffer 注释与示例代码注释。</li>
 <li>C18、C19、C20、C21、C22、C23、C24（V2）：README News 与 EPv2 条目（含 "Install NVSHMEM dependency"——V2 仍依赖 NVSHMEM 支持 legacy 方法）、README 示例代码注释（handle 缓存）、<code>deep_ep/buffers/elastic.py</code> 的 ElasticBuffer 与 get_theoretical_num_sms docstring。</li>
 <li>C25、C26（网络与门槛）：README Network configurations 与 Requirements、legacy.md Requirements。</li>
-<li>C27、C28、C29（V3 部署与 DualPipe）：V3 报告 §3.4.1（prefill）、§3.4.2（decode）、§3.2.1（DualPipe 与 1:1 计算通信比；"In this overlapping strategy, we can ensure that both all-to-all and PP communication can be fully hidden during execution"）。</li>
+<li>C27、C28、C29（V3 部署与 DualPipe）：V3 报告 §3.4.1（prefill）、§3.4.2（decode：40 节点 320 GPU、64 块 GPU 承载冗余与共享专家、decode 将共享专家视为恒选的路由专家，每 token 选择 9 个专家）、§3.2.1（DualPipe 与 1:1 计算通信比；"In this overlapping strategy, we can ensure that both all-to-all and PP communication can be fully hidden during execution"）。</li>
 <li>C30、C31、C32（低精度、布局契约、实验原语）：V3 报告 §3.3.3；legacy.md 与 README 示例代码注释；README News、elastic.py engram 相关 docstring。</li>
 <li>相邻系统描述（第 5 章「DeepEP 不解决什么」对 UltraEP、MoonEP、无辅助损失路由的一句话概述）：取自本仓库 wiki/ultraep、wiki/moonep、wiki/aux-loss-free-routing 页面（内部来源，正文附链接）。</li>
 </ul>

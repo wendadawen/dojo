@@ -69,7 +69,7 @@
 
 <p>Strata 用三个机制回应这两个原因。<b>GPU-assisted I/O</b>用 CUDA kernel 代替传统的 cudaMemcpyAsync 传输——数千线程各搬一小块数据，并发与传输粒度都大幅改善；用少量大 block 把 kernel 关进少数 SM 不影响计算；让 GPU 保持 layer-first 计算布局，host 与存储用 page-first 传输布局，布局转换由 I/O kernel 内一次算术完成。<b>Cache-aware 调度</b>把 PCIe 带宽当成一等资源：transient node 标记避免 delay hit（同一缓存"正在计算中"时的重复 prefill），均衡组批（load/compute 比例阈值 100）避免 loading-bound，bubble filling 在不可避免的空泡里插入 decode 批填充。H200 上的实验显示，对比 vLLM+LMCache 吞吐最多提升 5 倍、对比 TensorRT-LLM 最多 3.75 倍，短上下文不退化<sup>[C24]</sup>。</p>
 
-<p>阅读前假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿示例：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.44 GB——已超出单请求显存预算，分层与跨层搬运不可避免。</p>
+<p>阅读前假设读者已熟悉 <a href="../kv-cache/index.html">KV cache</a>、<a href="../paged-attention/index.html">PagedAttention</a>、<a href="../prefix-caching/index.html">前缀缓存</a>、<a href="../standard-attention/index.html">标准注意力</a>、<a href="../gpu-execution-model/index.html">GPU 执行模型</a>、<a href="../gpu-communication/index.html">GPU 通信</a>。贯穿示例：一份 20,000 token 的产品手册的文档问答服务（与 LooGLE avg 输入 21,613 token 同量级），三个客服请求 A、B、C 相继到达，Llama-3.1-8B（32 层、8 KV 头、head_dim 128、bf16，每 token 128 KB）下手册缓存约 2.44 GB——已占掉 GPU 显存预算的相当份额（40 GB HBM 下约 6.1%），多份文档或多轮对话即可耗尽，分层与跨层搬运不可避免。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -162,7 +162,7 @@ $$C=\lambda\cdot L,\qquad X=\lambda\cdot S,$$<sup>[F1]</sup>
 
 $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
-<p>三个杠杆任一可改善 $X$：高并发 $C$、大传输 $S$、低延迟 $L$。但 CPU-GPU 场景下 $C$ 受 CPU 侧并行度与驱动/硬件队列容量限制<sup>[C5]</sup>，$L$ 由 PCIe/NVLink 等硬件决定，Strata 之前没有太多可调空间；最实际的杠杆是<b>大 $S$</b>。论文给的经验阈值：打满 PCIe 5.0 的 75%–80% 需要 1–2 MB 传输<sup>[C5]</sup>；SSD/NIC 等更高带宽介质的要求更高<sup>[C5]</sup>。</p>
+<p>三个杠杆任一可改善 $X$：高并发 $C$、大传输 $S$、低延迟 $L$。但 CPU-GPU 场景下 $C$ 受 CPU 侧并行度与驱动/硬件队列容量限制<sup>[C5]</sup>，$L$ 由 PCIe/NVLink 等硬件决定，Strata 之前没有太多可调空间；最实际的杠杆是<b>大 $S$</b>。论文给的经验阈值：打满 PCIe 5.0 的 75%–80% 需要 1–2 MB 传输<sup>[C5]</sup>；SSD/NIC 等介质要达到高吞吐同样（甚至更）依赖大传输<sup>[C5]</sup>。</p>
 
 <p>实测后果明显。8192 token（页 32、Llama-3.1-8B）从 CPU 加载到 GPU 的带宽利用率仅约 22%<sup>[C8, N3]</sup>；带宽更高的平台反而利用率更低——GH200 把 PCIe 换成 NVLink、峰值带宽是 PCIe 的 6 倍，但实测利用率跌到约 5%<sup>[N3]</sup>（同样的页布局导致同样的小传输，但相对目标带宽更高，所以相对比例更低）。换言之，硬件升级无法挽救布局带来的带宽浪费。</p>
 
@@ -252,7 +252,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <p>图 5 显示资源配额对 I/O kernel 干扰的影响——2 个 1024 线程 block 是兼顾吞吐与干扰的甜点。</p>
 <img src="assets/img-11.webp" alt="图（原文 Figure 5）：I/O kernel 资源配额 vs prefill/decode 干扰">
-<p><b>图（原文 Figure 5）</b>：横轴是 I/O kernel 占用的 CUDA block 数与每 block 线程数，纵轴是同跑场景下的吞吐（数据传输、prefill、decode）与互相干扰百分比。仅用 2 个 1024 线程 block 时，Strata 达到约 50 GB/s 传输吞吐、prefill 性能损失 <5%、decode 损失约 10%<sup>[N5]</sup>。这一组数字决定了默认配额：CPU$\to$GPU 加载用 2 block（关键路径），GPU$\to$CPU 备份用 1 block（非关键路径，备份带宽本就够用）。</p>
+<p><b>图（原文 Figure 5）</b>：横轴是 I/O kernel 占用的 CUDA block 数（每 block 1024 线程固定），纵轴是同跑场景下的吞吐（数据传输、prefill、decode）与互相干扰百分比。仅用 2 个 1024 线程 block 时，Strata 达到约 50 GB/s 传输吞吐、prefill 性能损失 <5%、decode 损失约 10%<sup>[N5]</sup>。这一组数字决定了默认配额：CPU$\to$GPU 加载用 2 block（关键路径），GPU$\to$CPU 备份用 1 block（非关键路径，备份带宽本就够用）。</p>
 
 <p>端到端确认该配置对整体性能影响 <5%<sup>[N5]</sup>，意味着 I/O kernel 进入了"高吞吐 + 几乎零代价"的安全区。ROCm 后端下 kernel 实现兼容 AMD GPU（论文 §4.2 提及，无对应实验数据）<sup>[C26]</sup>。</p>
 
@@ -488,7 +488,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 <tr><td>LooGLE</td><td>Qwen-14B</td><td><b>$3.9\times$</b></td><td><b>$2.1\times$</b></td><td><b>$1.9\times$</b></td></tr>
 <tr><td>LooGLE</td><td>Llama-70B</td><td><b>$5\times$</b></td><td><b>$5\times$</b></td><td><b>$3.75\times$</b></td></tr>
 <tr><td>ReviewMT</td><td>Llama-8B</td><td><b>$1.7\times$</b></td><td><b>$2.3\times$</b></td><td><b>$2.3\times$</b></td></tr>
-<tr><td>NarrativeQA（预热稳态）</td><td>Llama-8B / Qwen-14B / Llama-70B</td><td>—</td><td>$2.3\times$ / $2.6\times$ / $2.5\times$</td><td>—</td></tr>
+<tr><td>NarrativeQA（预热稳态）</td><td>Llama-8B / Qwen-14B / Llama-70B</td><td>论文正文未给出倍数，见 Figure 8 第二行</td><td>$2.3\times$ / $2.6\times$ / $2.5\times$</td><td>未测（不支持预热）</td></tr>
 </tbody>
 </table>
 </div>

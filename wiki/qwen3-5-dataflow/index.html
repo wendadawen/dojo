@@ -148,7 +148,7 @@
   <div class="note"><code>attn_output_gate=true</code> 只是 checkpoint 里的记录键——transformers 的实现里输出门是无条件的，不读这个键，MoE 与稠密两个变体的注意力实现完全相同。本代 <code>layer_types</code> 里的 <code>full_attention</code> 就是标准全注意力：配置类没有 Qwen3.8-Flash-Next 那种把 <code>full_attention</code> 改写成 <code>qwen_sparse_attention</code> 的后处理，权重里也不存在任何 indexer 张量。</div>
 
   <h2 id="flow">2. 交互式数据流</h2>
-  <p>视图在七个标签页间切换：整体总览之外，可下钻到 GDN 层、全注意力层、MoE 内部、MTP 草稿层、视觉编码器与多模态融合。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。形状取自本机对等比缩小模型打点得到的实测记录，维度数字为官方 config 的真实取值。脚本失效时图表不显示；第 3–6 节给出全部结论与数值。</p>
+  <p>视图在七个标签页间切换：整体总览之外，可下钻到 GDN 层、全注意力层、MoE 内部、MTP 草稿层、视觉编码器与多模态融合。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。节点的张量形状结构取自官方源码与 <code>config.json</code>，维度数字取自 <code>config.json</code> 与 checkpoint 张量头；等比缩小模型只用于核对残差宽度与缓存形状随长度的变化。脚本失效时图表不显示；第 3–6 节给出全部结论与数值。</p>
 
   <div class="viz">
     <div class="viz-head">
@@ -226,7 +226,7 @@
 <p>边：x→rt（4096）；rt→rn（[T,10]）；rn→ex（权重）；x→ex（[T,4096]）；x→sh（4096）；x→shg（4096）；shg→sh（标量门）；rt→aux（路由统计）；ex→sum（加权和）；sh→sum（门控输出）</p>
 <h4>MTP 草稿层：拼接接入 + 同构全注意力层</h4>
 <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>主干末端隐状态 · h</td><td><code>[1,T,4096]</code></td><td>$h$</td><td>第 59 层输出（末端 norm 之前/之后由实现定义，vLLM 从主干取 hidden_states）。</td></tr>
+<tr><td>主干末端隐状态 · h</td><td><code>[1,T,4096]</code></td><td>$h$</td><td>第 59 层输出经主干末端 RMSNorm 后的隐状态（vLLM 主干 forward 在返回前执行末端 norm，MTP 取该返回值）。</td></tr>
 <tr><td>词嵌入 e · (共享主干)</td><td><code>ids [1,T] -&gt; [1,T,4096]</code></td><td>$e = \mathrm{Embedding}(\mathrm{ids})$</td><td>mtp_use_dedicated_embeddings=false：直接复用主干 embed_tokens（1.02B），checkpoint 无 mtp.embed_tokens。</td></tr>
 <tr><td>pre_fc_norm · _embedding</td><td><code>[1,T,4096]</code></td><td>$\mathrm{RMSNorm}(e)$</td><td>嵌入流独立的 RMSNorm，weight 形状 [4096]。</td></tr>
 <tr><td>pre_fc_norm · _hidden</td><td><code>[1,T,4096]</code></td><td>$\mathrm{RMSNorm}(h)$</td><td>隐状态流独立的 RMSNorm，与嵌入流不共享参数。</td></tr>
@@ -280,7 +280,7 @@
     <li>两个门都由输入投影得到：$\beta_t = \sigma(W_b x_t)$ 控制写入强度，$g_t = -e^{A_{\log}}\,\mathrm{softplus}(W_a x_t + b_{dt})$ 控制遗忘。因 $e^{A_{\log}}>0$ 且 $\mathrm{softplus}>0$，$g_t$ 恒负、$e^{g_t}\in(0,1)$ 必为衰减。本机实测 $g_t$ 落在 $[-63.306, -0.010]$，对应每 token 记忆保留率从 0.990 到接近 0，衰减强度跨四个数量级；$\beta_t$ 范围 $[0.0033, 0.9994]$。</li>
     <li>16 键头、64 值头，比值 4，源码用 <code>repeat_interleave</code> 把查询与键各复制 4 份对齐到 64 值头；查询与键在递归前做 L2 归一化。前置 kernel 4 的<a href="../depthwise-conv/">深度可分离因果卷积</a>作用于整个 QKV 拼接（12288 通道），decode 时必须跨步保留 kernel−1=3 个位置的状态。</li>
     <li><b>两条计算路径等价</b>：prefill 走分块并行、decode 走逐 token 递归。本机在真实头数与头维（16/64 头、128 维、20 个 token）下实测，两者输出最大绝对差 $3.725\times10^{-8}$、末态差 $3.576\times10^{-7}$；2 token 正交键的手算复核（末态 $[[3,5],[7,11]]$）与实跑差 $5.722\times10^{-6}$。</li>
-    <li><b>输出门用 silu</b>：递归输出先做逐头 RMSNorm（weight 形状 [128]，全模型 64 个值头共享同一份参数，且以 F32 存储——90 个 F32 张量中的一半），再乘 $\mathrm{silu}(W_z x)$。这一点与 Qwen3.8-Flash-Next 不同：那边 <code>output_gate_type=sigmoid</code> 可配置且 checkpoint 取 sigmoid，这边硬编码 silu。</li>
+    <li><b>输出门用 silu</b>：递归输出先做逐头 RMSNorm（weight 形状 [128]，该层 64 个值头共享同一份 128 维参数，45 层各一份，且以 F32 存储——90 个 F32 张量中的一半），再乘 $\mathrm{silu}(W_z x)$。这一点与 Qwen3.8-Flash-Next 不同：那边 <code>output_gate_type=sigmoid</code> 可配置且 checkpoint 取 sigmoid，这边硬编码 silu。</li>
   </ul>
 
   <h3>全注意力层（15 层）：输出门 + QK-norm + 极端 GQA</h3>
@@ -395,7 +395,7 @@
   <table>
     <tr><th>项目</th><th>依据</th></tr>
     <tr><td>全部 config 数值</td><td>官方 <code>config.json</code>：huggingface.co/Qwen/Qwen3.5-397B-A17B，commit <code>84726181</code></td></tr>
-    <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方实现 huggingface/transformers commit <code>36deb0b5</code>，<code>src/transformers/models/qwen3_5/</code>、<code>qwen3_5_moe/</code>（视觉侧组件继承自 <code>qwen3_vl_moe/</code>）</td></tr>
+    <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方实现 huggingface/transformers commit <code>36deb0b5</code>，<code>src/transformers/models/qwen3_5/</code>、<code>qwen3_5_moe/</code>（视觉侧组件继承自 <code>qwen3_5/</code> 并定义在 <code>qwen3_5_moe/</code> 内；自 <code>qwen3_vl_moe/</code> 继承的是多模态装配类、输出类与文本路由器）</td></tr>
     <tr><td>MTP 前向语义（拼接顺序、共享两头）</td><td>vLLM <code>vllm/model_executor/models/qwen3_next_mtp.py</code>（注释明写 mirroring the Qwen3.5 MTP handling）；transformers 不实现 MTP 前向，<code>mtp.*</code> 权重被显式忽略</td></tr>
     <tr><td>官方对外规模表述（397B 总参 / 17B 激活 / 256k 上下文）</td><td>官方模型卡与官方 <code>config.json</code>；对外口径出处为官方博客「Qwen3.5: Towards Native Multimodal Agents」（qwen.ai，2026-02-16，正文未取得，仅按标题与日期记录）。三项数值均已另由 <code>config.json</code> 与 checkpoint 张量头独立复现，见本节末「核对说明」</td></tr>
     <tr><td>MTP 训练目标（Multi-Token Prediction）</td><td>官方模型卡「Multi-Token Prediction (MTP): trained with multi-steps」</td></tr>
@@ -722,7 +722,7 @@ mtp: {
   rankSep:42, nodeSep:22,
   legend:[['#e0922f','MTP 专属'],['#7a45c9','同构注意力层'],['#3f6fd0','同构 MoE'],['#556070','共享输出']],
   nodes:{
-    hid:  {label:'主干末端隐状态\nh', t:'mtp', io:'[1,T,4096]', f:'h', d:'第 59 层输出（末端 norm 之前/之后由实现定义，vLLM 从主干取 hidden_states）。'},
+    hid:  {label:'主干末端隐状态\nh', t:'mtp', io:'[1,T,4096]', f:'h', d:'第 59 层输出经主干末端 RMSNorm 后的隐状态（vLLM 主干 forward 在返回前执行末端 norm，MTP 取该返回值）。'},
     emb:  {label:'词嵌入 e\n(共享主干)', t:'mtp', io:'ids [1,T] -> [1,T,4096]', f:'e = \\mathrm{Embedding}(\\mathrm{ids})', d:'mtp_use_dedicated_embeddings=false：直接复用主干 embed_tokens（1.02B），checkpoint 无 mtp.embed_tokens。'},
     ne:   {label:'pre_fc_norm\n_embedding', t:'mtp', io:'[1,T,4096]', f:'\\mathrm{RMSNorm}(e)', d:'嵌入流独立的 RMSNorm，weight 形状 [4096]。'},
     nh:   {label:'pre_fc_norm\n_hidden', t:'mtp', io:'[1,T,4096]', f:'\\mathrm{RMSNorm}(h)', d:'隐状态流独立的 RMSNorm，与嵌入流不共享参数。'},
