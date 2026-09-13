@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/mooncake/index.html
+reviewed_content_sha256: f493751a80a01fa1
+-->
 # Mooncake 审查记录（第 3 轮）
 
 - 页面版本：index.html a2c3ddb5b58e56f04a0ecd64078b2eb7bce0a8e0；overview.html c739e76979383c5e431378b6a063ba94b1c5c5be（git hash-object，工作树）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/vit/index.html
+reviewed_content_sha256: ab150975df2d0949
+-->
 # Vision Transformer（ViT）独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/ngram/index.html
+reviewed_content_sha256: d3310e49a8721026
+-->
 # N-gram 审查记录（第 3 轮）
 
 - 页面版本：0de5157408d157fc9a3f3958d2cc792f943c5bce（wiki/ngram/index.html 工作树哈希）

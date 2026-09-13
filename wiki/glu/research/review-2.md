@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/glu/index.html
+reviewed_content_sha256: 3b566c51ebb09596
+-->
 # GLU（门控线性单元）独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源）

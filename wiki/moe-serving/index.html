@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="从 Transformer 的 FFN 出发，梳理 router、top-k 稀疏激活、共享与路由专家、专家并行和 all-to-all；再连接到 prefill/decode、KV cache、TTFT、TPOT、goodput 与 PD 分离。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="模型结构">
-  <meta name="dojo:tag" content="MoE 推理">
+  <meta name="dojo:tag" content="MoE">
   <title>MoE 大模型推理与服务基础：从"存得多、算得少"到在线服务</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -472,7 +472,7 @@ combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
 </div>
 
 <div class="callout callout-yellow">
-<p><b>注意边界：</b>重叠是"藏"不是"消"。通信本身仍占用带宽与硬件资源；能否藏住取决于有没有足够的可并行计算——批太小、或 shared expert 的计算太短，气泡还是会露出来。TBO/SBO 也没有消除 all-to-all，只是让它与计算同时进行。</p>
+<p><b>注意边界：</b>重叠是"藏"不是"消"。通信本身仍占用带宽与硬件资源；能否藏住取决于有没有足够的可并行计算——批太小、或 shared expert 的计算太短，气泡还是会露出来。TBO/SBO 也没有消除 all-to-all，只是让它与计算同时进行。 把 dispatch、专家计算与 combine 融进一个占满全部 SM 的持久 kernel、由 kernel 内的 warp 分工让两者同时推进，是同一思路在 kernel 层的实现，见 <a href="../megamoe/index.html">MegaMoE</a>。</p>
 </div>
 
 <h3>本章问题</h3>
@@ -628,7 +628,7 @@ combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
 
 <p><strong>PD 合设（colocation）</strong>：prefill 和 decode 跑在同一批 GPU、同一份模型权重上。好处是省显存、prefill 建好的 KV cache 就地可用。代价是<strong>互相干扰</strong>：一个 prefill 步往往比一个 decode 步长得多，排在一起时 decode 步被拖慢、TPOT 变差；decode 步挤进来也抬高 TTFT。两个阶段抢同一份资源，调度上偏向哪边都伤另一边。</p>
 
-<p><strong>PD 分离（PDD，prefill-decode disaggregation）</strong>：prefill 和 decode 各自用一组 GPU 实例。干扰消失，两个阶段可以按各自目标独立配置资源与并行方式（prefill 求吞吐、decode 求延迟）。代价有三：第一，每个实例都要存一份完整模型副本——对 MoE 模型，权重的大头是专家，副本很贵；第二，prefill 产出的 KV cache 要跨实例传给 decode；第三，两阶段的容量要按配比成组供给，最小供给单位是一整个"部署单元"——DeepSeek-V3 技术报告的一个配比单元是 32 张 prefill GPU 加 320 张 decode GPU（数字 N5）。不是对半分：配比由两阶段负载的不对称决定。</p>
+<p><strong>PD 分离（PDD，prefill-decode disaggregation）</strong>：prefill 和 decode 各自用一组 GPU 实例。干扰消失，两个阶段可以按各自目标独立配置资源与并行方式（prefill 求吞吐、decode 求延迟）。代价有三：第一，每个实例都要存一份完整模型副本——对 MoE 模型，权重的大头是专家，副本很贵；第二，prefill 产出的 KV cache 要跨实例传给 decode；第三，两阶段的容量要按配比成组供给，最小供给单位是一整个"部署单元"——DeepSeek-V3 技术报告的一个配比单元是 32 张 prefill GPU 加 320 张 decode GPU（数字 N5）。不是对半分：配比由两阶段负载的不对称决定。这条路线的一个完整实例是 <a href="../mooncake/index.html">Mooncake</a>：它把全集群闲置的 CPU/DRAM/SSD 组织成全局 KVCache 池，再由 Conductor 按缓存复用与负载同时最优来路由请求。</p>
 
 <div class="table-scroll">
 <table>
@@ -642,7 +642,7 @@ combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
 </table>
 </div>
 
-<p>两条路线各自的深层局限——分离的副本太贵、部署单元太粗，合设的干扰难消、GPU 内部切分太死——以及一种更细的混合架构，正是论文 ExpertPlex 要解决的问题；其解析页将从本页的概念出发。</p>
+<p>两条路线各自的深层局限——分离的副本太贵、部署单元太粗，合设的干扰难消、GPU 内部切分太死——以及一种更细的混合架构，正是论文 ExpertPlex 要解决的问题；其解析页将从本页的概念出发。该页见 <a href="../expertplex/index.html">ExpertPlex</a>——它跨阶段共享同一份 MoE 专家，attention 按阶段各自独占整卡。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/sherry-ternary-quant/index.html
+reviewed_content_sha256: 5e79835bf4bdaa4a
+-->
 # Sherry 稀疏三值量化审查记录（第 2 轮）
 
 - 页面版本：index.html `757f2a575c9067bcfd4e406de2e70b68e594d56f`（overview.html `539e1f724d49f7cb534617b6b25a38e2399e64fa`）

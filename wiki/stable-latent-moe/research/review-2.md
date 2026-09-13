@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/stable-latent-moe/index.html
+reviewed_content_sha256: d6b690623e8424be
+-->
 # Stable LatentMoE 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 段B对照来源）

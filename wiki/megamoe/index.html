@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="DeepSeek 开源在 DeepGEMM 里的融合 MoE kernel：把 EP 下 MoE 层的五段执行（dispatch、Linear-1、SwiGLU、Linear-2、combine）塞进一个占满全部 SM 的持久 kernel，用对称内存支撑 kernel 内跨 rank 读写，让 NVLink 传输与 Tensor Core 计算重叠；EP8 基准下相对非重叠基线加速 1.50–1.96 倍，仅支持 Blackwell（sm100）。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="推理系统,并行与通信">
-  <meta name="dojo:tag" content="moe-kernel,deepgemm,communication-overlap">
+  <meta name="dojo:tag" content="MoE">
   <title>MegaMoE：把 MoE 一层塞进一个持久 kernel，让通信与计算同时进行</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -239,7 +239,7 @@ $$y=\sum_{e\in\mathcal{S}} g_{e}\cdot W_2^{(e)}\,\mathrm{SwiGLU}\!\left(W_1^{(e)
 <figcaption class="diagram-caption">上：传统串行——dispatch/combine 时 SM 空闲，GEMM 时互联空闲。下：Mega MoE——dispatch 组分块拉取、epilogue 组分块写回与 Tensor Core 计算在不同线程组上同时推进，两条泳道同时被填满。</figcaption>
 </figure>
 
-<p>通信本身也不是小数目。用基准里的 DeepSeek-V4-Pro 规格（hidden $h=7168$、top-$k=6$）<sup>[N3]</sup>算一笔账：激活按 FP8 存储时每元素 1 字节，一个 token 的 dispatch 发送量约为 $k\times h\times 1\,\mathrm{B}=6\times 7168=43008\,\mathrm{B}\approx 43\,\mathrm{KB}$；combine 回传的是 BF16 结果，约 $86\,\mathrm{KB}$。每 rank 512 个 token 时，仅 dispatch 方向就要发出约 $22\,\mathrm{MB}$（$43008\times 512=22{,}020{,}096$ 字节，十进制口径）——这还是每层、每 rank 反复发生的量。这笔账只算数据本体，是按公式 $k\times h\times b_{\mathrm{act}}$ 直接推出的量级估算<sup>[F3]</sup>，不是实测流量；官方基准表中互联带宽一列（batch 512 时 266/182 GB/s<sup>[N2, N4]</sup>）就是这些流量的实测体现。</p>
+<p>通信本身也不是小数目。用基准里的 DeepSeek-V4-Pro 规格（hidden $h=7168$、top-$k=6$）<sup>[N3]</sup>算一笔账：激活按 FP8 存储时每元素 1 字节，一个 token 的 dispatch 发送量约为 $k\times h\times 1\,\mathrm{B}=6\times 7168=43008\,\mathrm{B}\approx 43\,\mathrm{KB}$；combine 回传的是 BF16 结果，约 $86\,\mathrm{KB}$。每 rank 512 个 token 时，仅 dispatch 方向就要发出约 $22\,\mathrm{MB}$（$43008\times 512=22{,}020{,}096$ 字节，十进制口径）——这还是每层、每 rank 反复发生的量。这笔账只算数据本体，是按公式 $k\times h\times b_{\mathrm{act}}$ 直接推出的量级估算<sup>[F3]</sup>，不是实测流量；官方基准表中互联带宽一列（batch 512 时 266/182 GB/s<sup>[N2, N4]</sup>）就是这些流量的实测体现。这一规格对应模型的完整前向路径（61 层、HCA/CSA 交替压缩、mHC 四路残差），见 <a href="../deepseek-v4-dataflow/index.html">DeepSeek-V4-Pro 前向数据流</a>。</p>
 
 <p>既然通信量删不掉，唯一出路就是让它与计算同时发生。这要求"发数据的人"和"算数的人"住在同一个 kernel 里——这正是 Mega MoE 的做法，下一章看它如何组织。</p>
 

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/latent-moe/index.html
+reviewed_content_sha256: 74e9f3c5f5432c40
+-->
 # LatentMoE 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 来源对照）

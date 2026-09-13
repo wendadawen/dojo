@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/megamoe/index.html
+reviewed_content_sha256: d69f02e466173f3e
+-->
 # MegaMoE 审查记录（第 3 轮）
 
 - 页面版本：index.html，110754 字节（overview.html，6750 字节）

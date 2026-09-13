@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/dualpath/index.html
+reviewed_content_sha256: 0fd0c60f7e368695
+-->
 # DualPath 审查记录（第 3 轮）
 
 - 页面版本：`wiki/dualpath/index.html`（工作树未提交） + `overview.html`

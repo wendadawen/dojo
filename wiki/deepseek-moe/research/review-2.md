@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/deepseek-moe/index.html
+reviewed_content_sha256: e9ad9f9e773d138f
+-->
 # DeepSeekMoE 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟）

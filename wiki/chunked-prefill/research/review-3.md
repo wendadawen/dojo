@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/chunked-prefill/index.html
+reviewed_content_sha256: 25774db2e22de7ad
+-->
 # Chunked Prefill 审查记录（第 3 轮）
 
 - 页面版本：index.html 工作树哈希 4751b577a9111e5e6efab9f034afc37fdde49731

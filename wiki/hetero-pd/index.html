@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="P（NVIDIA，HPC_ATTN）与 D（AMD，HYVL_INT8_ATTN）经 FlexibleConnector + NIXL + Mooncake + RoCE 做 PD 分离：proxy 按 request_id 双投递，P 只出 1 个 token，KV 以 1351680 B/block 原样 RDMA WRITE 推给 D。异构可行的硬条件是两侧 KV 布局逐字节相同；实测 KV 传输仅占端到端 0.12%。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
-  <meta name="dojo:tag" content="PD 分离">
+  <meta name="dojo:tag" content="推理系统">
   <title>异构 PD 分离全链路 · Dojo</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -299,7 +299,7 @@
 
     <p><strong>这个一致是脆弱的、靠参数组合碰上的</strong>。反例：head_size=192、block_size=64 时 $\gcd=64$、unit=3、elems=6 $\neq$ 4，两侧布局就不再匹配；而第 2 节说过 <code>compat_hash</code> 只报告不阻止——布局错配会变成静默的数据损坏风险，只能在观测侧发现。</p>
 
-    <p>另有两处「允许不同」：一是 <code>block_stride</code>，P 若走 cross-layer split KV 则 stride=2，D 的 backend 不 split 则 stride=1，两侧各用各自的 stride 计算索引（descriptor 长度建链时已按对端参数算好）；二是 D 侧代码注释明确 HYVL_INT8_ATTN 不能加进 K/V-outer 布局的 backend 集合——它是 NHD 序且 scale 内嵌在每个 head 尾部，属于另一套布局约定。</p>
+    <p>另有两处「允许不同」：一是 <code>block_stride</code>，P 若走 cross-layer split KV 则 stride=2，D 的 backend 不 split 则 stride=1，两侧各用各自的 stride 计算索引（descriptor 长度建链时已按对端参数算好）；二是 D 侧代码注释明确 HYVL_INT8_ATTN 不能加进 K/V-outer 布局的 backend 集合——它是 NHD 序且 scale 内嵌在每个 head 尾部，属于另一套布局约定（NHD 与 HND 两种排法的取舍见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>）。</p>
 
     <h2>6. 失败路径与可观测点</h2>
 
@@ -338,7 +338,7 @@ grep -a "KV transfer timeout\|NIXL transfer failed\|prefill_failed"   $L</code><
       <tr><td>D decode（64 token @ 17.3 tok/s）</td><td>3.48 s</td><td><strong>96%</strong></td></tr>
     </table>
 
-    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么；单请求吞吐上，走 PD（20.3 tok/s）比 D 本机跑全程（23.5 tok/s）略慢，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
+    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么（D 侧把本地命中的头部块数回传、P 侧据此只发增量的设计能进一步压低这部分传输，见 <a href="../increase-kv/index.html">增量 KV 传输</a>）；单请求吞吐上，走 PD（20.3 tok/s）比 D 本机跑全程（23.5 tok/s）略慢，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
 
     <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。多请求并发下的整体吞吐才是 PD 的收益所在，单请求对比体现不出来。</p>
 

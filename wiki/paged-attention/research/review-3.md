@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/paged-attention/index.html
+reviewed_content_sha256: 0f474fcc87d3b403
+-->
 # PagedAttention 审查记录（第 3 轮）
 
 - 页面版本：index.html fb64fe1dfe91f60d1579496e3d6e52b949a7f059 / overview.html b373b4493caca5df24dcfa58064a2d4adb2b2880

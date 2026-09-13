@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/hyper-connections/index.html
+reviewed_content_sha256: 249aa2d82661b411
+-->
 # 超连接审查记录（第 2 轮）
 
 - 页面版本：d127e54c9aaf9c496bf47d702c2e39b83f3f5ddc

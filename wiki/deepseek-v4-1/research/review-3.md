@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/deepseek-v4-1/index.html
+reviewed_content_sha256: b7e599bb2a229803
+-->
 # DeepSeek-V4.1-Flash 审查记录（第 3 轮）
 
 - 页面版本：`index.html` 工作树哈希 `b34f57bbcb4e08a20d538ac808715397711288fe`（1688 行）；`overview.html` 工作树哈希 `9c190d4000863f0ae04b1fa61f3db393e74d52e0`（86 行）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/eagle-speculative/index.html
+reviewed_content_sha256: 72ba0e04577fa7a3
+-->
 # EAGLE-3 投机解码 draft 模型独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源核查）

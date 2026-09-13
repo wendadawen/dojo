@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/cross-layer-kv-sharing/index.html
+reviewed_content_sha256: bf92e817ddc1423a
+-->
 # 跨层 KV 复用审查记录（第 2 轮）
 
 - 页面版本：89f6b15f585b81ab79acf7ec2eb8c86cc542f897

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/hisparse/index.html
+reviewed_content_sha256: 90e69beb788bc82e
+-->
 # HiSparse 审查记录（第 2 轮）
 
 - 页面版本：index.html 0123d1fb746a7ca590f21180e6724428eac7d4fa；overview.html 7dee9775f87e59f726dba7624d0561bb52cf53df

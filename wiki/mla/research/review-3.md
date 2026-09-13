@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/mla/index.html
+reviewed_content_sha256: abb9c21402019872
+-->
 # MLA 审查记录（第 3 轮）
 
 - 页面版本：ed789198e398965df701b6daf1eda8b4812b5ec6（`git hash-object wiki/mla/index.html`；overview.html = 098e2b4e189efe63d35650c101cdb4d4e02f89b4）

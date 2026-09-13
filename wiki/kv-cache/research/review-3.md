@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/kv-cache/index.html
+reviewed_content_sha256: 9ffd0ab56891efdd
+-->
 # KV cache 审查记录（第 3 轮）
 
 - 页面版本：index.html aff624f68ab8bbf6e5afdf12c77b9864b9ecc488；overview.html cb4d7c41a3c1f4b3b493ac9af054dca6e0d500c6

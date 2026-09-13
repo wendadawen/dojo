@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/cross-layer-kv-sharing/index.html
+reviewed_content_sha256: bf92e817ddc1423a
+-->
 # 跨层 KV 复用审查记录（第 3 轮）
 
 - 页面版本：index.html 工作树哈希 `f1df025dee8f2fa504ab263bb437b81359e97753`（overview.html 同为未跟踪新文件）

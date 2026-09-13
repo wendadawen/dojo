@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/mla/index.html
+reviewed_content_sha256: d497ee0809a6e47d
+-->
 # Multi-head Latent Attention（MLA）独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 强推理模型对照来源）

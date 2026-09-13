@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/ppd-disaggregation/index.html
+reviewed_content_sha256: 7e5d7861ec450a35
+-->
 # PPD 分离审查记录（第 2 轮）
 
 - 页面版本：未跟踪（`?? wiki/ppd-disaggregation/`，index.html/overview.html 均修改于 2026-08-19 21:32）

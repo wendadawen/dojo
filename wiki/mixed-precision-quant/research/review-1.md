@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/mixed-precision-quant/index.html
+reviewed_content_sha256: f8f39fe973041328
+-->
 # 逐层混合精度量化（MIX-STQ1_0）审查记录（第 1 轮）
 
 - 页面版本：index.html 8124c2d5ee8e4d1a7ae9d8598cbabbd873756a35；overview.html 657c70f034b11105e9003e871ab3a9949aeb9704

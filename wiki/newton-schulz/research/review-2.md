@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/newton-schulz/index.html
+reviewed_content_sha256: a496b7e197df20ac
+-->
 # Newton-Schulz 迭代独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟 / 真实目标读者）

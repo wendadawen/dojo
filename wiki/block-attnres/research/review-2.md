@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/block-attnres/index.html
+reviewed_content_sha256: 82402c8f2b312207
+-->
 # Block AttnRes 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 / 第二次审查，未参与生成与第一次审查）

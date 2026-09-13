@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/causal-mask/index.html
+reviewed_content_sha256: db78ab32a96a5298
+-->
 # 因果掩码审查记录（第 1 轮）
 
 - 页面版本：c707be8e87a8f604cb7b6f138f5d9e82cb7d6103（`git hash-object wiki/causal-mask/index.html`）

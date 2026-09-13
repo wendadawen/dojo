@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/fused-moe/index.html
+reviewed_content_sha256: 6027a00a32d23f39
+-->
 # FusedMoE 审查记录（第 2 轮）
 
 - 页面版本：index.html 工作树哈希 `3dd1704797f8a3e9780ce3e247f4f25d46b64acd`（overview.html `11a0a590f1c9789739f7fa3adaa7fd555e5f8386`）

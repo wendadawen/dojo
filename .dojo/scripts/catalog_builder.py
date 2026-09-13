@@ -40,6 +40,29 @@ ALLOWED_TOPICS = [
     "数学基础",
 ]
 
+# 细粒度标签封闭词表：dojo:tag 只取其一，供首页按技术筛选。
+# 与 ALLOWED_TOPICS 的分工——topics 是粗分类，一个页面可属多个；
+# tag 回答「这篇讲什么技术」，单一取值。技术栈名（vLLM、llama.cpp）属于
+# 实现细节、文档形态（速查、论文）由 dojo:type 承担，都不进这里。
+# 新增取值前先确认它至少有 3 个页面，否则标签会重新碎片化。
+ALLOWED_TAGS = [
+    "KV cache",
+    "MoE",
+    "优化器",
+    "位置编码",
+    "并行与通信",
+    "推理加速",
+    "推理系统",
+    "数学与数值",
+    "数据流",
+    "模型架构",
+    "注意力",
+    "网络结构",
+    "视觉与多模态",
+    "训练",
+    "量化",
+]
+
 
 class WikiHTMLParser(HTMLParser):
     def __init__(self) -> None:
@@ -157,11 +180,30 @@ def git_first_seen_dates(root: Path) -> dict[str, str]:
     return dates
 
 
+def review_fields(root: Path, slug: str) -> dict:
+    """审查状态从 research/ 下的记录算出，不往页面里写字段。
+
+    页面本身不标注可信度时，读者无法分辨哪篇经过独立审查、哪篇没有。
+    状态在构建期算出来给首页卡片用；每加一轮审查不需要回填任何页面。
+    """
+    import review_status  # 同目录；按需导入，避免拖慢只做结构校验的 validate
+
+    try:
+        info = review_status.status_of(slug, root)
+    except Exception:  # noqa: BLE001 - 状态算不出来不该让构建失败
+        return {"rounds": 0, "measured": False, "stale": None, "reviewed_at": ""}
+    return {
+        "rounds": info["rounds"],
+        "measured": info["measured"],
+        "stale": info["stale"],
+        "reviewed_at": info["reviewed_at"],
+    }
+
+
 def parse_page(root: Path, page_path: Path) -> dict:
     relative = page_path.relative_to(root).as_posix()
     parser = WikiHTMLParser()
     parser.feed(page_path.read_text(encoding="utf-8", errors="ignore"))
-
     h1 = clean_text(" ".join(parser.h1_parts))
     title_tag = clean_text(" ".join(parser.title_parts))
     title = h1 or title_tag or page_path.parent.name
@@ -187,6 +229,7 @@ def parse_page(root: Path, page_path: Path) -> dict:
         "_has_summary": bool(summary_meta),
         "_invalid_topics": invalid_topics,
         "_hrefs": parser.hrefs,
+        "review": review_fields(root, page_path.parent.name),
     }
 
 

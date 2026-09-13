@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/moonep/index.html
+reviewed_content_sha256: 90580b8703835845
+-->
 # MoonEP 完美均衡专家并行独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源核查）

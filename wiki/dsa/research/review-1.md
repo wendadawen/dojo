@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/dsa/index.html
+reviewed_content_sha256: 2e0cc4d08acba829
+-->
 # DeepSeek Sparse Attention（DSA）审查记录（第 1 轮）
 
 - 页面版本：`index.html` 工作树哈希 `c1cc1b5c08ffad0ced514ecb780615dc592f9312`；`overview.html` 工作树哈希 `5d299b2f2859bdd240d3c097ecc8ccf4ff552c71`

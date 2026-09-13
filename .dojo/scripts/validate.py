@@ -17,7 +17,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 
-from catalog_builder import ALLOWED_TOPICS
+from catalog_builder import ALLOWED_TAGS, ALLOWED_TOPICS
 
 
 LOCAL_ASSET_RE = re.compile(r'''(?:href|src)=["']([^"']+)["']''')
@@ -202,6 +202,15 @@ def validate_page(path: Path) -> list[str]:
                 errors.append(
                     f"unknown topic: {topic} (allowed: {', '.join(ALLOWED_TOPICS)})"
                 )
+
+        # 标签取封闭词表内的单一值，防止细粒度标签再次碎片化
+        raw_tag = inspector.meta.get("dojo:tag", "")
+        if re.search(r"[,，]", raw_tag):
+            errors.append(f"dojo:tag must be a single value, got: {raw_tag}")
+        elif raw_tag and raw_tag not in ALLOWED_TAGS:
+            errors.append(
+                f"unknown tag: {raw_tag} (allowed: {', '.join(ALLOWED_TAGS)})"
+            )
 
         description = inspector.meta.get("description", "")
         summary = inspector.meta.get("dojo:summary", "")

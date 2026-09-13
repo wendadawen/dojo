@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/ihc/index.html
+reviewed_content_sha256: 8800c91acad6e3a3
+-->
 # iHC（恒等超连接）审查记录（第 2 轮）
 
 - 页面版本：index.html `25dac9c9faf197de6075f1c42e86f14d241199be`（overview.html `d7ee0bf21697b6c33732c78b2ac1ac544500277b`）

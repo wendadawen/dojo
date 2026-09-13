@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/mrope/index.html
+reviewed_content_sha256: 58069347247a6cdb
+-->
 # MRoPE审查记录（第 3 轮）
 
 - 页面版本：70388d2458b2d3fc1a66935d5bfa6e0ef9caa8a7（wiki/mrope/index.html 工作树哈希）

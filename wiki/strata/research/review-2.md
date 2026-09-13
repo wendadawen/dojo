@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/strata/index.html
+reviewed_content_sha256: 284c9496a1cd82d5
+-->
 # Strata 审查记录（第 2 轮）
 
 - 页面版本：index.html 1078083 字节，SHA1 `32082f3627a001221b9ebe8b33597ca1571debae`；overview.html 6194 字节，SHA1 `df924a6e26b594b933a124429b6077c40edf6f5f`

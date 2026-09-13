@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/beyond-buzz-disaggregation/index.html
+reviewed_content_sha256: f98af4922afcc09c
+-->
 # Beyond the Buzz 审查记录（第 1 轮）
 
 - 页面版本：index.html 工作树未取哈希（仅做内容核对）

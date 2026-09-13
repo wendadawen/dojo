@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/sft/index.html
+reviewed_content_sha256: 37165df48ca5ee9b
+-->
 # SFT（监督微调）审查记录（第 1 轮）
 
 - 页面版本：index.html 工作树哈希 `771e3ea633e82135eaef8e8f6c06aaa369f508db`（overview.html 同刻哈希 `b0b161173a1c49892b41720286ba611d07f15a8d`）

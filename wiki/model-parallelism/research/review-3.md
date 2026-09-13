@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/model-parallelism/index.html
+reviewed_content_sha256: 57ce7ff122077a27
+-->
 # 模型并行审查记录（第 3 轮）
 
 - 页面版本：ceb762cea31d915324554152cc33843970f08d34

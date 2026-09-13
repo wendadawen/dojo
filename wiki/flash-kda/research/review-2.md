@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/flash-kda/index.html
+reviewed_content_sha256: 93bee6f21dbff1f9
+-->
 # FlashKDA 与 KDA Context Parallelism 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源核查）

@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="Strata 解决长上下文 LLM serving 中把 KV cache 从 CPU 内存搬回 GPU 时的两个瓶颈：分页布局让传输粒度只有几 KB 而实测只达 PCIe 5.0 带宽的约 22%（GH200 约 5%），现有调度器按 prefill 计算掩盖加载的旧假设在长上下文下失效导致 loading-bound。回应：GPU-assisted I/O（CUDA kernel 代替 cudaMemcpyAsync，2 block $\times$ 1024 thread 限制 SM 干扰），布局解耦（layer-first/page-first 在 I/O kernel 内一次算术转换），cache-aware 调度（transient node 防 delay hit、均衡 batch 防 loading-bound、bubble filling 用 decode 填空泡）。H200 上 Llama-70B LooGLE 同 TTFT 吞吐对 vLLM-LMCache 与 SGLang-HiCache 各 $5\times$，对 TensorRT-HiCache $3.75\times$。">
   <meta name="dojo:type" content="paper">
   <meta name="dojo:topics" content="推理系统, 内存与缓存">
-  <meta name="dojo:tag" content="long-context-serving">
+  <meta name="dojo:tag" content="推理系统">
   <title>Strata：分层 KV cache 缓存框架——把 I/O 与调度都纳入带宽资源模型</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -147,7 +147,7 @@
 <details>
 <summary>展开：20,000 token 手册的完整容量与传输账</summary>
 <p>构造示例（与本文贯穿场景对齐）。Llama-3.1-8B 下手册每 token 128 KB，总 $20{,}000\times 128\,\text{KB}\approx 2.56\,\text{GB}$——单一请求独占已占 40 GB HBM 的 6.4%。按页 32 切分：$\lceil 20{,}000/32\rceil=625$ 页，每页 $32\times 128\,\text{KB}=4\,\text{MB}$。手册在 CPU 内存中的 625 页散布在互不相邻的物理位置。</p>
-<p><b>为什么 4 MB 的"大页"仍然打不满 PCIe？</b>答案在 layer-first 布局（详见第 3 章）：GPU 内存里同页的 K/V 是按"层优先"而非"页优先"排列——同一页 32 token 的 K/V 在 32 层上各占一段，跨内存层搬运时，一次只能拉取一页的某一层，单次传输单元是"页内单层片段"= 4 MB / 32 层 = 128 KB，远低于打满 PCIe 5.0 64 GB/s 所需的 1–2 MB 阈值<sup>[C8, N3]</sup>。更小的模型（小 head 数 $\times$ 小 head_dim）或更小的页（页 1/页 16）下，单层片段可低至几 KB——这正是论文引言所述"sometimes only a few kilobytes"的来源<sup>[C3]</sup>。搬运粒度由页大小<b>和</b>布局共同决定，单看页大小会漏掉这一关键约束。</p>
+<p><b>为什么 4 MB 的"大页"仍然打不满 PCIe？</b>答案在 layer-first 布局（详见第 3 章）：GPU 内存里同页的 K/V 是按"层优先"而非"页优先"排列——同一页 32 token 的 K/V 在 32 层上各占一段，跨内存层搬运时，一次只能拉取一页的某一层，单次传输单元是"页内单层片段"= 4 MB / 32 层 = 128 KB，远低于打满 PCIe 5.0 64 GB/s 所需的 1–2 MB 阈值<sup>[C8, N3]</sup>。更小的模型（小 head 数 $\times$ 小 head_dim）或更小的页（页 1/页 16）下，单层片段可低至几 KB——这正是论文引言所述"sometimes only a few kilobytes"的来源<sup>[C3]</sup>。搬运粒度由页大小<b>和</b>布局共同决定，单看页大小会漏掉这一关键约束。 这里说的是层与页的先后；页内维度的排法（token 与 KV 头谁在外层，即 NHD 与 HND）是决定单头取数是否连续的另一层，见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>。</p>
 </details>
 
 <h3 id="bandwidth-utilization">1.2 瓶颈一：分页带来的碎片化传输</h3>
@@ -190,7 +190,7 @@ $$X=C\cdot\frac{S}{L}.$$<sup>[F2]</sup>
 
 <h3 id="scheduler-assumption">1.4 瓶颈二：调度器假设失效与 delay hit</h3>
 
-<p>第一类瓶颈出在 I/O 路径上，把单次传输的带宽用起来了，能否藏住？现有调度器一般按"FIFO + 组批到满"运行，假设 prefill 的新 token 计算量足以掩盖 cache miss 的加载时间<sup>[C4]</sup>。SGLang/vLLM/TensorRT-LLM 都不例外。这个假设在短上下文下成立（prefill 计算量大、加载量小），但长上下文反过来：需要加载的 KV cache（按 F3 公式，每 token 字节数 $\times$ token 数）远大于新增的少量 token prefill 计算。加载时间反超计算，系统进入 loading-bound。</p>
+<p>第一类瓶颈出在 I/O 路径上，把单次传输的带宽用起来了，能否藏住？现有调度器一般按"FIFO + 组批到满"运行，假设 prefill 的新 token 计算量足以掩盖 cache miss 的加载时间<sup>[C4]</sup>。SGLang/vLLM/TensorRT-LLM 都不例外。这个假设在短上下文下成立（prefill 计算量大、加载量小），但长上下文反过来：需要加载的 KV cache（按 F3 公式，每 token 字节数 $\times$ token 数）远大于新增的少量 token prefill 计算。加载时间反超计算，系统进入 loading-bound。在 PD 分离的部署里，同一加载瓶颈会落到 prefill 引擎的存储网卡上——长上下文 agentic 负载命中率超过 95% 时 prefill 从计算密集退化为 I/O 密集，<a href="../dualpath/index.html">DualPath</a> 为这一存储带宽瓶颈另辟第二条 KV 加载路径。</p>
 
 <p>图 1 的 24% 即是优化 I/O 后仍存在的 stall——剩下来这部分无法靠传输加速解决，必须靠调度：让 batch 在加载与计算间取得平衡、把不可避免的等待与有用计算重叠起来。</p>
 

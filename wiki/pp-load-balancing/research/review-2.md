@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/pp-load-balancing/index.html
+reviewed_content_sha256: 18488e2a5196407c
+-->
 # PP 负载均衡审查记录（第 2 轮）
 
 - 页面版本：ed83eff48b55febd8050d4cdcc7db0e3f030e206（index.html 工作树 SHA-1）

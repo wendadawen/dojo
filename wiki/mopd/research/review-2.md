@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/mopd/index.html
+reviewed_content_sha256: e0b4792dec03e854
+-->
 # MOPD 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟 / 小白读者视角）

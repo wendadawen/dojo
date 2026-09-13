@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/low-rank-projection/index.html
+reviewed_content_sha256: 421ea6aad7a0b517
+-->
 # 低秩分解独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟）

@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="长 prefill 会让同批 decode 停摆数秒（generation stall）。chunked prefill 把它切成等计算量的块：块间只靠 KV cache 衔接（$N$ 块产生 $\frac{N(N-1)}{2}$ 次重复读），decode 搭 prefill 块的车近乎免费（权重读一次服务两者），token budget 给每次迭代封顶实现 stall-free。与 PP 组合成 CPP，等大的块顺带消掉流水线气泡。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="推理系统, 并行与通信">
-  <meta name="dojo:tag" content="serving">
+  <meta name="dojo:tag" content="推理系统">
   <title>Chunked Prefill：切块预填充与搭车调度</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -310,7 +310,7 @@
 
 <p>前面几章都在单卡（或单实例）语境下讨论。当部署是流水线并行（PP）时，chunked prefill 顺带解决了另一个问题：流水线气泡。</p>
 
-<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，流水线被均匀地填满，双重气泡都被压缩<sup>[C14]</sup>。Sarathi 在 GPT-3 流水线部署上实测气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。</p>
+<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，流水线被均匀地填满，双重气泡都被压缩<sup>[C14]</sup>。Sarathi 在 GPT-3 流水线部署上实测气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。CPP 均的是块与块之间的时长；流水线各 stage 的忙闲不均还有更一般的两类对策（token 维切分与 batch 维配平），整理见 <a href="../pp-load-balancing/index.html">PP 负载均衡</a>。</p>
 
 <p>CPP 在 Beyond the Buzz 论文（PD 分离设计的系统性研究）中成为 prefill 池的标准答案：分离部署里 FTL（First Token Latency，首 token 延迟）约束只作用于 prefill 池，DeepSeek-R1 在 ISL（Input Sequence Length，输入序列长度）256K、64 GPU（EP（Expert Parallelism，专家并行）$\times$ PP = 64）的模拟中，增大 PP 维度持续降低 FTL 而吞吐基本保持——CPP 是严格 FTL SLA 下兼顾高吞吐的最优策略<sup>[C16]</sup>。同一论文还发现 co-located 基线里的 piggybacking 对注意力架构敏感：DeepSeek-R1 的 MLA（Multi-head Latent Attention，多头潜在注意力）在 chunked piggyback 下每个块都要重算 down/up 投影，产生额外开销（可临时缓存上投影 KV 缓解）<sup>[C17]</sup>——这是第 2 章"切块代价"在特定架构上的又一实例。完整讨论见 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页。</p>
 

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/hyper-connections/index.html
+reviewed_content_sha256: 249aa2d82661b411
+-->
 # 超连接审查记录（第 1 轮）
 
 - 页面版本：130be2be2465cf650c210d98dbb51df8b8cde57d（`git hash-object index.html`）

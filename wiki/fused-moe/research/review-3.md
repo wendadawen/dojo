@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/fused-moe/index.html
+reviewed_content_sha256: 6027a00a32d23f39
+-->
 # FusedMoE 审查记录（第 3 轮）
 
 - 页面版本：index.html `4f45d676b01affbe48ff605e4c569b9b3ce30a08`；overview.html `11a0a590f1c9789739f7fa3adaa7fd555e5f8386`

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/positional-encoding/index.html
+reviewed_content_sha256: c74341d4595da013
+-->
 # 位置编码基础 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源）

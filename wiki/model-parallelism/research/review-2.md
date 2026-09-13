@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/model-parallelism/index.html
+reviewed_content_sha256: 57ce7ff122077a27
+-->
 # 模型并行（Model Parallelism）审查记录（第 2 轮）
 
 - 页面版本：index.html 工作树哈希 66dda204db08483cf49ae12a7802cb47962d0b0b

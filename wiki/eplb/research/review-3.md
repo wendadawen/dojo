@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/eplb/index.html
+reviewed_content_sha256: 781cd98f1a2b82f4
+-->
 # EPLB 第 3 轮审查（独立，最终）
 
 - 页面版本：index.html 工作树哈希 `f51d075b3bef2e6c0308260cac4448a7da0a8206`；overview.html `5b9d5d98fe4bb135861225ae2e6ca9c8a7b3b020`

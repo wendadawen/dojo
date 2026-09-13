@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/situ-glu/index.html
+reviewed_content_sha256: d6600e7a598660c6
+-->
 # SiTU-GLU 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 段B对照来源）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/eplb/index.html
+reviewed_content_sha256: 781cd98f1a2b82f4
+-->
 # EPLB 第 2 轮审查（独立）
 
 - 审查对象：`wiki/eplb/index.html`、`wiki/eplb/overview.html`

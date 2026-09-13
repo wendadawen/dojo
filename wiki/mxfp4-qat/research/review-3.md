@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/mxfp4-qat/index.html
+reviewed_content_sha256: 2baa50b5c2710ef5
+-->
 # MXFP4 量化审查记录（第 3 轮）
 
 - 页面版本：`9f3573ffbd2c6ec6189c1227aaab2574fb965d51`（index.html 工作树哈希，`git hash-object`）

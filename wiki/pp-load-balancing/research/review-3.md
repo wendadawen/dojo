@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/pp-load-balancing/index.html
+reviewed_content_sha256: 18488e2a5196407c
+-->
 # PP 负载均衡审查记录（第 3 轮）
 
 - 页面版本：index.html 工作树哈希 `50a7d75f54660c08fd301079b54f9e683a944ab8`（git hash-object；SHA-256 `3966d164d4d89c4346b87dc4b9450d76a8e77182984357d066aad6063070442c`，1616 行）。overview.html 76 行，同轮审查。

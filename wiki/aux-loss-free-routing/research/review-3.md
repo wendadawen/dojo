@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/aux-loss-free-routing/index.html
+reviewed_content_sha256: 1b0c7e1eb658ed0c
+-->
 # 无辅助损失负载均衡审查记录（第 3 轮）
 
 - 页面版本：`wiki/aux-loss-free-routing/index.html` 工作树 blob `e982f379d0941939eddfbbf1b1bb2f5f30d16a17`（sha256 `76d0c12ba83ef808399e1f6bf5c7090effabe11ac6651080f1d50e43cb47dd70`）；`overview.html` 工作树 blob `58a538bb14548f90c52639e3453ab453898e5a98`（sha256 `c812a4fd54efee5141dcad8b2baf1c2921c1b1c4f999a73600d9eb10907c07af`）

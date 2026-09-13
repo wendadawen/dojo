@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/sliding-window-attention/index.html
+reviewed_content_sha256: be6c4fd7d61fcaed
+-->
 # 滑动窗口注意力审查记录（第 3 轮）
 
 - 页面版本：`de346beb943861cdff8f91906a8791ff984c7daa`（index.html 工作树哈希）

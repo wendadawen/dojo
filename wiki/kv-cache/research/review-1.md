@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/kv-cache/index.html
+reviewed_content_sha256: 9ffd0ab56891efdd
+-->
 # KV cache 审查记录（第 1 轮）
 
 - 页面版本：index.html 57,997 字节，SHA1 `fd1a587e0ff0907bcbaa79c803cb74d706451a0b`；overview.html 5,232 字节，SHA1 `1b55fcf65eb69d95d30fcfd472d68c8ba7da53e9`

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/pretraining/index.html
+reviewed_content_sha256: 2d2bc751de18b843
+-->
 # 语言模型预训练审查记录（第 3 轮）
 
 - 页面版本：index.html 工作树哈希 99e14710bb98314425287a8423549d3b0be14d73

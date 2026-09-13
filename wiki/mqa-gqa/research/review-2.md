@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/mqa-gqa/index.html
+reviewed_content_sha256: be046dec31e4b022
+-->
 # MQA 与 GQA 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源）

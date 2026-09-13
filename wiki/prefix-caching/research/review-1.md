@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/prefix-caching/index.html
+reviewed_content_sha256: 702727a98d2bd973
+-->
 # 前缀缓存 审查记录（第 1 轮）
 
 - 页面版本：index.html 59612 字节，SHA1 b91cd0764ef79c7038f11d48abcd293c63e02bf8

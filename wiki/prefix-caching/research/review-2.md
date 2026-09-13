@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/prefix-caching/index.html
+reviewed_content_sha256: 702727a98d2bd973
+-->
 # 前缀缓存 审查记录（第 2 轮）
 
 - 页面版本：index.html 869d74f3f26020f847b94d198ef8e7fe5ebf65a6 / overview.html befe0af60c0737a5a4e92a3e25f6782438d9b8a4

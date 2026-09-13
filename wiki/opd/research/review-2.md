@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/opd/index.html
+reviewed_content_sha256: a6e8c9b4b35002e6
+-->
 # OPD（On-Policy Distillation）审查记录（第 2 轮）
 
 - 页面版本：index.html c89aa132276c88e1634e86d05a3c4cbdd98906d9；overview.html d4827f3c14905aaaa78a02fbc9701aa40ffcc416

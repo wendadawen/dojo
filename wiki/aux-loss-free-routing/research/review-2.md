@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/aux-loss-free-routing/index.html
+reviewed_content_sha256: bb54f9d5109e6258
+-->
 # 辅助损失无关路由独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 来源对照）

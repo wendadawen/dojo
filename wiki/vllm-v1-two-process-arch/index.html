@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="vLLM V1 由 APIServer 与 EngineCore 两进程组成：前者经 AsyncLLM 与 EngineCoreClient 只做请求接发，后者的 run_busy_loop 忙等循环逐回合完成调度、forward、采样与更新；回合内经 Executor→Worker→Runner 三层下发，collective_rpc 用方法名字符串统一 TP=1 直调与 TP&gt;1 广播。文末一次性辨析 EngineClient、AsyncLLM、EngineCoreClient、EngineCore、EngineCoreProc、WorkerWrapper、Worker、GPUModelRunner 等全部类的归属与关系。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
-  <meta name="dojo:tag" content="vLLM">
+  <meta name="dojo:tag" content="推理系统">
   <title>vLLM V1 框架总览 · Dojo</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -106,7 +106,7 @@
         <td>调度、模型 forward、采样、KV cache 管理</td>
       </tr>
     </table>
-    <p>两份进程 trace 印证这一划分：APIServer 侧只出现 core_client、output_processor、renderers 等模块，不含调度器与 worker；EngineCore 侧则是 scheduler、gpu_worker、gpu_model_runner。</p>
+    <p>两份进程 trace 印证这一划分：APIServer 侧只出现 core_client、output_processor、renderers 等模块，不含调度器与 worker；EngineCore 侧则是 scheduler、gpu_worker、gpu_model_runner。两个进程如何拼成完整引擎——入口、引擎、执行、模型、编译五层与跨层子系统的地图见<a href="../vllm-framework-map/index.html">vLLM 框架全景</a>。</p>
 
     <h2 id="loop">2. 忙等循环与回合结构</h2>
     <p>EngineCore 进程的入口是 <code>run_busy_loop</code>，它以一个 while 循环交替执行两个动作：</p>
@@ -201,7 +201,7 @@ return func(*args, **kwargs)
       <tr><td>采样</td><td><code>model_executor.sample_tokens</code> → sampler</td><td>新 token id</td></tr>
       <tr><td>更新</td><td><code>Scheduler.update_from_output</code></td><td>更新请求状态与 KV cache，产出 <code>EngineCoreOutputs</code></td></tr>
     </table>
-    <p>调度器没有 prefill 与 decode 两个阶段：每个请求只维护 <code>num_computed_tokens</code>（已计算数）与 <code>num_tokens_with_spec</code>（目标数），每步在 token 预算内尽量推进前者追上后者。一个 983 token 的 prefill 请求表现为单回合内调度 983 个 token，之后的 decode 每回合只推进 1 个 token。这一分布同样体现在 trace 中：EngineCore 主线程的高频事件集中在 forward 与 KV cache 管理函数上，调度函数的调用频率远低于前者。</p>
+    <p>调度器没有 prefill 与 decode 两个阶段：每个请求只维护 <code>num_computed_tokens</code>（已计算数）与 <code>num_tokens_with_spec</code>（目标数），每步在 token 预算内尽量推进前者追上后者。一个 983 token 的 prefill 请求表现为单回合内调度 983 个 token，之后的 decode 每回合只推进 1 个 token。同一个 983 token 的 prefill 回合在模型执行阶段退回 eager，随后的 decode 回合才命中捕获图重放（<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）。这一分布同样体现在 trace 中：EngineCore 主线程的高频事件集中在 forward 与 KV cache 管理函数上，调度函数的调用频率远低于前者。</p>
     <p>两进程间一次请求往返的五要素：输入为 <code>EngineCoreRequest</code>（普通字段经 MsgpackEncoder 序列化，张量走带外共享内存传输）；状态为 <code>EngineCoreProc</code> 的输入与输出两个队列；关键参数为 ZMQ 地址（同机 <code>ipc://</code>，跨机 <code>tcp://host:port</code>）；主要步骤为 <code>add_request_async</code> 经 ZMQ 发送 ADD → <code>_process_input_queue</code> 收到并放入调度器 → 回合执行 → 结果放入输出队列 → APIServer 的 output_handler 循环拉取；输出为 <code>EngineCoreOutputs</code>，经 <code>OutputProcessor</code> 转为 <code>RequestOutput</code> 推给用户。</p>
 
     <h2 id="classes">6. 类与进程大全辨析</h2>
