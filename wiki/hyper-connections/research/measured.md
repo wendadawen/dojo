@@ -1,0 +1,17 @@
+# 实测产物清单
+
+本页的实测产物原先存放在本目录下，现已从仓库移除（内容不发布，且体积可观）。
+下表是它们被移除时的登记，用于说明本页「含实测」的判定依据来自何处。
+
+| 文件 | 体积 | 说明 |
+|---|---|---|
+| `concept_probes.out` | 0.0 KB | 运行输出存档 |
+| `concept_probes.py` | 0.0 KB | 实测脚本 |
+| `dw_page_code.out` | 464 B | 运行输出存档 |
+| `dw_page_code.py` | 0.0 KB | 实测脚本 |
+| `fp8_page_code.out` | 463 B | 运行输出存档 |
+| `fp8_page_code.py` | 0.0 KB | 实测脚本 |
+| `hc_page_code.out` | 763 B | 运行输出存档 |
+| `hc_page_code.py` | 0.0 KB | 实测脚本 |
+| `rms_page_code.out` | 905 B | 运行输出存档 |
+| `rms_page_code.py` | 0.0 KB | 实测脚本 |

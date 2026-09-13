@@ -81,9 +81,17 @@ def status_of(slug: str, root: Path) -> dict:
         fingerprint = header_fingerprint(latest_path.read_text(encoding="utf-8"))
 
     current = content_fingerprint(page.read_text(encoding="utf-8")) if page.exists() else None
+    # 「含实测」看记录而不是看产物：实测产物已从仓库移除，清单留在 measured.md；
+    # 早期页面在 evidence.md 里用 MEAS 记号标注实测论断。
     measured = False
     if research.is_dir():
-        measured = bool(list(research.rglob("*.py")) or list(research.rglob("*.out")))
+        if (research / "measured.md").is_file():
+            measured = True
+        else:
+            for note in research.glob("*.md"):
+                if "MEAS" in note.read_text(encoding="utf-8", errors="replace"):
+                    measured = True
+                    break
 
     stale = None
     if fingerprint and current:
