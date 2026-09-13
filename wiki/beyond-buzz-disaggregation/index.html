@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Beyond the Buzz: A Pragmatic Take on Inference Disaggregation（NVIDIA, arXiv:2506.05508v1）——首次对大规模 PD 分离推理的设计空间做系统性研究。专有 GPU 模拟器评估数十万设计点，结论：prefill-heavy 流量 + 大模型（>10B）受益最大；动态 rate matching 与弹性伸缩是必需件；CPP 是 prefill 池严格 FTL 下的最优策略；KV 传输所需带宽在现有数据中心供给内。">
-  <meta name="dojo:summary" content="NVIDIA 用专有 GPU 模拟器系统性研究 PD 分离推理的设计空间，评估数十万设计点。核心结论：prefill-heavy 流量 + 大模型（&gt;10B）受益最大；动态 rate matching 与弹性伸缩不可省（最优 ctx:gen GPU 比例跨模型跨度极大）；CPP 是 prefill 池最优；egress 带宽 $BW_{egress}=\frac{N_{layers}\cdot BS_{prefill}\cdot ISL\cdot d_{head}\cdot N_{kv\textunderscore heads}\cdot bytes_{element}}{FTL\cdot NumGPU_{prefill}}$，ingress 类同；DeepSeek-R1 模拟所需约 $0.4$–$1.8\,\text{GBps/GPU}$，在现有数据中心供给内。">
+  <meta name="dojo:summary" content="NVIDIA 用专有 GPU 模拟器系统性研究 PD 分离推理的设计空间，评估数十万设计点。核心结论：prefill-heavy 流量 + 大模型（&gt;10B）受益最大；动态 rate matching 与弹性伸缩不可省（最优 ctx:gen GPU 比例跨模型跨度极大）；CPP 是 prefill 池最优；egress 带宽 $BW_{egress}=\frac{N_{layers}\cdot BS_{prefill}\cdot ISL\cdot d_{head}\cdot N_{kv\_heads}\cdot bytes_{element}}{FTL\cdot NumGPU_{prefill}}$，ingress 类同；DeepSeek-R1 模拟所需约 $0.4$–$1.8\,\text{GBps/GPU}$，在现有数据中心供给内。">
   <meta name="dojo:type" content="paper">
   <meta name="dojo:topics" content="并行与通信, 推理系统, 数学基础">
   <meta name="dojo:tag" content="推理系统">
@@ -130,7 +130,7 @@
 
 <p>任何对"分离"的研究都要先回答一个问题：在多大的设计空间里、以什么粒度观察。论文给出一个极宽的空间和极细的粒度。论文用专有高保真 GPU 性能模拟器作为主要研究工具——输入模型架构（DeepSeek-R1、LLaMa-3.1-8B/70B/405B 等）、流量模式（ISL/OSL）、GPU 配置（Blackwell 系统），输出各批大小与并行策略下的延迟与吞吐，再据此构造吞吐-交互性 Pareto 前沿<sup>[C5]</sup>。研究覆盖的并行策略包括张量并行（TP）、专家并行（EP）、流水线并行（PP）、分块流水线并行（CPP），以及组合策略 TEP（Tensor Parallel Attention + EP FFNs）<sup>[C5]</sup>，见 <a href="../model-parallelism/index.html">模型并行</a>页。整个空间被评估为"数十万设计点"（hundreds of thousands）<sup>[C1, N9]</sup>。</p>
 
-<p>关键边界是模拟器性质——它不是真实集群实测。论文明确了几条假设与排除：模拟假设数据中心有足够 GPU 与到达请求使 rate-matched 部署满载，且 prefill 池每层产生的 KV cache 在可用时立即传给生成池并与后续层计算重叠<sup>[C8]</sup>；FTL>10s（宽松但实用的上限）的设计点被排除<sup>[C7, N3]</sup>；分析聚焦现代 Blackwell 系统与 FP4 精度<sup>[C6]</sup>。所有图均归一化呈现，目的是传达趋势而非具体性能声明<sup>[C9]</sup>。这些边界共同把"结论的迁移范围"标在了模拟研究这一格内：纸面数字不能直接当某集群的预期吞吐，需要用自己的工作负载与硬件再验证。</p>
+<p>关键边界是模拟器性质——它不是真实集群实测。论文明确了几条假设与排除：模拟假设数据中心有足够 GPU 与到达请求使 rate-matched 部署满载，且 prefill 池每层产生的 KV cache 在可用时立即传给生成池并与后续层计算重叠<sup>[C8]</sup>；FTL>10s（宽松但实用的上限）的设计点被排除<sup>[C7, N3]</sup>；分析聚焦现代 Blackwell 系统与 FP4 精度<sup>[C6]</sup>。多数图以归一化形式呈现，目的是传达趋势而非具体性能声明<sup>[C9]</sup>。这些边界共同把"结论的迁移范围"标在了模拟研究这一格内：纸面数字不能直接当某集群的预期吞吐，需要用自己的工作负载与硬件再验证。</p>
 
 <p>为什么选择模拟而非实测？论文未说明理由；从研究目标可推断两个特征：①设计空间维度极多（模型 $\times$ 切分 $\times$ 批 $\times$ 比例 $\times$ 流量 $\times$ 硬件），真实集群只能测其中一小撮，无法支撑系统性的"何时分离有利"判断；②分离的核心效益对比对象（合设部署）本身需要同等细粒度的对照—— piggybacked co-located 与非 piggybacked co-located 同时评估<sup>[C16]</sup>，模拟器才能一致地做这件事。模拟研究的代价是失去了真实系统的小细节（如碎片、调度异常），收益是第一次能在统一方法下看到整个 Pareto 前沿的形状。</p>
 
@@ -144,7 +144,7 @@
 
 <p>设计空间可从两个维度去组织：①模型切分（prefill 与 decode 各自独立选择 TP/EP/PP/CPP）；②伸缩/rate matching（两池 GPU 数比例）。第 3 章展开第二维。附录 C（源文件名 appendixD.tex）支撑模拟方法的可信度：图 14 比较了"直接模拟动态流量"与"用 P50 ISL/OSL 的最近 2 的幂近似"两个 Pareto 前沿，两者非常接近，表明常数流量近似在论文所测的真实分布下是合理的<sup>[C19]</sup>。</p>
 
-<img src="assets/img-08.webp" alt="Fig.14 动态流量模拟（实线）与 P50 近似（虚线）下的 Pareto 前沿对比。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
+<img src="assets/img-08.webp" alt="Fig.14 LLaMa-3.1-70B 动态流量模拟与 P50 近似（ISL 4096 OSL 512）的 Pareto 前沿对比，两条曲线均为实线（蓝=动态流量模拟，红=ISL 4096 OSL 512）。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
 <h3 id="method-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -152,7 +152,7 @@
 <p>为什么论文用模拟器而不是真实集群实验？这种选择的代价与收益是什么？</p>
 <details>
 <summary>解答：设计空间维度太多，Pareto 前沿只能在模拟上看到</summary>
-<p>论文的研究目标是"什么时候分离有利、需要什么配套机制"——这要求在模型$\times$切分$\times$批$\times$比例$\times$流量$\times$硬件的多维空间上系统扫描、构造 Pareto 前沿。真实集群能测的配置数量受时间与硬件成本限制，往往只能选少数代表性点，无法呈现"前沿"形状；模拟器虽不能重现真实系统的全部细节（如显存碎片、调度异常），但能在统一方法下同时评估合设（含 piggybacked 与非 piggybacked 基线）与分离的所有相关设计点，构造出可比的 Pareto 前沿。代价：失去真实数字的迁移性，论文图全部归一化<sup>[C9]</sup>，不能直接当某集群的预期吞吐。收益：第一次能在统一方法下看到整个 Pareto 前沿的形状与配套机制的影响。</p>
+<p>论文的研究目标是"什么时候分离有利、需要什么配套机制"——这要求在模型$\times$切分$\times$批$\times$比例$\times$流量$\times$硬件的多维空间上系统扫描、构造 Pareto 前沿。真实集群能测的配置数量受时间与硬件成本限制，往往只能选少数代表性点，无法呈现"前沿"形状；模拟器虽不能重现真实系统的全部细节（如显存碎片、调度异常），但能在统一方法下同时评估合设（含 piggybacked 与非 piggybacked 基线）与分离的所有相关设计点，构造出可比的 Pareto 前沿。代价：失去真实数字的迁移性，论文多数图以归一化形式呈现<sup>[C9]</sup>，不能直接当某集群的预期吞吐。收益：第一次能在统一方法下看到整个 Pareto 前沿的形状与配套机制的影响。</p>
 </details>
 </li>
 <li>
@@ -255,7 +255,7 @@
 
 <img src="assets/img-03.webp" alt="Fig.9 ISL 16k OSL 2k 下四个模型的最优 Ctx:Gen GPU 比例随 tokens/s/user 变化。LLaMa-8B 几乎水平、约 0.4；LLaMa-70B 从约 0.95 降到约 0.45；LLaMa-405B 从约 2.1 降到约 0.2；DeepSeek-R1 从约 3.6 降到约 0.05（变化最剧烈）。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
-<p>这条曲线的物理含义：随延迟收紧（高 TPS 端），decode 池的每 GPU 吞吐上升（批小、TTL 紧），prefill 池的处理能力相对需要更少 GPU；比例随之下移。论文未解释不同模型的跨度为何差异巨大；一种页面推断是各模型的 TP/EP 可调整能力不同——EP 可调性更高的模型（如 DeepSeek-R1）比例跨度更大（页面推断，论文未给出该机制）。结论：通用分离系统必须内置动态 rate matching，不能预编译一个固定比例<sup>[C20]</sup>。</p>
+<p>这条曲线的物理含义：ctx:gen 比例 = prefill GPU 数 / decode GPU 数。随延迟收紧（高 TPS 端），decode 池的每 GPU 吞吐下降（批小、TTL 紧），需要更多 decode GPU 才能满足 TTL，比例随之下移；延迟宽松时相反——decode 每 GPU 吞吐高、所需 decode GPU 少，比例上移。论文未解释不同模型的跨度为何差异巨大；一种页面推断是各模型的 TP/EP 可调整能力不同——EP 可调性更高的模型（如 DeepSeek-R1）比例跨度更大（页面推断，论文未给出该机制）。结论：通用分离系统必须内置动态 rate matching，不能预编译一个固定比例<sup>[C20]</sup>。</p>
 
 <p>固定比例的退化如图 10。DeepSeek-R1、ISL 16k OSL 2k 下：比例 0.5 在低 tokens/s/user（宽松延迟）端被卡在约 0.4 的吞吐（无法满足低 TPS 区的请求量），但在高 TPS 端（紧延迟）相对较好；比例 3.5 在低 TPS 端接近 Optimal Rate Matching，但在高 TPS 端退化明显<sup>[C21, G7]</sup>。Optimal Rate Matching（动态调整比例）蓝线在全区间都最高——证明动态性不可省。</p>
 
@@ -276,7 +276,7 @@
 <p>为什么固定比例 3.5 在某些延迟下退化？</p>
 <details>
 <summary>解答：3.5 在宽松延迟（低 TPS）最优，但收紧延迟时 prefill GPU 过多拖累</summary>
-<p>图 10 显示 3.5 在低 tokens/s/user 端接近 Optimal，但在高 tokens/s/user 端退化明显<sup>[C21, G7]</sup>。机制：低 TPS 端 decode 每 GPU 吞吐低，需要更多 decode GPU（或相对少 prefill GPU）来平衡；比例 3.5 意味着 prefill 多 decode 少，正好匹配。高 TPS 端 decode 每 GPU 吞吐高，比例应向 decode 多 prefill 少方向移动（小于 1）；比例 3.5 在此区间硬性给 prefill 太多 GPU，浪费在该端属于主导。比例 0.5 镜像：低 TPS 端硬性给 prefill 太少 GPU，被卡在 0.4；高 TPS 端相对匹配。Optimal Rate Matching 沿曲线动态调整，全区间最高<sup>[C21]</sup>。</p>
+<p>图 10 显示 3.5 在低 tokens/s/user 端接近 Optimal，但在高 tokens/s/user 端退化明显<sup>[C21, G7]</sup>。机制：最优 ctx:gen 比例（prefill GPU 数 / decode GPU 数）在低 TPS 端（宽松延迟）偏高——DeepSeek-R1 在该端约 3.6，与固定比例 3.5 接近，所以 3.5 在低 TPS 端接近最优。到高 TPS 端（紧延迟），最优比例下移到远小于 1（约 0.05），意味着 decode 池需要占绝大多数 GPU；固定比例 3.5 仍把大部分 GPU 分给 prefill，decode 池不足，性能退化。比例 0.5 镜像：低 TPS 端最优比例高、0.5 硬性给 prefill 太少 GPU，被卡在约 0.4 吞吐；高 TPS 端最优比例低，0.5 相对接近最优。Optimal Rate Matching 沿曲线动态调整，全区间最高<sup>[C21]</sup>。</p>
 </details>
 </li>
 </ol>
@@ -385,7 +385,7 @@
 
 <ul>
 <li><b>模拟器性质</b>。所有数据来自专有模拟器，非真实集群实测<sup>[C5]</sup>。模拟器内部建模方法（如何估计注意力时间、显存压力、调度开销）未公开；论文未说明模拟器如何处理显存碎片、调度异常等真实系统细节，这些细节可能未被建模（页面推断，论文未作此表述）。</li>
-<li><b>归一化数字</b>。所有图归一化呈现<sup>[C9]</sup>，不能直接当某配置的预期吞吐；要拿到绝对数字需要用自己的工作负载与硬件配置在模拟器上重跑（论文模拟器未公开）或实测。</li>
+<li><b>归一化数字</b>。多数图以归一化形式呈现<sup>[C9]</sup>，不能直接当某配置的预期吞吐；要拿到绝对数字需要用自己的工作负载与硬件配置在模拟器上重跑（论文模拟器未公开）或实测。</li>
 <li><b>硬件语境</b>。聚焦现代 Blackwell 系统与 FP4 精度<sup>[C6]</sup>；外推到 H100/A100 或其他精度时需重新验证。</li>
 <li><b>流量模型</b>。常数 ISL/OSL 的 P50 近似，已在附录 C 验证<sup>[C19, G9]</sup>；极端多峰分布（如长尾高度倾斜）未在论文验证范围内。</li>
 <li><b>搜索空间排除</b>。FTL&gt;10s 的设计点不在空间内<sup>[C7, N3]</sup>，FTL&gt;10s 的工作负载（如超长序列分析）论文没回答。</li>
@@ -419,6 +419,7 @@
 <h3>论断与来源（C）</h3>
 <ul>
 <li>C1–C3、C9、C24–C25：abstract 与 introduction、§8 conclusions。版本：arXiv:2506.05508v1（2025-06-05 提交，TeX 源码 2025-06-06 打包，NeurIPS 2025 模板，未见会议录用信息）。</li>
+<li>C4、context chunking 的有效性依赖注意力机制（MLA vs GQA）、并在宽松延迟与生成密集流量下最有利：introduction。</li>
 <li>C5–C7、§3 模拟方法：设计空间探索章（design_principles.tex）。</li>
 <li>C8、§5 带宽：system_considerations.tex §5.1 Bandwidth requirements for KV cache transfer（论文 §5）。</li>
 <li>C10–C15、§4 实践与模型/流量/配置敏感性：disaggregation_in_practice.tex §4 及子节。</li>

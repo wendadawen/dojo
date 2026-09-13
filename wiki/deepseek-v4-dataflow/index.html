@@ -142,6 +142,121 @@
     <div id="cy"></div>
     <div class="legend" id="legend"></div>
   </div>
+  <noscript>
+  <style>.viz { display: none; }</style>
+  <h4>整体总览 (61 层)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>embed · id → 7168</td><td><code>token id [1,512] -&gt; [1,512,7168]</code></td><td>$x = \mathrm{Embedding}(\mathrm{ids})$</td><td>词嵌入。vocab_size=129280, hidden_size=7168。真实权重 embed.weight 为 BF16 [129280, 7168]。</td></tr>
+  <tr><td>mHC 扩展 · 7168 → 4×7168</td><td><code>[1,512,7168] -&gt; [1,512,4,7168]</code></td><td>$h = x.\mathrm{unsqueeze}(2).\mathrm{repeat}(1,1,n_{hc},1)$</td><td>model.py Transformer.forward 把 embedding 复制成 hc_mult=4 份，形成 4 条并行残差流。此后整个主干的残差形状都是 [b,s,4,7168]。</td></tr>
+  <tr><td>Layer 0,1 HCA · Hash 路由 FFN</td><td><code>[1,512,4,7168] -&gt; [1,512,4,7168]</code></td><td>$\text{ratio}=128$</td><td>compress_ratios 前两项都是 128，即开头连续两层 HCA（此后才严格奇偶交替）。这两层的 FFN 用 Hash 路由（num_hash_layers=3 覆盖第0,1,2层）。</td></tr>
+  <tr><td>Layers 2..60 · HCA/CSA 交替</td><td><code>[1,512,4,7168] -&gt; [1,512,4,7168]</code></td><td>$\text{HCA} \leftrightarrow \text{CSA}$</td><td>第2层起严格奇偶交替：偶数层 ratio=4 (CSA)，奇数层 ratio=128 (HCA)。全模型 HCA 31 层、CSA 30 层。checkpoint 中恰好 30 层含 attn.indexer.*，与 CSA 层数一致。</td></tr>
+  <tr><td>CSA 层 ×30 · ratio=4 + Indexer</td><td><code>[1,512,7168] -&gt; [1,512,7168]</code></td><td>$\text{compress }4\text{, top-}k\text{ }1024$</td><td>代表性 CSA 层。每 4 个 token 压成一条 KV（重叠压缩），再由 Lightning Indexer 从全部压缩条目里选 1024 条。</td></tr>
+  <tr><td>HCA 层 ×31 · ratio=128 无稀疏</td><td><code>[1,512,7168] -&gt; [1,512,7168]</code></td><td>$\text{compress }128$</td><td>代表性 HCA 层。每 128 个 token 压成一条 KV，不重叠、不做稀疏选择，全部压缩条目参与注意力。</td></tr>
+  <tr><td>MoE FFN · 384 专家 top-6</td><td><code>[1,512,7168] -&gt; [1,512,7168]</code></td><td>$\text{384 experts, top-6} + 1\text{ shared}$</td><td>所有 61 层的 FFN 都是 DeepSeekMoE。前 3 层用 Hash 路由，其余用 sqrt(softplus) 分数 + bias 选 top-6。</td></tr>
+  <tr><td>mHC 归约 · 4×7168 → 7168</td><td><code>[1,512,4,7168] -&gt; [1,512,7168]</code></td><td>$y = \sum_j \mathrm{pre}_j \cdot x_j$</td><td>ParallelHead.hc_head：主干结束后把 4 份残差流用 sigmoid 门控加权求和成 1 份。该头只有 pre 权重，不再做 Sinkhorn（无 comb）。</td></tr>
+  <tr><td>final norm · 7168 → 7168</td><td><code>[1,512,7168] -&gt; [1,512,7168]</code></td><td>$\mathrm{RMSNorm}(h)$</td><td>最后一层 RMSNorm。真实权重 norm.weight 为 BF16 [7168]。</td></tr>
+  <tr><td>lm_head · 7168 → 129280</td><td><code>[1,7168] -&gt; [1,129280]</code></td><td>$\mathrm{logits} = h_{-1} W_{lm}^{\top}$</td><td>输出投影。get_logits 只取最后一个位置 x[:, -1]，故 prefill 也只返回 [b, vocab]。tie_word_embeddings=false，head.weight 为独立的 BF16 [129280, 7168]。</td></tr>
+  <tr><td>MTP 模块 ×1 · 额外预测头</td><td><code>[1,512,4,7168] -&gt; [1,129280]</code></td><td>$\text{Multi-Token Prediction}$</td><td>num_nextn_predict_layers=1。结构与主干 Block 相同但额外有 e_proj/h_proj 融合 embedding 与隐状态。compress_ratios 第 62 项为 0，即 MTP 层用纯滑窗注意力、不做压缩。</td></tr>
+  <tr><td>logits · → 129280</td><td><code>[1, 129280]</code></td><td>$\mathrm{logits}$</td><td>对 129280 个 token 的分数。实测缩小配置下 prefill 与 decode 输出均无 NaN/Inf。</td></tr>
+  </table>
+  <p>边：emb→hcexp（7168）；hcexp→l01（4×7168）；l01→blk（4×7168）；blk→csa（×30）；blk→hca（×31）；csa→moe（7168）；hca→moe（7168）；blk→hchead（4×7168）；hchead→fnorm（7168）；fnorm→head（7168）；head→out（129280）；blk→mtp（4×7168）</p>
+  <h4>CSA 内部 (Compressed Sparse Attention, ratio=4, prefill seqlen=512)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>输入 · 7168</td><td><code>[1,512,7168]</code></td><td>$x$</td><td>attn_norm(hc_pre 归约后的残差) 的输出。</td></tr>
+  <tr><td>wq_a · 7168 → 1536</td><td><code>[1,512,7168] -&gt; [1,512,1536]</code></td><td>$c^Q = x W^{DQ}$</td><td>query 低秩下投影。q_lora_rank=1536。真实权重 F8_E4M3 [1536, 7168]。</td></tr>
+  <tr><td>q_norm · 1536</td><td><code>[1,512,1536] -&gt; [1,512,1536]</code></td><td>$\mathrm{RMSNorm}(c^Q)$</td><td>带权重的 RMSNorm。归一后的 qr 同时供主注意力和 Indexer 使用——两者共享同一个潜向量。</td></tr>
+  <tr><td>wq_b · 1536 → 65536</td><td><code>[1,512,1536] -&gt; [1,512,128,512]</code></td><td>$q = c^Q W^{UQ}$</td><td>query 上投影到 128 头 × 512 维。真实权重 F8_E4M3 [65536, 1536]。</td></tr>
+  <tr><td>q 逐头 RMS 归一 · (无权重)</td><td><code>[1,512,128,512]</code></td><td>$q \mathrel{*} = \mathrm{rsqrt}(\overline{q^2}+\varepsilon)$</td><td>model.py 中在 wq_b 之后对每个头做一次无权重的 RMS 归一。实测归一后每头 RMS 精确为 1.0。对应报告 2.3.3「避免 attention logits 爆炸」。</td></tr>
+  <tr><td>q 后 64 维 RoPE</td><td><code>q[..., -64:]</code></td><td>$\mathrm{RoPE}_{t}(q_{[-64:]})$</td><td>只对每头最后 64 维施加旋转（qk_rope_head_dim=64），前 448 维不带位置。带压缩的层用 compress_rope_theta=160000 且启用 YaRN(factor=16)。</td></tr>
+  <tr><td>wkv · 7168 → 512</td><td><code>[1,512,7168] -&gt; [1,512,512]</code></td><td>$kv = x W^{KV}$</td><td>滑窗用的未压缩 KV。num_key_value_heads=1，即所有 128 个 query 头共享这唯一一个 KV 头（MQA）。真实权重 F8_E4M3 [512, 7168]。</td></tr>
+  <tr><td>kv_norm + RoPE · + FP8 模拟</td><td><code>[1,512,512]</code></td><td>$\mathrm{RMSNorm}(kv)$</td><td>带权重 RMSNorm，后 64 维施加 RoPE，前 448 维按 block=64 做 FP8 量化再反量化（QAT 模拟）。这对应报告的混合存储：RoPE 维 BF16、其余维 FP8。</td></tr>
+  <tr><td>Compressor · ratio=4 重叠</td><td><code>[1,512,7168] -&gt; [1,128,512]</code></td><td>$C^{\mathrm{Comp}}$</td><td>压缩器。wkv/wgate 输出宽度翻倍(1024=2×512)以支持重叠压缩。真实权重 layers.2.attn.compressor.wkv.weight 为 BF16 [1024, 7168]，恰为 HCA 层的两倍。</td></tr>
+  <tr><td>Lightning Indexer · → top-k</td><td><code>[1,512,7168] -&gt; [1,512,128]</code></td><td>$I_{t,s} = \sum_h w_{t,h}\mathrm{ReLU}(q^I_{t,h}\cdot K^{\mathrm{IComp}}_s)$</td><td>从压缩条目中选出 min(index_topk, seqlen/4) 条：本视图 prefill seqlen=512、压缩后 128 条，故取 128 条，上下文 $\ge 4096$ 时才取满 index_topk=1024。自带独立压缩器(index_head_dim=128)。打分是 ReLU 后按头加权求和，不是 softmax。</td></tr>
+  <tr><td>索引拼接 · 128 + 128</td><td><code>[1,512,128] ++ [1,512,128] -&gt; [1,512,256]</code></td><td>$\mathrm{cat}[\text{win}, \text{compress}]$</td><td>滑窗索引与 Indexer 选中的压缩索引拼成一个索引表。两者进入同一次 sparse_attn 调用，共享同一个 softmax 分母，而非各算一次再融合。</td></tr>
+  <tr><td>sparse_attn · MQA + sink</td><td><code>q[1,512,128,512], kv[1,640,512], idx[1,512,256] -&gt; [1,512,128,512]</code></td><td>$s_{h,i,j}=\frac{\mathrm{Exp}(z_{h,i,j})}{\sum_k \mathrm{Exp}(z_{h,i,k})+\mathrm{Exp}(z_h')}$</td><td>按索引 gather KV 后做 online softmax。attn_sink 为每头一个可学习标量(真实权重 F32 [128])，其 Exp 加进分母，使注意力权重之和可小于 1。索引为 -1 的位置完全不参与（实测差异为 0）。</td></tr>
+  <tr><td>输出反向 RoPE · 位置 −t</td><td><code>o[..., -64:]</code></td><td>$\mathrm{RoPE}_{-t}(o_{[-64:]})$</td><td>KV 同时充当 key 和 value，输出因此带绝对位置相位。用共轭旋转转回相对位置。实测正向再反向误差 2.4e-7，是精确逆变换。</td></tr>
+  <tr><td>wo_a 分组 · 16 组 → 1024</td><td><code>[1,512,16,4096] -&gt; [1,512,16,1024]</code></td><td>$o^{G'}_{t,i} = o^G_{t,i} W^{O_a}_i$</td><td>o_groups=16。每组把 4096(=65536/16) 维降到 o_lora_rank=1024。真实权重 F8_E4M3 [16384, 4096]。</td></tr>
+  <tr><td>wo_b · 16384 → 7168</td><td><code>[1,512,16384] -&gt; [1,512,7168]</code></td><td>$\hat o_t = [o^{G'}] W^{O_b}$</td><td>合并 16 组后投回 7168。真实权重 F8_E4M3 [7168, 16384]。分组设计把 65536→7168 的直接投影拆成两步，大幅降低开销。</td></tr>
+  </table>
+  <p>边：x→wqa（7168）；wqa→qn（1536）；qn→wqb（1536）；wqb→qrms（65536）；qrms→qrope（128×512）；x→wkv（7168）；wkv→kvn（512）；x→comp（7168）；x→idx（7168）；qn→idx（共享 qr）；comp→idx（压缩条目）；kvn→catidx（滑窗）；idx→catidx（top-128）；qrope→attn（q）；catidx→attn（索引）；comp→attn（压缩 KV）；attn→oinv（128×512）；oinv→woa（分组）；woa→wob（16×1024）</p>
+  <h4>HCA 内部 (Heavily Compressed Attention, ratio=128)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>输入 · 7168</td><td><code>[1,512,7168]</code></td><td>$x$</td><td>与 CSA 层相同的入口。HCA 与 CSA 的 q 路、输出路完全一致，差别只在 KV 侧。</td></tr>
+  <tr><td>q 路(同 CSA) · 7168→1536→65536</td><td><code>[1,512,7168] -&gt; [1,512,128,512]</code></td><td>$q = \mathrm{RMSNorm}(x W^{DQ}) W^{UQ}$</td><td>wq_a → q_norm → wq_b → 逐头 RMS 归一 → 后 64 维 RoPE。与 CSA 层结构和形状均相同（真实权重形状一致）。</td></tr>
+  <tr><td>wkv · 7168 → 512</td><td><code>[1,512,7168] -&gt; [1,512,512]</code></td><td>$kv = x W^{KV}$</td><td>滑窗未压缩 KV，单 KV 头。与 CSA 层相同。</td></tr>
+  <tr><td>Compressor · ratio=128 不重叠</td><td><code>[1,512,7168] -&gt; [1,4,512]</code></td><td>$C^{\mathrm{Comp}}_i = \sum_{j} S_j \odot C_j$</td><td>压缩率 128、overlap=False，故 wkv/wgate 输出宽度就是 512（真实权重 BF16 [512, 7168]，是 CSA 层 [1024, 7168] 的一半）。softmax 在 128 个元素上归一化（实测宽度=128）。</td></tr>
+  <tr><td>滑窗索引 · 128</td><td><code>[1,512,128]</code></td><td>$\text{window}$</td><td>get_window_topk_idxs 生成的环形缓冲索引，覆盖最近 128 个 token。</td></tr>
+  <tr><td>压缩索引 · 全部条目</td><td><code>[1,512,4]</code></td><td>$\text{all compressed}$</td><td>get_compress_topk_idxs 直接给出全部合法压缩块索引——HCA 不做稀疏选择，无 Indexer。1M 上下文下为 8192 条。</td></tr>
+  <tr><td>sparse_attn · MQA + sink</td><td><code>kv[1,516,512], idx[1,512,132] -&gt; [1,512,128,512]</code></td><td>$s_{h,i,j}=\frac{\mathrm{Exp}(z_{h,i,j})}{\sum_k \mathrm{Exp}(z_{h,i,k})+\mathrm{Exp}(z_h')}$</td><td>实测 seqlen=512、ratio=128 时候选集为 128+512/128=132，与手算一致。虽名为 sparse_attn，HCA 层里它承担的是「稠密于压缩条目」的注意力。</td></tr>
+  <tr><td>输出路(同 CSA) · 反向RoPE→分组投影</td><td><code>[1,512,128,512] -&gt; [1,512,7168]</code></td><td>$\hat o = \mathrm{group}(\mathrm{RoPE}_{-t}(o))$</td><td>反向 RoPE → wo_a 分 16 组降到 1024 → wo_b 投回 7168。与 CSA 层完全相同。</td></tr>
+  </table>
+  <p>边：x→qpath（7168）；x→wkv（7168）；x→comp（7168）；wkv→winidx（滑窗）；comp→cmpidx（4 条）；qpath→attn（q）；winidx→attn（128）；cmpidx→attn（4）；comp→attn（压缩 KV）；attn→opath（128×512）</p>
+  <h4>Compressor 内部 (学习式加权压缩)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>隐藏状态 · 7168</td><td><code>[1,512,7168]</code></td><td>$H$</td><td>压缩器直接吃 block 的输入隐藏状态（fp32 计算，model.py 中 x = x.float()）。</td></tr>
+  <tr><td>wkv · 7168 → c·512</td><td><code>[1,512,7168] -&gt; [1,512,512 或 1024]</code></td><td>$C = H W^{KV}$</td><td>待压缩的 KV 内容。CSA(ratio=4) 时输出 1024（前半供重叠、后半供本块）；HCA(ratio=128) 时输出 512。</td></tr>
+  <tr><td>wgate · 7168 → c·512</td><td><code>[1,512,7168] -&gt; [1,512,512 或 1024]</code></td><td>$Z = H W^{Z}$</td><td>压缩权重的 logits。权重由内容算出，使压缩成为学习式而非池化。实测压缩条目与均值池化输出的 RMS 相对差为 0.76。</td></tr>
+  <tr><td>ape 位置偏置 · (ratio, c·512)</td><td><code>CSA: [4,1024]  HCA: [128,512]</code></td><td>$B$</td><td>块内位置偏置，加在 logits 上。真实权重：layers.2.attn.compressor.ape 为 F32 [4,1024]（CSA），layers.0.attn.compressor.ape 为 F32 [128,512]（HCA）。</td></tr>
+  <tr><td>overlap_transform · (仅 ratio=4)</td><td><code>[b,s,4,1024] -&gt; [b,s,8,512]</code></td><td>$[Z^a_{mi:m(i+1)}; Z^b_{m(i-1):mi}]$</td><td>重排为 2m 个来源：后 m 个取本块的后半维，前 m 个取上一块的前半维。相邻压缩条目因此共享来源，但序列长度仍只压到 1/m。实测 softmax 宽度为 8=2m。</td></tr>
+  <tr><td>softmax · 沿来源维</td><td><code>[b,s,2m 或 m,512]</code></td><td>$S = \mathrm{Softmax}_{\mathrm{row}}(Z + B)$</td><td>在 2m（CSA）或 m（HCA）个来源上归一化。padding 位置填 -inf，故不占权重。</td></tr>
+  <tr><td>加权求和 · → 1 条 KV</td><td><code>-&gt; [1, s/ratio, 512]</code></td><td>$C^{\mathrm{Comp}}_i = \sum_j S_j \odot C_j$</td><td>逐元素乘后沿来源维求和。实测 seqlen=64、ratio=4 得 16 条；seqlen=512、ratio=128 得 4 条——序列压到 1/ratio。</td></tr>
+  <tr><td>norm + RoPE · + 量化模拟</td><td><code>[1, s/ratio, 512]</code></td><td>$\mathrm{RMSNorm}$</td><td>带权重 RMSNorm，后 64 维施加 RoPE（位置取所在块首 token）。主压缩器对前 448 维做 FP8 模拟；Indexer 的压缩器则先 Hadamard 旋转再 FP4 模拟。</td></tr>
+  <tr><td>kv_state / score_state · decode 增量缓冲</td><td><code>[max_bsz, c·ratio, c·512]</code></td><td>$\text{state buffers}$</td><td>decode 阶段逐 token 累积，满 ratio 个才触发一次压缩（should_compress = (start_pos+1) % ratio == 0）。实测 prefill 一次压 128 个 token 与 decode 逐个喂入的结果差异为 1.1e-6，语义一致。</td></tr>
+  </table>
+  <p>边：x→wkv（7168）；x→wg（7168）；wg→ape（logits）；ape→ovl（+B）；ovl→sm（2m）；sm→sum（权重）；wkv→ovl（内容）；wkv→sum（C）；sum→nrm（1 条）；x→st（decode）；st→sum（增量）</p>
+  <h4>Lightning Indexer 内部 (稀疏选择)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>共享潜向量 qr · 1536</td><td><code>[1,512,1536]</code></td><td>$c^Q$</td><td>来自主注意力的 q_norm(wq_a(x))。Indexer 不另做下投影，与主注意力共享同一个 qr 潜向量。</td></tr>
+  <tr><td>indexer.wq_b · 1536 → 8192</td><td><code>[1,512,1536] -&gt; [1,512,64,128]</code></td><td>$q^I = c^Q W^{IUQ}$</td><td>上投影到 index_n_heads=64 头 × index_head_dim=128 维。真实权重 F8_E4M3 [8192, 1536]。</td></tr>
+  <tr><td>RoPE + Hadamard · + FP4 模拟</td><td><code>[1,512,64,128]</code></td><td>$\mathrm{FP4}(\mathrm{Had}(\mathrm{RoPE}(q^I)))$</td><td>后 64 维 RoPE，随后整体 Hadamard 旋转把信息摊平到各维，再做 FP4 量化模拟。对应报告 2.3.4「indexer 内的注意力计算用 FP4 精度」。</td></tr>
+  <tr><td>隐藏状态 · 7168</td><td><code>[1,512,7168]</code></td><td>$H$</td><td>Indexer 也直接读隐藏状态，用于自己的压缩器与头权重。</td></tr>
+  <tr><td>独立压缩器 · ratio=4, dim=128</td><td><code>[1,512,7168] -&gt; [1,128,128]</code></td><td>$K^{\mathrm{IComp}}$</td><td>Indexer 自带一套压缩器，输出维度是 index_head_dim=128（不是主注意力的 512）。真实权重 indexer.compressor.wkv.weight 为 BF16 [256, 7168]（256=2×128，重叠压缩）。</td></tr>
+  <tr><td>weights_proj · 7168 → 64</td><td><code>[1,512,7168] -&gt; [1,512,64]</code></td><td>$w^I = H W^{w}$</td><td>每个 indexer 头一个标量权重。真实权重 BF16 [64, 7168]。乘以 softmax_scale × n_heads^(-1/2) 做缩放。</td></tr>
+  <tr><td>索引分数 · ReLU 后加权求和</td><td><code>q[1,512,64,128] × K[1,128,128] -&gt; [1,512,128]</code></td><td>$I_{t,s}=\sum_{h} w^I_{t,h}\,\mathrm{ReLU}\!\left(q^I_{t,h}\cdot K^{\mathrm{IComp}}_s\right)$</td><td>先算每头点积、ReLU 截断负值，再按头权重加权求和成一个标量分数。此处没有 softmax，是与注意力打分的本质区别。</td></tr>
+  <tr><td>因果掩码</td><td><code>[1,512,128]</code></td><td>$-\infty \text{ if } s \ge \lfloor t/m \rfloor$</td><td>prefill 时对每个 query 屏蔽尚未形成的压缩块，保证严格因果：query t 只能看块号 &lt; floor(t/ratio) 的条目。</td></tr>
+  <tr><td>top-k 选择 · k=1024</td><td><code>[1,512,128] -&gt; [1,512,min(1024, n/4)]</code></td><td>$\mathcal{C}_t = \{C_s \mid I_{t,s} \in \text{Top-}k\}$</td><td>index_topk=1024。上下文 $\ge 4096$ 时恒为 1024 条，候选集因此与序列长度脱钩。实测缩小配置(topk=16, seqlen=512)下输出形状为 [1,512,16]。</td></tr>
+  </table>
+  <p>边：qr→wqb（1536）；wqb→rot（64×128）；x→icmp（7168）；x→wp（7168）；rot→score（q^I）；icmp→score（K^IComp）；wp→score（w^I）；score→mask（分数）；mask→topk（掩码后）</p>
+  <h4>MoE FFN 内部 (DeepSeekMoE, 384+1)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>输入 · 7168</td><td><code>[512,7168]  (展平)</code></td><td>$x$</td><td>ffn_norm 输出，展平成 [b·s, 7168] 后逐 token 路由。</td></tr>
+  <tr><td>gate.weight · 7168 → 384</td><td><code>[512,7168] -&gt; [512,384]</code></td><td>$s = x W_g$</td><td>路由打分。fp32 计算。真实权重 BF16 [384, 7168]。</td></tr>
+  <tr><td>sqrt(softplus)</td><td><code>[512,384]</code></td><td>$s = \sqrt{\mathrm{Softplus}(s)}$</td><td>V4 把 V3 的 sigmoid 换成 sqrt(softplus)。实测 logit=12 时 sigmoid 饱和到 0.999994，而 sqrt(softplus) 仍增长到 3.46——高置信路由的亲和度差异不被压平。</td></tr>
+  <tr><td>Hash 路由 · 前 3 层</td><td><code>input_ids -&gt; [512,6]</code></td><td>$\text{indices} = \mathrm{tid2eid}[\mathrm{ids}]$</td><td>第 0,1,2 层按 token ID 查表定专家，与隐藏状态无关。真实权重 gate.tid2eid 为 I64 [129280, 6]，且只存在于这 3 层；这 3 层也没有 gate.bias（61 层中 58 层有）。</td></tr>
+  <tr><td>+ bias 选 top-6 · (不进权重)</td><td><code>[512,384] -&gt; [512,6]</code></td><td>$\mathrm{idx} = \mathrm{TopK}(s + b)$</td><td>auxiliary-loss-free 均衡：bias 只影响谁被选中。实测把某专家 bias 抬到 5 后它被挤进 top-6，但权重仍取自未加 bias 的原始分数。真实权重 gate.bias 为 F32 [384]。</td></tr>
+  <tr><td>权重归一 × 2.5</td><td><code>[512,6]</code></td><td>$w = \frac{s_{\mathrm{idx}}}{\sum s_{\mathrm{idx}}}\cdot 2.5$</td><td>从原始分数 gather 后归一化（norm_topk_prob=true），再乘 routed_scaling_factor=2.5。</td></tr>
+  <tr><td>路由专家 ×6 · 7168→3072→7168</td><td><code>[n_i,7168] -&gt; [n_i,7168]</code></td><td>$w_2\!\left(\mathrm{SiLU}(\mathrm{clamp}(w_1 x))\odot \mathrm{clamp}(w_3 x)\right)$</td><td>SwiGLU，中间维 3072。swiglu_limit=10.0 对 up 支双侧截断、对 gate 支上侧截断。权重为 FP4：真实张量 I8 [3072, 3584]（沿 K 维两值打包）+ scale F8_E8M0 [3072, 224]。</td></tr>
+  <tr><td>共享专家 ×1 · 7168→3072→7168</td><td><code>[512,7168] -&gt; [512,7168]</code></td><td>$\mathrm{Expert}_{\mathrm{shared}}(x)$</td><td>对所有 token 恒激活，不经门控。精度与路由专家不同：真实权重为 F8_E4M3 [3072, 7168]，未降到 FP4。</td></tr>
+  <tr><td>聚合输出 · 7168</td><td><code>-&gt; [1,512,7168]</code></td><td>$y = \sum_i w_i E_i(x) + E_{\mathrm{shared}}(x)$</td><td>路由专家按权重加权求和后，直接加上共享专家输出。实算每 token 激活专家参数 = 61 层 × 6 × 66.06M = 24.18B。</td></tr>
+  </table>
+  <p>边：x→gate（7168）；gate→sf（384）；sf→bias（分数）；bias→w（top-6）；x→hash（ids）；hash→exp（前3层）；w→exp（权重）；x→exp（x）；x→shd（x）；exp→add（6 路）；shd→add（1 路）</p>
+  <h4>mHC 内部 (Manifold-Constrained Hyper-Connections)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>残差流 · [b,s,4,7168]</td><td><code>[1,512,4,7168]</code></td><td>$X_l = [x_{l,1};\dots;x_{l,4}]$</td><td>4 份并行残差流（hc_mult=4）。实测一个 Block 内 hc_pre/hc_post 各调用两次：attn 前后、ffn 前后。</td></tr>
+  <tr><td>展平 + RMS · 4×7168 → 28672</td><td><code>[1,512,4,7168] -&gt; [1,512,28672]</code></td><td>$\mathrm{rsqrt}(\overline{x^2}+\varepsilon)$</td><td>把 4 份残差拼成 28672 维并计算 RMS 缩放因子。fp32 计算。</td></tr>
+  <tr><td>hc_fn · 28672 → 24</td><td><code>[1,512,28672] -&gt; [1,512,24]</code></td><td>$\mathrm{mixes} = X W_{hc}\cdot \mathrm{rsqrt}$</td><td>mix_hc=(2+4)×4=24。真实权重 layers.0.hc_attn_fn 为 F32 [24, 28672]。每层有 attn/ffn 两套独立参数。混合系数由当前残差算出，不是静态权重。</td></tr>
+  <tr><td>切分 4/4/16</td><td><code>[1,512,24] -&gt; pre[4], post[4], comb[16]</code></td><td>$[\mathrm{pre}; \mathrm{post}; \mathrm{comb}]$</td><td>前 4 维给输入映射 A，中 4 维给输出映射 C，后 16 维给残差矩阵 B（4×4）。</td></tr>
+  <tr><td>pre = $\sigma(\cdot)+\varepsilon$ · [b,s,4]</td><td><code>[1,512,4]</code></td><td>$A_l = \sigma(\tilde A_l)$</td><td>报告 Eq.6。实测取值落在 $(0,1)+\varepsilon$ 内。用于把 4 份残差加权归约成 1 份。</td></tr>
+  <tr><td>post = $2\sigma(\cdot)$ · [b,s,4]</td><td><code>[1,512,4]</code></td><td>$C_l = 2\sigma(\tilde C_l)$</td><td>报告 Eq.7。实测取值落在 (0,2) 内。用于把子层输出分发回 4 份残差。</td></tr>
+  <tr><td>Sinkhorn 20 轮 · [b,s,4,4]</td><td><code>[1,512,4,4]</code></td><td>$M^{(t)} = \mathcal{T}_c(\mathcal{T}_r(M^{(t-1)}))$</td><td>官方 kernel 的迭代顺序：$\mathrm{softmax}(-1)+\varepsilon$ → 列归一化 → 19 轮(行归一化→列归一化)，每轮最后一步是列归一化，故列和精确为 1。报告式(8)把该复合写成 𝒯_r∘𝒯_c(M)（末步为行归一化），与 kernel 顺序相反。实测：列和精确为 1（1e-6，来自 hc_eps）；行和收敛慢，logits 尺度为 3 时 20 轮后仍偏离 3.5e-2，需约 231 轮才到 1e-3。尺度 $\le 0.1$ 时 20 轮已足够。</td></tr>
+  <tr><td>hc_pre 归约 · 4×7168 → 7168</td><td><code>[1,512,4,7168] -&gt; [1,512,7168]</code></td><td>$y = \sum_j \mathrm{pre}_j x_j$</td><td>加权求和成单份，送进 attn_norm/ffn_norm 再进子层。子层内部完全不感知残差份数。</td></tr>
+  <tr><td>子层 · attn 或 ffn</td><td><code>[1,512,7168] -&gt; [1,512,7168]</code></td><td>$\mathcal{F}_l(A_l X_l)$</td><td>注意力或 MoE FFN。输入输出都是 7168 维，与残差宽度解耦。</td></tr>
+  <tr><td>hc_post 扩展 · → [b,s,4,7168]</td><td><code>-&gt; [1,512,4,7168]</code></td><td>$X_{l+1} = \mathrm{post}\otimes \mathcal{F} + \sum_j \mathrm{comb}_{ij} x_j$</td><td>子层输出按 post 分发到 4 份，再叠加经 comb 重排的旧残差。实测双随机 comb 的混合使 L2 范数比值为 0.83（压缩映射）；若只做行归一化，列和会散到 [0, 2.62]，部分通道被反复放大。</td></tr>
+  </table>
+  <p>边：res→flat（4×7168）；flat→fn（28672）；fn→split（24）；split→pre（4）；split→post（4）；split→sink（16）；pre→reduce（权重）；res→reduce（残差）；reduce→sub（7168）；sub→expand（7168）；post→expand（分发）；sink→expand（comb）；res→expand（旧残差）</p>
+  <h4>MTP 模块内部 (Multi-Token Prediction)</h4>
+  <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
+  <tr><td>主干隐状态 · [b,s,4,7168]</td><td><code>[1,512,4,7168]</code></td><td>$h$</td><td>来自主干的 4 份残差流。MTPBlock 继承 Block，故同样带 mHC。</td></tr>
+  <tr><td>input_ids</td><td><code>[1,512]</code></td><td>$\mathrm{ids}$</td><td>下一个位置的 token id。</td></tr>
+  <tr><td>共享 embed</td><td><code>[1,512] -&gt; [1,512,7168]</code></td><td>$e = \mathrm{Embedding}(\mathrm{ids})$</td><td>与主干共享同一个 embedding（model.py 中 self.mtp[-1].embed = self.embed）。</td></tr>
+  <tr><td>enorm / hnorm</td><td><code>各 [.,7168]</code></td><td>$\mathrm{RMSNorm}$</td><td>embedding 与隐状态各自归一化后再融合。</td></tr>
+  <tr><td>e_proj + h_proj · 融合</td><td><code>-&gt; [1,512,4,7168]</code></td><td>$x = e\_proj(e)\!\uparrow + h\_proj(h)$</td><td>e_proj 结果 unsqueeze 到残差维后与 h_proj 相加。真实权重均为 F8_E4M3 [7168, 7168]。</td></tr>
+  <tr><td>Block · (滑窗注意力+MoE)</td><td><code>[1,512,4,7168] -&gt; [1,512,4,7168]</code></td><td>$\mathrm{Block}(x)$</td><td>结构与主干层相同，但 compress_ratios 第 62 项为 0，即注意力不做压缩、只用 128 长度滑窗（model.py 中 compress_ratio=0 时关闭 YaRN 并用 rope_theta=10000）。</td></tr>
+  <tr><td>hc_head 归约 · + 共享 lm_head</td><td><code>[1,512,4,7168] -&gt; [1,129280]</code></td><td>$\mathrm{logits}$</td><td>用自己的 hc_head_fn（真实权重 F32 [4, 28672]）把 4 份残差归约成 1 份，再走与主干共享的 lm_head。</td></tr>
+  <tr><td>MTP logits · 129280</td><td><code>[1,129280]</code></td><td>$\mathrm{logits}$</td><td>实测缩小配置下 MTP 前向跑通，输出形状与主干一致。</td></tr>
+  </table>
+  <p>边：ids→emb（ids）；emb→en（e）；h→en（h）；en→fuse（归一后）；fuse→blk（7168）；blk→hd（4×7168）；hd→out（129280）</p>
+  </noscript>
   <div id="tip"></div>
 
   <h2 id="points">3. 要点</h2>

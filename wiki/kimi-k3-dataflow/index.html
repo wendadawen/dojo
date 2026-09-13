@@ -102,7 +102,7 @@
     <tr><th>视觉</th><td><a href="../moonvit-v2/">MoonViT-V2</a>：27 层、vt_hidden=1024、12 头 $\times$ 128（qkv_hidden_size=1536，头维 $\ne$ hidden/heads）、patch=14、RMSNorm、GELU(tanh) MLP2（1024→4096→1024）、可学习 64×64 位置嵌入 + 4 帧时间 sincos、2D RoPE（网格上限 512×512）；merger sd2_tpool 时间全池化 + 2×2 合并、PatchMergerMLPV2 4096→4096→7168；塔 401,214,464 参数（技术报告 401M 吻合）+ merger 46,144,512</td></tr>
     <tr><th>多模态融合</th><td>media_placeholder_token_id=163605（<code>&lt;|kimi_image_placeholder|&gt;</code>）占位符扩展：$T' = T - \#\mathrm{PH} + \sum_i n_i$，序列变长（LLaVA 式，非原地替换）；视觉 token 数 $n_i=(h_i/2)(w_i/2)$ 与帧数无关（$t \le 4$）</td></tr>
     <tr><th>MTP</th><td>num_nextn_predict_layers=0（HF 配置未含 NextN 层）；技术报告 Table 1 与 §4.1.4 称 K3 预训练含 1 层 MTP 并微调为 EAGLE-3 草稿模型——两个官方来源在此分歧，配置中未体现</td></tr>
-    <tr><th>其他</th><td>RMSNorm eps=1e-5；routed_scaling_factor=1.0；moe_renormalize=true；MXFP4 权重量化（QAT；范围=路由专家的 w1/w2/w3 权重）；config.json 的 ignore 表列出的豁免为 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector（embedding 非 Linear，天然不量化），而技术报告 §4.1.4 称 latent MoE 投影与 MoE 路由器亦保持高精度——两个官方来源在豁免范围上分歧，AttnRes 的 self_attention_res_proj / mlp_res_proj 也不在 ignore 表内</td></tr>
+    <tr><th>其他</th><td>RMSNorm eps=1e-5；routed_scaling_factor=1.0；moe_renormalize=true；MXFP4 权重量化（QAT）；config.json 的 ignore 表列出的豁免为 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector（embedding 非 Linear，天然不量化），按该表反推，量化目标为路由专家的 w1/w2/w3、latent 下/上投影（routed_expert_down_proj / routed_expert_up_proj）与 AttnRes 的三个 res 投影（self_attention_res_proj / mlp_res_proj / output_attn_res_proj），三者均不在豁免内；技术报告 §4.1.4 称 latent MoE 投影与 MoE 路由器保持高精度——两个官方来源在 latent MoE 投影上分歧（MoE 路由器是裸参数、不属 Linear 量化目标，与报告不冲突）</td></tr>
   </table>
 
   <h2 id="viz">2. 交互式数据流</h2>
@@ -296,7 +296,7 @@
   <p>视觉侧是一个 27 层的独立 <a href="../moonvit-v2/">MoonViT-V2</a>：参数 401,214,464（技术报告称 MoonViT-V2 401M），加 merger 的 46,144,512 共 447.4M，占全模型约 0.016%。它的职责是把像素变成 7168 宽 token；融合之后视觉与文本在同一序列里共享全部 93 层，不存在贯穿深度的独立视觉分支。「视觉编码器」与「多模态融合」两个视图给出完整路径。</p>
 
   <h3>4.1 patch 投影：一次 Conv2d</h3>
-  <p><code>patch_embed</code> 是 Conv2d，kernel 与 stride 都等于 patch_size=14，因此每个 patch 独立映射、互不重叠，等价于对展平后的 $3\times14\times14=588$ 维向量做一次 $588\to1024$ 的线性变换；无 bias（patch_embed_proj_bias=false）。权重形状 $[1024,3,14,14]$，共 602,112 参数。像素边长非 14 整数倍时由 processor 先 resize；视频沿时间维分组，每组 t 帧，$t\le 4$（位置嵌入时间表仅 4 帧，源码 assert）。patch 数 $=t\cdot h\cdot w$。</p>
+  <p><code>patch_embed</code> 是 Conv2d，kernel 与 stride 都等于 patch_size=14，因此每个 patch 独立映射、互不重叠，等价于对展平后的 $3\times14\times14=588$ 维向量做一次 $588\to1024$ 的线性变换；无 bias（patch_embed_proj_bias=false）。权重形状 $[1024,3,14,14]$，共 602,112 参数。processor 按 patch 预算（in_patch_limit=65536、单边 512 patch）决定是否缩放，并把尺寸补齐到 merge_kernel_size$\times$patch_size=28 的倍数；模型侧 h、w 需为 28 的倍数（2×2 合并按整除切分，余数会被丢弃）。视频沿时间维分组，每组 t 帧，$t\le 4$（位置嵌入时间表仅 4 帧，源码 assert）。patch 数 $=t\cdot h\cdot w$。</p>
 
   <h3>4.2 位置信息：可学习方格插值 + 2D RoPE 双轨</h3>
   <p>视觉侧两套位置机制职责不同。</p>
@@ -313,7 +313,7 @@
     <tr><td>注意力</td><td>双向、变长打包（cu_seqlens）、12 头 × 128（头维 $=$ qkv_hidden/heads $\ne$ hidden/heads $=85.3$）</td><td>KDA 96×128 因果 / MLA 96 头 NoPE 因果</td></tr>
     <tr><td>FFN</td><td>稠密 MLP2：1024→4096→1024，GELU(tanh)</td><td>Stable Latent MoE / 第 0 层 Dense，SiTU-GLU</td></tr>
     <tr><td>位置编码</td><td>2D RoPE + 可学习方格</td><td>NoPE</td></tr>
-    <tr><td>量化</td><td>vision_tower 与 mm_projector 均豁免 MXFP4</td><td>路由专家的 w1/w2/w3 权重量化；config 的 ignore 表豁免 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector（报告 §4.1.4 另称 latent MoE 投影与 MoE 路由器保持高精度，config 未列）</td></tr>
+    <tr><td>量化</td><td>vision_tower 与 mm_projector 均豁免 MXFP4</td><td>MXFP4 量化目标为路由专家的 w1/w2/w3、latent 下/上投影与 AttnRes res 投影；config 的 ignore 表豁免 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector（报告 §4.1.4 另称 latent MoE 投影与 MoE 路由器保持高精度，与 config 的量化目标不一致）</td></tr>
     <tr><td>参数占比</td><td>447.4M（0.016%）</td><td>其余 99.984%</td></tr>
   </table>
   <p>归一化两侧一致（RMSNorm、无 bias）。多图输入时同一图像内所有 patch 互相可见、跨图不互注意——本机实测两图拼接跑与分开跑输出逐元素一致（max diff &lt; 1e-5），印证 cu_seqlens 块对角掩码。</p>
@@ -333,11 +333,11 @@
   <h3>4.5 融合：占位符扩展，序列变长</h3>
   <p>融合发生在 embedding 之后、第 0 层之前，核心是 <code>_merge_input_ids_with_image_features</code> 的三步：① 全 1 的 occupation 表把每个占位符位置（media_placeholder_token_id=163605）改写为该图的 $n_i$；② cumsum − 1 得到所有 token 的新位置，占位符之后的文本整体后移；③ 文本 embedding 与视觉特征交错写入长度为 $T'=T-\#\mathrm{PH}+\textstyle\sum_i n_i$ 的新序列。</p>
   <p>本机实测（官方方法原样调用）：6 位序列含 1 个占位符加 5 个视觉 token，输出 10 位，文本落在 0–2 与 8–9、视觉特征按序落在 3–7，position_ids 连续 0..9；两占位符两图（3+2 token）输出 8 位，交错序列 [文本, 图1×3, 文本, 图2×2, 文本] 逐元素正确；视觉段 labels 填 ignore_index=-100。</p>
-  <p>三个边界行为：占位符数必须等于输入图数（段多于占位符在 occupation 表 broadcast 处即报错，占位符多于段在填充校验处抛 ValueError）；纯文本输入不进融合函数（官方 forward 有 pixel_values 非空守卫）；decode 单步（len(ids)==1、带 KV cache，且本次仍传入 pixel_values）不重跑融合，只按 cache 痕迹修补 attention_mask。</p>
+  <p>三个边界行为：占位符数必须等于输入图数（段数等于 1 时占位符多于段在 occupation 表 broadcast，到填充校验处抛 ValueError；段数大于 1 时无论哪一侧不匹配都在 occupation 表赋值处报形状错误）；纯文本输入不进融合函数（官方 forward 有 pixel_values 非空守卫）；decode 单步（len(ids)==1、带 KV cache，且本次仍传入 pixel_values）不重跑融合，只按 cache 痕迹修补 attention_mask。</p>
   <p>这是 LLaVA 式<b>扩展</b>融合，与 <a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next</a> 的 masked_scatter <b>原地替换</b>（processor 预先填充等量占位符、序列长度不变）是两种方案。扩展式让 tokenizer 层面的序列长度与实际进入主干的长度解耦；替换式把对齐责任前移到 processor。</p>
 
   <h2 id="memcost">5. 长上下文开销的来源</h2>
-  <p>推理时的缓存/状态开销由层型比例决定：69 层 <a href="../kda/">KDA</a> 的递归状态与短卷积状态固定不变，24 层 <a href="../mla/">MLA</a> 的 <a href="../kv-cache/">KV cache</a> 随长度线性增长。按官方 config 与官方实现精确计算（MLA KV 为 bf16，KDA 递归与短卷积状态为 fp32）：</p>
+  <p>推理时的缓存/状态开销由层型比例决定：69 层 <a href="../kda/">KDA</a> 的递归状态与短卷积状态固定不变，24 层 <a href="../mla/">MLA</a> 的 <a href="../kv-cache/">KV cache</a> 随长度线性增长。按官方 config 与官方实现精确计算（MLA KV 与 KDA 短卷积状态为 bf16，KDA 递归状态为 fp32）：</p>
   <table>
     <tr><th>上下文</th><th>MLA KV × 24 层（参考实现）</th><th>MLA KV × 24 层（潜压缩）</th><th>KDA 状态 × 69 层</th><th>合计（参考口径）</th></tr>
     <tr><td>4K</td><td>5.625 GiB</td><td>0.105 GiB</td><td>0.423 GiB</td><td>6.048 GiB</td></tr>
@@ -749,7 +749,7 @@ vision: {
   rankSep:48, nodeSep:24,
   legend:[['#1f9d6b','输入/输出'],['#d9639a','patch 卷积'],['#e0922f','位置信息'],['#7a45c9','注意力/MLP'],['#3f6fd0','merger 投影'],['#556070','归一/合并']],
   nodes:{
-    px:   {label:'时空 patch\n(仅多模态输入)', t:'io', io:'[n_patch, 3,14,14] + grid_thw', f:'\\mathrm{grid\\_thw}=(t,h,w)', d:'图像按 patch=14 切块（processor 预切展平）；视频沿时间分组，$t \le 4$（init_pos_emb_time=4，源码 assert）。patch 数 = t·h·w。像素不为 14 整除时 processor 先 resize。'},
+    px:   {label:'时空 patch\n(仅多模态输入)', t:'io', io:'[n_patch, 3,14,14] + grid_thw', f:'\\mathrm{grid\\_thw}=(t,h,w)', d:'图像按 patch=14 切块（processor 预切展平）；视频沿时间分组，$t \le 4$（init_pos_emb_time=4，源码 assert）。patch 数 = t·h·w。processor 按 patch 预算（in_patch_limit=65536、单边 512 patch）决定是否缩放，并补齐到 merge_kernel_size×patch_size=28 的倍数。'},
     pconv:{label:'patch_embed Conv2d\n3×14×14 → 1024', t:'conv', io:'[n_patch,3,14,14] -> [n_patch,1024]', f:'x = \\mathrm{Conv2d}_{k=s=14}(x)', d:'kernel=stride=14，每个 patch 独立映射互不重叠，等价于 588→1024 的逐 patch 线性变换；无 bias（patch_embed_proj_bias=false）。权重 [1024,3,14,14] 共 602,112 参数。'},
     posemb:{label:'divided_fixed 位置嵌入\n64×64 可学习 + 时间 sincos', t:'shp', io:'[n_patch,1024] -> [n_patch,1024]', f:'x \\leftarrow x + \\mathrm{bilinear}(P_{64\\times64}) + T_t', d:'可学习 64×64 方格按每张图实际 (h,w) 双线性插值（位置信息跟随真实长宽比，不要求 resize 成固定尺寸）；t>1 时 2D 嵌入重复 t 份再加冻结的 1D sincos 时间嵌入（非持久 buffer，仅 4 帧）。表参数 4,194,304。实测 t=3 时输出 = 2D 重复 3 份 + time_weight[0:3] 逐元素相加。'},
     rope: {label:'2D RoPE\n(h,w) 交错', t:'shp', io:'(h,w) -> cos/sin [n,64]', f:'\\mathrm{cis}[h,w,2i] = e^{jw\\theta_i},\\;\\mathrm{cis}[h,w,2i{+}1] = e^{jh\\theta_i}', d:'Rope2DPosEmbRepeated，作用在注意力头维 128 上：相邻频率槽交错编码宽 w（偶数槽）与高 h（奇数槽），θ 基 10000，网格硬上限 512×512。源码 docstring 把 h/w 标注写反，此处按代码实测行为记录；旋转严格保范数（实测 33.935440 → 33.935440）。'},
@@ -758,7 +758,7 @@ vision: {
     tpool:{label:'时间全池化\nmean(dim=t)', t:'shp', io:'[t·h·w,1024] -> [h·w,·]', f:'\\bar{x} = \\tfrac{1}{t}\\textstyle\\sum_{i=1}^{t} x_i', d:'sd2_tpool：t 帧沿时间维全部平均（实测第 1/2/3 帧填 1/2/3，合并后处处 = 2.0）。因此视觉 token 数与帧数无关：一张 448×448 无论 1 帧还是 4 帧都是同样多 token。与 tpool 同一函数内完成 2×2 空间合并（下节点）。'},
     mg2:  {label:'2×2 空间合并\n→ (n,4,1024)', t:'nrm', io:'[h·w,1024] -> [(h/2)(w/2), 4, 1024]', f:'(h/2)\\times(w/2)\\ \\mathrm{tokens}', d:'空间相邻 2×2 的 4 个 patch 捆成一个 token 的 4 份特征（不相加，留给投影层自行混合）。'},
     pmv2: {label:'PatchMergerMLPV2\n4096 → 4096 → 7168', t:'lin', io:'[n,4,1024] -> [n,4096] -> [n,7168]', f:'\\mathrm{RMSNorm}\\big(W_2\\,\\mathrm{GELU}(W_1\\,x)\\big)', d:'两层 Linear 均无 bias（4096×4096 + 4096×7168），输出接 RMSNorm(7168, eps=1e-5)。V1 的 pre_norm（LayerNorm@1024）在 V2 已移除。输出宽 7168 = 语言主干 hidden，是两侧能直接拼接的前提。参数 46,144,512。'},
-    vtok: {label:'视觉 token\n[n_vis, 7168]', t:'io', io:'[n_vis, 7168]', f:'n_{vis} = (h/2)(w/2)', d:'实算：448×448→256；896×896→1024；1344×1344→2304；1820×1008→2340；4 帧 448×448 视频→仍 256（时间已全池化）。视觉塔 401,214,464 参数（技术报告称 MoonViT-V2 401M，吻合）+ merger 46,144,512 = 447.4M。视觉塔与 mm_projector 均在 MXFP4 量化豁免名单，量化范围仅路由专家的 w1/w2/w3 权重（config 的 ignore 表另列 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head 为豁免）。'},
+    vtok: {label:'视觉 token\n[n_vis, 7168]', t:'io', io:'[n_vis, 7168]', f:'n_{vis} = (h/2)(w/2)', d:'实算：448×448→256；896×896→1024；1344×1344→2304；1820×1008→2340；4 帧 448×448 视频→仍 256（时间已全池化）。视觉塔 401,214,464 参数（技术报告称 MoonViT-V2 401M，吻合）+ merger 46,144,512 = 447.4M。视觉塔与 mm_projector 均在 MXFP4 量化豁免名单；按 config 的 ignore 表反推，量化目标为路由专家的 w1/w2/w3、latent 下/上投影与 AttnRes res 投影（self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector 为豁免）。'},
   },
   edges:[
     ['px','pconv','patch'],['pconv','posemb','1024'],['posemb','blk','1024'],

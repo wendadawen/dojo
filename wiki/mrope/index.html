@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="MRoPE 把 RoPE 的一维位置 id 拆成时间/高/宽三个分量：文本退化为三值相同、图像按网格、视频逐帧递增；频率槽位按 mrope_section 配额分段或交错分配；图像块只推进 max(h,w)/merge 个位置，支撑长序列外推。依据 Qwen2-VL 论文、transformers 源码与本机实测。">
-  <meta name="dojo:summary" content="MRoPE 把位置 id 拆成 $(t,h,w)$ 三元组：文本三值相同（退化为 1D-RoPE）、图像 $t$ 恒定而 $h/w$ 按网格、视频 $t$ 逐帧递增；频率槽位按 mrope_section 配额分段或交错占用；图像块结束后位置轴只推进 $\max(h,w)/\mathrm{merge}$ 而非 token 数。">
+  <meta name="description" content="MRoPE 把 RoPE 的一维位置 id 拆成时间/高/宽三个分量：文本退化为三值相同、图像按网格、视频逐帧递增；频率槽位按 mrope_section 配额分段或交错分配；图像块只推进 max(g_h,g_w)/merge 个位置，支撑长序列外推。依据 Qwen2-VL 论文、transformers 源码与本机实测。">
+  <meta name="dojo:summary" content="MRoPE 把位置 id 拆成 $(t,h,w)$ 三元组：文本三值相同（退化为 1D-RoPE）、图像 $t$ 恒定而 $h/w$ 按网格、视频 $t$ 逐帧递增；频率槽位按 mrope_section 配额分段或交错占用；图像块结束后位置轴只推进 $\max(g_h,g_w)/\mathrm{merge}$ 而非 token 数。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制,多模态">
   <meta name="dojo:tag" content="位置编码">
@@ -92,7 +92,7 @@
     <li>
       <p>为什么 MRoPE 有助于长序列外推？</p>
       <details>
-        <summary>解答：图像块只推进 $\max(h,w)/\text{merge}$ 个位置</summary>
+        <summary>解答：图像块只推进 $\max(g_h,g_w)/\text{merge}$ 个位置</summary>
         <p>一段视觉输入结束后，位置轴的推进量是该图像网格最大边长除以空间合并因子，而不是视觉 token 数——一张 1764 个 token 的图只让位置前进 42。同样长的多模态序列占用的位置 id 范围小得多，推理长度得以超过训练长度。实测与证据见「位置轴上的省账」一章。</p>
       </details>
     </li>
@@ -104,7 +104,7 @@
   <ul>
     <li>「MRoPE 是一种新的旋转公式」——旋转公式与 RoPE 完全相同，变的只是位置 id 从一维变三维、以及频率槽位怎么分给三个分量。</li>
     <li>「三个分量各占头维的三分之一」——配额由 mrope_section 决定（如 $[11,11,10]$；以 Qwen3.8-Flash-Next 的 32 个频率槽位计，$W$ 因 32 不被 3 整除而少一档），且存在分段与交错两种排布。</li>
-    <li>「视觉 token 占多少个序列位置，位置编号就前进多少」——推进量是 $\max(h,w)/\text{merge}$；序列长度预算与位置轴预算是两回事。</li>
+    <li>「视觉 token 占多少个序列位置，位置编号就前进多少」——推进量是 $\max(g_h,g_w)/\text{merge}$；序列长度预算与位置轴预算是两回事。</li>
   </ul>
 </section>
 
@@ -112,7 +112,7 @@
 
 <p>RoPE 给每个 token 一个整数位置 id，token 之间的相对位置决定内积的旋转差。文本串里这件事是自然的：第 5 个词就是位置 5，相邻即距离 1。视觉输入不是这样——编码器输出的是一张网格，<a href="../vit/">ViT</a> 把图像切成 patch 后每个 token 带的是「第几行第几列」，而不是「第几个」。</p>
 
-<p>把网格拉平成一行会丢什么？一维位置差是单个标量：横向相邻对应 $\Delta=1$、纵向相邻对应 $\Delta=W$（$W$ 为网格列数）。同一个 $\Delta$ 在不同宽度的网格下对应不同空间位移——$\Delta=W$ 既可指向下一行，也可指同一行向右 $W$ 个——模型无法从位置差判断位移沿哪个轴。方向信息在一维轴上无法唯一表达，而这恰是空间理解最需要的信息。论文把动机说成一句一般性的话：文本天然一维，真实环境却是三维的，一维位置嵌入显著限制了模型对三维空间与时间动态的建模<sup>[C5]</sup>。</p>
+<p>把网格拉平成一行会丢什么？一维位置差是单个标量：横向相邻对应 $\Delta=1$、纵向相邻对应 $\Delta=g_w$（$g_w$ 为网格列数）。同一个 $\Delta$ 在不同宽度的网格下对应不同空间位移——$\Delta=g_w$ 既可指向下一行，也可指同一行向右 $g_w$ 个——模型无法从位置差判断位移沿哪个轴。方向信息在一维轴上无法唯一表达，而这恰是空间理解最需要的信息。论文把动机说成一句一般性的话：文本天然一维，真实环境却是三维的，一维位置嵌入显著限制了模型对三维空间与时间动态的建模<sup>[C5]</sup>。</p>
 
 <figure class="diagram">
   <div class="dg-stack">
@@ -134,14 +134,14 @@
     <p>一维位置轴具体丢了什么信息？</p>
     <details>
       <summary>解答：网格的方向区分</summary>
-      <p>二维网格里一个 patch 有右邻和下邻两种「相邻」；拉平后位置差是一个标量，横向相邻对应 $\Delta=1$、纵向相邻对应 $\Delta=W$，同一个差值在不同宽度的网格下对应不同的空间位移，模型无法从位置编码唯一分辨「向右」与「向下」。方向与轴向信息只存在于二维坐标里。</p>
+      <p>二维网格里一个 patch 有右邻和下邻两种「相邻」；拉平后位置差是一个标量，横向相邻对应 $\Delta=1$、纵向相邻对应 $\Delta=g_w$，同一个差值在不同宽度的网格下对应不同的空间位移，模型无法从位置编码唯一分辨「向右」与「向下」。方向与轴向信息只存在于二维坐标里。</p>
     </details>
   </li>
   <li>
     <p>为什么不干脆给视觉 token 单独做一套二维位置编码？</p>
     <details>
       <summary>解答：文本与视觉要进同一个注意力</summary>
-      <p>多模态模型把文本与视觉 token 放进同一序列做注意力，位置编码必须同构才能比较。若视觉用二维、文本用一维两套体系，跨模态的相对位置无从定义。MRoPE 的做法是让文本也用三元组（三值相同），统一表示下视觉才自然退化回一维——统一是设计的关键约束，不是多余形式。</p>
+      <p>多模态模型把文本与视觉 token 放进同一序列做注意力，位置编码必须同构才能比较。若视觉用二维、文本用一维两套体系，跨模态的相对位置无从定义。MRoPE 的做法是让文本也用三元组（三值相同），统一表示下文本才自然退化回一维——统一是设计的关键约束，不是多余形式。</p>
     </details>
   </li>
 </ol>
@@ -306,7 +306,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 
 <h2 id="position-budget">4. 位置轴上的省账——推进量与长序列外推</h2>
 
-<p>回到「位置 id 变三元组」一章结尾的数字：196 个视觉 token 只让位置轴前进 14。规则是图像块结束后位置轴推进 $\max(h,w)/\text{merge}$，而非推进 token 数<sup>[C10]</sup>。规模越大省得越多（下表为本机实测<sup>[N3, N4]</sup>）：</p>
+<p>回到「位置 id 变三元组」一章结尾的数字：196 个视觉 token 只让位置轴前进 14。规则是图像块结束后位置轴推进 $\max(g_h,g_w)/\text{merge}$，而非推进 token 数<sup>[C10]</sup>。规模越大省得越多（下表为本机实测<sup>[N3, N4]</sup>）：</p>
 
 <div class="table-scroll">
 <table>
@@ -322,14 +322,14 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 
 <p>于是多模态序列有两笔独立的预算：序列长度（token 数）决定注意力与缓存的规模，位置轴（id 范围）决定位置编码的覆盖。$\text{max\_position\_embeddings}$ 约束的是后者。以 Qwen3.8-Flash-Next 为例（config 的 max_position_embeddings 为 262144，见数据流页），同样 262144 的位置上限，纯文本最多 26 万多个 token；穿插图像时，token 数可以远超位置范围——因为图像块的位置消耗按网格边长而非 token 数计。</p>
 
-<p>论文把这归为 MRoPE 的实际收益：M-RoPE 降低了图像与视频的位置 id 取值，使模型能在推理时外推到更长序列<sup>[C6]</sup>。两个支撑数字<sup>[N1, N2]</sup>：其一，Qwen2-1.5B + ViT-L 骨干的消融显示 M-RoPE 在多数基准上优于 1D-RoPE、视频基准提升最明显（如 NextQA 46.0 对 43.9、STAR 57.9 对 55.5；个别基准如 RWQ、InfoVQA 小幅下降），论文的措辞是「更好的整体表现，尤其视频基准」；其二，训练时每个视频最多 16K token，推理到 80K token 仍保持性能（Figure 5 语境为 Qwen2-VL-72B 在 Video-MME 中等时长视频）。</p>
+<p>论文把这归为 MRoPE 的实际收益：M-RoPE 降低了图像与视频的位置 id 取值，使模型能在推理时外推到更长序列<sup>[C6]</sup>。两个支撑数字<sup>[N1, N2]</sup>：其一，Qwen2-1.5B + ViT-L 骨干的消融显示 M-RoPE 在多数基准上优于 1D-RoPE、视频基准提升最明显（如 NextQA 46.0 对 43.9、STAR 57.9 对 55.5；个别基准如 RealWorldQA、InfoVQA 小幅下降），论文的措辞是「更好的整体表现，尤其视频基准」；其二，训练时每个视频最多 16K token，推理到 80K token 仍保持性能（Figure 5 语境为 Qwen2-VL-72B 在 Video-MME 中等时长视频）。</p>
 
 <p>回到贯穿示例收尾：8 个文本 + 一张 $(1,28,28)$ 图 + 5 个文本的序列，token 数 209，而位置轴只用到 $22+5-1=26$。若把这张图换成 $(1,84,84)$，token 数变 1777，位置轴仍是 $8+42+5-1=54$——序列长度大幅增加，位置轴几乎没动。token 数与位置轴范围由此解耦。Qwen3.8-Flash-Next 的完整配置与上下文占比实测见<a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>。Qwen3.5-397B-A17B 的 MRoPE 配置与此逐项相同（rotary_dim 64、mrope_section $[11,11,10]$、$\theta=10^7$），其视觉 token 位置推进与长上下文开销见<a href="../qwen3-5-dataflow/index.html">Qwen3.5-397B-A17B 前向数据流</a>。</p>
 
 <h3 id="position-budget-questions">本章问题</h3>
 <ol class="chapter-questions">
   <li>
-    <p>「前一模态最大位置 id 加一」和「推进 $\max(h,w)/\text{merge}$」是什么关系？</p>
+    <p>「前一模态最大位置 id 加一」和「推进 $\max(g_h,g_w)/\text{merge}$」是什么关系？</p>
     <details>
       <summary>解答：同一规则的两种表述</summary>
       <p>视觉 token 的高、宽分量各自从起始值 $s$ 遍历到 $s+g_h/\text{merge}-1$ 与 $s+g_w/\text{merge}-1$，时间分量恒为 $s$，因此块内最大位置 id 是 $s+\max(g_h,g_w)/\text{merge}-1$；「下一个模态从最大 id 加一开始」即从 $s+\max(g_h,g_w)/\text{merge}$ 开始。论文用前一种表述，实现源码算后一种，数值相同。</p>

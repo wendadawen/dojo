@@ -185,7 +185,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 
 <p>第一，SM 争抢。用通用库做通信，搬运由 SM 上的 kernel 执行，抢的是计算的 SM：V3 训练用 20/132 个 H800 SM 专职通信，且这些 SM 上 tensor core 完全闲置<sup>[C9, N5]</sup>。通信内核必须把 SM 用量做成可控制的参数，而不是任由库的默认配置占用。</p>
 
-<p>第二，接收侧布局契约。all-to-all 原语只按 rank 搬数据，不知道"按专家分组连续排布"这回事；而接收侧的计算是 grouped GEMM——对按来源分组的多段矩阵连续做乘法，要求数据落进 buffer 时就按专家分组排好。DeepEP 的接收布局就是为配套 GEMM 库设计的<sup>[C31]</sup>，这是通用原语不提供的接口语义。</p>
+<p>第二，接收侧布局契约。all-to-all 原语只按 rank 搬数据，不知道"按专家分组连续排布"这回事；而接收侧的计算是 grouped GEMM——对按专家分组的多段矩阵连续做乘法，要求数据落进 buffer 时就按专家分组排好。DeepEP 的接收布局就是为配套 GEMM 库设计的<sup>[C31]</sup>，这是通用原语不提供的接口语义。</p>
 
 <p>第三，FP8 dispatch。V3 把 MoE up 投影前的激活量化为 FP8 再 dispatch，反向的激活梯度同样处理；前后向 combine 保留 BF16 以保住训练关键路径的精度<sup>[C30]</sup>。dispatch 载荷的 FP8（连同样因子的布局约定）不是通用库的标准需求。</p>
 
@@ -328,7 +328,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 </table>
 </div>
 
-<p>节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值；跨节点 43-58 GB/s 中 EP32/64 的 57-58 GB/s 已高于单卡 CX7 网卡约 50 GB/s 的峰值。这与第 4 章 V2 表同理：RDMA 带宽是含本 rank 流量的逻辑带宽，故可超过单卡网卡峰值（legacy.md 未注明口径，此为页面据数值与 NIC 峰值的推断）——高吞吐内核的设计目标就是把两种网络都跑满。V2 的实测（每 batch 8K tokens、hidden 7168、top-8 专家、FP8 dispatch + BF16 combine，逻辑带宽含本 rank 流量）在 SM90 + CX7 的 EP 8×2 拓扑用 12 个 SM 达到 90/81 GB/s<sup>[N4]</sup>，见第 4 章「V2 重构」。</p>
+<p>节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值；跨节点 43-58 GB/s 中 EP32 的 58/57 GB/s 已高于单卡 CX7 网卡约 50 GB/s 的峰值，EP64 的 51/50 GB/s 则与峰值持平（dispatch 的 51 GB/s 仅略高，combine 的 50 GB/s 与之相等）。这与第 4 章 V2 表同理：RDMA 带宽是含本 rank 流量的逻辑带宽，故可超过单卡网卡峰值（legacy.md 未注明口径，此为页面据数值与 NIC 峰值的推断）——高吞吐内核的设计目标就是把两种网络都跑满。V2 的实测（每 batch 8K tokens、hidden 7168、top-8 专家、FP8 dispatch + BF16 combine，逻辑带宽含本 rank 流量）在 SM90 + CX7 的 EP 8×2 拓扑用 12 个 SM 达到 90/81 GB/s<sup>[N4]</sup>，见第 4 章「V2 重构」。</p>
 
 <p>高吞吐内核用两段转发换带宽，代价是路径长、同步点多：V1 的 normal dispatch 内部还有等待接收计数的隐式 CPU 同步，与 CUDA graph 不兼容<sup>[C11]</sup>。prefill 与训练的大 batch 扛得住这些代价，decode 的每步小 batch 通信等不起——需要一套设计点完全不同的内核。</p>
 
@@ -366,7 +366,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 <p>实测带宽到什么水平？</p>
 <details>
 <summary>解答：节点内与跨节点都逼近各自峰值</summary>
-<p>V1 normal 实测（H800、每 batch 4096 tokens、hidden 7168、top-4 组 top-8 专家、FP8 dispatch + BF16 combine）：节点内 EP8 dispatch/combine 为 153/158 GB/s，逼近 160 GB/s 的 NVLink 峰值；跨节点 EP16/32/64 为 43-58 GB/s，其中 EP32/64 的 57-58 GB/s 高于单卡网卡约 50 GB/s 的峰值——口径为含本 rank 流量的逻辑带宽。</p>
+<p>V1 normal 实测（H800、每 batch 4096 tokens、hidden 7168、top-4 组 top-8 专家、FP8 dispatch + BF16 combine）：节点内 EP8 dispatch/combine 为 153/158 GB/s，逼近 160 GB/s 的 NVLink 峰值；跨节点 EP16/32/64 为 43-58 GB/s，其中 EP32 的 58/57 GB/s 高于单卡网卡约 50 GB/s 的峰值，EP64 的 51/50 GB/s 与峰值持平——口径为页面推断的含本 rank 流量逻辑带宽（说明见 2.5 节「实测带宽」）。</p>
 </details>
 </li>
 </ol>
@@ -634,7 +634,7 @@ rank 0 两个 token 的 combine 结果：
 </table>
 </div>
 
-<p>dispatch 延迟从 EP8 的 77 µs 涨到 EP128 的 192 µs 后趋于平坦，折算带宽则随 EP 增大持续下降。与 normal 内核跨节点的 43-58 GB/s 相比：EP8 的 98/127 GB/s、EP16 的 63/74 GB/s 都高于这个范围；EP64 的 43/46 GB/s 落进范围之内；到 EP128/256 才下探到范围下界之下（39/39、39/40 GB/s）——只有更大 EP 规模下，纯 RDMA 的带宽利用率才明显更低。表列带宽同为含本 rank 流量的逻辑带宽，可超过单卡网卡峰值。小 batch 的 decode 关心的是延迟而非带宽，这个交换才划算；低延迟内核的定位本来就是延迟敏感的 decode——与 high-throughput 内核面向训练/prefill 的分工相对（见第 1 章「专家并行的 all-to-all 卡在哪」）。另一个代价是显存：固定槽位按最坏情况预留，低延迟模式的 buffer 消耗远大于 normal 模式<sup>[C17]</sup>。</p>
+<p>dispatch 延迟从 EP8 的 77 µs 涨到 EP128 的 192 µs 后趋于平坦，折算带宽则随 EP 增大持续下降。与 normal 内核跨节点的 43-58 GB/s 相比：EP8 的 98/127 GB/s、EP16 的 63/74 GB/s 都高于这个范围；EP64 的 43/46 GB/s 落进范围之内；到 EP128/256 才下探到范围下界之下（39/39、39/40 GB/s）——只有更大 EP 规模下，纯 RDMA 的带宽利用率才明显更低。表列带宽同为含本 rank 流量的逻辑带宽（该口径为页面推断，说明见 2.5 节），可超过单卡网卡峰值。小 batch 的 decode 关心的是延迟而非带宽，这个交换才划算；低延迟内核的定位本来就是延迟敏感的 decode——与 high-throughput 内核面向训练/prefill 的分工相对（见第 1 章「专家并行的 all-to-all 卡在哪」）。另一个代价是显存：固定槽位按最坏情况预留，低延迟模式的 buffer 消耗远大于 normal 模式<sup>[C17]</sup>。</p>
 
 <p>两套内核讲完，剩下的是工程面：V1 的接口是两套、通信后端是 NVSHMEM、SM 数量靠 auto-tuning——V2 把这些统一重做，引出第 4 章「V2 重构」。</p>
 

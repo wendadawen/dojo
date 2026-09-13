@@ -62,7 +62,7 @@
 <p><b>主要依据</b>：Su, Lu, Pan, Murtadha, Wen, Liu. "RoFormer: Enhanced Transformer with Rotary Position Embedding." arXiv:2104.09864v5, 2023（首版 2021）。论文公式编号：Eq.(1)–(10) 在 §2 背景与相关工作；Eq.(11) 相对位置编码目标，Eq.(12)–(13) 2 维复数解与旋转矩阵，Eq.(14)–(16) d 维形式与块对角矩阵；Eq.(20)–(33) §3.4.1 的 2 维严格推导，Eq.(34) §3.4.2 高效实现，Eq.(35)–(37) §3.4.3 远程衰减。</p>
 </blockquote>
 
-<p>给一个 Transformer 喂三个内容完全相同的 token "the the the"，每个位置的输出会一样吗？答案是：在没有任何位置信息时，三个位置的输出完全一样——注意力只看内容匹配，不看顺序。要让模型分清"第一个 the"和"第三个 the"，必须把位置信息注入到注意力里。<strong>RoPE</strong>（Rotary Position Embedding，旋转位置编码）的做法是：按 token 的绝对位置旋转它的 query 和 key 向量，使两个 token 之间的注意力内积自然只依赖它们的相对位置 $m-n$，且不引入任何可学习参数。RoPE 是当前自回归 LLM 的默认位置编码，被 LLaMA、Mistral、Qwen、Falcon、PaLM、Gemma、GPT-NeoX 等采用<sup>[C6]</sup>。本文回答：RoPE 的旋转矩阵长什么样？为什么内积只依赖 $m-n$？远程衰减从何而来？为什么只动 Q/K 不动 V？长度外推为何需要扩展方法？</p>
+<p>给一个 Transformer 喂三个内容完全相同的 token "the the the"，每个位置的输出会一样吗？答案是：在没有任何位置信息时，三个位置的输出完全一样——注意力只看内容匹配，不看顺序。要让模型分清"第一个 the"和"第三个 the"，必须把位置信息注入到注意力里。<strong>RoPE</strong>（Rotary Position Embedding，旋转位置编码）的做法是：按 token 的绝对位置旋转它的 query 和 key 向量，使两个 token 之间的注意力内积自然只依赖它们的相对位置 $m-n$，且不引入任何可学习参数。RoPE 是当前自回归 LLM 中采用最广的位置编码方案，公开资料常把 LLaMA、Mistral、Qwen、Falcon、PaLM、Gemma、GPT-NeoX 等模型家族列为它的使用者（此句为公开模型资料的概括，未逐模型核对到可定位出处）<sup>[C6]</sup>。围绕 RoPE 的核心问题有五个：旋转矩阵长什么样？为什么内积只依赖 $m-n$？远程衰减从何而来？为什么只动 Q/K 不动 V？长度外推为何需要扩展方法？</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -126,7 +126,7 @@
 
 <p><a href="../../wiki/standard-attention/index.html"><strong>自注意力</strong></a>（softmax 注意力）是"用 query 和 key 做匹配、按匹配程度对 value 加权求和"的机制；<a href="../../wiki/positional-encoding/index.html"><strong>位置编码</strong></a>是给注意力注入位置信息的方法；<a href="../../wiki/causal-mask/index.html"><strong>因果掩码</strong></a>是 decoder-only 注意力中阻止看到未来 token 的上三角 mask；<strong>排列等变</strong>——交换输入顺序后各位置的输出值不变——的形式化讨论见 <a href="../../wiki/nope/index.html">NoPE</a>。矩阵吸收与 RoPE 解耦见 <a href="../../wiki/mla/index.html">MLA</a>，K3 的 MLA 用 NoPE 设计见 <a href="../../wiki/kimi-k3/index.html">Kimi K3</a>。</p>
 
-<p>贯穿全文的问题是：把同一组 2 维 query 和 key 放在不同位置 $m$、$n$ 上，旋转后它们的内积会是什么样？这个问题在 2 维 RoPE 一章手算回答，并在内积证明一章验证它只依赖 $m-n$。</p>
+<p>把同一组 2 维 query 和 key 放在不同位置 $m$、$n$ 上，旋转后它们的内积会是什么样？这个问题在 2 维 RoPE 一章手算回答，并在内积证明一章验证它只依赖 $m-n$。</p>
 
 <h2 id="why-position-encoding">1. 为什么 Transformer 需要位置编码——RoPE 与四类方案的差异</h2>
 
@@ -325,7 +325,7 @@ $$\langle R_m q, R_n k \rangle = q^T R_m^T R_n k = q^T R_{n-m} k.$$
 <p>再用上一章的手算例子做一次验证：上一章里 $m=1$、$n=2$、$q=k=(1,0)$、$\theta=\pi/4$，内积是 $\sqrt{2}/2$。如果把 $m$ 改成 5、$n$ 改成 6（保持 $n-m=1$），手算结果应当一致。代入 F2：$(q_0 k_0 + q_1 k_1)\cos((6-5)\pi/4) - (q_0 k_1 - q_1 k_0)\sin((6-5)\pi/4) = 1\cdot\cos(\pi/4) - 0\cdot\sin(\pi/4) = \sqrt{2}/2$。结果确实一致——这是 $R_m^T R_n = R_{n-m}$ 在具体数字上的验证。</p>
 
 <div class="callout callout-yellow">
-<p>注意 $R_{n-m}$ 与 $R_{m-n}$ 的区别：$R_{n-m}$ 角度是 $(n-m)\theta$，$R_{m-n}$ 角度是 $(m-n)\theta = -(n-m)\theta$。由于 $R_{-t} = R_t^T$，两者方向相反但内积结果相同（内积是标量，转置不改变）。论文统一用 $R_{n-m}$，本页沿用。</p>
+<p>注意 $R_{n-m}$ 与 $R_{m-n}$ 的区别：$R_{n-m}$ 角度是 $(n-m)\theta$，$R_{m-n}$ 角度是 $(m-n)\theta = -(n-m)\theta$。由于 $R_{-t} = R_t^T$，两者方向相反但内积结果相同（内积是标量，转置不改变）。论文统一写作 $R_{n-m}$。</p>
 </div>
 
 <h3 id="relative-position-proof-questions">本章问题</h3>
@@ -387,7 +387,7 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 
 <p>这是个几何级数<sup>[C4]</sup>：$i$ 每加 1，$\theta_i$ 乘上 $\mathrm{base}^{-2/d}$<sup>[F6]</sup>。它和 Vaswani et al. 2017 的正弦位置编码频率公式同源，不是 RoPE 新发明的。但 RoPE 把它用在旋转矩阵上，每对维度独立旋转。</p>
 
-<p>几何级数让 $\theta_i$ 跨越很大范围——$i$ 小则 $\theta_i$ 大（旋转快、捕获短程依赖），$i$ 大则 $\theta_i$ 小（旋转慢、捕获长程依赖）。下面是 $d=128$、$\mathrm{base}=10000$ 的几个典型值：</p>
+<p>几何级数让 $\theta_i$ 跨越很大范围——$i$ 小则 $\theta_i$ 大（旋转快、捕获短程依赖），$i$ 大则 $\theta_i$ 小（旋转慢、捕获长程依赖）。表给出 $d=128$、$\mathrm{base}=10000$ 的几个典型值：</p>
 
 <div class="table-scroll">
 <table>
@@ -417,7 +417,7 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 <p>两对的 $(n-m)$ 都是 1，但 $\theta_i$ 不同使相对角 $(n-m)\theta_i$ 不同，因而内积贡献也不同：第 0 对 $\cos((n-m)\theta_0)=\cos1\approx0.5403$（相对角 1 弧度），第 1 对 $\cos((n-m)\theta_1)=\cos0.5\approx0.8776$（相对角 0.5 弧度）。若改看 key 在位置 $n=2$ 处的绝对旋转状态（角度 $n\theta_i$，不是内积贡献）：$\theta_0=1$ 时已转到 $n\theta_0=2$ 弧度（$\cos2\approx-0.416$），$\theta_1=0.5$ 时只转到 $n\theta_1=1$ 弧度（$\cos1\approx0.540$）。同一位置处高频对的相位推进更快，这就是"多尺度同时编码"的最小例证。</p>
 </details>
 
-<p>实现层面存在一个等价性：原论文用"相邻对"形式 $(q_0,q_1), (q_2,q_3), \ldots$；但 GPT-NeoX、LLaMA 等实现把向量拆成"前半 $q_{0..d/2-1}$ 与后半 $q_{d/2..d-1}$"，对 $(q_i, q_{i+d/2})$ 做逐元素旋转。两种形式数学等价（只是配对方式不同；"实现用前后两半因为逐元素操作更高效"为社区通行解释，RoPE 论文未讨论实现细节）。本文按论文原形式讲解。</p>
+<p>实现层面存在一个等价性：原论文用"相邻对"形式 $(q_0,q_1), (q_2,q_3), \ldots$；但 GPT-NeoX、LLaMA 等实现把向量拆成"前半 $q_{0..d/2-1}$ 与后半 $q_{d/2..d-1}$"，对 $(q_i, q_{i+d/2})$ 做逐元素旋转。两种形式数学等价（只是配对方式不同；"实现用前后两半因为逐元素操作更高效"为社区通行解释，RoPE 论文未讨论实现细节）。按论文原形式讲解。</p>
 
 <h3 id="d-dim-generalization-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -462,7 +462,7 @@ $$\langle R_m^d q, R_n^d k \rangle = \sum_{i=0}^{d/2-1} 2\cos((n-m)\theta_i) \pr
 
 $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 
-<p>这是个有限和的振荡函数。当 $|m-n|$ 增大时，$\theta_i$ 跨越多个数量级使各 $\cos((n-m)\theta_i)$ 的相位相互抵消，归一化和的幅度总体趋小（但并非严格收敛到 0，而是几乎周期的振荡）。论文 §3.4.3 用 Abel 变换给出该和的上界<sup>[F8]</sup>；本文此处用特定情形的确定性计算与相位抵消直觉作教学简化，不等价于论文上界。一般 $q,k$ 下内积是 $\sum_i r_{q,i}r_{k,i}\cos((n-m)\theta_i+\phi_{q,i}-\phi_{k,i})$（极坐标表示），相位抵消的定性结论同样成立。</p>
+<p>这是个有限和的振荡函数。当 $|m-n|$ 增大时，$\theta_i$ 跨越多个数量级使各 $\cos((n-m)\theta_i)$ 的相位相互抵消，归一化和的幅度总体趋小（但并非严格收敛到 0，而是几乎周期的振荡）。论文 §3.4.3 用 Abel 变换给出该和的上界<sup>[F8]</sup>；特定情形的确定性计算与相位抵消直觉是教学简化，不等价于论文上界。一般 $q,k$ 下内积是 $\sum_i r_{q,i}r_{k,i}\cos((n-m)\theta_i+\phi_{k,i}-\phi_{q,i})$（极坐标表示，$\phi_{q,i}$、$\phi_{k,i}$ 为两向量各坐标对的相位），相位抵消的定性结论同样成立。</p>
 
 <details>
 <summary>补充：从内积公式到归一化和的推导</summary>
@@ -477,7 +477,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p>注意：上式是 $q=k$、分量恒定这一特定情形的确定性计算，不是 i.i.d. 期望。真实模型中 $q$、$k$ 分量分布有结构，具体 token 对的内积不一定遵循这条曲线；但相位抵消的定性趋势（$|m-n|$ 大时归一化和幅度趋小）对一般 $q,k$ 仍成立，这解释了 RoPE 经验上的隐式局部性偏置。</p>
 </details>
 
-<p>下面是 $d=128$、$\mathrm{base}=10000$（LLaMA 系列典型配置）下，归一化内积随 $|m-n|$ 的变化。这是构造示例，按归一化内积公式 $\frac{1}{64}\sum_{i=0}^{63}\cos((n-m)\theta_i)$ 直接计算（非实测数据）：</p>
+<p>表给出 $d=128$、$\mathrm{base}=10000$（LLaMA 系列典型配置）下，归一化内积随 $|m-n|$ 的变化。这是构造示例，按归一化内积公式 $\frac{1}{64}\sum_{i=0}^{63}\cos((n-m)\theta_i)$ 直接计算（非实测数据）：</p>
 
 <div class="table-scroll">
 <table>
@@ -552,7 +552,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p><strong>常见误解</strong>："RoPE 可以任意外推到更长序列。"这是错的。论文摘要提到"flexibility of sequence length"，指的是 RoPE 在结构上能扩展到任意长度（不像 learned APE 超出表长即失败），但不意味着简单外推效果不变。超出训练长度时性能下降是经验事实，需要扩展方法处理。</p>
 </div>
 
-<p>常见的扩展方法（本文不展开推导，只列方向）<sup>[C7]</sup>：</p>
+<p>常见的扩展方法（不展开推导，只列方向）<sup>[C7]</sup>：</p>
 
 <div class="table-scroll">
 <table>
@@ -604,7 +604,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
   </li>
 </ol>
 
-<p>本文从"Transformer 为什么需要位置编码"出发，依次回答了开篇的五个问题：RoPE 用旋转矩阵编码绝对位置，使内积只依赖相对位置 $m-n$<sup>[C2]</sup>；2 维机制通过分块对角推广到 d 维，$\theta_i$ 几何级数实现多尺度编码<sup>[C4]</sup>；远程衰减来自相位抵消<sup>[C5]</sup>；RoPE 只动 Q/K 不动 V<sup>[C1]</sup>；超出训练长度需要 YaRN/PI 扩展<sup>[C7]</sup>，与 MLA 矩阵吸收冲突时用解耦或 NoPE 绕过<sup>[C8]</sup>。这些是理解任何 transformer 位置方案的前提——不是"加 RoPE 就行"，而是"RoPE 在什么条件下成立、不成立时怎么办"。</p>
+<p>从"Transformer 为什么需要位置编码"出发，依次回答核心问题中的五个问题：RoPE 用旋转矩阵编码绝对位置，使内积只依赖相对位置 $m-n$<sup>[C2]</sup>；2 维机制通过分块对角推广到 d 维，$\theta_i$ 几何级数实现多尺度编码<sup>[C4]</sup>；远程衰减来自相位抵消<sup>[C5]</sup>；RoPE 只动 Q/K 不动 V<sup>[C1]</sup>；超出训练长度需要 YaRN/PI 扩展<sup>[C7]</sup>，与 MLA 矩阵吸收冲突时用解耦或 NoPE 绕过<sup>[C8]</sup>。这些是理解任何 transformer 位置方案的前提——不是"加 RoPE 就行"，而是"RoPE 在什么条件下成立、不成立时怎么办"。</p>
 
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
@@ -612,11 +612,11 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p><strong>C1（RoPE 只作用于 Q 和 K，不作用于 V）</strong>：Su et al. 2021, arXiv:2104.09864v5, §3.2.1 Eq.(13)（2 维）与 §3.2.2 Eq.(14)（d 维）。Eq.(14) 的下标为 $\{q,k\}$、不含 $v$，故 $v_n = W_v x_n$ 不带旋转矩阵。</p>
 <p><strong>C2（绝对构造、相对效果）</strong>：Su et al. 2021, 摘要；§3.1 Eq.(11)；论文摘要原文 "encodes the absolute position with a rotation matrix and meanwhile incorporates the explicit relative position dependency …"。</p>
 <p><strong>C3（无可学习参数）</strong>：Su et al. 2021, §3.2.2 Eq.(15) 后的参数定义（"pre-defined parameters $\Theta=\{\theta_i=10000^{-2(i-1)/d}\}$"）与 §3.3（"Following Vaswani et al. 2017, we set $\theta_i=10000^{-2i/d}$"）；$\theta_i$ 与 base=10000 为固定常数。</p>
-<p><strong>C4（几何级数多尺度）</strong>：Su et al. 2021, §3.2.2 Eq.(15) 后的 $\Theta$ 定义与 §3.3；多源综述印证（agentica.wiki、unseel.com/cs/rotary-position-embedding、spawn08.github.io）。</p>
+<p><strong>C4（几何级数多尺度）</strong>：Su et al. 2021, §3.2.2 Eq.(15) 后的 $\Theta$ 定义（$\Theta=\{\theta_i=10000^{-2(i-1)/d}\}$）与 §3.3（"Following Vaswani et al. 2017, we set $\theta_i=10000^{-2i/d}$"）；与 Vaswani et al. 2017 正弦位置编码的频率公式（Eq.(4)）同源。</p>
 <p><strong>C5（远程衰减性质）</strong>：Su et al. 2021, §3.4.3 "Long-term decay", Eq.(35)–(37)；论文用 Abel 变换证明上界（Eq.(36)–(37)），图 2 给出上界量 $\frac{1}{d/2}\sum_{i=1}^{d/2}|S_i|$ 随相对距离增大而衰减的曲线（原文 "the value of $\frac{1}{d/2}\sum_{i=1}^{d/2}|S_{i}|$ decay with the relative distance $m-n$ increases … as shown in Figure 2"；论文未标注图中维度取值）。本文用特定情形（$q=k$、分量恒定）的确定性计算作教学简化（见简化 3），论证不等价于论文上界。</p>
-<p><strong>C6（主流 LLM 采用）</strong>：多源综述印证（LLaMA / Mistral / Falcon / Qwen / PaLM / Gemma / GPT-NeoX）；逐模型引用需查对应论文 / 配置文件。</p>
+<p><strong>C6（主流 LLM 采用）</strong>：基于公开模型资料的概括性推断——LLaMA / Mistral / Falcon / Qwen / PaLM / Gemma / GPT-NeoX 等模型家族在公开描述中常被列为 RoPE 的使用者；本文未逐模型核对到可定位出处，正文已按推断标注。可核对路径为各模型论文或官方 config.json 中的 <code>rope_theta</code> / <code>rope_scaling</code> 字段。</p>
 <p><strong>C7（长度外推需扩展）</strong>：Chen et al. 2023, arXiv:2306.15595（PI）；Peng et al. 2023, arXiv:2309.00071（YaRN）。</p>
-<p><strong>C8（K3 MLA 用 NoPE）</strong>：Kimi K3 技术报告 §2.1.2、§3.4；config.json <code>mla_use_nope=true</code>；<a href="../../wiki/mla/index.html">MLA</a> 的"为什么 RoPE 要解耦"一章、<a href="../../wiki/nope/index.html">NoPE</a>、<a href="../../wiki/kimi-k3/index.html">Kimi K3</a> 的"Gated MLA"与"长上下文扩展"一章已对此论证。</p>
+<p><strong>C8（K3 MLA 用 NoPE）</strong>：Kimi K3 技术报告 §2.1.2、§3.4；config.json <code>mla_use_nope=true</code>；<a href="../../wiki/mla/index.html">MLA</a> 的"为什么 RoPE 要解耦"与"K3 的 Gated MLA"一章、<a href="../../wiki/nope/index.html">NoPE</a>、<a href="../../wiki/kimi-k3/index.html">Kimi K3</a> 的"长上下文扩展"一章已对此论证。</p>
 
 <h3>公式与来源（F）</h3>
 <p><strong>F1（2 维旋转矩阵 $R_m$）</strong>：Su et al. 2021, §3.2.1, Eq.(13)。</p>
