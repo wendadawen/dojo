@@ -1,0 +1,39 @@
+<!-- review-meta
+round: 5
+page: wiki/mxfp4-qat/index.html
+reviewed_content_sha256: 973fbed66fc115a6
+-->
+# MXFP4 量化感知训练审查记录（第 5 轮）
+
+- 页面版本：6e7d8eb5cd6a67450a66c01b337e06de5b46f863（git hash-object wiki/mxfp4-qat/index.html）
+- 审查时间：2026-09-13 21:20
+- 审查者：独立子代理
+- 已完整阅读章节：核心问题、常见误解、1. MoE 专家权重——896 个专家压到 4-bit 能省多少显存（含「展开：每个专家参数量与 BF16/MXFP4 显存」折叠块、本章问题）、2. MXFP4 编码——一个权重值怎么用 4-bit 表示（含块结构图、「展开：两个 4 元素块的量化、反量化与误差」折叠块、本章问题）、3. QAT 机制——前向和反向做了什么，与 PTQ 差在哪（含手算折叠块、可运行代码折叠块、辅助解释 callout、本章问题）、4. RL 一致性——QAT 怎么贯穿 SFT 和 RL 且不产生 mismatch（含 RL 循环图、本章问题）、5. 选择性量化——K3 量化了哪些组件、不量化哪些（含组件表、「补充：config.json 的 quantization_config 字段（节选）」折叠块、本章问题）、来源与范围说明
+
+外部核对：arXiv:2607.24653v2（Kimi K3 技术报告）§4.1.4 正文、§3.2 Table 1、Abstract 与 References 中 [49]/[50]/[103]/[104] 逐条抓原文；HuggingFace `moonshotai/Kimi-K3` `config.json` 逐字段（`num_experts`/`num_experts_per_token`/`num_shared_experts`/`num_hidden_layers`/`first_k_dense_replace`/`hidden_size`/`routed_expert_hidden_size`/`moe_intermediate_size`/`quantization_config`）；arXiv:2310.10537（Rouhani et al.）Table 1 与 Algorithm 1；ONNX 数据类型文档「Float stored in 4 bits」「Float stored in 8 bits」（FLOAT4E2M1 位表、E8M0 表、downcast 截断规则）。页面 Python 代码在本机 python3 实跑并与「预期输出」逐行比对；`python3 .dojo/scripts/validate.py wiki/mxfp4-qat/index.html` 返回 `validation ok`（exit 0）。
+
+## 问题
+
+- [阻断·技术] 来源与范围说明 C6（L608）：把 K3 报告对 Jacob et al. (2018) 的引文编号写成 [50]，报告实际编号为 [49]。｜引文依据：报告 §4.1.4 原文「We perform quantization-aware training (QAT) [49] throughout the entire post-training stage」；References 中「[49] B. Jacob, S. Kligys, B. Chen, M. Zhu, M. Tang, A. Howard, H. Adam, and D. Kalenichenko (2018) Quantization and training of neural networks for efficient integer-arithmetic-only inference. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR), pp. 2704–2713」（书目信息与页面所写完全一致，可确认所指即此条），而「[50] S. A. Jacobs, M. Tanaka, C. Zhang, M. Zhang, S. L. Song, S. Rajbhandari, and Y. He (2023) DeepSpeed ulysses…」——[50] 并不支持该论断。｜修复要求：将 C6 中的「K3 引用 [50]」改为「K3 引用 [49]」；正文其余 [C6] 引用点（常见误解第 2 条、第 3 章）无需改动。｜修复：｜复验：
+- [重要·技术] 第 5 章正文（L531）与核心问题 5 解答（L150）：称「表中 attention 投影、共享专家、dense FFN 投影、lm_head、vision tower、mm_projector 六行能在官方 config.json 的 ignore 列表里直接核对」，但表中并不存在「dense FFN 投影」这一行——表中不量化的行是 attention 投影、latent MoE 投影、共享专家（2 个）、MoE router、lm_head、vision tower / mm_projector；与 config.json ignore 六条正则语义对应的实际只有 4 行（attention 投影、共享专家、lm_head、vision tower / mm_projector）。同段下句又说「latent MoE 投影与 MoE router 两行只有 K3 报告的支持」，与「六行」自相矛盾。｜引文依据：config.json `quantization_config.ignore` = ["re:.*self_attn.*", "re:.*shared_experts.*", "re:.*mlp\\.(gate|up|gate_up|down)_proj.*", "re:.*lm_head.*", "re:.*vision_tower.*", "re:.*mm_projector.*"]；本页 L517–527 表格共 8 行，其中「dense FFN 投影」不在行内。｜修复要求：把「表中 …dense FFN 投影… 六行」改为与表格一致的表述，例如「config.json 的 ignore 列表覆盖表格中 attention 投影、共享专家、lm_head、vision tower / mm_projector 四行，对应 `self_attn`、`shared_experts`、`lm_head`、`vision_tower`、`mm_projector`（另含表外的前 1 层 dense FFN 投影正则 `mlp.(gate|up|gate_up|down)_proj`）」；核心问题 5 解答（L150）中的「其中 attention 投影、共享专家、dense FFN 投影、lm_head、vision tower、mm_projector 可在官方 config.json 的 ignore 列表核对」同步改为同口径（「六」改「五」项，或明确 dense FFN 投影为表外组件）。｜修复：｜复验：
+- [轻微·技术] 第 2 章结构图图注（L228）：图注写「下图为教学缩写 4 元素」，但图中元素框依次为 $q_1$、$q_2$、$q_3$、$q_4$、……、$q_{32}$，即 32 元素的真实块，图注与图不符（同页他处统一为「块大小教学缩写为 4，真实为 32」）。｜引文依据：不适用（页内自校，L227–241 与 L414、L631、L646）。｜修复要求：将图注改为「块大小 = 32，真实格式；图中省略中间元素」或删去「4 元素」字样，使图注与图内 $q_1$…$q_{32}$ 一致。｜修复：｜复验：
+- [轻微·技术] 来源与范围说明 C5（L605）与「简化条件及其限制」（L648）：两处引用「本机 `kernel.py` 的 `fp4_max = 6.0`」作为 MXFP4 归一化值截断规则的对照依据，但仓库内不存在该文件，本机检索（`find` / `mdfind`）亦无 `fp4_max` 语义对应的 `kernel.py`（仅有 vllm 的 NVFP4 内核注释），读者无法定位核对；且该对照属 DeepSeek-V4.1-Flash 推理内核的语义复现，与本页主体（Kimi K3）非同一来源。｜引文依据：不适用（文件定位失败；该论断本身已由 OCP MX v1.0 §6.3 与 ONNX float4 文档「x>6 → 6，x<-6 → -6」独立支持，核对通过）。｜修复要求：删去 C5 与「简化条件及其限制」中的「本机 `kernel.py`」引用（保留 OCP MX v1.0 §6.3 与 ONNX float4 文档即可），或改为可定位的仓库内路径。｜修复：｜复验：
+
+## 结论
+
+- 统计：阻断 1 / 重要 1 / 轻微 2
+- 处置：修复
+
+补充说明（不计入问题）：
+
+（a）核心数字与算式复算全部通过：单专家 $3\times3584\times3072=33{,}030{,}144\approx33.03\mathrm{M}$；$896\times92=82{,}432$ 个专家，$82{,}432\times33.03\mathrm{M}\approx2.72\mathrm{T}$；BF16 $2.72\mathrm{T}\times2\approx5.44$ TB；MXFP4 元素 $2.72\mathrm{T}\times0.5\approx1.36$ TB + scale $2.72\mathrm{T}/32\approx85.1$ GB，合计 $\approx1.445$ TB；压缩 $5.44/1.445\approx3.76\times$，与有效位宽 $4+8/32=4.25$ bit 推出的 $16/4.25\approx3.76\times$ 一致；「省下约 4 TB」与 $5.44-1.445\approx4.0$ TB 一致。块 2 误差 $[0.05,-0.025,-0.05,-0.05]$ 与相对误差 17%/25%/11%/25% 复算一致；QAT 单步 $0.80/0.25=3.2\to3.0\to\hat w=0.75$、偏差 $0.05$ 复算一致。正文、核心问题解答、本章问题解答与 overview.html 的同一数字（2.72T / 5.4 TB / 1.45 TB / 3.76×）无一处互相矛盾。
+
+（b）config.json 逐字段核对通过：`num_experts: 896`、`num_experts_per_token: 16`、`num_shared_experts: 2`、`num_hidden_layers: 93`、`first_k_dense_replace: 1`、`hidden_size: 7168`、`routed_expert_hidden_size: 3584`、`moe_intermediate_size: 3072`、`group_size: 32`、`num_bits: 4`、`type: "float"`、`symmetric: true`、`format: "mxfp4-pack-quantized"`、`ignore` 六条正则均与页面一致（页面摘录取自 `text_config.quantization_config` 并标为「节选」，省略的 `input_activations: null` 等字段不影响结论）。报告 §3.2 Table 1「Total Parameters 2.78T / Activated Parameters 104.2B / 93 Layers / 896 Routed Experts / 16 Active / 2 Shared / 3584 Latent MoE Dimension / 3,072 per Expert」与 Abstract「a 2.8T parameter Mixture-of-Experts model with 104 billion activated parameters」与 N7 一致。
+
+（c）E2M1 值集 $\{0,0.5,1,1.5,2,3,4,6\}$（非零正值 7 个、最大幅度 6、指数 bias 1）由 ONNX「Float stored in 4 bits」位表逐位核对一致；E8M0 的 bias 127、Min $00000000_2=2^{-127}$、Max $11111110_2=2^{127}$、NaN $11111111_2$ 由 ONNX「Float stored in 8 bits」核对一致；MXFP8 块 32 + E8M0 scale + FP8（E4M3/E5M2）由 Rouhani et al. Table 1 核对一致；Algorithm 1 第 4 行「clamping normal numbers…」与其正文「normal numbers that exceed the representable range of the element format are clamped to the maximum representable value, preserving the sign. This is in accordance with the OCP MX specification」支持截断规则。C1/C2/C3/C4/N6 的报告引文逐字核对一致（C2「During RL, rollout and training share the same quantization scheme — eliminating the train–inference mismatch.」；C3「all non-expert components (attention projections, latent MoE projections, shared experts, and MoE routers) remain in higher precision.」；C4「Draft fine-tuning follows the post-training QAT configuration (§ 4.1.4), with MoE expert weights in MXFP4 and their input activations in MXFP8, while non-expert modules remain in higher precision.」）。
+
+（d）可运行代码在本机 python3 实跑，输出与页面「预期输出」8 行逐行一致（block1 误差全零、block2 量化 [1.0, 0.5, 2.0, 1.0]、w_hat=0.75、STE 传回梯度 1.0）。
+
+（e）表述维度：全文无「我们/咱们/你/笔者」等会话人称，无「下面来看」「需要注意的是」「值得注意的是」类元话语，无调试/复现踩坑叙事，无「场景」当术语的用法。多处「本页推断」「本页示例未触发该分支」属 style-guide §12 允许的自称与 check.md 要求的推断标注，不计为问题；各章末「下一章讲…」为章节衔接句，与同仓库 39 个概念页写法一致，不计为问题。
+
+（f）两级问题块齐备：页面级「核心问题」5 条与各章「本章问题」各 3 条均配有 `解答：` 折叠块，5 条核心问题答案末尾均指明完整论证所在章节。前置概念链接 `../moe-serving/index.html`、`../quantization-basics/index.html` 均真实存在，无「（待生成）」占位；overview.html 与 index.html 相互链接；head 的 description / dojo:summary / dojo:type=concept / dojo:topics（「训练与优化」在词表内）/ dojo:tag 齐备；数学符号全部经 KaTeX 书写，`×`、`→` 属 validate.py 明确排除的排版字符；结构图为 HTML 结构（非等宽字符框线），无 alt 属性含 `$...$`。

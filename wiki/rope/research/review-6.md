@@ -1,0 +1,27 @@
+<!-- review-meta
+round: 6
+page: wiki/rope/index.html
+reviewed_content_sha256: db9c72d3ca1119b7
+-->
+# RoPE 旋转位置编码审查记录（第 6 轮）
+
+- 页面版本：4d38ee47707912c33511d802449153cd8a2af489（wiki/rope/index.html）
+- 审查时间：2026-09-13 21:18
+- 审查者：独立子代理（未参与写作与前序轮次）
+- 已完整阅读章节：核心问题（5 问 5 答）；1. 为什么 Transformer 需要位置编码——RoPE 与四类方案的差异；2. 2 维 RoPE 是怎么旋转的——最小可手算机制；3. 内积为何只依赖 $m-n$——旋转矩阵群的性质；4. d 维推广——分块对角旋转矩阵与 $\theta_i$ 几何级数；5. 远程衰减——相位抵消与 QK-only 机制；6. 适用边界——长度外推、K3 MLA 的 NoPE 选择（含 6.1、6.2）；来源与范围说明（论断与来源 C、公式与来源 F、外部数字与实验条件 N、构造示例、辅助解释与类比边界、简化条件及其限制）。另完整阅读 wiki/rope/overview.html。
+- 机械验证：`python3 .dojo/scripts/validate.py wiki/rope/index.html` → `validation ok`；`dojo:topics=注意力机制` 与 `dojo:tag=位置编码` 均在 AGENTS.md/catalog_builder.py 固定词表内。
+- 本轮已回源核对并复算通过（无问题）：论文 Eq. 编号（Eq.(11) 相对位置目标、Eq.(12)–(13) 2 维复数解与旋转、Eq.(14) d 维投影、Eq.(15) 分块对角 $R^d_m$ 与 $\Theta$ 定义、Eq.(16) $q_m^\top k_n=x^\top W_q R^d_{\Theta,n-m}W_kx_n$、Eq.(20)–(33) §3.4.1 2 维推导、Eq.(34) §3.4.2、Eq.(35)–(37) §3.4.3 与 Fig.2，ar5iv 原文逐条对上）；摘要原文 “encodes the absolute position with a rotation matrix…” 与 “flexibility of sequence length”（arXiv:2104.09864 摘要页原文）；§3.3 “$\theta_i=10000^{-2i/d}$” 与 Eq.(15) 后 “$\Theta=\{\theta_i=10000^{-2(i-1)/d}\}$”；2 维内积公式 F2（自行按旋转矩阵展开复算一致）；$R_m^T R_n=R_{n-m}$ 三角恒等式推导；d 维分块对角矩阵结构；d=4/base=4 手算（$\theta_1=0.5$，$\cos1+\cos0.5=1.4179$）、d=4/base=10000（$\theta_1=0.01$）、$\theta=(1,1)$/$k=(0,1)$ 例题（$(\sqrt3-1)/2=0.3660$）；d=128/base=10000 频率表（$\theta_1\approx0.8660$、$\theta_{16}=0.1$、$\theta_{63}\approx1.155\times10^{-4}$；$2\pi/\theta$ 分别 ≈6.28/7.26/62.8/54410）；衰减表 10 行数值（0.9702/0.7373/0.6691/0.5462/0.4772/0.2985/0.1590/-0.0070/-0.0279）用 Python 独立复算全部一致；T5 相对位置偏置（Raffel et al. 2020：32 个对数分桶、“within a given layer each attention head uses a different learned position embedding”）支持 [N4]；PI/YaRN/LongRoPE 的 arXiv 编号（2306.15595 / 2309.00071 / 2402.13753）与思路；Kimi K3 报告 arXiv:2607.24653 存在且含 KDA 与 1M 上下文，其 §2.1.2/§3.4 与 config.json `mla_use_nope=true` 经站内 MLA 页第 5 章、Kimi K3 页第 2/6.3 章交叉印证；站内引用章节「为什么 RoPE 要解耦」（MLA 页第 3 章）、「长上下文扩展」（K3 页 6.3）均真实存在，六个前置概念页（standard-attention / positional-encoding / causal-mask / nope / mla / kimi-k3）均存在；图示为内联 SVG，公式标签走 `<foreignObject>`，aria-label 与 img alt 中无 `$...$`，标题/summary/正文/列表/表格中无 Unicode 数学字符（validate.py 通过）。
+
+## 问题
+
+- [重要·技术] 5. 远程衰减（index.html 第 465 行）：「一般 $q,k$ 下内积是 $\sum_i r_{q,i}r_{k,i}\cos((n-m)\theta_i+\phi_{q,i}-\phi_{k,i})$」的相位项符号写反，正确应为 $\cos((n-m)\theta_i+\phi_{k,i}-\phi_{q,i})$（即 $\cos(\Delta-(\phi_q-\phi_k))$，$\Delta=(n-m)\theta_i$）。本页 F2 公式 ⟨R_m q,R_n k⟩=(q·k)cosΔ-(q×k)sinΔ 已复算正确；把 q、k 写成极坐标 $q=r_q(\cos\phi_q,\sin\phi_q)$、$k=r_k(\cos\phi_k,\sin\phi_k)$ 代入 F2 得 $r_qr_k\cos(\Delta+\phi_k-\phi_q)$，与页面所写差一个符号。｜引文依据：数值核对（Python 复算，q=(1,0)、k=(0,1)、Δ=(n-m)θ=1）：直接旋转得 q̃_m·k̃_n = sin(mθ-nθ) = -sin Δ = -0.8415；页面公式给 cos(Δ-π/2) = +0.8415；正确式给 cos(Δ+π/2) = -0.8415。｜修复要求：把该项改为 $\phi_{k,i}-\phi_{q,i}$（或写法 $\cos((n-m)\theta_i-(\phi_{q,i}-\phi_{k,i}))$），改后用上面 q=(1,0)、k=(0,1)、Δ=1 的算例复算，须与直接旋转结果 -0.8415 一致。｜修复：｜复验：
+- [重要·来源] 开篇第 65 行与来源说明 C6（第 617 行）：「RoPE … 被 LLaMA、Mistral、Qwen、Falcon、PaLM、Gemma、GPT-NeoX 等采用<sup>[C6]</sup>」是一条点名 7 个系统的事实性论断，但 C6 的依据只写「多源综述印证（LLaMA / Mistral / Falcon / Qwen / PaLM / Gemma / GPT-NeoX）；逐模型引用需查对应论文 / 配置文件」——所列为模型名清单而非可定位出处，页面自述尚未逐模型核对。站内同类页面均给可定位来源（Kimi K3 页「基于 arXiv:2607.24653v2 技术报告、官方 config.json 与源码三层核对」）。按 check.md §2.2，来源论断需给出可打开的出处与原文片段，本条无法给出。｜引文依据：C6 原文「多源综述印证（LLaMA / Mistral / Falcon / Qwen / PaLM / Gemma / GPT-NeoX）；逐模型引用需查对应论文 / 配置文件。」——无任何可访问的 URL / 编号。｜修复要求：为 C6 补可定位出处（各模型论文或 config.json 中 `rope_theta`/`rope_scaling` 字段，逐项列出文件名与关键值），或将该句降级为明确标注的推断并写明「未逐模型核对」。｜修复：｜复验：
+- [轻微·表述] 全文多处以页面自身为主语（第 65、129、328、390、420、480 行）：元话语与自我指代——「本文回答：RoPE 的旋转矩阵长什么样？」（开篇）、「贯穿全文的问题是：…」、「论文统一用 $R_{n-m}$，本页沿用。」、「下面是 $d=128$、$\mathrm{base}=10000$ 的几个典型值：」、「本文按论文原形式讲解。」、「下面是 … 归一化内积随 $|m-n|$ 的变化。」。｜引文依据：不适用｜修复要求：改为以内容为主语的表述，如「RoPE 用旋转矩阵回答的是……」、「表给出 $d=128$、$\mathrm{base}=10000$ 的几个典型值」、「按论文原形式讲解」、「归一化内积随 $|m-n|$ 的变化如下表」；正文中不再出现「本文/本页/全文/下面是」这类指向页面自身的措辞（「来源与范围说明」一节内说明取材范围时使用「本文」可保留）。｜修复：｜复验：
+- [轻微·来源] 来源说明 C4（第 615 行）：「多源综述印证（agentica.wiki、unseel.com/cs/rotary-position-embedding、spawn08.github.io）」引用了无法定位的第三方站点。｜引文依据：HTTP 抓取结果——`https://spawn08.github.io` 返回 404 Not Found；`https://unseel.com/cs/rotary-position-embedding` 返回 403 Forbidden；`https://agentica.wiki/` 只返回站点标题无正文。C4 的核心依据「Su et al. 2021, §3.2.2 Eq.(15) 后的 $\Theta$ 定义与 §3.3」本身可核对（ar5iv 原文已对上）。｜修复要求：删除这三个站点，或替换为可核对出处（论文 §3.2.2/§3.3 与 Vaswani et al. 2017 正弦位置编码 Eq.(4)）。｜修复：｜复验：
+- [轻微·表述] overview.html「关键结论与边界」第 3 条：「详见 Kimi K3 的「K3 的 Gated MLA」与「长上下文扩展」一章」——「K3 的 Gated MLA」是 MLA 页第 5 章的标题（`wiki/mla/index.html` §5「K3 的 Gated MLA——NoPE 与 full-rank output gate」），Kimi K3 页并无该章节标题（该页仅在「2. 序列维度」正文中以链接形式提到 Gated MLA）。括号引号在本站用于指章节名，此处章节归属与链接目标不一致。｜引文依据：kimi-k3/index.html 的 h2/h3 清单无「K3 的 Gated MLA」；mla/index.html 第 5 章标题为「K3 的 Gated MLA——NoPE 与 full-rank output gate」；kimi-k3/index.html 第 221 行「…+ 1 层 <a href="../../wiki/mla/index.html">Gated MLA</a>…」。｜修复要求：改为「详见 MLA 的「K3 的 Gated MLA」与 Kimi K3 的「长上下文扩展」一章」并分别指向 `../../wiki/mla/index.html` 与 `../../wiki/kimi-k3/index.html`，或把引号内标题换成目标页真实存在的章节名。｜修复：｜复验：
+
+## 结论
+
+- 统计：阻断 0 / 重要 2 / 轻微 3
+- 处置：修复（2 条重要问题未关闭；3 条轻微问题可一并处理）
+- 说明：本轮已按来源逐条回源核对（arXiv:2104.09864 摘要与 Eq.(11)–(37)、T5 论文、PI/YaRN/LongRoPE 编号、Kimi K3 报告与 config.json），全部数值与算式（2 维内积、$R_m^TR_n$、d=4 手算、d=128 频率表与 10 行衰减表）独立复算，除上列条目外未见数字不符、页内自相矛盾、分项之和≠合计或正文与 summary/overview 数字不一致的情况。
