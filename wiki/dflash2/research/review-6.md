@@ -1,0 +1,30 @@
+<!-- review-meta
+round: 6
+page: wiki/dflash2/index.html
+reviewed_content_sha256: 4fcd46f4f063fa23
+-->
+# DFlash 2 审查记录（第 6 轮）
+
+- 页面版本：f3a0506c549eb680f0e2ec88d80077f18058556c（index.html 工作树哈希；overview.html 为 270aff735a3639c52ac84d892f55d359727549ab）
+- 审查时间：2026-09-13 22:42
+- 审查者：编排者派发的独立审查者（独立子代理，未参与写作与前序轮次审查）
+- 已完整阅读章节：核心问题 ▸ 1. 两个剩余问题——候选池里有答案、块末端在漏气（含本章问题）▸ 2. 路径选择器——在候选之间打分，而不是重新预测（2.1 打分公式 / 2.2 全并行、串行只在最后 / 2.3 与 DSpark 修正头的对比 / 2.4 一个最小例子 / 本章问题）▸ 3. 两抽头卷积——给块末端补上「看见前一位」的通道（3.1 后缀衰减的证据链 / 3.2 两抽头动态深度卷积 / 3.3 效果 / 补充折叠块 / 本章问题）▸ 4. 组合效果——每次验证多一个 token 的账（4.1–4.3 / 本章问题）▸ 5. 端到端与边界——哪里收益趋近 1（5.1–5.3 / 本章问题）▸ 来源与范围说明
+
+## 来源核对（逐条核对，引文依据）
+
+- 公式：F1 `$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle$` 与博客 "A Lightweight Path Selector" 节一致；博客原文给出 `U_t(b)`="DFlash's own logit"、"a compact 256-dim embedding"、"low-rank bilinear attention"。F2 `$\mathrm{Conv}_k(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}$` 与 "A Lightweight Local Convolution" 节一致；"learned base kernel + small correction from the current hidden state"、"one correction shared per 16 channels"、"The first position reads the last verified token's representation"、"block-local and stateless" 均一致。
+- 数字：博客 Table 1（Recall@1 85.4/80.3/79.4/78.3/77.5/75.9/72.9%、Recall@16 99.5/97.3/94.8/92.6/90.8/89.4/87.8%、oracle 4.27→6.79）；Table 2（DFlash 4.27/3.78、DSpark 修正头 +77.8M/+9.6%/4.49/4.08、路径选择器 +2.0M/+0.6%/4.61/4.25、"~40× fewer params and 16× lower latency overhead"）；Figure 2（3L 85.21/75.75/64.97、5L 85.39/78.27/72.86、15L 86.42/80.34/78.73、5L+conv 85.83/79.68/77.61、"Its convolutions add 3% parameters and 0.7% cycle latency; the ten extra layers of 15L add 15.2%"）；Figure 3（逐头数据复算：Layer 1 均值 30.4%、Layer 5 均值 8.3%、Layer 4+5 均值 9.4%，与博客 "drops from 9.4% to 0.5%" 一致）；Table 3（4.78/4.99/5.69/6.20 等逐格与均值 4.54/4.92/5.49/5.97，逐行复算均值一致）；Table 4/5（均值 4.28/3.62/4.80、4.44/4.48/5.70）；Figure 5（DFlash 2 首 88.3、区间 84.88–86.48、末位 86.48，基线末位 77.85/77.48/79.86）；N8 吞吐表（并发 1/8/32 共 45 格倍数与 HF 模型卡逐格一致，自回归基线 68.9/69.0/69.0/69.0/68.9 tok/s 一致）、模型卡实验条件（单卡 H200、FA3、块 8=7 草稿 token、temperature 1.0/top-p 0.95/top-k 20、xhigh、最大 4096 新 token）一致。全部无出入。
+- 引文片段核对通过：C3 "Decoding is lossless: greedy output matches the target model exactly, and sampling preserves its distribution"；C5 "Coherence is mostly local: a candidate's fit depends mainly on the token just before it"、"Choosing is cheaper than predicting."；C6 "Scoring stays fully parallel … The only sequential work is the final walk over precomputed scores … rejection sampling restores the exact target distribution"、"starting from the last verified token, greedy follows the best successor at each step"；C7 "Even the oracle decays … No selector can fix that"、"a backbone problem"；C10 见上；C12 "the selector and the convolution together add only 1.3%"；C13 节标题 "Two Drafters, Out Today"（正文 "We are releasing two DFlash 2 drafters today"）；N10 "Across benchmarks the gain runs 16–25%.（与逐基准 15.7–24.7% 相符）"；C16 vLLM `refs/pull/52816/head`、llama.cpp PR 27342、oMLX 安装步骤；C17 "We trained the DFlash and DSpark drafters ourselves under matched setups"、模型卡 "community drafter RadixArk/Qwen3.8-27B-DSpark"；C15 "DFlash models have been downloaded more than 3.5 million times (as of August 2026)"、"up to 15× throughput on NVIDIA Blackwell"、Google TPU 3×。DSpark 修正头的机制描述核对通过：博客 "sequential heads that rewrite each position's full-vocabulary distribution"、"costly autoregressive correction"。C14 已显式标注为分析性推断，博客确未给出该因果分析。Muse-Glimmer-30B-DFlash2 许可 apache-2.0 核对通过。块大小 4–16 核对通过："a block spans only 4 to 16 tokens"。"接受长度表未注明硬件"核对通过（Table 3/Figure 5 题注无硬件）。
+- 机械项：`python3 .dojo/scripts/validate.py wiki/dflash2/index.html` 与 `…/overview.html` 均返回 `validation ok`；正文 `<sup>[…]</sup>` 引用与来源章节 C1–C17/F1–F2/N1–N10 双向一一对应、无孤儿、无缺项；本地资源 libs/ 全部存在；`../dflash/index.html#inference-pipeline`、`../block-diffusion/`、`../speculative-decoding/` 均存在；index.html 与 overview.html 互链；无「（待生成）」占位；图表为内联 SVG 且公式在 `<foreignObject>` 内，`<text>` 内无 ASCII 近似公式。构造示例两表算术复算一致（0.55−0.30=0.25、0.40+0.20=0.60、0.80+0.05=0.85、0.18+0.02=0.20），走路径推导（decoding is parallel）自洽。
+
+## 问题
+
+- [重要·格式] 2.4 节铺垫段（正文第 222 行）与「来源与范围说明·构造示例」段（第 562 行）：变量 $S_t$ 以 ASCII 原样写出（"便于演示 S_t 的两个成分"、"相邻对双线性内积与 S_t 数值均为人为构造"），未包在 `$...$` 内，浏览器按字面显示 "S_t"，与同页第 144 行同一变量的写法 `$S_t$` 及 2.1 节公式不一致｜引文依据：不适用（格式项；同页 144 行写作 `$S_t$`，style-guide 第 11 节"数学符号一律写为 LaTeX……覆盖……正文段落……不因位置而放宽"）｜修复要求：将这两处 `S_t` 改写为 `$S_t$`，全页搜索确认无其他裸 ASCII 变量（已确认仅此两处；`base_model`/`library_name` 属 YAML 字段名不计）｜修复：｜复验：
+- [重要·图示] 3.2 节 SVG（第 308–345 行），尤其第 341 行 `<polyline points="80,200 80,300 410,300 410,100">` 与第 343 行 `<text x="306" y="132">`：把"已验证 token"接到 `Conv_k(x)_1` 前一位输入的虚线在 x=410 竖直上行，而右侧三个输出方框横跨 x∈[370,450]（第 320/324/328 行，w=80），中心正是 x=410，标签又为居中排布（`text-align:center`），该虚线因此从正中穿过 `Conv_k(x)_2`（y∈[140,180]）与 `Conv_k(x)_3`（y∈[220,260]）两个方框及其公式标签；同一段第 343 行 11px 标签"自身（实线）+ 前一位（虚线）"基线 y=132、自 x=306 起向右约 150px，而 (250,80)→(370,160) 的虚线在 y≈124–134 区间位于 x≈316–331，压住该标签开头两个字｜引文依据：不适用（几何可复算：方框 x=370 w=80 → 中心 410；polyline 竖直段 x=410、y 从 300 到 100；text 起点 x=306、y=132；虚线斜率 80/120）｜修复要求：改走线路径使虚线不穿任何方框与标签（例如沿 x>450 或 x<370 绕行、从侧面进入 `Conv_k(x)_1`），并把该说明标签移到与所有连线均不相交的空白处（如右上角空白区），确认明暗主题下均不压线｜修复：｜复验：
+- [轻微·可读性] 1 章末段（第 144 行）："两列量纲不同，不对数值作横向比较"的理由不成立——按 2.1/2.4 节定义 $S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle$，两列同为 logit 量级打分量纲相同，真正的差别是"同一位置上的不同泛函/不同位置的分数"；"量纲不同"会给读者"$U$ 与 $S$ 不同量、不可比"的错误印象｜引文依据：不适用（本页内部一致性；2.4 节 "0.25（$U_2=0.55$ + 低双线性 $-0.30$）"表明 $S_t$ 与 $U_t$ 同尺度相加）｜修复要求：改为"两列不是同一个量（一列为 $U_t$、一列为含相邻对双线性项的 $S_t$），不对数值作横向比较"，删除"量纲不同"四字｜修复：｜复验：
+- [轻微·一致性] 3.2 节图前一句（第 305 行）："用 3 个位置的最小图示（`ver` = 上一周期已验证 token，作为首位的前驱）"引入了记号 `ver`，但图内（第 311 行）与图注中该节点一律写作"已验证 token"，全页无第二处 `ver`，读者找不到该记号所指对象｜引文依据：不适用｜修复要求：删除或改写该括注（直接写"图中左侧蓝框为上一周期已验证 token，作为首位的前驱"），使正文、图内文字、图注使用同一称呼｜修复：｜复验：
+
+## 结论
+
+- 统计：阻断 0 / 重要 2 / 轻微 2
+- 处置：修复。本轮未发现事实性错误、来源不一致或核心结论问题——全部数字（Tables 1–5、Figures 2/3/5、吞吐 45 格、均值复算）、公式、机制描述与引文片段均可回源并一致；遗留 2 项重要问题为公式书写与图示压线，2 项轻微为表述与记号一致性，均不影响来源结论成立。
