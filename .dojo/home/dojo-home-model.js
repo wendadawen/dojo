@@ -3,7 +3,7 @@
   if (typeof module === "object" && module.exports) module.exports = api;
   root.DojoHomeModel = api;
 }(typeof globalThis !== "undefined" ? globalThis : this, function createModel() {
-  const TYPE_LABELS = { paper: "论文", concept: "概念", note: "笔记", unknown: "未分类" };
+  const TYPE_LABELS = { paper: "论文", concept: "概念", note: "笔记", dataflow: "数据流", unknown: "未分类" };
 
   function normalize(value) {
     return String(value || "").normalize("NFKC").toLocaleLowerCase();
