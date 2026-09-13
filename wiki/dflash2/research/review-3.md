@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/dflash2/index.html
+reviewed_content_sha256: e6f4d16f7d7e75ee
+-->
 # DFlash 2 审查记录（第 3 轮）
 
 - 页面版本：index.html `2b6c5843f71742b57136faee1d0e8aa2a05b0c78`；overview.html `3686ceb773b760e9d58fd5538ac713d3882688cc`

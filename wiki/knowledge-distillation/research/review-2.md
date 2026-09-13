@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/knowledge-distillation/index.html
+reviewed_content_sha256: ffe37e9bb97fd9de
+-->
 # 知识蒸馏独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟 / 真实目标读者）

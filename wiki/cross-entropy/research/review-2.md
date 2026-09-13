@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/cross-entropy/index.html
+reviewed_content_sha256: afb3460b07d8abb9
+-->
 # 交叉熵审查记录（第 2 轮）
 
 - 页面版本：799674ba9eb54afb2ab11e71457979415a19a6ef

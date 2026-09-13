@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/rmsnorm/index.html
+reviewed_content_sha256: f96615c5336e58b4
+-->
 # RMSNorm 审查记录（第 2 轮）
 
 - 页面版本：`85fb8e468b227dc59345bb9beefec0d8a9ab5379`（index.html 工作树哈希）

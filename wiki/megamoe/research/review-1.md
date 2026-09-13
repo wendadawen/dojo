@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/megamoe/index.html
+reviewed_content_sha256: d69f02e466173f3e
+-->
 # MegaMoE 审查记录（第 1 轮）
 
 - 页面版本：index.html md5 83aa5adb05544b1e34e2c8195df2c24e（108970 字节）；overview.html 6751 字节

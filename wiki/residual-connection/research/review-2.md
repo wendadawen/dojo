@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/residual-connection/index.html
+reviewed_content_sha256: 33a4c280afb3250e
+-->
 # 残差连接独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源）

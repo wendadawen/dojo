@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/chunked-prefill/index.html
+reviewed_content_sha256: 25774db2e22de7ad
+-->
 # Chunked Prefill 审查记录（第 1 轮）
 
 - 页面版本：index.html 28b506acb93fd004d04f1226533a9258e1215125；overview.html 1c7ec4ec64dbcfe0059ef71fe2a5f5f924719d70

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/block-diffusion/index.html
+reviewed_content_sha256: a8cbcfc28506e1dc
+-->
 # 块扩散语言模型（Block Diffusion）审查记录（第 1 轮）
 
 - 页面版本：index.html 534fdc41ec8629d145e3bdeb60b2bb65f9770b63；overview.html 84e06849307f63ec29f2e4eea80b7d6ec2fc8fdb

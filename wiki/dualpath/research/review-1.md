@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/dualpath/index.html
+reviewed_content_sha256: 0fd0c60f7e368695
+-->
 # DualPath 审查记录（第 1 轮）
 
 - 页面版本：502c4984d7d1a03dfa5108370c15e7e1d618b849（git hash-object，工作树未提交）

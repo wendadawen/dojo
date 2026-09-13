@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/deepseek-moe/index.html
+reviewed_content_sha256: 30686c800d13718b
+-->
 # DeepSeek MoE 审查记录（第 3 轮）
 
 - 页面版本：`git hash-object wiki/deepseek-moe/index.html` = `2e129bd4281d4b69bb7eaa1ddf398fdfbb9fe4c2`（overview.html = `4017ad13e59ce1a9eff81c61dec3854525da4634`）

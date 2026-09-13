@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/muon-optimizer/index.html
+reviewed_content_sha256: d6c56c367328786e
+-->
 # Muon 优化器独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟 / 真实目标读者）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/linear-attention/index.html
+reviewed_content_sha256: c1a40d4929606af2
+-->
 # 线性注意力独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源核查）

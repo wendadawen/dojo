@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/rope/index.html
+reviewed_content_sha256: 97eb555581c5c324
+-->
 # RoPE 审查记录（第 1 轮）
 
 - 页面版本：wiki/rope/index.html（1539 行）

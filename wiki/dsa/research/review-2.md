@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/dsa/index.html
+reviewed_content_sha256: 2e0cc4d08acba829
+-->
 # DSA 审查记录（第 2 轮）
 
 - 页面版本：`git hash-object wiki/dsa/index.html` = `fe5cbf22f11f94610fd59d026c2915dd4200e8fa`；`wiki/dsa/overview.html` = `3bfc3ebc6674797ed2b8ecac670f5b771c1b4503`（两文件均为工作树修改未提交，仓库 HEAD `0f4a841`）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/paged-attention/index.html
+reviewed_content_sha256: 0f474fcc87d3b403
+-->
 # PagedAttention 审查记录（第 1 轮）
 
 - 页面版本：index.html 工作树哈希 `7b9bb81874691c840b9e2128bcb3defe1ebb1990`

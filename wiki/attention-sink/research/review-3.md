@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/attention-sink/index.html
+reviewed_content_sha256: 884e8e8684c178d3
+-->
 # 注意力汇聚点审查记录（第 3 轮）
 
 - 页面版本：4f0f7ea745fffb4196065c6fea1693157118d0e8（index.html）；63d28e1ee2247f59ba69759892f6bf40929c2ea7（overview.html）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/speculative-decoding/index.html
+reviewed_content_sha256: 8bd9cdb821686704
+-->
 # 推测解码审查记录（第 3 轮）
 
 - 页面版本：index.html `7875dd2b7ee5ed0f4e5aebe4524c329f493e7c5c`（git hash-object，sha256 前 16 位 `626ff48161faabfd`）；overview.html `8a1b4877133636d8c89e57aabe425d6506767bd7`

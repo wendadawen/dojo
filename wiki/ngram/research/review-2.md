@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/ngram/index.html
+reviewed_content_sha256: d3310e49a8721026
+-->
 # N-gram 审查记录（第 2 轮）
 
 - 页面版本：index.html `bf129ade3b3c1b192f509d331e9c091796c862f6`；overview.html `75dbbec27ff0cf839305b12e9f05af99fb6bf16a`

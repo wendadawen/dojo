@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/dflash2/index.html
+reviewed_content_sha256: e6f4d16f7d7e75ee
+-->
 # DFlash 2 审查记录（第 2 轮）
 
 - 页面版本：index.html 工作树哈希 `7331c772f33d7e76e20ee045d95a99f27900beeb`

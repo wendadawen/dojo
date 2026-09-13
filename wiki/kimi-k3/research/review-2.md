@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/kimi-k3/index.html
+reviewed_content_sha256: 69cb32c0187ed460
+-->
 # Kimi K3 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照原文）

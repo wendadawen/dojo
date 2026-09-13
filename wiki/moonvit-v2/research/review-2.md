@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/moonvit-v2/index.html
+reviewed_content_sha256: 89f6d4951b7964b1
+-->
 # MoonViT-V2 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟 / 小白读者视角）

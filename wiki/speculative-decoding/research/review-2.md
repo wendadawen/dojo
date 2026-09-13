@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/speculative-decoding/index.html
+reviewed_content_sha256: c636a048ef427773
+-->
 # 投机解码独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟 / 真实目标读者）

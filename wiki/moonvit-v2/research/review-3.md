@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/moonvit-v2/index.html
+reviewed_content_sha256: ff993f41904ec276
+-->
 # MoonViT-V2 审查记录（第 3 轮，2026-09-03 修订轮）
 
 - 页面版本：index.html（修复后）；overview.html（修复后）

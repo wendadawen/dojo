@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/rope/index.html
+reviewed_content_sha256: 32bc3f083e278e19
+-->
 # RoPE 审查记录（第 2 轮）
 
 - 页面版本：wiki/rope/index.html（第一轮修复后版本）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/deepseek-v4-1/index.html
+reviewed_content_sha256: b7e599bb2a229803
+-->
 # DeepSeek-V4.1-Flash 审查记录（第 1 轮）
 
 - 页面版本：`0796f2784a735cee015aebd9b7dc17d3c4335d61`（`git hash-object wiki/deepseek-v4-1/index.html`；overview.html 为 `9c190d4000863f0ae04b1fa61f3db393e74d52e0`）

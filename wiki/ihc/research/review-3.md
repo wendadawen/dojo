@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/ihc/index.html
+reviewed_content_sha256: 8800c91acad6e3a3
+-->
 # iHC（恒等超连接）审查记录（第 3 轮）
 
 - 页面版本：de0551e113001e0d67e9e5eac3398618eebe9e3f（`wiki/ihc/index.html` 工作树哈希；`overview.html` 为 d7ee0bf21697b6c33732c78b2ac1ac544500277b）

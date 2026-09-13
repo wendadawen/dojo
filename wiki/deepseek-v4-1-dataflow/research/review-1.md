@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/deepseek-v4-1-dataflow/index.html
+reviewed_content_sha256: 7efc351b29f34370
+-->
 # DeepSeek-V4.1-Flash 前向数据流 审查记录（第 1 轮）
 
 - 页面版本：`defb658da0ad740c7ebb479d8bebe6a85e38127f`（`git hash-object wiki/deepseek-v4-1-dataflow/index.html`）

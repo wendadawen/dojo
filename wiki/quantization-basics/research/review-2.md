@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/quantization-basics/index.html
+reviewed_content_sha256: 0e80a3157db898e0
+-->
 # 量化基础独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 来源对照）

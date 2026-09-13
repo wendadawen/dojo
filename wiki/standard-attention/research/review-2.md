@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/standard-attention/index.html
+reviewed_content_sha256: 2a82dae2d5ac4e7e
+-->
 # 标准 Transformer 注意力 独立审查（第二轮）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 对照来源）

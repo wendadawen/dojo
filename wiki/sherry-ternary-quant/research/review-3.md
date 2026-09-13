@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/sherry-ternary-quant/index.html
+reviewed_content_sha256: 5e79835bf4bdaa4a
+-->
 # Sherry 稀疏三值量化审查记录（第 3 轮）
 
 - 页面版本：index.html blob `06622365b17e47175cd05d318249f1c8a1a67cf9`，overview.html blob `e221703b1da268c302d4b0574857aabb5d6d6412`（目录尚未提交，`git status` 显示 `?? wiki/sherry-ternary-quant/`）

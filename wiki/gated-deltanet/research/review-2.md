@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/gated-deltanet/index.html
+reviewed_content_sha256: 2efaf752e8c84698
+-->
 # Gated DeltaNet 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 来源对照）

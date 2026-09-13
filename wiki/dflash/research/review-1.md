@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/dflash/index.html
+reviewed_content_sha256: d76052516d2cc66b
+-->
 # DFlash 审查记录（第 1 轮）
 
 - 页面版本：wiki/dflash/index.html 与 overview.html（工作树未哈希，编辑器自上次改动未提交）

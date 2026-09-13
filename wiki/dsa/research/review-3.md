@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/dsa/index.html
+reviewed_content_sha256: 2e0cc4d08acba829
+-->
 # DSA 审查记录（第 3 轮）
 
 - 页面版本：`git hash-object wiki/dsa/index.html` = `405c9fd66d1bf07af759642cc47bd28e1e3a22b0`（sha256 前 16 位 `9105a70b40f419eb`）；`overview.html` 一并审查

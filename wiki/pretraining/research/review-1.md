@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/pretraining/index.html
+reviewed_content_sha256: 2d2bc751de18b843
+-->
 # 语言模型预训练审查记录（第 1 轮）
 
 - 页面版本：index.html ea79a0610ffb1aa0d51717864b6e0e648745c7e3（overview.html c5681bd5828fe13c94a0851d432ba054292f9dfe）

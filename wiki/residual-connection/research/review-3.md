@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/residual-connection/index.html
+reviewed_content_sha256: 645ad8c8460542cd
+-->
 # 残差连接审查记录（第 3 轮）
 
 - 页面版本：2f5484f75b47b420be6d8137f93e0a80875bd881（`wiki/residual-connection/index.html` 工作树哈希）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/increase-kv/index.html
+reviewed_content_sha256: 6231a068311a59af
+-->
 # 增量 KV 传输审查记录（第 2 轮）
 
 - 页面版本：bbb4a058567ecaf25ae494eb8c4311fc1ffafea0（index.html 工作树哈希）

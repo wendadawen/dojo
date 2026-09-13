@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/kda/index.html
+reviewed_content_sha256: 3f220274bef55a8a
+-->
 # Kimi Delta Attention（KDA）独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟，未参与生成与第一次审查）

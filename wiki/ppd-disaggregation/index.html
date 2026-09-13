@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="本文把多轮对话下 PD 分离的两个低效——每轮全历史重算与 KV 传输饱和——归因到 full prefill 与 append-prefill 的干扰非对称性（batch 200 时 TPOT 减速 $48\%$ vs $2\%$），并以打分函数 $S(\psi;\pi,\mathbf{w})=w_{\text{ttft}}\Delta_{\text{ttft}}-w_{\text{tpot}}\Delta_{\text{tpot}}$ 把是否走 P 路由为带 SLO 权重的逐请求决策；离线建表+在线 $&lt;1\,\text{ms}$ 查表的 PPD 路由系统在 3060 配置扫描与 ShareGPT/WildChat 真实负载上把 Turn 2+ TTFT 平均降低约 $68\%$，TPOT 保持竞争力。">
   <meta name="dojo:type" content="paper">
   <meta name="dojo:topics" content="推理系统, 并行与通信, 内存与缓存, 模型结构">
-  <meta name="dojo:tag" content="论文">
+  <meta name="dojo:tag" content="推理系统">
   <title>Not All Prefills Are Equal：PD 分离在多轮对话下为何系统性低效，PPD 动态路由如何修复</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -404,7 +404,7 @@
 <p>在 vLLM 的标准 disaggregated serving 之上加一层路由代理（不修改 KV 传输协议）<sup>[C13]</sup>：</p>
 <ul>
 <li>P 节点：vLLM 标准配置 <code>kv_role=kv_producer</code>，生成 KV 后通过 ZeroMQ 发送；Turn 1 与被路由回 P（$x{=}0$）的 Turn 2+ 请求都触发 KV 传输。</li>
-<li>D 节点：vLLM 标准配置（缓存以整页粒度匹配、跨请求复用 KV 的机制见 <a href="../prefix-caching/index.html">前缀缓存</a>） <code>kv_role=kv_consumer</code>，接收到的 KV 存入本地前缀缓存（prefix cache）供后续轮次复用；Turn 2+ 请求若决策为 $x{=}1$，在本地用该缓存做 append-prefill。</li>
+<li>D 节点：vLLM 标准配置（缓存以整页粒度匹配、跨请求复用 KV 的机制见 <a href="../prefix-caching/index.html">前缀缓存</a>） <code>kv_role=kv_consumer</code>，接收到的 KV 存入本地前缀缓存（prefix cache）供后续轮次复用；Turn 2+ 请求若决策为 $x{=}1$，在本地用该缓存做 append-prefill。 而当请求被路由回 P（$x{=}0$）时，D 侧已命中的头部块可免于重传——把命中块数回传、P 侧只发增量即可（见 <a href="../increase-kv/index.html">增量 KV 传输</a>）。</li>
 <li>会话管理：路由代理维护内存字典 <code>session_table[conv_hash] = {turn_count, assigned_pd, last_access}</code>，会话标识由首条用户消息的 MD5 哈希生成，空闲 60 分钟逐出（对齐 vLLM prefix cache 默认 TTL）。</li>
 <li>服务发现：后端每 10 秒经 ZeroMQ 心跳，30 秒无心跳标记移除，支持动态扩缩容与故障转移。</li>
 <li>代理实现：Quart（async Flask），职责包括请求解析、会话查表、转发、流式回传、决策与延迟统计采集。</li>

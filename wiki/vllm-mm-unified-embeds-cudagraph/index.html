@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="多模态模型（Qwen3.5）的模型 forward 有两个输入分支：inputs_embeds 直接使用、input_ids 过 embedding 层。图像特征只能以 embedding 形式进入，token id 无法承载。vLLM V1 的解法是统一输入：_preprocess 把全部 token 过 embed_input_ids，图片位置再用 is_multimodal 掩码覆写为 ViT 特征，纯文本 batch 也走同一路径。于是被 torch.compile 捕获的模型主体只有一种输入格式（v0 曾按两种输入各编译一张图）。dispatch 按 batch 形状选模式：decode 的 uniform 小批次命中 FULL 重放，983 token 的大 prefill 超出捕获尺寸走 eager。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
-  <meta name="dojo:tag" content="vLLM">
+  <meta name="dojo:tag" content="推理系统">
   <title>多模态统一输入与 cudagraph · Dojo</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -98,7 +98,7 @@
 else:
     hidden_states = self.embed_input_ids(input_ids)  # 分支二：token id 过 embedding 层
 </code></pre>
-    <p>而 cudagraph 的特性是<strong>捕获的图固定不变</strong>：一次捕获录制一段固定的执行流程，之后每次重放的都是这段流程。这带来一个矛盾：图像特征是 ViT 输出的浮点向量，只能以 embedding 形式进入模型，token id 无法承载它；纯文本却天然是 token id。如果两种输入各走各的分支，被捕获的图就有两种形态，管理与调度都会变复杂。</p>
+    <p>而 cudagraph 的特性是<strong>捕获的图固定不变</strong>：一次捕获录制一段固定的执行流程，之后每次重放的都是这段流程。录制一次、反复重放的完整机制见 <a href="../vllm-cudagraph/index.html">torch.compile 图捕获与 CUDA Graph</a>。这带来一个矛盾：图像特征是 ViT 输出的浮点向量，只能以 embedding 形式进入模型，token id 无法承载它；纯文本却天然是 token id。如果两种输入各走各的分支，被捕获的图就有两种形态，管理与调度都会变复杂。</p>
 
     <h2 id="unify">2. 解法：统一成 inputs_embeds（一个格式，一张图）</h2>
     <p><code>GPUModelRunner._preprocess</code> 的多模态分支（<code>supports_mm_inputs and is_first_rank and not is_encoder_decoder</code> 三个条件：模型支持多模态、流水线第一段、非编解码架构）统一执行如下流程：</p>
@@ -119,7 +119,7 @@ else:
     </svg>
 
     <h3 id="mixed">混合 batch（既有纯文本请求又有图片请求）</h3>
-    <p>没有单独的"纯文本路径"。整个 batch 的所有 token 一起调 <code>embed_input_ids</code> 过 embedding 层，得到每个位置的文本 embedding；随后 <code>_merge_multimodal_embeddings</code> 用 <code>is_multimodal</code> 布尔掩码做一次覆写：<code>inputs_embeds[is_multimodal] = 图像特征</code>。掩码为 True 的位置（图片占位符处）被换成 ViT 特征，为 False 的位置（文本 token）保持原样。输出是一个形状统一的张量，纯文本请求与图片请求的区别只剩"每个位置的 embedding 来自哪里"。</p>
+    <p>没有单独的"纯文本路径"。整个 batch 的所有 token 一起调 <code>embed_input_ids</code> 过 embedding 层，得到每个位置的文本 embedding；随后 <code>_merge_multimodal_embeddings</code> 用 <code>is_multimodal</code> 布尔掩码做一次覆写：<code>inputs_embeds[is_multimodal] = 图像特征</code>。掩码为 True 的位置（图片占位符处）被换成 ViT 特征，为 False 的位置（文本 token）保持原样。被换入的图像特征由视觉编码器产出并按图片哈希缓存，其产出与缓存过程见 <a href="../vllm-mm-image-two-stage/index.html">多模态图片的两阶段处理</a>。输出是一个形状统一的张量，纯文本请求与图片请求的区别只剩"每个位置的 embedding 来自哪里"。</p>
 
     <h3 id="text-only">全纯文本 batch</h3>
     <p>同样走这条路径：<code>_execute_mm_encoder</code> 发现没有待编码项直接返回，特征列表为空，<code>embed_input_ids</code> 检测到特征列表为空时跳过覆写、原样返回文本 embedding。也就是说，多模态模型上纯文本请求也承担一次 embedding 层计算——这是格式统一优先于单次计算开销的取舍。</p>

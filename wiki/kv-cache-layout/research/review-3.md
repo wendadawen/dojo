@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/kv-cache-layout/index.html
+reviewed_content_sha256: ec628ccc2e93dc5d
+-->
 # KV cache 布局（NHD/HND）审查记录（第 3 轮）
 
 - 页面版本：index.html 工作树哈希 a6a72e2ccedd40435cd541a7ad5068218a0fee39（审查时）

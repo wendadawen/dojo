@@ -7,7 +7,7 @@
   <meta name="dojo:summary" content="torch.compile 先由 TorchDynamo 捕获计算图，再由 Inductor 编译；CUDA Graph 则录制固定形状的 GPU 工作并在解码阶段重放。页面同时梳理 Python 控制流、C 扩展与动态形状的处理边界。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
-  <meta name="dojo:tag" content="推理引擎">
+  <meta name="dojo:tag" content="推理系统">
   <title>torch.compile 图捕获与 CUDA Graph · Dojo</title>
   <link rel="stylesheet" href="../../libs/katex.min.css">
   <script defer src="../../libs/katex.min.js"></script>
@@ -112,7 +112,7 @@
     <h2 id="cuda-graph">3. CUDA Graph 的录制与重放</h2>
     <p>即便 kernel 已编译完成，每次推理仍由 CPU 逐个向 GPU 提交 kernel，每次提交存在固定延迟（CPU 到 GPU 的命令下发开销）。CUDA Graph 将<strong>完整的 GPU 执行序列</strong>——包括 kernel 顺序、各 kernel 参数、输入输出内存地址及数据搬运操作——一次性<strong>录制（capture）</strong>为一张图，此后 CPU 仅需一次命令即可整张<strong>重放（replay）</strong>，从而消除逐个下发的开销。</p>
     <ul>
-      <li><strong>适用阶段</strong>：主要用于<strong>解码（decode）</strong>阶段。decode 每步仅生成一个 token，kernel 单次计算量小但数量多，CPU 逐个下发开销占比较高，且计算形状相对稳定，适合录制；而预填充（prefill）单次处理大量 token、计算形状动态变化，不适用于固定形状的图录制。</li>
+      <li><strong>适用阶段</strong>：主要用于<strong>解码（decode）</strong>阶段。decode 每步仅生成一个 token，kernel 单次计算量小但数量多，CPU 逐个下发开销占比较高，且计算形状相对稳定，适合录制；而预填充（prefill）单次处理大量 token、计算形状动态变化，不适用于固定形状的图录制。每步是否重放捕获图由 GPUModelRunner 查表决定，这一层在引擎进程中的位置见 <a href="../vllm-v1-two-process-arch/index.html">vLLM V1 框架总览</a>。</li>
       <li><strong>开销特征</strong>：录制开销较大（需逐次执行、记录地址与依赖、分配内存池，量级可达几十至数百毫秒），因此只执行一次并复用；重放开销极小。</li>
       <li><strong>显存代价</strong>：除图本身（每张数十至数百 MB）外，还须预留固定地址的<strong>内存池（memory pool）</strong>，按最大容量预留、即使未用满也不释放，因此显存占用随捕获图数量线性增长，vLLM 通过限制捕获图数量控制显存。</li>
       <li><strong>核心约束</strong>：录制时地址被固化，重放阶段输入输出内存地址不可改变，故数据须存放于预分配的固定内存池中（如 vLLM 的 KV cache 缓冲区即为此设计）。</li>
@@ -120,7 +120,7 @@
 
     <h2 id="capture-size">4. 捕获尺寸的确定</h2>
     <p>CUDA Graph 捕获的尺寸以<strong>解码阶段的总 token 数</strong>为单位。decode 中每个请求每步仅产生一个 token，故总 token 数近似等于并发请求数（<code>num_seqs</code>，即 batch size）；seq_len 在 decode 中恒定，不参与尺寸组合。</p>
-    <p>默认捕获尺寸按 <code>[1, 2, 4] + list(range(8, 256, 8)) + list(range(256, max, 16))</code> 生成，最大捕获尺寸默认取 <code>min(max_num_seqs * 2, 512)</code>。实际请求数不落在合法捕获尺寸上时，按邻近的合法尺寸向上补齐（padding）。</p>
+    <p>默认捕获尺寸按 <code>[1, 2, 4] + list(range(8, 256, 8)) + list(range(256, max, 16))</code> 生成，最大捕获尺寸默认取 <code>min(max_num_seqs * 2, 512)</code>。实际请求数不落在合法捕获尺寸上时，按邻近的合法尺寸向上补齐（padding）。尺寸超出捕获上限或未命中捕获记录时退回 eager 执行，这一对照在一次真实走读中表现为 decode 命中 FULL 重放、983 token 的 prefill 落到 eager（<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）。</p>
 
     <h2 id="ref">来源与范围说明</h2>
     <ul>

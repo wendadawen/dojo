@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/block-diffusion/index.html
+reviewed_content_sha256: a8cbcfc28506e1dc
+-->
 # 块扩散（block-diffusion）审查记录（第 2 轮）
 
 - 页面版本：index.html 691fede074cae1de78e43649afb32f9817d9131c；overview.html ca010d1715214c14700db50379c96f2707726f7d

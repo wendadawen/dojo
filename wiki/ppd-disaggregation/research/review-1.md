@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 1
+page: wiki/ppd-disaggregation/index.html
+reviewed_content_sha256: 7e5d7861ec450a35
+-->
 # PPD 分离审查记录（第 1 轮）
 
 - 页面版本：未跟踪（git status: `?? wiki/ppd-disaggregation/`，新页面）

@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/deepep/index.html
+reviewed_content_sha256: 2b531101a909962f
+-->
 # DeepEP 审查记录（第 3 轮）
 
 - 页面版本：index.html `d985dcb143f6d5207c164a34c7bc36d86f7e3bd5`（修复前）

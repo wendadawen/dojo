@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/quantile-balancing/index.html
+reviewed_content_sha256: f6b68262d48c500d
+-->
 # Quantile Balancing 独立审查（第二次）
 
 - 审查者：独立上下文（AI 模拟小白读者 + 段B对照来源）

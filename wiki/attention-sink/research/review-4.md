@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 4
+page: wiki/attention-sink/index.html
+reviewed_content_sha256: 884e8e8684c178d3
+-->
 # 注意力汇聚点审查记录（第 4 轮）
 
 - 页面版本：index.html 工作树 blob 哈希 `0b4b269f3ad45d0f0fe4ef9b5df7f885e44585e2`

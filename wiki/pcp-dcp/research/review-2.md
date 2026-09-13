@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 2
+page: wiki/pcp-dcp/index.html
+reviewed_content_sha256: a13c84ffea35809e
+-->
 # PCP/DCP 第 2 轮审查
 
 ## 元信息

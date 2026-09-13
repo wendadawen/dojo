@@ -1,3 +1,8 @@
+<!-- review-meta
+round: 3
+page: wiki/clip/index.html
+reviewed_content_sha256: 5ef26eb8980a3215
+-->
 # CLIP 审查记录（第 3 轮）
 
 - 页面版本：fb0eec74340fb6c9eeeba5ef2c3969850defa9fa（wiki/clip/index.html 工作树哈希）
