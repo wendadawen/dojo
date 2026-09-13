@@ -61,10 +61,10 @@
 <!-- 页面开头 -->
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Kimi K3 技术报告 §2.5 "Per-Head Muon" 与 §5.2.2 "P2P-based Muon orthogonalization"；Muon 正交化的定义沿用 Keller Jordan 原始博客。</p>
+<p><b>主要依据</b>：Kimi K3 技术报告 §2.5 "Per-Head Muon" 与 §5.2.2「Memory-Efficient Training」下的 P2P-based Muon orthogonalization 小节；Muon 正交化的定义沿用 Keller Jordan 原始博客。</p>
 </blockquote>
 
-<p>多头注意力中，当各头动量尺度差异 10 倍时（如 $M_1=[3,4]$ 与 $M_2=[0.3,0.4]$），原版 Muon 对整块投影矩阵做正交化会让小尺度头行块范数被压到约 0.1<sup>[C1]</sup>。Per-Head Muon 把动量矩阵沿头维度切分、每头单独正交化，让各头更新幅度趋于一致<sup>[C2]</sup>。本文依赖 Muon 与 Newton-Schulz 正交化两个前置概念（完整讲解分别见 <a href="../muon-optimizer/index.html">Muon 优化器</a> 与 <a href="../newton-schulz/index.html">Newton-Schulz 正交化</a>），只使用结论不重复推导。本文回答：按头正交化在机制上做了什么、如何均衡各头更新尺度、为什么略降开销、分布式训练中如何避免全参数 all-gather。</p>
+<p>多头注意力中，当各头动量尺度差异 10 倍时（如 $M_1=[3,4]$ 与 $M_2=[0.3,0.4]$），原版 Muon 对整块投影矩阵做正交化会让小尺度头行块范数被压到约 0.1<sup>[C1]</sup>。Per-Head Muon 把动量矩阵（Muon 累积的梯度动量）沿头维度切分、每头单独正交化，让各头更新幅度趋于一致<sup>[C2]</sup>。本文依赖 Muon 与 Newton-Schulz 正交化两个前置概念（完整讲解分别见 <a href="../muon-optimizer/index.html">Muon 优化器</a> 与 <a href="../newton-schulz/index.html">Newton-Schulz 正交化</a>），只使用结论不重复推导。本文回答：按头正交化在机制上做了什么、如何均衡各头更新尺度、为什么略降开销、分布式训练中如何避免全参数 all-gather。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -169,7 +169,7 @@
 
 <p>耦合带来两个后果。第一，大梯度或大动量尺度的头主导奇异向量方向——它们对 $U$ 的贡献更大，$U V^\top$ 的行结构更多由大尺度头决定。第二，小尺度头在 $U V^\top$ 中对应的行块没有获得单位范数——它被大尺度头"拉偏"了，正交化没有把它单独拉平到 1。K3 报告把后者称为"未充分正交化的更新"（insufficiently normalized updates）。注意被压低的是小尺度头更新块的<b>幅度</b>，不是它的方向信息——方向仍由 SVD 共同决定，per-head 改动修复的是幅度不均。</p>
 
-<p>用一个极小例子把这件事算清楚。</p>
+<p>这一压低过程可以用以下极小例子直接算出。</p>
 
 <p>构造示例（人为构造数据，不代表真实模型参数）。设头数 $H=2$、每头维度 $d_h=1$、模型维度 $d=2$。两头动量行向量平行同向、尺度差 10 倍：$M_1 = [3, 4]$（范数 5），$M_2 = [0.3, 0.4]$（范数 0.5）。完整动量矩阵</p>
 
@@ -185,17 +185,17 @@
 <p>第一行（头 1）范数 $\sqrt{0.597^2 + 0.796^2} \approx 0.995 \approx 1$，正交化生效。第二行（头 2）范数 $\sqrt{0.0597^2 + 0.0796^2} \approx 0.0995 \approx 0.1$，远小于 1——这就是"未充分正交化"。两头行块范数比约 10:1，与输入动量尺度比一致。</p>
 </details>
 
-<p>这个例子是极端情形（两头平行同向），用来展示"尺度被压低"的最简形态。实际训练中各头方向通常不完全平行，全矩阵 SVD 还会进一步混合方向信息；但"小尺度头行块范数远小于 1"这一核心现象在行空间有重叠的非平行情形下同样存在，只是数值不同；完全正交时各头不互相干扰、行块范数均为 1。本章不展开非平行情形的手算。</p>
+<p>这个例子是极端情形（两头平行同向，整块动量是秩 1 的秩亏矩阵），用来展示"尺度被压低"的最简形态。实际训练中各头方向通常不完全平行，全矩阵 SVD 还会进一步混合方向信息。被压低现象出现的条件是整块动量为秩亏矩阵——各头行块线性相关，$\mathrm{rank}(M) < H d_h$，此时 $UV^\top$ 中部分头块对应的行块范数小于 1。反过来，只要 $M$ 行满秩（$\mathrm{rank}(M) = H d_h$），正交化就把它的每一行都变成单位向量、各头行块幅度都已均衡；各头是否两两正交并不是判据。本章不展开非平行情形的手算。</p>
 
-<p>本章展示了全矩阵正交化压低小尺度头更新幅度的问题。但如何修复这个幅度不均——下一章讲按头正交化的切分与逐头正交化。</p>
+<p>全矩阵正交化的问题至此清楚：它压低小尺度头的更新幅度。如何修复这一幅度不均，是下一章的内容——按头切分动量矩阵并逐头正交化。</p>
 
 <h3 id="why-full-matrix-fails-questions">本章问题</h3>
 <ol class="chapter-questions">
   <li>
     <p>给定 $M_1 = [1, 0]$、$M_2 = [0, 2]$（两行正交），判断全矩阵正交化后两头行块范数是否都接近 1，并说明原因。</p>
     <details>
-      <summary>解答：都接近 1，正交时两头互不干扰</summary>
-      <p>两行正交时 $M M^\top$ 是对角阵，两个奇异方向分别由两行各自决定，$U V^\top$ 的两行块各自获得单位范数。这对应"完全正交时各头不互相干扰、行块范数均为 1"的边界情形——压低效应只在行空间有重叠（如平行同向）时出现。</p>
+      <summary>解答：都接近 1，整块动量行满秩</summary>
+      <p>两行线性无关，$M$ 行满秩（$\mathrm{rank}(M) = 2 = H d_h$），$U V^\top$ 的两行都是单位向量，两头行块范数均为 1，两头互不干扰。这就是"行满秩时各头行块范数均为 1"的边界情形——压低效应只在整块动量秩亏（各头行块线性相关，如两头平行同向）时出现，与各头是否两两正交无关：例如 $M_1=[1,0]$、$M_2=[1,1]$ 既不平行也不正交，但行满秩，两头行块范数同样均为 1。</p>
     </details>
   </li>
   <li>
@@ -209,7 +209,7 @@
     <p>判断全矩阵正交化被压低的是小尺度头更新块的"方向"还是"幅度"。</p>
     <details>
       <summary>解答：压低的是幅度，不是方向</summary>
-      <p>方向仍由整体 SVD 共同决定；被压低的是小尺度头行块的范数（幅度）。Per-Head Muon 修复的正是幅度不均，不改变各头方向由各自动量决定的机制。</p>
+      <p>方向仍由整体 SVD 共同决定；被压低的是小尺度头行块的范数（幅度）。Per-Head Muon 修复的正是幅度不均，并使各头更新方向只由各自头块的动量决定——这也是相对全矩阵正交化的改变之一。</p>
     </details>
   </li>
 </ol>
@@ -245,24 +245,24 @@
   模型维度 d
 
 状态：
-  正交化后的更新 U ← 零矩阵（同 M 的形状）
+  正交化后的更新 O ← 零矩阵（同 M 的形状）
 
 核心步骤：
   对 h 从 1 到 H：
       取出第 h 个头块 M_h ← M 的第 (h-1)·d_h+1 到 h·d_h 行   # 形状 d_h × d
       对 M_h 单独做 Newton-Schulz 正交化：O_h ← NS_Ortho(M_h)  # 把 M_h 的奇异值拉平为 1
-      把 O_h 放回 U 的对应行块位置
-  （更新由 U 替换原版 Muon 的 Ortho(M)，后续缩放与参数更新与原版 Muon 一致）
+      把 O_h 放回 O 的对应行块位置
+  （更新由 O 替换原版 Muon 的 Ortho(M)，后续缩放与参数更新与原版 Muon 一致）
 
 输出：
-  正交化后的更新 U = [O_1; O_2; ...; O_H]，每个 O_h 是对应头块的正交化结果
+  正交化后的更新 O = [O_1; O_2; ...; O_H]，每个 O_h 是对应头块的正交化结果
 </code></pre>
 </div>
 </details>
 
-<p>机制澄清：Newton-Schulz 迭代算法本身没有被改动，改的只是它作用的对象——从整个 $M$ 变成每个 $M_h$。NS 多项式系数、迭代步数、归一化方式都与原版 Muon 一致。所以 Per-Head Muon 不是"新的正交化算法"，而是"同一个算法作用在更小的对象上"。</p>
+<p>机制澄清：由 C2 可推断，Newton-Schulz 迭代算法本身没有被改动，改的只是它作用的对象——从整个 $M$ 变成每个 $M_h$。据此本页推断，NS 的多项式系数、迭代步数、归一化方式沿用原版 Muon（K3 报告 §2.5 只说明"对每个头块单独正交化"，未陈述这些实现细节）。所以 Per-Head Muon 不是"新的正交化算法"，而是"同一个算法作用在更小的对象上"。</p>
 
-<p>本章讲清了按头正交化的机制。但带来什么效果、开销怎样变化——下一章讲均衡更新尺度与开销变化。</p>
+<p>按头正交化的机制已经讲清：切分发生在头维度，每个头块单独正交化，NS 算法本身不变。这套改动带来什么效果、开销如何变化，是下一章要回答的问题。</p>
 
 <h3 id="per-head-mechanism-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -284,7 +284,7 @@
     <p>判断 Newton-Schulz 迭代算法本身是否被改，以及改的只是什么。</p>
     <details>
       <summary>解答：算法没改，改的只是作用对象</summary>
-      <p>NS 多项式系数、迭代步数、归一化方式都与原版 Muon 一致。Per-Head Muon 不是新的正交化算法，而是同一个算法作用在更小的对象上——从整个 $M$ 变成每个 $M_h$。</p>
+      <p>由 C2 可推断算法没改，改的只是作用对象；NS 的多项式系数、迭代步数、归一化方式按原版 Muon 沿用（此为本页推断，K3 §2.5 未陈述这些实现细节）。Per-Head Muon 不是新的正交化算法，而是同一个算法作用在更小的对象上——从整个 $M$ 变成每个 $M_h$。</p>
     </details>
   </li>
 </ol>
@@ -293,7 +293,7 @@
 
 <h2 id="balanced-scale-and-overhead">3. 效果与开销——均衡更新尺度与开销变化</h2>
 
-<p>先说"均衡"均衡的是什么。按头正交化使每个 $M_h$ 在各自内部获得单位奇异值——也就是每个头块的更新行块范数都接近 1。这与原版 Muon 的差别在于"作用域"：原版只保证整块矩阵的奇异值拉平，各头之间仍保留原始动量尺度的比例（大尺度头行块范数大、小尺度头行块范数小，当各行块行空间有重叠时；正交时不保留该比例、各头行块范数均为 1）；按头正交化把"拉平"的作用域缩小到每个头，各头更新幅度不再受原始动量尺度差异的耦合影响，趋于一致。K3 报告把这称为"均衡各头更新尺度"<sup>[C2, C3]</sup>。</p>
+<p>"均衡"均衡的是各头更新幅度。按头正交化使每个 $M_h$ 在各自内部获得单位奇异值——也就是每个头块的更新行块范数都接近 1。这与原版 Muon 的差别在于"作用域"：原版只保证整块矩阵的奇异值拉平——整块动量秩亏（各头行块线性相关，$\mathrm{rank}(M) < H d_h$）时，$UV^\top$ 中部分头块对应的行块范数小于 1、幅度不均；整块动量行满秩时正交化本身已让各头行块范数均为 1。按头正交化把"拉平"的作用域缩小到每个头，各头更新幅度不再受原始动量尺度差异的耦合影响，趋于一致。K3 报告把这称为"均衡各头更新尺度"<sup>[C2, C3]</sup>。</p>
 
 <p>辅助解释。可以把全矩阵正交化类比成"把不同音量的乐器混进一条音轨再统一调音量"——音量大的乐器定调、音量小的乐器被压低，统一调音量后小音量乐器依然听不清。按头正交化像给每个乐器单独调音量，各自都调到标准音量。这个类比只解释"尺度耦合"这一局部关系：它帮助理解为什么全矩阵正交化不能保证每个头都被拉平。它不覆盖方向耦合（各头方向信息也会被 SVD 混合），也不保证收敛或最优。正式判断仍以 SVD 与正交化公式为准。</p>
 
@@ -310,7 +310,7 @@
 </table>
 </div>
 
-<p>为什么开销会略降？Newton-Schulz 迭代每步的主要计算是 Gram 矩阵 $X X^\top$ 及其平方。对每头块 $M_h \in \mathbb{R}^{d_h \times d}$，Gram 矩阵是 $d_h \times d_h$；对全矩阵 $M \in \mathbb{R}^{H d_h \times d}$，Gram 矩阵是 $H d_h \times H d_h$。$H$ 个 $d_h \times d_h$ 的小方阵总开销，低于一个 $H d_h \times H d_h$ 的大方阵（当 $d_h \ll d$ 且 $H$ 适中时）。这正是 K3 报告所说"NS 在更小的 per-head 块上比在全投影矩阵上便宜"<sup>[C3]</sup>。</p>
+<p>为什么开销会略降？Newton-Schulz 迭代每步的主要计算是 Gram 矩阵 $X X^\top$ 及其平方。对每头块 $M_h \in \mathbb{R}^{d_h \times d}$，Gram 矩阵是 $d_h \times d_h$；对全矩阵 $M \in \mathbb{R}^{H d_h \times d}$，Gram 矩阵是 $H d_h \times H d_h$。$H$ 个 $d_h \times d_h$ 的小方阵总开销，低于一个 $H d_h \times H d_h$ 的大方阵，比值约为 $1/H$。这正是 K3 报告所说"NS 在更小的 per-head 块上比在全投影矩阵上便宜"<sup>[C3]</sup>。</p>
 
 <details>
 <summary>展开：Gram 矩阵规模对比</summary>
@@ -322,7 +322,7 @@
 
 <p>边界提醒：C3 的三个结论是 K3 在其大尺度训练配置下观察到的定性判断。报告没有给出"per-head Muon 单独贡献了多少稳定性或多少开销节省"的消融数字——这些是整体训练配方的综合结果。因此不应推广为"任何规模、任何头数配置下都更稳更省"，也不应给出来源未公开的具体百分比。"略降"是定性判断。</p>
 
-<p>本章讲清了按头正交化的效果与开销。但分布式训练里 NS 正交化需要完整参数矩阵而参数被分片了——下一章讲 P2P 参数取回如何避免全参数通信。</p>
+<p>本章说明了 per-head 改动带来的效果与开销变化。剩下的问题是工程落地：正交化需要完整参数矩阵，而参数在分布式训练中被分片，下一章讲 P2P 参数取回如何避免全参数通信。</p>
 
 <h3 id="balanced-scale-and-overhead-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -337,7 +337,7 @@
     <p>说明为什么每头块的 Gram 矩阵比全矩阵的 Gram 矩阵小，以及量级比值约为多少。</p>
     <details>
       <summary>解答：$d_h \times d_h$ 对 $H d_h \times H d_h$，比值约 $1/H$</summary>
-      <p>NS 每步主要计算 Gram 矩阵及其平方：每头块的是 $d_h \times d_h$，全矩阵的是 $H d_h \times H d_h$。$H$ 个小方阵的总开销量级约为大方的 $1/H$（当 $d_h \ll d$ 且 $H$ 适中时），实际节省还受工程因素影响。</p>
+      <p>NS 每步主要计算 Gram 矩阵及其平方：每头块的是 $d_h \times d_h$，全矩阵的是 $H d_h \times H d_h$。$H$ 个小方阵的总开销量级约为大方的 $1/H$，实际节省还受工程因素影响。</p>
     </details>
   </li>
   <li>
@@ -453,27 +453,27 @@
 <p>C1（全矩阵正交化耦合各头、大尺度头主导、小尺度头未充分正交化）：Kimi K3 技术报告 §2.5 "Per-Head Muon"，原文 "full-matrix orthogonalization treats all heads as a single coupled block, so heads with larger gradient or momentum scales dominate the shared update direction, while smaller-scale heads receive insufficiently normalized updates"。</p>
 <p>C2（按头切分动量矩阵、每头块单独正交化、均衡各头更新尺度）：K3 技术报告 §2.5，原文 "we partition their momentum matrices along the head dimension and orthogonalize each head's block separately ... per-head orthogonalization equalizes the update scale across heads"。</p>
 <p>C3（更均衡学习动力学、提升大尺度稳定性、略降开销）：K3 技术报告 §2.5，原文 "this design yields more balanced learning dynamics across heads and improves training stability at larger scales. It also slightly reduces optimizer overhead, as Newton–Schulz iterations on tall per-head blocks are cheaper than on the full projection matrix"。</p>
-<p>C4（朴素 all-gather 的内存与通信问题）：K3 技术报告 §5.2.2 "P2P-based Muon orthogonalization"，原文 "The naive approach performs an all-gather over the entire parameter buffer on every rank, which incurs a substantial memory footprint on top of making communication the primary bottleneck at scale"。</p>
-<p>C5（P2P 取回本地所需分片、消除全参数缓冲区、流水化隐藏通信）：K3 技术报告 §5.2.2，原文 "each rank retrieves only the shards of its locally owned parameters via peer-to-peer (P2P) communication ... eliminating the full-parameter buffer and reducing both memory usage and communication volume. Communication and computation are further pipelined at the granularity of model-chunk buffers"。</p>
+<p>C4（朴素 all-gather 的内存与通信问题）：K3 技术报告 §5.2.2「Memory-Efficient Training」下的 P2P-based Muon orthogonalization 小节，原文 "The naive approach performs an all-gather over the entire parameter buffer on every rank, which incurs a substantial memory footprint on top of making communication the primary bottleneck at scale"。</p>
+<p>C5（P2P 取回本地所需分片、消除全参数缓冲区、流水化隐藏通信）：K3 技术报告 §5.2.2 的同一小节，原文 "each rank retrieves only the shards of its locally owned parameters via peer-to-peer (P2P) communication ... eliminating the full-parameter buffer and reducing both memory usage and communication volume. Communication and computation are further pipelined at the granularity of model-chunk buffers"。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1（动量矩阵按头堆叠与逐头正交化的形式化表达）：切分方式由 C2 直接给出；记号 $M=[M_1;\dots;M_H]$、每块 $M_h\in\mathbb{R}^{d_h\times d}$ 为本页标注，用于表达"沿头维度切分"。</p>
 <p>F2（正交化等价于 SVD 后取 $UV^\top$、奇异值拉平为 1）：Muon 原始博客（Keller Jordan, "Muon" blog post, 2024-12）将正交化目标定义为 $\arg\min_O \|O-G\|_F$ s.t. $O$ 半正交，等价于 SVD 后取 $UV^\top$。K3 §2.5 默认沿用 Muon 的 NS 正交化定义。本页只使用其结论，NS 迭代的内部实现属于 Newton-Schulz 概念页。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>本页无外部实验数字。K3 报告对 Per-Head Muon 只给定性结论（C3），未给 per-head 单独贡献的消融数值。Moonlight 技术报告（arXiv:2502.16982）给出的 Muon 相对 AdamW 的 ~2× 计算效率是整体 Muon 的结果，不归因于 per-head 改动，本页不引用以避免误导。</p>
 
 <h3>构造示例</h3>
 <p>本页构造示例是人为构造的：$H=2, d_h=1, d=2$，$M_1=[3,4]$（范数 5）、$M_2=[0.3,0.4]$（范数 0.5），两头平行同向、尺度差 10 倍。构造目的：用最小的可手算矩阵展示"全矩阵正交化把小尺度头行块压到远小于 1、按头正交化把它拉回 1"的尺度耦合效应。数字不代表真实训练数据，也不代表工程推荐值。极端情形（平行同向）展示的是"幅度被压低"的最简形态；非平行情形方向也会被耦合，本页不展开手算。</p>
-<p>「整块正交化」章本章问题中的对照例子 $M_1=[1,0], M_2=[0,2]$（两行正交）也是构造数据，用于说明"两行正交时全矩阵正交化不会压低任一头"这一边界情形。</p>
+<p>「整块正交化」章本章问题中的对照例子 $M_1=[1,0], M_2=[0,2]$（两行正交）也是构造数据，用于说明"整块动量行满秩时全矩阵正交化不会压低任一头"这一边界情形。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>效果与开销章的"乐器混进一条音轨再统一调音量"类比只解释"尺度耦合"这一局部关系：帮助理解为什么全矩阵正交化不能保证每个头都被拉平。失效边界：它不覆盖方向耦合（各头方向信息也会被 SVD 混合），不保证收敛或最优，不说明各头学到的内容差异。正式判断以 SVD 与正交化公式为准。</p>
 
 <h3>简化条件及其限制</h3>
 <p>简化一：动量矩阵只用 $H=2, d_h=1, d=2$ 的极小矩阵，真实训练中 $H$ 通常为几十、$d_h$ 为 64–256、$d$ 为数千。可推出：全矩阵正交化不保证每头行块范数为 1、按头正交化保证。不可推出：真实尺度下的具体节省量。</p>
-<p>简化二：只展示"平行同向"极端情形的尺度耦合，不展开非平行情形的方向耦合手算。可推出：按头正交化均衡幅度的结论在非平行情形下同样成立。不可推出：非平行情形下方向耦合的具体数值。</p>
-<p>简化三：Newton-Schulz 迭代用 $\mathrm{Ortho}(\cdot)$ 符号表示，不展开其多项式系数 $(3.4445, -4.7750, 2.0315)$、5 步迭代与 bfloat16 归一化等实现细节。可推出：NS 把矩阵奇异值拉平为 1 这一结论。不可推出：NS 迭代的内部实现细节（属于 Newton-Schulz 概念页）。</p>
+<p>简化二：正文手算只展示"平行同向"这一秩亏情形的尺度耦合，不展开非平行情形的手算；本章问题另给出行满秩的正交边界情形供读者自行判断。可推出：按头正交化均衡幅度的结论与各头是否平行无关。不可推出：非平行情形下方向耦合的具体数值。</p>
+<p>简化三：Newton-Schulz 迭代用 $\mathrm{Ortho}(\cdot)$ 符号表示，不展开其多项式系数、迭代步数与归一化方式等实现细节。可推出：NS 把矩阵奇异值拉平为 1 这一结论。不可推出：NS 迭代的内部实现细节（属于 Newton-Schulz 概念页；K3 §2.5 亦未陈述这些细节）。</p>
 <p>简化四：分布式实现的 P2P 图示只展示 4 个 rank、按投影（Q/K/V）分配的示意，真实实现按 model-chunk 粒度流水化，参数布局与分片策略更复杂。可推出：P2P 取回本地所需分片替代全参数 all-gather 的核心。不可推出：真实实现的参数布局与流水化细节。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

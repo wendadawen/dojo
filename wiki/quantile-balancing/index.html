@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="K3 的 MoE 负载均衡：从单次前向推导下一 bias（取 margins 的 1-k/n 分位数），替代 DeepSeek-V3 固定步长 sign 更新。896 专家时 sign 失效，QB 一步到位无学习率。训练用 histogram 估计分位数，推理冻结。基于 K3 报告 §2.3.3 + §C/§D 附录核对。">
+  <meta name="description" content="K3 的 MoE 负载均衡：从单次前向推导下一 bias（取 margins 的 1-k/n 分位数），替代 DeepSeek-V3 固定步长 sign 更新。896 专家时 sign 更难维持均衡，QB 一步到位无学习率。训练用 histogram 估计分位数，推理冻结。基于 K3 报告 §2.3.3 + §C/§D 附录核对。">
   <meta name="dojo:summary" content="从单次前向中的 margin 分布取 $1-k/n$ 分位数，直接推导下一步 router bias，替代固定步长的 sign 更新。训练时用 histogram 估计分位数，推理时冻结 bias。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="模型结构">
@@ -95,7 +95,7 @@
 <!-- 页面开头 -->
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Kimi K3 Technical Report §2.3.3 (Eq.13–14)、Appendix C (balanced-assignment 推导)、Appendix D (histogram 估计)；DeepSeek-V3 Technical Report (arXiv:2412.19437) §3.3；HuggingFace moonshotai/Kimi-K3 config.json。</p>
+<p><b>主要依据</b>：Kimi K3 Technical Report §2.3.3 (Eq.13–14)、Appendix C (balanced-assignment 推导)、Appendix D (histogram 估计)；DeepSeek-V3 Technical Report (arXiv:2412.19437) §2.1.2；HuggingFace moonshotai/Kimi-K3 config.json。</p>
 </blockquote>
 
 <p>896 个专家，每个 token 只用 16 个——如果总有一部分专家被冷落、另一部分被挤爆，训练会怎样？更关键的是：怎么把负载调平，还不干扰模型本身在学的东西？</p>
@@ -106,7 +106,7 @@
   <h2>核心问题</h2>
   <ol class="chapter-questions">
     <li>
-      <p>QB 要解决什么问题？DeepSeek-V3 的固定步长 bias 更新为什么在 896 专家时失效？</p>
+      <p>QB 要解决什么问题？DeepSeek-V3 的固定步长 bias 更新为什么在 896 专家时更难维持均衡？</p>
       <details>
       <summary>解答：负载不均衡且不引入损失项；sign 更新只保留方向</summary>
       <p>QB 解决 MoE 训练中的专家负载不均衡问题，且不引入任何损失项，只改 bias 的更新规则。DeepSeek-V3 的 sign 更新只保留负载误差的方向、丢弃幅度，唯一步长 $\gamma$ 同时承担"快速纠正"与"不震荡"两个矛盾要求；专家数扩大到 896 后，该缺陷被放大为收敛慢、均衡附近震荡和部分专家长期训练不足。完整论证见「1. auxiliary-loss-free 路由」与「2. DeepSeek-V3 的固定步长更新」。</p>
@@ -147,7 +147,7 @@
   <h2>最容易误解</h2>
   <ul>
     <li>"QB 是一种新的损失函数"——QB 是 bias 的更新规则，不引入任何损失项，它替代的是 bias 的更新方式而非损失函数。</li>
-    <li>"QB 一步就能完美均衡任何负载"——QB 是交替求解器的一轮更新，论文报告在近 10³ 专家时"几步内"收敛；手算例子恰好一步收敛，但不代表一般情况。</li>
+    <li>"QB 一步就能完美均衡任何负载"——QB 是交替求解器的一轮更新，论文报告在近 $10^3$ 专家时"几步内"收敛；手算例子恰好一步收敛，但不代表一般情况。</li>
     <li>"bias 参与了 mixture weight 的计算"——bias 只加到 router 分数上做 Top-k 选择，归一化权重只用原始分数计算。</li>
   </ul>
 </section>
@@ -156,7 +156,7 @@
 
 <h2 id="aux-loss-free-routing">1. auxiliary-loss-free 路由——bias 做什么、不做什么</h2>
 
-<p>在讲 QB 之前，先理解它所处的路由框架。MoE（混合专家模型）的基本路由机制见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>。这里只说 QB 直接依赖的部分。</p>
+<p>QB 处在 auxiliary-loss-free 路由的框架内。MoE（混合专家模型）的基本路由机制见 <a href="../moe-serving/index.html">MoE 大模型推理与服务基础</a>；QB 直接依赖的是 bias 在路由中的角色。</p>
 
 <p>MoE 路由的核心是：对每个 token $x_i$，router（一个线性层 $W_r$）打出每个专家的分数 $s_{i,j} = \sigma(W_r x_i)_j$，其中 $\sigma$ 是 sigmoid。$\sigma$ 的作用是将实数分数压到 $(0,1)$ 区间。然后选分数最高的 $k$ 个专家处理这个 token。</p>
 
@@ -176,7 +176,7 @@ $$T_i = \text{argtopk}(s_i + b), \qquad p_{i,j} = \frac{s_{i,j}}{\sum_{r \in T_i
 
 <p>用两个快速检查验证 bias 的角色。第一，如果所有专家的 bias 同时加常数 $c$，则 $s_{i,j} + b_j + c = (s_{i,j} + b_j) + c$，Top-k 选择不变——因为所有分数同时平移，相对排序不变。第二，归一化权重 $p_{i,j}$ 不含 $b$，所以 bias 完全不影响专家的输出权重，只影响"这个 token 分给谁"。</p>
 
-<p>本章说明了 bias 在路由中的角色——只影响选谁，不进权重。但 bias 本身怎么更新、为什么固定步长更新在大规模时失效——下一章讲 DeepSeek-V3 的 sign 更新及其瓶颈。</p>
+<p>bias 的作用到此明确：它只改变每个 token 选中哪些专家，不进入归一化权重，因此在梯度优化之外独立服务于负载调节。下一章转向它自身的更新规则——DeepSeek-V3 的 sign 更新，以及固定步长在专家池扩大后为何更难维持均衡。</p>
 
 <h3 id="ch1-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -198,7 +198,7 @@ $$T_i = \text{argtopk}(s_i + b), \qquad p_{i,j} = \frac{s_{i,j}}{\sum_{r \in T_i
 
 <!-- DeepSeek-V3 sign 更新 -->
 
-<h2 id="deepseek-v3-sign-update">2. DeepSeek-V3 的固定步长更新——为什么 896 专家时失效</h2>
+<h2 id="deepseek-v3-sign-update">2. DeepSeek-V3 的固定步长更新——为什么 896 专家时更难维持均衡</h2>
 
 <p>DeepSeek-V3 提出 auxiliary-loss-free 路由时，bias 的更新规则是固定步长的 sign 更新：<sup>[C2, F2]</sup></p>
 
@@ -216,19 +216,19 @@ $$b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \text{sign}(\bar{\ell}^{(t)} - \ell_j^{
 
 <p>这个更新有一个根本性的两难：$\gamma$ 只有一个值，既要够大才能快速纠正不均衡，又要够小才不会在均衡附近来回震荡。<strong>sign 只保留了负载误差的方向，丢掉了幅度</strong>。无论专家多了 100 个 token 还是多了 1 个 token，$\text{sign}(\bar{\ell} - \ell_j)$ 都返回 $-1$，bias 都只走 $\gamma$ 这一步。</p>
 
-<p>构造示例。假设 $\gamma = 0.001$，某专家负载 $\ell_j = 100$，目标 $\bar{\ell} = 50$（多了 50 个）。$\text{sign}(50 - 100) = \text{sign}(-50) = -1$，每步 bias 减 $0.001$。另一个场景中负载 $\ell_j = 51$（只多了 1 个），$\text{sign}(50 - 51) = \text{sign}(-1) = -1$，每步 bias 也减 $0.001$。两种差距相差 50 倍，但 bias 的更新幅度完全相同——sign 丢失了"差多远"的信息。前者需要约 50000 步才能把 bias 调到合理水平。</p>
+<p>构造示例。假设 $\gamma = 0.001$，某专家负载 $\ell_j = 100$，目标 $\bar{\ell} = 50$（多了 50 个）。$\text{sign}(50 - 100) = \text{sign}(-50) = -1$，每步 bias 减 $0.001$。另一种情况，负载 $\ell_j = 51$（只多了 1 个），$\text{sign}(50 - 51) = \text{sign}(-1) = -1$，每步 bias 也减 $0.001$。两种差距相差 50 倍，但 bias 的更新幅度完全相同——sign 丢失了"差多远"的信息。若把 bias 调整到能显著改变路由的水平需要移动约 $0.05$，按每步固定 $0.001$ 计算，两种情况都需要约 $50$ 步。</p>
 
 <p>K3 将 routed expert 池扩大到 <strong>896 per layer</strong>，每个 token 选 <strong>16 个</strong>（$k=16$）。这些数字来自 K3 官方 config.json（<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>topk_method: "noaux_tc"</code>）。<sup>[C17, N1]</sup> 专家数从前代 K2 的 384 扩大到 896（K3 报告 Table 1）后，sign 更新只保留方向的缺陷被放大：收敛慢、均衡附近震荡、部分专家长期训练不足，拖慢专家并行训练。</p>
 
-<p>本章说明了 sign 更新在大规模专家时的瓶颈——只保留方向、步长固定。但能不能从当前分数分布直接算出"正确的 bias 应该是多少"——下一章讲 QB 的核心机制。</p>
+<p>固定步长的 sign 更新只保留负载误差的方向，无从反映差距的大小；专家池扩大后，这一局限以收敛慢、均衡附近震荡和部分专家训练不足的形式显现。能否从当前分数分布直接算出目标 bias，是 QB 要回答的问题。</p>
 
 <h3 id="ch2-questions">本章问题</h3>
 <ol class="chapter-questions">
   <li>
     <p>$\gamma = 0.001$ 时，负载从 100 降到目标 50，sign 更新需要约多少步才能把 bias 调到合理水平？这说明 sign 更新的什么问题？</p>
     <details>
-    <summary>解答：约 50000 步；步长与误差幅度无关</summary>
-    <p>每步 bias 只变化 $0.001$，要在 $0.05$ 量级上产生实质影响需要约 $50000$ 步。问题在于步长 $\gamma$ 与负载误差的幅度无关：误差大时纠正太慢，误差小时又容易在均衡附近过冲震荡——sign 只保留方向，丢掉了"差多远"的信息。</p>
+    <summary>解答：约 50 步；步长与误差幅度无关</summary>
+    <p>负载差 50 个 token 不等于 bias 需要移动 50——bias 的移动量取决于分数分布。若把 bias 调整到能显著改变路由需要移动约 $0.05$，则每步 $0.001$ 需要约 $50$ 步（$0.05 / 0.001$）。问题在于步长 $\gamma$ 与负载误差的幅度无关：误差大时纠正太慢，误差小时又容易在均衡附近过冲震荡——sign 只保留方向，丢掉了"差多远"的信息。</p>
     </details>
   </li>
   <li>
@@ -260,8 +260,6 @@ $$b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \text{sign}(\bar{\ell}^{(t)} - \ell_j^{
   <div class="flow-step"><b>下一步生效（因果性）</b>：batch 不用自己推导的 bias 路由</div>
 </div>
 
-<p>下面逐步拆解。</p>
-
 <h3 id="step1-topk-plus-1">3.1 步骤 1：Top-$(k+1)$ 路由得 cutoff $\alpha_i$</h3>
 
 <p>QB 不是做 Top-k，而是做 <strong>Top-(k+1)</strong>。对 token $i$，把 $s_{i,j} + b_j^{(t)}$ 从大到小排序，取前 $k+1$ 个。前 $k$ 个是实际路由 $T_i$（与普通 Top-k 相同），第 $(k+1)$ 个就是 cutoff $\alpha_i$——"要进 Top-k 必须超过的分数线"。</p>
@@ -274,13 +272,13 @@ $$b_j^{(t+1)} = b_j^{(t)} + \gamma \cdot \text{sign}(\bar{\ell}^{(t)} - \ell_j^{
 
 $$\text{margin}_{i,j} = s_{i,j} - \alpha_i$$
 
-<p>注意这里用的是 <strong>raw score $s_{i,j}$</strong> 减 cutoff $\alpha_i$。$\alpha_i$ 来自 Top-(k+1) 的 biased score（含旧 bias $b^{(t)}$），但 $s_{i,j}$ 不含 bias。所以旧 bias 只通过 cutoff $\alpha_i$ 间接进入 margin，raw score 保持"干净"。</p>
+<p>这里用的是 <strong>raw score $s_{i,j}$</strong> 减 cutoff $\alpha_i$。$\alpha_i$ 来自 Top-(k+1) 的 biased score（含旧 bias $b^{(t)}$），但 $s_{i,j}$ 不含 bias。所以旧 bias 只通过 cutoff $\alpha_i$ 间接进入 margin，raw score 保持"干净"。</p>
 
 <p>margin 的直觉含义：它衡量"专家 $j$ 对 token $i$ 的吸引力，减去进入 Top-k 的门槛"。margin 为正说明该专家的 raw 分数超过了 cutoff（在 biased 分数下它本可以进 Top-k），margin 为零说明恰好等于 cutoff，margin 为负说明不够格。</p>
 
 <h3 id="step3-quantile">3.3 步骤 3：取 $(1-k/n)$ 分位数得 $\tilde{b}$</h3>
 
-<p>对每个专家 $j$，收集所有 $m$ 个 token 对它的 margin，取 $(1 - k/n)$ 分位数，取负就是 b̃：<sup>[C1, F3]</sup></p>
+<p>对每个专家 $j$，收集所有 $m$ 个 token 对它的 margin，取 $(1 - k/n)$ 分位数，取负就是 $\tilde{b}$：<sup>[C1, F3]</sup></p>
 
 $$\tilde{b}_j^{(t+1)} \leftarrow -\text{quantile}_{1-k/n}\left(s_{:,j}^{(t)} - \alpha^{(t)}\right)$$
 
@@ -307,10 +305,6 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 <div class="callout callout-yellow">
 <p><b>因果性</b>：更新在下一步生效。第 $t$ 步的前向传播算出 $b^{(t+1)}$，但第 $t$ 步的 batch 用的是 $b^{(t)}$（上一步算出的）。一个 batch 绝不用自己推导的 bias 路由——否则会造成信息泄漏。</p>
 </div>
-
-<p>公式讲清了，现在用手算例子验证每一步。</p>
-
-<!-- 手算例子嵌入本章正文 -->
 
 <p>构造示例。以下分数为人为构造，数字便于手算，不代表真实模型输出。但 QB 的计算过程与真实机制完全一致。设 $m=8$（8 个 token）、$n=4$（4 个专家）、$k=1$（每个 token 选 1 个专家），目标负载 $q = mk/n = 8 \times 1 / 4 = 2$。初始 bias $b = (0, 0, 0, 0)$。</p>
 
@@ -356,7 +350,7 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 </table>
 </div>
 
-<p>注意被选中的专家（路由列）的 margin 恰好为 $+0.0$，这是巧合还是规律？实际上，当 $k=1$ 且初始 bias 为 0 时，Top-2 的第二个值（cutoff）就是 Top-2 对应专家的 raw score，所以该专家的 margin 恰好为 0。Top-1 对应专家的 margin 为正（因为它分数更高）。</p>
+<p>每个 token 的 Top-2 专家（cutoff 所属的专家）在 margin 表中的值为 $+0.0$。当 $k=1$ 且初始 bias 为 0 时，cutoff 就是 Top-2 专家的 raw score，所以它的 margin 恰好为 0；被路由的 Top-1 专家 margin 为正（分数更高）。</p>
 
 <h3 id="example-quantile">3.7 取分位数得 $\tilde{b}$</h3>
 
@@ -404,7 +398,7 @@ $$b^{(t+1)} \leftarrow \tilde{b}^{(t+1)} - \text{mean}\left(\tilde{b}^{(t+1)}\ri
 
 <p>新负载 $\ell = (2, 2, 2, 2)$——完美均衡。3 个 token（T4、T5、T8）的路由被 QB 改变，从过热的 E1/E2 转向冷门的 E3/E4。</p>
 
-<p>这个例子一步就达到完美均衡，但请注意：QB 是交替求解器的一轮更新，论文报告在近 $10^3$ 专家时"几步内"收敛。<sup>[C1]</sup> 一步收敛是本例的特殊性，不是一般保证。一般情况下一轮更新在给定旧 cutoff 的条件下保证目标负载，但实际路由使用新 cutoff，可能需要多轮。</p>
+<p>这个例子一步就达到完美均衡，但这是本例的特殊性：QB 是交替求解器的一轮更新，论文报告在近 $10^3$ 专家时"几步内"收敛。<sup>[C1]</sup> 一步收敛不是一般保证。一般情况下一轮更新在给定旧 cutoff 的条件下保证目标负载，但实际路由使用新 cutoff，可能需要多轮。</p>
 
 <details class="code-details">
 <summary>代码：手算例子的完整 QB 计算</summary>
@@ -534,7 +528,7 @@ print(f"  改变的 token: {', '.join(changed)}")</code></pre>
 <p><b>教学简化</b>：代码使用纯 Python 列表，逐 token 排序，便于观察每一步；真实工程使用张量操作和直方图估计（见下一章），不逐 token 排序也不收集全部 margins。</p>
 </details>
 
-<p>本章用公式和手算例子说明了 QB 的四步机制——从 Top-(k+1) 取 cutoff 到 mean-centering。但 QB 为什么比 sign 更新好、为什么不需要超参数——下一章从对偶理论的视角回答。</p>
+<p>四步流程到此结束：Top-(k+1) 取 cutoff、计算 margins、取 $(1-k/n)$ 分位数、mean-centering；手算例子一轮即达均衡。QB 相对 sign 更新的优势、以及它无需步长超参数的原因，要从对偶目标的角度才能看清。</p>
 
 <h3 id="ch3-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -592,6 +586,7 @@ $$\min_{\alpha, \beta} L(\alpha, \beta) := \sum_{i,j} \max\left(0, s_{i,j} - \al
 <p>$$\frac{\partial L_j}{\partial \beta_j} = -\sum_{i=1}^{m} \mathbb{1}[m_i > \beta_j] + \frac{mk}{n}$$</p>
 <p>第一项是 $\beta_j$ 上方 margin 的个数的负数，第二项是目标负载 $q = mk/n$。令梯度为零，得 $\beta_j$ 上方的 margin 数 $= q$，即 $\beta_j$ 是第 $(q+1)$ 大的 margin，也就是 $(1-k/n)$ 分位数。</p>
 <p>因为 $b_j = -\beta_j$（bias 是阈值的负数），所以 $b_j = -\text{quantile}_{1-k/n}(margins_{:,j})$，正是 Eq.14。</p>
+<p>这个符号也正是 sign 更新与 $\beta$ 的关系所在。对 $\beta_j$ 做（次）梯度下降是 $\beta_j \leftarrow \beta_j - \gamma \cdot \partial L_j/\partial \beta_j$；由 $b_j = -\beta_j$，两边取负得 $b_j \leftarrow b_j + \gamma \cdot \partial L_j/\partial \beta_j$，即对 $b$ 的更新方向与对 $\beta$ 的相反。把次梯度 $\partial L_j/\partial \beta_j = mk/n - \ell_j = \bar{\ell} - \ell_j$ 换成它的符号 $\text{sign}(\bar{\ell} - \ell_j)$，就得到 DeepSeek-V3 的 $b_j \leftarrow b_j + \gamma \cdot \text{sign}(\bar{\ell} - \ell_j)$。</p>
 </details>
 
 <h3 id="sign-vs-qb">4.3 sign 更新是 SignSGD，QB 是 coordinate minimizer</h3>
@@ -606,7 +601,7 @@ $$\frac{\partial L}{\partial \beta_j} = \frac{mk}{n} - \sum_{i=1}^{m} \mathbb{1}
 <table>
 <thead><tr><th></th><th>DeepSeek-V3 sign 更新</th><th>QB</th></tr></thead>
 <tbody>
-<tr><td>求解策略</td><td>SignSGD（梯度方向 × 固定步长）</td><td>精确 coordinate minimizer</td></tr>
+<tr><td>求解策略</td><td>SignSGD（梯度方向 $\times$ 固定步长）</td><td>精确 coordinate minimizer</td></tr>
 <tr><td>保留信息</td><td>只保留方向</td><td>保留完整分布（通过分位数）</td></tr>
 <tr><td>超参数</td><td>需要 $\gamma$（权衡慢适应与震荡）</td><td>无超参数</td></tr>
 <tr><td>收敛</td><td>慢，大规模时震荡</td><td>近 $10^3$ 专家时几步内收敛<sup>[C1]</sup></td></tr>
@@ -617,7 +612,7 @@ $$\frac{\partial L}{\partial \beta_j} = \frac{mk}{n} - \sum_{i=1}^{m} \mathbb{1}
 
 <p>这就是 QB 无需 $\gamma$ 的根本原因：它不是在走梯度步，而是在直接求精确解。代价是每步需要计算分位数（而非简单的 sign），但直方图估计（下一章）使这个代价可控。</p>
 
-<p>本章从对偶理论说明了 QB 为什么比 sign 更新好——它直接求精确 coordinate minimizer 而非走梯度步。但训练时百万级 margin 无法全量收集——下一章讲直方图估计如何以固定成本恢复分位数。</p>
+<p>对偶视角给出了 QB 无需 $\gamma$ 的原因：它直接求对偶目标的精确 coordinate minimizer。剩下的工程障碍是每步的百万级 margin 无法全量收集；直方图估计以与 token 数无关的固定通信成本解决这个问题。</p>
 
 <h3 id="ch4-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -647,7 +642,7 @@ $$\frac{\partial L}{\partial \beta_j} = \frac{mk}{n} - \sum_{i=1}^{m} \mathbb{1}
 
 <h3 id="histogram-mechanism">5.1 直方图估计机制</h3>
 
-<p>对每个专家维护一个 $B$ 个 bin 的直方图。分箱范围为 $[b_{\min}-1, b_{\max}+1]$，其中 $b_{\min}$、$b_{\max}$ 是当前 bias 的极值。因为 router 分数 $s_{i,j} \in (0,1)$（sigmoid 输出），cutoff $\alpha_i$ 也是某个 biased score，落在 $(b_{\min}, 1+b_{\max})$ 内，所以所有 $r_{i,j} = \alpha_i - s_{i,j} = -\text{margin}_{i,j}$（与上文 margin 符号相反；来源称 $r$ 为 required bias）落在 $[b_{\min}-1, b_{\max}+1]$ 内。<sup>[C14, F7]</sup> 范围每步重算，bin width $w = (b_{\max} - b_{\min} + 2)/B$ 随 bias 扩散而自适应。</p>
+<p>对每个专家维护一个 $B$ 个 bin 的直方图。分箱范围为 $[b_{\min}-1, b_{\max}+1]$，其中 $b_{\min}$、$b_{\max}$ 是当前 bias 的极值。因为 router 分数 $s_{i,j} \in (0,1)$（sigmoid 输出），cutoff $\alpha_i$ 也是某个 biased score，落在 $(b_{\min}, 1+b_{\max})$ 内，所以所有 $r_{i,j} = \alpha_i - s_{i,j} = -\text{margin}_{i,j}$（与上文 margin 符号相反；来源称 $r$ 为 required bias）落在 $[b_{\min}-1, b_{\max}+1]$ 内。<sup>[C14, F7]</sup> 范围每步重算，bin width $w = (b_{\max} - b_{\min} + 2)/B$ 随 bias 扩散而自适应。目标 $\tilde{b}_j$ 也就是 $r$ 的 $k/n$ 分位数：由 $\text{quantile}_p(-x) = -\text{quantile}_{1-p}(x)$，$\tilde{b}_j = -\text{quantile}_{1-k/n}(s_{:,j}-\alpha) = -\text{quantile}_{1-k/n}(-r_{:,j}) = \text{quantile}_{k/n}(r_{:,j})$——符号翻转一次，分位数就从 $1-k/n$ 变为 $k/n$。</p>
 
 <p>训练时的流程：</p>
 
@@ -668,10 +663,10 @@ bin width w = (hi - lo) / B
 all-reduce 汇总 H（一次整数 all-reduce，nB 个值）
 
 对每个专家 j：
-    找第一个 bin β_j 使累积 count ≥ ⌈q⌉
-    c_j = bin β_j 前的累积 count
-    h_j = bin β_j 内的 count
-    分位数 = lo + (β_j + clip((q - c_j) / h_j, 0, 1)) × w
+    找第一个 bin u_j 使累积 count ≥ ⌈q⌉
+    c_j = bin u_j 前的累积 count
+    h_j = bin u_j 内的 count
+    分位数 = lo + (u_j + clip((q - c_j) / h_j, 0, 1)) × w
     b̃_j = 分位数    # 注意 r = α - s = -margin，所以取 k/n 分位数
 
 b = b̃ - mean(b̃)·1    # mean-centering
@@ -683,9 +678,9 @@ b = b̃ - mean(b̃)·1    # mean-centering
 
 <p>从 pooled counts 恢复分位数：找第一个累计 count 达到 $\lceil q \rceil$ 的 bin，在 bin 内线性插值：</p>
 
-$$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h_j}, 0, 1\right)\right) w$$
+$$\tilde{b}_j = b_{\min} - 1 + \left(u_j + \text{clip}\left(\frac{q - c_j}{h_j}, 0, 1\right)\right) w$$
 
-<p>其中 $\beta_j$ 是选中 bin 的索引，$c_j$ 是其前累计 count，$h_j$ 是 bin 内 count。</p>
+<p>其中 $u_j$ 是选中 bin 的索引，$c_j$ 是其前累计 count，$h_j$ 是 bin 内 count。</p>
 
 <h3 id="histogram-error">5.2 误差与成本</h3>
 
@@ -709,7 +704,7 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 
 <p>作为进一步优化，维护估计分位数的 EMA（指数移动平均）可以减少批次间采样噪声，进一步改善负载均衡。<sup>[C16]</sup></p>
 
-<p>本章说明了训练时的直方图估计与推理冻结——通信量与 token 数无关，推理时零额外开销。本文的论断、公式与数字的来源出处及简化条件的边界，见下文「来源与范围说明」。</p>
+<p>训练时以固定成本估计分位数，推理时 bias 冻结、不再有分位数计算或额外通信。本文的论断、公式与数字的来源出处及简化条件的边界，见下文「来源与范围说明」。</p>
 
 <h3 id="ch5-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -744,14 +739,14 @@ $$\tilde{b}_j = b_{\min} - 1 + \left(\beta_j + \text{clip}\left(\frac{q - c_j}{h
 <ul>
   <li>C1–C13：Kimi K3 Technical Report §2.3.3 (Eq.13–14) 及 Appendix C (Derivation of Quantile Balancing, Eq.20–27, Algorithm 1)。</li>
   <li>C14–C16：K3 报告 §2.3.3 histogram 段及 Appendix D (Histogram-Based Quantile Estimation)。</li>
-  <li>C2（DeepSeek-V3 sign 更新）：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report (arXiv:2412.19437) §3.3 auxiliary-loss-free 策略。原文：overload 则 $b_j \leftarrow b_j - \gamma$，underload 则 $b_j \leftarrow b_j + \gamma$，等价于 $b_j + \gamma \cdot \text{sign}(\bar{\ell} - \ell_j)$。</li>
+  <li>C2（DeepSeek-V3 sign 更新）：K3 报告 §2.3.3 引用 [27]；DeepSeek-V3 Technical Report (arXiv:2412.19437) §2.1.2 auxiliary-loss-free 策略。原文：overload 则 $b_j \leftarrow b_j - \gamma$，underload 则 $b_j \leftarrow b_j + \gamma$，等价于 $b_j + \gamma \cdot \text{sign}(\bar{\ell} - \ell_j)$。</li>
   <li>C17（K3 config）：HuggingFace <code>moonshotai/Kimi-K3/config.json</code>，<code>num_experts: 896</code>, <code>num_experts_per_token: 16</code>, <code>moe_router_activation_func: "sigmoid"</code>, <code>topk_method: "noaux_tc"</code>。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
 <ul>
   <li>F1 (Eq.13 路由)：K3 报告 §2.3.3 Eq.13。</li>
-  <li>F2 (DeepSeek-V3 sign 更新)：K3 报告 §2.3.3 引用 [30]；DeepSeek-V3 Technical Report §3.3。</li>
+  <li>F2 (DeepSeek-V3 sign 更新)：K3 报告 §2.3.3 引用 [27]；DeepSeek-V3 Technical Report §2.1.2。</li>
   <li>F3 (QB 更新 Eq.14)：K3 报告 §2.3.3 Eq.14。</li>
   <li>F4 (对偶目标 Eq.23)：K3 报告 Appendix C Eq.23，由 Eq.20–22 推导。</li>
   <li>F5 (coordinate minimizer Eq.25–26)：K3 报告 Appendix C Eq.25–26。</li>

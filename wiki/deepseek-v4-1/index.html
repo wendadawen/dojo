@@ -60,11 +60,11 @@
 
 
 <blockquote class="meta">
-<p><b>主要依据</b>：DeepSeek-V4.1-Flash 技术报告《DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression》（<code>research/official/tech_report.txt</code>）；官方推理配置 <code>official/inference/config.json</code>（HF 仓库版 <code>official/config.json</code> 为 transformers 格式；两版关键字段取值一致，个别字段名不同，本页按各自版本引用）；官方参考实现 <code>official/inference/model.py</code>、<code>kernel.py</code>；真实 checkpoint 分片头（HTTP Range 读取，<code>research/ckpt/headers.json</code>，96085 个张量）。全部数值来自这些材料的直接读取或本机实测，实测脚本与存档见文末。</p>
+<p><b>主要依据</b>（公开仓库 <code>deepseek-ai/DeepSeek-V4.1-Flash</code>）：DeepSeek-V4.1-Flash 技术报告《DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression》（<code>DeepSeek_V41_Tech_Report.pdf</code>）；官方推理配置 <code>inference/config.json</code>（HF 仓库版 <code>config.json</code> 为 transformers 格式；两版关键字段取值一致，个别字段名不同，本页按各自版本引用）；官方参考实现 <code>inference/model.py</code>、<code>inference/kernel.py</code>；真实 checkpoint 分片头（HTTP Range 读取，96085 个张量）。全部数值来自这些材料的直接读取或本机实测，实测脚本与运行输出不随仓库分发，实测清单见 <code>research/measured.md</code>。</p>
 </blockquote>
 
 <div class="callout callout-blue">
-<p>一次 1M 上下文的长请求里，模型每生成一个 token，要为「它能回头看多远」在显存里留下 890 字节——不到一页纯文本的 ASCII 长度。这个数字不是某个单点技巧的结果：<b>压缩</b>把每 $r$ 个 token 池化成一条条目，<b>跨层共享</b>让多层共用同一份缓存，<b>FP4</b> 把每条条目的存储压到 4 位。本页要做的就是把 890 拆开，逐项对上这三个来源。页内所有字节数出自官方配置与参考实现的常量，不是估算；凡是为说明计算方法而人为设定的参数，都会标为构造示例。各模块在完整前向中的先后顺序与张量形状，另见 <a href="../deepseek-v4-1-dataflow/index.html">DeepSeek-V4.1-Flash 前向数据流</a>。</p>
+<p>一次 1M 上下文的长请求里，模型每生成一个 token，要为「它能回头看多远」在显存里留下 890 字节——不到一页纯文本的 ASCII 长度。这个数字不是某个单点技巧的结果：<b>压缩</b>把每 $r$ 个 token 池化成一条条目，<b>跨层共享</b>让多层共用同一份缓存，<b>FP4</b> 把每条条目的存储压到 4 位。下文按压缩、共享、FP4 三项拆开 890 的构成。页内所有字节数出自官方配置与参考实现的常量，不是估算；凡是为说明计算方法而人为设定的参数，都会标为构造示例。各模块在完整前向中的先后顺序与张量形状，另见 <a href="../deepseek-v4-1-dataflow/index.html">DeepSeek-V4.1-Flash 前向数据流</a>。</p>
 </div>
 
 <section class="learning-goals">
@@ -528,7 +528,7 @@ print(f"  屏蔽后选中项全在可达范围内: "
   屏蔽后选中项全在可达范围内: True</code></pre>
 </div>
 <p><b>验证的机制</b>：第一段对应 3.2 节的可达性公式——$\lfloor(i+1)/r\rfloor$ 与「整组出现」的逐组枚举在 $r\in\{1,2,4\}$、$i\in[0,200)$ 上完全一致；其中 $i=4999$ 的两行就是穿越示例里的 2500 与 5000。第二段对应 3.3 节的选择语义：同一个分数列表，屏蔽不可达条目前后选出的 Top-4 不同。</p>
-<p><b>观察重点</b>：看第二段两组结果的差别。不屏蔽时前 4 名是槽位 0、2、6、7——槽位 6、7 属于尚未完成的组，它们凭分数 2.5 与 3.5 挤进了名单，而 3.5 甚至是全场最高分之一。屏蔽后前 4 名变成 0、2、3、4，全部落在可达的 0–4 之内。这说明「置 $-\infty$」不是可有可无的收尾：没有它，未生成的条目会参与竞争并被选中，注意力就会读到并不存在的槽位。第一段则说明公式与逐组枚举没有边界偏差，$i=4$、$r=2$ 这一行尤其要看清——它给的是 2 条（覆盖 token 0–3），组 2 因为组尾 5 尚未出现而不可达。</p>
+<p><b>观察重点</b>：第二段两组输出的差别在于，未屏蔽时前 4 名含槽位 6、7，屏蔽后落在 0–4 内。不屏蔽时前 4 名是槽位 0、2、6、7——槽位 6、7 属于尚未完成的组，它们凭分数 2.5 与 3.5 挤进了名单，而 3.5 甚至是全场最高分之一。屏蔽后前 4 名变成 0、2、3、4，全部落在可达的 0–4 之内。这说明「置 $-\infty$」不是可有可无的收尾：没有它，未生成的条目会参与竞争并被选中，注意力就会读到并不存在的槽位。第一段则说明公式与逐组枚举没有边界偏差，$i=4$、$r=2$ 这一行给的是 2 条（覆盖 token 0–3），组 2 因为组尾 5 尚未出现而不可达。</p>
 <p><b>简化条件</b>：示例用纯 Python 列表模拟索引分与选择，未包含真实实现中的分块量化、张量并行切分与候选池掩码；3.3 节的块级聚合也未涉及，代码只覆盖位置级的可达性与选择。它验证的是规则，不是性能。</p>
 </details>
 
@@ -603,7 +603,7 @@ $$\text{score} = \sqrt{\mathrm{softplus}\big(xW^\top\big)},\qquad \text{idx} = \
 
 <details>
 <summary>补充：超连接模块为什么只占 0.98M</summary>
-<p>超连接把残差流按 4 份并行携带，用三套系数（读前、写后、以及 4 份之间的混合）读写<sup>[F6]</sup>，其中混合矩阵经 20 轮行列交替归一化逼近双随机<sup>[C9]</sup>（见 <a href="../hyper-connections/index.html">超连接</a>）。它的参数量来自一个从隐状态到系数的小投影：输入是展平后的 $4\times5120=20480$ 维残差流，输出是「4 份乘三套系数」所需的 24 维系数，因此总参数为 $2\times24\times20480=983{,}040$，约 0.98M。这个模块的意义不在参数量，而在改变了信息流的结构——它让每层读写残差流的路径不止一条，从而分摊了单一路径上的干扰。参数量小不等于影响小，这一点在阅读同类模型时值得注意。</p>
+<p>超连接把残差流按 4 份并行携带，用三套系数（读前、写后、以及 4 份之间的混合）读写<sup>[F6]</sup>，其中混合矩阵经 20 轮行列交替归一化逼近双随机<sup>[C9]</sup>（见 <a href="../hyper-connections/index.html">超连接</a>）。它的参数量来自一个从隐状态到系数的小投影：输入是展平后的 $4\times5120=20480$ 维残差流，输出是「4 份乘三套系数」所需的 24 维系数，因此总参数为 $2\times24\times20480=983{,}040$，约 0.98M。这个模块的意义不在参数量，而在改变了信息流的结构——它让每层读写残差流的路径不止一条，从而分摊了单一路径上的干扰。它的参数量虽小，但每个 token 都要读入并写回全部 $4\times5120=20480$ 维残差流，影响不由参数量衡量。</p>
 </details>
 
 <h3 id="params-half">4.2 半栈加总：7.89B 与 7.58B</h3>
@@ -731,41 +731,41 @@ $$\text{score} = \sqrt{\mathrm{softplus}\big(xW^\top\big)},\qquad \text{idx} = \
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>[C1] 主干结构：技术报告（<code>research/official/tech_report.txt</code>）行 314–319「Its language backbone comprises 40 causal Transformer layers, organized into a 20-layer causal encoder followed by a 20-layer decoder. Each layer incorporates both global attention and sliding window attention (SWA), except for the first two layers, which use SWA only.」配置 <code>compress_ratios = [0,0,2×18,1×20,0×3]</code>（前两层为 0，即纯 SWA）；运行期实测 <code>research/ckpt/verify_csa2_modes.out</code> 的层表一致。</p>
-<p>[C2] CSA2 三种静态模式与跨层共享：报告 §2.3.1（行 490–520）「Full Mode. The layer computes its own main KV and indexer Q, projects indexer K from that main KV, and runs the indexer to produce fresh Top-K indices.」；<code>official/inference/model.py</code> L496–503、L653–661、L722–737；L498–500 注释「the index keys are derived from the compressor's latent, so only a layer that compresses its own KV can produce them; every other indexer reads them from that layer's cache」。实测 Full = 2/8/14/20、Reindex = 24/28/32/36、Reuse = 其余 30 层。</p>
+<p>[C1] 主干结构：技术报告（<code>DeepSeek_V41_Tech_Report.pdf</code>）行 314–319「Its language backbone comprises 40 causal Transformer layers, organized into a 20-layer causal encoder followed by a 20-layer decoder. Each layer incorporates both global attention and sliding window attention (SWA), except for the first two layers, which use SWA only.」配置 <code>compress_ratios = [0,0,2×18,1×20,0×3]</code>（前两层为 0，即纯 SWA）；运行期实测的层表一致（实测清单见 <code>research/measured.md</code>）。</p>
+<p>[C2] CSA2 三种静态模式与跨层共享：报告 §2.3.1（行 490–520）「Full Mode. The layer computes its own main KV and indexer Q, projects indexer K from that main KV, and runs the indexer to produce fresh Top-K indices.」；<code>inference/model.py</code> L496–503、L653–661、L722–737；L498–500 注释「the index keys are derived from the compressor's latent, so only a layer that compresses its own KV can produce them; every other indexer reads them from that layer's cache」。实测 Full = 2/8/14/20、Reindex = 24/28/32/36、Reuse = 其余 30 层。</p>
 <p>[C3] 主 KV 用 MXFP4、SWA KV 保持 FP8、索引器 Q/K 也是 FP4：报告 §2.4.4 行 689–691「we select E2M1 with one E4M3 scale per 16 channels, following NVFP4, but omitting its second-level global scale」、行 703–704「We retain FP8 for the SWA KV cache due to its sensitivity to quantization.」；<code>model.py</code> L760 <code>fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)</code>、L707 窗口 KV 的 <code>act_quant(...)</code>、L546/L552 索引器 K/Q。</p>
-<p>[C4] Engram 的位置、查表规模与门控：配置 <code>engram_layer_ids=[1,14]</code>、<code>engram_max_ngram_size=4</code>、<code>engram_n_heads=8</code>、<code>engram_head_dim=256</code>；<code>model.py</code> L328–365（<code>Engram.forward</code>）与 <code>engram.py</code>；L344 <code>n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads</code>；实测 <code>ckpt/probe_engram_layout.out</code> 的层分布为 <code>[1, 14]</code>。</p>
-<p>[C5] DSpark 的块式草稿结构：配置 <code>n_mtp_layers=3</code>、<code>dspark_block_size=5</code>、<code>dspark_noise_token_id=128799</code>、<code>dspark_target_layer_ids=[37,38,39]</code>、<code>dspark_markov_rank=256</code>、<code>dspark_n_routed_experts=128</code>、<code>dspark_n_activated_experts=3</code>；<code>model.py</code> L1100–1156；L1131–1132 <code>draft_input_ids = input_ids.new_full([input_ids.size(0), self.block_size], self.noise_token_id)</code>；L1265–1266 <code>if i in self.target_layer_ids: main_hiddens.append(h.mean(dim=2))</code>；<code>ckpt/headers.json</code> 中 <code>mtp.0/1/2.*</code> 共 2401 个张量。</p>
+<p>[C4] Engram 的位置、查表规模与门控：配置 <code>engram_layer_ids=[1,14]</code>、<code>engram_max_ngram_size=4</code>、<code>engram_n_heads=8</code>、<code>engram_head_dim=256</code>；<code>model.py</code> L328–365（<code>Engram.forward</code>）与 <code>engram.py</code>；L344 <code>n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads</code>；实测的层分布为 <code>[1, 14]</code>。</p>
+<p>[C5] DSpark 的块式草稿结构：配置 <code>n_mtp_layers=3</code>、<code>dspark_block_size=5</code>、<code>dspark_noise_token_id=128799</code>、<code>dspark_target_layer_ids=[37,38,39]</code>、<code>dspark_markov_rank=256</code>、<code>dspark_n_routed_experts=128</code>、<code>dspark_n_activated_experts=3</code>；<code>model.py</code> L1100–1156；L1131–1132 <code>draft_input_ids = input_ids.new_full([input_ids.size(0), self.block_size], self.noise_token_id)</code>；L1265–1266 <code>if i in self.target_layer_ids: main_hiddens.append(h.mean(dim=2))</code>；真实 checkpoint 张量头中 <code>mtp.0/1/2.*</code> 共 2401 个张量。</p>
 <p>[C6] CED 的全局 KV 来源：报告 §2.2 行 388–393「For global attention, CED treats the bottom L/2 layers of the Transformer as the causal encoder. For the upper half layers (i.e., the decoder, l &gt; L/2), the KV entries are not derived from their respective hidden states H_l. Instead, they are projected directly from the hidden state of the (L/2)-th layer, H_{L/2}, using layer-dependent projection weights」；同报告行 544–546「When CSA2 is combined with CED, the decoder layer assigned to Full Mode computes its own global KV from the hidden state of the (L/2)-th layer, i.e. the last layer of the causal encoder.」</p>
 <p>[C7] 分层稀疏索引器与候选池：报告 §2.3.2 行 542–570「For example, selecting 2,048 blocks with 8 positions each yields 16,384 candidate positions.」；配置 <code>candidate_source_layer=20</code>、<code>candidate_topk_blocks=2048</code>、<code>candidate_block_size=8</code>；<code>model.py</code> L583–610 <code>select_candidate_blocks</code>，其中 L604–605 为「钉住最新块」处理。</p>
-<p>[C8] MoE 路由：配置 <code>n_routed_experts=384</code>、<code>n_activated_experts=6</code>、<code>score_func="sqrtsoftplus"</code>、<code>route_scale=1.5</code>、<code>norm_topk_prob=true</code>；<code>model.py</code> L809–827，其中 L821–823 注释「the bias picks experts but does not scale them: weights come from the raw scores」、L817 <code>scores = F.softplus(scores).sqrt()</code>；实测 <code>verify_gate_formula.py</code> 独立重实现 indices 完全一致、权重最大差 0。</p>
-<p>[C9] Single-Pass mHC 与 Sinkhorn：配置 <code>hc_mult=4</code>、<code>hc_sinkhorn_iters=20</code>；<code>kernel.py</code> L406–462；<code>model.py</code> L948–966；实测 <code>verify_sinkhorn.py</code> 独立 float64 重实现最大差 8.9e-08，行、列各归一化 20 次且末步在列方向。</p>
-<p>[C10] 参考实现在压缩比大于 1 的 kv_source 层上读取到其他层的索引键：<code>model.py</code> L537–548（发布语句在 <code>if self.owns_k and latent is not None:</code> 分支内）与 L554（读取语句无条件执行）；配置 <code>kv_source_layer_ids=[2,8,14,20]</code>（层 2/8/14 压缩比 2、层 20 压缩比 1）；实测 <code>ckpt/debug_consistency7.out</code>：偶数解码步层 2 读到的键与层 4 的缓存一致、奇数步读到自己发布的。此条仅描述该参考实现的行为。</p>
+<p>[C8] MoE 路由：配置 <code>n_routed_experts=384</code>、<code>n_activated_experts=6</code>、<code>score_func="sqrtsoftplus"</code>、<code>route_scale=1.5</code>、<code>norm_topk_prob=true</code>；<code>model.py</code> L809–827，其中 L821–823 注释「the bias picks experts but does not scale them: weights come from the raw scores」、L817 <code>scores = F.softplus(scores).sqrt()</code>；实测独立重实现 indices 完全一致、权重最大差 0。</p>
+<p>[C9] Single-Pass mHC 与 Sinkhorn：配置 <code>hc_mult=4</code>、<code>hc_sinkhorn_iters=20</code>；<code>kernel.py</code> L406–462；<code>model.py</code> L948–966；实测独立 float64 重实现最大差 8.9e-08，行、列各归一化 20 次且末步在列方向。</p>
+<p>[C10] 参考实现在压缩比大于 1 的 kv_source 层上读取到其他层的索引键：<code>model.py</code> L537–548（发布语句在 <code>if self.owns_k and latent is not None:</code> 分支内）与 L554（读取语句无条件执行）；配置 <code>kv_source_layer_ids=[2,8,14,20]</code>（层 2/8/14 压缩比 2、层 20 压缩比 1）；实测：偶数解码步层 2 读到的键与层 4 的缓存一致、奇数步读到自己发布的。此条仅描述该参考实现的行为。</p>
 <p>[C11] 参考实现不含 prefill 半栈跳过与 SWA 有界重放：<code>model.py</code> L1261–1267 的 <code>for i, layer in enumerate(self.layers)</code> 无跳过条件；<code>inference/</code> 目录无重放相关标识。报告行 404–410 描述的 SWA Replay 与 Decoder SWA Bounded Replay 属服务端行为。</p>
 
 <h3>公式与来源（F）</h3>
-<p>[F1] 压缩器池化与组位置 $C_j = \mathrm{RMSNorm}\big(\sum_{t=jr}^{(j+1)r-1}\mathrm{softmax}_{t'}(s_{t'})\,v_t\big)$、RoPE 位置 $j\cdot r$：池化路径见 <code>model.py</code> L458–485，组位置取 $j\cdot r$ 的约定见 L538–543（<code>Indexer.forward</code> 内的注释）与 L752–757；实测 <code>verify_compressor_pooling.py</code> 独立重实现逐位一致（最大差 0.000e+00）。$r=1$ 时退化为 $\mathrm{RMSNorm}(W_{kv}h)$，无门控。</p>
-<p>[F2] 索引器打分 $I_{q,j} = \sum_h w_{q,h}\cdot\mathrm{ReLU}(q_h\cdot k_j)$：<code>model.py</code> L550–557；分数原值存档见 <code>ckpt/debug_consistency4.out</code>。</p>
-<p>[F3] 压缩条目可达性 $n_{\text{reach}}(i)=\lfloor(i+1)/r\rfloor$（prefill）、$\lfloor(s+1)/r\rfloor$（decode）：<code>model.py</code> L563–567；本页复核脚本 <code>research/verify_reach_topk.py</code> 与公式逐位置一致（$r\in\{1,2,4\}$、$i\in[0,200)$ 不符 0 处）。</p>
+<p>[F1] 压缩器池化与组位置 $C_j = \mathrm{RMSNorm}\big(\sum_{t=jr}^{(j+1)r-1}\mathrm{softmax}_{t'}(s_{t'})\,v_t\big)$、RoPE 位置 $j\cdot r$：池化路径见 <code>model.py</code> L458–485，组位置取 $j\cdot r$ 的约定见 L538–543（<code>Indexer.forward</code> 内的注释）与 L752–757；实测独立重实现逐位一致（最大差 0.000e+00）。$r=1$ 时退化为 $\mathrm{RMSNorm}(W_{kv}h)$，无门控。</p>
+<p>[F2] 索引器打分 $I_{q,j} = \sum_h w_{q,h}\cdot\mathrm{ReLU}(q_h\cdot k_j)$：<code>model.py</code> L550–557；分数原值由实测记录（见 <code>research/measured.md</code>）。</p>
+<p>[F3] 压缩条目可达性 $n_{\text{reach}}(i)=\lfloor(i+1)/r\rfloor$（prefill）、$\lfloor(s+1)/r\rfloor$（decode）：<code>model.py</code> L563–567；复核脚本（见 <code>research/measured.md</code>）与公式逐位置一致（$r\in\{1,2,4\}$、$i\in[0,200)$ 不符 0 处）。</p>
 <p>[F4] 候选块打分 $\text{block}(b)=\max_{j\in b}I_{q,j}$、钉住最新块、取前 2048 块：<code>model.py</code> L596–610。</p>
-<p>[F5] MoE 路由 $\text{score}=\sqrt{\mathrm{softplus}(xW^\top)}$、$\text{idx}=\mathrm{topk}_6(\text{score}+b)$、$w=\text{score}_{\text{idx}}/(\sum\text{score}_{\text{idx}}+10^{-20})\times1.5$：<code>model.py</code> L811–826；实测 <code>verify_gate_formula.py</code> 独立重实现一致。</p>
+<p>[F5] MoE 路由 $\text{score}=\sqrt{\mathrm{softplus}(xW^\top)}$、$\text{idx}=\mathrm{topk}_6(\text{score}+b)$、$w=\text{score}_{\text{idx}}/(\sum\text{score}_{\text{idx}}+10^{-20})\times1.5$：<code>model.py</code> L811–826；实测独立重实现一致。</p>
 <p>[F6] mHC 系数 $\text{pre}=\sigma(ms_0+b)+\epsilon$、$\text{post}=2\sigma(ms_1+b)$、$\text{comb}=\text{Sinkhorn}_{20}(\mathrm{softmax}(ms_2+b)+\epsilon)$：<code>kernel.py</code> L426–460；实测行、列各 20 次归一化、末步列方向。</p>
 <p>[F7] CED 全局 KV $C_l = H_{L/2}W_l^{KV}$、$Z_l = H_{L/2}W_l^{Z}$（$l&gt;L/2$）：报告行 388–396（行 389–392 为文字描述，行 394–396 为 Eq. 1 的公式排版）。与 CSA2 结合后仅解码器 Full 层实现；参考实现中 $H_{L/2}$ 即层 20 的注意力输入。</p>
-<p>[F8] 稀疏注意力 $o = \sum_{t\in\mathcal{T}}e^{q\cdot k_t/\sqrt{d}-m}v_t / \big(\sum_{t\in\mathcal{T}}e^{q\cdot k_t/\sqrt{d}-m}+e^{\text{sink}-m}\big)$，$m=\max_{t\in\mathcal{T}}q\cdot k_t/\sqrt{d}$：<code>kernel.py</code> L310–403；实测 <code>verify_sparse_attn_window.py</code> 与解析解逐元素差 0.00e+00。</p>
+<p>[F8] 稀疏注意力 $o = \sum_{t\in\mathcal{T}}e^{q\cdot k_t/\sqrt{d}-m}v_t / \big(\sum_{t\in\mathcal{T}}e^{q\cdot k_t/\sqrt{d}-m}+e^{\text{sink}-m}\big)$，$m=\max_{t\in\mathcal{T}}q\cdot k_t/\sqrt{d}$：<code>kernel.py</code> L310–403；实测与解析解逐元素差 0.00e+00。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>[N1] 全局 KV 缓存 890 B/token，约为 DeepSeek-V4-Flash 的 1/4：报告行 18–19、行 133–140；本页复核脚本 <code>research/verify_cache_size.py</code> 按配置与源码常量推导得 $720+170=890$（精确一致）。成立条件为 1M 上下文、FP4 主 KV + 跨层共享 + 压缩比 2/1。</p>
-<p>[N2] 每 token 激活 8B（prefill）/ 16B（decode）：报告行 320–322；实测 <code>verify_active_params.py</code> 得编码器半栈 7.8929B、解码器半栈 7.5758B，两者及其差额的分解见 <code>verify_halfstack_diff.py</code>。报告口径不含嵌入层与输出头（各 0.6619B）。</p>
-<p>[N3] 552B 主干 + 196B Engram 参数：报告行 320；实测 <code>count_params.py</code> 按 <code>ckpt/headers.json</code> 的 96085 个张量统计得主干 551.57B、Engram 196.93B（FP4 按两值一字节折算）。两层 Engram 表各约 98.3B，来源为 <code>engram_num_embeddings</code> 与 <code>engram_head_dim</code> 的乘积。</p>
-<p>[N4] 窗口 128、索引 Top-512、候选 $2048\times8=16384$、索引头 $32\times128$、KV 头 $1\times512$：配置与报告 §2.3.2；与 <code>headers.json</code> 的形状一致。</p>
-<p>[N5] 主 KV FP4 相对误差 9.5%（FP8 为 2.65%，比值 3.58）；可表示上界 $448\times6=2688$：报告 §2.4.4 行 691–700；实测 <code>verify_fp4_error.py</code> 在 512 维 RMSNorm 输出（L2 范数 22.6274）上测得。</p>
-<p>[N6] 单层每 token 激活 377.31M（注意力 126.62M、门控 1.97M、共享专家 35.39M、top-6 路由 212.34M、超连接 0.98M、归一化 0.010M）：实测 <code>verify_active_params.py</code>，用真实张量头形状加配置专家数。</p>
-<p>[N7] prefill 与 decode 的一致性实测：原始最大差 8.9e-3（从层 2 起，首个差异出现在位置 10），修正后 bf16 残差 5.0e-3、fp32 为 1.5e-8 至 3e-8：实测 <code>ckpt/debug_consistency3~7.out</code>，使用等比缩小模型（dim 64、7 层、保留全部结构特征）。</p>
-<p>[N8] 压缩器池化两条路径的差异：fp32 层面对照差 4.5e-6（相对 2.2e-6）；转 bf16 后 4096 个元素中有 5 个落在不同 ulp：实测 <code>verify_compressor_pooling.py</code>，真实维度（dim 5120、head 512）随机权重。</p>
+<p>[N1] 全局 KV 缓存 890 B/token，约为 DeepSeek-V4-Flash 的 1/4：报告行 18–19、行 133–140；复核脚本（见 <code>research/measured.md</code>）按配置与源码常量推导得 $720+170=890$（精确一致）。成立条件为 1M 上下文、FP4 主 KV + 跨层共享 + 压缩比 2/1。</p>
+<p>[N2] 每 token 激活 8B（prefill）/ 16B（decode）：报告行 320–322；实测得编码器半栈 7.8929B、解码器半栈 7.5758B，两者及其差额的分解见 <code>research/measured.md</code>。报告口径不含嵌入层与输出头（各 0.6619B）。</p>
+<p>[N3] 552B 主干 + 196B Engram 参数：报告行 320；实测按真实 checkpoint 张量头的 96085 个张量统计得主干 551.57B、Engram 196.93B（FP4 按两值一字节折算）。两层 Engram 表各约 98.3B，来源为 <code>engram_num_embeddings</code> 与 <code>engram_head_dim</code> 的乘积。</p>
+<p>[N4] 窗口 128、索引 Top-512、候选 $2048\times8=16384$、索引头 $32\times128$、KV 头 $1\times512$：配置与报告 §2.3.2；与真实 checkpoint 张量头的形状一致。</p>
+<p>[N5] 主 KV FP4 相对误差 9.5%（FP8 为 2.65%，比值 3.58）；可表示上界 $448\times6=2688$：报告 §2.4.4 行 691–700；实测在 512 维 RMSNorm 输出（L2 范数 22.6274）上测得。</p>
+<p>[N6] 单层每 token 激活 377.31M（注意力 126.62M、门控 1.97M、共享专家 35.39M、top-6 路由 212.34M、超连接 0.98M、归一化 0.010M）：实测得到，用真实张量头形状加配置专家数。</p>
+<p>[N7] prefill 与 decode 的一致性实测：原始最大差 8.9e-3（从层 2 起，首个差异出现在位置 10），修正后 bf16 残差 5.0e-3、fp32 为 1.5e-8 至 3e-8：实测得到，使用等比缩小模型（dim 64、7 层、保留全部结构特征）。</p>
+<p>[N8] 压缩器池化两条路径的差异：fp32 层面对照差 4.5e-6（相对 2.2e-6）；转 bf16 后 4096 个元素中有 5 个落在不同 ulp：实测得到，真实维度（dim 5120、head 512）随机权重。</p>
 <p>[N9] 约 1/4（相对 DeepSeek-V4-Flash）、1/437（相对 DeepSeek-V1）、持久化 1/8：报告行 35–38、行 139–140。<b>登记为报告宣称</b>：缺少对方模型的配置与缓存结构，无法独立推导，本页只陈述宣称本身，不给推导。前两个是缓存体积的比值，第三个依赖服务实现的持久化策略。</p>
 
 <h3>构造示例</h3>
-<p>890 字节的加总过程、单层激活参数的加总过程、两个半栈的差额分解、压缩条目可达性的枚举核对、Top-$K$ 选择的语义演示均为构造示例：数字取自官方配置与真实张量头，计算过程由本页脚本复算，不是额外实跑的模型输出。第 3.6 节的代码输出为实际运行结果。</p>
+<p>890 字节的加总过程、单层激活参数的加总过程、两个半栈的差额分解、压缩条目可达性的枚举核对、Top-$K$ 选择的语义演示均为构造示例：数字取自官方配置与真实张量头，计算过程由复核脚本复算（见 <code>research/measured.md</code>），不是额外实跑的模型输出。第 3.6 节的代码输出为实际运行结果。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>「两级筛选」是辅助解释：它说明选择过程先在块级别缩小搜索范围、再在位置级别选出 Top-512。边界：它不改变可见性规则（可达性判据与选择是两件事），也不意味着两级筛选一定比单级选得更准——它换的是计算量，准确性仍由索引器的训练质量决定。本页不评价索引器的选择质量。</p>

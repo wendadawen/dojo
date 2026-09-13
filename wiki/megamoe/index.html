@@ -59,7 +59,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：DeepGEMM 官方仓库（GitHub deepseek-ai/DeepGEMM，main 分支 commit 559d79f，2026-07-15）的 README、PR #304（2026-04-17 引入 Mega MoE）、PR #316（2026-04-24 基准数据）与 kernel 源码 <code>sm100_fp8_fp4_mega_moe.cuh</code> 等；机制描述另引第三方论文 X-Stage（arXiv:2607.23264）。来源均存档于本页 <code>research/sources/</code>。</p>
+<p><b>主要依据</b>：DeepGEMM 官方仓库（GitHub deepseek-ai/DeepGEMM，main 分支 commit 559d79f，2026-07-15）的 README、PR #304（2026-04-17 引入 Mega MoE）、PR #316（2026-04-24 基准数据）与 kernel 源码 <code>sm100_fp8_fp4_mega_moe.cuh</code> 等；机制描述另引第三方论文 X-Stage（arXiv:2607.23264）。README、PR 与第三方论文的摘录以 .md 形式存于本页 <code>research/sources/</code>，kernel 源码的行号定位见「来源与范围说明」。</p>
 </blockquote>
 
 <p>一块 GPU 在跑 MoE 模型的一层时，token 要发给别的卡上的专家去算，算完还要送回来。传统做法把这件事拆成五个独立 kernel 依次执行：先发数据、等着，再算、等着，最后收回结果、等着。发送和收回的时候，负责计算的单元停着；计算的时候，负责传输的互联线路闲着。Mega MoE 是 DeepSeek 开源在 DeepGEMM 里的 kernel 家族（官方写法 Mega MoE，2026 年 4 月随 PR #304 公开<sup>[C1, N6]</sup>），它把这五段工作融合成一个占满整块 GPU、从头跑到尾的持久 kernel，让 NVLink 传输与 Tensor Core 计算同时进行——通信量没有减少，但通信造成的空闲被计算填满了。后文约定几个用词：一块 GPU 上参与通信的一个进程称为一个 rank；SM 是 GPU 的计算单元；warp 是 32 线程为一组的执行单位；TMA 是异步批量搬运数据的单元。它们在首次正式使用的章节还有更完整的说明与概念页链接。</p>
@@ -174,7 +174,7 @@ $$y=\sum_{e\in\mathcal{S}} g_{e}\cdot W_2^{(e)}\,\mathrm{SwiGLU}\!\left(W_1^{(e)
 
 <p>其中 $W_1^{(e)}\in\mathbb{R}^{2d\times h}$ 的两半分别是 gate 与 up（$d$ 为中间维），$\mathrm{silu}(u)=u\cdot\sigma(u)$，$\odot$ 为逐元素乘；combine 段完成的就是这个按 $g_{e}$ 的加权求和<sup>[F1]</sup>。SwiGLU 的完整讲解见<a href="../../wiki/swiglu/index.html">SwiGLU</a>，这里只需要它的形状事实：输出宽度是输入 gate/up 拼接宽度的一半。</p>
 
-<p>在贯穿示例里走一遍 $t_0$ 的路径：$t_0$ 在 rank0，被路由到 $E_0$（rank0）和 $E_3$（rank1）。dispatch 段，$t_0$ 的一份副本留在 rank0 给 $E_0$，另一份发往 rank1 给 $E_3$。计算段，rank0 上 $E_0$ 对 $t_0$ 做 Linear-1 → SwiGLU → Linear-2，同时 rank1 上 $E_3$ 也对 $t_0$ 的副本做同样三段。combine 段，$E_3$ 的输出要送回 rank0，与 $E_0$ 的输出按各自路由权重相加，得到 $t_0$ 的层输出。注意两件事：$t_0$ 一共被两个专家处理，dispatch 要发出 $k=2$ 份副本；其中一份根本不出本 rank（$E_0$ 也在 rank0），另一份要跨 rank 往返。四个 token 的全部 8 个专家-路由对里，6 个（$t_0$→$E_3$、$t_1$→$E_2$ 与 $t_1$→$E_3$、$t_2$→$E_1$、$t_3$→$E_0$ 与 $t_3$→$E_1$）需要跨 rank 传输，只有 $t_0$→$E_0$ 与 $t_2$→$E_2$ 留在本地——四分之三的专家计算要等远端数据。</p>
+<p>在贯穿示例里走一遍 $t_0$ 的路径：$t_0$ 在 rank0，被路由到 $E_0$（rank0）和 $E_3$（rank1）。dispatch 段，$t_0$ 的一份副本留在 rank0 给 $E_0$，另一份发往 rank1 给 $E_3$。计算段，rank0 上 $E_0$ 对 $t_0$ 做 Linear-1 → SwiGLU → Linear-2，同时 rank1 上 $E_3$ 也对 $t_0$ 的副本做同样三段。combine 段，$E_3$ 的输出要送回 rank0，与 $E_0$ 的输出按各自路由权重相加，得到 $t_0$ 的层输出。$t_0$ 一共被两个专家处理，dispatch 要发出 $k=2$ 份副本；其中一份根本不出本 rank（$E_0$ 也在 rank0），另一份要跨 rank 往返。四个 token 的全部 8 个专家-路由对里，6 个（$t_0$→$E_3$、$t_1$→$E_2$ 与 $t_1$→$E_3$、$t_2$→$E_1$、$t_3$→$E_0$ 与 $t_3$→$E_1$）需要跨 rank 传输，只有 $t_0$→$E_0$ 与 $t_2$→$E_2$ 留在本地——四分之三的专家计算要等远端数据。</p>
 
 <p>dispatch 与 combine 这两个方向合起来就是 all-to-all 通信的形态——每个 rank 都既向别的 rank 发数据、也从别的 rank 收数据，这种集合通信的背景见<a href="../../wiki/gpu-communication/index.html">GPU 通信</a>。DeepSeek 的专用通信库 DeepEP 提供的就是这两段的高吞吐/低延迟实现（其概念页见<a href="../../wiki/deepep/index.html">DeepEP</a>）；本文只需要 dispatch/combine 的方向语义。</p>
 
@@ -460,7 +460,7 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)</code></pr
 
 <p>拉进来的数据由调度器安排计算。调度单元叫 task：一个 task 说明"哪个专家的第几个 M 块（行块）、在第几个 N 簇（列块）上、处于哪个相位"——相位有四个值：Linear1、Linear2、SharedLinear1、SharedLinear2<sup>[C18]</sup>。调度 warp 先发布若干批 Linear-1 任务作为预热（保证后续 Linear-2 依赖的数据已经开动，避免死锁），之后 L1 与 L2 任务交替发布；每个 2-SM cluster 的 leader CTA 上运行一个调度 warp，通过 workspace 里的原子计数器动态认领 task 并发布给 cluster 内的两个 CTA，快的 cluster 多干活<sup>[C18]</sup>。共享专家的任务不依赖 dispatch，可以在等路由统计的同时先行<sup>[C17]</sup>。</p>
 
-<p>数据缓冲是环形的：L1/L2 的输入输出都在一个固定容量的缓冲里循环复用，每块配一对 full/empty 计数器——生产者写完加 full，消费者用完加 empty，下一轮使用者自旋等待计数到位<sup>[C19]</sup>。一个值得注意的省内存设计：L1 的输出缓冲和 L2 的输入缓冲是同一块内存——SwiGLU 把宽度从 $2d$ 减半到 $d$，正好原地容纳<sup>[C13]</sup>。</p>
+<p>数据缓冲是环形的：L1/L2 的输入输出都在一个固定容量的缓冲里循环复用，每块配一对 full/empty 计数器——生产者写完加 full，消费者用完加 empty，下一轮使用者自旋等待计数到位<sup>[C19]</sup>。L1 的输出缓冲和 L2 的输入缓冲是同一块内存——SwiGLU 把宽度从 $2d$ 减半到 $d$，正好原地容纳<sup>[C13]</sup>。</p>
 
 <p>tile 大小不是拍脑袋定的。配置启发式按"每专家期望 token 数"分档选择 block_m：</p>
 
@@ -483,7 +483,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 
 <h3 id="epilogue-combine">4.3 epilogue：SwiGLU 重量化、远程写回与归约</h3>
 
-<p>GEMM 的两端各有一段收尾工作，都由 epilogue 线程组完成。L1 相位：从 TMEM 读出 Linear-1 输出的 gate 与 up 两半，gate 只按上限截断、up 上下限都截断（防止激活爆炸），算 $\mathrm{silu}(\mathrm{gate})\times\mathrm{up}$，乘上该 token-专家对的路由权重 $g_{e}$，统计绝对值最大值后量化回 FP8 E4M3（缩放因子 UE8M0），写进 L2 的输入缓冲<sup>[C14]</sup>。这里出现了一个容易忽视的事实：F1 公式里 combine 段的加权求和，权重 $g_{e}$ 的乘法其实在这里就完成了——写回源 rank 的是<b>已经乘过权重</b>的专家输出，最后的归约是纯加法<sup>[F1]</sup>。</p>
+<p>GEMM 的两端各有一段收尾工作，都由 epilogue 线程组完成。L1 相位：从 TMEM 读出 Linear-1 输出的 gate 与 up 两半，gate 只按上限截断、up 上下限都截断（防止激活爆炸），算 $\mathrm{silu}(\mathrm{gate})\times\mathrm{up}$，乘上该 token-专家对的路由权重 $g_{e}$，统计绝对值最大值后量化回 FP8 E4M3（缩放因子 UE8M0），写进 L2 的输入缓冲<sup>[C14]</sup>。F1 公式里 combine 段的加权求和，权重 $g_{e}$ 的乘法在这里就完成了——写回源 rank 的是<b>已经乘过权重</b>的专家输出，最后的归约是纯加法<sup>[F1]</sup>。</p>
 
 <p>L2 相位：结果从 TMEM 读出转成 BF16 后，每个 token 行查一下 dispatch 阶段记录的源元数据——它来自哪个 rank、是哪个 token 的第几个 top-k 槽——然后通过对称地址直接远程写入源 rank 的 combine 缓冲对应槽位<sup>[C15]</sup>。全部写回经 NVLink barrier 确认后，combine 阶段开始：源 rank 的 epilogue 线程按 token 遍历自己的 $k$ 个槽（有共享专家时再加第 $k+1$ 个槽，共享专家结果不经 dispatch、本地算完直接入槽），在浮点寄存器里累加，转 BF16 写出 $y$<sup>[C16, C17]</sup>。</p>
 
@@ -663,7 +663,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 </table>
 </div>
 
-<p>三个读数值得停下来看。第一，batch 为 1 时加速最大（V4-Flash 1.96 倍、V4-Pro 1.61 倍）<sup>[N2, N4]</sup>：token 越少、每段工作越薄，串行执行的启动与等待占比越高，融合的相对收益就越大——这正是延迟敏感场景（低并发推理、强化学习采样）的形态。第二，大 batch 下收益收敛到约 1.5 倍：计算本身已经很满，可挤的空闲变少。第三，互联带宽一列在 batch 512 时达到 266/182 GB/s——通信流量真实且可观，Mega MoE 是把它藏进了计算里，而不是让它消失。</p>
+<p>三个读数如下。第一，batch 为 1 时加速最大（V4-Flash 1.96 倍、V4-Pro 1.61 倍）<sup>[N2, N4]</sup>：token 越少、每段工作越薄，串行执行的启动与等待占比越高，融合的相对收益就越大——这正是延迟敏感场景（低并发推理、强化学习采样）的形态。第二，大 batch 下收益收敛到约 1.5 倍：计算本身已经很满，可挤的空闲变少。第三，互联带宽一列在 batch 512 时达到 266/182 GB/s——通信流量真实且可观，Mega MoE 是把它藏进了计算里，而不是让它消失。</p>
 
 <h3 id="correctness">5.2 正确性验证</h3>
 
@@ -678,7 +678,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 <li><b>精度</b>：PR #304 发布时仅支持 FP8xFP4 组合（激活 FP8 E4M3、权重 FP4 E2M1）<sup>[C3]</sup>；当前主线的源码与测试中已出现 bf16 变体（<code>sm100_bf16_mega_moe</code>、<code>--mma-type bf16xbf16</code>）<sup>[C4]</sup>，属于后续加入的路径。</li>
 <li><b>软件与形态</b>：要求 PyTorch 不低于 2.9、多进程启动与对称内存；FP8 路径要求 hidden 与中间维被 128 整除<sup>[C1, C3, N7]</sup>。测试覆盖的默认配置是 384 专家、top-$k$ 6、hidden 7168、1 个共享专家、每 rank 最多 8192 token<sup>[N7]</sup>。</li>
 <li><b>结构约束</b>：top-$k$ 不超过 32；有共享专家时 top-$k$ 加共享专家数不超过 32（combine 归约由单个 warp 逐槽遍历的约束）；专家数必须被 rank 数整除<sup>[N8]</sup>。</li>
-<li><b>拓扑</b>：官方基准为单节点 EP8；跨机（RDMA 域）行为没有公布数据。SymBuffer 偏移表最多 72 个 rank<sup>[N11]</sup>。</li>
+<li><b>拓扑</b>：官方基准为单节点 EP8；跨机（RDMA 域）行为没有公布数据。SymBuffer 偏移表最多 72 个 rank<sup>[N10]</sup>。</li>
 <li><b>成熟度</b>：官方声明仍在开发与优化中（"still under development and optimizations"）<sup>[C27]</sup>。调试上提供环境变量 <code>DG_COMM_KERNEL_DEBUG</code>，每次调用前清零对称缓冲以定位问题<sup>[C26]</sup>。</li>
 </ul>
 
@@ -708,7 +708,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
-<p>同名项目说明：AMD ROCm 的 Primus 项目中也有一个名为 MegaMoE 的融合 MoE 层（FlyDSL 实现，面向训练的 EP-only + bf16 路径；见 AMD ROCm Primus 官方文档 rocm.docs.amd.com/projects/primus 的 "MegaMoE" 技术指南页，2026-09-03 访问，摘录存档于 sources/primus-extracts.md），与本文所述 DeepSeek DeepGEMM 的 Mega MoE 是不同项目；本文全部内容只针对后者。本页核对的源码版本为 DeepGEMM main 分支 commit 559d79f（2026-07-15），关键文件已拷贝存档于 <code>research/sources/</code>（仓库内 scheduler 与 layout 各有一个 mega_moe.cuh，同名不同文件，存档分别命名为 scheduler_mega_moe.cuh 与 layout_mega_moe.cuh），下列定位均可在存档中复核。</p>
+<p>同名项目说明：AMD ROCm 的 Primus 项目中也有一个名为 MegaMoE 的融合 MoE 层（FlyDSL 实现，面向训练的 EP-only + bf16 路径；见 AMD ROCm Primus 官方文档 rocm.docs.amd.com/projects/primus 的 "MegaMoE" 技术指南页，2026-09-03 访问，摘录存于 sources/primus-extracts.md），与本文所述 DeepSeek DeepGEMM 的 Mega MoE 是不同项目；本文全部内容只针对后者。本页核对的源码版本为 DeepGEMM main 分支 commit 559d79f（2026-07-15）：下表与正文中出现的所有 <code>.cuh</code>、<code>.hpp</code> 与 <code>test_mega_moe.py</code> 文件名及行号，都是该 commit 官方仓库内的定位，可在 deepseek-ai/DeepGEMM 对应文件处检索复核（本仓库不再随页存档源码快照）；其中未带路径的 <code>.cuh</code> 指 <code>sm100_fp8_fp4_mega_moe.cuh</code>。README、PR 与第三方论文的摘录以 .md 形式存于 <code>research/sources/</code>。</p>
 
 <h3>论断与来源（C）</h3>
 <div class="table-scroll">
@@ -718,7 +718,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 <tr><td>C1</td><td>五段融合为单 mega-kernel、重叠 NVLink 通信与 Tensor Core 计算、要求多进程与对称内存</td><td>DeepGEMM README "Mega MoE" 节；PR #304 New features（pr304-extracts.md）</td></tr>
 <tr><td>C2</td><td>DeepGEMM 定位为统一 Tensor Core kernel 库，Mega MoE 为其中融合 MoE 组件；2026-04-16 News 宣布</td><td>README 首段与 News 节</td></tr>
 <tr><td>C3</td><td>发布时仅支持 FP8xFP4、要求 PyTorch 2.9+</td><td>PR #304（"Only FP8 x FP4 MoE is supported"、"Requires PyTorch &gt;= 2.9"）</td></tr>
-<tr><td>C4</td><td>主线存在 bf16 变体</td><td>sm100_bf16_mega_moe.hpp（存档）；test_mega_moe.py 行 197、425（bf16_mega_moe 分派与 --mma-type bf16xbf16）</td></tr>
+<tr><td>C4</td><td>主线存在 bf16 变体</td><td>sm100_bf16_mega_moe.hpp；test_mega_moe.py 行 197、425（bf16_mega_moe 分派与 --mma-type bf16xbf16）</td></tr>
 <tr><td>C5</td><td>仅 sm100 实现，架构守卫 + 断言</td><td>sm100_fp8_fp4_mega_moe.cuh 行 78、行 1454-1457</td></tr>
 <tr><td>C6</td><td>TMEM、2-SM cluster、2-CTA UMMA（tcgen05）</td><td>同上文件行 80、216-222、848、899</td></tr>
 <tr><td>C7</td><td>激活 FP8 E4M3、权重 FP4 E2M1、共享专家 FP8、输出 BF16</td><td>同上文件行 142-146；README API 示例</td></tr>
@@ -731,10 +731,10 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 <tr><td>C14</td><td>L1 epilogue：截断、SwiGLU、乘路由权重、amax、FP8 E4M3 + UE8M0</td><td>.cuh 行 995-1172（行 1045 注释 "Apply SwiGLU: silu(gate) * up"）</td></tr>
 <tr><td>C15</td><td>L2 epilogue 查源元数据 remote store 到源 rank combine 缓冲</td><td>.cuh 行 1205 注释 "write GEMM output to remote combine buffer via NVLink"、行 1274-1299</td></tr>
 <tr><td>C16</td><td>combine 归约：top-k 槽浮点累加、BF16 写出</td><td>.cuh 行 1313-1452（行 1323 注释 "Combine: reduce top-k results and write back"）</td></tr>
-<tr><td>C17</td><td>共享专家不经 dispatch，占第 k+1 槽；任务可先行</td><td>scheduler_mega_moe.cuh 行 386-390（"Shared expert L1 tasks do not depend on dispatch"）；sm100_fp8_fp4_mega_moe.cuh 行 1278、1370；layout_mega_moe.cuh 行 433-435（combine 缓冲 top-k+1 槽）</td></tr>
-<tr><td>C18</td><td>task 调度：BlockPhase 四相、L1 预热、L1/L2 交替、原子认领</td><td>scheduler_mega_moe.cuh 行 83-134（BlockPhase/TaskInfo）、15-45（"ensure no L1 -&gt; L2 deadlock"）、316-350（L1/L2 交替）、309-314（atomic_add 认领）</td></tr>
+<tr><td>C17</td><td>共享专家不经 dispatch，占第 k+1 槽；任务可先行</td><td>scheduler/mega_moe.cuh 行 386-390（"Shared expert L1 tasks do not depend on dispatch"）；sm100_fp8_fp4_mega_moe.cuh 行 1278、1370；layout/mega_moe.cuh 行 433-435（combine 缓冲 top-k+1 槽）</td></tr>
+<tr><td>C18</td><td>task 调度：BlockPhase 四相、L1 预热、L1/L2 交替、原子认领</td><td>scheduler/mega_moe.cuh 行 83-134（BlockPhase/TaskInfo）、15-45（"ensure no L1 -&gt; L2 deadlock"）、316-350（L1/L2 交替）、309-314（atomic_add 认领）</td></tr>
 <tr><td>C19</td><td>环形缓冲 + full/empty 计数衔接；workspace 含拉取/推送两索引区</td><td>.cuh 行 525-531、692-704；layout/mega_moe.cuh 行 113-117 注释</td></tr>
-<tr><td>C20</td><td>官方源码无 "expert wave" 术语；该词为 X-Stage 论文描述</td><td>scheduler_mega_moe.cuh 全文（无 expert wave 用语，仅 L1 warmup waves 指 CTA 波次）；xstage-extracts.md §2.2 与使用注意</td></tr>
+<tr><td>C20</td><td>官方源码无 "expert wave" 术语；该词为 X-Stage 论文描述</td><td>scheduler/mega_moe.cuh 全文（无 expert wave 用语，仅 L1 warmup waves 指 CTA 波次）；xstage-extracts.md §2.2 与使用注意</td></tr>
 <tr><td>C21</td><td>正确性：无共享专家逐位一致、有共享 &lt;1e-8、统计一致；基线为 DeepEP+分组 GEMM+TileLang</td><td>test_mega_moe.py 断言代码与基线流程</td></tr>
 <tr><td>C22</td><td>API 三步：分配对称缓冲、变换权重、调用</td><td>README Usage 代码块；test_mega_moe.py 完整调用</td></tr>
 <tr><td>C23</td><td>多进程形态：spawn 每 rank 一进程（默认 8）</td><td>test_mega_moe.py __main__ 与 init 逻辑</td></tr>
@@ -775,8 +775,8 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 <tr><td>N7</td><td>测试默认参数（384 专家、top-k 6、hidden 7168、中间维 3072、共享专家 1、8192 token/rank）；FP8 路径 128 整除约束</td><td>test_mega_moe.py argparse 默认值与约束注释</td></tr>
 <tr><td>N8</td><td>top-k 32 上限；top-k+共享 32 上限；专家数被 rank 数整除</td><td>.cuh 行 334、1345、86 静态断言</td></tr>
 <tr><td>N9</td><td>Hopper 状况（无官方数据；第三方称无 TMEM 不显著、可用 FP4 EP v2 + FP8 DeepGEMM + PDL 替代）</td><td>PR #316 评论，yiakwy 2026-08-12——第三方陈述；其中架构守卫已由 C5 独立核实</td></tr>
-<tr><td>N11</td><td>SymBuffer 最大 72 rank</td><td>layout/sym_buffer.cuh 行 7</td></tr>
-<tr><td>N12</td><td>代码注释耗时参考（取计数约 6.5 us、源索引约 2 us@512 token、NVLink barrier 约 4 us、combine 约 3 us/token/topk）</td><td>.cuh 行 361、370、1313、1325 注释（本页正文未引用，备考）</td></tr>
+<tr><td>N10</td><td>SymBuffer 最大 72 rank</td><td>layout/sym_buffer.cuh 行 7</td></tr>
+<tr><td>N11</td><td>代码注释耗时参考（取计数约 6.5 us、源索引约 2 us@512 token、NVLink barrier 约 4 us、combine 约 3 us/token/topk）</td><td>.cuh 行 361、370、1313、1325 注释（本页正文未引用，备考）</td></tr>
 </tbody>
 </table>
 </div>

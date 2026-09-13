@@ -67,7 +67,7 @@
 
 <p>一块 80 GB 的 GPU 放不下 405B 参数的模型——哪怕只算权重本身。要让这类模型跑起来，必须把模型切开、分布到多块 GPU 上协同完成每一次前向计算。切法只有两条基本路径：按层内矩阵的维度切（张量并行，Tensor Parallelism，TP），或按层堆叠的深度切（流水线并行，Pipeline Parallelism，PP）。两条路径的通信结构完全不同，因此适合部署在不同的互联拓扑上，实际系统几乎总是组合使用。</p>
 
-<p>"模型并行"在部分文献（如 Megatron-LM）中狭义地指层内切分，与"流水线并行"并列；本页取广义用法，把两者都算作模型并行，正文首次引入各术语时会说明这一历史语境。本文的学习目标包括：说明两条切分路径各自切的是什么；解释张量并行怎么切一个 Transformer 层、每层需要哪些通信；推导流水线并行的气泡占比；说明 TP 与 PP 为什么分别适合机内与跨机互联、推理系统为什么组合使用。本文讨论的是推理 serving 场景；前置概念：多头注意力结构见 <a href="../standard-attention/index.html">标准注意力</a>，all-reduce 等集合通信与 NVLink/跨机网络分层见 <a href="../gpu-communication/index.html">GPU 通信</a>，prefill/decode 两阶段与 KV cache 见 <a href="../moe-serving/index.html">MoE Serving</a>。</p>
+<p>"模型并行"在部分文献（如 Megatron-LM）中狭义地指层内切分，与"流水线并行"并列；本页取广义用法，把两者都算作模型并行。本文讨论的是推理 serving 场景；前置概念：多头注意力结构见 <a href="../standard-attention/index.html">标准注意力</a>，all-reduce 等集合通信与 NVLink/跨机网络分层见 <a href="../gpu-communication/index.html">GPU 通信</a>，prefill/decode 两阶段与 KV cache 见 <a href="../moe-serving/index.html">MoE Serving</a>。</p>
 
 <section class="learning-goals">
 <h2>核心问题</h2>
@@ -150,11 +150,11 @@
 
 <p>$$X = [1, 1, 1, 1],\quad A = \begin{bmatrix} 1 & 1 & 0 & 0 \\ 2 & 2 & 0 & 0 \\ 0 & 0 & 3 & 3 \\ 0 & 0 & 4 & 4 \end{bmatrix},\quad B = A.$$</p>
 
-<p>按列切 $A_1 = A_{:, 0:2}$、$A_2 = A_{:, 2:4}$。直接计算 $XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；分段 $XA_1 = [3, 3, 0, 0]$、$XA_2 = [0, 0, 7, 7]$，拼接 $[XA_1, XA_2] = [3, 3, 7, 7] = XA$，过 GeLU 后（记 $\mathrm{GeLU}(v)$ 逐元素作用）再乘 $B$。两卡路径：GPU 1 算 $\mathrm{GeLU}(XA_1)B_1$，GPU 2 算 $\mathrm{GeLU}(XA_2)B_2$，两者之和与单卡 $\mathrm{GeLU}(XA)B$ 完全一致——分块乘法保证 $[Y_1, Y_2]\begin{bmatrix} B_1 \\ B_2 \end{bmatrix} = Y_1B_1 + Y_2B_2$，这里不需要任何近似。</p>
+<p>按列切 $A_1 = A_{:, 0:2}$、$A_2 = A_{:, 2:4}$。直接计算 $XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；分段 $XA_1 = [3, 3]$、$XA_2 = [7, 7]$，拼接 $[XA_1, XA_2] = [3, 3, 7, 7] = XA$，过 GeLU 后（记 $\mathrm{GeLU}(v)$ 逐元素作用）再乘 $B$。两卡路径：GPU 1 算 $\mathrm{GeLU}(XA_1)B_1$，GPU 2 算 $\mathrm{GeLU}(XA_2)B_2$，两者之和与单卡 $\mathrm{GeLU}(XA)B$ 完全一致——分块乘法保证 $[Y_1, Y_2]\begin{bmatrix} B_1 \\ B_2 \end{bmatrix} = Y_1B_1 + Y_2B_2$，这里不需要任何近似。</p>
 
 <details>
 <summary>展开：上面构造示例的完整手算</summary>
-<p>构造示例（数字自设，目的是验证切分等价性，不代表真实模型）。取 $X = [1,1,1,1]$、$A$ 为上面同一块对角矩阵、$B = A$。记 $G(\cdot)$ 为任意逐元素函数（GeLU 即其一例）。第一步，$XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；按列切后 GPU 1 拿 $A_1$（$A$ 的前两列），算得 $XA_1 = [3, 3, 0, 0]$；GPU 2 拿 $A_2$（$A$ 的后两列），算得 $XA_2 = [0, 0, 7, 7]$。两段拼接恰好是 $[4,4,4,8]$——列切的直接效果就是输出按列分段。第二步，关键观察：$G$ 逐元素作用，所以 $G(XA)$ 按列分段等于各段分别过 $G$，即 $G(XA) = [G(XA_1),\ G(XA_2)]$。单卡结果可改写为</p>
+<p>构造示例（数字自设，目的是验证切分等价性，不代表真实模型）。取 $X = [1,1,1,1]$、$A$ 为上面同一块对角矩阵、$B = A$。记 $G(\cdot)$ 为任意逐元素函数（GeLU 即其一例）。第一步，$XA = [3, 3, 7, 7]$（列和：col1=1+2=3、col2=1+2=3、col3=3+4=7、col4=3+4=7）；按列切后 GPU 1 拿 $A_1$（$A$ 的前两列），算得 $XA_1 = [3, 3]$；GPU 2 拿 $A_2$（$A$ 的后两列），算得 $XA_2 = [7, 7]$。两段拼接恰好是 $[3, 3, 7, 7]$——列切的直接效果就是输出按列分段。第二步，关键观察：$G$ 逐元素作用，所以 $G(XA)$ 按列分段等于各段分别过 $G$，即 $G(XA) = [G(XA_1),\ G(XA_2)]$。单卡结果可改写为</p>
 <p>$$G(XA)\,B = [G(XA_1),\ G(XA_2)] \begin{bmatrix} B_1 \\ B_2 \end{bmatrix} = G(XA_1)B_1 + G(XA_2)B_2,$$</p>
 <p>第二个等号是分块乘法恒等式。而等式右边的两项正好是 GPU 1、GPU 2 各自本地算出的部分积——两卡各算一项，all-reduce 求和即得单卡结果。注意这个论证对任何逐元素函数 $G$ 都成立，不需要代入 GeLU 的具体数值；等价性的全部来源是"列切让逐元素函数可分段作用 + 行切让分块乘法可拆成部分积之和"。</p>
 </details>
@@ -167,7 +167,7 @@
 
 <h3 id="tp-comm-count">1.3 一层两次通信</h3>
 
-<p>把两个子块拼起来：一个标准 Transformer 层 = attention 子块 + FFN 子块，每个子块 1 次 all-reduce，所以 TP 之下每层前向共 2 次 all-reduce，反向再各 2 次<sup>[C4, N2]</sup>。一个 61 层的模型做一次 TP 前向要发起 122 次 all-reduce——通信次数不随切分粗细变化，但每卡计算量随卡数增多而变小，通信在总时间里的占比因此升高。这个"次数多、每层都要"的结构是第 3 章拓扑结论的直接原因。</p>
+<p>把两个子块拼起来：一个标准 Transformer 层 = attention 子块 + FFN 子块，每个子块 1 次 all-reduce，所以 TP 之下每层前向共 2 次 all-reduce，反向同样 2 次<sup>[C4, N2]</sup>。以 61 层模型为例（构造示例，层数自设），一次 TP 前向要发起 122 次 all-reduce——通信次数不随切分粗细变化，但每卡计算量随卡数增多而变小，通信在总时间里的占比因此升高。这个"次数多、每层都要"的结构是第 3 章拓扑结论的直接原因。</p>
 
 <h3 id="tp-split-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -189,7 +189,7 @@
 <p>一个 $L$ 层模型 TP 前向一共几次 all-reduce？</p>
 <details>
 <summary>解答：$2L$ 次</summary>
-<p>每层两个子块（attention、FFN）各 1 次 all-reduce，共 2 次；$L$ 层堆叠后线性叠加为 $2L$ 次<sup>[C4]</sup>。例如 61 层模型一次前向 122 次 all-reduce。这个计数只覆盖 Megatron-LM 式的标准切分；嵌入层与输出层的切分可能附加通信，本页不展开。通信次数与 TP 卡数无关（不因切得更细而减少），但每卡计算量随卡数上升而下降，因此通信时间占比随卡数上升——这是 TP 不能无限加卡的结构性原因之一。</p>
+<p>每层两个子块（attention、FFN）各 1 次 all-reduce，共 2 次；$L$ 层堆叠后线性叠加为 $2L$ 次<sup>[C4]</sup>。例如 61 层模型（构造示例）一次前向 122 次 all-reduce。这个计数只覆盖 Megatron-LM 式的标准切分；嵌入层与输出层的切分可能附加通信，本页不展开。通信次数与 TP 卡数无关（不因切得更细而减少），但每卡计算量随卡数上升而下降，因此通信时间占比随卡数上升——这是 TP 不能无限加卡的结构性原因之一。</p>
 </details>
 </li>
 </ol>
@@ -314,7 +314,7 @@
 
 <h2 id="tp-vs-pp-topology">3. 两种切法的通信代价：TP 圈在机内，PP 跨机</h2>
 
-<p>前两章分别得到两种切法的通信画像：TP 每层 2 次 all-reduce、次数多且逐层发生；PP 每个 micro-batch 只在边界传一次激活、频率低量小。这一章把两个画像放到互联拓扑上对比——为什么实际部署几乎总是"机内 TP、跨机 PP"。</p>
+<p>前两章分别得到两种切法的通信特征：TP 每层 2 次 all-reduce、次数多且逐层发生；PP 每个 micro-batch 只在边界传一次激活、频率低量小。这一章把这两组特征放到互联拓扑上对比，回答为什么实际部署几乎总是"机内 TP、跨机 PP"。</p>
 
 <h3 id="comm-structure">3.1 通信结构对比</h3>
 
@@ -375,7 +375,7 @@
 
 <h2 id="tradeoffs">4. TP 与 PP 的取舍</h2>
 
-<p>机制讲完，这一章把两种切法放回"选型"的语境。以下对比是对第 1–3 章机制的综合判断（分析性判断），不是某篇论文的直接结论。</p>
+<p>这一章讨论两种切法在选型上的取舍。以下对比是对第 1–3 章机制的综合判断（分析性判断），不是某篇论文的直接结论。</p>
 
 <div class="table-scroll">
 <table>
@@ -389,7 +389,7 @@
 </table>
 </div>
 
-<p>重要边界：本页讲的是两种切法的机制与代价结构，不回答"给定模型、流量和延迟约束下最优配置是什么"。最优配置恰恰是一个巨大的搜索问题——它依赖模型架构与规模、输入输出长度、延迟目标、硬件拓扑的组合，这正是 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文用模拟器系统性研究的对象：该论文在 prefill 与 decode 两池上独立选择切分策略（TP/EP/PP/CPP 的组合），并给出"大模型、prefill-heavy 流量下分离收益最大"等结论。本页提供阅读该论文所需的全部切分机制基础。</p>
+<p>重要边界：这一章讨论的是两种切法的机制与代价结构，不回答"给定模型、流量和延迟约束下最优配置是什么"。最优配置恰恰是一个巨大的搜索问题——它依赖模型架构与规模、输入输出长度、延迟目标、硬件拓扑的组合，这正是 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文用模拟器系统性研究的对象：该论文在 prefill 与 decode 两池上独立选择切分策略（TP/EP/PP/CPP 的组合），并给出"大模型、prefill-heavy 流量下分离收益最大"等结论。这些机制是阅读该论文所需的切分基础。</p>
 
 <h3 id="tradeoffs-questions">本章问题</h3>
 <ol class="chapter-questions">

@@ -59,7 +59,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Mistral 7B（Jiang et al., arXiv:2310.06825）§2「Architectural details」；StreamingLLM（Xiao et al., arXiv:2309.17453）§1、§3.1；DeepSeek-V4.1-Flash 官方推理配置与参考实现（<code>inference/config.json</code>、<code>inference/model.py</code>）。字节账与索引规则的复算脚本见文末来源说明。</p>
+<p><b>主要依据</b>：Mistral 7B（Jiang et al., arXiv:2310.06825）§2「Architectural details」；StreamingLLM（Xiao et al., arXiv:2309.17453）§1、§3.1；DeepSeek-V4.1-Flash 官方推理配置与参考实现（<code>inference/config.json</code>、<code>inference/model.py</code>，官方发布物、非本仓库镜像）。字节账与索引规则的复算记录见文末来源说明。</p>
 </blockquote>
 
 <div class="callout callout-blue">
@@ -112,9 +112,9 @@
 
 <h2 id="visible-set">1. 窗口把可见集切成「最近 $W$ 个位置」</h2>
 
-<p>先明确一个 query 到底能看到什么。<a href="../standard-attention/index.html">全注意力</a>里，位置 $i$ 的 query 可以看到从序列开头到 $i$ 的全部位置；滑动窗口注意力把上界砍到 $W$：只保留上一层最近的 $W$ 个位置，即 $[i-W+1, i]$ 的隐状态。来源论文把这一区间写作 $[i-W, i]$，而实现与图注都取最近 $W$ 个，本页统一按 $[i-W+1, i]$ 表述<sup>[C1]</sup>。这里的 $W$ 是窗口大小，DeepSeek-V4.1-Flash 取 128<sup>[C4]</sup>。</p>
+<p><a href="../standard-attention/index.html">全注意力</a>里，位置 $i$ 的 query 可以看到从序列开头到 $i$ 的全部位置；滑动窗口注意力把上界砍到 $W$：只保留上一层最近的 $W$ 个位置，即 $[i-W+1, i]$ 的隐状态。来源论文把这一区间写作 $[i-W, i]$，而实现与图注都取最近 $W$ 个，本页统一按 $[i-W+1, i]$ 表述<sup>[C1]</sup>。这里的 $W$ 是窗口大小，DeepSeek-V4.1-Flash 取 128<sup>[C4]</sup>。</p>
 
-<p>要注意窗口不是「把文本切成固定段」。每个位置的窗口都不同：位置 4999 的窗口是 4872–4999，位置 5000 的窗口是 4873–5000，窗口随位置滑动，这也是「滑动窗口」这个名字的来源。</p>
+<p>每个位置的窗口都不同，随位置滑动：位置 4999 的窗口是 4872–4999，位置 5000 的窗口是 4873–5000，这也是「滑动窗口」这个名字的来源。</p>
 
 <figure class="diagram">
   <svg viewBox="0 0 680 140" role="img" aria-label="序列位置与滑动窗口示意：一个 query 只关注最近 W 个位置">
@@ -235,12 +235,12 @@ $$\text{每层窗口缓存} = 128 \times 512 \times 1\ \text{B} = 65\,536\ \text
 
 <details>
 <summary>展开：40 层窗口缓存的总量与「不随长度增长」的含义</summary>
-<p><b>构造示例</b>（数字取自官方配置，非实测运行）。主干 40 层各有一份窗口缓存：$40 \times 64\ \text{KiB} = 2560\ \text{KiB} = 2.50\ \text{MiB}$。除这 40 层外，模型还有 3 个 DSpark 草稿层各自注册一份同尺寸的窗口缓存，合计约 $3 \times 64\ \text{KiB} = 0.19\ \text{MiB}$；本页的「整个模型」账目只统计主干 40 层。这一项与序列长度无关：序列从 4K 涨到 1M，窗口缓存始终是 2.50 MiB。作为对照，若把 1M 个位置的窗口 KV 全部留下，单层就是 $1\,048\,576 \times 512 \times 1\ \text{B} = 512\ \text{MiB}$，40 层为 20 GiB；固定窗口相对它是 $1/8192$。注意这里只算窗口 KV，不含另一路压缩全局 KV 与索引器缓存——那两项才是长上下文缓存的主要部分。</p>
+<p><b>构造示例</b>（数字取自官方配置，非实测运行）。主干 40 层各有一份窗口缓存：$40 \times 64\ \text{KiB} = 2560\ \text{KiB} = 2.50\ \text{MiB}$。除这 40 层外，模型还有 3 个 DSpark 草稿层各自注册一份同尺寸的窗口缓存，合计约 $3 \times 64\ \text{KiB} = 0.19\ \text{MiB}$；本页的「整个模型」账目只统计主干 40 层。这一项与序列长度无关：序列从 4K 涨到 1M，窗口缓存始终是 2.50 MiB。作为对照，若把 1M 个位置的窗口 KV 全部留下，单层就是 $1\,048\,576 \times 512 \times 1\ \text{B} = 512\ \text{MiB}$，40 层为 20 GiB；固定窗口相对它是 $1/8192$。这里的字节账只算窗口 KV，不含另一路压缩全局 KV 与索引器缓存——那两项才是长上下文缓存的主要部分。</p>
 </details>
 
 <h3 id="cost-precision">2.3 窗口 KV 为什么保持 FP8</h3>
 
-<p>同一份模型里，压缩后的全局 KV 被量化到 FP4，而窗口 KV 保持 FP8。技术报告给出的理由是窗口 KV 对量化更敏感<sup>[C4]</sup>。这与两路 KV 的角色一致：窗口 KV 是最近位置保留 FP8 的较高精度副本（比全局 KV 的 FP4 少一道压缩），每个 query 都必然读到；压缩全局 KV 是远距离的粗粒度摘要，本身已经过池化。</p>
+<p>同一份模型里，压缩后的全局 KV 被量化到 FP4，而窗口 KV 保持 FP8。技术报告给出的理由是窗口 KV 对量化更敏感<sup>[C4]</sup>。两路 KV 角色不同：窗口 KV 直接保存最近 $W$ 个位置的键值并以 FP8 存储，不经压缩全局 KV 的池化与 FP4 量化这两步，每个 query 都必然读到；压缩全局 KV 是远距离的粗粒度摘要，本身已经过池化。</p>
 
 <h3 id="cost-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -262,7 +262,7 @@ $$\text{每层窗口缓存} = 128 \times 512 \times 1\ \text{B} = 65\,536\ \text
 
 <h2 id="receptive-field">3. 层堆叠接力：感受野 $k\times W$ 与它的天花板</h2>
 
-<p>窗口砍掉了可见范围，但模型并没有因此「只记得最近 128 个 token」——因为层与层是串联的：第 1 层把远处信息搬到近处，第 2 层再搬一次。这一章算清这个接力能走多远，以及它什么时候不够用。</p>
+<p>窗口砍掉了可见范围，但模型并没有因此「只记得最近 128 个 token」——因为层与层是串联的：第 1 层把远处信息搬到近处，第 2 层再搬一次。接力能走多远由每层前移量与层数共同决定，走到头之后窗口就不再够用。</p>
 
 <h3 id="rf-propagation">3.1 信息每层前移 $W$</h3>
 
@@ -326,7 +326,7 @@ $$\text{span}(40) = 40 \times 128 = 5120\ \text{token}$$
     <p>40 层、$W=128$ 的模型，感受野是 5120 个 token，这个数字怎么来的？它意味着什么？</p>
     <details>
       <summary>解答：$40 \times 128$，意味着窗口只能覆盖 1M 上下文的 0.49%</summary>
-      <p>每层把可见范围向前推 $W=128$ 个位置，40 层累计 $40 \times 128 = 5120$。它意味着：只有落在最近 5120 个 token 内的信息能通过层堆叠间接到达当前 query，更早的内容必须由另一路全局可见性提供。注意这是「上限」而非「保真范围」——间接路径要经过多层混合，实际可利用性会随距离下降。</p>
+      <p>每层把可见范围向前推 $W=128$ 个位置，40 层累计 $40 \times 128 = 5120$。它意味着：只有落在最近 5120 个 token 内的信息能通过层堆叠间接到达当前 query，更早的内容必须由另一路全局可见性提供。$k\times W$ 是上限而非保真范围——间接路径要经过多层混合，实际可利用性会随距离下降。</p>
     </details>
   </li>
   <li>
@@ -340,7 +340,7 @@ $$\text{span}(40) = 40 \times 128 = 5120\ \text{token}$$
 
 <h2 id="ring-buffer">4. 环形缓冲：槽位、覆盖与位置编码</h2>
 
-<p>前两章把「缓存固定为 $W$ 条」当作结论使用，这一章说明它怎么实现，以及实现中最容易出错的两处：索引与位置。</p>
+<p>前两章把「缓存固定为 $W$ 条」当作结论使用，其实现归结为两处最容易出错的地方：索引与位置。</p>
 
 <h3 id="rb-slot">4.1 槽位 = 位置对窗口取模</h3>
 
@@ -434,8 +434,8 @@ print("  位置 % W   :", [p % W for p in positions])</code></pre>
 <p>[C1] Mistral 7B（Jiang et al., arXiv:2310.06825）§2「Sliding Window Attention」：「the hidden state in position i of the layer k, h_i, attends to all hidden states from the previous layer with positions between i−W and i. Recursively, h_i can access tokens from the input layer at a distance of up to W×k tokens」；「At each attention layer, information can move forward by W tokens. Hence, after k attention layers, information can move forward by up to k×W tokens.」</p>
 <p>[C2] 同上 §2「Rolling Buffer Cache」：「The cache has a fixed size of W, and the keys and values for the timestep i are stored in position i mod W of the cache. As a result, when the position i is larger than W, past values in the cache are overwritten, and the size of the cache stops increasing.」</p>
 <p>[C3] StreamingLLM（Xiao et al., arXiv:2309.17453）§1、Table 2 与 §3.1：§1「StreamingLLM simply keeps the attention sink tokens' KV (with just 4 initial tokens sufficing) together with the sliding window's KV」；Table 2 caption「(1) Window attention (0+y) has a drastic increase in perplexity.」（§3.1 对应表述为「it results in an exceedingly high language modeling perplexity」）与 §3.1「removing these initial tokens' KV will remove a considerable portion of the denominator in the SoftMax function in attention computation.」</p>
-<p>[C4] DeepSeek-V4.1-Flash 官方推理配置 <code>official/inference/config.json</code>（<code>window_size=128</code>、<code>head_dim=512</code>、<code>n_layers=40</code>）与参考实现 <code>official/inference/model.py</code>：<code>_window_kv</code> 中 <code>act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)</code> 与注释「The K stays fp8, quantized over the whole post-RoPE vector」（该调用的 <code>inplace=True</code> 按 kernel 文档为 quant+dequant 回 BF16，1 B/元素取自技术报告的部署口径）；<code>forward</code> 中 <code>kv = torch.cat([kv, compress_kv], dim=1)</code>。技术报告 §2.4.4：「We retain FP8 for the SWA KV cache due to its sensitivity to quantization.」</p>
-<p>[C5] 原序列位置：参考实现 <code>model.py</code> 中 <code>freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]</code>（窗口 KV 的 RoPE）与 decode 分支的 <code>start_pos</code> 用法。缓存内位置：StreamingLLM §3.2「StreamingLLM focuses on positions within the cache rather than those in the original text. This distinction is crucial for StreamingLLM's performance.」</p>
+<p>[C4] DeepSeek-V4.1-Flash 官方推理配置 <code>inference/config.json</code>（官方发布物、非本仓库镜像；其中 <code>window_size=128</code>、<code>head_dim=512</code>、<code>n_layers=40</code> 按官方配置，未在本仓库复核）与参考实现 <code>inference/model.py</code>：<code>_window_kv</code> 中 <code>act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)</code> 与注释「The K stays fp8, quantized over the whole post-RoPE vector」（该调用的 <code>inplace=True</code> 按 kernel 文档为 quant+dequant 回 BF16，1 B/元素取自技术报告的部署口径）；<code>forward</code> 中 <code>kv = torch.cat([kv, compress_kv], dim=1)</code>。技术报告 §2.4.4：「We retain FP8 for the SWA KV cache due to its sensitivity to quantization.」</p>
+<p>[C5] 原序列位置：官方参考实现 <code>inference/model.py</code>（官方发布物、非本仓库镜像）中 <code>freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]</code>（窗口 KV 的 RoPE）与 decode 分支的 <code>start_pos</code> 用法。缓存内位置：StreamingLLM §3.2「StreamingLLM focuses on positions within the cache rather than those in the original text. This distinction is crucial for StreamingLLM's performance.」</p>
 
 <h3>公式与来源（F）</h3>
 <p>[F1] $\text{span}(k)=k\times W$：由 [C1] 的逐层前移直接推出，Mistral 7B 用 $W=4096$、32 层给出 131K 的对照。</p>
@@ -447,9 +447,9 @@ print("  位置 % W   :", [p % W for p in positions])</code></pre>
 <p>[N2] Mistral 7B：32K 序列下滚动缓冲把缓存显存减少 8 倍（$32768/4096=8$）。来源：同 [C2] 论文 §2。本页只引用其倍数关系，不引用其加速比数字。</p>
 <p>[N3] StreamingLLM Table 1（Llama-2-13B，PG19 首本书 65K token）：「0+1024」（纯窗口）困惑度 5158.07，「4+1020」5.40，「4"\n"+1020」（4 个换行符 + 1020）5.60。x+y 表示 x 个初始位置 + y 个近期位置。</p>
 <p>[N4] StreamingLLM Table 3（160M 参数模型，PG19 首样本）：可学习 sink token 训练的模型在 1+1023 配置下困惑度 18.01；未做该训练的模型在 2+1022 下 18.05。</p>
-<p>[N5] DeepSeek-V4.1-Flash 的窗口缓存账：$W=128$、512 维、FP8，每层 64 KiB，主干 40 层 2.50 MiB（另有 3 个 DSpark 草稿层各注册一份同尺寸缓存，约 0.19 MiB），相对 1M 位置全缓存为 $1/8192$；打分次数对照表的三个规模由 $N\times W$ 与 $N^2$ 直接算出。复算脚本：<code>research/verify_swa_accounts.py</code>。</p>
-<p>[N6] 感受野：$40\times128=5120$，占 $1\,048\,576$ 的 0.49%。同上脚本。</p>
-<p>[N7] 索引一致性：$W=128$、序列长 300 时 decode 槽位映射回的位置集合与 prefill 因果窗口逐步一致（0 处不符）；$W=8$、序列长 20 时对官方函数 <code>get_window_topk_idxs</code> 的直接对照同样一致。复算脚本同上；官方函数对照存档见 <code>wiki/deepseek-v4-1/research/ckpt/verify_sparse_attn_window.out</code>。</p>
+<p>[N5] DeepSeek-V4.1-Flash 的窗口缓存账：$W=128$、512 维、FP8，每层 64 KiB，主干 40 层 2.50 MiB（另有 3 个 DSpark 草稿层各注册一份同尺寸缓存，约 0.19 MiB），相对 1M 位置全缓存为 $1/8192$；打分次数对照表的三个规模由 $N\times W$ 与 $N^2$ 直接算出。复算记录与产物清单见 <code>research/measured.md</code>。</p>
+<p>[N6] 感受野：$40\times128=5120$，占 $1\,048\,576$ 的 0.49%。复算记录见 <code>research/measured.md</code>。</p>
+<p>[N7] 索引一致性：$W=128$、序列长 300 时 decode 槽位映射回的位置集合与 prefill 因果窗口逐步一致（0 处不符）；$W=8$、序列长 20 时对官方函数 <code>get_window_topk_idxs</code> 的直接对照同样一致。复算记录见 <code>research/measured.md</code>；官方函数对照的产物登记见 <code>wiki/deepseek-v4-1/research/measured.md</code>。</p>
 
 <h3>构造示例</h3>
 <p>64 KiB 与 2.50 MiB 的加总、第 1 章图中 6 个位置的窗口示意、可运行代码中的 $W=8$、序列长 20 均为构造示例，用于说明计算步骤；数值取自官方配置而非实测运行。代码输出为实际运行结果。</p>

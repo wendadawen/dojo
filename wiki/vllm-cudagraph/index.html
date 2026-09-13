@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="torch.compile 两阶段流程（TorchDynamo 图捕获 / Inductor 图编译）、Dynamo 对张量运算、Python 控制流与 C 扩展的处理边界，以及 CUDA Graph 在解码阶段的录制重放机制与捕获尺寸确定方式。">
-  <meta name="dojo:summary" content="torch.compile 先由 TorchDynamo 捕获计算图，再由 Inductor 编译；CUDA Graph 则录制固定形状的 GPU 工作并在解码阶段重放。页面同时梳理 Python 控制流、C 扩展与动态形状的处理边界。">
+  <meta name="dojo:summary" content="torch.compile 先由 TorchDynamo 捕获计算图，再由 Inductor 编译；CUDA Graph 则录制固定形状的 GPU 工作并在解码阶段重放。页面同时梳理 Python 控制流与 C 扩展的处理边界。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
   <meta name="dojo:tag" content="推理系统">
@@ -88,11 +88,11 @@
 
 <h1 class="title">torch.compile 图捕获与 CUDA Graph</h1>
 <p class="page-lead">torch.compile 通过 TorchDynamo 将前向计算捕获为计算图、再由 Inductor 编译为 GPU kernel 以提升推理性能；图捕获阶段的约束决定了哪些代码可被编译，解码阶段则由 CUDA Graph 录制一次、逐批重放。</p>
-<p class="page-meta">更新于 2026-08-06 · 类型：代码机制</p>
+<p class="page-meta">更新于 2026-08-06 · 类型：学习笔记</p>
 <p class="reading-time" id="readingTime"></p>
 
 <h2 id="pipeline">1. torch.compile 的两阶段流程</h2>
-    <p>PyTorch 默认的 <code>forward()</code> 以逐行解释方式执行：每一条 Python 语句对应一次算子（kernel）提交，中间结果写入显存、再由后续算子读回，解释器与 kernel 启动存在固定开销。torch.compile 通过将计算整体化为可复用编译产物来消除这部分开销，分为两个阶段：</p>
+    <p>PyTorch 默认的 <code>forward()</code> 以逐行解释方式执行：每条 Python 语句通常对应一次或多次算子（kernel）提交，中间结果写入显存、再由后续算子读回，解释器与 kernel 启动存在固定开销。torch.compile 通过将计算整体化为可复用编译产物来大幅降低这部分开销，分为两个阶段：</p>
     <ol>
       <li><strong>图捕获（graph capture）</strong>：由 <strong>TorchDynamo</strong> 在运行前向时，将 Python 层调用逐条转换为一张计算图（graph），图中节点对应算子。</li>
       <li><strong>图编译（graph compilation）</strong>：由后端将计算图翻译为可执行的 GPU kernel。torch.compile 的默认后端为 <strong>Inductor</strong>（PyTorch 官方内置），其通过代码生成以 <strong>Triton</strong> 语言产出 kernel，再编译为 CUDA 机器码。产物除 kernel 外，还包括调用它们的执行计划，整体封装为可复用的编译函数，此后推理直接执行该产物、不再逐行解释。</li>
@@ -103,30 +103,31 @@
     <table>
       <tr><th>代码类型</th><th>Dynamo 处理方式</th><th>结果</th></tr>
       <tr><td>张量运算（<code>torch.add</code>、<code>torch.matmul</code>）</td><td>映射为图节点</td><td>正常编译</td></tr>
-      <tr><td>Python 原生控制流（<code>if</code>、<code>for</code>、<code>len</code>）</td><td>graph break，回落到 Python 执行</td><td>可继续，性能下降</td></tr>
-      <tr><td>C 扩展（如 <code>hashlib.sha1</code>）</td><td>无追踪规则，标记为 skipped 并抛异常</td><td>图捕获中断</td></tr>
+      <tr><td>可静态展开的控制流（<code>for</code> 循环、<code>len</code>）</td><td>展开或追踪为图节点</td><td>正常编译</td></tr>
+      <tr><td>数据相关的控制流（分支/循环条件依赖张量取值，如 <code>if x.sum() &gt; 0</code>）</td><td>graph break，回落到 Python 执行</td><td>可继续，性能下降</td></tr>
+      <tr><td>C 扩展（如 <code>hashlib.sha1</code>）</td><td>无追踪规则，标记为 skipped 并 graph break</td><td>可继续（<code>fullgraph=True</code> 时以 <code>Unsupported</code> 失败）</td></tr>
     </table>
-    <p>graph break 是软性失效：图在该位置断开、控制流回落 Python，执行仍可继续；而 C 扩展被标记为 skipped 时是硬性失败，Dynamo 直接抛出 <code>Unsupported</code> 异常终止捕获。</p>
-    <p><strong>C 扩展</strong>指通过 CPython C API 编译为共享库（<code>.so</code>）供 Python 调用的函数。这类函数对 Dynamo 而言是黑盒——既无法映射为图节点，也无 graph break 的兜底规则，因此捕获失败。典型报错信息为：<code>Dynamo does not know how to trace the builtin _hashlib.openssl_sha1.</code></p>
+    <p>graph break 是软性失效：图在该位置断开、控制流回落 Python，执行仍可继续。被标记为 skipped 的 C 扩展同样走这条路径，Dynamo 按 graph break 处理（并给出一次警告），编译继续；只有在 <code>fullgraph=True</code>（或 <code>nopython</code>）模式下，这类 graph break 才被当作硬错误，抛出 <code>Unsupported</code> 终止捕获。</p>
+    <p><strong>C 扩展</strong>指通过 CPython C API 编译为共享库（<code>.so</code>）供 Python 调用的函数。这类函数对 Dynamo 而言是黑盒，无法映射为图节点，默认模式下 Dynamo 在此 graph break 并给出警告、执行继续。警告文本形如：<code>Dynamo does not know how to trace the builtin `_hashlib.openssl_sha1.`</code></p>
 
     <h2 id="cuda-graph">3. CUDA Graph 的录制与重放</h2>
     <p>即便 kernel 已编译完成，每次推理仍由 CPU 逐个向 GPU 提交 kernel，每次提交存在固定延迟（CPU 到 GPU 的命令下发开销）。CUDA Graph 将<strong>完整的 GPU 执行序列</strong>——包括 kernel 顺序、各 kernel 参数、输入输出内存地址及数据搬运操作——一次性<strong>录制（capture）</strong>为一张图，此后 CPU 仅需一次命令即可整张<strong>重放（replay）</strong>，从而消除逐个下发的开销。</p>
     <ul>
-      <li><strong>适用阶段</strong>：主要用于<strong>解码（decode）</strong>阶段。decode 每步仅生成一个 token，kernel 单次计算量小但数量多，CPU 逐个下发开销占比较高，且计算形状相对稳定，适合录制；而预填充（prefill）单次处理大量 token、计算形状动态变化，不适用于固定形状的图录制。每步是否重放捕获图由 GPUModelRunner 查表决定，这一层在引擎进程中的位置见 <a href="../vllm-v1-two-process-arch/index.html">vLLM V1 框架总览</a>。</li>
-      <li><strong>开销特征</strong>：录制开销较大（需逐次执行、记录地址与依赖、分配内存池，量级可达几十至数百毫秒），因此只执行一次并复用；重放开销极小。</li>
-      <li><strong>显存代价</strong>：除图本身（每张数十至数百 MB）外，还须预留固定地址的<strong>内存池（memory pool）</strong>，按最大容量预留、即使未用满也不释放，因此显存占用随捕获图数量线性增长，vLLM 通过限制捕获图数量控制显存。</li>
+      <li><strong>适用阶段</strong>：主要用于<strong>解码（decode）</strong>阶段。decode 每步仅生成一个 token，kernel 单次计算量小但数量多，CPU 逐个下发开销占比较高，且计算形状相对稳定，适合以 FULL（整图）模式录制重放；预填充（prefill）单次处理的 token 数变化大、计算形状动态，整图重放不适用，vLLM 对其通常采用 PIECEWISE 分段录制或直接落到 eager 执行。每步是否重放捕获图由 GPUModelRunner 查表决定，这一层在引擎进程中的位置见 <a href="../vllm-v1-two-process-arch/index.html">vLLM V1 框架总览</a>。</li>
+      <li><strong>开销特征</strong>：录制开销较大（需逐次执行、记录地址与依赖、分配内存池），因此只执行一次并复用；重放开销极小。</li>
+      <li><strong>显存代价</strong>：除图本身（每张数十至数百 MB，此量级为推断）外，还须预留固定地址的<strong>内存池（memory pool）</strong>，按最大容量预留、即使未用满也不释放，因此显存占用随捕获图数量线性增长，vLLM 通过限制捕获图数量控制显存。</li>
       <li><strong>核心约束</strong>：录制时地址被固化，重放阶段输入输出内存地址不可改变，故数据须存放于预分配的固定内存池中（如 vLLM 的 KV cache 缓冲区即为此设计）。</li>
     </ul>
 
     <h2 id="capture-size">4. 捕获尺寸的确定</h2>
-    <p>CUDA Graph 捕获的尺寸以<strong>解码阶段的总 token 数</strong>为单位。decode 中每个请求每步仅产生一个 token，故总 token 数近似等于并发请求数（<code>num_seqs</code>，即 batch size）；seq_len 在 decode 中恒定，不参与尺寸组合。</p>
-    <p>默认捕获尺寸按 <code>[1, 2, 4] + list(range(8, 256, 8)) + list(range(256, max, 16))</code> 生成，最大捕获尺寸默认取 <code>min(max_num_seqs * 2, 512)</code>。实际请求数不落在合法捕获尺寸上时，按邻近的合法尺寸向上补齐（padding）。尺寸超出捕获上限或未命中捕获记录时退回 eager 执行，这一对照在一次真实走读中表现为 decode 命中 FULL 重放、983 token 的 prefill 落到 eager（<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）。</p>
+    <p>CUDA Graph 捕获的尺寸以<strong>解码阶段的总 token 数</strong>为单位。decode 中每个请求每步仅产生一个 token（无投机解码时），故单步总 token 数等于并发请求数（<code>num_seqs</code>，即 batch size）。上下文长度（<code>seq_len</code>）不进入尺寸组合：注意力经分页 KV cache 与 block table 读取，与上下文长度解耦。</p>
+    <p>默认捕获尺寸按 <code>[1, 2, 4] + list(range(8, 256, 8)) + list(range(256, max_cudagraph_capture_size + 1, 16))</code> 生成，末元素即最大捕获尺寸 <code>max_cudagraph_capture_size</code>。未显式指定时，该上限默认取 <code>min(max_num_seqs × decode_query_len × 2, 512)</code>，再与 <code>max_num_batched_tokens</code> 取较小值；其中 <code>decode_query_len = 1 + num_speculative_tokens</code>（无投机解码时为 1）。实际请求数不落在合法捕获尺寸上时，按邻近的合法尺寸向上补齐（padding）。尺寸超出捕获上限或未命中捕获记录时退回 eager 执行；据<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>的走读数据，decode 命中 FULL 重放，而单批 token 数超出捕获尺寸上限的大 prefill 落到 eager。</p>
 
     <h2 id="ref">来源与范围说明</h2>
     <ul>
-      <li>PyTorch torch.compile 官方文档：两阶段（图捕获 / 图编译）与 Inductor 后端说明。</li>
-      <li>vLLM 源码：<code>vllm/config/compilation.py</code>（捕获尺寸默认生成规则）、<code>vllm/v1/cudagraph_dispatcher.py</code>（batch 到捕获尺寸的映射与 padding）。</li>
-      <li>关于 graph break 软性失效与 C 扩展硬性失败的行为区分，以及 CUDA Graph 显存占用的具体量级，属于推断，未逐一实测。</li>
+      <li>PyTorch torch.compile 官方文档（<a href="https://docs.pytorch.org/docs/stable/torch.compiler.html">torch.compiler</a> 及 <code>programming_model</code> 系列）：两阶段（图捕获 / 图编译）、Inductor 后端与 graph break 行为说明。</li>
+      <li>vLLM 源码（本地检出 commit <code>5ac2684</code>，2026-08-07）：<code>vllm/config/vllm.py::VllmConfig._set_cudagraph_sizes</code>（捕获尺寸默认生成规则）、<code>vllm/config/compilation.py</code>（尺寸规律的 docstring 描述）、<code>vllm/v1/cudagraph_dispatcher.py</code>（batch 到捕获尺寸的映射与 padding）。</li>
+      <li>C 扩展被标记为 skipped 时的 graph break 行为与警告文本，经本地 torch 2.8.0 实测核对；CUDA Graph 显存占用的具体量级属于推断，未逐一实测。</li>
     </ul>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

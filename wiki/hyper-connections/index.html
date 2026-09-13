@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="超连接（HC）把残差流加宽成 n 条并用三个映射读写；mHC 进一步把流间混合矩阵约束为双随机（Sinkhorn 投影），恢复恒等映射的稳定性。含 HC 无约束放大的 3000 倍实测对照、双随机三性质、Sinkhorn-Knopp 收敛实测与 GLM-5.3-Flash 的实现规格与差异清单。">
-  <meta name="dojo:summary" content="把残差流加宽成 $n$ 条并行流，每层用 $pre$（压成单路）、$res$（流间 $n\times n$ 混合）、$post$（分发回写）三个映射读写。无约束的 $res$ 连乘会指数放大信号（实测峰值约 3000，理想值 1）；mHC 把 $res$ 约束为双随机矩阵——行和列和都是 1 的非负矩阵——靠谱范数 $\leq1$、乘法封闭、凸组合三条性质恢复恒等映射的稳定性，用 Sinkhorn-Knopp 交替行列归一化投影实现。">
+  <meta name="description" content="超连接（HC）把残差流加宽成 n 条并用三个映射读写；mHC 进一步把流间混合矩阵约束为双随机（Sinkhorn 投影），恢复恒等映射的稳定性。含无约束链放大实测与论文 27B 峰值约 3000 的对照、双随机三性质、Sinkhorn-Knopp 收敛实测与 GLM-5.3-Flash 的实现规格与差异清单。">
+  <meta name="dojo:summary" content="把残差流加宽成 $n$ 条并行流，每层用 $pre$（压成单路）、$res$（流间 $n\times n$ 混合）、$post$（分发回写）三个映射读写。无约束的 $res$ 连乘会指数放大信号（论文 27B 实测峰值约 3000，理想值 1；本页 $4\times4$ 链实测放大到约 $10^6$）；mHC 把 $res$ 约束为双随机矩阵——行和列和都是 1 的非负矩阵——谱范数 $\leq1$、乘法封闭、凸组合三条性质恢复恒等映射的稳定性，用 Sinkhorn-Knopp 交替行列归一化投影实现。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="模型结构">
   <meta name="dojo:tag" content="网络结构">
@@ -59,12 +59,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Zhu et al., <i>Hyper-Connections</i>, arXiv:2409.19606v3（2025）；Xie et al., <i>mHC: Manifold-Constrained Hyper-Connections</i>, arXiv:2512.24880v2（2026）；GLM-5.3-Flash 规格与实测（<code>wiki/glm-5-3-flash-dataflow/research/</code>）；mHC 机制的可定位参考实现（<code>wiki/deepseek-v4-1/research/official/inference/</code> 的 <code>model.py</code>、<code>kernel.py</code>）。</p>
+<p><b>主要依据</b>：Zhu et al., <i>Hyper-Connections</i>, arXiv:2409.19606v3（2025）；Xie et al., <i>mHC: Manifold-Constrained Hyper-Connections</i>, arXiv:2512.24880v2（2026）；GLM-5.3-Flash 官方 config、官方 transformers 源码与 checkpoint 张量头（本机实测得到，交叉核对见 <code>wiki/glm-5-3-flash-dataflow/index.html</code>）。</p>
 </blockquote>
 
-<p>一个 45 层的模型，如果每层的残差混合把信号放大 1.5 倍，到第 45 层信号是最初的 $1.5^{44}\approx 10^{7.7}$ 倍——放大倍数随深度按指数累积。这不是假想的危险：把残差流从一条加宽到多条、并且让混合矩阵自由学习的 Hyper-Connections（HC），在 27B 模型上实测过残差通路增益峰值约 3000（理想值是 1），同期出现训练损失突增<sup>[N1]</sup>。流形约束超连接（mHC）的应对是把混合矩阵约束为双随机矩阵——行和、列和都等于 1 的非负矩阵——让任何深度的复合映射都不放大信号。GLM-5.3-Flash 是采用 mHC 的公开模型，每层维持 4 条并行残差流。</p>
-
-<p>本文先讲清普通残差连接保住了什么（恒等映射），再看 HC 怎么加宽残差流、失控点在哪，然后是双随机约束的三条性质与 Sinkhorn-Knopp 投影，最后对照 GLM-5.3-Flash 的实现规格。</p>
+<p>一个 45 层的模型，如果每层的残差混合把信号放大 1.5 倍，到第 45 层信号是最初的 $1.5^{45}\approx 10^{7.9}$ 倍——放大倍数随深度按指数累积。把残差流从一条加宽到多条、并且让混合矩阵自由学习的 Hyper-Connections（HC），在 27B 模型上实测到残差通路增益峰值约 3000（理想值是 1），同期出现训练损失突增<sup>[N1]</sup>。流形约束超连接（mHC）的应对是把混合矩阵约束为双随机矩阵——行和、列和都等于 1 的非负矩阵——让任何深度的复合映射都不放大信号。GLM-5.3-Flash 是采用 mHC 的公开模型，每层维持 4 条并行残差流。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -132,7 +130,7 @@
 
 <p>$$\mathbf{x}_{L}=\mathbf{x}_{l}+\sum_{i=l}^{L-1}\mathcal{F}(\mathbf{x}_{i},\mathcal{W}_{i}).$$</p>
 
-<p>右边的第一项 $\mathbf{x}_l$ 就是恒等映射：来自浅层的信号不经任何修改直达第 $L$ 层<sup>[C1]</sup>。它带来两个直接后果：子层输出趋零时（$\mathcal{F}\approx 0$），整层退化为 $\mathbf{x}_{l+1}\approx\mathbf{x}_l$，信号既不放大也不衰减；反向传播时梯度沿同一条通路回传，不经过会连乘放大的系数。恒等映射是深网络训练稳定性的来源，也是本页后续所有讨论的「基准线」——HC 改动了它，mHC 的全部设计都在把它找回来。</p>
+<p>右边的第一项 $\mathbf{x}_l$ 就是恒等映射：来自浅层的信号不经任何修改直达第 $L$ 层<sup>[C1]</sup>。它带来两个直接后果：子层输出趋零时（$\mathcal{F}\approx 0$），整层退化为 $\mathbf{x}_{l+1}\approx\mathbf{x}_l$，信号既不放大也不衰减；反向传播时梯度沿同一条通路回传，不经过会连乘放大的系数。恒等映射是深网络训练稳定性的来源；HC 改动了它，mHC 的全部设计都在把它找回来。</p>
 
 <h3 id="identity-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -147,7 +145,7 @@
 
 <h2 id="hyper-connections">2. 超连接——把一条流加宽成 $n$ 条</h2>
 
-<p>在引入多路结构之前，先看单路残差长期存在的权衡。Pre-Norm 把归一化放在残差分支入口，缓解了梯度消失，但深层表示趋向高度相似（表示坍塌）；Post-Norm 反过来，缓解坍塌但重新引入梯度消失——两者像跷跷板的两端<sup>[C2]</sup>。HC 论文把根源归结为：残差连接（两种变体都一样）预先固定了层输入输出之间的连接强度，网络无法自己学习该多强<sup>[C2]</sup>。Pre-Norm 和 Post-Norm 都可以写成 $n=1$ 的非可训练超连接<sup>[C3]</sup>；只有 $n>1$ 时，网络才既能调整残差强度又能重排层间的并行与串行关系<sup>[C4]</sup>。</p>
+<p>单路残差长期存在一个权衡：Pre-Norm 把归一化放在残差分支入口，缓解了梯度消失，但深层表示趋向高度相似（表示坍塌）；Post-Norm 反过来，缓解坍塌但重新引入梯度消失——两者像跷跷板的两端<sup>[C2]</sup>。HC 论文把根源归结为：残差连接（两种变体都一样）预先固定了层输入输出之间的连接强度，网络无法自己学习该多强<sup>[C2]</sup>。Pre-Norm 和 Post-Norm 都可以写成 $n=1$ 的非可训练超连接<sup>[C3]</sup>；只有 $n>1$ 时，网络才既能调整残差强度又能重排层间的并行与串行关系<sup>[C4]</sup>。</p>
 
 <p>HC 的做法是把残差流从一条加宽成 $n$ 条（$n$ 叫扩张率）。入口把初始输入复制 $n$ 份，堆叠成超隐藏矩阵 $\mathbf{H}\in\mathbb{R}^{n\times d}$（第 $k$ 行是一条流）。每层用三组系数读写这 $n$ 条流<sup>[F1]</sup>：</p>
 
@@ -218,7 +216,7 @@
   <figcaption class="diagram-caption">HC 单层的读写结构。pre 把 $n$ 条流压成单路（图中左侧汇聚），子层计算后由 post 分发回各流；res 是 $n\times n$ 的流间混合矩阵，也是唯一能跨流放大信号的位置。</figcaption>
 </figure>
 
-<p>$n=1$ 时这个结构精确退化为普通残差：$\mathbf{A_m}$、$\mathbf{A_r}$、$\mathbf{B}$ 都只剩一个标量，取 1 时上式就是 $\mathbf{x}_{l+1}=\mathcal{T}(\mathbf{x}_l)+\mathbf{x}_l$。下面的代码验证这个退化，并观察 $n=2$ 时两路流如何开始分化。</p>
+<p>$n=1$ 时这个结构精确退化为普通残差：$\mathbf{A_m}$、$\mathbf{A_r}$、$\mathbf{B}$ 都只剩一个标量，取 1 时上式就是 $\mathbf{x}_{l+1}=\mathcal{T}(\mathbf{x}_l)+\mathbf{x}_l$。该退化由下例验证，并观察 $n=2$ 时两路流如何开始分化。</p>
 
 <details class="code-details">
   <summary>代码：n=2 的 HC 层与 n=1 退化验证</summary>
@@ -229,7 +227,7 @@ def hc_layer(H, A_m, A_r, B, T):
     """H: [n,d], A_m: [n], A_r: [n,n], B: [n], T: 子层(函数)"""
     h0 = A_m @ H                            # pre：加权求和成单路
     out = T(h0)                             # 子层
-    return A_r @ H + torch.outer(B, out)    # res 混合 + post 写回
+    return A_r.T @ H + torch.outer(B, out)  # res 混合 + post 写回
 
 d = 4
 x = torch.arange(1, d + 1, dtype=torch.float32)
@@ -258,8 +256,8 @@ print("两行是否已不同:", not torch.allclose(h_n2[0], h_n2[1]))</code></pr
   <pre><code class="language-text">n=1 输出: [1.1, 2.2, 3.3, 4.4]
 普通残差: [1.1, 2.2, 3.3, 4.4]
 最大差: 0.0
-n=2 输出行 0: [1.1, 2.2, 3.3, 4.4]
-n=2 输出行 1: [1.05, 2.1, 3.15, 4.2]
+n=2 输出行 0: [1.2, 2.4, 3.6, 4.8]
+n=2 输出行 1: [0.95, 1.9, 2.85, 3.8]
 两行是否已不同: True</code></pre>
   </div>
   <p><b>验证的机制</b>：代码按公式 $\hat{\mathbf{H}}=\mathbf{B}^{\intercal}\mathcal{T}(\mathbf{H}^{\intercal}\mathbf{A_m})^{\intercal}+\mathbf{A_r}^{\intercal}\mathbf{H}$ 逐项实现 pre、res、post 三个映射。</p>
@@ -273,7 +271,7 @@ n=2 输出行 1: [1.05, 2.1, 3.15, 4.2]
     <p>三个映射中哪个是「跨流」的？为什么它是后续约束的对象？</p>
     <details>
       <summary>解答：res 是唯一跨流混合点</summary>
-      <p>pre 只把 $n$ 条流汇总为一条（读出），post 只把一条输出分发给 $n$ 条流（写入），两者都不在流与流之间传递信息；res 是 $n\times n$ 的流间混合矩阵，信息跨流流动全部经过它。它同时也是唯一能对多条流的总量做线性放大或衰减的位置——本章会看到，信号爆炸正是从这里发生的，所以约束也只加在它身上。</p>
+      <p>pre 只把 $n$ 条流汇总为一条（读出），post 只把一条输出分发给 $n$ 条流（写入），两者都不在流与流之间传递信息；res 是 $n\times n$ 的流间混合矩阵，信息跨流流动全部经过它。它同时也是唯一能对多条流的总量做线性放大或衰减的位置——信号爆炸正发生在这里，所以约束也只加在它身上。</p>
     </details>
   </li>
   <li>
@@ -305,9 +303,9 @@ n=2 输出行 1: [1.05, 2.1, 3.15, 4.2]
 <li><strong>凸组合</strong>：Birkhoff polytope 是置换矩阵的凸包，$\mathcal{H}^{\mathrm{res}}\mathbf{x}$ 是对各路输入的加权平均，总量守恒（既不会被创造也不会被销毁）。</li>
 </ul>
 
-<p>还有一个漂亮的退化事实：$n=1$ 时，行和、列和都是 1 的非负标量只能是 1，双随机条件恰好退化为恒等映射<sup>[C8]</sup>——约束不只修复了多路结构的稳定性，还保证它包含普通残差作为特例。</p>
+<p>还有一个退化事实：$n=1$ 时，行和、列和都是 1 的非负标量只能是 1，双随机条件恰好退化为恒等映射<sup>[C8]</sup>——约束不只修复了多路结构的稳定性，还保证它包含普通残差作为特例。</p>
 
-<p>下面的构造实验直接对照两种链的行为：24 层、每层一个 $4\times4$ 的 res 矩阵，一边从标准正态分布自由采样，一边先做 Sinkhorn 投影成双随机（投影算法见「Sinkhorn-Knopp」一章）再相乘。</p>
+<p>一个 24 层的对照实验：每层一个 $4\times4$ 的 res 矩阵，一边从标准正态分布自由采样，一边先做 Sinkhorn 投影成双随机（投影算法见「Sinkhorn-Knopp」一章）再相乘。</p>
 
 <details class="code-details">
   <summary>代码：无约束链与双随机链的 24 层对照</summary>
@@ -340,7 +338,7 @@ print("双随机链 24 层, 复合矩阵行和:",
 双随机链 24 层, 复合矩阵行和: [1.0, 1.0, 1.0, 1.0]</code></pre>
   </div>
   <p><b>验证的机制</b>：打印量是行和的绝对值的最大值 $\max_i|\sum_j G_{ij}|$，正是 mHC 论文 §3.1 定义的 Amax Gain Magnitude（前向通路的最坏情况放大）<sup>[N1]</sup>。双随机链靠乘法封闭性保住行和恒为 1。</p>
-  <p><b>观察重点</b>：无约束链的行和绝对值最大在 24 层内放大到约 $10^6$<sup>[N4]</sup>；单次采样结果的具体数值不稳定（这正是「无界」的含义），但量级随层数指数增长的趋势每次运行都在。双随机链行和精确等于 1。</p>
+  <p><b>观察重点</b>：无约束链的行和绝对值最大在 24 层内放大到约 $10^6$<sup>[N4]</sup>；种子固定（<code>seed=0</code>）后该数值可复现为 $8.693\times10^{5}$，放大是无约束连乘的系统性趋势，换种子只改变具体倍数、不改变量级随层数指数增长这一点。双随机链行和精确等于 1。</p>
   <p><b>简化条件</b>：矩阵维度取 $4\times4$、层数取 24、无约束侧从 $\mathcal{N}(0,1)$ 采样，均为构造示例；真实训练中的 res 由网络预测且逐层不同，但「无约束连乘无界、双随机连乘有界」的对比不受这些构造选择影响。</p>
 </details>
 
@@ -387,7 +385,7 @@ print("双随机链 24 层, 复合矩阵行和:",
 <p>非对称例子：取 $\mathbf{M}=\begin{pmatrix}9&amp;1\\1&amp;2\end{pmatrix}$。列和为 $(10,3)$。第一步列归一化得 $\begin{pmatrix}0.9&amp;1/3\\0.1&amp;2/3\end{pmatrix}$，行和为 $(1.233,0.767)$。第二步行归一化（每行除以自己的和）得 $\begin{pmatrix}0.730&amp;0.270\\0.130&amp;0.870\end{pmatrix}$，行和恰为 1，列和为 $(0.860,1.140)$。再一轮列归一化后列和回到 1，行和为 $(1.086,0.914)$。两轮之后行和偏差从最初的 0.233 降到 0.086，再继续会进一步收缩——收敛是几何的，速率依赖矩阵本身。</p>
 </details>
 
-<p>下面是 $3\times3$ 的完整收敛过程与谱范数检验<sup>[F7]</sup>。</p>
+<p>$3\times3$ 正矩阵的完整收敛过程与谱范数检验<sup>[F7]</sup>：</p>
 
 <details class="code-details">
   <summary>代码：$3\times3$ 正矩阵的 Sinkhorn 收敛与谱范数</summary>
@@ -437,7 +435,7 @@ print("最大奇异值:", round(float(torch.linalg.svdvals(M)[0]), 6))</code></p
     <p>有限次迭代后矩阵还不是精确双随机，这算实现缺陷吗？</p>
     <details>
       <summary>解答：是速度与精度的折中，且偏差可控可测</summary>
-      <p>精确投影需要迭代到收敛，训练里每个 token 都要算一次，开销不可接受；20 次是论文的选择。残差的性质比精确性更重要：有限次迭代只得到近似双随机，偏差意味着行和或列和离 1 有距离，复合后该偏差随深度增大但仍有界——论文实测复合映射的增益偏差最大约 1.6，与无约束时随深度指数累积的情形有本质区别<sup>[C6]</sup>。偏差不是单向收缩：本页实现的实测中行和最高到 $1.0037$（略大于 1）；「落地」一章 GLM 的实测给出该偏差的具体量级。</p>
+      <p>精确投影需要迭代到收敛，训练里每个 token 都要算一次，开销不可接受；20 次是论文的选择。残差的性质比精确性更重要：有限次迭代只得到近似双随机，行和或列和离 1 都可能有距离，但复合映射的幅度不再随深度无界累积——论文实测 mHC 复合映射的最大增益约 1.6，与无约束时随深度指数增长的情形有本质区别<sup>[C6]</sup>。偏差不是单向收缩——本页 $3\times3$ 实测首轮（列归一 + 行归一后）的列和 $[1.0025, 1.0351, 0.9624]$ 里就有大于 1 的分量，随迭代才收敛；「落地」一章 GLM 的实测给出该偏差的具体量级。</p>
     </details>
   </li>
 </ol>
@@ -552,9 +550,9 @@ print("最大奇异值:", round(float(torch.linalg.svdvals(M)[0]), 6))</code></p
 <li><strong>[C7]</strong> 双随机三性质：谱范数 $\leq1$、乘法封闭、Birkhoff polytope 为置换矩阵凸包。mHC 论文 §4.1。</li>
 <li><strong>[C8]</strong> $n=1$ 时双随机条件退化为标量 1、恢复恒等映射。mHC 论文 §4.1 原句。</li>
 <li><strong>[C9]</strong> pre/post 施加非负约束（防正负系数复合抵消）。mHC 论文 §4.1 末段。</li>
-<li><strong>[C10]</strong> GLM-5.3-Flash 规格（hc_mult=4、两站点、$fn$ 形状、三路系数、末端均值）。GLM 侧：<code>wiki/glm-5-3-flash-dataflow/research/config.json</code> L16/L17/L15（hc_mult=4、hc_sinkhorn_iters=20、hc_eps=1e-6）与实测 <code>p3.out</code> §3.1–3.8（§3.7 末端无权重均值）。机制等价实现：<code>wiki/deepseek-v4-1/research/official/inference/kernel.py</code> L407–474（pre L427、post L429、comb L430–443）与 <code>model.py</code> L938、L941–946、L948–955、L1257–1258。GLM 的 transformers 源文件未收录在本机，不引其行号。</li>
-<li><strong>[C11]</strong> 实现与论文三处差异（softmax 初始化、$\varepsilon$ 分母、迭代序末步为列方向）。机制等价实现 <code>wiki/deepseek-v4-1/research/official/inference/kernel.py</code> L436–443（softmax 后加 $\varepsilon$）、L445–458（先列归一一次，再循环「行归一 $+$ 列归一」，末步为列）、L448/L454（分母加 $\varepsilon$），对照 mHC 论文 §4.2 Eq.(9)（列后行、末步行）；GLM 侧同序见 <code>wiki/glm-5-3-flash-dataflow/research/p3.out</code> §3.3。</li>
-<li><strong>[C12]</strong> 参数 35,391,870（0.011%）、激活显存 4 倍。单站点形状与 <code>mix_hc</code> 定义见机制等价实现 <code>wiki/deepseek-v4-1/research/official/inference/model.py</code> L938、L941–946 与 <code>kernel.py</code> L409；GLM 侧合计与占比见 <code>wiki/glm-5-3-flash-dataflow/research/p3.out</code> §3.1 与 <code>verify_structure.out</code> 参数量合计项 [10]；4 路复制见 <code>model.py</code> L1257–1258。</li>
+<li><strong>[C10]</strong> GLM-5.3-Flash 规格（hc_mult=4、两站点、$fn$ 形状、三路系数、末端均值）。来源：GLM 官方 config（hc_mult=4、hc_sinkhorn_iters=20、hc_eps=1e-6）、官方 transformers 源码与 checkpoint 张量头，本机实测得到；交叉核对见 <code>wiki/glm-5-3-flash-dataflow/index.html</code>，实测清单见 <code>wiki/glm-5-3-flash-dataflow/research/measured.md</code>。GLM 的 transformers 源文件未收录在本机，不引其行号。</li>
+<li><strong>[C11]</strong> 实现与论文三处差异（softmax 初始化、$\varepsilon$ 分母、迭代序末步为列方向）。来源：GLM 官方 transformers 源码与本机实测得到——初始正矩阵用 softmax 后加 $\varepsilon$，归一化分母加 $\varepsilon=10^{-6}$，迭代序为先列归一一次、再循环「行归一 $+$ 列归一」使末步落在列方向；对照 mHC 论文 §4.2 Eq.(9)（列后行、末步行）。</li>
+<li><strong>[C12]</strong> 参数 35,391,870（0.011%）、激活显存 4 倍。来源：GLM 官方 config 与 checkpoint 张量头、官方 transformers 源码，本机实测得到——单站点 $24\times16384+24+3$、每层两站点、45 层，4 路复制把主干隐藏状态从每 token 4096 个元素变成 16384 个。</li>
 <li><strong>[C13]</strong> Block AttnRes 用可学习 pseudo-query 对前序块表征做 softmax 加权检索（块内求和、块间注意力），突破单路残差的表达限制但不施加流形约束。来源：<code>wiki/block-attnres/index.html</code> 的 meta 与正文。</li>
 </ul>
 
@@ -566,21 +564,21 @@ print("最大奇异值:", round(float(torch.linalg.svdvals(M)[0]), 6))</code></p
 <li><strong>[F4]</strong> 双随机流形约束定义（Eq. 6）。mHC 论文 §4.1。</li>
 <li><strong>[F5]</strong> mHC 参数化与最终映射 $\sigma$/$2\sigma$/Sinkhorn（Eq. 7/8）。mHC 论文 §4.2。</li>
 <li><strong>[F6]</strong> Sinkhorn-Knopp 迭代式与 $t_{\max}=20$（Eq. 9）。mHC 论文 §4.2。</li>
-<li><strong>[F7]</strong> Sinkhorn 数值行为（$3\times3$ 收敛、双随机乘积封闭、谱范数 1、无约束链对照）。research/ 内实跑输出（构造示例）。</li>
-<li><strong>[F8]</strong> GLM 回写式 $h^{\prime}=post\otimes y+comb^{\top}h$。机制等价实现 <code>wiki/deepseek-v4-1/research/official/inference/model.py</code> L962–966（<code>hc_post</code>：<code>post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)</code>）；GLM 侧形状实测见 <code>wiki/glm-5-3-flash-dataflow/research/p3.out</code> §3.5。</li>
+<li><strong>[F7]</strong> Sinkhorn 数值行为（$3\times3$ 收敛、双随机乘积封闭、谱范数 1、无约束链对照）。本页代码块实测得到（构造示例，清单见 <code>research/measured.md</code>）。</li>
+<li><strong>[F8]</strong> GLM 回写式 $h^{\prime}=post\otimes y+comb^{\top}h$。来源：GLM 官方 transformers 源码与本机实测得到——<code>post</code> 对子层输出 $y$ 逐路缩放写回、<code>comb</code> 混合旧残差流 $h$，与 mHC 论文 §4.2 的参数化一致。</li>
 </ul>
 
 <h3>外部数字与实验条件（N）</h3>
 <ul>
 <li><strong>[N1]</strong> 增益峰值约 3000（HC）vs 约 1.6（mHC）；27B 模型约 12k 步损失突增。mHC 论文 §3.1/§5.4，实验条件为该论文的训练设置，引用时不外推。</li>
-<li><strong>[N2]</strong> GLM：hc_sinkhorn_iters=20、hc_eps=1e-6、单站点 393,243 参数、两站点 786,486、45 层合计 35,391,870。config.json 与 checkpoint 张量头（GLM 数据流页交叉验证存档）。</li>
-<li><strong>[N3]</strong> GLM 实测 20 次迭代后列和偏差 $1.1\times10^{-6}$、行和 $1.0\times10^{-2}$；$n=1$ 且 $fn=0$ 时退化为普通残差（误差 $3.8\times10^{-6}$，由 $\varepsilon$ 决定）。GLM 数据流页 p3 探针，随机初始化构造条件。</li>
-<li><strong>[N4]</strong> 无约束链 24 层行和绝对值的最大值 $\max_i|\sum_j G_{ij}|=8.693\times10^{5}$（$4\times4$、seed=0、$\mathcal{N}(0,1)$）。本页 research/ 实跑输出，构造示例。</li>
+<li><strong>[N2]</strong> GLM：hc_sinkhorn_iters=20、hc_eps=1e-6、单站点 393,243 参数、两站点 786,486、45 层合计 35,391,870。来源：GLM 官方 config 与 checkpoint 张量头，本机实测得到；与 <code>wiki/glm-5-3-flash-dataflow/index.html</code> 交叉一致。</li>
+<li><strong>[N3]</strong> GLM 实测 20 次迭代后列和偏差 $1.1\times10^{-6}$、行和 $1.0\times10^{-2}$；$n=1$ 且 $fn=0$ 时退化为普通残差（误差 $3.8\times10^{-6}$，由 $\varepsilon$ 决定）。来源：GLM 官方实现的本机实测，随机初始化构造条件；同结论见 <code>wiki/glm-5-3-flash-dataflow/index.html</code>。</li>
+<li><strong>[N4]</strong> 无约束链 24 层行和绝对值的最大值 $\max_i|\sum_j G_{ij}|=8.693\times10^{5}$（$4\times4$、seed=0、$\mathcal{N}(0,1)$）。本页代码块实测得到，构造示例，清单见 <code>research/measured.md</code>。</li>
 </ul>
 
 <h3>构造示例</h3>
 <ul>
-<li>$1.5^{44}\approx10^{7.7}$：开篇的指数放大演示，纯算术。</li>
+<li>$1.5^{45}\approx10^{7.9}$：开篇的指数放大演示，纯算术。</li>
 <li>$n=2$、$d=4$ 的 HC 层与手写系数：验证退化与分化。</li>
 <li>$\begin{pmatrix}9&amp;1\\1&amp;2\end{pmatrix}$ 与 $3\times3$ 正矩阵的 Sinkhorn 过程：演示收敛行为。</li>
 <li>24 层随机矩阵链：演示无界放大与双随机对照。</li>
@@ -595,7 +593,7 @@ print("最大奇异值:", round(float(torch.linalg.svdvals(M)[0]), 6))</code></p
 <h3>简化条件及其限制</h3>
 <ul>
 <li>复合映射分析假设 res 为方阵且逐步连乘，忽略了子层输出的注入项——注入项不影响「通路是否有界」的定性结论，但不代表完整的信号幅度分析。</li>
-<li>代码实验的维度（$2\times2$、$3\times3$、$4\times4$）与层数（24）均为构造选择；无约束链的具体放大数值每次运行不同，量级趋势稳定。</li>
+<li>代码实验的维度（$2\times2$、$3\times3$、$4\times4$）与层数（24）均为构造选择；无约束链的具体放大倍数依赖矩阵取值，量级随层数指数增长的趋势不依赖这些构造选择。</li>
 <li>GLM 实测数字（$10^{-2}$ 行和残差）对应官方初始化的随机权重，训练后的模型中该偏差会不同；方向性结论（行列不对称）由迭代顺序决定，不受权重影响。</li>
 <li>mHC 论文的训练收益数字（损失曲线、基准分数）不在本页范围：它们依赖该论文的实验设置，机制页不展开。</li>
 </ul>

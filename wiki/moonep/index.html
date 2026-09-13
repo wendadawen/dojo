@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="每 rank 恰好收到 S×K token 的 EP 方案：动态冗余专家在线规划（证明 E/R 上界基本紧）、零拷贝通信（固定 S×K buffer）、静态形状免 host 同步、workload-aware GEMM 调度。基于 K3 报告 §5.2.1 + §E 附录核对。">
+  <meta name="description" content="每 rank 恰好收到 S×K token 的 EP 方案：动态冗余专家在线规划（证明 E/R 上界基本紧）、零拷贝通信（固定 S×K buffer）、静态形状免 host 同步；rank 内 per-expert 偏斜是 MoonEP 不解决的问题，由 workload-aware GEMM 调度处理。基于 K3 报告 §5.2.1 + §E 附录核对。">
   <meta name="dojo:summary" content="让每个 EP rank 恰好收到 $S\times K$ 个 token：动态冗余专家在线规划给出接近紧致的 $E/R$ 上界，固定大小 buffer 实现零拷贝通信，并以静态形状消除 host 同步。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="训练与优化">
@@ -76,7 +76,7 @@
       <p>传统 EP 在 MoE 训练中为什么让 rank 间负载不均衡？MoonEP 用什么核心思路让每 rank 恰好收到 $S\times K$ 个 token？</p>
       <details>
         <summary>解答：router 偏好动态决定收 token 数，MoonEP 用冗余专家做完美均衡</summary>
-        <p>传统 EP 下每 rank 收到多少 token-expert pair 完全由"我持有的 $E/R$ 个专家被全网 token 选了多少次"决定，而 router 偏好随每个 micro-batch、每一层变化，导致有的 rank 过载、有的空转。MoonEP 在保留传统 EP 总体计算流的前提下，通过在线规划把部分专家临时复制为冗余专家、迁移 token 到空转 rank，使每 rank 恰好收到 $S\times K$ 个 token。见「1. 传统 EP 的不均衡」章。</p>
+        <p>传统 EP 下每 rank 收到多少 token-expert pair 完全由"该 rank 持有的 $E/R$ 个专家被全网 token 选了多少次"决定，而 router 偏好随每个 micro-batch、每一层变化，导致有的 rank 过载、有的空转。MoonEP 在保留传统 EP 总体计算流的前提下，通过在线规划把部分专家临时复制为冗余专家、迁移 token 到空转 rank，使每 rank 恰好收到 $S\times K$ 个 token。见「1. 传统 EP 的不均衡」章。</p>
       </details>
     </li>
     <li>
@@ -96,22 +96,24 @@
     <li>
       <p>MoonEP 解决什么、不解决什么？与 ECHO、UltraEP、DeepEP 的关键区别是什么？</p>
       <details>
-        <summary>解答：解决三问题、不解决三问题；有证明的界、扩展而非替代</summary>
-        <p>MoonEP 解决训练时 EP 的 rank 间负载不均衡、通信 buffer 形状动态、每层 host 同步开销；不解决 rank 内 per-expert 偏斜（由 Expert-GEMM workload-aware scheduler 处理）、router 本身的训练（由路由机制负责）、内存碎片（由 memory-efficient training 处理）。与 ECHO/UltraEP 的核心区别是用有证明的基本紧上界 $E/R$ 替代预设 cap——不会因无解中断训练、不需手动调参；与 DeepEP 的关系是扩展而非替代，保留其 dispatch/combine 数据路径。见「4. MoonEP 的边界」章。</p>
+        <summary>解答：解决三问题、不解决两问题</summary>
+        <p>MoonEP 解决训练时 EP 的 rank 间负载不均衡、通信 buffer 形状动态、每层 host 同步开销；不解决 rank 内 per-expert 偏斜（由 Expert-GEMM workload-aware scheduler 处理）与 router 本身的训练（由路由机制负责）。报告 §5.2.1 把 rank 间负载不均衡的后果拆成两条：计算不均衡降低吞吐，routed-expert 激活形状动态变化造成显存碎片；完美均衡消解计算不均衡这条，碎片这条报告列为不均衡的后果但未声明被消除——MoonEP 固定的是每 rank 总量 $S\times K$，报告同节指出 rank 内 per-expert token 数仍随层偏斜。与 ECHO/UltraEP 的核心区别是用有证明的基本紧上界 $E/R$ 替代预设 cap——不会因无解中断训练、不需手动调参；与 DeepEP 的关系是扩展而非替代，保留其 dispatch/combine 数据路径。见「4. MoonEP 的边界」章。</p>
       </details>
     </li>
   </ol>
 </section>
 
-<p>下面先用一个最小例子把"不均衡"具体化。构造示例。设 $E=4$ 个专家、$R=2$ 个 EP rank、每 rank 本地 $S=4$ 个 token、每 token 选 $K=1$ 个专家。每 rank 持有 $E/R=2$ 个本地专家：rank 0 持专家 $\{0,1\}$，rank 1 持专家 $\{2,3\}$。每 rank 发出 $S\times K=4$ 个 token-expert pair，全网络总 pair 数 $S\times K\times R=8$。完美均衡时每 rank 收到 $S\times K=4$ 个 pair。</p>
+<p>构造示例。设 $E=4$ 个专家、$R=2$ 个 EP rank、每 rank 本地 $S=4$ 个 token、每 token 选 $K=1$ 个专家。每 rank 持有 $E/R=2$ 个本地专家：rank 0 持专家 $\{0,1\}$，rank 1 持专家 $\{2,3\}$。每 rank 发出 $S\times K=4$ 个 token-expert pair，全网络总 pair 数 $S\times K\times R=8$。完美均衡时每 rank 收到 $S\times K=4$ 个 pair。记 $n_r$ 为 rank $r$ 实际收到的 pair 数，总量守恒<sup>[F4]</sup>：</p>
+
+$$\sum_{r=0}^{R-1} n_r = S\times K\times R.$$
 
 <h2 id="imbalance-and-idea">1. 传统 EP 的不均衡——根源与 MoonEP 的核心思路</h2>
 
-<p>先回顾 EP 的基础数据流（详细见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>的 EP 章节）：每个 token 选 $K$ 个专家，专家被均匀分片到 $R$ 个 rank 上、每个 rank 持有 $E/R$ 个本地专家。一个 token 想算某个专家，就得把它的激活送到那个专家所在的 rank（home rank）上算，算完再送回原 rank。一次 forward 由两段 all-to-all 组成：dispatch 把 token-expert pair 送到 home rank，combine 把专家输出送回原 rank。</p>
+<p>EP 的基础数据流（详细见 <a href="../../wiki/moe-serving/index.html">MoE 大模型推理与服务基础</a>的 EP 章节）：每个 token 选 $K$ 个专家，专家被均匀分片到 $R$ 个 rank 上、每个 rank 持有 $E/R$ 个本地专家。一个 token 想算某个专家，就得把它的激活送到那个专家所在的 rank（home rank）上算，算完再送回原 rank。一次 forward 由两段 all-to-all 组成：dispatch 把 token-expert pair 送到 home rank，combine 把专家输出送回原 rank。</p>
 
-<p>关键问题在于：每 rank 收到多少 pair 完全取决于"我持有的 $E/R$ 个专家被全网 token 选了多少次"。这个数由 router 的偏好决定，而 router 偏好随每个 micro-batch、每一层都在变。报告原文<sup>[C1]</sup>给出两个直接后果：<strong>计算不均衡降低训练吞吐</strong>，<strong>routed-expert 激活形状动态变化导致显存碎片</strong>。</p>
+<p>关键问题在于：每 rank 收到多少 pair 完全取决于"该 rank 持有的 $E/R$ 个专家被全网 token 选了多少次"。这个数由 router 的偏好决定，而 router 偏好随每个 micro-batch、每一层都在变。报告原文<sup>[C1]</sup>给出两个直接后果：<strong>计算不均衡降低训练吞吐</strong>，<strong>routed-expert 激活形状动态变化导致显存碎片</strong>。</p>
 
-<p>构造示例。设 router 输出极端不均衡——8 个 token 的选择全部落到专家 0（在 rank 0 上）。那么 rank 0 收到全部 8 个 pair（过载 2 倍），rank 1 收到 0 个（完全空转）。总量守恒（公式 F4）仍成立：$8+0=8=S\times K\times R$，但每 rank 收到的数远偏离平衡值 $S\times K=4$。</p>
+<p>构造示例。设 router 输出极端不均衡——8 个 token 的选择全部落到专家 0（在 rank 0 上）。那么 rank 0 收到全部 8 个 pair（过载 2 倍），rank 1 收到 0 个（完全空转）。总量守恒<sup>[F4]</sup>仍成立：$8+0=8=S\times K\times R$，但每 rank 收到的数远偏离平衡值 $S\times K=4$。</p>
 
 <figure class="diagram">
   <div class="dg-flow">
@@ -158,7 +160,7 @@
 </table>
 </div>
 
-<p>本章说明了传统 EP 不均衡的根源与 MoonEP 的核心思路。但要迁多少个冗余专家才够——下一章讲 $E/R$ 上界与基本紧性。</p>
+<p>完美均衡要迁多少冗余专家才够，需要一条可证明的上界来回答——报告 §E 给出 $E/R$ 上界，并证明它基本紧。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -180,24 +182,24 @@
     <p>在 $E=4,R=2,S=4,K=1$ 的例子里，rank 0 收到 8、rank 1 收到 0 时，总量与每 rank 平衡值 $S\times K=4$ 之间是什么关系。</p>
     <details>
       <summary>解答：总量守恒为 8，实际分布偏离平衡值</summary>
-      <p>总量守恒（公式 F4）仍成立：$8+0=8=S\times K\times R$，不均衡改变的是 pair 在 rank 间的分布而非总量。每 rank 平衡值为 $S\times K=4$，实际 $\{8,0\}$ 严重偏离。完美均衡的做法是在总量不变的前提下重新分配——把 rank 0 上的 4 个 pair 迁到 rank 1 上，这 4 个 pair 都想算专家 0，所以 rank 1 需要专家 0 的一个冗余副本。</p>
+      <p>总量守恒<sup>[F4]</sup>仍成立：$8+0=8=S\times K\times R$，不均衡改变的是 pair 在 rank 间的分布而非总量。每 rank 平衡值为 $S\times K=4$，实际 $\{8,0\}$ 严重偏离。完美均衡的做法是在总量不变的前提下重新分配——把 rank 0 上的 4 个 pair 迁到 rank 1 上，这 4 个 pair 都想算专家 0，所以 rank 1 需要专家 0 的一个冗余副本。</p>
     </details>
   </li>
 </ol>
 
 <h2 id="bound-and-tightness">2. 冗余专家的界——$E/R$ 上界与基本紧性</h2>
 
-<p>现在把"要多少冗余专家"形式化。给定一个 router 输出 $I$，规划 $P$ 决定哪些专家被复制到哪些 rank。记 $m_r(P)$ 为规划 $P$ 下 rank $r$ 上的冗余专家数。MoonEP 的规划目标是</p>
+<p>现在把"要多少冗余专家"形式化。给定一个 router 输出 $I$，规划 $P$ 决定哪些专家被复制到哪些 rank。记 $m_r(P)$ 为规划 $P$ 下 rank $r$ 上的冗余专家数。MoonEP 的规划目标是<sup>[F1]</sup>：</p>
 
-$$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
+$$M(I)=\min_P\max_r\{m_r(P)\}.$$
 
-<p>这是个 min-max 目标——最小化"任意 rank 上冗余数的最大值"。注意它不要求每 rank 冗余数相等，只要求最坏那个 rank 别太离谱。这个目标的选择直接对应工程预留：每 rank 预留 $M(I)$ 个冗余槽位即可保证该 router 输出下有可行规划。</p>
+<p>这是个 min-max 目标——最小化"任意 rank 上冗余数的最大值"。注意它不要求每 rank 冗余数相等，只要求最坏 rank 的冗余数不超过给定值。这个目标的选择直接对应工程预留：每 rank 预留 $M(I)$ 个冗余槽位即可保证该 router 输出下有可行规划。</p>
 
 <p>报告 §E 证明了两个定理。第一个是一般上界<sup>[F2]</sup>：</p>
 
 <p><strong>Theorem 1</strong>：对任意 router 输出 $I$，$M(I)\le E/R$。</p>
 
-<p>证明的核心是一条关键引理：<strong>存在一种规划 $P^*$，使每 rank 的远端 token 全部来自同一个 home rank</strong>。构造过程是迭代的填充：初始每 rank 只有本地 token，按是否达到 $S\times K$ 分为 underloaded 和 overloaded；每次取一个 underloaded rank 和一个 overloaded rank，把 overloaded rank 上的 token 迁过来填满 underloaded rank 到 $S\times K$；overloaded rank 可能仍过载、可能恰好平衡、可能变 underloaded，放回对应集合。重复直到全部平衡。</p>
+<p>证明的核心是一条关键引理：<strong>存在一种规划 $P^*$，使每 rank 的远端 token（来自其他 rank、非本 rank 本地的 token）全部来自同一个 home rank</strong>。构造过程是迭代的填充：初始每 rank 只有本地 token，按是否达到 $S\times K$ 分为 underloaded 和 overloaded；每次取一个 underloaded rank 和一个 overloaded rank，把 overloaded rank 上的 token 迁过来填满 underloaded rank 到 $S\times K$；overloaded rank 可能仍过载、可能恰好平衡、可能变 underloaded，放回对应集合。重复直到全部平衡。</p>
 
 <p>这个填充过程有两个关键性质。第一，每次 fill 让一个 underloaded rank 达到 $S\times K$ 且此后不再变化，所以至多 $R-1$ 次 fill 就终止。第二，每个 rank 至多被 fill 一次，所以它的远端 token 全部来自同一个 home rank。既然远端 token 同源 rank $s$，而这些 token 想算的都是 rank $s$ 上的本地专家，而 rank $s$ 至多有 $E/R$ 个本地专家（专家均匀分片），所以 rank $r$ 上的冗余专家数 $m_r(P^*)\le E/R$。这就推出 $M(I)\le E/R$。</p>
 
@@ -229,7 +231,7 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 <p><strong>情形 B（最坏构造，界达到）</strong>：rank 0 上的专家 $\{0,1\}$ 收到 0 个 pair，rank 1 上的专家 $\{2,3\}$ 均分全部 8 个 pair（每个专家收 4 个）。rank 0 必须从远端收 $S\times K=4$ 个 pair。最优规划让 rank 0 取同一专家的全部 4 个 pair（如全取专家 2），只需 1 个冗余专家。验证 $M(I^*)=1=\lceil E(R-1)/R^2\rceil=\lceil 4\times 1/4\rceil=1&lt;E/R=2$。此例展示小 $R$ 下 $\lceil E(R-1)/R^2\rceil$ 严格小于 $E/R$，$E/R$ 仅大 $R$ 渐近紧。</p>
 </details>
 
-<p>本章说明了 $E/R$ 上界的来源与基本紧性。但有了上界还不够——下一章讲完美均衡带来的工程收益与 forward/backward 流程。</p>
+<p>$E/R$ 上界保证任意 router 输出下都有可行规划；这一保证在工程上具体兑现为 buffer 形状、host 同步与 forward/backward 流程三项收益。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -258,7 +260,7 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 
 <h2 id="buffer-sync-flow">3. 完美均衡的工程收益——buffer、host 同步与 forward/backward 流程</h2>
 
-<p>有了 $E/R$ 上界保证可行解，接下来看完美均衡带来的三个工程收益怎样落地，以及 MoonEP 的 forward/backward 与传统 EP 有什么不同。</p>
+<p>完美均衡带来三个工程收益：通信 buffer 形状固定、每层 host 同步消除、forward/backward 流程多出规划与归还两步。</p>
 
 <h3 id="s3-1-buffer">3.1 通信 buffer 从 $S\times K\times R$ 降到 $S\times K$</h3>
 
@@ -350,8 +352,8 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
   plan = planning_kernel(I, home, S, K, E, R)   # 近最优，m_r ≤ E/R
   
   # 2. 预取冗余专家权重
-  for (expert e, target_rank r) in plan.redundant_copies:
-      redund_w[r].pull(home[e], e)   # 从 home rank 拉专家 e 的权重
+  for (slot, expert e) in plan.local_redundant:
+      redund_w[slot].pull(home[e], e)   # 从 home rank 拉专家 e 的权重到本地槽位 slot
   
   # 3. fused permute dispatch：每 token 直接发到远端 expert-grouped 位置
   for token t in local_tokens:
@@ -381,7 +383,7 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 </table>
 </div>
 
-<p>本章说明了完美均衡的工程收益与 forward/backward 流程。但 MoonEP 解决什么、不解决什么——下一章讲清边界与方案对比。</p>
+<p>MoonEP 的收益边界需要与它的作用范围一起界定：它解决什么、不解决什么，以及与 ECHO、UltraEP、DeepEP 有何区别。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -412,13 +414,13 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 
 <h3 id="s4-1-solves">4.1 MoonEP 解决的三个问题</h3>
 
-<p>前三章已得结论，这里汇总：MoonEP 解决<strong>训练时 EP 的 rank 间负载不均衡</strong>、<strong>通信 buffer 形状动态</strong>、<strong>每层 host 同步开销</strong>。三个问题都源自同一个根因——router 偏好动态导致每 rank 收到 token 数动态——所以同一个机制（完美均衡）一次性解决。</p>
+<p>MoonEP 解决<strong>训练时 EP 的 rank 间负载不均衡</strong>、<strong>通信 buffer 形状动态</strong>、<strong>每层 host 同步开销</strong>。这三个问题源自同一个根因——router 偏好动态导致每 rank 收到 token 数动态——所以同一个机制（完美均衡）一次性解决。报告 §5.2.1 把 rank 间负载不均衡的后果拆成两条：计算不均衡降低训练吞吐，routed-expert 激活形状动态变化造成显存碎片<sup>[C1]</sup>。完美均衡消解前一条；后一条报告列为不均衡的后果但未声明被消除——MoonEP 固定的是每 rank 总量 $S\times K$，报告同节指出 rank 内 per-expert token 数仍随层偏斜，激活形状仍随层变化。</p>
 
-<h3 id="s4-2-not-solves">4.2 MoonEP 不解决的三个问题</h3>
+<h3 id="s4-2-not-solves">4.2 MoonEP 不解决的问题</h3>
 
-<p>报告 §5.2.1 最后一段<sup>[C9]</sup>明确指出：即使 rank 间总量完美均衡，<strong>每 rank 内部 per-expert token 数仍可能偏斜</strong>，固定顺序、workload-oblivious 的调度会让这种偏斜变成跨 SM 的 makespan 不均。这是 MoonEP 不解决的问题，由独立的 <strong>Expert-GEMM workload-aware scheduler</strong> 处理：launch 前根据当前 token 分布调参、launch 后固定；系数通过离线 autotuning 标定（具体算法报告未公开，本页不展开）。同时，<strong>shared expert 的 GEMM 分到独立 stream</strong> 与其他 kernel 重叠。</p>
+<p>报告 §5.2.1 最后一段<sup>[C9]</sup>明确指出：即使 rank 间总量完美均衡，<strong>每 rank 内部 per-expert token 数仍可能偏斜</strong>，固定顺序、workload-oblivious 的调度会让这种偏斜变成跨 SM 的 makespan 不均。这是 MoonEP 不解决的问题，由独立的 <strong>Expert-GEMM workload-aware scheduler</strong> 处理：launch 前根据当前 token 分布调参、launch 后固定；系数通过离线 autotuning 标定（报告只给出启发式类别——解析硬件代价模型 + 离线 autotuning 标定系数，未给出完整公式）。同时，<strong>shared expert 的 GEMM 分到独立 stream</strong> 与其他 kernel 重叠。</p>
 
-<p>另外两个 MoonEP 不解决的问题：<strong>router 本身的训练</strong>——router 的负载均衡训练由路由机制本身负责（K3 采用 auxiliary-loss-free routing 与 Quantile Balancing，见报告 §2.3.3），MoonEP 只在 router 输出给定后做规划，不修改 router（这是常见误解，见下方边界）；<strong>内存碎片</strong>——由 §5.2.2 memory-efficient training 独立处理（如 unified activation manager、memory-efficient MoE），与完美均衡无关。</p>
+<p>另一个 MoonEP 不解决的问题是 <strong>router 本身的训练</strong>：router 的负载均衡训练由路由机制本身负责（K3 采用 auxiliary-loss-free routing 与 Quantile Balancing，见报告 §2.3.3），MoonEP 只在 router 输出给定后做规划，不修改 router。把"router 均衡"和"EP 后 rank 均衡"混为一谈是常见误解——router 均衡不保证 dispatch 后各 rank 收到的 token 数相等，正是这个差额由 MoonEP 的冗余专家迁移填平。至于显存碎片：报告 §5.2.1 把 routed-expert 激活形状动态变化列为 rank 间负载不均衡的直接后果<sup>[C1]</sup>，但未声明 MoonEP 消除碎片——MoonEP 固定的是每 rank 总量 $S\times K$，报告同节指出 rank 内 per-expert token 数仍随层偏斜；§5.2.2 的 memory-efficient training 处理的是另一类问题——激活/梯度/优化器状态的显存预算（如 unified activation manager 以单一内存池避免 multi-stream 碎片），与本页讨论的激活形状碎片不是同一件事。</p>
 
 <h3 id="s4-3-vs-echo-ultra">4.3 与 ECHO、UltraEP 的区别</h3>
 
@@ -434,21 +436,21 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 <tbody>
 <tr><td>MoonEP</td><td>是，$E/R$（Theorem 1）</td><td>否</td><td>$S\times K$</td><td>不会</td></tr>
 <tr><td>DeepEP</td><td>否（传统方案）</td><td>—</td><td>$S\times K\times R$（最坏）</td><td>不会（但不保证均衡）</td></tr>
-<tr><td>ECHO</td><td>否，预设冗余数</td><td>是</td><td>—</td><td>会（无解时）</td></tr>
-<tr><td>UltraEP</td><td>否，施加 token cap</td><td>是</td><td>—</td><td>会（无解时）</td></tr>
+<tr><td>ECHO</td><td>否，预设冗余数或 token cap</td><td>是</td><td>—</td><td>会（无解时）</td></tr>
+<tr><td>UltraEP</td><td>否，预设冗余数或 token cap</td><td>是</td><td>—</td><td>会（无解时）</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>本章说明了 MoonEP 的边界与方案对比。核心论断、公式与教学简化的完整定位见下一章来源与范围说明。</p>
+<p>上述论断、公式与教学简化的完整来源定位集中在「来源与范围说明」一节。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
   <li>
-    <p>列出 MoonEP 解决的三个问题与不解决的三个问题，并说明每个"不解决"由谁处理。</p>
+    <p>列出 MoonEP 解决的三个问题与不解决的两个问题，并说明每个"不解决"由谁处理。</p>
     <details>
-      <summary>解答：同一根因三个收益；三个独立机制各管一段</summary>
-      <p>解决：训练时 EP 的 rank 间负载不均衡、通信 buffer 形状动态、每层 host 同步开销——三者同源于 router 偏好动态，被完美均衡一次性解决。不解决：rank 内部 per-expert token 数偏斜（由独立的 Expert-GEMM workload-aware scheduler 处理，shared expert 的 GEMM 分到独立 stream 重叠）；router 本身的训练（由路由机制负责，K3 采用 auxiliary-loss-free routing 与 Quantile Balancing，MoonEP 只在 router 输出给定后做规划）；内存碎片（由 §5.2.2 memory-efficient training 独立处理）。</p>
+      <summary>解答：同一根因三个收益；两个独立机制各管一段</summary>
+      <p>解决：训练时 EP 的 rank 间负载不均衡、通信 buffer 形状动态、每层 host 同步开销——三者同源于 router 偏好动态，被完美均衡一次性解决。不解决：rank 内部 per-expert token 数偏斜（由独立的 Expert-GEMM workload-aware scheduler 处理，shared expert 的 GEMM 分到独立 stream 重叠）；router 本身的训练（由路由机制负责，K3 采用 auxiliary-loss-free routing 与 Quantile Balancing，MoonEP 只在 router 输出给定后做规划）。routed-expert 激活形状动态变化造成的显存碎片报告列为 rank 间不均衡的后果，但未声明被完美均衡消除（MoonEP 固定的是每 rank 总量 $S\times K$，rank 内 per-expert 形状仍随层变化）；§5.2.2 memory-efficient training 处理的是激活/梯度/优化器状态的显存预算，与此不同。</p>
     </details>
   </li>
   <li>
@@ -474,14 +476,14 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 <ul>
   <li>C1（传统 EP 不均衡 + 内存碎片）：§5.2.1 开头。</li>
   <li>C2（MoonEP 用动态冗余专家 + forward/backward 总述）：§5.2.1。</li>
-  <li>C3（每 rank 收 $S\times K$）。</li>
-  <li>C4（online planning + ILP + GPU kernel 近最优）。</li>
-  <li>C5（backward 暂存 + reduce 回 home rank）。</li>
-  <li>C6（fused permute/unpermute + buffer view 免拷贝）。</li>
-  <li>C7（DeepEP 最坏 $S\times K\times R$ vs MoonEP $S\times K$）：明确 "Under worst-case imbalance" 限定。</li>
-  <li>C8（静态形状消除每层 host 同步）。</li>
-  <li>C9（per-expert 偏斜 + Expert-GEMM scheduler + shared expert 独立 stream）。</li>
-  <li>C10（ECHO/UltraEP 预设 cap 可能中断）。</li>
+  <li>C3（每 rank 收 $S\times K$）：§5.2.1 "Perfect balance with bounded redundant experts" 段。</li>
+  <li>C4（online planning + ILP + GPU kernel 近最优）：§5.2.1 "Online planning" 段。</li>
+  <li>C5（backward 暂存 + reduce 回 home rank）：§5.2.1 首段 backward 句。</li>
+  <li>C6（fused permute/unpermute + buffer view 免拷贝）：§5.2.1 "Zero-copy communication" 段。</li>
+  <li>C7（DeepEP 最坏 $S\times K\times R$ vs MoonEP $S\times K$）：§5.2.1 "Zero-copy communication" 段，明确 "Under worst-case imbalance" 限定。</li>
+  <li>C8（静态形状消除每层 host 同步）：§5.2.1 "Sync-free execution with static shapes" 段。</li>
+  <li>C9（per-expert 偏斜 + Expert-GEMM scheduler + shared expert 独立 stream）：§5.2.1 "Expert-GEMM scheduling and overlap" 段。</li>
+  <li>C10（ECHO/UltraEP 预设 cap 可能中断）：§5.2.1 "Perfect balance with bounded redundant experts" 段。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
@@ -493,7 +495,7 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 </ul>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>K3 是 2.8 万亿参数级 MoE 模型（报告 §2.3 提及 "2.8-trillion-parameter scale"），训练规模为 3T 级（报告 §5.2 提及 "3T-class"）。报告未公开 K3 训练 MoE 的具体 $E, R, K, S$ 取值；本页所有数字均为教学构造。</p>
+<p>K3 是 2.8 万亿参数级 MoE 模型（报告 §2.3 提及 "2.8-trillion-parameter scale"），训练规模为 3T 级（报告 §5.2 提及 "3T-class"）。报告公开了模型层的专家配置 $E=896$、$K=16$（§2.3："896 routed experts with 16 active experts per token"），但未公开 K3 训练时的 EP size $R$ 与每 rank 序列长度 $S$ 等具体配置；本页所用 $E=4, R=2, S=4, K=1$ 均为教学构造，不代表真实配置。</p>
 
 <h3>构造示例</h3>
 <p>$E=4, R=2, S=4, K=1$ 的构造示例及其两种 router 输出（情形 A 一般不均衡、情形 B 最坏构造）是<strong>教学构造</strong>，目的在于让 $E/R$ 上界、最坏构造、forward/backward 流程在 $\le 4$ 的数字上可手算复算。<strong>不来自 K3 报告</strong>，不代表真实训练配置。</p>
@@ -501,7 +503,7 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
 <h3>辅助解释与类比边界</h3>
 <ul>
   <li>"冗余专家 = 临时副本"：用于强调 forward 预取、backward 归还的特性。失效边界：若 router 极端偏好长期不变，冗余专家可能在多个 micro-batch 间复用副本，但 MoonEP 仍按每 micro-batch、每层重新规划，不假设长期复用。</li>
-  <li>"reduce-back 与 all-reduce 同语义但只针对冗余专家梯度"：用于帮助理解 reduce-back 的归约语义。失效边界：reduce-back 不是全量梯度 all-reduce，只涉及当前层、当前 micro-batch 用到的冗余专家梯度。</li>
+  <li>"reduce-back = 跨 rank 归约到 home rank"：用于帮助理解 reduce-back 的归约语义——结果只 home rank 得到，不是 all-reduce 让所有 rank 都得到。失效边界：reduce-back 不是全量梯度 all-reduce，只涉及当前层、当前 micro-batch 用到的冗余专家梯度。</li>
 </ul>
 
 <h3>简化条件及其限制</h3>
@@ -512,8 +514,7 @@ $$M(I)=\min_P\max_r\{m_r(P)\}.\quad\text{(F1)}$$
   <li>DeepEP 的 $S\times K\times R$ 只在最坏不均衡限定下使用。可推出：MoonEP 的固定 $S\times K$ buffer 在最坏情况下比 DeepEP 节省 $R$ 倍。不可推出：DeepEP 在非最坏情况下的实际 buffer 分配策略（报告未涉及）。</li>
 </ul>
 
-<h3>全文总结</h3>
-<p>回到开篇的问题：MoonEP 怎样让每 rank 恰好收到 $S\times K$？需要多少冗余专家？解决了什么、不解决什么？——以上四章已逐一回答。MoonEP 的核心贡献是把"经验值"换成"有证明的界"：用 $E/R$ 这个基本紧的上界保证总有可行规划，让完美均衡成为训练时的静态保证而非动态希望。这带来三重工程收益——通信 buffer 从 $S\times K\times R$ 降到固定 $S\times K$、所有层计算形状静态已知消除每层 host 同步、forward 加 planning + 预取 + 零拷贝 dispatch、backward 暂存梯度再 reduce 回 home rank。MoonEP 不解决 per-expert 偏斜、router 训练、内存碎片，这些由独立机制处理；与 ECHO/UltraEP 的核心区别是有界保证对预设 cap，与 DeepEP 的关系是扩展不是替代。</p>
+<p>全文总结：MoonEP 让每 rank 恰好收到 $S\times K$ 个 token，所需冗余专家数由基本紧的 $E/R$ 上界保证。核心贡献是把"经验值"换成"有证明的界"：用 $E/R$ 这个基本紧的上界保证总有可行规划，让完美均衡成为训练时的静态保证而非动态希望。这带来三重工程收益——通信 buffer 从 $S\times K\times R$ 降到固定 $S\times K$、所有层计算形状静态已知消除每层 host 同步、forward 加 planning + 预取 + 零拷贝 dispatch、backward 暂存梯度再 reduce 回 home rank。MoonEP 不解决 per-expert 偏斜与 router 训练，二者由独立机制处理；routed-expert 激活形状动态变化造成的显存碎片报告列为不均衡的后果，未声明被完美均衡消除（每 rank 总量固定为 $S\times K$，rank 内 per-expert 形状仍随层变化）。与 ECHO/UltraEP 的核心区别是有界保证对预设 cap，与 DeepEP 的关系是扩展不是替代。</p>
 
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

@@ -310,7 +310,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 
 <p>两段转发由通信 kernel 里的 SM 执行。V3 的内核设计只需 20 个 SM 即可跑满 IB 与 NVLink 带宽，并用 warp specialization——让 warp（SM 内的线程调度单元）各自专职一类任务——把 20 个 SM 分成 10 个通信通道<sup>[C8]</sup>。dispatch 侧三类任务由各自的 warp 专职负责：(1) IB 发送，(2) IB 到 NVLink 的转发，(3) NVLink 接收；combine 侧反向：(1) NVLink 发送，(2) NVLink 到 IB 的转发与累加，(3) IB 接收与累加。各任务分到的 warp 数量按实际负载动态调整<sup>[C8]</sup>。SM 的其余通信任务还包括 RDMA buffer 与输入输出 buffer 之间的搬运、combine 的归约运算、分块传输时的细粒度内存布局管理<sup>[C9]</sup>。</p>
 
-<p>SM 用量是可控参数：V1 的 normal 内核提供 SM 数量控制（示例代码里 <code>Buffer.set_num_sms(24)</code>），并配合定制的 PTX 指令与 auto-tune 的通信分块大小，降低 L2 缓存占用和对其他 SM 计算的干扰<sup>[C8, C10]</sup>。V2 进一步把 SM 数量改为解析式计算（第 4 章「V2 重构」）。</p>
+<p>SM 用量是可控参数：V1 的 normal 内核提供 SM 数量控制（示例代码里 <code>Buffer.set_num_sms(24)</code>），并配合定制的 PTX 指令（PTX 是 NVIDIA GPU 的汇编中间表示）与 auto-tune 的通信分块大小，降低 L2 缓存占用和对其他 SM 计算的干扰<sup>[C8, C10]</sup>。V2 进一步把 SM 数量改为解析式计算（第 4 章「V2 重构」）。</p>
 
 <h3 id="measured-bandwidth">2.5 实测带宽</h3>
 
@@ -328,7 +328,7 @@ $$\mathbf{h}_{t}^{\prime} =\mathbf{u}_{t}+\sum_{i=1}^{N_{s}}\operatorname{FFN}^{
 </table>
 </div>
 
-<p>节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s 逼近 50 GB/s 的 RDMA 峰值——高吞吐内核的设计目标就是把两种网络都跑满。表中带宽为瓶颈带宽口径：按最慢一段网络折算。V2 的实测（每 batch 8K tokens、hidden 7168、top-8 专家、FP8 dispatch + BF16 combine，逻辑带宽含本 rank 流量）在 EP 8×2 拓扑用 12 个 SM 达到 90/81 GB/s<sup>[N4]</sup>，见第 4 章「V2 重构」。</p>
+<p>节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s 逼近 50 GB/s 的 RDMA 峰值——高吞吐内核的设计目标就是把两种网络都跑满。表中带宽为瓶颈带宽口径：按最慢一段网络折算。V2 的实测（每 batch 8K tokens、hidden 7168、top-8 专家、FP8 dispatch + BF16 combine，逻辑带宽含本 rank 流量）在 SM90 + CX7 的 EP 8×2 拓扑用 12 个 SM 达到 90/81 GB/s<sup>[N4]</sup>，见第 4 章「V2 重构」。</p>
 
 <p>高吞吐内核用两段转发换带宽，代价是路径长、同步点多：V1 的 normal dispatch 内部还有等待接收计数的隐式 CPU 同步，与 CUDA graph 不兼容<sup>[C11]</sup>。prefill 与训练的大 batch 扛得住这些代价，decode 的每步小 batch 通信等不起——需要一套设计点完全不同的内核。</p>
 
@@ -395,7 +395,7 @@ $$[\,\text{num\_local\_experts},\quad \text{num\_max\_dispatch\_tokens\_per\_ran
 <li><code>num_local_experts</code>：本 rank 持有的专家数（构造示例里每 rank 1 个）。</li>
 <li><code>num_max_dispatch_tokens_per_rank</code>：每 rank 最多发出的 token 数，全组统一取值。</li>
 <li>第二个维度按来源 rank 分段预留：每个来源 rank 固定占 <code>num_max_dispatch_tokens_per_rank</code> 个槽，构造示例取 2，于是每行 16 个槽。</li>
-<li>$h$：hidden，数据为 FP8 e4m3，附带每 128 元素一组的缩放因子（列主序排布以兼容 TMA）<sup>[C13]</sup>。</li>
+<li>$h$：hidden，数据为 FP8 e4m3，附带每 128 元素一组的缩放因子（列主序排布，以兼容 TMA——Tensor Memory Accelerator，张量内存加速器）<sup>[C13]</sup>。</li>
 </ul>
 
 <p>关键设计在第二个维度：接收行按来源 rank 分段，段基址由来源 rank 决定，段内下标按该 rank 发往此专家的 token 依次递增——V1 源码的偏移计算即"来源 rank × num_max + 段内序号"，序号是发送 rank 内按专家计数的到达顺序<sup>[C13]</sup>。确定一个副本落在哪个槽只需要发送 rank 自己的路由信息，不需要任何跨 rank 同步；接收侧也不需要预先知道"实际会收到多少 token"——所有 rank 都按最坏情况（每个来源 rank 的全部 token 都可能发来）预留空间，不做 CPU 接收计数同步。这带来两个直接后果：其一，内核与 CUDA graph 兼容（replay 时需恢复部分 buffer 状态），dispatch 还隐式完成 FP8 转换<sup>[C14]</sup>；其二，槽位不全部有效，<code>recv_count</code> 给出每个本地专家的实际接收数，计算侧据此只处理有效槽位<sup>[C13]</sup>。</p>
@@ -710,7 +710,7 @@ rank 0 两个 token 的 combine 结果：
 </table>
 </div>
 
-<p>拓扑列记法的含义 README 未定义，本文解读为：EP 8×2 指 8 块 GPU 分布于 2 个节点、EP 8×4 指分布于 4 个节点——依据是这两种拓扑的瓶颈带宽都标注为 RDMA，与跨节点部署一致。官方未公布更大 EP 配置的数字，本表不外推。代价<sup>[C21]</sup>：buffer 消耗大于 V1；0 SM RDMA 低延迟 EP 不再支持——第 3 章「低延迟内核」hook 形式的"等待不占 SM"在 V2 中移除；Engram（RDMA 远程内存访问）、0 SM PP、0 SM CP 均为实验特性<sup>[C32]</sup>。</p>
+<p>拓扑列的记法 README 未定义；EP 8×2 与 EP 8×4 两行的瓶颈带宽都标注为 RDMA，与跨节点部署一致，本表仅据此认定二者为跨节点配置，不据记法推断具体卡数。官方未公布更大 EP 配置的数字，本表不外推。代价<sup>[C21]</sup>：buffer 消耗大于 V1；0 SM RDMA 低延迟 EP 不再支持——第 3 章「低延迟内核」hook 形式的"等待不占 SM"在 V2 中移除；Engram（RDMA 远程内存访问）、0 SM PP、0 SM CP 均为实验特性<sup>[C32]</sup>。</p>
 
 <div class="table-scroll">
 <table>
@@ -798,7 +798,7 @@ rank 0 两个 token 的 combine 结果：
 
 <h3 id="requirements">5.3 使用门槛</h3>
 
-<p>硬件与依赖<sup>[C26]</sup>：V2 要求 Hopper（SM90）或支持 SM90 PTX ISA 的架构、PyTorch 2.10+、NCCL 2.30.4+、节点内 NVLink、跨节点 RDMA 网络；V1 曾支持 Ampere（SM80，仅节点内）。网络配置<sup>[C25]</sup>：DeepEP 在 IB 上完整测试，理论上兼容 RoCE；建议用虚拟路（VL）隔离不同类型的流量；V2 建议在所有网络负载条件下开启自适应路由（虽引入额外延迟）；拥塞控制被禁用（损害最大带宽）。</p>
+<p>硬件与依赖<sup>[C26]</sup>：V2 要求 Hopper（SM90）或支持 SM90 PTX ISA 的架构、PyTorch 2.10+、NCCL 2.30.4+、节点内 NVLink、跨节点 RDMA 网络；V1 曾支持 Ampere（SM80，仅节点内）。网络配置<sup>[C25]</sup>：DeepEP 在 IB 上完整测试，理论上兼容 RoCE（RDMA over Converged Ethernet）；建议用虚拟路（VL）隔离不同类型的流量；V2 建议在所有网络负载条件下开启自适应路由（虽引入额外延迟）；拥塞控制被禁用（损害最大带宽）。</p>
 
 <h3 id="ch5-boundary-questions">本章问题</h3>
 <ol class="chapter-questions">

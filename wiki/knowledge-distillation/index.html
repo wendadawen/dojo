@@ -88,10 +88,10 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Hinton, Vinyals, Dean. "Distilling the Knowledge in a Neural Network." arXiv:1503.02531, 2015（NIPS 2014 Deep Learning Workshop）。下文简称 HVD15。</p>
+<p><b>主要依据</b>：Hinton, Vinyals, Dean. "Distilling the Knowledge in a Neural Network." arXiv:1503.02531, 2015（NIPS 2014 Deep Learning Workshop）。下文简称 HVD15，§N 指论文第 N 节。</p>
 </blockquote>
 
-<p>部署一个 70B 参数的教师模型，推理一次要数百毫秒、显存上百 GB；一个 10 模型 ensemble 把延迟再乘 10。但训练阶段已经把能力塞进了那个庞大模型。能不能让一个体量只有教师十分之一的学生模型，学到教师几乎全部的能力，部署时只跑学生一份？</p>
+<p>部署一个大型教师模型，单次推理的延迟和显存开销都很可观；若改用多个模型组成的 ensemble，开销还要再乘上模型个数。但训练阶段已经把能力塞进了那个庞大模型。能不能让一个体量远小于教师的学生模型，学到教师几乎全部的能力，部署时只跑学生一份？</p>
 
 <p>知识蒸馏（Knowledge Distillation，KD）就是 Hinton 等人 2015 年给出的答案：<strong>用教师模型在温度 $T$ 下输出的"软概率分布"</strong>（不是只看 argmax 后的最终答案）<strong>作为监督，把教师对类间相似度的判断传给学生</strong>。本文讲清楚它的机制——为什么软分布比硬标签多带信息、温度 $T$ 起什么作用、完整损失怎么写、它在哪些场景下有效又在哪些场景下做不到。</p>
 
@@ -102,7 +102,7 @@
       <p>为什么不能只用硬标签训练，必须借教师模型的软概率分布？软标签额外携带什么信息？</p>
       <details>
         <summary>解答：软分布携带非目标类的类间相似度（暗知识）</summary>
-        <p>硬标签是 one-hot，非目标类概率全为零，只保留"正确答案"；教师软分布的非零非目标类概率携带类间相似度信息（Hinton 称为暗知识），例如一张手写 7 的图，教师同时说明它更像 9 而不是 6。这部分监督来自已训练好的教师，能让同架构学生的效果显著提升。论证见「1. 硬标签丢掉了什么」。</p>
+        <p>硬标签是 one-hot，非目标类概率全为零，只保留"正确答案"；教师软分布的非零非目标类概率携带类间相似度信息（业界习称暗知识），例如一张手写 7 的图，教师同时说明它更像 9 而不是 6。这部分监督来自已训练好的教师，能让同架构学生的效果显著提升。论证见「1. 硬标签丢掉了什么」。</p>
       </details>
     </li>
     <li>
@@ -154,15 +154,17 @@
 </table>
 </div>
 
-<p>硬标签告诉学生的全部信息只是"这是 7"。但教师软分布还告诉学生：这张 7 在表示空间中更像 9（0.048）而不是 6（0.000），也有一点像 8（0.018）和 2（0.010）。这种"错得离哪个类近"的信息——Hinton 称之为<strong>暗知识（dark knowledge）</strong>——硬标签完全丢弃，但教师模型已经学到了。</p>
+<p>表中数值四舍五入到 3 位小数，0.000 表示该类别概率小于 0.0005（softmax 输出不会严格为零）。</p>
 
-<div class="callout callout-blue">
-<p><strong>暗知识</strong>是 KD 想传递的核心。它不是教师偶然输出的噪声，而是教师模型对"类别之间在表示空间中如何分布"的判断。一旦学生学到这种类间关系，相当于免费拿到了大量辅助监督信号。</p>
+<p>硬标签告诉学生的全部信息只是"这是 7"。但教师软分布还告诉学生：这张 7 在表示空间中更像 9（0.048）而不是 6（0.000），也有一点像 8（0.018）和 2（0.010）。这种"错得离哪个类近"的信息——业界习称<strong>暗知识（dark knowledge）</strong>——硬标签完全丢弃，但教师模型已经学到了。</p>
+
+<div class="callout callout-yellow">
+<p><strong>暗知识（dark knowledge）</strong>是 KD 想传递的核心；这是业界流传的称谓，HVD15 论文正文并未使用该词。它不是教师偶然输出的噪声，而是教师模型对"类别之间在表示空间中如何分布"的判断。一旦学生学到这种类间关系，相当于免费拿到了大量辅助监督信号。</p>
 </div>
 
 <p>HVD15 §3 的"无数字 3"实验<sup>[C8, N2]</sup>直接验证了这一点。Hinton 把训练集中所有数字 3 的样本移除，然后只让蒸馏学生看教师对其他数字的软分布——学生从未见过任何 3 的图像。经偏差校正（将 3 类的 logit bias 增加 3.5）后，测试集中 1010 个 3 里有 996 个仍被正确分类；未校正时错误 206 个、其中 133 个是 3（即 3 中正确仅 877/86.8%）。如果只用硬标签训练（训练集没有 3），学生根本不可能识别 3；但 KD 学生从教师在其他数字上的软分布中"推断出" 3 在类别空间中的相对位置，这正是暗知识的力量。</p>
 
-<p>这里就回答了第一个问题——硬标签是 one-hot，非目标类全零，把"错得离哪个类近"的信息全删了；教师软分布的非零概率携带类间相似度，是 KD 想要传递的核心监督。<sup>[C1]</sup></p>
+<p>硬标签是 one-hot，非目标类全零，把"错得离哪个类近"的信息全删了；教师软分布的非零概率携带类间相似度，是 KD 想要传递的核心监督。<sup>[C1]</sup></p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -221,7 +223,7 @@ $$q_i = \frac{\exp(z_i / T)}{\sum_{j=1}^{K} \exp(z_j / T)},\qquad i \in \{1, \ld
 <p>温度 $T$ 越大，logits 之间的差距被"压缩"得越厉害——原本被压成 0.001 的非目标类概率被显著放大。直觉上：除以 $T$ 等于把所有 logits 同时缩小到 $1/T$ 量级，类别间差异变小，softmax 输出更"平"。<sup>[C3]</sup></p>
 
 <div class="callout callout-yellow">
-<p><strong>温度不是越大越好</strong>。HVD15 §2、§3 报告<sup>[C4, N4]</sup>：MNIST 主实验用 $T=20$（教师是 2×1200 dropout 大模型）；但当学生容量很小（每层仅 30 单元）时，最佳 $T$ 落在 $T \approx 2.5$–$4$ 之间。过大 $T$ 会让分布接近均匀，学生学到大量微小噪声反而效果下降；过小 $T$ 又退化为硬标签训练，等于没用上暗知识。</p>
+<p><strong>温度不是越大越好</strong>。HVD15 §2、§3 报告<sup>[C4, N4]</sup>：MNIST 主实验用 $T=20$（教师是 2×1200 的 dropout 大模型，即 2 个隐藏层、每层 1200 个单元）；但当学生容量很小（每层仅 30 单元）时，最佳 $T$ 落在 $T \approx 2.5$–$4$ 之间。过大 $T$ 会让分布接近均匀，学生学到大量微小噪声反而效果下降；过小 $T$ 又退化为硬标签训练，等于没用上暗知识。</p>
 </div>
 
 <h3>本章问题</h3>
@@ -366,17 +368,27 @@ T=100.0: probs=[0.336672, 0.333322, 0.330006]
 
 $$\mathcal{L} = \alpha \cdot T^2 \cdot \mathrm{KL}\!\left(p_T^{\text{teacher}}\,\|\,p_T^{\text{student}}\right) + (1-\alpha)\cdot \mathrm{CE}\!\left(y,\,p_1^{\text{student}}\right).$$
 
+<p>符号逐一定义：</p>
+<ul>
+  <li>$p_T^{\text{teacher}}$：教师在温度 $T$ 下的输出分布，由其 logits 经温度 softmax 得到；</li>
+  <li>$p_T^{\text{student}}$：学生在温度 $T$ 下的输出分布，由学生 logits 经温度 softmax 得到；</li>
+  <li>$p_1^{\text{student}}$：学生在 $T=1$ 标准 softmax 下的输出分布；</li>
+  <li>$y$：真实标签分布（one-hot）；</li>
+  <li>$\alpha \in [0,1]$：软损失项权重；</li>
+  <li>$T$：温度参数，取值同「2. 温度 softmax」。</li>
+</ul>
+
 <p>KL 散度<sup>[F3]</sup>衡量两个分布的差异：$\mathrm{KL}(p\|q) = \sum_i p_i \ln(p_i/q_i)$，非对称，$p$ 在前时以 $p$ 为基准。各项职责：</p>
 <ul>
   <li><strong>软损失项</strong> $\mathrm{KL}(p_T^{\text{teacher}} \| p_T^{\text{student}})$：让学生在温度 $T$ 下的输出匹配教师在同一温度下的输出。这是 KD 的核心监督信号，传递暗知识。</li>
   <li><strong>硬损失项</strong> $\mathrm{CE}(y, p_1^{\text{student}})$：让学生在 $T=1$ 下（即推理时使用的标准 softmax）仍能命中正确标签 $y$。避免学生"模仿得太软而忘了正确答案"。</li>
-  <li><strong>权重 $\alpha \in [0,1]$</strong>：控制两项相对重要性。HVD15 §2、§3 报告<sup>[N5]</sup> $\alpha$ 通常接近 1（软项主导），硬项只作温和校准。本文采用 $\alpha$ 为软损失权重的约定；部分文献用 $\beta = 1 - \alpha$ 作硬损失权重，含义等价。</li>
+  <li><strong>权重 $\alpha \in [0,1]$</strong>：控制两项相对重要性。HVD15 §2 指出硬标签交叉熵应取明显更低的权重（原文："a considerably lower weight on the second objective function"），论文未给出统一最优值；§4.1 的具体实验以 0.5 作为硬标签交叉熵的相对权重（按本文 $\alpha$ 为软损失权重的约定即 $\alpha = 0.5$）。本文采用 $\alpha$ 为软损失权重的约定；部分文献用 $\beta = 1 - \alpha$ 作硬损失权重，含义等价。<sup>[N5]</sup></li>
   <li><strong>$T^2$ 缩放因子</strong>：只乘在软损失项上，下文展开。</li>
 </ul>
 
 <p>用一张图把训练流程串起来——前向计算如何产生两个损失项，最后回传到学生参数：</p>
 
-<svg class="flow-svg" viewBox="0 0 680 540" role="img" aria-label="KD 训练流程：教师与学生各算一次温度 softmax，软硬两项损失加权得到总损失，梯度只回传到学生">
+<svg class="flow-svg" viewBox="0 0 680 620" role="img" aria-label="KD 训练流程：教师与学生各算温度 softmax，学生另算 T=1 标准 softmax；软硬两项损失加权得到总损失，梯度只回传到学生">
   <defs>
     <marker id="kd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path class="arrow" d="M0,0 L10,5 L0,10 z"></path>
@@ -385,34 +397,37 @@ $$\mathcal{L} = \alpha \cdot T^2 \cdot \mathrm{KL}\!\left(p_T^{\text{teacher}}\,
   <rect class="node" x="270" y="16" width="140" height="36" rx="6"></rect>
   <foreignObject x="270" y="16" width="140" height="36"><div xmlns="http://www.w3.org/1999/xhtml">训练样本 $x$</div></foreignObject>
   <rect class="node" x="90" y="96" width="180" height="36" rx="6"></rect>
-  <foreignObject x="90" y="96" width="180" height="36"><div xmlns="http://www.w3.org/1999/xhtml">教师 $v$（冻结）</div></foreignObject>
+  <foreignObject x="90" y="96" width="180" height="36"><div xmlns="http://www.w3.org/1999/xhtml">教师 logits $v$（冻结）</div></foreignObject>
   <rect class="node" x="410" y="96" width="180" height="36" rx="6"></rect>
-  <foreignObject x="410" y="96" width="180" height="36"><div xmlns="http://www.w3.org/1999/xhtml">学生 $z$（可训练）</div></foreignObject>
+  <foreignObject x="410" y="96" width="180" height="36"><div xmlns="http://www.w3.org/1999/xhtml">学生 logits $z$（可训练）</div></foreignObject>
   <rect class="node" x="90" y="176" width="180" height="56" rx="6"></rect>
   <foreignObject x="90" y="176" width="180" height="56"><div xmlns="http://www.w3.org/1999/xhtml">$p_T^{\text{teacher}}$<br>温度 $T$ 下的软分布</div></foreignObject>
   <rect class="node" x="410" y="176" width="180" height="56" rx="6"></rect>
   <foreignObject x="410" y="176" width="180" height="56"><div xmlns="http://www.w3.org/1999/xhtml">$p_T^{\text{student}}$<br>温度 $T$ 下的软分布</div></foreignObject>
-  <rect class="node" x="70" y="296" width="260" height="56" rx="6"></rect>
-  <foreignObject x="70" y="296" width="260" height="56"><div xmlns="http://www.w3.org/1999/xhtml">软损失 $\mathrm{KL}(p_T^{\text{teacher}} \,\|\, p_T^{\text{student}}) \times T^2$</div></foreignObject>
-  <rect class="node" x="390" y="296" width="260" height="56" rx="6"></rect>
-  <foreignObject x="390" y="296" width="260" height="56"><div xmlns="http://www.w3.org/1999/xhtml">硬损失 $\mathrm{CE}(y,\, p_1^{\text{student}})$<br>$T=1$ 标准 softmax，$y$ 为真实标签</div></foreignObject>
-  <rect class="node" x="190" y="406" width="300" height="44" rx="6"></rect>
-  <foreignObject x="190" y="406" width="300" height="44"><div xmlns="http://www.w3.org/1999/xhtml">总损失 $\mathcal{L} = \alpha T^2 \mathrm{KL} + (1-\alpha)\mathrm{CE}$</div></foreignObject>
-  <rect class="node" x="210" y="486" width="260" height="36" rx="6"></rect>
-  <foreignObject x="210" y="486" width="260" height="36"><div xmlns="http://www.w3.org/1999/xhtml">梯度回传到学生参数</div></foreignObject>
+  <rect class="node" x="410" y="262" width="180" height="40" rx="6"></rect>
+  <foreignObject x="410" y="262" width="180" height="40"><div xmlns="http://www.w3.org/1999/xhtml">$p_1^{\text{student}}$<br>$T=1$ 标准 softmax</div></foreignObject>
+  <rect class="node" x="60" y="360" width="260" height="56" rx="6"></rect>
+  <foreignObject x="60" y="360" width="260" height="56"><div xmlns="http://www.w3.org/1999/xhtml">软损失 $\mathrm{KL}(p_T^{\text{teacher}} \,\|\, p_T^{\text{student}}) \times T^2$</div></foreignObject>
+  <rect class="node" x="390" y="360" width="260" height="56" rx="6"></rect>
+  <foreignObject x="390" y="360" width="260" height="56"><div xmlns="http://www.w3.org/1999/xhtml">硬损失 $\mathrm{CE}(y,\, p_1^{\text{student}})$<br>$y$ 为真实标签</div></foreignObject>
+  <rect class="node" x="190" y="470" width="300" height="44" rx="6"></rect>
+  <foreignObject x="190" y="470" width="300" height="44"><div xmlns="http://www.w3.org/1999/xhtml">总损失 $\mathcal{L} = \alpha T^2 \mathrm{KL} + (1-\alpha)\mathrm{CE}$</div></foreignObject>
+  <rect class="node" x="210" y="550" width="260" height="36" rx="6"></rect>
+  <foreignObject x="210" y="550" width="260" height="36"><div xmlns="http://www.w3.org/1999/xhtml">梯度回传到学生参数</div></foreignObject>
   <polyline class="edge" points="340,52 340,72 180,72 180,96" marker-end="url(#kd-arrow)"></polyline>
   <polyline class="edge" points="340,52 340,72 500,72 500,96" marker-end="url(#kd-arrow)"></polyline>
   <polyline class="edge" points="180,132 180,176" marker-end="url(#kd-arrow)"></polyline>
   <polyline class="edge" points="500,132 500,176" marker-end="url(#kd-arrow)"></polyline>
-  <polyline class="edge" points="180,232 180,296" marker-end="url(#kd-arrow)"></polyline>
-  <polyline class="edge" points="500,232 500,252 240,252 240,296" marker-end="url(#kd-arrow)"></polyline>
-  <polyline class="edge" points="500,232 500,296" marker-end="url(#kd-arrow)"></polyline>
-  <polyline class="edge" points="200,352 200,406" marker-end="url(#kd-arrow)"></polyline>
-  <polyline class="edge" points="520,352 520,378 440,378 440,406" marker-end="url(#kd-arrow)"></polyline>
-  <polyline class="edge" points="340,450 340,486" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="590,114 648,114 648,282 590,282" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="180,232 180,360" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="410,204 370,204 370,330 240,330 240,360" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="500,302 500,360" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="170,416 170,445 280,445 280,470" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="520,416 520,445 400,445 400,470" marker-end="url(#kd-arrow)"></polyline>
+  <polyline class="edge" points="340,514 340,550" marker-end="url(#kd-arrow)"></polyline>
 </svg>
 
-<p>图展示前向计算依赖：教师与学生各算一次温度 softmax，软损失比较两者；硬损失用学生的 $T=1$ 分布与真实标签比较；两项加权得到总损失，梯度只回传到学生（教师冻结）。每个节点的具体公式由正文给出。</p>
+<p>图展示前向计算依赖：教师与学生各算一次温度 softmax，学生另算一次 $T=1$ 标准 softmax；软损失比较师生在温度 $T$ 下的分布，硬损失比较学生 $T=1$ 分布与真实标签；两项加权得到总损失，梯度只回传到学生（教师冻结）。每个节点的具体公式由正文给出。</p>
 
 <h3 id="why-t-squared">4.1 为什么必须乘 $T^2$</h3>
 
@@ -431,12 +446,18 @@ $$\frac{\partial \mathcal{L}_{\text{soft}}}{\partial z_i} = \frac{\partial \math
 
 $$\frac{\partial \mathcal{L}_{\text{soft}}}{\partial z_i} \approx \frac{1}{N T^2}(z_i - v_i),$$
 
-<p>其中 $N$ 是类别数（与 $K$ 同义，沿用 HVD15 记号），$z_i$ 是学生 logit、$v_i$ 是教师 logit。这里梯度与 $(z_i - v_i)$ 成正比，比例系数为 $1/(N T^2)$——整体被压低 $1/T^2$ 倍。乘 $T^2$ 后梯度变成 $\frac{1}{N}(z_i - v_i)$，量级与硬损失项可比。<sup>[F4]</sup></p>
+<p>其中：</p>
+<ul>
+  <li>$N$：类别数（与 $K$ 同义，沿用 HVD15 记号）；</li>
+  <li>$z_i$：学生 logit；</li>
+  <li>$v_i$：教师 logit。</li>
+</ul>
+<p>这里梯度与 $(z_i - v_i)$ 成正比，比例系数为 $1/(N T^2)$——整体被压低 $1/T^2$ 倍。乘 $T^2$ 后梯度变成 $\frac{1}{N}(z_i - v_i)$，量级与硬损失项可比。<sup>[F4]</sup></p>
 <p>这个推导还顺带揭示了 KD 的另一个性质：在高温零均值极限下，软损失最小化等价于最小化 $\frac{1}{2N}\|z - v\|^2$——也就是让学生 logits 直接匹配教师 logits。这种等价形式叫 <strong>logit matching</strong>。<sup>[C12]</sup>注意它只在 $T \to \infty$ 且 $\sum_i z_i = 0$ 时严格成立，实际有限 $T$ 下是近似。</p>
 <p>这个推导回答了本节开头的问题：$T^2$ 来自温度对 logits 的两重压低效应（链式法则的 $1/T$ + 分布差异被压缩），不是人为加权。但推导只描述软损失对单 logit 的梯度，不直接给出参数更新规则——参数梯度还要经过学生网络的反向传播。</p>
 </details>
 
-<div class="callout callout-blue">
+<div class="callout callout-yellow">
 <p><strong>训练温度与推理温度必须区分</strong>。训练时温度 softmax 用 $T > 1$ 软化教师与学生输出，让软损失能"看见"暗知识；推理时学生用 $T = 1$ 的标准 softmax 给出最终预测。KD 损失的硬损失项 $\mathrm{CE}(y, p_1^{\text{student}})$ 本来就是在 $T=1$ 下计算——保证学生推理时的输出分布也被监督。如果训练时用 $T$、推理时也用 $T$，会把推理分布变得过软，分类时置信度太低。</p>
 </div>
 
@@ -480,6 +501,7 @@ $$\frac{\partial \mathcal{L}_{\text{soft}}}{\partial z_i} \approx \frac{1}{N T^2
 </tbody>
 </table>
 </div>
+<p>架构记号「2×N」表示 2 个隐藏层、每层 N 个单元。</p>
 
 <p>2×800 学生从硬标签训练的 146 错误降到蒸馏后的 74，几乎追平 2×1200 教师的 67 错误。同等架构、同等数据，只因为换了监督信号（额外加上教师软分布），效果差距巨大。<sup>[C7, N1]</sup></p>
 
@@ -497,12 +519,12 @@ $$\frac{\partial \mathcal{L}_{\text{soft}}}{\partial z_i} \approx \frac{1}{N T^2
 
 <p>10 模型 ensemble 把 WER 从 10.9% 降到 10.7%，但部署时要跑 10 个模型；蒸馏后的单一模型 WER 同样是 10.7%，帧准确率 60.8% 接近 ensemble 的 61.1%——ensemble 的增益几乎完全被吸收进一个可部署的单模型里。这是 KD 在工业场景的核心价值：把昂贵的 ensemble 能力压缩到一份。<sup>[C9, N3]</sup></p>
 
-<div class="callout callout-red">
+<div class="callout callout-yellow">
 <p><strong>学生质量以教师为上限</strong><sup>[C10]</sup>。两个实验里蒸馏学生最多接近教师（MNIST 74 vs 教师 67；语音 WER 10.7% 与 ensemble 持平），从未显著超越教师。这并非偶然：KD 的监督信号就是教师提供的，学生学到的能力上限就是教师的能力上限。要超过教师需要的是真正的额外训练信号（任务奖励、RL 探索等），不是 KD 本身能提供的。</p>
 </div>
 
 <h3 id="applicability">5.1 适用条件</h3>
-<p>KD 有效需要满足以下条件，不满足时无法直接应用：</p>
+<p>KD 有效需要满足以下条件，不满足时无法直接应用（前两条为一般性适用条件，由 KD 的监督设定推出，非 HVD15 直接给出的实验结论；第三条对应 HVD15 §2、§3 的实验观察）：</p>
 <ul>
   <li><strong>师生共享输出空间</strong>：教师与学生在同一组类别上输出 logits（同分类类别、同词表）。logit-based KD 不支持师生输出空间不一致——例如教师是 10 类、学生是 5 类时不能直接做 KL。词表不一致需要额外对齐机制，不属于标准 KD。</li>
   <li><strong>教师已训练到收敛</strong>：教师软分布作为监督信号，必须可靠。未收敛教师的软分布本身有噪声，蒸馏后学生也学不好。</li>
@@ -555,13 +577,13 @@ $$\frac{\partial \mathcal{L}_{\text{soft}}}{\partial z_i} \approx \frac{1}{N T^2
 
 <h3>论断与来源（C）</h3>
 <ul>
-  <li><strong>C1（硬标签丢弃类间关系，暗知识）</strong>：HVD15 摘要与 §1、§2。"dark knowledge" 一词出自论文 §1。</li>
+  <li><strong>C1（硬标签丢弃类间关系，暗知识）</strong>：概念见 HVD15 摘要与 §1、§2；"暗知识"（dark knowledge）为业界流传的称谓，非 HVD15 论文正文用词（HVD15 全文无该词）。</li>
   <li><strong>C2（温度 softmax 公式）</strong>：HVD15 §2，公式直接给出。</li>
   <li><strong>C3（温度极限行为）</strong>：HVD15 §2 描述与公式直接推出。</li>
   <li><strong>C4（温度与师生容量关系）</strong>：HVD15 §2、§3 MNIST 实验设定。</li>
   <li><strong>C5（KD 总损失）</strong>：HVD15 §2。原论文以 cross-entropy 形式书写，本文采用现代实现通用的 KL 形式（两者在教师固定时相差一个常数，对梯度无影响）。</li>
   <li><strong>C6（$T^2$ 缩放）</strong>：HVD15 §2 末段，原文："Since the magnitudes of the gradients produced by the soft targets scale as $1/T^2$ ..."。</li>
-  <li><strong>C7（MNIST 错误数）</strong>：HVD15 §3 表格。教师 67、硬标签学生 146、蒸馏学生 74。</li>
+  <li><strong>C7（MNIST 错误数）</strong>：HVD15 §3 正文。教师 67、硬标签学生 146、蒸馏学生 74。</li>
   <li><strong>C8（"无数字 3" 实验）</strong>：HVD15 §3。经偏差校正后 996/1010 测试集 3 被正确分类；未校正时 206 错误、其中 133 个是 3。</li>
   <li><strong>C9（语音识别实验）</strong>：HVD15 §4。10 模型 ensemble 帧准确率 61.1%、WER 10.7%；蒸馏单模型 60.8% / 10.7%。</li>
   <li><strong>C10（学生上限）</strong>：HVD15 §3–§4 实验结论直接推出。</li>
@@ -583,7 +605,7 @@ $$\frac{\partial \mathcal{L}_{\text{soft}}}{\partial z_i} \approx \frac{1}{N T^2
   <li><strong>N2（"无数字 3" 实验）</strong>：经偏差校正后 996/1010 测试集 3 正确分类；未校正时 206 错误、其中 133 个是 3。HVD15 §3。</li>
   <li><strong>N3（语音识别）</strong>：基线 58.9% / 10.9%；ensemble 61.1% / 10.7%；蒸馏 60.8% / 10.7%。声学模型 8 层、每层 2560 单元、约 85M 参数、约 2000 小时英语语音。HVD15 §4。</li>
   <li><strong>N4（温度取值）</strong>：MNIST 主实验 $T=20$；小容量学生 $T\approx 2.5$–$4$。HVD15 §2、§3。</li>
-  <li><strong>N5（$\alpha$ 取值倾向）</strong>：HVD15 报告硬项权重远小于软项，$\alpha$ 接近 1。论文未给统一最优值。</li>
+  <li><strong>N5（$\alpha$ 取值倾向）</strong>：HVD15 §2 报告硬项权重明显低于软项（原文："a considerably lower weight on the second objective function"），论文未给统一最优值；§4.1 实验以 0.5 作为硬标签交叉熵的相对权重。</li>
 </ul>
 
 <h3>构造示例</h3>

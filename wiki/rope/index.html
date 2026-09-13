@@ -75,7 +75,7 @@
       <p>本质区别在于位置信息的注入方式与注入位置：</p>
       <ul>
         <li>绝对位置编码把位置向量<strong>加</strong>在第一层之前的 token 嵌入上，learned 版本有可学习参数、超出表长即失效。</li>
-        <li>相对位置编码（T5 相对偏置、ALiBi）把距离相关的偏置<strong>加</strong>在 softmax 之前的注意力分数上，T5 有约 32 个 bucket 每头的参数，ALiBi 无参数。</li>
+        <li>相对位置编码（T5 相对偏置、ALiBi）把距离相关的偏置<strong>加</strong>在 softmax 之前的注意力分数上，T5 有约 32 个 bucket 每头的参数<sup>[N4]</sup>，ALiBi 无参数。</li>
         <li>RoPE 是<strong>乘</strong>：在每个注意力层内、softmax 之前旋转 Q 和 K，不修改 V、不修改输入嵌入，且没有可学习参数（$\theta_i$ 与 base 都是固定常数）。</li>
         <li>NoPE 不注入任何位置信息，依赖因果掩码隐式提供位置区分。</li>
       </ul>
@@ -90,7 +90,7 @@
       $$\langle R_m q, R_n k \rangle = (q_0 k_0 + q_1 k_1)\cos((n-m)\theta) - (q_0 k_1 - q_1 k_0)\sin((n-m)\theta).$$
       <p>以 $q=k=(1,0)$、$\theta=\pi/4$、$m=1$、$n=2$ 为例：对称项 $1\cdot1+0\cdot0=1$，反对称项 $1\cdot0-0\cdot1=0$，相对角 $(n-m)\theta=\pi/4$，因此内积为 $1\cdot\cos(\pi/4)-0=\sqrt{2}/2\approx0.7071$。把位置换成 $m=5$、$n=6$（位置差不变）结果仍是 $0.7071$。</p>
       <p>只依赖 $m-n$ 的原因是旋转矩阵构成群：$R_m^T=R_m^{-1}=R_{-m}$，于是 $R_m^T R_n=R_{n-m}$，代入 $\langle R_m q, R_n k\rangle=q^T R_m^T R_n k=q^T R_{n-m} k$，绝对位置完全抵消。</p>
-      <p>需要注意 $\sin$ 项不总为零：它的系数是 $q$ 与 $k$ 的二维叉积，只有 $q$ 与 $k$ 共线（含 $q=k$）时才消失。完整推导与更多手算例子见「2 维 RoPE 是怎么旋转的」与「内积为何只依赖 $m-n$」两章。</p>
+      <p>$\sin$ 项的系数是 $q$ 与 $k$ 的二维叉积，只有 $q$ 与 $k$ 共线（含 $q=k$）时才为零。完整推导与更多手算例子见「2 维 RoPE 是怎么旋转的」与「内积为何只依赖 $m-n$」两章。</p>
       </details>
     </li>
     <li>
@@ -107,8 +107,8 @@
       <p>远程衰减性质从何而来？为什么 RoPE 只旋转 Q 和 K 而不动 V。</p>
       <details>
         <summary>解答：相位抵消带来衰减；分数只来自 $QK^T$</summary>
-        <p>远程衰减来自确定性求和的<strong>相位抵消</strong>，不需要概率假设。d 维内积是 $d/2$ 个 $\cos((n-m)\theta_i)$ 的加权和，而 $\theta_i$ 跨越多个数量级；$|m-n|$ 增大时各项相位分散到不同象限、正负贡献互相抵消，归一化和的幅度总体趋小。以 $q=k$ 且每对分量恒定的构造情形（$d=128$、$\mathrm{base}=10000$）实测：$|m-n|=1$ 时归一化和 $0.9702$，$=10$ 时 $0.6691$，$=1000$ 时 $0.1590$，$=5000$ 时 $-0.0070$。</p>
-      <p>两点需要注意：一是"衰减"指幅度趋小而非严格单调递减，本质是几乎周期的振荡，因此远处出现负值不构成矛盾；二是该曲线来自上述构造情形，论文 §3.4.3 用 Abel 变换给出的是求和上界，真实模型中具体 token 对可能偏离曲线，成立的是定性趋势。</p>
+        <p>远程衰减来自确定性求和的<strong>相位抵消</strong>，不需要概率假设。d 维内积是 $d/2$ 个 $\cos((n-m)\theta_i)$ 的加权和，而 $\theta_i$ 跨越多个数量级；$|m-n|$ 增大时各项相位分散到不同象限、正负贡献互相抵消，归一化和的幅度总体趋小。以 $q=k$ 且每对分量恒定的构造情形（$d=128$、$\mathrm{base}=10000$）按归一化内积公式直接计算：$|m-n|=1$ 时归一化和 $0.9702$，$=10$ 时 $0.6691$，$=1000$ 时 $0.1590$，$=5000$ 时 $-0.0070$。</p>
+      <p>这里的"衰减"指幅度趋小而非严格单调递减，本质是几乎周期的振荡，因此远处出现负值不构成矛盾；该曲线来自上述构造情形，论文 §3.4.3 用 Abel 变换给出的是求和上界，真实模型中具体 token 对可能偏离曲线，成立的是定性趋势。</p>
       <p>不动 V 的原因是注意力分数只由 $QK^T$ 决定：旋转 Q 和 K 已经让"看哪里"带上位置感知，而 V 决定"取到之后拿什么内容"，旋转 V 不改变 softmax 的输入，不属于位置编码要解决的问题。详见「远程衰减」一章。</p>
       </details>
     </li>
@@ -140,9 +140,9 @@
 <table>
 <thead><tr><th>方案</th><th>做了什么（位置注入方式）</th><th>加在哪里</th><th>可学习参数</th><th>长度外推</th></tr></thead>
 <tbody>
-<tr><td>绝对位置编码（APE）</td><td>给输入嵌入加一个与绝对位置绑定的向量</td><td>第一层之前的 token 嵌入</td><td>有（learned）或无（sinusoidal）</td><td>差（learned 超出表长即失败；sinusoidal 中等）</td></tr>
-<tr><td>相对位置编码（T5 相对偏置、ALiBi）</td><td>在注意力分数上加一个与两个位置距离绑定的偏置</td><td>注意力分数（softmax 之前）</td><td>T5 有；ALiBi 无</td><td>ALiBi 较好；T5 中等</td></tr>
-<tr><td>旋转位置编码（RoPE）</td><td>按绝对位置 $m$ 旋转 Q 和 K（乘法）</td><td>每个注意力层内、softmax 之前</td><td>无</td><td>需配合扩展（YaRN、PI）</td></tr>
+<tr><td>绝对位置编码（APE）</td><td>给输入嵌入加一个与绝对位置绑定的向量</td><td>第一层之前的 token 嵌入</td><td>有（learned）或无（sinusoidal）</td><td>差（learned 超出表长即失败；sinusoidal 中等）<sup>[N3]</sup></td></tr>
+<tr><td>相对位置编码（T5 相对偏置、ALiBi）</td><td>在注意力分数上加一个与两个位置距离绑定的偏置</td><td>注意力分数（softmax 之前）</td><td>T5 有<sup>[N4]</sup>；ALiBi 无</td><td>ALiBi 相对优于 learned APE，但长度泛化整体不佳（NoPE 论文总结 ALiBi 同样不适合长度外推）；T5 中等<sup>[N3]</sup></td></tr>
+<tr><td>旋转位置编码（RoPE）</td><td>按绝对位置 $m$ 旋转 Q 和 K（乘法）</td><td>每个注意力层内、softmax 之前</td><td>无</td><td>需配合扩展（YaRN、PI）<sup>[C7]</sup></td></tr>
 <tr><td>NoPE</td><td>什么都不做</td><td>——</td><td>无</td><td>decoder-only 外推性好（NoPE 论文主张）</td></tr>
 </tbody>
 </table>
@@ -151,7 +151,7 @@
 <p>前三类都在"加"位置信息，区别只是加在哪里、怎么加。RoPE 那一行的特征是：它<strong>乘</strong>而不是加——把位置 $m$ 编码成一个旋转矩阵 $R_m$，左乘到 query 和 key 上；它不修改 value，也不修改输入嵌入<sup>[C1]</sup>；它没有可学习参数，$\theta_i$ 和 base 都是固定常数<sup>[C3]</sup>。NoPE 那一行的"什么都不做"是另一条路径，依赖因果掩码隐式提供位置信息，详见 <a href="../../wiki/nope/index.html">NoPE</a> 页面。</p>
 
 <div class="callout callout-yellow">
-<p>RoPE 经常被叫做"相对位置编码"，但这个名字容易让人误以为它直接用 $m-n$ 构造旋转。准确的说法是<strong>"绝对构造、相对效果"</strong>：构造旋转用的是绝对位置 $m$ 和 $n$，但产生的内积 $(R_m q)\cdot(R_n k)$ 只依赖 $m-n$<sup>[C2]</sup>。论文摘要原文："encodes the absolute position with a rotation matrix and meanwhile incorporates the explicit relative position dependency"——同时编码绝对位置并引入相对位置依赖。</p>
+<p>RoPE 经常被叫做"相对位置编码"，但这个名字容易让人误以为它直接用 $m-n$ 构造旋转。准确的说法是<strong>"绝对构造、相对效果"</strong>：构造旋转用的是绝对位置 $m$ 和 $n$，但产生的内积 $(R_m q)\cdot(R_n k)$ 只依赖 $m-n$<sup>[C2]</sup>。论文摘要原文："encodes the absolute position with a rotation matrix and meanwhile incorporates the explicit relative position dependency …"——同时编码绝对位置并引入相对位置依赖。</p>
 </div>
 
 <h3 id="why-position-encoding-questions">本章问题</h3>
@@ -160,7 +160,7 @@
     <p>APE、相对 PE、RoPE、NoPE 各把位置信息加在哪里？分别是否有可学习参数。</p>
     <details>
       <summary>解答：四类方案的注入位置与参数</summary>
-      <p>APE 把位置向量加在第一层之前的 token 嵌入上；learned 版本有可学习参数，sinusoidal 版本没有。相对位置编码（T5 相对偏置、ALiBi）把距离相关的偏置加在 softmax 之前的注意力分数上；T5 有约 32 个 bucket 每头的可学习参数，ALiBi 没有。RoPE 在每个注意力层内、softmax 之前把绝对位置编码成旋转矩阵左乘到 Q 和 K 上，没有可学习参数（$\theta_i$ 与 base 都是固定常数）。NoPE 不注入任何位置信息，也没有参数，依赖因果掩码隐式提供位置区分。</p>
+      <p>APE 把位置向量加在第一层之前的 token 嵌入上；learned 版本有可学习参数，sinusoidal 版本没有。相对位置编码（T5 相对偏置、ALiBi）把距离相关的偏置加在 softmax 之前的注意力分数上；T5 有约 32 个 bucket 每头的可学习偏置<sup>[N4]</sup>，ALiBi 没有。RoPE 在每个注意力层内、softmax 之前把绝对位置编码成旋转矩阵左乘到 Q 和 K 上，没有可学习参数（$\theta_i$ 与 base 都是固定常数）。NoPE 不注入任何位置信息，也没有参数，依赖因果掩码隐式提供位置区分。</p>
     </details>
   </li>
   <li>
@@ -303,7 +303,7 @@ $$\langle R_m q, R_n k \rangle = (q_0 k_0 + q_1 k_1)\cos((n-m)\theta) - (q_0 k_1
 
 $$R_m^T R_n = R_{n-m}.$$
 
-<p>这是旋转矩阵群的性质：两个旋转矩阵的乘积还是旋转矩阵，且角度是两个角度之差。下面用三角恒等式直接验证。</p>
+<p>这是旋转矩阵群的性质：两个旋转矩阵的乘积还是旋转矩阵，且角度是两个角度之差。三角恒等式可直接验证这一点。</p>
 
 <details>
 <summary>补充：R_m^T R_n = R_{n-m} 的三角恒等式推导</summary>
@@ -414,10 +414,10 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 <p><strong>第 1 对</strong> $(q_2, q_3)=(1,0)$、$(k_2, k_3)=(1,0)$、$\theta_1=0.5$：</p>
 <p>$(n-m)\theta_1 = 0.5$。F2 公式：$\cos(0.5) \approx 0.8776$。</p>
 <p><strong>总内积</strong> = $0.5403 + 0.8776 = 1.4179$。</p>
-<p>注意：两对的 $(n-m)$ 都是 1，但因为 $\theta_i$ 不同，旋转角度不同。$\theta_0=1$ 让第 0 对在位置 $n=2$ 已旋转到 $\cos(2)$ 约为 $-0.416$（接近"转回去"），$\theta_1=0.5$ 让第 1 对在位置 $n=2$ 只旋转到 $\cos(1)$ 约为 $0.540$（还在前半圈）。这就是"多尺度同时编码"的最小例证。</p>
+<p>两对的 $(n-m)$ 都是 1，但 $\theta_i$ 不同使相对角 $(n-m)\theta_i$ 不同，因而内积贡献也不同：第 0 对 $\cos((n-m)\theta_0)=\cos1\approx0.5403$（相对角 1 弧度），第 1 对 $\cos((n-m)\theta_1)=\cos0.5\approx0.8776$（相对角 0.5 弧度）。若改看 key 在位置 $n=2$ 处的绝对旋转状态（角度 $n\theta_i$，不是内积贡献）：$\theta_0=1$ 时已转到 $n\theta_0=2$ 弧度（$\cos2\approx-0.416$），$\theta_1=0.5$ 时只转到 $n\theta_1=1$ 弧度（$\cos1\approx0.540$）。同一位置处高频对的相位推进更快，这就是"多尺度同时编码"的最小例证。</p>
 </details>
 
-<p>实现层面有个等价性值得注意：原论文用"相邻对"形式 $(q_0,q_1), (q_2,q_3), \ldots$；但 GPT-NeoX、LLaMA 等实现把向量拆成"前半 $q_{0..d/2-1}$ 与后半 $q_{d/2..d-1}$"，对 $(q_i, q_{i+d/2})$ 做逐元素旋转。两种形式数学等价（只是配对方式不同；"实现用前后两半因为逐元素操作更高效"为社区通行解释，RoPE 论文未讨论实现细节）。本文按论文原形式讲解。</p>
+<p>实现层面存在一个等价性：原论文用"相邻对"形式 $(q_0,q_1), (q_2,q_3), \ldots$；但 GPT-NeoX、LLaMA 等实现把向量拆成"前半 $q_{0..d/2-1}$ 与后半 $q_{d/2..d-1}$"，对 $(q_i, q_{i+d/2})$ 做逐元素旋转。两种形式数学等价（只是配对方式不同；"实现用前后两半因为逐元素操作更高效"为社区通行解释，RoPE 论文未讨论实现细节）。本文按论文原形式讲解。</p>
 
 <h3 id="d-dim-generalization-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -450,7 +450,7 @@ $$\theta_i = \mathrm{base}^{-2i/d}, \qquad i = 0, 1, \ldots, d/2-1, \qquad \math
 
 <p>这一章回答两个问题：d 维 RoPE 的内积随 $|m-n|$ 增大怎样变化？为什么 RoPE 不旋转 V？两个问题来自同一个事实——注意力分数只来自 $QK^T$。</p>
 
-<p>先看内积的衰减。把 d 维内积按 $d/2$ 个对展开：</p>
+<p>把 d 维内积按 $d/2$ 个对展开：</p>
 
 $$\langle R_m^d q, R_n^d k \rangle = \sum_{i=0}^{d/2-1} \left[(q_{2i} k_{2i} + q_{2i+1} k_{2i+1})\cos((n-m)\theta_i) - (q_{2i} k_{2i+1} - q_{2i+1} k_{2i})\sin((n-m)\theta_i)\right].$$
 
@@ -540,7 +540,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 
 <p>这一章讲 RoPE 在什么条件下成立、什么条件下不成立，以及两个与边界相关的实际选择：长度外推时的扩展方法、Kimi K3 的 MLA（Multi-head Latent Attention，多头潜注意力）层为何拆出 rot 分量但不施旋转。</p>
 
-<p>先看适用条件。RoPE 成立需要：（1）softmax 注意力机制（注意力分数来自 $QK^T$）；（2）query/key 维度 $d$ 是偶数（能拆成 $d/2$ 个 2 维对）；（3）token 位置能用整数 $m$ 表示。在这些条件下，原始 RoPE 不引入可学习参数、不修改 V、不修改输入嵌入，是"乘"而非"加"的位置编码。</p>
+<p>RoPE 成立需要：（1）softmax 注意力机制（注意力分数来自 $QK^T$）；（2）query/key 维度 $d$ 是偶数（能拆成 $d/2$ 个 2 维对）；（3）token 位置能用整数 $m$ 表示。在这些条件下，原始 RoPE 不引入可学习参数、不修改 V、不修改输入嵌入，是"乘"而非"加"的位置编码。</p>
 
 <p>RoPE <strong>不解决</strong>的问题：它不替代 token 类型嵌入（如 segment embedding）；不解决位置编号的语义（如分段文档、相对时间）；不提供"绝对位置嵌入"那种直接的位置查询能力。在纯双向编码器中若需要显式绝对位置信号，APE 或可学习位置嵌入可能更直接。RoPE 的优势在自回归与长上下文外推。</p>
 
@@ -610,7 +610,7 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 
 <h3>论断与来源（C）</h3>
 <p><strong>C1（RoPE 只作用于 Q 和 K，不作用于 V）</strong>：Su et al. 2021, arXiv:2104.09864v5, §3.2.1 Eq.(13)（2 维）与 §3.2.2 Eq.(14)（d 维）。Eq.(14) 的下标为 $\{q,k\}$、不含 $v$，故 $v_n = W_v x_n$ 不带旋转矩阵。</p>
-<p><strong>C2（绝对构造、相对效果）</strong>：Su et al. 2021, 摘要；§3.1 Eq.(11)；论文摘要原文 "encodes the absolute position with a rotation matrix and meanwhile incorporates the explicit relative position dependency"。</p>
+<p><strong>C2（绝对构造、相对效果）</strong>：Su et al. 2021, 摘要；§3.1 Eq.(11)；论文摘要原文 "encodes the absolute position with a rotation matrix and meanwhile incorporates the explicit relative position dependency …"。</p>
 <p><strong>C3（无可学习参数）</strong>：Su et al. 2021, §3.2.2 Eq.(15) 后的参数定义（"pre-defined parameters $\Theta=\{\theta_i=10000^{-2(i-1)/d}\}$"）与 §3.3（"Following Vaswani et al. 2017, we set $\theta_i=10000^{-2i/d}$"）；$\theta_i$ 与 base=10000 为固定常数。</p>
 <p><strong>C4（几何级数多尺度）</strong>：Su et al. 2021, §3.2.2 Eq.(15) 后的 $\Theta$ 定义与 §3.3；多源综述印证（agentica.wiki、unseel.com/cs/rotary-position-embedding、spawn08.github.io）。</p>
 <p><strong>C5（远程衰减性质）</strong>：Su et al. 2021, §3.4.3 "Long-term decay", Eq.(35)–(37)；论文用 Abel 变换证明上界（Eq.(36)–(37)），图 2 给出上界量 $\frac{1}{d/2}\sum_{i=1}^{d/2}|S_i|$ 随相对距离增大而衰减的曲线（原文 "the value of $\frac{1}{d/2}\sum_{i=1}^{d/2}|S_{i}|$ decay with the relative distance $m-n$ increases … as shown in Figure 2"；论文未标注图中维度取值）。本文用特定情形（$q=k$、分量恒定）的确定性计算作教学简化（见简化 3），论证不等价于论文上界。</p>
@@ -629,8 +629,10 @@ $$\frac{1}{d/2}\sum_{i=0}^{d/2-1} \cos((n-m)\theta_i).$$
 <p><strong>F8（远程衰减上界）</strong>：Su et al. 2021, §3.4.3, Eq.(36)–(37)；论文用 Abel 变换证明上界，图 2 给出相对上界随距离增大而减小的曲线。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p><strong>N1（base 默认 10000）</strong>：Su et al. 2021, §3.2, Eq.(12)；与 Vaswani et al. 2017 同源。</p>
+<p><strong>N1（base 默认 10000）</strong>：Su et al. 2021, §3.2.2（Eq.(15) 后的参数定义 $\Theta=\{\theta_i=10000^{-2(i-1)/d}\}$）与 §3.3（"Following Vaswani et al. 2017, we set $\theta_i=10000^{-2i/d}$"）；base 取 10000 与 Vaswani et al. 2017 同源。</p>
 <p><strong>N2（d=128 时 $\theta_0=1$、$\theta_{63}\approx 0.0001$）</strong>：F6 代入 d=128 计算；d 维推广一章的表格中"旋转一圈需要的位置数"按 $2\pi/\theta_i$ 计算。</p>
+<p><strong>N3（§1 表格"长度外推"一列）</strong>：该列为基于各方案机制与所引文献的定性推断，非单一论文的直接实验结论。其中 ALiBi 一项与 <a href="../../wiki/nope/index.html">NoPE</a> 页所引 Kazemnejad et al. 2023（arXiv:2305.19466）摘要结论一致——最常用的位置编码方法（ALiBi、RoPE、APE）并不适合长度外推；此处的"相对优于 learned APE"仅指有限外推范围内优于绝对可学习位置嵌入，不代表良好的长度泛化。</p>
+<p><strong>N4（T5 相对位置偏置每头约 32 个 bucket）</strong>：Raffel et al. 2020, "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer"（T5）；相对位置偏置按对数分桶，每个注意力头配一个约 32 个 bucket 的可学习偏置。</p>
 
 <h3>构造示例</h3>
 <p><strong>2 维手算例子</strong>：$q=(1,0)$、$k=(1,0)$、$\theta=\pi/4$、$m=1$、$n=2$。$\theta=\pi/4$ 是教学数字（真实模型 $\theta_i$ 由 $\mathrm{base}=10000$ 决定），便于手算验证 $\cos(\pi/4)=\sin(\pi/4)=\sqrt{2}/2$。</p>

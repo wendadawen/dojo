@@ -1,0 +1,31 @@
+<!-- review-meta
+round: 4
+page: wiki/dualpath/index.html
+reviewed_content_sha256: 0e11dc90b5660a6d
+-->
+# DualPath 审查记录（第 4 轮）
+
+- 页面版本：f7a3857477cb4cf87a48fb0c28a15ae20b859ff7（index.html 工作树哈希）
+- 论文版本：arXiv:2602.21548v2（核对 v2 PDF 正文与 v2 LaTeX 源码 `paper.tex`/`session/*.tex`/`reference.bib`；并用 v1 PDF 交叉确认编号）
+- 审查时间：2026-09-13 19:36
+- 审查者：独立子代理
+- 已完整阅读章节：核心问题、贯穿示例、1. agentic 推理的存储 I/O 瓶颈由三因素叠加（1.1–1.3）、2. DualPath 的双路径数据流与块布局（2.1–2.4）、3. 双路径不引入新瓶颈的 P/D 区间（3.1–3.3）、4. CNIC-centric 流量管理（4.1–4.5）、5. Adaptive Request Scheduler（5.1–5.6）、6. 实验（6.1–6.8）、7. 方法评价（7.1–7.4）、来源与范围说明；含全部折叠块与图注
+- 回源核对方式：官方 arXiv v2 原文（PDF + LaTeX 源 + reference.bib）逐条定位；页面内嵌 14 张原图与 assets/ 逐一比对；公式全部复算。
+
+## 问题
+
+- [阻断·技术] §3.2「PE CNIC 读方向（F-3）」（正文第 263 行）：把不等式条件写错，并与同一句括注自相矛盾。正文先写「要求 $\frac{2Bs}{g} \le B$，即 $s \le g$」，紧接着括注写「$2Bs/g \le B$ 等价 $s \le g/2$」。由 $2Bs/g \le B$ 只能推出 $s \le g/2$，推不出 $s \le g$；同一个式子在同一句里给出两个互斥的等价结论。｜引文依据：论文 §4.2 eq.(1)「$2\times T_p \times Dg = 2Bs/g \leq B$」，其后原文「Since $s \le g$ always holds in practice, the read direction is always bottleneck-free.」（论文原文的 $s \le g$ 与 eq.(1) 本身不自洽；本页既照录原文，又自行加了一句错误的「即 $s \le g$」推导）。｜修复要求：删去「即 $s \le g$」，改为「$\frac{2Bs}{g} \le B$ 等价于 $s \le g/2$」；并明确写成：论文原文此处写的是更宽松的 $s \le g$（与 eq.(1) 不一致、疑为原文笔误），本页按论文原文照录、不据此改写结论。｜修复：｜复验：
+- [重要·技术] 全页对论文章节号的引用（第 160、214、361、376、423、488、497、505、563、581、590、612、621、664、672、699、703、742–745、752、755、770 行）：正文把 Evaluation / Discussion / Appendix 全部按 LaTeX 源文件名编号，位置系统性错误：§8.1/§8.3/§8.4/§8.5 应为 §7.3/§7.4/§7.5/§7.6；§11.1/§11.4/§11.5 应为 §A.1/§A.4/§A.5；working set 与 future work 引的「§9」应为 §8.2 与 §8.1；Testbed 引的「§8.2」应为 §7.2。（§1、§3、§4、§5、§6、§9 Related Work 的引用正确。）｜引文依据：v2 PDF（v1 同）正文章标题为「7 EVALUATION」（7.1 Implementation / 7.2 Experimental Setup / 7.3 Offline Batch Inference / 7.4 Online Serving / 7.5 Ablation Study / 7.6 Large-Scale Scalability）、「8 DISCUSSION」（8.1 Potential Future Work / 8.2 Working Set Analysis）、「9 RELATED WORK」；附录在 `\appendix` 下编号 A.1 Traffic Isolation Configuration Details / A.4 Experimental Configurations / A.5 KV-Cache Block Layout。页面沿用的数字来自源文件名 08_evaluation.tex / 09_discussion.tex / 11_appendix.tex，非渲染后的章节号。｜修复要求：按上述映射逐处改正正文与「来源与范围说明」中 C/F/N 定位表的章节号（§8.x→§7.x、§11.x→§A.x、working set/future work 的 §9→§8.2/§8.1、Testbed §8.2→§7.2）。｜修复：｜复验：
+- [重要·技术] §2.2 图注段（第 192 行）与 §3.2 F-3、F-4（第 263、265 行）：把图 4a 的步骤 (4)(5) 方向写反，且页内互相矛盾。§2.2 写「(3)(4) 喂给 PE GPU」；§3.2 F-4 却写「PE 节点把本层算完的 Layer Block 推回 PE buffer（PE path 步骤 4）」；§2.2 写「(5) PE CNIC 把新生成的 Layer Block 推回 DRAM」，§3.2 F-3 也写「(5)（PE CNIC → PE DRAM，对应 Layer Block 推回 DRAM 的 D2H）」。按图 4a，(4) 是 CNIC→GPU（H2D），(5) 是 GPU→CNIC，二者都不是「写回 DRAM」。｜引文依据：论文 Figure 4(a) 箭头标注：(3) DRAM→CNIC、(4) CNIC→GPU、(5) GPU→CNIC、(6) PE CNIC→DE CNIC、DE 侧 (7) CNIC→DRAM、(8) DRAM→CNIC、(9) CNIC→GPU；论文 §4.1 原文「those KV-Caches of that layer are transferred to PE HBM (3 and 4)」「all KV-Caches of both hit and miss tokens are transferred to the DE buffer (5-7)」。｜修复要求：把 (4) 统一描述为 CNIC→PE GPU（H2D）、(5) 描述为 PE GPU→PE CNIC，删除「(5) 推回 DRAM / PE CNIC → PE DRAM」；使 §2.2 与 §3.2 的步骤含义一致。｜修复：｜复验：
+- [轻微·技术] §7.3「vs LayerKV、PrefillOnly（SOSP'25）」（第 711 行）：括注 (SOSP'25) 一并覆盖 LayerKV，但 LayerKV 在论文 bib 中无会议归属。｜引文依据：`reference.bib`「@misc{LayerKV, title={LayerKV: Optimizing Large Language Model Serving with Layer-wise KV Cache Management}, year={2024}, eprint={2410.00428}, archivePrefix={arXiv}}」；「@inproceedings{SOSP25:PrefillOnly, … series={SOSP '25}}」。｜修复要求：改为「LayerKV（论文 bib 为 @misc / arXiv 2410.00428，无会议字段）、PrefillOnly（SOSP'25）」。｜修复：｜复验：
+- [轻微·技术] §1.3（第 160 行）与 §7.3（第 709 行）对 Strata 的归属：「外部资料常称 ATC'24」与论文 bib 不相容，且无外部来源可查。｜引文依据：`reference.bib`「@misc{Strata, title={Strata: Hierarchical Context Caching for Long Context Language Model Serving}, year={2025}, eprint={2508.18572}, archivePrefix={arXiv}}」（2025-08 的 arXiv 稿，不可能对应 ATC'24）。｜修复要求：删去「外部资料常称 ATC'24」这一归属，保留已核实事实「论文 reference.bib 中 Strata 条目为 @misc，无具体会议字段」。｜修复：｜复验：
+- [轻微·表述] 第 117、142、306、382、727 行，及第 263、709 行的「本页」自我指代：含元话语、会话指代与临场评价。｜引文依据：不适用。｜修复要求：逐处改写——117「本节先量化三因素，再回答为什么过去没人加第二条路径。」删去导语直接陈述；142「把视野从「这一代硬件够不够」拉到「代际之间谁在涨谁不涨」会更清楚。」删去该句；306「需要警惕的是越界情况：」→「越界情况：」；382「另一个意外收益是性能。」→「附带收益是性能。」；727「如果我的集群 g 不是 8 或 s 不是 1」→「如果部署集群的 g 不是 8 或 s 不是 1」；263/709「本页照论文原文照录」「本页不引用…」→「原文照录」「未在论文 bib 中确认的会议归属不引用」。｜修复：｜复验：
+- [轻微·可读性] 全文缩写首次出现处未给全称（第 77、84、105、160 行）：第 77 行「SNIC 单点饱和」、第 84 行「CNIC-RDMA」、第 105 行「JCT」「64K MAL」、第 160 行「0.45 APS」均无全称；APS 全称直到第 602 行才出现。｜引文依据：不适用（论文 §2.3 定义 compute NIC = CNIC、storage NIC = SNIC；§7.4 定义 APS = agent arrival rate per second）。｜修复要求：在各缩写首次出现处给出全称：SNIC=节点存储网卡、CNIC=GPU 配对计算网卡、TTFT=首 token 时间、JCT=作业完成时间、MAL=Max Agent Length、APS=每秒 agent 到达率。｜修复：｜复验：
+- [轻微·技术] §2.4（第 216 行）与本章问题第 2 问解答（第 233 行）：把 trie 的命中查询过程（「从请求的 prompt 前缀沿 trie 找到最长 hit 区间」「哈希只能做精确 key 匹配…查询开销爆炸」）写成论文事实，但论文只说明存储结构与节点含义。｜引文依据：论文 §A.5「KV-Cache is stored in distributed storage using a trie structure, where each tree node corresponds to a Full Block.」（未描述命中查询过程，也未做 trie/hash 对比）；§A.4 亦仅写「the hit length is calculated in the client」。｜修复要求：把查询过程与 trie/hash 对比标注为辅助解释或推断，或删除；保留第 214 行照录原文的部分。｜修复：｜复验：
+
+## 结论
+
+- 统计：阻断 1 / 重要 2 / 轻微 5
+- 处置：修复。第 1 条（F-3 条件错误且同句自相矛盾）与第 2 条（章节号系统性错位）必须关闭后方可复验；第 3 条（图 4a 步骤 (4)(5) 方向与页内矛盾）一并修正。其余轻微问题按修复要求逐条处理。
+
+（核对通过、无需修改的项，列此备查：cache-compute ratio 表（Table 1：117-267 / 47-95 / 39-60 / 13-36 / 4.8-5.8）与 §3 正文 22 GB/PFLOP；硬件代际 28.8× / 2.0× / 2.4× 与 I/O-compute 14.4×（28.8/2.0=14.4 复算一致）；P/D 四式 F-1 至 F-12 的代数全部复算正确，§3.3 代入 (g=8,s=1,M=500,Bs=50) 得下界 1/7、上界 min{6, 3.5, 3.5}=3.5，与原文一致；Q3 问「(g-s)/(2s) ≤ (g-2s)/s ⟺ s ≤ g/3」复算正确；IB 配置四行（qos_max_vls 4 / qos_high_limit 240 / vlarb_high 0:192,1:192,2:0,3:192 / vlarb_low 0:192,1:192,2:64,3:192）与 Appendix §A.1 逐字一致，240/255≈94% 与 §5.1 原文「approximately 99%」的差异页内已说明；cudaMemcpyAsync 5-7 µs / RDMA Write ~1 µs / doorbell batching 与 §5.2 一致；α=3s、β=5s、compute quota=300ms、Z=1.05 与 §A.4/§6 一致；消融 17.21% / 38.19% / 45.62%（差分 20.98、7.43 复算正确）；离线 1.87×/1.78×/1.09-1.85×/1.82-1.99×、P/D 敏感 1.64×/2.46×、在线 1.67×/2.25× 与 SLO（TTFT≤4s、TPOT≤50ms）、大规模 3167s→3201s、22×、1.739→1.847/0.228→0.194/0.039→0.036、<10 cores、working set 69→681 GB 与 r/r²/r³ 均与原文一致；Table 2 数据集六列数值逐格一致；基线 SGL(MC) commit 19089aa 组合一致；默认 2P4D/1P2D/1P1D 一致；14 张原图与 Figure 编号映射正确；页面引用的 7 个前置概念页与 3 个锚点均真实存在。）

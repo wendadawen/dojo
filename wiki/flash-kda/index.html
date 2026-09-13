@@ -67,7 +67,7 @@
 <p><b>主要依据</b>：Kimi K3 Technical Report §5.1.1（FlashKDA、设备内 CP）、§5.1.2（KCP，Eq.17）、§5.4.2（KDA 解码 kernel）。KDA 递归公式 Eq.1 见 §2.1.1，完整机制见 <a href="../../wiki/kda/index.html">KDA 概念页</a>。</p>
 </blockquote>
 
-<p>Kimi K3 用 69 层 KDA 替换 softmax 注意力，把随序列增长的 KV cache 压成固定大小的递归状态——省了显存，但状态必须串行更新。一块 H100 有 132 块 SM 靠宽并行隐藏延迟，串行依赖却让多数 SM 排队等状态。这个冲突在四个执行 regime 下表现成不同瓶颈。K3 为每个 regime 设计了专门方案。本文讲解这四套方案——FlashKDA、设备内 CP、KCP、投影输入缓存——各自解决什么瓶颈，核心机制是什么。</p>
+<p>Kimi K3 用 69 层 KDA 替换大部分 softmax 注意力，把随序列增长的 KV cache 压成固定大小的递归状态（其余 24 层为 Gated MLA 全局注意力）——省了显存，但状态必须串行更新。一块 H100 有 132 块 SM 靠宽并行隐藏延迟，串行依赖却让多数 SM 排队等状态。这个冲突在四个执行 regime（同一模型在训练、长 prefill、跨设备、解码等阶段的不同执行形态）下表现成不同瓶颈。K3 为每个 regime 设计了一套方案——FlashKDA、设备内 CP、KCP、投影输入缓存。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -90,7 +90,7 @@
       <p>设备内 context parallelism 如何在单 rank 上并行一条长序列，且不产生跨设备通信。</p>
       <details>
         <summary>解答：SM 级切序列，段转移独立计算后精确合并</summary>
-        <p>关键观察是 KDA 状态转移为线性：一段 token 的转移效果可分解成作用于入状态的部分和从零生成的部分，独立于入状态预先算好。SM 级 CP planner 据此把序列切到单 rank 的多块 SM 上并行算段转移，再合并恢复每段精确初始状态；SM 之间通过 shared memory / L2 协作，完全不走跨设备通信。见「3. 设备内 context parallelism」章。</p>
+        <p>关键观察是 KDA 状态转移为线性：一段 token 的转移效果可分解成作用于入状态的部分和从零生成的部分，独立于入状态预先算好。SM 级 CP planner 据此把序列切到单 rank 的多块 SM 上并行算段转移，再合并恢复每段精确初始状态；整个并行完全发生在单设备内、不产生跨设备通信。见「3. 设备内 context parallelism」章。</p>
       </details>
     </li>
     <li>
@@ -104,7 +104,7 @@
       <p>KDA 解码如何处理投机解码拒绝 draft token 时的状态回滚，又不让状态流量爆炸。</p>
       <details>
         <summary>解答：缓存投影输入，片上重跑递归重建状态</summary>
-        <p>为每个 draft 位置存状态快照会把状态流量乘上 draft 长度，大 batch 在线服务下不可接受。K3 的方案是只缓存 draft token 的投影输入（几个 $d_k$ 维向量，比 $d_k\times d_v$ 的状态矩阵小得多）：任意接受前缀后的状态由投影输入完全决定，验证后在片上重跑 KDA 递归即可重建接受 token 的状态并写回。投影缓存不离开 decode 阶段，不污染上层服务架构。见「5. KDA 解码」章。</p>
+        <p>为每个 draft 位置存状态快照会把状态流量乘上 draft 长度，大 batch 在线服务下不可接受。K3 的方案是只缓存 draft token 的投影输入（即 KDA 前向的 $q,k,v,\beta,\alpha$，比 $d_k\times d_v$ 的状态矩阵小得多）：任意接受前缀后的状态由投影输入完全决定，验证后在片上重跑 KDA 递归即可重建接受 token 的状态并写回。投影缓存不离开 decode 阶段，不污染上层服务架构。见「5. KDA 解码」章。</p>
       </details>
     </li>
   </ol>
@@ -122,15 +122,15 @@
 
 <h2 id="serial-vs-parallel">1. 串行状态 vs GPU 并行——为什么 KDA 在四个 regime 瓶颈不同</h2>
 
-<p>KDA 把 softmax 注意力随序列长度增长的 KV cache 压成了一个<strong>固定大小的递归状态</strong> $S_t \in \mathbb{R}^{d_k \times d_v}$（K3 config.json 中 $d_k=d_v=128$，约 32KB<sup>[N1]</sup>）。省了显存，但代价是状态必须一步一步串行更新。K3 报告 §2.1.1 的 Eq.1<sup>[F1]</sup>给出单步更新：</p>
+<p>KDA 把 softmax 注意力随序列长度增长的 KV cache 压成了一个<strong>固定大小的递归状态</strong> $S_t \in \mathbb{R}^{d_k \times d_v}$（$d_k$ 为 key 维度、$d_v$ 为 value 维度；K3 config.json 中 $d_k=d_v=128$，单 head 状态约 32KB，按 bf16 估算<sup>[N1]</sup>）。省了显存，但代价是状态必须一步一步串行更新。K3 报告 §2.1.1 的 Eq.1<sup>[F1]</sup>给出单步更新：</p>
 
-$$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t).$$
+$$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := \left(I - \beta_t k_t k_t^\top\right)\mathrm{Diag}(\alpha_t).$$
 
-<p>关键在右边：$S_t$ 依赖 $S_{t-1}$。要算第 $t$ 步的状态，必须先有第 $t-1$ 步的状态。这是一个<strong>串行依赖</strong>。KDA 的机制、$M_t$ 的含义、channel-wise forget gate 的作用由 <a href="../../wiki/kda/index.html">KDA 概念页</a>完整讲解，本页只引用 Eq.1 与 $M_t$ 的结论。</p>
+<p>关键在右边：$S_t$ 依赖 $S_{t-1}$。要算第 $t$ 步的状态，必须先有第 $t-1$ 步的状态。这是一个<strong>串行依赖</strong>。$M_t$ 中 $\mathrm{Diag}(\alpha_t)$ 位于乘法链最右侧，先按通道衰减入状态 $S_{t-1}$，擦除项 $(I - \beta_t k_t k_t^\top)$ 再作用于衰减后的旧状态。KDA 的机制、$M_t$ 的含义、channel-wise forget gate 的作用由 <a href="../../wiki/kda/index.html">KDA 概念页</a>完整讲解，本页只引用 Eq.1 与 $M_t$ 的结论。</p>
 
 <p>串行依赖和 GPU 的天性对立。一块 GPU（以 H100 为例）有 132 块 SM<sup>[N3]</sup>，每块 SM 内还有多个 warp 轮流占用计算单元——GPU 靠<strong>宽而均匀的并行</strong>隐藏延迟、撑满算力，详见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>。当一个计算必须一步步串行时，同一时刻只有少数 SM 在干活，其余的排队等状态。</p>
 
-<p>这个冲突不是抽象的——它在 KDA 的四个执行 regime 下表现成<strong>不同的瓶颈</strong>。K3 报告 §5.1.1 开门见山："The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime."<sup>[C1]</sup>所以 K3 为每个 regime 设计了专门的方案：</p>
+<p>这个冲突不是抽象的——它在 KDA 的四个执行 regime 下表现成<strong>不同的瓶颈</strong>。K3 报告 §5.1.1 指出："The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime."<sup>[C1]</sup>所以 K3 为每个 regime 设计了专门的方案：</p>
 
 <div class="table-scroll">
 <table>
@@ -171,9 +171,9 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
   <figcaption class="diagram-caption">箭头为时间方向：朴素 chunkwise 里 intra-chunk 计算与 cross-chunk 状态传播交替进行，传播期间多数 SM 空转，chunk 之间留下空隙。</figcaption>
 </figure>
 
-<p>这个空隙就是 FlashKDA 要解的第一个瓶颈。本章先建立"冲突根源 + 四 regime 定位"的框架，后续四章各解一个 regime。</p>
+<p>这个空隙就是 FlashKDA 要解的第一个瓶颈。</p>
 
-<p>本章建立了冲突根源与四 regime 定位的框架。但框架只是开始，每个 regime 还需要专门方案——下一章讲 FlashKDA 如何重叠 chunk 内计算与 chunk 间状态传播。</p>
+<p>空隙的根源是 intra-chunk 计算与 cross-chunk 传播互相等待；要消除它，就得让两者同时进行。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -207,7 +207,7 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
 <p>FlashKDA<sup>[C2]</sup>是 K3 为此开发的 CUTLASS-based chunkwise kernel。它的核心动作是一个词：<strong>重叠</strong>。具体做法是把工作分解成两个独立调度的部分：</p>
 
 <ul>
-  <li><strong>token-parallel stages</strong>：chunk 内的 token 维度并行。一个 chunk 有 $C$ 个 token，intra-chunk 的位置-位置 attention 可以在 token 维度上铺开到多块 SM 同时算。</li>
+  <li><strong>token-parallel stages</strong>：chunk 内的 token 维度并行。一个 chunk 有 $C$ 个 token，intra-chunk 的位置-位置 attention（chunk 内所有位置对的注意力计算）可以在 token 维度上铺开到多块 SM 同时算。</li>
   <li><strong>head-parallel recurrence</strong>：chunk 间的 head 维度递归。KDA 有多个 head（K3 配置 96 个 head<sup>[N2]</sup>），不同 head 的状态递归<strong>互相独立</strong>——算 head $h$ 的 $S[t]\to S[t+1]$ 不需要等 head $h'$ 的 intra-chunk。</li>
 </ul>
 
@@ -241,9 +241,9 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
 </table>
 </div>
 
-<p>工程定位：FlashKDA 是 CUTLASS-based（NVIDIA 的高性能 kernel 模板库），同时服务<strong>训练和推理 prefill</strong>两个场景，并作为 <strong>flash-linear-attention</strong> 框架的一个后端自动分发——这意味着上层调用方不需要手写 dispatch，框架会自动选用 FlashKDA<sup>[C2]</sup>。CUTLASS 模板编程和 Tensor Core 的具体调度细节超出本页职责，<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面足够支撑这里的理解。</p>
+<p>FlashKDA 基于 CUTLASS（NVIDIA 的高性能 kernel 模板库），同时服务<strong>训练和推理 prefill</strong>两个场景，并作为 <strong>flash-linear-attention</strong> 框架的一个后端自动分发——这意味着上层调用方不需要手写 dispatch，框架会自动选用 FlashKDA<sup>[C2]</sup>。CUTLASS 模板编程和 Tensor Core 的具体调度细节超出本页职责，<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面足够支撑这里的理解。</p>
 
-<p>本章讲了 FlashKDA 通过重叠消除 chunk 间空隙。但 FlashKDA 仍假设序列在一个 rank 上跑完，长 prefill 下纯 TP 填不满 SM——下一章讲设备内 CP 如何在单 rank 的 SM 级切序列。</p>
+<p>重叠调度解决了传播期（chunk 间）的 SM 空转，但 FlashKDA 仍要求序列在一个 rank 上跑完；长 prefill 下纯 TP 只切 head 不切序列，SM 依然填不满。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -295,13 +295,13 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
 <p>有了这个观察，<strong>SM 级 CP planner</strong>把序列切到单 rank 的多块 SM：每块 SM 算一段的 segment transition（独立于入状态），算完后合并恢复每段的<strong>精确初始状态</strong><sup>[C3]</sup>。关键区别在通信：</p>
 
 <ul>
-  <li>设备内 CP：完全在一个 rank 的 SMs 之间，<strong>无跨设备通信</strong>。SM 之间通过 shared memory / L2 协作，不走网络。</li>
+  <li>设备内 CP：完全在一个 rank 的 SMs 之间，<strong>无跨设备通信</strong>。</li>
   <li>KCP（下一章）：跨 device rank，需要一次 all-gather。</li>
 </ul>
 
 <p>这个区别是设备内 CP 和 KCP 最容易混淆的点（见页首误解提示）。设备内 CP 解决的是"单 rank SM 没填满"，KCP 解决的是"序列超单卡"——两者层次不同。</p>
 
-<p>本章讲了设备内 CP 在单 rank 内切序列、无跨设备通信。但序列长到一台设备装不下时需要跨 device rank——下一章讲 KCP 为什么不能直接求和以及 $M+\tilde S$ 分解。</p>
+<p>设备内 CP 处理的是单 rank 内 SM 填不满，切分不跨设备；序列长到一张卡装不下时，切分要落到多个 device rank，这时本地状态能否像 vanilla 线性注意力那样直接相加就成了新的问题。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -323,14 +323,14 @@ $$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\to
     <p>设备内 CP 与 KCP 在通信上的根本区别是什么。</p>
     <details>
       <summary>解答：SM 间协作 vs 跨设备 all-gather</summary>
-      <p>设备内 CP 完全在一个 rank 的 SMs 之间，SM 通过 shared memory / L2 协作，无跨设备通信；KCP 是跨 device rank 的方案，需要一次 all-gather 交换状态片段。两者解决的问题层次也不同：设备内 CP 解决"单 rank SM 没填满"，KCP 解决"序列超单卡"。</p>
+      <p>设备内 CP 完全在一个 rank 的 SMs 之间，无跨设备通信；KCP 是跨 device rank 的方案，需要一次 all-gather 交换状态片段。两者解决的问题层次也不同：设备内 CP 解决"单 rank SM 没填满"，KCP 解决"序列超单卡"。</p>
     </details>
   </li>
 </ol>
 
 <h2 id="kcp">4. KCP——为什么不能直接求和，以及 $M+\tilde S$ 分解</h2>
 
-<p>跨设备时，最自然的想法是借鉴 vanilla 线性注意力的 context parallelism。但它对 KDA 不成立——这一章讲清楚为什么，以及 K3 的 KCP 怎么解决。</p>
+<p>跨设备时，最自然的想法是借鉴 vanilla 线性注意力的 context parallelism。但它对 KDA 不成立——原因见 4.2，K3 的 KCP 方案见 4.3。</p>
 
 <h3 id="vanilla-la-cp">4.1 vanilla 线性注意力为什么能直接求和</h3>
 
@@ -368,7 +368,7 @@ $$s_i = s_{i-1} + \phi(k_i) v_i^\top.$$
 
 <p>对比 KDA 的 Eq.1<sup>[F1]</sup>：</p>
 
-$$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t).$$
+$$S_t = M_t S_{t-1} + \beta_t k_t v_t^\top,\qquad M_t := \left(I - \beta_t k_t k_t^\top\right)\mathrm{Diag}(\alpha_t).$$
 
 <p>右边<strong>有</strong>一个 token-dependent 矩阵 $M_t$ 作用于入状态 $S_{t-1}$，然后才加写入 $\beta_t k_t v_t^\top$。这就是 delta rule 的"先擦后写"——先用 $M_t$ 擦除/衰减旧状态，再加新内容。<a href="../../wiki/kda/index.html">KDA 页</a>讲过这个几何，这里只用结论。</p>
 
@@ -382,7 +382,7 @@ $$\boxed{\,S_t^{[i+1]} = \tilde S_t^{[i+1]} + M_{t\leftarrow 1}^{[i+1]}\, S_T^{[
 
 <p>其中：</p>
 <ul>
-  <li>$M_{t\leftarrow 1}^{[i+1]} := \prod_{r\leftarrow 1}^{t} M_r \in \mathbb{R}^{d_k \times d_k}$ 是 rank $i+1$ 内前 $t$ 个本地 token 的 $M$ <strong>连乘</strong>（累积转移）。</li>
+  <li>$M_{t\leftarrow 1}^{[i+1]} := \prod_{r\leftarrow 1}^{t} M_r \in \mathbb{R}^{d_k \times d_k}$ 是 rank $i+1$ 内前 $t$ 个本地 token 的 $M$ <strong>连乘</strong>（累积转移）；记号 $\leftarrow$ 表示按文档顺序从右向左连乘。</li>
   <li>$\tilde S_t^{[i+1]}$ 是同一个递归<strong>从 $S=0$ 起</strong>跑出的状态（从零生成）。</li>
 </ul>
 
@@ -400,7 +400,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <ol>
   <li>每个 rank 本地算自己的 $(M_{T\leftarrow 1}^{[i]},\, \tilde S_T^{[i]})$ 两个片段（在入状态可用前就能算）。</li>
-  <li><strong>一次 all-gather</strong>：所有 rank 把自己的两个片段广播给其他所有 rank。交换的是固定大小的状态（$S\in\mathbb{R}^{d_k\times d_v}$ 及同形状的 $M$）。</li>
+  <li><strong>一次 all-gather</strong>：所有 rank 把自己的两个片段广播给其他所有 rank。交换的是固定大小的两个片段——状态 $\tilde S\in\mathbb{R}^{d_k\times d_v}$ 与累积转移 $M\in\mathbb{R}^{d_k\times d_k}$（K3 中 $d_k=d_v=128$，故两者尺寸相同）。</li>
   <li>每个 rank 用收到的所有片段做 <strong>prefix scan</strong>：从 $S=0$ 起，按文档顺序依次应用 $S \leftarrow M_{T\leftarrow 1}^{[j]} S + \tilde S_T^{[j]}$，重组出本 rank 的入状态。</li>
 </ol>
 
@@ -408,11 +408,11 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
   <div class="dg-stack">
     <div class="dg-layer">
       <span class="dg-layer-label">rank 1</span>
-      <span class="dg-layer-body">本地算两个片段 $(M累积_1,\ \tilde S_1)$——入状态可用前即可算出</span>
+      <span class="dg-layer-body">本地算两个片段 $(M_{T\leftarrow1}^{[1]},\ \tilde S_T^{[1]})$——入状态可用前即可算出</span>
     </div>
     <div class="dg-layer">
       <span class="dg-layer-label">rank 2</span>
-      <span class="dg-layer-body">本地算两个片段 $(M累积_2,\ \tilde S_2)$——入状态可用前即可算出</span>
+      <span class="dg-layer-body">本地算两个片段 $(M_{T\leftarrow1}^{[2]},\ \tilde S_T^{[2]})$——入状态可用前即可算出</span>
     </div>
     <div class="dg-layer">
       <span class="dg-layer-label">all-gather</span>
@@ -420,13 +420,13 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
     </div>
     <div class="dg-layer">
       <span class="dg-layer-label">prefix scan</span>
-      <span class="dg-layer-body">每个 rank 自己重组入状态：$S_T^{[0]}=0$；$S_T^{[1]}=\tilde S_1+M累积_1\cdot S_T^{[0]}=\tilde S_1$；$S_T^{[2]}=\tilde S_2+M累积_2\cdot S_T^{[1]}$（即 rank 2 的入状态）</span>
+      <span class="dg-layer-body">每个 rank 自己重组入状态：$S_T^{[0]}=0$；$S_T^{[1]}=\tilde S_T^{[1]}+M_{T\leftarrow1}^{[1]}\cdot S_T^{[0]}=\tilde S_T^{[1]}$（离开 rank 1、进入 rank 2 的状态）；$S_T^{[2]}=\tilde S_T^{[2]}+M_{T\leftarrow1}^{[2]}\cdot S_T^{[1]}$（离开 rank 2 的状态，即序列末状态）</span>
     </div>
   </div>
-  <figcaption class="diagram-caption">自上而下为执行顺序（2 个 rank 示意）：本地算片段 → 一次 all-gather 交换 → prefix scan 重组。通信量 = 固定大小的状态，与序列长度无关。</figcaption>
+  <figcaption class="diagram-caption">自上而下为执行顺序（2 个 rank 示意）：本地算片段 → 一次 all-gather 交换 → prefix scan 重组。$S_T^{[i]}$ 表示离开 rank $i$、进入 rank $i+1$ 的状态。通信量 = 固定大小的两个片段，与序列长度无关。</figcaption>
 </figure>
 
-<p><strong>通信量固定</strong>是 KCP 相对 softmax CP 的核心优势。softmax 注意力的 context parallelism（如 Ring Attention）要交换随序列长度增长的 KV block——序列越长，通信越多<sup>[C4]</sup>。KCP 只 all-gather 固定大小的状态（config.json 中约 32KB<sup>[N1]</sup>），<strong>与序列长度无关</strong>，并达成线性计算扩展。</p>
+<p><strong>通信量固定</strong>是 KCP 相对 softmax CP 的核心优势。softmax 注意力的 context parallelism（如 Ring Attention）要交换随序列长度增长的 KV block——序列越长，通信越多<sup>[C4]</sup>。KCP 只 all-gather 固定大小的两个片段——状态 $\tilde S$ 与累积转移 $M$ 各约 32KB（由 config.json 的 head_dim=128 推得，bf16 估算<sup>[N1]</sup>），一次 all-gather 合计约 64KB，<strong>与序列长度无关</strong>，并达成线性计算扩展。</p>
 
 <div class="table-scroll">
 <table>
@@ -441,29 +441,29 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <h3 id="kcp-handcalc">4.5 手算验证：2 rank × 2 token 的 KDA 递归</h3>
 
-<p>构造示例。取 $d_k=d_v=2$，教学构造 $\alpha=0.5$（标量，$\mathrm{Diag}(\alpha)=0.5I$）、$\beta=1$、单位向量 $k$。于是 $M_t = I - 0.5\,k_t k_t^\top$。序列 4 个 token 分给 2 个 rank，每 rank 2 个：</p>
+<p>构造示例。取 $d_k=d_v=2$，示例令 $\mathrm{Diag}(\alpha_t)=I$（略去通道衰减，使手算落在整数上）、标量 $\beta=0.5$、单位向量 $k$。代入 Eq.1 的 $M_t$ 得 $M_t = (I - 0.5\,k_t k_t^\top)\,\mathrm{Diag}(\alpha_t) = I - 0.5\,k_t k_t^\top$。序列 4 个 token 分给 2 个 rank，每 rank 2 个：</p>
 
 <ul>
-  <li>rank 1（token 1,2）：$k_1=(1,0), v_1=(1,2)$；$k_2=(0,1), v_2=(3,4)$。</li>
-  <li>rank 2（token 3,4）：$k_3=(1,0), v_3=(5,6)$；$k_4=(0,1), v_4=(7,8)$。</li>
+  <li>rank 1（token 1,2）：$k_1=(1,0), v_1=(2,4)$；$k_2=(0,1), v_2=(6,8)$。</li>
+  <li>rank 2（token 3,4）：$k_3=(1,0), v_3=(10,12)$；$k_4=(0,1), v_4=(14,16)$。</li>
 </ul>
 
 <p>对应的 $M$：$M_1=M_3=\begin{pmatrix}0.5&0\\0&1\end{pmatrix}$，$M_2=M_4=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}$。</p>
 
-<p><strong>顺序计算的 ground truth</strong>（从 $S_0=0$ 起一步步算）结果是 $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。下面用 KCP 分解重组，看能否得到同样的值。</p>
+<p><strong>顺序计算的 ground truth</strong>（从 $S_0=0$ 起一步步算）结果是 $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。用 KCP 分解重组的结果如下。</p>
 
 <p>各 rank 本地算两个片段：</p>
 <ul>
-  <li>$M累积_1 = M_2 M_1 = \begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$；$\tilde S_1$ 从 $0$ 起算两步 $=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</li>
-  <li>$M累积_2 = M_4 M_3 = \begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$；$\tilde S_2$ 从 $0$ 起算两步 $=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。</li>
+  <li>$M_{T\leftarrow1}^{[1]} = M_2 M_1 = \begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$；$\tilde S_T^{[1]}$ 从 $0$ 起算两步 $=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</li>
+  <li>$M_{T\leftarrow1}^{[2]} = M_4 M_3 = \begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$；$\tilde S_T^{[2]}$ 从 $0$ 起算两步 $=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。</li>
 </ul>
 
 <p>一次 all-gather 后，prefix scan 重组入状态：</p>
 
 <ul>
   <li>$S_T^{[0]}=0$。</li>
-  <li>$S_T^{[1]}=\tilde S_1 + M累积_1\cdot 0=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</li>
-  <li>$S_T^{[2]}=\tilde S_2 + M累积_2\cdot S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+0.5I\cdot\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。</li>
+  <li>$S_T^{[1]}=\tilde S_T^{[1]} + M_{T\leftarrow1}^{[1]}\cdot 0=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</li>
+  <li>$S_T^{[2]}=\tilde S_T^{[2]} + M_{T\leftarrow1}^{[2]}\cdot S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+0.5I\cdot\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。</li>
 </ul>
 
 <p>$S_T^{[2]}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，与顺序计算的 $S_4$ <strong>完全一致</strong>。分解成立。</p>
@@ -471,20 +471,20 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 <details>
 <summary>展开：ground truth 4 步 + KCP 分解 3 步的逐矩阵代入</summary>
 <p><b>顺序计算 ground truth</b>（$S_0=0$）：</p>
-<p>$S_1 = M_1\cdot 0 + k_1 v_1^\top = 0 + \begin{pmatrix}1\\0\end{pmatrix}\begin{pmatrix}1&2\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}$。</p>
-<p>$S_2 = M_2 S_1 + k_2 v_2^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}1&2\\0&0\end{pmatrix} + \begin{pmatrix}0&0\\3&4\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</p>
-<p>$S_3 = M_3 S_2 + k_3 v_3^\top = \begin{pmatrix}0.5&0\\0&1\end{pmatrix}\begin{pmatrix}1&2\\3&4\end{pmatrix} + \begin{pmatrix}5&6\\0&0\end{pmatrix} = \begin{pmatrix}0.5&1\\3&4\end{pmatrix}+\begin{pmatrix}5&6\\0&0\end{pmatrix}=\begin{pmatrix}5.5&7\\3&4\end{pmatrix}$。</p>
-<p>$S_4 = M_4 S_3 + k_4 v_4^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}5.5&7\\3&4\end{pmatrix} + \begin{pmatrix}0&0\\7&8\end{pmatrix} = \begin{pmatrix}5.5&7\\1.5&2\end{pmatrix}+\begin{pmatrix}0&0\\7&8\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。</p>
+<p>$S_1 = M_1\cdot 0 + \beta_1 k_1 v_1^\top = 0 + 0.5\begin{pmatrix}1\\0\end{pmatrix}\begin{pmatrix}2&4\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}$。</p>
+<p>$S_2 = M_2 S_1 + \beta_2 k_2 v_2^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}1&2\\0&0\end{pmatrix} + 0.5\begin{pmatrix}0\\1\end{pmatrix}\begin{pmatrix}6&8\end{pmatrix} = \begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。</p>
+<p>$S_3 = M_3 S_2 + \beta_3 k_3 v_3^\top = \begin{pmatrix}0.5&0\\0&1\end{pmatrix}\begin{pmatrix}1&2\\3&4\end{pmatrix} + 0.5\begin{pmatrix}1\\0\end{pmatrix}\begin{pmatrix}10&12\end{pmatrix} = \begin{pmatrix}0.5&1\\3&4\end{pmatrix}+\begin{pmatrix}5&6\\0&0\end{pmatrix}=\begin{pmatrix}5.5&7\\3&4\end{pmatrix}$。</p>
+<p>$S_4 = M_4 S_3 + \beta_4 k_4 v_4^\top = \begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}5.5&7\\3&4\end{pmatrix} + 0.5\begin{pmatrix}0\\1\end{pmatrix}\begin{pmatrix}14&16\end{pmatrix} = \begin{pmatrix}5.5&7\\1.5&2\end{pmatrix}+\begin{pmatrix}0&0\\7&8\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。</p>
 <p><b>KCP 分解的本地片段</b>：</p>
-<p>rank 1：$M累积_1=M_2 M_1=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}0.5&0\\0&1\end{pmatrix}=\begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$。$\tilde S_1$ 从 $0$ 起：第一步 $\tilde S_1^{(1)}=M_1\cdot 0+k_1 v_1^\top=\begin{pmatrix}1&2\\0&0\end{pmatrix}$；第二步 $\tilde S_1^{(2)}=M_2\tilde S_1^{(1)}+k_2 v_2^\top=\begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。故 $\tilde S_1=\begin{pmatrix}1&2\\3&4\end{pmatrix}$（与 $S_2$ 一致，因 $S_0=0$）。</p>
-<p>rank 2：$M累积_2=M_4 M_3=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}0.5&0\\0&1\end{pmatrix}=\begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$。$\tilde S_2$ 从 $0$ 起：第一步 $\tilde S_2^{(1)}=M_3\cdot 0+k_3 v_3^\top=\begin{pmatrix}5&6\\0&0\end{pmatrix}$；第二步 $\tilde S_2^{(2)}=M_4\tilde S_2^{(1)}+k_4 v_4^\top=\begin{pmatrix}5&6\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\7&8\end{pmatrix}=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。故 $\tilde S_2=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。</p>
-<p><b>prefix scan 重组</b>：$S_T^{[0]}=0$；$S_T^{[1]}=\tilde S_1+M累积_1\cdot 0=\begin{pmatrix}1&2\\3&4\end{pmatrix}$；$S_T^{[2]}=\tilde S_2+M累积_2\cdot S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+0.5I\cdot\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+\begin{pmatrix}0.5&1\\1.5&2\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。与 $S_4$ 一致，分解成立。</p>
-<p><b>对照：若误用 vanilla 线性注意力的直接求和</b>（错误做法）：$S_T^{[2]}\stackrel{?}{=}\tilde S_2+\tilde S_1=\begin{pmatrix}5&6\\7&8\end{pmatrix}+\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}6&8\\10&12\end{pmatrix}\neq\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。直接求和会得到错误结果，因为漏掉了 $M累积_2$ 对入状态的衰减作用。这就是"direct summation is insufficient for KDA"的数值体现。</p>
+<p>rank 1：$M_{T\leftarrow1}^{[1]}=M_2 M_1=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}0.5&0\\0&1\end{pmatrix}=\begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$。$\tilde S_T^{[1]}$ 从 $0$ 起：第一步 $\tilde S_1^{(1)}=M_1\cdot 0+\beta_1 k_1 v_1^\top=\begin{pmatrix}1&2\\0&0\end{pmatrix}$；第二步 $\tilde S_1^{(2)}=M_2\tilde S_1^{(1)}+\beta_2 k_2 v_2^\top=\begin{pmatrix}1&2\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\3&4\end{pmatrix}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$。故 $\tilde S_T^{[1]}=\begin{pmatrix}1&2\\3&4\end{pmatrix}$（与 $S_2$ 一致，因 $S_0=0$）。</p>
+<p>rank 2：$M_{T\leftarrow1}^{[2]}=M_4 M_3=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}\begin{pmatrix}0.5&0\\0&1\end{pmatrix}=\begin{pmatrix}0.5&0\\0&0.5\end{pmatrix}=0.5I$。$\tilde S_T^{[2]}$ 从 $0$ 起：第一步 $\tilde S_2^{(1)}=M_3\cdot 0+\beta_3 k_3 v_3^\top=\begin{pmatrix}5&6\\0&0\end{pmatrix}$；第二步 $\tilde S_2^{(2)}=M_4\tilde S_2^{(1)}+\beta_4 k_4 v_4^\top=\begin{pmatrix}5&6\\0&0\end{pmatrix}+\begin{pmatrix}0&0\\7&8\end{pmatrix}=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。故 $\tilde S_T^{[2]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}$。</p>
+<p><b>prefix scan 重组</b>：$S_T^{[0]}=0$；$S_T^{[1]}=\tilde S_T^{[1]}+M_{T\leftarrow1}^{[1]}\cdot 0=\begin{pmatrix}1&2\\3&4\end{pmatrix}$；$S_T^{[2]}=\tilde S_T^{[2]}+M_{T\leftarrow1}^{[2]}\cdot S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+0.5I\cdot\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+\begin{pmatrix}0.5&1\\1.5&2\end{pmatrix}=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。与 $S_4$ 一致，分解成立。</p>
+<p><b>对照：若误用 vanilla 线性注意力的直接求和</b>（错误做法）：$S_T^{[2]}\stackrel{?}{=}\tilde S_T^{[2]}+\tilde S_T^{[1]}=\begin{pmatrix}5&6\\7&8\end{pmatrix}+\begin{pmatrix}1&2\\3&4\end{pmatrix}=\begin{pmatrix}6&8\\10&12\end{pmatrix}\neq\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$。直接求和会得到错误结果，因为漏掉了 $M_{T\leftarrow1}^{[2]}$ 对入状态的衰减作用。这就是"direct summation is insufficient for KDA"的数值体现。</p>
 </details>
 
-<p>这个例子把 KCP 的两个关键点都展示了：$\tilde S$ 是本地从零算的状态片段，$M累积$ 是入状态要经过的衰减变换。两者分开计算、一次 all-gather 交换、prefix scan 重组，就能在不串行走完整序列的前提下恢复每段入状态。</p>
+<p>这个例子把 KCP 的两个关键点都展示了：$\tilde S_T^{[i]}$ 是本地从零算的状态片段，$M_{T\leftarrow1}^{[i]}$ 是入状态要经过的衰减变换。两者分开计算、一次 all-gather 交换、prefix scan 重组，就能在不串行走完整序列的前提下恢复每段入状态。</p>
 
-<p>本章讲了 KCP 的 $M+\tilde S$ 分解与固定通信量。但前三章的瓶颈都是利用并行，解码的瓶颈转为管理状态——下一章讲投影输入缓存如何支持投机解码的状态回滚。</p>
+<p>KCP 处理的是跨设备的并行度；到了解码阶段，瓶颈不再是并行，而是每步原地更新的状态如何在投机解码拒绝 draft token 后回退。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -506,7 +506,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
     <p>KCP 通信量为何与序列长度无关，与 softmax CP 对比；在手算例子中误用直接求和会得到什么结果。</p>
     <details>
       <summary>解答：固定大小片段一次 all-gather，直接求和数值错误</summary>
-      <p>KCP 只在一次 all-gather 中交换固定大小的状态片段（$S\in\mathbb{R}^{d_k\times d_v}$ 及同形状的 $M$，config.json 中约 32KB），与序列长度无关；softmax 注意力的 CP（如 Ring Attention）要交换随序列长度增长的 KV block。手算例子中误用直接求和得 $\tilde S_2+\tilde S_1=\begin{pmatrix}6&8\\10&12\end{pmatrix}$，而正确结果是 $\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$——错误在于漏掉了 $M累积_2$ 对入状态的衰减作用，正确做法多了 prefix scan 中应用累积转移这一步。</p>
+      <p>KCP 只在一次 all-gather 中交换固定大小的状态片段（状态 $\tilde S\in\mathbb{R}^{d_k\times d_v}$ 与累积转移 $M\in\mathbb{R}^{d_k\times d_k}$，K3 中 $d_k=d_v=128$ 故两者同尺寸，由 config.json 推得各约 32KB、合计约 64KB），与序列长度无关；softmax 注意力的 CP（如 Ring Attention）要交换随序列长度增长的 KV block。手算例子中误用直接求和得 $\tilde S_T^{[2]}+\tilde S_T^{[1]}=\begin{pmatrix}6&8\\10&12\end{pmatrix}$，而正确结果是 $\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$——错误在于漏掉了 $M_{T\leftarrow1}^{[2]}$ 对入状态的衰减作用，正确做法多了 prefix scan 中应用累积转移这一步。</p>
     </details>
   </li>
 </ol>
@@ -550,11 +550,11 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <h3 id="projection-cache">5.2 投影输入缓存：更小的载荷</h3>
 
-<p>K3 的关键观察是：<strong>任意接受前缀后的状态，由 draft token 的投影输入完全决定</strong>，而投影输入比状态小得多<sup>[C5]</sup>。这里的"投影输入"指 draft token 经过 $W_{q/k/v/\beta/\alpha}$ 投影后的 $q,k,v,\beta,\alpha$——它们是 KDA 前向的全部投影输入（$k,v,\beta,\alpha$ 用于状态更新 Eq.1，$q$ 用于输出计算 $o_t = S_t^\top q_t$）。KDA 更新是确定性的：给定相同输入序列，状态唯一。所以只要缓存了投影输入，就能在任何时候重新跑一遍递归，重建出任意接受前缀的状态。</p>
+<p>K3 的关键观察是：<strong>任意接受前缀后的状态，由 draft token 的投影输入完全决定</strong>，而投影输入比状态小得多<sup>[C5]</sup>。这里的"投影输入"指 draft token 经 $W_{q/k/v/\beta/\alpha}$ 投影得到的量，即 KDA 前向的投影输入 $q,k,v,\beta,\alpha$（$k,v,\beta,\alpha$ 用于状态更新 Eq.1，$q$ 用于输出计算 $o_t = S_t^\top q_t$）。KDA 更新是确定性的：给定相同输入序列，状态唯一。所以只要缓存了投影输入，就能在任何时候重新跑一遍递归，重建出任意接受前缀的状态。</p>
 
 <p>方案是<sup>[C5]</sup>：</p>
 <ol>
-  <li><strong>只缓存 draft token 的投影输入</strong>（不存状态快照）。投影输入比状态小——状态是 $d_k\times d_v$ 的矩阵，投影输入是几个 $d_k$ 维向量。</li>
+  <li><strong>只缓存 draft token 的投影输入</strong>（不存状态快照）。投影输入比状态小——状态是 $d_k\times d_v$ 的矩阵，投影输入是每个 token 的投影向量与门控标量。</li>
   <li>验证后，<strong>在片上（on-chip，SM 内）重建接受 token 的状态</strong>：用缓存的投影输入重跑 KDA 递归，从最后一个确定状态算到接受前缀的末尾。</li>
   <li><strong>写回已验证 token 和 bonus token 的状态</strong>，继续后续解码。</li>
 </ol>
@@ -567,7 +567,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
     </div>
     <div class="dg-layer">
       <span class="dg-layer-label">投影输入缓存</span>
-      <span class="dg-layer-body">K3 方案（流量小）：对 $t_1$ 至 $t_4$ 只存投影输入（几个 $d_k$ 维向量）；拒绝 $t_2$ 后，用缓存的投影输入在片上重跑递归、重建 $S_a$（接受前缀的状态）；流量 = draft 长度 × 投影输入大小，远小于状态</span>
+      <span class="dg-layer-body">K3 方案（流量小）：对 $t_1$ 至 $t_4$ 只存投影输入（每个 token 的投影向量）；拒绝 $t_2$ 后，用缓存的投影输入在片上重跑递归、重建 $S_a$（接受前缀的状态）；流量 = draft 长度 × 投影输入大小，远小于状态</span>
     </div>
   </div>
   <figcaption class="diagram-caption">上：朴素快照方案，状态流量被乘上 draft 长度；下：K3 的投影输入缓存方案，载荷更小且可重建任意接受前缀的状态。</figcaption>
@@ -579,7 +579,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <p>投影缓存<strong>不离开 decode 阶段</strong><sup>[C5]</sup>。这意味着前缀缓存和 prefill–decode 分离（PD 分离，把 prefill 和 decode 分到不同设备的部署方式）与非投机服务<strong>使用相同的载荷</strong>——K3 报告原文："Because the projection caches never leave the decode stage, prefix caching and prefill–decode disaggregation operate on the same payload as in non-speculative serving." 投机解码的回滚机制被完全封装在 decode kernel 内部，不污染上层服务架构。</p>
 
-<p>本章讲了投影输入缓存与片上重建。四套方案至此解完——下一章是来源与范围说明。</p>
+<p>各条论断的来源与适用范围如下。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -594,7 +594,7 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
     <p>状态快照方案为什么在大 batch 下不可接受，投影输入缓存为什么可行。</p>
     <details>
       <summary>解答：快照放大状态流量，投影输入小且可重建状态</summary>
-      <p>为每个 draft 位置存状态快照会把状态流量乘上 draft 长度，这一代价在在线服务的大 batch 下占主导。可行的替代：任意接受前缀后的状态由 draft token 的投影输入完全决定（KDA 更新是确定性的），而投影输入（$q,k,v,\beta,\alpha$ 等几个 $d_k$ 维向量）比 $d_k\times d_v$ 的状态矩阵小得多——只缓存投影输入，验证后在片上重跑递归即可重建接受 token 的状态并写回。</p>
+      <p>为每个 draft 位置存状态快照会把状态流量乘上 draft 长度，这一代价在在线服务的大 batch 下占主导。可行的替代：任意接受前缀后的状态由 draft token 的投影输入完全决定（KDA 更新是确定性的），而投影输入（$q,k,v,\beta,\alpha$ 等）比 $d_k\times d_v$ 的状态矩阵小得多——只缓存投影输入，验证后在片上重跑递归即可重建接受 token 的状态并写回。</p>
     </details>
   </li>
   <li>
@@ -610,33 +610,33 @@ $$S_T^{[i]} = \tilde S_T^{[i]} + \sum_{j=1}^{i-1}\left(\prod_{l=j+1}^{i} M_{T\le
 
 <h3>论断与来源（C）</h3>
 <p><sup>[C1]</sup> KDA 串行状态与 GPU 并行偏好冲突，四 regime 瓶颈不同：Kimi K3 Technical Report §5.1.1，原文 "The serial dependence of the KDA state is at odds with the GPU's preference for wide, uniform parallelism, and it manifests as a different bottleneck in each execution regime. We design a dedicated kernel for each regime."<br>
-<sup>[C2]</sup> FlashKDA 重叠 intra-chunk 计算与 cross-chunk 状态传播：K3 报告 §5.1.1，原文 "We therefore develop FlashKDA [14], a CUTLASS-based chunkwise kernel that overlaps intra-chunk computation with cross-chunk state propagation. The kernel decomposes the work into token-parallel stages and a head-parallel recurrence, each scheduled and tuned independently... FlashKDA serves both training and inference prefill and is auto-dispatched as a backend of flash-linear-attention [141]."<br>
+<sup>[C2]</sup> FlashKDA 重叠 intra-chunk 计算与 cross-chunk 状态传播：K3 报告 §5.1.1，原文 "We therefore develop FlashKDA, a CUTLASS-based chunkwise kernel that overlaps intra-chunk computation with cross-chunk state propagation. The kernel decomposes the work into token-parallel stages and a head-parallel recurrence, each scheduled and tuned independently... FlashKDA serves both training and inference prefill and is auto-dispatched as a backend of flash-linear-attention."<br>
 <sup>[C3]</sup> 设备内 CP 的段转移可独立于入状态计算、SM 级切序列、无跨设备通信：K3 报告 §5.1.1，原文 "Tensor parallelism partitions heads across devices but never shortens the recurrence... The key observation is that the state transition of each segment can be evaluated independently of the incoming state and composed exactly afterward. An automatic SM-level context-parallel (CP) planner... partitions the sequence across the SMs of a single rank, evaluates the segment transitions in parallel, and merges them to recover each segment's exact initial state. In contrast to the cross-device KCP of §5.1.2, this parallelism is entirely intra-device and incurs no cross-device communication."<br>
-<sup>[C4]</sup> KDA 的 $M_t$ 使直接求和失效，KCP 的 $M+\tilde S$ 分解 + prefix scan + 一次 all-gather + 固定通信量：K3 报告 §5.1.2，原文 "This direct summation, however, is insufficient for KDA. Recall from Eq. 1 that KDA updates its state as $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$, where $M_t := I - \beta_t k_t k_t^\top \mathrm{Diag}(\alpha_t)$. KDA's delta rule applies the token-dependent matrix $M_t$ to the incoming state before adding the current write. Consequently, the effect of a local sequence segment depends on the state entering that segment..." 与 "we introduce KDA Context Parallelism (KCP), which decomposes the effect of each segment into two locally computable quantities, a cumulative transition acting on the incoming state and a state generated locally from zero" 与 "KCP requires only a fixed-size all-gather for recurrent-state synchronization and achieves linear compute scaling."<br>
-<sup>[C5]</sup> 解码缓存投影输入而非状态，片上重建，与 ReplaySSM 并发提出，投影缓存不离开 decode 阶段：K3 报告 §5.4.2，原文 "the primary bottleneck shifts from exploiting parallelism to efficiently managing the evolving recurrent state, which is updated in place at every decoding step. This in-place update becomes problematic in MTP-based speculative decoding: if verification rejects a subset of the drafted tokens, the state has already advanced beyond the last accepted token and cannot be trivially rolled back. Maintaining a state snapshot for each draft position would enable rollback, but would also multiply state traffic... The state after any accepted draft prefix, however, is fully determined by the projected inputs of the draft tokens, which are far smaller than the state itself. We therefore cache only these projected inputs, rebuild the states of accepted tokens on-chip, and write back the states of the verified and bonus tokens, a design independently proposed in the concurrent work ReplaySSM [25]." 与 "Because the projection caches never leave the decode stage, prefix caching and prefill–decode disaggregation operate on the same payload as in non-speculative serving."</p>
+<sup>[C4]</sup> KDA 的 $M_t$ 使直接求和失效，KCP 的 $M+\tilde S$ 分解 + prefix scan + 一次 all-gather + 固定通信量：K3 报告 §5.1.2，原文 "This direct summation, however, is insufficient for KDA. Recall from Eq. 1 that KDA updates its state as $S_t = M_t S_{t-1} + \beta_t k_t v_t^\top$, where $M_t := (I - \beta_t k_t k_t^\top)\mathrm{Diag}(\alpha_t)$. KDA's delta rule applies the token-dependent matrix $M_t$ to the incoming state before adding the current write. Consequently, the effect of a local sequence segment depends on the state entering that segment..." 与 "we introduce KDA Context Parallelism (KCP), which decomposes the effect of each segment into two locally computable quantities, a cumulative transition acting on the incoming state and a state generated locally from zero" 与 "KCP requires only a fixed-size all-gather for recurrent-state synchronization and achieves linear compute scaling."<br>
+<sup>[C5]</sup> 解码缓存投影输入而非状态，片上重建，与 ReplaySSM 并发提出，投影缓存不离开 decode 阶段：K3 报告 §5.4.2，原文 "the primary bottleneck shifts from exploiting parallelism to efficiently managing the evolving recurrent state, which is updated in place at every decoding step. This in-place update becomes problematic in MTP-based speculative decoding: if verification rejects a subset of the drafted tokens, the state has already advanced beyond the last accepted token and cannot be trivially rolled back. Maintaining a state snapshot for each draft position would enable rollback, but would also multiply state traffic... The state after any accepted draft prefix, however, is fully determined by the projected inputs of the draft tokens, which are far smaller than the state itself. We therefore cache only these projected inputs, rebuild the states of accepted tokens on-chip, and write back the states of the verified and bonus tokens, a design independently proposed in the concurrent work ReplaySSM." 与 "Because the projection caches never leave the decode stage, prefix caching and prefill–decode disaggregation operate on the same payload as in non-speculative serving."</p>
 
 <h3>公式与来源（F）</h3>
 <p><sup>[F1]</sup> KDA 单步递归（Eq.1）：K3 报告 §2.1.1 Eq.1；由 <a href="../../wiki/kda/index.html">KDA 概念页</a> [F1] 完整讲解。本页引用不重推。<br>
-<sup>[F2]</sup> KCP 段效果分解（Eq.17）：K3 报告 §5.1.2 Eq.17。第一项 $\tilde S$ 是本地从零生成，第二项 $M累积\cdot S_{入}$ 是入状态经各 rank 本地 $M$ 累积传播。展开的求和形式（$S_T^{[i]}=\tilde S_T^{[i]}+\sum_{j}(\prod_l M)\tilde S_T^{[j]}$）由 Eq.17 第二行给出，依赖 rank 级更新的结合律。<br>
+<sup>[F2]</sup> KCP 段效果分解（Eq.17）：K3 报告 §5.1.2 Eq.17。第一项 $\tilde S_t^{[i+1]}$ 是本地从零生成，第二项 $M_{t\leftarrow1}^{[i+1]}S_T^{[i]}$ 是入状态经本地 $M$ 累积传播。展开的求和形式（$S_T^{[i]}=\tilde S_T^{[i]}+\sum_{j}(\prod_l M)\tilde S_T^{[j]}$）由 Eq.17 第二行给出，依赖 rank 级更新的结合律。<br>
 <sup>[F3]</sup> vanilla 线性注意力加性递归：K3 报告 §5.1.2 所述 "additive recurrence of vanilla linear attention"；由 <a href="../../wiki/linear-attention/index.html">线性注意力页</a>完整讲解。本页用于对照说明"为何可直接求和而 KDA 不可"。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p><sup>[N1]</sup> KDA 状态维度 $d_k=d_v=128$：K3 config.json。状态大小约 32KB（$128\times128\times2$ bytes，bf16）。<br>
+<p><sup>[N1]</sup> KDA 状态维度 $d_k=d_v=128$：K3 config.json。按 bf16（2 bytes/元素）估算，$128\times128$ 的状态约 32KB；精度为估算前提，config.json 与报告均未给出状态存储精度。<br>
 <sup>[N2]</sup> KDA head 数 96：K3 config.json。FlashKDA 的 head-parallel recurrence 以此为并行维度。<br>
 <sup>[N3]</sup> H100 SXM5 有 132 块 SM：NVIDIA H100 规格表。本页以 H100 为例说明 GPU 并行特性，非 K3 报告数据。<br>
-<sup>[N4]</sup> KDA 的 $\alpha$ 由 scaled sigmoid 产出，范围 $(e^{-5},1)$：K3 报告 §2.1.1。手算例子取 $\alpha=0.5$ 标量为教学构造，不代表真实范围。</p>
+<sup>[N4]</sup> KDA 的 $\alpha$ 由 scaled sigmoid 产出，范围 $(e^{-5},1)$：K3 报告 §2.1.1。手算例子取 $\mathrm{Diag}(\alpha_t)=I$（略去通道衰减）为教学构造，不代表真实范围。</p>
 
 <h3>构造示例</h3>
-<p>KCP 章的 2 rank × 2 token KDA 递归：$d_k=d_v=2$，教学构造 $\alpha=0.5$（标量，$\mathrm{Diag}(\alpha)=0.5I$）、$\beta=1$、单位向量 $k$。rank 1（token 1,2）：$k_1=(1,0),v_1=(1,2)$；$k_2=(0,1),v_2=(3,4)$。rank 2（token 3,4）：$k_3=(1,0),v_3=(5,6)$；$k_4=(0,1),v_4=(7,8)$。构造目的：让"不能直接求和"和"$M+\tilde S$ 分解"在 2×2 矩阵上手算可见，$M累积=0.5I$ 干净。不代表真实 K3 数值（K3 的 $\alpha$ 由 scaled sigmoid 产出、范围 $(e^{-5},1)$、$d_k=128$、96 head）。ground truth $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，KCP 分解重组后一致；误用直接求和得 $\begin{pmatrix}6&8\\10&12\end{pmatrix}$（错误）。</p>
+<p>KCP 章的 2 rank × 2 token KDA 递归：$d_k=d_v=2$，教学构造 $\mathrm{Diag}(\alpha_t)=I$（略去通道衰减）、标量 $\beta=0.5$、单位向量 $k$。rank 1（token 1,2）：$k_1=(1,0),v_1=(2,4)$；$k_2=(0,1),v_2=(6,8)$。rank 2（token 3,4）：$k_3=(1,0),v_3=(10,12)$；$k_4=(0,1),v_4=(14,16)$。构造目的：让"不能直接求和"和"$M+\tilde S$ 分解"在 2×2 矩阵上手算可见，$M_{T\leftarrow1}=0.5I$ 干净。不代表真实 K3 数值（K3 的 $\alpha$ 由 scaled sigmoid 产出、范围 $(e^{-5},1)$、$d_k=128$、96 head）。ground truth $S_4=\begin{pmatrix}5.5&7\\8.5&10\end{pmatrix}$，KCP 分解重组后一致；误用直接求和得 $\begin{pmatrix}6&8\\10&12\end{pmatrix}$（错误）。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>(1) "KDA 串行状态与 GPU 并行偏好冲突"是机制解释，服务"串行状态 vs GPU 并行"章。失效边界：冲突的前提是 KDA 用递归状态（$S_t$ 依赖 $S_{t-1}$）；若用 softmax 的 KV cache（无递归依赖），瓶颈形态完全不同。<br>
 (2) "FlashKDA 重叠两阶段"是工程解释，服务 FlashKDA 章。失效边界：重叠的前提是 chunkwise 形式成立（chunk 内并行、chunk 间递归）且 head 间递归独立；若递归本身不可分块或 head 间有依赖，重叠无从谈起。<br>
 (3) "段转移可独立于入状态计算"是机制解释，服务设备内 CP 与 KCP 章。失效边界：依赖 KDA 状态转移的线性性（$M_t$ 和加性项可分离）；若递归非线性使段转移不可分离，设备内 CP 和 KCP 的分解都不成立。<br>
-(4) "投影输入比状态小"是量级解释，服务 KDA 解码章。失效边界：投影输入是 $q,k,v,\beta,\alpha$ 等几个 $d_k$ 维向量，状态是 $d_k\times d_v$ 矩阵；具体比例依赖模型配置，本页只陈述"小得多"的定性结论，不引入未经证实的精确比例数字。</p>
+(4) "投影输入比状态小"是量级解释，服务 KDA 解码章。失效边界：投影输入是 $q,k,v,\beta,\alpha$ 等按 token 缓存的投影量，状态是 $d_k\times d_v$ 矩阵；具体比例依赖模型配置，本页只陈述"小得多"的定性结论，不引入未经证实的精确比例数字。</p>
 
 <h3>简化条件及其限制</h3>
-<p>(1) <strong>手算例子参数简化</strong>：取 $d_k=d_v=2$、标量 $\alpha$、单位 $k$，让矩阵运算手算可见。可推出：KCP 的 $M+\tilde S$ 分解在数值上成立、直接求和会得到错误结果。不可推出：真实 K3 数值（$d_k=128$、$\alpha$ 由 scaled sigmoid 产出、$k$ 经 L2Norm 单位化但非坐标轴向量）。<br>
+<p>(1) <strong>手算例子参数简化</strong>：取 $d_k=d_v=2$、$\mathrm{Diag}(\alpha_t)=I$（略去通道衰减）、标量 $\beta=0.5$、单位 $k$，让矩阵运算手算可见。可推出：KCP 的 $M+\tilde S$ 分解在数值上成立、直接求和会得到错误结果。不可推出：真实 K3 数值（$d_k=128$、$\alpha$ 由 scaled sigmoid 产出、$k$ 经 L2Norm 单位化但非坐标轴向量）。<br>
 (2) <strong>无伪代码与可运行代码</strong>：四套方案均以图示表达流程。可推出：每套方案的数据流与通信模式。不可推出：CUTLASS/分布式框架（flash-linear-attention、NCCL）层面的工程实现。<br>
 (3) <strong>CUTLASS/TMA/warp specialization 细节未展开</strong>：只点名 FlashKDA 是 CUTLASS-based。可推出：FlashKDA 通过 token-parallel 与 head-parallel 重叠两阶段。不可推出：tile 调度、warp 分工、TMA 异步搬运等 GPU 编程实现细节（<a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型页</a>已讲 SM/CTA/warp 层面）。<br>
 (4) <strong>MTP 投机解码最小解释</strong>：只用到 draft/verify/accept/reject/bonus 五个词汇。可推出：拒绝 draft token 时状态需要回滚、投影输入缓存如何支持回滚。不可推出：draft 模型架构、接受策略、bonus 生成的完整算法。<br>
