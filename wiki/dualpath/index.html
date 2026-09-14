@@ -74,7 +74,7 @@
 <p>Agentic LLM 推理为什么从计算瓶颈退化为存储 I/O 瓶颈？哪些独立因素叠加造就了 PD 分离下 prefill 引擎 storage NIC 的单点饱和？</p>
 <details>
 <summary>解答：三因素叠加：长上下文高命中率 + 硬件代际剪刀差 + PD 分离的存储网利用不均</summary>
-<p>答案是三个相互独立的因素共同造就。因素一：agentic 工作负载命中率 $\ge 95\%$，prefill 阶段从计算密集退化为 I/O 密集，DS V3.2 660B cache-compute ratio 约 22 GB/PFLOP，Qwen2.5-32B（FP16）更高达 117-267 GB/PFLOP。因素二：硬件代际差距——Ampere 到 Blackwell 期间，GPU FLOPS 增长 28.8× 而 PCIe 仅 2×、HBM 仅 2.4×，I/O-compute 比下降 14.4×。因素三：PD 分离架构把所有 KV-Cache 读取经 prefill 引擎，DE 的 storage NIC 完全闲置。三者叠加让 SNIC（节点存储网卡）单点饱和成为性能主导。完整论证在第一章。</p>
+<p>答案是三个相互独立的因素共同造就。因素一：agentic 工作负载命中率 $\ge 95\%$，prefill 阶段从计算密集退化为 I/O 密集，DS V3.2 660B cache-compute ratio 约 22 GB/PFLOP，Qwen2.5-32B（FP16）更高达 117-267 GB/PFLOP。因素二：硬件代际差距——Ampere 到 Blackwell 期间，GPU FLOPS 增长 28.8× 而 PCIe 仅 2×、HBM 仅 2.4×，I/O-compute 比下降 14.4×。因素三：PD 分离架构把所有 KV-Cache 读取经 prefill 引擎，DE 的 storage NIC 基本空闲（KV-Cache 读取带宽未被利用）。三者叠加让 SNIC（节点存储网卡）单点饱和成为性能主导。完整论证在第一章。</p>
 </details>
 </li>
 <li>
@@ -109,7 +109,7 @@
 </section>
 
 <div class="callout callout-blue">
-<p>贯穿示例：64K MaxLen、append 平均 429、命中率 98.7% 的 agent round，模型为 DS 660B、部署 2P4D（<b>构造示例</b>：按 64K 数据集平均 trajectory 取值，trace 单条 trajectory 包含约 32721 个 context token 与 429 个 append token、context 全 hit 时 hit 数 $\approx$ 32721、miss 数 = 429；为便于 P/D 区间与调度章节代入，该代表数字取 32721 hit + 429 miss，但凡涉及 "hit + miss" 之和与 trace 平均命中率，需按此口径理解）。在第一章里它是「为什么是 I/O 瓶颈」的具体场景；在第二章里它先后走 PE read path 与 DE read path；在第三章里它用于代入 $1/7 \le P/D \le 7/2$ 的典型区间；在第五章里它被分到 read_q 短、tok_e 小的 PE，DE 端走 Z 阈值下的低 token DE；在第六章里它对应 64K MAL / 1024 agents 下 1.87× 离线加速的每一条 trajectory。</p>
+<p>贯穿示例：64K MaxLen、append 平均 429、命中率 98.7% 的 agent round，模型为 DS 660B、部署 2P4D（<b>构造示例</b>：按 64K 数据集平均 trajectory 取值，trace 单条 trajectory 包含约 32721 个 context token 与 429 个 append token、context 全 hit 时 hit 数 $\approx$ 32721、miss 数 = 429；为便于 P/D 区间与调度章节代入，该代表数字取 32721 hit + 429 miss，但凡涉及 "hit + miss" 之和与 trace 平均命中率，需按此口径理解）。在第一章里它是「为什么是 I/O 瓶颈」的具体场景；在第二章里它先后走 PE read path 与 DE read path；在第三章里它用于代入 $1/7 \le P/D \le 7/2$ 的典型区间；在第五章里它被分到 read_q 短、tok_e 小的 PE，DE 端走 Z 阈值下的低 token DE；在第六章里它对应 DS 660B 离线实验最高（含 64K MAL 配置）1.87× 加速的每一条 trajectory。</p>
 </div>
 
 <h2 id="io-bottleneck">1. agentic 推理的存储 I/O 瓶颈由三因素叠加</h2>
@@ -155,11 +155,11 @@
 <p>这个分工决定了一个不对称：每次需要复用 KV-Cache 的请求，prefill 引擎都要从存储读回自己的 KV-Cache；DE 引擎在这个过程中完全没有承担任何 storage I/O。下图把这种不对称画成视觉对比：</p>
 
 <p><img src="assets/img-13.webp" alt="双路径动机：左 PE 100% 存储、40% GPU；右 DualPath 80% GPU、两侧 100% 存储"></p>
-<p><b>图（原文 Figure 1）</b>：左：现有 PD 分离架构，PE 节点 storage NIC 100% 饱和、GPU 利用率 40%，DE 节点 storage NIC 完全空闲。右：DualPath 双路径，让两侧 SNIC 都参与加载、把 GPU 利用率推回 80%。这是 DualPath 名字的由来——一条路径不够，要两条。</p>
+<p><b>图（原文 Figure 1）</b>：左：现有 PD 分离架构，PE 节点 storage NIC 100% 饱和、GPU 利用率 40%，DE 节点 storage NIC 基本空闲（KV-Cache 读取带宽未被利用）。右：DualPath 双路径，让两侧 SNIC 都参与加载、把 GPU 利用率推回 80%。名字对应两条 KV-Cache 加载路径（页面解释，论文未说明命名由来）。</p>
 
 <p>为什么以前没人加第二条路径？论文 §1 简要列了几条原因：Mooncake（FAST'25）走的是「DRAM 池」路线，把 KV-Cache 缓存到分布式 DRAM 再用亲和性调度提高命中率。但 DRAM 池在两类场景不适用：rollout 阶段（agentic RL 训练中的 trajectory 采样）DRAM 被训练状态占用；在在线服务下 working set 可以远超 DRAM 容量（论文 §8.2 给出 DS 660B 在 0.45 APS（每秒 agent 到达率）下 working set 达 681 GB），相对 SSD 不具备成本优势。Strata（论文 reference.bib 中条目为 @misc，无具体会议字段）在 §9 Related Work 段被列为相邻工作，走「层次化存储 + GPU 辅助 I/O 调度」路线；KVPR、TailorKV 同样在 §9 Related Work 段被列，走「单数据路径内压缩 / 重叠」路线——这些工作都未打破「只走一条 SNIC」这一根本假设。</p>
 
-<p>DualPath 的核心观察是：DE 节点的 storage NIC 是闲置的；compute NIC 在算子间突发之间也是相对空闲的；这两类闲置资源合起来足以承载第二条 KV-Cache 读取路径。问题是如何让这两类资源被利用而不在流量上把模型推理本身挤爆，这正是后文第五章要解决的。</p>
+<p>DualPath 的核心观察是：DE 节点的 storage NIC 是闲置的；compute NIC 在算子间突发之间也是相对空闲的；这两类闲置资源合起来足以承载第二条 KV-Cache 读取路径。问题是如何让这两类资源被利用而不在流量上把模型推理本身挤爆，这正是后文第四章要解决的。</p>
 
 <h3 id="chapter-1-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -213,9 +213,9 @@
 
 <p>转换关系简单：$n$ 个相邻 Layer Block 在内存布局上连续，可直接拼成一个 Full Block，避免运行时切块拷贝。论文把这个性质作为设计点（§A.5「KV-Cache Block Layout」）。</p>
 
-<p>存储端的 KV-Cache 索引用 trie 树：每个 trie 节点对应一个 Full Block（论文 §A.5 只说明这一存储结构与节点含义）。命中查询时，从请求的 prompt 前缀沿 trie 找到最长 hit 区间，再按 Full Block 读出——查询过程为辅助解释，论文未展开。这一设计沿用业界 prefix cache 的常规做法，但与 layerwise prefill 的耦合让 block_size 远小于传统非分层方案。</p>
+<p>存储端的 KV-Cache 索引用 trie 树：每个 trie 节点对应一个 Full Block（论文 §A.5 只说明这一存储结构与节点含义）。命中查询时，从请求的 prompt 前缀沿 trie 找到最长 hit 区间，再按 Full Block 读出——查询过程为辅助解释，论文未展开。trie 前缀匹配与业界 prefix cache 的常见做法一致，但这一说法是页面推断（论文未就此对比）；与 layerwise prefill 的耦合让 block_size 远小于传统非分层方案。</p>
 
-<p>PE/DE buffer 则是各引擎 host DRAM 上划出的小块缓存，承担两类中转：storage↔engine 之间（F-1、F-2 描述的每对 PE-DE 存储侧流量都先经过 buffer），以及 engine↔engine 之间（CNIC 的 RDMA 写入也要在 DRAM 上落一次）。论文 §4.1 Decode Phase 段解释：刻意不绕过 buffer 直接走 GPU Direct RDMA，是因为 TTFT 在 agentic 场景下占总时延比例不可忽略，buffer 可以减少 GPU 显存瞬时占用。让 H2D/D2H 也走 CNIC 是第五章流量隔离方案的组成部分（论文 §5 引言段）；这一联系由页面综合两处得出，§4.1 Decode Phase 段未作此表述。</p>
+<p>PE/DE buffer 则是各引擎 host DRAM 上划出的小块缓存，承担两类中转：storage↔engine 之间（F-1、F-2 描述的每对 PE-DE 存储侧流量都先经过 buffer），以及 engine↔engine 之间（CNIC 的 RDMA 写入也要在 DRAM 上落一次）。论文 §4.1 Decode Phase 段解释：刻意不绕过 buffer 直接走 GPU Direct RDMA，是因为 TTFT 在 agentic 场景下占总时延比例不可忽略，buffer 可以减少 GPU 显存瞬时占用。让 H2D/D2H 也走 CNIC 是第四章流量隔离方案的组成部分（论文 §5 引言段）；这一联系由页面综合两处得出，§4.1 Decode Phase 段未作此表述。</p>
 
 <h3 id="chapter-2-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -473,7 +473,7 @@
 <li>本组所有 DE 都不够 HBM 时停止 fetch</li>
 </ol>
 
-<p>Z 阈值取 1.05 倍均值来自论文 §6；把 5% 余量解释为容忍 HBM 碎片与估计误差是本文的推断，论文未说明 1.05 的取法。</p>
+<p>Z 阈值取 1.05 倍均值来自论文 §6；把 5% 余量解释为容忍 HBM 碎片与估计误差是页面的推断，论文未说明 1.05 的取法。</p>
 
 <h3 id="path-choice">5.4 KV-Cache 读路径选择</h3>
 
@@ -502,7 +502,7 @@
 <p>为什么 Z 阈值取 1.05 倍均值而不是 1.0？</p>
 <details>
 <summary>解答：留 5% 余量容忍 HBM 碎片与估计误差</summary>
-<p>HBM 分配并非完美连续——已分配的 KV-Cache 块在 HBM 中可能存在碎片，导致实际能装下的请求数低于「按总容量简单算」的结果。1.05 倍均值是本文为覆盖大多数碎片场景给出的解释（推断）。论文没有给出碎片对 Z 影响的精确分析，也未说明 1.05 的取法，因此该系数是工程经验值而非理论最优。</p>
+<p>HBM 分配并非完美连续——已分配的 KV-Cache 块在 HBM 中可能存在碎片，导致实际能装下的请求数低于「按总容量简单算」的结果。1.05 倍均值是页面为覆盖大多数碎片场景给出的解释（推断）。论文没有给出碎片对 Z 影响的精确分析，也未说明 1.05 的取法，因此该系数是工程经验值而非理论最优。</p>
 </details>
 </li>
 <li>
@@ -569,7 +569,7 @@
 <li>1.87× 是相对 Basic，不是相对 Oracle</li>
 </ul>
 
-<p>把贯穿示例代入：64K MAL / 1024 agents 下的 1.87× 加速意味着，把 1024 条含 hit token + miss token 的 trajectory 在同等硬件上从 $T$ 缩短到 $T/1.87$。cache-compute ratio 13-36 GB/PFLOP（DS V3.2 660B，Table 1）原本是 SNIC 单点饱和的量级；DualPath 把所有 6 个节点（2P4D）的 storage NIC 拉进加载后，每秒可加载的 KV-Cache 数据量从 Basic 的 2×400 Gbps（仅 PE 节点能加载）提升到 DualPath 的 6×400 Gbps（PE+DE 共 6 个节点都参与加载），I/O 等待时间相应缩短；DS 27B 1P1D 配置因总节点数仅 2 个，提升幅度受限。</p>
+<p>把贯穿示例代入：DS 660B 离线实验最高（含 64K MAL 配置）1.87× over Basic 的加速意味着，把 1024 条含 hit token + miss token 的 trajectory 在同等硬件上从 $T$ 缩短到 $T/1.87$。cache-compute ratio 13-36 GB/PFLOP（DS V3.2 660B，Table 1）原本是 SNIC 单点饱和的量级；DualPath 把所有 6 个节点（2P4D）的 storage NIC 拉进加载后，每秒可加载的 KV-Cache 数据量从 Basic 的 2×400 Gbps（仅 PE 节点能加载）提升到 DualPath 的 6×400 Gbps（PE+DE 共 6 个节点都参与加载），I/O 等待时间相应缩短；DS 27B 1P1D 配置因总节点数仅 2 个，提升幅度受限。</p>
 
 <h3 id="append-gen">6.3 append / generation 长度敏感性</h3>
 
@@ -684,7 +684,7 @@
 
 <p><b>存储 I/O 不再是 PD 分离的瓶颈</b>。在 dual-path + scheduling 的组合下，原本被 prefill 引擎独占的 storage NIC 带宽被扩到全集群所有节点，agentic 推理的 I/O 等待时间被显著压低。1152 GPU 大规模下做到近线性扩展（48P96D vs 2P4D，agent 数 24× 而 JCT 几乎不变）。</p>
 
-<p><b>给出可证明的 P/D 区间</b>。第四章的不等式推导不是经验调参，而是从 PCIe/CNIC/DRAM 三个物理约束反推的充分条件，可直接用于判断集群配置是否落在覆盖范围内（典型 g=8、s=1 下 $1/7 \le P/D \le 7/2$ 覆盖大多数现实部署）。</p>
+<p><b>给出可证明的 P/D 区间</b>。第三章的不等式推导不是经验调参，而是从 PCIe/CNIC/DRAM 三个物理约束反推的充分条件，可直接用于判断集群配置是否落在覆盖范围内（典型 g=8、s=1 下 $1/7 \le P/D \le 7/2$ 覆盖大多数现实部署）。</p>
 
 <p><b>可复现的 NIC QoS 配置</b>。InfiniBand 四 VL 配置（<code>qos_high_limit=240</code>、<code>vlarb_high/low</code> 权重）与 RoCE DSCP→TC 映射方案都被具体给出，生产部署可以直接照搬。</p>
 
@@ -752,7 +752,7 @@
 <p>F-1/F-2（每对 PE-DE 流量基本单元）：§4.2 Traffic per PE-DE pair 段。F-3 至 F-12（CNIC/PCIE/DRAM 推导）：§4.2 PE CNIC Bandwidth、DE CNIC Bandwidth、DRAM Pressure、Summary 各段。F-13（Z 阈值）：§6 DE Scheduling Phase 2 段。F-14（working set 估算）：§8.2 Working Set Analysis 段。</p>
 
 <h3>外部数字与实验条件</h3>
-<p>N-1 至 N-26 全部来自论文正文或 Appendix §A；具体实验条件（数据集 500 trajectories、3FS 存储、8×Hopper GPU/节点、IB 400 Gbps CNIC + 1×400 Gbps SNIC、P/D 默认 2P4D/1P2D/1P1D）见 §7.2 Testbed 与 §A.4 Configuration Parameters 段。</p>
+<p>页面 N 编号论断均来自论文正文或 Appendix §A；具体实验条件（数据集 500 trajectories、3FS 存储、8×Hopper GPU/节点、IB 400 Gbps CNIC + 1×400 Gbps SNIC、P/D 默认 2P4D/1P2D/1P1D）见 §7.2 Testbed 与 §A.4 Configuration Parameters 段。</p>
 
 <h3>原图与原文对应</h3>
 <p>页面内嵌的 14 张原图与原文 Figure 编号一一对应：motivation=Fig.3、teaser=Fig.1、dataflow_peread/ceread=Fig.4（左/右子图）、intrasched=Fig.6、rollout_combined=Fig.7、27b_rollout_diffpd=Fig.8、660b_rollout_var_append=Fig.9、660b-27b-serving-aps=Fig.10、660b_serving_breakdown=Fig.12、serving-aps-avg-jct=Fig.11、read_lb=Fig.13、attn_lb=Fig.14、largescale_rollout=Fig.15。Fig.2 (workload) 与 Fig.5 (intersched) 不在页面复用：trajectory 用文字描述、inter-sched 调度逻辑由 Algorithm 1 伪代码 + 文字承载。全部图片存于本页 assets/ 目录，页面可离线浏览。</p>
@@ -761,13 +761,13 @@
 <p>页面第七章（方法评价）整体是分析性判断，开头已用 callout 标记「不是论文的结论」。其他章节均为论文事实的直接陈述，附原文定位。少数边界性论断（如「DualPath 在非 agentic 场景收益有限」）在正文中标注为推断而非事实。</p>
 
 <h3>构造示例</h3>
-<p>Algorithm 1 伪代码完全照搬论文 §6 Algorithm 1，仅作为表述算法流程使用，未声明为可运行代码。$Z = 1.05 \times \text{平均}$ 的 $1.05$ 系数来自论文正文，本文将其含义解释为「留 5% 余量容忍 HBM 碎片与估计误差」（推断），论文未给出推导。贯穿示例 64K MaxLen/append 429/32721 hit + 429 miss 是人为设定的最小直接代入（论文 trace 平均 append 429、context 32721；为便于 P/D 区间与调度章节代入，统一采用 32721 hit + 429 miss 作为代表数字，命中率 1 − 429/32721 $\approx 98.7\%$ 与 trace 一致），与论文 trace 数字部分对应、部分构造。</p>
+<p>Algorithm 1 伪代码完全照搬论文 §6 Algorithm 1，仅作为表述算法流程使用，未声明为可运行代码。$Z = 1.05 \times \text{平均}$ 的 $1.05$ 系数来自论文正文，页面将其含义解释为「留 5% 余量容忍 HBM 碎片与估计误差」（推断），论文未给出推导。贯穿示例 64K MaxLen/append 429/32721 hit + 429 miss 是人为设定的最小直接代入（论文 trace 平均 append 429、context 32721；为便于 P/D 区间与调度章节代入，统一采用 32721 hit + 429 miss 作为代表数字，命中率 1 − 429/32721 $\approx 98.7\%$ 与 trace 一致），与论文 trace 数字部分对应、部分构造。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>「第二个 storage NIC」与「compute NIC 闲置资源」是辅助解释，不是论文术语；论文严格用 SNIC 与 CNIC。「双路径」是中文翻译，论文英文是「dual-path」。「PD 分离」中文用，全称 Prefill-Decode Disaggregation，<a href="../../wiki/moe-serving/index.html#s5-prefill-decode-kvcache">moe-serving §5</a> 给出背景。</p>
 
 <h3>简化条件及其限制</h3>
-<p>页面推导假设 PCIe 拓扑良好、调度均衡、计算网无拥塞、存储读带宽饱和（§4.2 引言），这些假设在生产集群上需要验证。第四章的不等式推导是「无新瓶颈」的充分条件，不是「能工作」的必要条件——实际可能存在区间外仍能工作的情况。第五章 vlarb 权重配置按实测给出（§A.1），不同 NIC 厂商或固件版本下可能需要调整。第七章的「解决了什么 / 没解决什么」边界基于论文 §1-9 已陈述内容；论文未做的实验（如非 agentic 工作负载）结论只能由读者自行外推。</p>
+<p>页面推导假设 PCIe 拓扑良好、调度均衡、计算网无拥塞、存储读带宽饱和（§4.2 引言），这些假设在生产集群上需要验证。第三章的不等式推导是「无新瓶颈」的充分条件，不是「能工作」的必要条件——实际可能存在区间外仍能工作的情况。第四章 vlarb 权重配置按实测给出（§A.1），不同 NIC 厂商或固件版本下可能需要调整。第七章的「解决了什么 / 没解决什么」边界基于论文 §1-9 已陈述内容；论文未做的实验（如非 agentic 工作负载）结论只能由读者自行外推。</p>
 
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

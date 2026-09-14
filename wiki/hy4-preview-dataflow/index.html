@@ -106,7 +106,7 @@
     <tr><td>FFN 分布</td><td>第 0 层 dense（中间维 18432），其余 77 层 MoE</td><td><code>mlp_layer_types</code>；张量头仅首层有 <code>mlp.gate_proj</code>，其余层有 <code>mlp.experts.*</code></td></tr>
     <tr><td>隐藏维 / 头数</td><td>6144 / 64 头</td><td><code>hidden_size</code> / <code>num_attention_heads</code></td></tr>
     <tr><td><a href="../mla/">MLA</a> 维度</td><td>q_lora 2048；kv_lora 512；键头维 $192{+}64$；值头维 256</td><td>张量头印证：<code>q_b_proj</code> [16384, 2048] $=64\times256$、<code>kv_b_proj</code> [28672, 512] $=64\times(192{+}256)$、<code>kv_a_proj_with_mqa</code> [576, 6144] $=512{+}64$</td></tr>
-    <tr><td>DSA 索引器</td><td>32 头 × 128 维（64 维过 + 64 维旋转），top-2048，打分全程 fp32</td><td><code>index_n_heads</code> / <code>index_head_dim</code> / <code>index_topk</code>；<code>wq_b</code> [4096, 2048] $=32\times128$</td></tr>
+    <tr><td>DSA 索引器</td><td>32 头 × 128 维（64 维过 + 64 维旋转），top-2048；transformers 参考实现按 fp32 打分</td><td><code>index_n_heads</code> / <code>index_head_dim</code> / <code>index_topk</code>；<code>wq_b</code> [4096, 2048] $=32\times128$</td></tr>
     <tr><td>full / shared 索引层</td><td>full 21 层：0, 1, 5, 9, …, 77；其余 57 层 shared 复用</td><td><code>indexer_types</code>；张量头 <code>indexer.*</code> 恰 21 层（另有 MTP 1 层）</td></tr>
     <tr><td>MoE</td><td>256 路由专家 top-8 + 1 共享专家，中间维均 2048</td><td><code>n_routed_experts</code> / <code>num_experts_per_tok</code> / <code>n_shared_experts</code>；<code>experts.gate_up_proj</code> [256, 4096, 6144]</td></tr>
     <tr><td>路由细节</td><td>sigmoid 打分 + 加性偏置选择；选中项归一化后整体 ×2.827</td><td><code>routed_scaling_factor</code> / <code>norm_topk_prob</code>；<code>n_group=1</code>、<code>topk_group=1</code> 使分组路由退化为无组限制</td></tr>
@@ -187,11 +187,11 @@
   <tr><td>q_a_proj → RMSNorm<br>→ q_b_proj</td><td><code>[1,T,6144] -&gt; [1,T,64,256]</code></td><td>$q = W_{qb}\,\mathrm{RMSNorm}(W_{qa}\tilde{x})$</td><td>查询低秩通道：6144 → 2048（RMSNorm）→ 64×256。真实权重 q_a_proj [2048,6144]、q_b_proj [16384,2048]。</td></tr>
   <tr><td>每头切分<br>[192 nope | 64 rope]</td><td><code>[1,T,64,256] -&gt; [·,192]+[·,64]</code></td><td>$\mathrm{nope} \,|\, \mathrm{rope}$</td><td>与索引器的 [64|64] 切分同构，旋转部分占尾部 64 维。</td></tr>
   <tr><td>kv_a_proj_with_mqa<br>6144 → 576</td><td><code>[1,T,6144] -&gt; [1,T,576]</code></td><td>$c = [c_{lat};\ k_{rope}] = W_{kva}\tilde{x}$</td><td>一次投影出 512 维潜向量 + 64 维共享旋转键。真实权重 kv_a_proj_with_mqa [576, 6144]。</td></tr>
-  <tr><td>kv_a_LN → kv_b_proj<br>512 → 64×448</td><td><code>[1,T,512] -&gt; k_nope[64,T,192] + v[64,T,256]</code></td><td>$W_{kvb}\,\mathrm{RMSNorm}(c_{lat})$</td><td>潜向量展开：每个头得到 192 维 nope 键与 256 维值。真实权重 kv_b_proj [28672, 512] = 64×448。旋转键 64 维所有头共享同一份。</td></tr>
+  <tr><td>kv_a_RMSNorm → kv_b_proj<br>512 → 64×448</td><td><code>[1,T,512] -&gt; k_nope[64,T,192] + v[64,T,256]</code></td><td>$W_{kvb}\,\mathrm{RMSNorm}(c_{lat})$</td><td>潜向量展开：每个头得到 192 维 nope 键与 256 维值。真实权重 kv_b_proj [28672, 512] = 64×448。旋转键 64 维所有头共享同一份。</td></tr>
   <tr><td>RoPE（64 维）<br>theta = 1e7</td><td><code>[·,·,·,64]</code></td><td>$\text{交错配对（见第 4 章）}$</td><td>只作用于每头尾部 64 维。checkpoint 的配对方式为交错（vLLM/SGLang 口径）；transformers 参考实现为半分式。</td></tr>
   <tr><td>KV cache<br>两种口径</td><td><code>展开 64×(256+256) 或潜向量 576</code></td><td>$32768\ \text{vs}\ 576\ \mathrm{elems/token/layer}$</td><td>transformers eager 缓存展开后的 K/V（每 token 每层 65536 B）；vLLM 缓存潜向量（1152 B）+ 常驻 per-head sink，56.89 倍差距。点击下钻对比。</td></tr>
   <tr><td>logits + 稀疏掩码<br>按 0.0625 缩放</td><td><code>q[64,T,256] k[64,T,256] -&gt; [64,T,T]</code></td><td>$\mathrm{logits} = qk^\top/\sqrt{256} + M_{causal} + M_{topk}$</td><td>缩放 0.0625。top-k 掩码把索引器未选中的位置填 dtype 最小值。</td></tr>
-  <tr><td>拼接 sink → softmax<br>去掉 sink 列</td><td><code>[64,T,T+1] -&gt; [64,T,T]</code></td><td>$P = \mathrm{softmax}([\mathrm{logits}; s_h])[:T]$</td><td>每头一个可学习 sink 标量拼到行尾，softmax 后丢掉该列——sink 只进分母，吸收概率质量使行和 &lt; 1。等比模型实测（sink 初始 0）：吸收质量 mean 0.121 / max 0.502。真实权重第 0 层 sink 均值 0.384（范围 [-6.54, 3.18]）。</td></tr>
+  <tr><td>拼接 sink → softmax<br>去掉 sink 列</td><td><code>[64,T,T+1] -&gt; [64,T,T]</code></td><td>$P = \mathrm{softmax}([\mathrm{logits}; s_h])[:T]$</td><td>每头一个可学习 sink 标量拼到行尾，softmax 后丢掉该列——sink 只进分母，吸收概率质量使行和 &lt; 1。等比模型实测（sink 初始 0）：吸收质量 mean 0.121 / max 0.502。真实权重第 0 层 sink 均值 0.384（范围 [-6.54, 3.17]）。</td></tr>
   <tr><td>P · V<br>→ 逐元素门 → o_proj</td><td><code>[64,T,256] -&gt; [1,T,6144]</code></td><td>$o = (P\,V) \odot \sigma(W_g\tilde{x}),\ y = W_o\,o$</td><td>注意力输出乘门后过 o_proj [6144, 16384]。等比模型全链路独立复算与官方输出最大差为 0。</td></tr>
   </table>
   <p>边：x→gate（6144）；x→qa（6144）；qa→qsplit（[·,256]）；x→kva（6144）；kva→kvb（512）；qsplit→rope（64）；kva→rope（64）；rope→logits（q,k）；kvb→logits（k_nope）；kvb→av（V）；cache→logits（读回 K）；logits→sink（[64,T,T]）；sink→av（P）；gate→av（逐元素门）；av→x（输出 y）</p>
@@ -275,7 +275,7 @@
   <ul>
     <li><b>独立的轻量投影</b>：查询走 $W_{q\_a}\to\mathrm{RMSNorm}\to W_{wq\_b}$（2048 $\to$ $32\times128$），复用主注意力的 q_a 通道但 wq_b 独立；键走 $W_{wk}$（6144 $\to$ 128）加 LayerNorm。键只有一个头，32 个查询头共享。</li>
     <li><b>头内切分是「过 + 旋转」</b>：每头 128 维切 [64 维过 | 64 维旋转]，与主 MLA 的 [192 nope | 64 rope] 同构，旋转部分都占头维的尾部。</li>
-    <li><b>打分公式</b>（全程 fp32，含 ReLU）：
+    <li><b>打分公式</b>（transformers 参考实现按 fp32 打分，含 ReLU）：
       $$\text{index\_score}_{s,t} = \sum_{h=1}^{32} \frac{(W_{proj}x_s)_h}{\sqrt{32}}\cdot\frac{1}{\sqrt{128}}\cdot \mathrm{ReLU}\big(q_{s,h}\cdot k_t\big)$$
       其中 $W_{proj}$ 是 <code>weights_proj</code>（6144 → 32）。ReLU 让单个头的负相关无法抵消其他头的正相关。等比缩小模型实测：头分数矩阵中精确为 0 的比例 47.8%，聚合分数中正数占 23.4%。</li>
     <li><b>top-k 取 min(2048, 可见长度)</b>：短序列时退化为全可见，不发生稀疏化。因果性通过给不可见位置加 $-\infty$ 掩码保证，因此 top-k 不会选出未来 token。</li>
@@ -290,7 +290,7 @@
     <li><b>logits 与稀疏掩码</b>：$\mathrm{logits} = qk^\top/\sqrt{256}$（缩放因子 $=qk\_head\_dim^{-1/2}=0.0625$），再叠加因果掩码与索引器 top-k 掩码（非选中位置填 dtype 最小值）。</li>
     <li><b>sink 只进分母</b>：每头一个可学习标量 $s_h$ 拼到 logits 行尾，
       $$P = \mathrm{softmax}\big([\,\mathrm{logits}-\max;\; s_h-\max\,]\big)[\,:\,:\,T\,]$$
-      输出丢掉 sink 列，行和小于 1，缺口就是 sink 吸收的概率质量。初始 $s_h=0$ 时它不是常数 1 的等价物——等比缩小模型实测（24 token、随机权重）：sink 吸收质量 min 0.059 / mean 0.121 / max 0.502，即 sink 为零时仍平均吃掉 12% 的注意力质量。真实权重的 sink 已大幅训练：第 0 层均值 0.384（范围 $[-6.54, 3.18]$）、第 40 层 0.666、第 77 层 $-0.022$。</li>
+      输出丢掉 sink 列，行和小于 1，缺口就是 sink 吸收的概率质量。初始 $s_h=0$ 时它不是常数 1 的等价物——等比缩小模型实测（24 token、随机权重）：sink 吸收质量 min 0.059 / mean 0.121 / max 0.502，即 sink 为零时仍平均吃掉 12% 的注意力质量。真实权重的 sink 已大幅训练：第 0 层均值 0.384（范围 $[-6.54, 3.17]$）、第 40 层 0.666、第 77 层 $-0.022$。</li>
     <li><b>逐元素 sigmoid 门</b>：注意力输出先乘 $\sigma(W_g x)$（$64\times256$ 维独立门）再过 o_proj。等比模型实测门值 min 0.389 / max 0.615 / mean 0.500。该门为逐元素门（输出宽度 $64\times256$），不是每头一个标量——<code>linear_gate.weight</code> [16384, 6144] 印证。</li>
     <li><b>全链路对撞</b>：q/kv 投影、展开、掩码、sink softmax、门、o_proj 的独立复算与官方实现输出最大绝对差 0（等比模型）；eager 返回的注意力概率矩阵也逐位一致。</li>
   </ul>
@@ -339,8 +339,8 @@
     <tr><td>transformers <code>hy_v4</code> 参考实现</td><td>半分式（<code>rotate_half</code>）</td><td><code>modeling_hy_v4.py</code> 的 <code>apply_rotary_pos_emb</code></td></tr>
     <tr><td>transformers <code>deepseek_v2</code>（血统参照）</td><td>交错（<code>view_as_complex</code> 相邻配对）</td><td><code>modeling_deepseek_v2.py</code> 的 <code>apply_rotary_emb</code></td></tr>
   </table>
-  <p>三方一致的部署实现（vLLM、SGLang）都按交错消费这份 checkpoint，且 hub 官方 README 的部署指引只覆盖这两者；transformers 的 hy_v4 参考实现用半分式，与 checkpoint 的实际布局不匹配，直接加载需要先做旋转维的权重置换——hub 仓库没有提供该转换脚本。DeepSeek 系参考实现（deepseek_v2）用交错，说明半分式是 hy_v4 参考实现的偏离而非血统传统。</p>
-  <div class="note">本节的证据性质是源码与张量结构级的交叉核对（三个实现的 RoPE 应用代码 + checkpoint 张量布局），不是端到端数值对撞——后者需要在部署框架里跑真实权重，本机不可行。结论按「官方部署路径的实现一致性」给出。</div>
+  <p>两个官方部署实现（vLLM、SGLang）都按交错消费这份 checkpoint，且 hub 官方 README 的部署指引只覆盖这两者；transformers 的 hy_v4 参考实现用半分式，与 checkpoint 的实际布局不匹配，直接加载需要先做旋转维的权重置换——hub 仓库没有提供该转换脚本。DeepSeek 系参考实现（deepseek_v2）用交错，说明半分式是 hy_v4 参考实现的偏离而非血统传统。</p>
+  <div class="note">这些结论的证据性质是源码与张量结构级的交叉核对（三个实现的 RoPE 应用代码 + checkpoint 张量布局），不是端到端数值对撞——后者需要在部署框架里跑真实权重，本机不可行。结论按「官方部署路径的实现一致性」给出。</div>
 
   <h3>checkpoint 是 vLLM 命名的 inner 格式</h3>
   <ul>
@@ -665,11 +665,11 @@ mla: {
     qa:   {label:'q_a_proj → RMSNorm\n→ q_b_proj', t:'qsa', io:'[1,T,6144] -> [1,T,64,256]', f:'q = W_{qb}\\,\\mathrm{RMSNorm}(W_{qa}\\tilde{x})', d:'查询低秩通道：6144 → 2048（RMSNorm）→ 64×256。真实权重 q_a_proj [2048,6144]、q_b_proj [16384,2048]。'},
     qsplit:{label:'每头切分\n[192 nope | 64 rope]', t:'qsa', io:'[1,T,64,256] -> [·,192]+[·,64]', f:'\\mathrm{nope} \\,|\\, \\mathrm{rope}', d:'与索引器的 [64|64] 切分同构，旋转部分占尾部 64 维。'},
     kva:  {label:'kv_a_proj_with_mqa\n6144 → 576', t:'qsa', io:'[1,T,6144] -> [1,T,576]', f:'c = [c_{lat};\\ k_{rope}] = W_{kva}\\tilde{x}', d:'一次投影出 512 维潜向量 + 64 维共享旋转键。真实权重 kv_a_proj_with_mqa [576, 6144]。'},
-    kvb:  {label:'kv_a_LN → kv_b_proj\n512 → 64×448', t:'qsa', io:'[1,T,512] -> k_nope[64,T,192] + v[64,T,256]', f:'W_{kvb}\\,\\mathrm{RMSNorm}(c_{lat})', d:'潜向量展开：每个头得到 192 维 nope 键与 256 维值。真实权重 kv_b_proj [28672, 512] = 64×448。旋转键 64 维所有头共享同一份。'},
+    kvb:  {label:'kv_a_RMSNorm → kv_b_proj\n512 → 64×448', t:'qsa', io:'[1,T,512] -> k_nope[64,T,192] + v[64,T,256]', f:'W_{kvb}\\,\\mathrm{RMSNorm}(c_{lat})', d:'潜向量展开：每个头得到 192 维 nope 键与 256 维值。真实权重 kv_b_proj [28672, 512] = 64×448。旋转键 64 维所有头共享同一份。'},
     rope: {label:'RoPE（64 维）\ntheta = 1e7', t:'qsa', io:'[·,·,·,64]', f:'\\text{交错配对（见第 4 章）}', d:'只作用于每头尾部 64 维。checkpoint 的配对方式为交错（vLLM/SGLang 口径）；transformers 参考实现为半分式。'},
     cache:{label:'KV cache\n两种口径', t:'buf', drill:'cache', io:'展开 64×(256+256) 或潜向量 576', f:'32768\\ \\text{vs}\\ 576\\ \\mathrm{elems/token/layer}', d:'transformers eager 缓存展开后的 K/V（每 token 每层 65536 B）；vLLM 缓存潜向量（1152 B）+ 常驻 per-head sink，56.89 倍差距。点击下钻对比。'},
     logits:{label:'logits + 稀疏掩码\n按 0.0625 缩放', t:'qsa', io:'q[64,T,256] k[64,T,256] -> [64,T,T]', f:'\\mathrm{logits} = qk^\\top/\\sqrt{256} + M_{causal} + M_{topk}', d:'缩放 0.0625。top-k 掩码把索引器未选中的位置填 dtype 最小值。'},
-    sink: {label:'拼接 sink → softmax\n去掉 sink 列', t:'gt', io:'[64,T,T+1] -> [64,T,T]', f:'P = \\mathrm{softmax}([\\mathrm{logits}; s_h])[:T]', d:'每头一个可学习 sink 标量拼到行尾，softmax 后丢掉该列——sink 只进分母，吸收概率质量使行和 < 1。等比模型实测（sink 初始 0）：吸收质量 mean 0.121 / max 0.502。真实权重第 0 层 sink 均值 0.384（范围 [-6.54, 3.18]）。'},
+    sink: {label:'拼接 sink → softmax\n去掉 sink 列', t:'gt', io:'[64,T,T+1] -> [64,T,T]', f:'P = \\mathrm{softmax}([\\mathrm{logits}; s_h])[:T]', d:'每头一个可学习 sink 标量拼到行尾，softmax 后丢掉该列——sink 只进分母，吸收概率质量使行和 < 1。等比模型实测（sink 初始 0）：吸收质量 mean 0.121 / max 0.502。真实权重第 0 层 sink 均值 0.384（范围 [-6.54, 3.17]）。'},
     av:   {label:'P · V\n→ 逐元素门 → o_proj', t:'qsa', io:'[64,T,256] -> [1,T,6144]', f:'o = (P\\,V) \\odot \\sigma(W_g\\tilde{x}),\\ y = W_o\\,o', d:'注意力输出乘门后过 o_proj [6144, 16384]。等比模型全链路独立复算与官方输出最大差为 0。'},
   },
   edges:[

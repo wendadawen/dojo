@@ -68,7 +68,7 @@
 <p><b>主要依据</b>：Schlag, Irie & Schmidhuber, ICML 2021（arXiv:2102.11174）首次将 delta rule 引入线性 Transformer 并提出 Delta Network；Yang, Wang, Zhang, Shen & Kim, NeurIPS 2024（arXiv:2406.06484）给出 DeltaNet 的并行训练算法并扩展到 1.3B / 100B tokens；Yang, Kautz & Hatamizadeh, ICLR 2025（arXiv:2412.06464）提出 Gated DeltaNet。第 5 章的现实应用与工程实现另引 Kimi K3 技术报告（arXiv:2607.24653）与 flash-linear-attention 开源库。表号、式号与小节号均按 arXiv:2406.06484 v3 与 arXiv:2412.06464 v3 标注。</p>
 </blockquote>
 
-<p>当一个语言模型需要在 10 万 token 的对话里“记住”前面写过的某个人名，标准 Transformer 把所有历史塞进 KV cache（显存随长度线性增长），线性注意力把它们压成一个固定大小的矩阵状态（省显存但记不清）。后者为什么会“记不清”？能不能既保留固定大小状态、又记得清？Delta 规则就是回答后一半问题的递归更新规则。Delta 规则与 DeltaNet 属于线性注意力 / 线性 RNN 家族，前置概念为 <a href="../../wiki/linear-attention/index.html">线性注意力</a>，现实应用如 Kimi K3 的 KDA（Kimi Delta Attention）<sup>[C9]</sup>；讨论范围限于规则本身，KDA 架构不展开。</p>
+<p>当一个语言模型需要在 10 万 token 的对话里"记住"前面写过的某个人名，标准 Transformer 把所有历史塞进 KV cache（显存随长度线性增长），线性注意力把它们压成一个固定大小的矩阵状态（省显存但记不清）。后者为什么会"记不清"？能不能既保留固定大小状态、又记得清？Delta 规则就是回答后一半问题的递归更新规则。Delta 规则与 DeltaNet 属于线性注意力 / 线性 RNN 家族，前置概念为 <a href="../../wiki/linear-attention/index.html">线性注意力</a>，现实应用如 Kimi K3 的 KDA（Kimi Delta Attention）<sup>[C9]</sup>；讨论范围限于规则本身，KDA 架构不展开。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -115,7 +115,7 @@
   <h2>最容易误解</h2>
   <ul>
     <li>把 DeltaNet 的 delta 规则当成训练阶段的 Widrow-Hoff delta rule —— 形式同构但作用对象不同：经典 delta rule 修改参数权重，DeltaNet delta rule 修改前向记忆矩阵状态。</li>
-    <li>认为 delta 规则“完全擦除”旧 key-value 对 —— 完全擦除的条件是 $\beta_t\|k_t\|^2 = 1$（归一化 key 下即 $\beta_t = 1$）；其余情况是新旧值的加权插值。</li>
+    <li>认为 delta 规则"完全擦除"旧 key-value 对 —— 完全擦除的条件是 $\beta_t\|k_t\|^2 = 1$（归一化 key 下即 $\beta_t = 1$）；其余情况是新旧值的加权插值。</li>
     <li>认为 $I - \beta k k^\top$ 总是投影矩阵 —— 它是正交投影当且仅当 $\beta\|k\|^2 = 1$（投影到 $k^\perp$）或 $\beta = 0$（退化为单位矩阵 $I$），其他情况是秩-1 扰动。</li>
   </ul>
 </section>
@@ -132,15 +132,15 @@ $$S_t = S_{t-1} + v_t k_t^\top,\qquad S_0 = 0.$$
 
 $$o_t = S_t q_t.$$
 
-<p>线性注意力的完整讲解见 <a href="../../wiki/linear-attention/index.html">线性注意力</a>；这里只用到它的两个最小事实——加性递归与 retrieval。由这两个公式即可看出“记不清”的来源。</p>
+<p>线性注意力的完整讲解见 <a href="../../wiki/linear-attention/index.html">线性注意力</a>；这里只用到它的两个最小事实——加性递归与 retrieval。由这两个公式即可看出"记不清"的来源。</p>
 
-<h3 id="retrieval-error-derivation">1.1 retrieval 时到底发生了什么</h3>
+<h3 id="retrieval-error-derivation">1.1 retrieval 的代数过程</h3>
 
 <p>把递归展开，$S_t = \sum_{i=1}^{t} v_i k_i^\top$。当 query 恰好等于某个历史 key（设 $q = k_j$）时，理想输出是 $v_j$。实际计算：</p>
 
 $$S_t k_j = \sum_{i=1}^{t} v_i (k_i^\top k_j) = v_j \cdot (k_j^\top k_j) + \sum_{i \neq j} v_i (k_i^\top k_j).$$
 
-<p>右边第二项 $\sum_{i \neq j} v_i (k_i^\top k_j)$ 就是 <strong>retrieval error</strong><sup>[F1]</sup>——其他 key 与 $k_j$ 不正交时，它们的 value 会被"误检"进来。当所有 $k_i$ 两两正交且 $\|k_j\| = 1$ 时，$k_i^\top k_j = 0$（$i \neq j$）、$k_j^\top k_j = 1$，retrieval error 为 0，输出恰好是 $v_j$。但 $d$ 维空间最多容纳 $d$ 个两两正交的向量，当序列长度 $L > d$ 时，必然存在 $k_i^\top k_j \neq 0$，retrieval error 不为零。这就是 Yang et al. 2024 NeurIPS §2.2 所说的“key 'collisions'”<sup>[C2]</sup>。</p>
+<p>右边第二项 $\sum_{i \neq j} v_i (k_i^\top k_j)$ 就是 <strong>retrieval error</strong><sup>[F1]</sup>——其他 key 与 $k_j$ 不正交时，它们的 value 会被"误检"进来。当所有 $k_i$ 两两正交且 $\|k_j\| = 1$ 时，$k_i^\top k_j = 0$（$i \neq j$）、$k_j^\top k_j = 1$，retrieval error 为 0，输出恰好是 $v_j$。但 $d$ 维空间最多容纳 $d$ 个两两正交的向量，当序列长度 $L > d$ 时，必然存在 $k_i^\top k_j \neq 0$，retrieval error 不为零。这就是 Yang et al. 2024 NeurIPS §2.2 所说的"key 'collisions'"<sup>[C2]</sup>。</p>
 
 <details>
 <summary>展开：retrieval error 的代数来源（展开 $S k_j$）</summary>
@@ -211,7 +211,7 @@ $$S k_2 = \begin{pmatrix}1 & 1 \\ 1 & 2\end{pmatrix}\begin{pmatrix}1 \\ 1\end{pm
   </li>
 </ol>
 
-<p>本章看到线性注意力的 retrieval error 来自“只写不删”。但仅知道问题还不够——下一章给出 delta 规则的形式定义，把“擦除”显式放进递归里。</p>
+<p>本章看到线性注意力的 retrieval error 来自"只写不删"。但仅知道问题还不够——下一章给出 delta 规则的形式定义，把"擦除"显式放进递归里。</p>
 
 <h2 id="delta-rule-formula">2. Delta 规则的紧凑公式与手算</h2>
 
@@ -227,7 +227,7 @@ $$\boxed{\,S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top\,}\qqu
   <li>$I \in \mathbb{R}^{d_k \times d_k}$：单位矩阵，与 $k_t$ 同维。</li>
   <li>$k_t \in \mathbb{R}^{d_k}$：第 $t$ 步的 key 向量，由输入 $x_t$ 经投影 $k_t = W_K x_t$ 得到。</li>
   <li>$v_t \in \mathbb{R}^{d_v}$：第 $t$ 步的 value 向量，由 $v_t = W_V x_t$ 得到。</li>
-  <li>$\beta_t = \sigma(W_\beta x_t) \in (0, 1)$：写入强度，由 sigmoid 输出。Yang 2024 §2.2 称其为 soft "writing strength"；Gated DeltaNet 论文（Yang, Kautz &amp; Hatamizadeh 2025 §3.1）亦称其为（自适应）“学习率”。$\beta_t$ 是数据相关的——模型根据当前输入 $x_t$ 决定本步要"擦多狠、写多深"。</li>
+  <li>$\beta_t = \sigma(W_\beta x_t) \in (0, 1)$：写入强度，由 sigmoid 输出。Yang 2024 §2.2 称其为 soft "writing strength"；Gated DeltaNet 论文（Yang, Kautz &amp; Hatamizadeh 2025 §3.1）亦称其为（自适应）"学习率"。$\beta_t$ 是数据相关的——模型根据当前输入 $x_t$ 决定本步要"擦多狠、写多深"。</li>
   <li>$\sigma(z) = 1/(1 + e^{-z})$：sigmoid 函数。</li>
   <li>$W_Q, W_K, W_V, W_\beta$：可学习参数。</li>
 </ul>
@@ -255,7 +255,7 @@ $$\text{经典：}\;w \leftarrow w + \eta (y - \hat y) x,\qquad \text{DeltaNet�
     <div class="dg-arrow">&#8594;</div>
     <div class="dg-node">
       <div class="dg-node-title">Yang, Wang, Zhang, Shen &amp; Kim（NeurIPS 2024）</div>
-      <div class="dg-node-note">arXiv:2406.06484，2024-06：沿用 “DeltaNet” 命名，给出 chunkwise 并行训练算法，扩展到 1.3B / 100B tokens</div>
+      <div class="dg-node-note">arXiv:2406.06484，2024-06：沿用 "DeltaNet" 命名，给出 chunkwise 并行训练算法，扩展到 1.3B / 100B tokens</div>
     </div>
     <div class="dg-arrow">&#8594;</div>
     <div class="dg-node">
@@ -266,7 +266,7 @@ $$\text{经典：}\;w \leftarrow w + \eta (y - \hat y) x,\qquad \text{DeltaNet�
   <figcaption class="diagram-caption">箭头为 "DeltaNet" 命名与方法的演化方向，时间从早到晚。</figcaption>
 </figure>
 
-<p>正式定义采用 Yang 2024 NeurIPS 的公式；Schlag 2021 作为 delta rule 的提出者溯源；Gated DeltaNet 在第 5 章对比。</p>
+<p>正式定义采用 Yang 2024 NeurIPS 的公式；Schlag 2021 作为把 delta rule 引入线性 Transformer 的溯源；Gated DeltaNet 在第 5 章对比。</p>
 
 <h3 id="step1-numeric">2.2 手算一步：$\beta_t = 1$ 的最简更新</h3>
 
@@ -331,7 +331,7 @@ $$S_2^{\text{linear}} k_2 = \begin{pmatrix}1 & 0 \\ 1 & 0\end{pmatrix}\begin{pma
   </li>
 </ol>
 
-<p>本章给出 delta 规则的紧凑公式，揭示了“擦除 + 写入”的两项结构。但“被擦的旧值是谁”还不直观——下一章把它改写为显式带 $v^{\text{old}}$ 的等价形式。</p>
+<p>本章给出 delta 规则的紧凑公式，揭示了"擦除 + 写入"的两项结构。但"被擦的旧值是谁"还不直观——下一章把它改写为显式带 $v^{\text{old}}$ 的等价形式。</p>
 
 <h2 id="equivalent-form">3. 等价改写——"先擦除后写入"与几何直觉</h2>
 
@@ -389,7 +389,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
   <li>对称性：$P^\top = (I - k k^\top)^\top = I - k k^\top = P$。</li>
 </ul>
 
-<p>幂等 + 对称 = 正交投影。它把任何向量 $x$ 投影到与 $k$ 正交的子空间 $k^\perp$：$Px = x - k(k^\top x) = x - (k^\top x) k$，即“去掉 $x$ 在 $k$ 方向的分量”。Yang et al. 2024 NeurIPS §3.3 将该投影描述为在一个子空间内擦除信息、保留其余 $d-1$ 维子空间<sup>[C6]</sup>。工程实现中通过 L2 归一化 key 向量获得此投影性质。</p>
+<p>幂等 + 对称 = 正交投影。它把任何向量 $x$ 投影到与 $k$ 正交的子空间 $k^\perp$：$Px = x - k(k^\top x) = x - (k^\top x) k$，即"去掉 $x$ 在 $k$ 方向的分量"。Yang et al. 2024 NeurIPS §3.3 将该投影描述为在一个子空间内擦除信息、保留其余 $d-1$ 维子空间<sup>[C6]</sup>。工程实现中通过 L2 归一化 key 向量获得此投影性质。</p>
 
 <p>2 维直觉：$k = (1, 0)^\top$，$I - k k^\top = \begin{pmatrix}0 & 0 \\ 0 & 1\end{pmatrix}$。任意 $x = (a, b)^\top$ 被 $P$ 乘后得 $(0, b)^\top$——$x$ 方向分量被擦掉，$y$ 方向分量保留。这就是"只擦 $k$ 方向、保正交补"的几何含义。</p>
 
@@ -431,7 +431,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 <figcaption class="diagram-caption">2 维投影示意：$k=(1,0)^\top$，$\beta=1$，$P=I-kk^\top$；蓝色箭头表示 $P$ 把 $(a,b)$ 的 $x$ 分量（$k$ 方向）擦掉、保留 $y$ 分量（$k^\perp$ 方向），结果落在 $y$ 轴上的 $(0,b)$。</figcaption>
 </figure>
 
-<p>当 $\beta_t\|k_t\|^2 \neq 1$ 时，$I - \beta_t k_t k_t^\top$ 不再是正交投影，只是一个<strong>秩-1 扰动</strong>：它沿 $k_t$ 方向的特征值为 $1 - \beta_t\|k_t\|^2$、在 $k_t$ 的正交补上仍为 1，因此不幂等。这是常见误解——投影性质并非没有前提，下一章详细讨论边界。</p>
+<p>当 $\beta_t \neq 0$ 且 $\beta_t\|k_t\|^2 \neq 1$ 时，$I - \beta_t k_t k_t^\top$ 不再是正交投影，只是一个<strong>秩-1 扰动</strong>：它沿 $k_t$ 方向的特征值为 $1 - \beta_t\|k_t\|^2$、在 $k_t$ 的正交补上仍为 1，因此不幂等。这是常见误解——投影性质并非没有前提，下一章详细讨论边界。</p>
 
 <h3 id="chapter-3-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -472,7 +472,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
 
 <p>代入 $S_t = S_{t-1}(I - k_t k_t^\top) + v_t k_t^\top$。当 $\|k_t\| = 1$ 时，$I - k_t k_t^\top$ 是沿 $k_t$ 方向的正交投影（C6），意味着把 $S_{t-1}$ 中所有"沿 $k_t$ 方向"的分量擦干净，再写入新值 $v_t k_t^\top$。旧 key-value 关联被完全替换。</p>
 
-<p><strong>前提条件</strong>：$\|k_t\| = 1$。如果 $k_t$ 未归一化，$\beta_t = 1$ 时 $I - k_t k_t^\top$ 不是投影——它仍是秩-1 扰动，但擦除强度由 $\|k_t\|^2$ 决定：把任意 $x$ 投影为 $x - k_t(k_t^\top x)$，$k_t$ 越长擦得越狠，可能"擦过头"。Yang 2024 NeurIPS §3.3 说工程实现中对 key 做 L2 归一化以避免这个问题。</p>
+<p><strong>前提条件</strong>：$\|k_t\| = 1$。如果 $k_t$ 未归一化，$\beta_t = 1$ 时 $I - k_t k_t^\top$ 不是投影——它仍是秩-1 扰动，但擦除强度由 $\|k_t\|^2$ 决定：把任意 $x$ 投影为 $x - k_t(k_t^\top x)$，$\|k_t\|>1$ 时沿 $k_t$ 方向的擦除量随 $\|k_t\|^2$ 放大，可能反向过头。Yang 2024 NeurIPS §3.3 说工程实现中对 key 做 L2 归一化以避免这个问题。</p>
 
 <h3 id="beta-middle">4.3 中间值 $\beta_t \in (0, 1)$：部分擦除</h3>
 
@@ -583,7 +583,7 @@ $$= \begin{pmatrix}1 & 0 \\ 0 & 0\end{pmatrix} - \begin{pmatrix}1 & 0 \\ 0 & 0\e
   <li>$\alpha_t \to 0$：$S_t = 0 + \beta_t v_t k_t^\top$——清空所有历史，只保留当前步的写入。</li>
 </ul>
 
-<p>这是 Yang, Kautz & Hatamizadeh ICLR 2025 摘要中设计动机的代数体现——“gating enables rapid memory erasure while the delta rule facilitates targeted updates”，$\alpha_t$ 与 $\beta_t$ 各管一摊。</p>
+<p>这是 Yang, Kautz & Hatamizadeh ICLR 2025 摘要中设计动机的代数体现——"gating enables rapid memory erasure while the delta rule facilitates targeted updates"，$\alpha_t$ 管全局衰减、$\beta_t$ 管方向擦除强度。</p>
 
 <h3 id="experimental-evidence">5.4 实际效果：DeltaNet 在哪些任务上占优</h3>
 
@@ -716,7 +716,7 @@ Matches compact form: True
   </li>
 </ol>
 
-<p>全文总结：Delta 规则把线性注意力的纯加性累加替换为“先擦除后写入”——用 $I - \beta_t k_t k_t^\top$ 沿当前 key 方向擦除旧值，再写入新旧值的凸插值。$\beta_t = 1$ 且 $\|k\| = 1$ 时退化为正交投影式的完全覆盖，$\beta_t = 0$ 时记忆不变，中间值为部分擦除。DeltaNet 用这一规则在写入前擦除旧关联、覆盖同方向的旧值，降低 key 非正交带来的干扰（碰撞来自 key 非正交，delta 规则移除的是陈旧关联而非维度上限），在 recall / copy 类任务上占优；Gated DeltaNet 进一步加入标量遗忘门 $\alpha_t$ 兼顾方向擦除与全局衰减。回到开篇的问题——既保留固定大小状态、又记得清，delta 规则给出的答案是“写入前先擦除”。</p>
+<p>全文总结：Delta 规则把线性注意力的纯加性累加替换为"先擦除后写入"——用 $I - \beta_t k_t k_t^\top$ 沿当前 key 方向擦除旧值，再写入新旧值的凸插值。$\beta_t = 1$ 且 $\|k\| = 1$ 时退化为正交投影式的完全覆盖，$\beta_t = 0$ 时记忆不变，中间值为部分擦除。DeltaNet 用这一规则在写入前擦除旧关联、覆盖同方向的旧值，降低 key 非正交带来的干扰（碰撞来自 key 非正交，delta 规则移除的是陈旧关联而非维度上限），在 recall / copy 类任务上占优；Gated DeltaNet 进一步加入标量遗忘门 $\alpha_t$ 兼顾方向擦除与全局衰减。回到开篇的问题——既保留固定大小状态、又记得清，delta 规则给出的答案是"写入前先擦除"。</p>
 
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
@@ -724,27 +724,27 @@ Matches compact form: True
 
 <p><b>C1（线性注意力加性递归）</b>：Yang, Wang, Zhang, Shen & Kim. "Parallelizing Linear Transformers with the Delta Rule over Sequence Length." NeurIPS 2024, arXiv:2406.06484 v3 §2.1 与 §5.1 Table 4 第一行（Linear Attention [47] = Katharopoulos et al. 2020）。</p>
 
-<p><b>C2（$L > d$ 时 key 碰撞）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §2.2（“a purely additive update rule makes it difficult to deallocate past key-value associations, eventually leading to key 'collisions' when $L > d$, as pointed out by Schlag et al.”）；Schlag, Irie & Schmidhuber. “Linear Transformers Are Secretly Fast Weight Programmers.” ICML 2021, arXiv:2102.11174 §4.1（overcapacity regime）；Yang, Kautz & Hatamizadeh. “Gated Delta Networks: Improving Mamba2 with Delta Rule.” ICLR 2025, arXiv:2412.06464 §1。</p>
+<p><b>C2（$L > d$ 时 key 碰撞）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §2.2（"a purely additive update rule makes it difficult to deallocate past key-value associations, eventually leading to key 'collisions' when $L > d$, as pointed out by Schlag et al."）；Schlag, Irie & Schmidhuber. "Linear Transformers Are Secretly Fast Weight Programmers." ICML 2021, arXiv:2102.11174 §4.1（overcapacity regime）；Yang, Kautz & Hatamizadeh. "Gated Delta Networks: Improving Mamba2 with Delta Rule." ICLR 2025, arXiv:2412.06464 §1。</p>
 
 <p><b>C3（Delta 规则紧凑公式）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §2.2 与 §3.1 展开式，Table 4 DeltaNet 行；Yang, Kautz & Hatamizadeh ICLR 2025 arXiv:2412.06464 §2.2 作为对比基准。</p>
 
 <p><b>C4（"先擦除后写入"等价形式）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §2.2 展开（原文 "it first retrieves the old value using the current key, $v_t^{\text{old}} = S_{t-1} k_t$"）；Schlag 2021 ICML arXiv:2102.11174 §4.2 Eq. 23（remove + write 形式）。</p>
 
-<p><b>C5（与 Widrow-Hoff 1960 的关系）</b>：Schlag 2021 ICML arXiv:2102.11174 §1（“akin to the famous error-correcting delta-rule (Widrow & Hoff, 1960)”），§4.2 亦称该指令 “essentially implements the famous error-correcting delta rule (Widrow & Hoff, 1960)”；Yang, Kautz & Hatamizadeh ICLR 2025 arXiv:2412.06464 §2.2（“The delta update rule (Widrow et al., 1960; Schlag et al., 2021b)”）；Widrow & Hoff. “Adaptive switching circuits.” IRE WESCON Convention Record, pp. 96–104, 1960。</p>
+<p><b>C5（与 Widrow-Hoff 1960 的关系）</b>：Schlag 2021 ICML arXiv:2102.11174 §1（"akin to the famous error-correcting delta-rule (Widrow & Hoff, 1960)"），§4.2 亦称该指令 "essentially implements the famous error-correcting delta rule (Widrow & Hoff, 1960)"；Yang, Kautz & Hatamizadeh ICLR 2025 arXiv:2412.06464 §2.2（"The delta update rule (Widrow et al., 1960; Schlag et al., 2021b)"）；Widrow & Hoff. "Adaptive switching circuits." IRE WESCON Convention Record, pp. 96–104, 1960。</p>
 
-<p><b>C6（Householder / 投影性质）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §3.1（“generalized Householder transformation”）与 §3.3（该投影在一个子空间内擦除信息、保留其余 $d-1$ 维子空间）；Bischof & Van Loan 1985 WY representation 论文（Yang 引用为 [11]）。</p>
+<p><b>C6（Householder / 投影性质）</b>：Yang 2024 NeurIPS arXiv:2406.06484 §3.1（"generalized Householder transformation"）与 §3.3（该投影在一个子空间内擦除信息、保留其余 $d-1$ 维子空间）；Bischof & Van Loan 1985 WY representation 论文（Yang 引用为 [11]）。</p>
 
 <p><b>C7（Gated DeltaNet 与 Mamba2 公式）</b>：Yang, Kautz & Hatamizadeh ICLR 2025 arXiv:2412.06464 v3 §3.1 Eq. 10（gated delta rule 公式）与 §2.1（Mamba2 公式 $S_t = \alpha_t S_{t-1} + v_t k_t^\top$）。</p>
 
 <p><b>C8（实验对比）</b>：Yang 2024 NeurIPS arXiv:2406.06484 v3 §4.1 Table 1（MAD benchmark）与 §4.2 Table 2（1.3B LM PPL）。</p>
 
-<p><b>C9（现实应用：Kimi K3 的 KDA）</b>：Kimi K3 技术报告 arXiv:2607.24653 §2.1.1；KDA 在 delta rule 基础上加入 channel-wise 遗忘门，是 K3 的线性注意力层。引用范围限于“基于 delta 规则递归”这一最小事实。</p>
+<p><b>C9（现实应用：Kimi K3 的 KDA）</b>：Kimi K3 技术报告 arXiv:2607.24653 §2.1.1；KDA 在 delta rule 基础上加入 channel-wise 遗忘门，是 K3 的线性注意力层。引用范围限于"基于 delta 规则递归"这一最小事实。</p>
 
 <p><b>C10（开源实现）</b>：flash-linear-attention 官方仓库 <code>github.com/fla-org/flash-linear-attention</code>：基于 Triton 的线性注意力与状态空间模型实现，包含 DeltaNet、Gated DeltaNet 层。</p>
 
 <h3>公式与来源（F）</h3>
 
-<p><b>F1（retrieval 展开 $S k_j = v_j + \sum_{i \neq j} (k_i^\top k_j) v_i$）</b>：代数恒等式，由 C1 $S = \sum_i v_i k_i^\top$ 直接展开得到。术语 retrieval error 与 $Sk_j$ 展开式出自 Schlag 2021 ICML（arXiv:2102.11174）§4.1（“storing more than $d_{dot}$ associations will result in a retrieval error”）；Yang 2024 §2.2 对应讨论 key “collisions”。</p>
+<p><b>F1（retrieval 展开 $S k_j = v_j + \sum_{i \neq j} (k_i^\top k_j) v_i$）</b>：代数恒等式，由 C1 $S = \sum_i v_i k_i^\top$ 直接展开得到。术语 retrieval error 与 $Sk_j$ 展开式出自 Schlag 2021 ICML（arXiv:2102.11174）§4.1（"storing more than $d_{dot}$ associations will result in a retrieval error"）；Yang 2024 §2.2 对应讨论 key "collisions"。</p>
 
 <p><b>F2（$\beta_t = 0$ 与 $\beta_t = 1$ 边界）</b>：由 C3 直接代入得到；$\beta_t = 1, \|k\| = 1$ 时的投影性质见 C6。</p>
 
