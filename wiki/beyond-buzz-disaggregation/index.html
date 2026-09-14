@@ -192,7 +192,7 @@
 
 <img src="assets/img-05.webp" alt="Fig.6 DeepSeek-R1（左）与 LLaMa-3.1-70B（右）架构敏感性对比。DeepSeek-R1 的 piggybacked 远低于合设 overall，反映 MLA 在 chunked prefill 下有 down/up 投影重复计算的开销。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
-<p>机制（详见 <a href="../chunked-prefill/index.html">Chunked Prefill</a> 与 <a href="../mla/index.html">MLA</a> 页）：MLA 把 KV 压缩到低维潜向量、计算注意力时再上投影重建 K/V。chunked prefill 把长 prefill 切成块，每块的 attention 要重新经过一次 down+up 投影重建 KV——同样的 down/up 计算被每个块重复做一次<sup>[C16]</sup>。GQA 没有 down/up 投影这一步，每块的 attention 只用本块自己的 K/V，没有重复计算开销。这条机制直接让论文的 co-located 基线 Pareto 同时含 piggybacked 与非 piggybacked 配置（不能只用其中一个代表合设）<sup>[C16]</sup>。缓解方法：临时缓存早前块的上投影 KV，跨块复用——属于实现细节，不改变结论。</p>
+<p>机制（详见 <a href="../chunked-prefill/index.html">Chunked Prefill</a> 与 <a href="../mla/index.html">MLA</a> 页）：MLA 把 KV 压缩到低维潜向量、计算注意力时再上投影重建 K/V。chunked prefill 把长 prefill 切成块，每块的 attention 要重新经过一次 down+up 投影重建 KV——同样的 down/up 计算被每个块重复做一次<sup>[C16]</sup>。GQA 没有 down/up 投影这一步——K/V 以完整维度存储，每块直接使用、无需重建，没有重复计算开销。这条机制直接让论文的 co-located 基线 Pareto 同时含 piggybacked 与非 piggybacked 配置（不能只用其中一个代表合设）<sup>[C16]</sup>。缓解方法：临时缓存早前块的上投影 KV，跨块复用——属于实现细节，不改变结论。</p>
 
 <p>对部署者的含义：MLA 模型（DeepSeek 系列）的合设部署若用 piggybacking，要单独评估其 chunking 开销；在某些工作负载下 piggybacking 的收益会被重复计算的开销吃掉，反而不如非 piggybacked 的合设。</p>
 
@@ -216,14 +216,14 @@
 <p>MLA 与 GQA 在 piggybacked 下的表现为什么不同？</p>
 <details>
 <summary>解答：MLA 每块重算 down/up 投影；GQA 无此开销</summary>
-<p>MLA 把 KV 压缩到低维潜向量，attention 时上投影重建 K/V。chunked prefill 切块后，每块都要重新经过 down+up 投影重建 KV——同样的 down/up 计算在每个块上被重复做<sup>[C16]</sup>。GQA 没有 down/up 投影这一步（K/V 直接以完整维度存储），每块的 attention 只用本块自己的 K/V，无重复计算开销。论文因此把 piggybacked 与非 piggybacked 的合设配置都纳入基线 Pareto——只用其中一个会显著偏移合设的参考基准，特别是对 MLA 模型。部署含义：MLA 模型评估合设部署时必须区分 piggybacked 与非 piggybacked 两种基线，否则结论会高估或低估分离收益。</p>
+<p>MLA 把 KV 压缩到低维潜向量，attention 时上投影重建 K/V。chunked prefill 切块后，每块都要重新经过 down+up 投影重建 KV——同样的 down/up 计算在每个块上被重复做<sup>[C16]</sup>。GQA 没有 down/up 投影这一步（K/V 直接以完整维度存储），每块直接使用已存储的 K/V、无需重建，无重复计算开销。论文因此把 piggybacked 与非 piggybacked 的合设配置都纳入基线 Pareto——只用其中一个会显著偏移合设的参考基准，特别是对 MLA 模型。部署含义：MLA 模型评估合设部署时必须区分 piggybacked 与非 piggybacked 两种基线，否则结论会高估或低估分离收益。</p>
 </details>
 </li>
 </ol>
 
 <h2 id="rate-matching">3. 配套机制：切分策略与动态 rate matching</h2>
 
-<p>分离解决了"是否分"的问题；分完之后怎么配才是工程上的真正难题。论文的两维度设计空间——模型切分（两阶段各自选映射）+ 伸缩/rate matching（两池 GPU 数比例）——给出了答案的骨架。本章展开第二维，因为它比模型切分更反直觉、更容易做错。</p>
+<p>分离解决了"是否分"的问题；分完之后怎么配才是工程上的真正难题。论文的两维度设计空间——模型切分（两阶段各自选映射）+ 伸缩/rate matching（两池 GPU 数比例）——给出了答案的骨架。本章展开第二维——最优 ctx:gen 比例随模型与延迟目标大幅变化，固定比例会显著退化（图 9、图 10）。</p>
 
 <h3 id="cpp-strategy">3.1 prefill 池的策略：CPP 压 FTL 保持吞吐</h3>
 
@@ -292,12 +292,12 @@
 <p>$$BW_{egress} = \frac{N_{layers} \cdot BS_{prefill} \cdot ISL \cdot d_{head} \cdot N_{kv\_heads} \cdot bytes_{element}}{FTL \cdot NumGPU_{prefill}}.$$</p>
 
 <ul>
-<li>$N_{layers}$：模型层数；$BS_{prefill}$：prefill 实例的批大小；$ISL$：输入序列长度；$d_{head}$：注意力头维；$N_{kv\_heads}$：KV 头数（MLA 下远小于注意力头数，详见 <a href="../mla/index.html">MLA</a> 页）；$bytes_{element}$：每 token 每头 KV 字节数（FP4 下为 0.5 等）；$FTL$：prefill 完成时间；$NumGPU_{prefill}$：唯一切分 KV 的 prefill GPU 数。</li>
+<li>$N_{layers}$：模型层数；$BS_{prefill}$：prefill 实例的批大小；$ISL$：输入序列长度；$d_{head}$：注意力头维；$N_{kv\_heads}$：KV 头数（MLA 下远小于注意力头数，详见 <a href="../mla/index.html">MLA</a> 页）；$bytes_{element}$：每个 KV 元素的字节数（FP4 下为 0.5 等）；$FTL$：prefill 完成时间；$NumGPU_{prefill}$：唯一切分 KV 的 prefill GPU 数。</li>
 </ul>
 
 <p>公式的解读：分子是"prefill 期间产生的 KV 总量"（层数 $\times$ 批 $\times$ 序列长 $\times$ 头维 $\times$ KV 头数 $\times$ 字节数）；分母是"可用于传输的时间"（FTL）与"分散出口的 GPU 数"的乘积。直觉：KV 总产出除以（时间 $\times$ 卡数）= 每卡每单位时间的字节率 = 带宽<sup>[C8, F1]</sup>。</p>
 
-<p>两个边界条件。其一，公式假设 KV 逐层即时传输与计算重叠（$C8$）——若实际系统有传输滞后，所需带宽按滞后比例增加。其二，当 TP 域超过 KV 头数时 KV 复制而非切分（如 TP=8 但 KV 头数=1，KV 在 8 个 TP rank 上复制 8 份），计算每卡带宽时只计入真正切分 KV 的 GPU（$NumGPU_{prefill}$）<sup>[C8, F6]</sup>。计算示例：DeepSeek-R1、$N_{layers}=61$、$BS_{prefill}=32$、$ISL=16384$、$d_{head}=128$、$N_{kv\_heads}=1$（以单头 128 维近似表示 MLA 的 KV 维度，仅为量级示意；MLA 实际 KV 维度为潜向量 512 加 rope 64 共 576 维）、$bytes_{element}=1$（FP8）、$FTL=2s$、$NumGPU_{prefill}=8$——代入得 $BW_{egress} \approx 61 \times 32 \times 16384 \times 128 \times 1 \times 1 / (2 \times 8) \approx 0.256$ GB/s/卡（构造示例，参数取自 DeepSeek-R1 公开架构，数字仅为说明量级）。</p>
+<p>两个边界条件。其一，公式假设 KV 逐层即时传输与计算重叠<sup>[C8]</sup>——若实际系统有传输滞后，所需带宽按滞后比例增加。其二，当 TP 域超过 KV 头数时 KV 复制而非切分（如 TP=8 但 KV 头数=1，KV 在 8 个 TP rank 上复制 8 份），计算每卡带宽时只计入真正切分 KV 的 GPU（$NumGPU_{prefill}$）<sup>[C8, F6]</sup>。计算示例：DeepSeek-R1、$N_{layers}=61$、$BS_{prefill}=32$、$ISL=16384$、$d_{head}=128$、$N_{kv\_heads}=1$（以单头 128 维近似表示 MLA 的 KV 维度，仅为量级示意；MLA 实际 KV 维度为潜向量 512 加 rope 64 共 576 维）、$bytes_{element}=1$（FP8）、$FTL=2s$、$NumGPU_{prefill}=8$——代入得 $BW_{egress} \approx 61 \times 32 \times 16384 \times 128 \times 1 \times 1 / (2 \times 8) \approx 0.256$ GB/s/卡（构造示例，参数取自 DeepSeek-R1 公开架构，数字仅为说明量级）。</p>
 
 <h3 id="bw-ingress">4.2 ingress 带宽：decode 侧时间窗</h3>
 
@@ -324,7 +324,7 @@
 
 <p>模型规模也有间接影响：FTL 随活跃参数数线性增长，但 KV 大小不随参数量同比例增长<sup>[F5]</sup>；带优化注意力（MLA）的更大模型 egress 需求可能低于注意力架构低效的小模型<sup>[F5, 推断]</sup>。MLA 在合设下有额外开销（§2.3），但在带宽维度反而可能更有利（KV 头数少，egress 量低）——两条机制方向相反。</p>
 
-<p>论文的模拟结果（图 12）：DeepSeek-R1、(ISL 16k, OSL 2k) 与 (ISL 1M, OSL 2k) 两组序列长度组合、多档 TTL 下，egress 与 ingress 两者较大者的带宽需求约在 0.4–1.8 GB/s/GPU 之间（图 12 纵轴取 egress 与 ingress 的较大值，原图注为 "Maximum of egress and ingress bandwidth across various TTLs"）<sup>[C8, N8, G9]</sup>。具体观察：</p>
+<p>论文的模拟结果（图 12）：DeepSeek-R1、(ISL 16k, OSL 2k) 与 (ISL 1M, OSL 2k) 两组序列长度组合、多档 TTL 下，egress 与 ingress 两者较大者的带宽需求约在 0.4–1.8 GB/s/GPU 之间（图 12 纵轴取 egress 与 ingress 的较大值，原图注为 "Maximum of egress and ingress bandwidth across various TTLs"）<sup>[C8, N8, G9]</sup>。两条曲线分别为：蓝色曲线（ISL 16k, OSL 2k）约在 0.4–1.2 GBps/GPU，红色曲线（ISL 1M, OSL 2k）约在 1.0–1.8 GBps/GPU。</p>
 
 <img src="assets/img-01.webp" alt="Fig.12 DeepSeek-R1 KV Transfer Requirements：x 轴 Normalized Tokens/s/user，y 轴 Bandwidth/GPU (GBps/GPU)，取 egress 与 ingress 的较大值。蓝线 (ISL 16k, OSL 2k) 范围约 0.4–1.2；红线 (ISL 1M, OSL 2k) 范围约 1.0–1.8。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
@@ -352,7 +352,7 @@
 <p>论文的带宽模拟为什么得出"现有数据中心带宽足够"的结论？</p>
 <details>
 <summary>解答：模拟量级 0.4–1.8 GBps/GPU，远低于现代数据中心互联能力</summary>
-<p>DeepSeek-R1 在 (16k/2k) 与 (1M/2k) 两组序列长度组合、多档 TTL 下，egress/ingress 带宽需求落在 0.4–1.8 GB/s/GPU 区间（图 12）<sup>[C8, N8, G9]</sup>。论文据此判断现有数据中心已配置的带宽足以支撑 KV cache 传输而不成为瓶颈："existing provisioned datacenter bandwidth is sufficient to support KV cache transfer without becoming a bottleneck"<sup>[C8]</sup>。边界：模拟假设 KV 逐层即时传输与计算重叠（$C8$）；若实际系统传输滞后或调度抖动大，所需带宽按比例增加；论文未给出"传输滞后 X% 时带宽需求上升 Y%"的具体量化。</p>
+<p>DeepSeek-R1 在 (16k/2k) 与 (1M/2k) 两组序列长度组合、多档 TTL 下，egress/ingress 带宽需求落在 0.4–1.8 GB/s/GPU 区间（图 12）<sup>[C8, N8, G9]</sup>。论文据此判断现有数据中心已配置的带宽足以支撑 KV cache 传输而不成为瓶颈："existing provisioned datacenter bandwidth is sufficient to support KV cache transfer without becoming a bottleneck"<sup>[C8]</sup>。边界：模拟假设 KV 逐层即时传输与计算重叠<sup>[C8]</sup>；若实际系统传输滞后或调度抖动大，所需带宽按比例增加；论文未给出"传输滞后 X% 时带宽需求上升 Y%"的具体量化。</p>
 </details>
 </li>
 </ol>
@@ -377,7 +377,7 @@
 <li><b>⑨MLA 在 chunking 下的开销 vs 带宽优势</b>。同样的 MLA 机制在合设下是不利因素（在带宽维度反而有利——KV 压缩使 egress 需求更低）<sup>[C8, F5]</sup>。架构选择是综合权衡。</li>
 </ul>
 
-<p>这些结论与 <a href="../moe-serving/index.html">MoE Serving</a> 页讲的"PD 分离基础机制"互补：MoE Serving 讲分离是什么、为什么可以工作；本文侧重分离在什么条件下值得、怎么配、有什么代价。两者一起覆盖决策的两端。</p>
+<p>这些结论与 <a href="../moe-serving/index.html">MoE Serving</a> 页讲的"PD 分离基础机制"互补：MoE Serving 讲分离是什么、为什么可以工作；这份解析侧重分离在什么条件下值得、怎么配、有什么代价。两者一起覆盖决策的两端。</p>
 
 <h3 id="boundaries">5.2 方法与结论边界</h3>
 
@@ -402,7 +402,7 @@
 <p>对"是否上 PD 分离"的决策，论文给的最直接结论是什么？</p>
 <details>
 <summary>解答：先做流量与模型画像，prefill-heavy + 大模型才上分离</summary>
-<p>论文的核心结论之一是分离不是普适最优——它对 prefill-heavy 流量（ISL&gt;&gt;OSL）与更大模型（&gt;10B）收益最大<sup>[C2, C24]</sup>。直接迁移到决策语境：先用流量画像与模型大小判断，若工作负载属于 prefill-heavy（典型如文档分析、长上下文推理）且模型达到 70B 以上规模，分离值得上；其他场景优先评估合设部署的优化空间（chunked prefill、IFB、并行策略调整）而非直接上分离。论文 §8 明确强调"we also highlight scenarios where disaggregation offers limited benefit — such as serving small-scale models or generation-heavy traffic"<sup>[C24]</sup>——这与"上分离"的决策一起给出两端判断。</p>
+<p>论文的核心结论之一是分离不是普适最优——它对 prefill-heavy 流量（ISL&gt;&gt;OSL）与更大模型（&gt;10B）收益最大<sup>[C2, C24]</sup>。直接迁移到决策语境：先用流量画像与模型大小判断，若工作负载属于 prefill-heavy（典型如文档分析、长上下文推理）且模型达到 10B 以上规模，分离值得上；其他场景优先评估合设部署的优化空间（chunked prefill、IFB、并行策略调整）而非直接上分离。论文 §8 明确强调"we also highlight scenarios where disaggregation offers limited benefit — such as serving small-scale models or generation-heavy traffic"<sup>[C24]</sup>——这与"上分离"的决策一起给出两端判断。</p>
 </details>
 </li>
 <li>
