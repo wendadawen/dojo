@@ -134,7 +134,7 @@
   </table>
 
   <h3>家族变体</h3>
-  <p>系列全家族架构一致（混合层型、GQA、交错 MRoPE、MTP），仅规模与 FFN 形态不同。以下数字由各型号官方 config 实拉取核对：</p>
+  <p>系列全家族架构一致（混合层型、GQA、交错 MRoPE、MTP），仅规模、FFN 形态与词表共享取舍不同。以下数字由各型号官方 config 实拉取核对：</p>
   <table>
     <tr><th>型号</th><th>层数</th><th>hidden</th><th>Q/KV 头</th><th>GDN 值头</th><th>FFN</th></tr>
     <tr><td>397B-A17B（本文档主线型号）</td><td>60</td><td>4096</td><td>32/2</td><td>64</td><td>512 专家 top-10，I=1024</td></tr>
@@ -180,8 +180,8 @@
 <tr><td>残差流入 · 4096</td><td><code>[1,T,4096]</code></td><td>$x$</td><td>单流残差（本代无超连接）。</td></tr>
 <tr><td>input_layernorm · RMSNorm</td><td><code>[1,T,4096] -&gt; [1,T,4096]</code></td><td>$\mathrm{RMSNorm}(x)$</td><td>pre-norm。真实权重 input_layernorm.weight 形状 [4096]。</td></tr>
 <tr><td>in_proj_qkv · 4096 投影到 12288</td><td><code>[1,T,4096] -&gt; [1,T,12288]</code></td><td>$\mathrm{conv\_dim} = 2 \cdot 16 \cdot 128 + 64 \cdot 128$</td><td>一次投影出 query/key/value。conv_dim = 2*key_dim + value_dim = 2*2048 + 8192 = 12288。真实权重 in_proj_qkv.weight 形状 [12288, 4096]。</td></tr>
-<tr><td>depthwise · causal conv1d</td><td><code>[1,12288,T] -&gt; [1,12288,T]</code></td><td>$\mathrm{kernel}=4,\ \mathrm{groups}=12288$</td><td>逐通道因果卷积作用于整个 QKV 拼接。decode 时必须跨步保留 kernel-1=3 个位置的状态。</td></tr>
-<tr><td>conv 状态 · [12288,3]</td><td><code>[1,12288,3]</code></td><td>$72.00\ \mathrm{KiB}\ (\mathrm{bf16})$</td><td>卷积滑窗状态，与序列长度无关。每层 12288 通道、3 个位置、2 字节。</td></tr>
+<tr><td>depthwise · causal conv1d</td><td><code>[1,12288,T] -&gt; [1,12288,T]</code></td><td>$\mathrm{kernel}=4,\ \mathrm{groups}=12288$</td><td>逐通道因果卷积作用于整个 QKV 拼接。decode 时保留 kernel=4 个位置的状态（覆盖前 3 个 token 的上下文）。</td></tr>
+<tr><td>conv 状态 · [12288,4]</td><td><code>[1,12288,4]</code></td><td>$96.00\ \mathrm{KiB}\ (\mathrm{bf16})$</td><td>卷积滑窗状态，与序列长度无关。每层 12288 通道、4 个位置（等于 conv kernel）、2 字节。</td></tr>
 <tr><td>split 拆成 q,k,v · + L2 归一化</td><td><code>[1,T,12288] -&gt; q,k[1,T,16,128] v[1,T,64,128]</code></td><td>$q,k \leftarrow \ell_2(\cdot)$</td><td>切成 query/key（各 16 头 × 128）与 value（64 头 × 128）。q/k 做 L2 归一化后 repeat_interleave 4 份对齐到 64 值头。</td></tr>
 <tr><td>in_proj_b 得 $\beta$ · sigmoid</td><td><code>[1,T,4096] -&gt; [1,T,64]</code></td><td>$\beta_t = \sigma(W_b x_t)$</td><td>写入强度门，每个值头一个标量。本机实测范围 [0.0033, 0.9994]。</td></tr>
 <tr><td>in_proj_a 得 g · 遗忘门</td><td><code>[1,T,4096] -&gt; [1,T,64]</code></td><td>$g_t = -e^{A_{\log}}\,\mathrm{softplus}(W_a x_t + b_{dt})$</td><td>遗忘门。g 恒为负，衰减因子 exp(g) 必在 (0,1)。本机实测 g 范围 [-63.306, -0.010]，记忆保留率 [0.000000, 0.990283]。A_log 以 F32 存储（真实张量头）。</td></tr>
@@ -278,7 +278,7 @@
   <ul>
     <li>状态是一个 $d_k \times d_v$ 的矩阵而非增长的 KV 序列。更新规则 $S_t = e^{g_t} S_{t-1} + k_t\big(\beta_t(v_t - S_{t-1}^{\top}k_t)\big)^{\top}$，输出 $o_t = S_t^{\top}q_t / \sqrt{d_k}$。括号里的 $v_t - S_{t-1}^{\top}k_t$ 是「当前值与状态已存内容之差」，即 <a href="../delta-rule/">delta rule</a> 的名称来源。</li>
     <li>两个门都由输入投影得到：$\beta_t = \sigma(W_b x_t)$ 控制写入强度，$g_t = -e^{A_{\log}}\,\mathrm{softplus}(W_a x_t + b_{dt})$ 控制遗忘。因 $e^{A_{\log}}>0$ 且 $\mathrm{softplus}>0$，$g_t$ 恒负、$e^{g_t}\in(0,1)$ 必为衰减。本机实测 $g_t$ 落在 $[-63.306, -0.010]$，对应每 token 记忆保留率从 0.990 到接近 0，衰减强度跨四个数量级；$\beta_t$ 范围 $[0.0033, 0.9994]$。</li>
-    <li>16 键头、64 值头，比值 4，源码用 <code>repeat_interleave</code> 把查询与键各复制 4 份对齐到 64 值头；查询与键在递归前做 L2 归一化。前置 kernel 4 的<a href="../depthwise-conv/">深度可分离因果卷积</a>作用于整个 QKV 拼接（12288 通道），decode 时必须跨步保留 kernel−1=3 个位置的状态。</li>
+    <li>16 键头、64 值头，比值 4，源码用 <code>repeat_interleave</code> 把查询与键各复制 4 份对齐到 64 值头；查询与键在递归前做 L2 归一化。前置 kernel 4 的<a href="../depthwise-conv/">深度可分离因果卷积</a>作用于整个 QKV 拼接（12288 通道），decode 时保留 kernel=4 个位置的状态（覆盖前 3 个 token 的上下文）。</li>
     <li><b>两条计算路径等价</b>：prefill 走分块并行、decode 走逐 token 递归。本机在真实头数与头维（16/64 头、128 维、20 个 token）下实测，两者输出最大绝对差 $3.725\times10^{-8}$、末态差 $3.576\times10^{-7}$；2 token 正交键的手算复核（末态 $[[3,5],[7,11]]$）与实跑差 $5.722\times10^{-6}$。</li>
     <li><b>输出门用 silu</b>：递归输出先做逐头 RMSNorm（weight 形状 [128]，该层 64 个值头共享同一份 128 维参数，45 层各一份，且以 F32 存储——90 个 F32 张量中的一半），再乘 $\mathrm{silu}(W_z x)$。这一点与 Qwen3.8-Flash-Next 不同：那边 <code>output_gate_type=sigmoid</code> 可配置且 checkpoint 取 sigmoid，这边硬编码 silu。</li>
   </ul>
@@ -311,11 +311,11 @@
   <p>按官方 config 实算（bf16 KV）：</p>
   <table>
     <tr><th>上下文</th><th>全注意力 KV（15 层）</th><th>GDN 状态（45 层）</th><th>合计</th></tr>
-    <tr><td>32K</td><td>0.938 GiB</td><td>0.179 GiB</td><td>1.117 GiB</td></tr>
-    <tr><td>256K</td><td>7.500 GiB</td><td>0.179 GiB</td><td>7.679 GiB</td></tr>
-    <tr><td>1M</td><td>30.000 GiB</td><td>0.179 GiB</td><td>30.179 GiB</td></tr>
+    <tr><td>32K</td><td>0.938 GiB</td><td>0.180 GiB</td><td>1.118 GiB</td></tr>
+    <tr><td>256K</td><td>7.500 GiB</td><td>0.180 GiB</td><td>7.680 GiB</td></tr>
+    <tr><td>1M</td><td>30.000 GiB</td><td>0.180 GiB</td><td>30.180 GiB</td></tr>
   </table>
-  <p>GDN 状态完全不随长度增长：每层递归状态的形状为 $64 \times 128 \times 128$，占 4.00 MiB（fp32，<code>mamba_ssm_dtype</code>）；卷积状态为 $12288 \times 3$，占 72.00 KiB（bf16）；45 层合计 0.179 GiB。层型比例让只有 15/60 层需要存 KV——若 60 层全为全注意力，256K 上下文需 30.000 GiB、1M 需 120.000 GiB，实际分别只要 1/4。与 Qwen3.8-Flash-Next 的差别在于：那边稀疏化的是注意力计算本身（每查询只见 2048 个 token），这边全注意力层的计算随长度正常增长，省的是「哪些层需要 KV」这一维度。</p>
+  <p>GDN 状态完全不随长度增长：每层递归状态的形状为 $64 \times 128 \times 128$，占 4.00 MiB（fp32，<code>mamba_ssm_dtype</code>）；卷积状态为 $12288 \times 4$，占 96.00 KiB（bf16）；45 层合计 0.180 GiB。层型比例让只有 15/60 层需要存 KV——若 60 层全为全注意力，256K 上下文需 30.000 GiB、1M 需 120.000 GiB，实际分别只要 1/4。与 Qwen3.8-Flash-Next 的差别在于：那边稀疏化的是注意力计算本身（每查询只见 2048 个 token），这边全注意力层的计算随长度正常增长，省的是「哪些层需要 KV」这一维度。</p>
 
   <h2 id="vision">4. 视觉编码器与多模态融合</h2>
   <p>视觉侧是一个 27 层的独立 ViT，参数量 456,010,480（0.456B），占全模型 0.113%。作用是把像素变成与语言主干同宽（4096）的 token，之后视觉与文本在同一序列里共享全部 60 层。</p>
@@ -643,8 +643,8 @@ gdn: {
     in:   {label:'残差流入\n4096', t:'grp', io:'[1,T,4096]', f:'x', d:'单流残差（本代无超连接）。'},
     ln1:  {label:'input_layernorm\nRMSNorm', t:'grp', io:'[1,T,4096] -> [1,T,4096]', f:'\\mathrm{RMSNorm}(x)', d:'pre-norm。真实权重 input_layernorm.weight 形状 [4096]。'},
     qkv:  {label:'in_proj_qkv\n4096 投影到 12288', t:'gdn', io:'[1,T,4096] -> [1,T,12288]', f:'\\mathrm{conv\\_dim} = 2 \\cdot 16 \\cdot 128 + 64 \\cdot 128', d:'一次投影出 query/key/value。conv_dim = 2*key_dim + value_dim = 2*2048 + 8192 = 12288。真实权重 in_proj_qkv.weight 形状 [12288, 4096]。'},
-    conv: {label:'depthwise\ncausal conv1d', t:'gdn', io:'[1,12288,T] -> [1,12288,T]', f:'\\mathrm{kernel}=4,\\ \\mathrm{groups}=12288', d:'逐通道因果卷积作用于整个 QKV 拼接。decode 时必须跨步保留 kernel-1=3 个位置的状态。'},
-    cst:  {label:'conv 状态\n[12288,3]', t:'buf', io:'[1,12288,3]', f:'72.00\\ \\mathrm{KiB}\\ (\\mathrm{bf16})', d:'卷积滑窗状态，与序列长度无关。每层 12288 通道、3 个位置、2 字节。'},
+    conv: {label:'depthwise\ncausal conv1d', t:'gdn', io:'[1,12288,T] -> [1,12288,T]', f:'\\mathrm{kernel}=4,\\ \\mathrm{groups}=12288', d:'逐通道因果卷积作用于整个 QKV 拼接。decode 时保留 kernel=4 个位置的状态（覆盖前 3 个 token 的上下文）。'},
+    cst:  {label:'conv 状态\n[12288,4]', t:'buf', io:'[1,12288,4]', f:'96.00\\ \\mathrm{KiB}\\ (\\mathrm{bf16})', d:'卷积滑窗状态，与序列长度无关。每层 12288 通道、4 个位置（等于 conv kernel）、2 字节。'},
     split:{label:'split 拆成 q,k,v\n+ L2 归一化', t:'gdn', io:'[1,T,12288] -> q,k[1,T,16,128] v[1,T,64,128]', f:'q,k \\leftarrow \\ell_2(\\cdot)', d:'切成 query/key（各 16 头 × 128）与 value（64 头 × 128）。q/k 做 L2 归一化后 repeat_interleave 4 份对齐到 64 值头。'},
     beta: {label:'in_proj_b 得 β\nsigmoid', t:'gt', io:'[1,T,4096] -> [1,T,64]', f:'\\beta_t = \\sigma(W_b x_t)', d:'写入强度门，每个值头一个标量。本机实测范围 [0.0033, 0.9994]。'},
     alpha:{label:'in_proj_a 得 g\n遗忘门', t:'gt', io:'[1,T,4096] -> [1,T,64]', f:'g_t = -e^{A_{\\log}}\\,\\mathrm{softplus}(W_a x_t + b_{dt})', d:'遗忘门。g 恒为负，衰减因子 exp(g) 必在 (0,1)。本机实测 g 范围 [-63.306, -0.010]，记忆保留率 [0.000000, 0.990283]。A_log 以 F32 存储（真实张量头）。'},
