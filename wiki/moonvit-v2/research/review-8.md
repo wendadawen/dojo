@@ -1,0 +1,42 @@
+<!-- review-meta
+round: 8
+page: wiki/moonvit-v2/index.html
+reviewed_content_sha256: f6ae9eeef8b0b28c
+-->
+# MoonViT-V2 审查记录（第 8 轮）
+
+- 页面版本：index.html 工作树哈希 cdfc204c1df6071301389ef1e865c61c065e82e1
+- 审查时间：2026-09-14 17:56
+- 审查者：独立子代理（第 8 轮；未参与写作，未参与前序轮次审查与修复）
+- 已完整阅读章节（按顺序，含全部折叠块、图注与 overview.html 全文）：核心问题；1 主流做法遇到什么问题——SigLIP 初始化为何不稳（含本章问题）；2 从零训练的方案——next-token prediction 如何替代对比预训练（含本章问题）；3 训练是怎么进行的——接入 LLM 的联合预训练（3.1 训练用什么数据、3.2 训练配置、3.3 系统层面怎么跑得动、本章问题）；4 服务稳定性的架构——27 层 ViT、RMSNorm、去 bias（含补充代码折叠块、本章问题）；5 图像/视频共享与高分辨率——分解注意力、时间池化、pixel-shuffle（含本章问题）；6 结果与结论——对比预训练初始化是否必要（含本章问题）；来源与范围说明（论断与来源 C、公式与来源 F、外部数字与实验条件 N、构造示例、辅助解释与类比边界、简化条件及其限制）；全文总结。
+
+## 来源核对（本轮核对的版本与关键原文）
+
+- 版本：arXiv:2607.24653v2《Kimi K3: Open Frontier Intelligence》（cs.CL，v1 2026-07-27 / v2 2026-08-07，正文 HTML）；HuggingFace `moonshotai/Kimi-K3` `config.json`（raw/main）。
+- §2.4：「we train Kimi K3 vision encoder, MoonViT-V2, entirely from scratch with next-token prediction」「We depart from this practice primarily for training stability」「the SigLIP-initialized MoonViT-3D shows persistently higher gradient norms with frequent spikes, while MoonViT-V2 remains stable throughout training (Fig. 6)」「Training with next-token prediction also allows the encoder's representations to be shaped directly by the language-modeling objective, rather than by a contrastive loss that favors global semantics over fine-grained textual and structural cues」「we find MoonViT-V2 matches the SigLIP-initialized baseline across vision evaluations, indicating that contrastive pre-training is unnecessary as an initialization for multimodal language models at scale」——C1/C2/C3/C7 逐字吻合。
+- §2.4 Architecture：「MoonViT-V2 is a 27-layer vision transformer with roughly 0.4B parameters that adopts RMSNorm and removes all bias terms from its linear and attention projections, a design that further stabilizes the from-scratch optimization above」「Images and videos are processed with fully shared parameters, as in MoonViT-3D: attention is factorized into intra-frame spatial and inter-frame temporal passes, and temporal pooling further compresses tokens along the time dimension」「Before projection, a pixel-shuffle operation with 2 × 2 downsampling reduces the number of visual tokens by a factor of four, keeping inputs of up to 3584 × 3584 pixels affordable within the 1M-token context」「Kimi K3 is natively multimodal: text, images, and videos are processed by a single shared backbone within one context, with no post-hoc modality-alignment stage」「This training recipe builds on a vision pathway that follows the overall design of Kimi K2.5」——C4/C5/C6/C8/C9 逐字吻合。
+- Fig.6 图注原文：「Vision-tower gradient norms in our pre-training ablations. Compared with the SigLIP-initialized MoonViT-3D, the from-scratch MoonViT-V2 maintains lower gradient norms with fewer spikes, indicating more stable optimization.」
+- §3.1：「four primary text domains—Web Text, Code, Mathematics, and Knowledge—together with a large-scale vision corpus」「The vision data covers captions, interleaved image–text documents, OCR, perception, video, and visual coding data」「The vision corpus follows the taxonomy of Kimi K2.5…」「During training, coordinate supervision is provided in both absolute and normalized ([0,1]) formats」「we substantially scale up programmatic multimodal data, coupling code snippets with their rendered visuals across domain-specific formats including SVG, 3D assets, Webpage, Game, and CAD schematics」——C10 吻合。
+- §3.3：「Kimi K3 adopts a native multimodal training strategy in which language and vision are jointly optimized from the start of training, rather than grafting a vision encoder onto a pre-trained language model through a post-hoc alignment stage. Under this paradigm, visual and textual tokens are interleaved within a single next-token prediction objective」「We optimize the model using the Per-Head Muon optimizer (§2.5) together with the weight-clipping mechanism introduced in Kimi K2, while adopting QB (§2.3.3) for MoE load balancing. We use a cosine learning rate schedule with a 1% linear warmup. Weight decay is set to 0.1 throughout.」——C9/N3 逐字吻合。
+- §5.2.3：「In long-context multimodal training, large images and long videos substantially increase the computation time of the vision encoder and cause significant load imbalance across devices.…A single large image is partitioned along the patch dimension across multiple devices, and attention is computed by gathering key–value pairs (gather-KV) across CP ranks.…divide each CP group into several sub-CP groups and distribute multiple large images across them in a load-balanced manner, preventing the communication fraction from growing with scale.」「In Kimi K2.5, we introduced the Decoupled Encoder Process (DEP), which splits ViT and text training into separate stages…The ViT forward passes of the first PP micro-batches are executed synchronously upfront, the remaining forward passes are scheduled into pipeline bubbles…most of the ViT computation is hidden within pipeline bubbles, largely eliminating the effective overhead of the vision encoder.」——C11 逐字吻合。
+- Table 1：「Total Parameters of ViT … 401M」「# ViT Layers … 27 layers」「Patch Size of ViT … 14」「# Attention Heads of ViT … 12」「Total Parameters 1.04T → 2.78T ↑167%」——与页面表格及 N4 吻合。
+- 结论节：「We present Kimi K3, an open 2.8-trillion-parameter Mixture-of-Experts model with native vision capabilities」——N4 引文吻合。
+- config.json vision_config 实测：vt_num_hidden_layers=27、vt_hidden_size=1024、qkv_hidden_size=1536、vt_intermediate_size=4096、vt_num_attention_heads=12、patch_size=14、norm_type=rmsnorm、attn_bias=false、linear_bias=false、patch_embed_proj_bias=false、merge_kernel_size=[2,2]、merge_type=sd2_tpool、mm_hidden_size=1024、mm_projector_type=patchmergerv2、text_hidden_size=7168——页面表格逐项吻合。
+- 可运行代码：实际以 python3 运行页面折叠块内代码，输出与"预期输出"逐行一致（attn/layer=6,291,456；mlp/layer=8,388,608；norms/layer=2,048；per_layer=14,682,112；total 27L=396,417,024 (~0.40B)；3584×3584→65536；pixel-shuffle→16384）。手算 F1/F2 复算均成立（4×1024×1536=6,291,456；2×1024×4096=8,388,608；27×14,682,112=396,417,024）。
+- 链接与结构：`../siglip/index.html`、`../vit/index.html`、`../standard-attention/index.html` 三个前置概念页均真实存在；无"（待生成）"占位；`python3 .dojo/scripts/validate.py wiki/moonvit-v2/index.html` 返回 `validation ok`；`dojo:topics=多模态` 在 ALLOWED_TOPICS 内、`dojo:tag=视觉与多模态` 在 ALLOWED_TAGS 内；overview.html 与 index.html 互链；alt 属性无 `$...$`；图内公式均置于 `<foreignObject>`，`<text>` 内无 ASCII 近似写法。
+
+## 问题
+
+- [轻微·可读性] 第 2 章末尾（正文第 187、189 行，两个相邻 `<p>`）：两段连续过渡句表达同一件事，都是"下一步讲训练流程"。前段"方案定了，但还差一环：训练本身怎么进行——在哪个阶段训、跟谁一起训、用什么数据？"，紧接后段"从零训练的方案与两个动机至此交代完毕，剩下的问题是如何把它落进真实的训练流程。二者信息重复。｜引文依据：不适用｜修复要求：保留其一（建议保留提出三问的那段），删去另一段，或把两段合并为一句过渡。｜修复：｜复验：
+- [轻微·可读性] 第 5 章 pixel-shuffle 说明段（正文第 611 行）：同一意思在一段内说了两遍——"这是无损重排……不是信息量；四个邻域 token 的内容被完整保留在通道维里，后续投影再决定如何把它们降维成 LLM 嵌入。它不是"丢信息的有损压缩"——压缩的是序列长度，信息量由后续投影降维那一步决定。"｜引文依据：不适用｜修复要求：删去后半句重复表述，只保留一次"压序列长度、不压信息量；降维的有损发生在后续投影"。｜修复：｜复验：
+- [轻微·技术] 第 1 章正文（第 116 行）与本章问题解答（第 157 行）：把"梯度范数持续偏高、反复尖峰"解释为"每步更新的方向和幅度在剧烈波动"。梯度范数是所有参数梯度组成向量的长度（页面自身在第 116 行也这样定义），只刻画更新的幅度，不刻画方向；单凭范数无法推出"方向"在波动。｜引文依据：页面第 116 行"梯度范数是所有参数梯度组成向量的长度，是一个标量"；报告 Fig.6 图注"Vision-tower gradient norms in our pre-training ablations."（未涉及更新方向）。｜修复要求：改为只讲幅度（如"每步更新的幅度在剧烈波动"），或删去"方向"二字。｜修复：｜复验：
+- [轻微·技术] 第 1 章 Fig.6 简化对照图（第 127–134 行）：从零训练的 MoonViT-V2 被画成一条无任何尖峰的水平虚线，而来源表述为"lower gradient norms with fewer spikes"（更少尖峰，并非零尖峰）；图注却声称该图"只表达两条曲线的相对高低与尖峰密度"，示意图把"更少尖峰"表现成"无尖峰"，与该宣称不完全一致。｜引文依据：报告 Fig.6 图注"the from-scratch MoonViT-V2 maintains lower gradient norms with fewer spikes"。｜修复要求：给从零训练曲线加上少量低幅尖峰，或把图注中"尖峰密度"改为"尖峰多寡（示意）"。｜修复：｜复验：
+- [轻微·技术] 第 4 章补充折叠块（第 394 行）：为说明"MLP 投影器不小"，页面写"pixel-shuffle 后通道维为 1024×4=4096，仅一层到 LLM 隐藏维 7168 的映射就要约 29M 参数"，把投影器设定为单层 4096→7168 线性（4096×7168=29.4M）。但同页所依赖的 config.json `vision_config` 另有 `mm_hidden_size=1024`、`mm_projector_type=patchmergerv2`，提示投影器输出维为 1024 而非 7168，实际形状与该假设不符；页面只写"报告未说明"，未与 config.json 已有字段核对，而页首元信息声称"可核对数字均与 config.json 与报告 Table 1 逐一对照"。｜引文依据：config.json vision_config：`mm_hidden_size=1024`、`mm_projector_type=patchmergerv2`、`merge_kernel_size=[2,2]`、`text_hidden_size=7168`；页面第 394 行"仅一层到 LLM 隐藏维 7168 的映射就要约 29M 参数"。｜修复要求：改为按 config.json 字段说明投影器（如"投影器类型 patchmergerv2、输出维 mm_hidden_size=1024"），或把 29M 明确标注为"若按单层 4096→7168 估计"的假设值。｜修复：｜复验：
+
+## 结论
+
+- 统计：阻断 0 / 重要 0 / 轻微 5
+- 处置：可发布。核心结论、全部 C/F/N 引文、Table 1 与 config.json 数字、两处手算与可运行代码输出均逐条回源核对通过，无可对来源的阻断或重要问题；以上 5 条为不影响正确性与主线的表达/表述问题，可在下一轮轻量清理。
+- 边界说明：本页第 6 章"限定规模"边界、N1"报告未明确二者为同一架构，同架构属页面推断，本页不采用"的自我限定，与来源一致，未发现把实验条件观察写成无条件论断或将推断包装成来源结论的情况。
+
+统计：阻断 0 / 重要 0 / 轻微 5
