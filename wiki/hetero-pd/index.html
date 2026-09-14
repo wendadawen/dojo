@@ -234,7 +234,7 @@
       <tr><td>15:54:06.545</td><td>D 全部完成：64 token，端到端 2.64 s</td></tr>
     </table>
 
-    <p style="color:var(--text-light);font-size:14px">注：ttft 为 P 侧内建计时，其计时起点与表中 proxy 投递时刻不同源，故 0.126 s 与相邻两行时间戳之差 0.113 s 相差 13 ms，属计时口径差异。</p>
+    <p style="color:var(--text-light);font-size:14px">注：表中时刻分别取自 proxy 与 P、D 两侧服务各自的本地时钟，三台机器未做时钟同步，毫秒级先后不可跨机直接比较（如 D 侧 <code>KV recv done</code> 15:54:04.024 早于 P 侧 <code>KV send done</code> 15:54:04.025，反映的是两侧时钟偏移，而非先收到、后发出）。ttft 为 P 侧内建计时，其计时起点与表中 proxy 投递时刻不同源，故 0.126 s 与相邻两行时间戳之差 0.113 s 相差 13 ms，属计时口径差异。</p>
 
     <h2>4. KV 的字节构成：1351680 的推导</h2>
 
@@ -281,7 +281,7 @@
       <figcaption>图 3：block 内布局。K、V 半块各 64 行 × 132 B（128 B 数据 + 4 B 行尾 scale），两半块各 8448 B。</figcaption>
     </figure>
 
-    <p>实测速率（关闭前缀缓存，单 rank 传输 8110080 B）：热路径 4.4 ms（约 1.70 GB/s），冷路径 17.8 ms（约 0.42 GB/s）。热路径指 RDMA 连接与显存映射已预热后的稳态传输、冷路径指该连接建立后的首次传输，两者字节数相同、差在是否已预热（此区分为推断）。日志沿用 GB/s 字样，基数实为 $2^{30}$（GiB）。第 3 节前缀缓存命中那次的 6.9 ms / 1.09 GB/s 同此口径，属另一次运行，条件不同，不与本节直接对比。</p>
+    <p>实测速率（关闭前缀缓存，单 rank 传输 8110080 B）：热路径 4.4 ms（约 1.70 GB/s），冷路径 17.8 ms（约 0.42 GB/s）。热路径指 RDMA 连接与显存映射已预热后的稳态传输、冷路径指该连接建立后的首次传输，两者字节数相同、差在是否已预热（此区分为推断）。日志沿用 GB/s 字样，基数实为 $2^{30}$（GiB）。第 3 节前缀缓存命中时的传输（6.9 ms / 1.09 GB/s）同此口径，属另一次运行，条件不同，不与本节直接对比。</p>
 
     <h2>5. 异构可行的条件与脆弱性</h2>
 
@@ -300,7 +300,7 @@
 
     <p>约束来自零拷贝 reshape：cache 按 (block_size, head_size+elems) 分配、运行时 reshape 成 (pad_total_rows, head_size)，元素总数必须守恒，所以 elems × block_size 必须能被 head_size 整除。代入 block_size=64、head_size=128：$\gcd(64,128)=64$，unit = 2，elems = 4——与 D 侧固定值恰好一致，两侧每层每 block 同为 16896 B。</p>
 
-    <p><strong>这个一致是脆弱的，由具体参数组合决定</strong>。反例：head_size=192、block_size=64 时 $\gcd=64$、unit=3、elems=6 $\neq$ 4，两侧布局就不再匹配；而第 2 节说过 <code>compat_hash</code> 只报告不阻止——布局错配会变成静默的数据损坏风险，只能在观测侧发现。</p>
+    <p><strong>这个一致是脆弱的，由具体参数组合决定</strong>。反例：head_size=192、block_size=64 时 $\gcd=64$、unit=3、elems=6 $\neq$ 4，两侧布局就不再匹配；而 <code>compat_hash</code> 只收集信息、不做校验（见第 2 节）——布局错配会变成静默的数据损坏风险，只能在观测侧发现。</p>
 
     <p>另有两处「允许不同」：一是 <code>block_stride</code>，P 若走 cross-layer split KV 则 stride=2，D 的 backend 不 split 则 stride=1，两侧各用各自的 stride 计算索引（descriptor 长度建链时已按对端参数算好）；二是 D 侧代码注释明确 HYVL_INT8_ATTN 不能加进 K/V-outer 布局的 backend 集合——它是 NHD 序且 scale 内嵌在每个 head 尾部，属于另一套布局约定（NHD 与 HND 两种排法的取舍见 <a href="../kv-cache-layout/index.html">KV cache 布局</a>）。</p>
 
@@ -338,10 +338,10 @@ grep -a "KV transfer timeout\|NIXL transfer failed\|prefill_failed"   $L</code><
       <tr><th>阶段</th><th>耗时</th><th>占比</th></tr>
       <tr><td>proxy 分发 + P prefill</td><td>约 150 ms</td><td>4%</td></tr>
       <tr><td>KV RDMA 传输</td><td>4.4 ms</td><td><strong>0.12%</strong></td></tr>
-      <tr><td>D decode（64 token）</td><td>3.48 s</td><td><strong>96%</strong></td></tr>
+      <tr><td>D decode（63 token，另承接 P 产出的首 token）</td><td>3.48 s</td><td><strong>96%</strong></td></tr>
     </table>
 
-    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么（D 侧把本地命中的头部块数回传、P 侧据此只发增量的设计能进一步压低这部分传输，见 <a href="../increase-kv/index.html">增量 KV 传输</a>）；单请求吞吐上，走 PD 的端到端为 64 token / 3.63 s（约 17.6 tok/s），低于 D 本机跑全程的 23.5 tok/s，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
+    <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么（D 侧把本地命中的头部块数回传、P 侧据此只发增量的设计能进一步压低这部分传输，见 <a href="../increase-kv/index.html">增量 KV 传输</a>）；单请求吞吐上，走 PD 的端到端为 64 token / 3.63 s（约 17.6 tok/s），其中 D 的 decode 占 96%。</p>
 
     <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。<strong>该收益为推断</strong>：实测仅覆盖单请求链路，多请求并发下的整体吞吐未测，单请求对比无法体现这一收益。</p>
 
