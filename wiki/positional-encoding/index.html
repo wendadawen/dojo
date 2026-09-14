@@ -62,7 +62,7 @@
 <p><b>主要依据</b>：Vaswani et al. 2017, "Attention Is All You Need", NeurIPS 2017, arXiv:1706.03762, §3.5 位置编码（正弦公式、Table 3 row (e) learned 对比）；Raffel et al. 2019, "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", JMLR, §2.1 相对位置偏置；Kimi K3 技术报告, arXiv:2607.24653v2, §2.1.2/§3.4 与官方 config.json（MLA 层 NoPE 选择）；Press et al. 2021, "Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation", arXiv:2108.12409（ALiBi 线性距离偏置）；DeepSeek-V2 论文（arXiv:2405.04434，§2.1.3 RoPE 与 MLA 矩阵吸收的冲突）。RoPE 与 NoPE 的完整机制分别见 <a href="../../wiki/rope/index.html">RoPE</a> 与 <a href="../../wiki/nope/index.html">NoPE</a>。</p>
 </blockquote>
 
-<p>把"我打你"和"你打我"这两句话喂给一个完全没有位置编码的 Transformer——模型能分清谁打谁吗？答案是：不能。两句话的 token 完全相同，只是顺序不同；而自注意力只看内容匹配、不看顺序，交换 token 顺序后输出只是随之一同重排（固定位置上的输出值会改变）。要让模型分清"谁在前谁在后"，必须把位置信息注入进去。<strong>位置编码</strong>就是干这件事的一类方法：给本身排列等变、不含位置感知的自注意力补充位置信号。按位置信号加在哪里，显式编码可分成四类——加在输入嵌入上的绝对正弦、同样加到嵌入上的可学习绝对、加在注意力分数上的相对偏置（T5）、乘在 query/key 上的旋转（RoPE）；此外还有完全不施加显式编码的 NoPE。这四类显式编码的注入点分别在输入嵌入、注意力分数与 query/key 旋转处，各自在参数量、外推能力与推理优化兼容性上有不同取舍；Kimi K3 的 MLA 层则选择 NoPE。</p>
+<p>把"我打你"和"你打我"输入一个不含位置编码的 Transformer，模型无法区分二者。两句话的 token 完全相同，只是顺序不同；而自注意力只看内容匹配、不看顺序，交换 token 顺序后输出只是随之一同重排（固定位置上的输出值会改变）。要让模型分清"谁在前谁在后"，必须把位置信息注入进去。<strong>位置编码</strong>就是干这件事的一类方法：给本身排列等变、不含位置感知的自注意力补充位置信号。按位置信号加在哪里，显式编码可分成四类——加在输入嵌入上的绝对正弦、同样加到嵌入上的可学习绝对、加在注意力分数上的相对偏置（T5）、乘在 query/key 上的旋转（RoPE）；此外还有完全不施加显式编码的 NoPE。这四类显式编码的注入点分别在输入嵌入、注意力分数与 query/key 旋转处，各自在参数量、外推能力与推理优化兼容性上有不同取舍；Kimi K3 的 MLA 层则选择 NoPE。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -220,7 +220,7 @@
 <p>高频维与低频维在同一位置的变化速率不同。维度 0,1（高频 $\omega_0=1$）：$pos$ 从 0 到 3，sin 值 $0 \to 0.8415 \to 0.9093 \to 0.1411$，cos 值 $1 \to 0.5403 \to -0.4161 \to -0.9900$——几乎转完一圈，变化剧烈。维度 2,3（低频 $\omega_1=0.01$）：sin 值 $0 \to 0.0100 \to 0.0200 \to 0.0300$，cos 值 $1 \to 1.0000 \to 0.9998 \to 0.9996$——几乎不动。高频维区分邻近位置（$pos=1$ 和 $pos=2$ 的 dim 0 差 0.07、dim 1 差 0.96），低频维区分远距离位置（$pos=1$ 和 $pos=100$ 的 dim 2 才差约 0.83）。这就是多尺度同时编码的最小例证。</p>
 
 <details>
-<summary>展开：d=4 手算例子的完整逐步代入</summary>
+<summary>展开：$d_{model}=4$ 手算例子的完整逐步代入</summary>
 <p>已知 $d_{model}=4$、base $=10000$、$\omega_0=1$、$\omega_1=0.01$。</p>
 <p><strong>$pos=1$</strong>：</p>
 <p>$$PE_{(1,0)}=\sin(1/10000^{0})=\sin(1)\approx 0.8415,$$</p>
@@ -250,7 +250,7 @@
 <p>$$\sin((pos+\Delta)\omega_i)=\sin(pos\cdot\omega_i)\cos(\Delta\omega_i)+\cos(pos\cdot\omega_i)\sin(\Delta\omega_i)=PE_{(pos,2i)}\cos(\Delta\omega_i)+PE_{(pos,2i+1)}\sin(\Delta\omega_i).$$</p>
 <p>同理用余弦和角公式 $\cos(a+b)=\cos a\cos b - \sin a\sin b$：</p>
 <p>$$\cos((pos+\Delta)\omega_i)=\cos(pos\cdot\omega_i)\cos(\Delta\omega_i)-\sin(pos\cdot\omega_i)\sin(\Delta\omega_i)=PE_{(pos,2i+1)}\cos(\Delta\omega_i)-PE_{(pos,2i)}\sin(\Delta\omega_i).$$</p>
-<p>用 d=4 手算例子验证：从 $pos=1$ 到 $pos=2$，$\Delta=1$、$\omega_0=1$。$PE_{(2,0)}=\sin 2\approx 0.9093$；按线性性质：$PE_{(1,0)}\cos 1 + PE_{(1,1)}\sin 1 = \sin 1\cos 1 + \cos 1\sin 1 = 2\sin 1\cos 1 = \sin 2 \approx 0.9093$。一致。</p>
+<p>用 $d_{model}=4$ 手算例子验证：从 $pos=1$ 到 $pos=2$，$\Delta=1$、$\omega_0=1$。$PE_{(2,0)}=\sin 2\approx 0.9093$；按线性性质：$PE_{(1,0)}\cos 1 + PE_{(1,1)}\sin 1 = \sin 1\cos 1 + \cos 1\sin 1 = 2\sin 1\cos 1 = \sin 2 \approx 0.9093$。一致。</p>
 <p>这个"旋转"性质只在一对维度内成立，且 $\Delta$ 是固定偏移。它说明相对位置可由线性变换读出，但正弦方案本身仍是绝对位置编码（向量与 $pos$ 绑定、加在嵌入上）——不等于"相对位置编码"。</p>
 </details>
 
@@ -382,7 +382,7 @@
 <p>本质区别在两点<sup>[C8]</sup>：</p>
 <ul>
   <li><strong>编码对象不同</strong>：绝对方案编码"第几位"（向量与绝对位置 $pos$ 绑定）；相对方案编码"相差几位"（偏置与相对距离 $i-j$ 绑定）。</li>
-  <li><strong>作用点不同</strong>：绝对方案加在输入嵌入上，位置信号只在第一层之前进入一次，之后被 $W^Q$、$W^K$、$W^V$ 投影扭曲；相对方案加在注意力分数上，每个注意力层、每个头都直接把位置信号注入分数——模型对位置更敏感。</li>
+  <li><strong>作用点不同</strong>：绝对方案加在输入嵌入上，位置信号只在第一层之前进入一次，之后被 $W^Q$、$W^K$、$W^V$ 投影扭曲；相对方案加在注意力分数上，每个注意力层、每个头都直接把位置信号注入分数。</li>
 </ul>
 
 <div class="table-scroll">
@@ -419,7 +419,7 @@
     <p>绝对方案与相对方案的两个本质区别是什么？</p>
     <details>
       <summary>解答：编码对象与作用点不同</summary>
-      <p>其一，编码对象：绝对方案编码"第几位"（向量与绝对位置 $pos$ 绑定），相对方案编码"相差几位"（偏置与相对距离 $i-j$ 绑定）。其二，作用点：绝对方案加在输入嵌入上，位置信号只在第一层之前进入一次、之后被 $W^Q,W^K,W^V$ 投影扭曲；相对方案加在注意力分数上，每个注意力层、每个头都直接注入位置信号，模型对位置更敏感。</p>
+      <p>其一，编码对象：绝对方案编码"第几位"（向量与绝对位置 $pos$ 绑定），相对方案编码"相差几位"（偏置与相对距离 $i-j$ 绑定）。其二，作用点：绝对方案加在输入嵌入上，位置信号只在第一层之前进入一次、之后被 $W^Q,W^K,W^V$ 投影扭曲；相对方案加在注意力分数上，每个注意力层、每个头都直接注入位置信号。</p>
     </details>
   </li>
   <li>
@@ -521,7 +521,7 @@
 <p><strong>N3（$d_{model}=512$）</strong>：Vaswani et al. 2017 §3.1 / Table 3 base 模型。</p>
 
 <h3>构造示例</h3>
-<p><strong>d=4 正弦 PE 手算</strong>：$d_{model}=4$、base $=10000$，计算 $pos=0,1,2,3$ 的 PE 向量。构造目的：用最小手算例子展示多频率在同一位置的不同变化速率（高频维 dim 0,1 振荡快、低频维 dim 2,3 几乎不动）。数字便于手算，不代表真实模型配置（真实 $d_{model}=512$）。</p>
+<p><strong>$d_{model}=4$ 正弦 PE 手算</strong>：$d_{model}=4$、base $=10000$，计算 $pos=0,1,2,3$ 的 PE 向量。构造目的：用最小手算例子展示多频率在同一位置的不同变化速率（高频维 dim 0,1 振荡快、低频维 dim 2,3 几乎不动）。数字便于手算，不代表真实模型配置（真实 $d_{model}=512$）。</p>
 <p><strong>"我打你"vs"你打我"钩子</strong>：教学构造，说明排列等变带来的语义丢失——相同 token 不同顺序在无位置信息时不可区分。</p>
 <p><strong>"The cat sat on the mat"相对距离</strong>：教学构造，说明语言学中相对距离比绝对位置更重要。</p>
 

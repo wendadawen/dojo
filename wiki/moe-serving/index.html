@@ -27,16 +27,6 @@
     onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
   <link rel="stylesheet" href="../../libs/dojo-concept.css">
     <style>
-    .diagram {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      background: var(--bg-code);
-      padding: 1rem;
-      overflow-x: auto;
-      border-radius: 6px;
-      line-height: 1.5;
-      margin: 1.5rem 0;
-    }
     /* ============ HTML 结构流程图 ============ */
     .flow {
       font-family: var(--font-ui);
@@ -110,7 +100,7 @@
 
 <p>DeepSeek-V3 有 6710 亿（671B）个参数，但它回答问题时，每生成一个字只动用其中约 370 亿（37B）——大约 5.5%<sup>[N1]</sup>。它是怎么做到"存得多、算得少"的？而这 5.5% 的计算，又如何摊到几百张 GPU 上，支撑起一个在线服务？</p>
 
-<p>一句话说清本页内容：MoE（Mixture-of-Experts，专家混合）大模型从模型结构到在线服务的最小概念链——为什么把 Transformer 层里的一个模块换成"一排只被选中几个的专家"、专家怎么摆到多张 GPU 上、一次请求经过哪两个阶段、服务好坏怎么量、两个阶段放一起还是分开。</p>
+<p>一句话说清：MoE（Mixture-of-Experts，专家混合）大模型从模型结构到在线服务的最小概念链——为什么把 Transformer 层里的一个模块换成"一排只被选中几个的专家"、专家怎么摆到多张 GPU 上、一次请求经过哪两个阶段、服务好坏怎么量、两个阶段放一起还是分开。</p>
 
 <div class="context-box">
   <p class="context-box-title">开始之前</p>
@@ -216,7 +206,7 @@
 
 <h2 id="s2-moe-topk">2. 把一个 FFN 换成一排专家：MoE 与 top-k 稀疏激活</h2>
 
-<p>直觉上，模型存的参数越多，能记住和表达的东西越多。但稠密（dense）模型里参数翻倍意味着每个 token 的计算量也翻倍——每一层的每个模块对每个 token 都要算一遍。计算量直接就是服务成本：参数翻倍，每个回答都贵一倍。有没有办法让"存得多"和"算得少"分开？</p>
+<p>直觉上，模型存的参数越多，能记住和表达的东西越多。但稠密（dense）模型里参数翻倍意味着每个 token 的计算量也翻倍——每一层的每个模块对每个 token 都要算一遍。在稠密模型这个设定下，每个 token 的计算量是服务成本的主要驱动：参数翻倍，每个回答的计算量也跟着翻倍。有没有办法让"存得多"和"算得少"分开？</p>
 
 <p>MoE 的做法是：把每层那个 FFN 复制成一排 $N$ 个小 FFN，每个叫一个<strong>专家</strong>（expert）；再加一个很小的打分器叫 <strong>router</strong>（路由器）。每个 token 到来时，router 给所有专家打分，只让得分最高的 $k$ 个（<strong>top-k</strong>）专家真正计算这个 token，其余专家这一轮完全不碰它。选中的专家各自给出输出，最后按 router 给的权重加权求和<sup>[F1]</sup>：</p>
 
@@ -334,7 +324,7 @@
 
 <p>每个"token–专家"对就是一次搬运：卡 0 收到 6 对，卡 1 只收到 2 对；combine 再按原路把同样数量的结果送回。现在看负载：如果每对的计算时间相近，卡 0 这一步要干的活约为卡 1 的 3 倍，而整层要等所有卡都算完才能继续——卡 1 的算力在空转。上一章"路由偏好导致负载不均"的隐患，在服务侧就长成这个样子：token 的偏好直接变成 GPU 之间的忙闲不均<sup>[C5]</sup>。真实系统会复制热门专家、定期调整摆放来缓解（DeepSeek 的部署就是这么做的），细节超出本页范围。</p>
 
-<p>真实规模示例：DeepSeek 的在线推理系统里，prefill 的一个部署单元是 4 节点 32 张 GPU（EP32，每卡放 9 个路由专家加 1 个共享专家），decode 的一个部署单元是 18 节点 144 张 GPU（EP144，每卡只放 2 个路由专家加 1 个共享专家）<sup>[N4]</sup>。每卡的专家数多于 $256$ 除以卡数，是因为除 256 个路由专家外另设了 32 个冗余路由专家（合计 288）：$288/32=9$、$288/144=2$。256 个专家摊到上百张卡上，每张卡只剩个位数。</p>
+<p>真实规模示例：DeepSeek 的在线推理系统里，prefill 的一个部署单元是 4 节点 32 张 GPU（EP32，每卡放 9 个路由专家加 1 个共享专家），decode 的一个部署单元是 18 节点 144 张 GPU（EP144，每卡只放 2 个路由专家加 1 个共享专家）<sup>[N4]</sup>。每卡的专家数多于 256 除以卡数，是因为除 256 个路由专家外另设了 32 个冗余路由专家（合计 288）：$288/32=9$、$288/144=2$。256 个专家摊到上百张卡上，每张卡只剩个位数。</p>
 
 <details class="code-details">
 <summary>代码：模拟 top-2 路由下的 dispatch 计数，验证上表</summary>
@@ -580,7 +570,7 @@ combine 把同样数量的结果送回：卡0=6 对，卡1=2 对
 
 <p>服务方对这两个指标分别承诺上限，并要求一定比例的请求达标——这叫 <strong>SLO</strong>（服务级别目标），达标请求占比的下限叫<strong>达成率</strong>（比如 90% 的请求满足 TTFT 与 TPOT 上限）。</p>
 
-<p>最后是衡量系统容量的主指标：<strong>goodput</strong>（有效吞吐）= 在满足 SLO 达成率的前提下，系统每秒最多能承接多少请求<sup>[C12]</sup>。注意它不是"尽量快"：请求越挤，排队越久，超 SLO 的请求越多。goodput 问的是"在不让达成率破防的前提下，还能再加多少请求"。<strong>构造示例。</strong> 若实测 4 req/s 时 95% 的请求达标、8 req/s 时只剩 80% 达标（构造数字），那么 goodput 落在 4 与 8 之间，需要找到仍满足 90% 达成率的最大速率。</p>
+<p>最后是衡量系统容量的主指标：<strong>goodput</strong>（有效吞吐）= 在满足 SLO 达成率的前提下，系统每秒最多能承接多少请求<sup>[C12]</sup>。注意它不是"尽量快"：请求越挤，排队越久，超 SLO 的请求越多。goodput 问的是"在不让 SLO 达成率跌破目标的前提下，还能再加多少请求"。<strong>构造示例。</strong> 若实测 4 req/s 时 95% 的请求达标、8 req/s 时只剩 80% 达标（构造数字），那么 goodput 落在 4 与 8 之间，需要找到仍满足 90% 达成率的最大速率。</p>
 
 <div class="table-scroll">
 <table>

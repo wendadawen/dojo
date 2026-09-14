@@ -30,3 +30,5 @@ reviewed_content_sha256: d97e52ca88007589
 - 模型卡 AngelSlim/Hy4-preview-GGUF：「2 + 32 + 8 = 42 bytes…1.3125 bpw」、`d = sum(w*sel*x)/sum(w*sel^2)`、零位 `w[j]*(x[j]^2-(|x[j]|-d)^2)`、`alternating for 3 rounds`、`-89.7%`/`-4.1%`、`1200 real expert rows`、PTQ、文件表 213.66 GiB/2.38 bpw、路由专家 gate/up 在 29 层用 1.3125 bpw（另 48 层 2.0625 bpw），均一致。
 - 链接与资源：`../hy4-preview-lite/index.html`、`../mixed-precision-quant/index.html`、`overview.html`、`../../index.html` 与全部 `../../libs/` 资源均存在；正文无 `research/` 路径、无「待生成」占位。
 - 表述维度：通读全文含折叠块与图注，未发现会话指代（我/我们/你）、调试或复现踩坑叙事、以「场景」当术语、公文连接词堆叠；「本页…」句式与「主角」「大头」等口语化措辞在站内同批页面中属通行写法（如 mixed-precision-quant 首段同构句式），本轮不另记问题。
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

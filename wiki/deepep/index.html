@@ -84,7 +84,7 @@
 <p>高吞吐内核如何利用 NVLink 与 RDMA 两种带宽，把跨节点 dispatch/combine 跑满？</p>
 <details>
 <summary>解答：两段转发让两种网络完全重叠</summary>
-<p>token 先经 IB 到目标节点上与发送 rank 同 in-node index 的 GPU，落地后经 NVLink 转发给持有目标专家的 GPU，不被后到 token 阻塞——IB 与 NVLink 完全重叠。配合 node-limited routing（每 token 至多 4 个目标节点）限制 IB 流量，20 个 SM 分成 10 个通信通道即可跑满两种网络。实测节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s（含本 rank 流量的逻辑带宽口径，可超过单卡网卡约 50 GB/s 的峰值）。完整论证见第 2 章「高吞吐内核」。</p>
+<p>token 先经 IB 到目标节点上与发送 rank 同 in-node index 的 GPU，落地后经 NVLink 转发给持有目标专家的 GPU，不被后到 token 阻塞——IB 与 NVLink 完全重叠。配合 node-limited routing（每 token 至多 4 个目标节点）限制 IB 流量，20 个 SM 分成 10 个通信通道即可跑满两种网络。实测节点内 153/158 GB/s 逼近 160 GB/s 的 NVLink 峰值，跨节点 43-58 GB/s（含本 rank 流量的逻辑带宽口径，可超过单卡网卡约 50 GB/s 的峰值；该口径为页面推断，说明见 2.5 节「实测带宽」）。完整论证见第 2 章「高吞吐内核」。</p>
 </details>
 </li>
 <li>
@@ -398,7 +398,7 @@ $$[\,\text{num\_local\_experts},\quad \text{num\_max\_dispatch\_tokens\_per\_ran
 <li>$h$：hidden，数据为 FP8 e4m3，附带每 128 元素一组的缩放因子（列主序排布，以兼容 TMA——Tensor Memory Accelerator，张量内存加速器）<sup>[C13]</sup>。</li>
 </ul>
 
-<p>关键设计在第二个维度：接收行按来源 rank 分段，段基址由来源 rank 决定，段内下标按该 rank 发往此专家的 token 依次递增——V1 源码的偏移计算即"来源 rank × num_max + 段内序号"，序号是发送 rank 内按专家计数的到达顺序<sup>[C13]</sup>。确定一个副本落在哪个槽只需要发送 rank 自己的路由信息，不需要任何跨 rank 同步；接收侧也不需要预先知道"实际会收到多少 token"——所有 rank 都按最坏情况（每个来源 rank 的全部 token 都可能发来）预留空间，不做 CPU 接收计数同步。这带来两个直接后果：其一，内核与 CUDA graph 兼容（replay 时需恢复部分 buffer 状态），dispatch 还隐式完成 FP8 转换<sup>[C14]</sup>；其二，槽位不全部有效，<code>recv_count</code> 给出每个本地专家的实际接收数，计算侧据此只处理有效槽位<sup>[C13]</sup>。</p>
+<p>关键设计在第二个维度：接收行按来源 rank 分段，段基址由来源 rank 决定，段内下标按该 rank 发往此专家的 token 依次递增——V1 源码的偏移计算即 $\text{来源 rank}\times\text{num\_max}+\text{段内序号}$（<code>num_max</code> 为源码变量 <code>num_max_dispatch_tokens_per_rank</code> 的简写），序号是发送 rank 内按专家计数的到达顺序<sup>[C13]</sup>。确定一个副本落在哪个槽只需要发送 rank 自己的路由信息，不需要任何跨 rank 同步；接收侧也不需要预先知道"实际会收到多少 token"——所有 rank 都按最坏情况（每个来源 rank 的全部 token 都可能发来）预留空间，不做 CPU 接收计数同步。这带来两个直接后果：其一，内核与 CUDA graph 兼容（replay 时需恢复部分 buffer 状态），dispatch 还隐式完成 FP8 转换<sup>[C14]</sup>；其二，槽位不全部有效，<code>recv_count</code> 给出每个本地专家的实际接收数，计算侧据此只处理有效槽位<sup>[C13]</sup>。</p>
 
 <p>构造示例切到 decode 场景：每 rank 2 个 token（即 <code>num_max_dispatch_tokens_per_rank</code> 取 2），16 个 token 按一张显式路由表分发，构造原则是均衡——每个专家恰好收到 4 个 token。专家 $E_5$ 的接收行共 16 槽（表中 $t_{r,j}$ 表示来源 rank $r$ 的第 $j$ 个 token）：</p>
 
@@ -577,7 +577,7 @@ rank 0 两个 token 的 combine 结果：
 槽位利用率：全库有效槽位 32 / 预留 128（每专家一行 16 槽，共 8 行）
 </code></pre>
 </div>
-<p><b>验证的机制</b>：dispatch 把每个 token 副本写入目标专家接收行的固定槽位（<code>segment_base</code> 与段内计数对应正文"来源 rank × num_max + 段内序号"的规则）；专家计算只读有效槽位；combine 从同一槽位取回输出、按门控值加权求和（对应式（12）最后一项）。第 5 步逐 token 比对槽位路径与直接计算，验证布局与归约的一致性。</p>
+<p><b>验证的机制</b>：dispatch 把每个 token 副本写入目标专家接收行的固定槽位（<code>segment_base</code> 与段内计数对应正文 $\text{来源 rank}\times\text{num\_max}+\text{段内序号}$ 的规则）；专家计算只读有效槽位；combine 从同一槽位取回输出、按门控值加权求和（对应式（12）最后一项）。第 5 步逐 token 比对槽位路径与直接计算，验证布局与归约的一致性。</p>
 <p><b>观察重点</b>：专家 $E_5$ 的接收行 16 槽中只有槽 0、4、8、12 有效，recv_count 全部为 4；combine 后 $t_0$ 得到 $(3.6,4.6)$，正是 $0.6\cdot\operatorname{FFN}_1(t_0)+0.4\cdot\operatorname{FFN}_5(t_0)$ 的手算结果。</p>
 <p><b>简化条件</b>：用数组读写代替 RDMA 传输、用逐元素加法的 mock FFN 代替 grouped GEMM、不做 FP8 量化（真实内核隐式完成 FP8 转换）、不含 hook 与双缓冲逻辑。构造中每个来源 rank 至多一个 token 发往同一专家，段内序号均为 0；真实内核中同一 rank 的多个 token 可发往同一专家，段内序号依次递增。本代码验证的是布局与归约的数据结构逻辑，不是 DeepEP 的通信实现。</p>
 </details>

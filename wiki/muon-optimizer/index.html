@@ -147,7 +147,7 @@
 
 <p>其中 $\|\cdot\|_F$ 为 Frobenius 范数（矩阵所有元素平方和的平方根）。设 $G = USV^\top$，则这个最近半正交矩阵就是 $UV^\top$——把所有奇异值全置 1、保留奇异向量方向。对上面的 $(0.9,\ 0.1)$，正交化目标是把奇异值拉平到接近 $(1,\ 1)$，使两个方向获得均等的更新尺度。$O^\top O = I$ 表示列正交（用于行数 $\ge$ 列数的矩阵），$OO^\top = I$ 表示行正交。</p>
 
-<p>本章解释了动量更新矩阵条件数高、正交化把奇异值拉平的动机。但直接做 SVD 取 $UV^\top$ 太慢——下一章讲 Newton-Schulz 迭代如何只用矩阵乘法逼近正交化。</p>
+<p>直接做 SVD 取 $UV^\top$ 太慢，需要一种只含矩阵乘法、能在 GPU 上高效运行的迭代来逼近正交化——Newton-Schulz 迭代正是这样一个方法。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -203,7 +203,7 @@
 
 <p>$$X = \frac{G}{\|G\|_F + \varepsilon},\qquad \varepsilon = 10^{-7}.$$</p>
 
-<p>其中 $\|G\|_F$ 是 Frobenius 范数（矩阵所有元素平方和的平方根）。归一化后所有奇异值落在 $[0,1]$，因为最大奇异值不超过 $\|G\|_F$。这个缩放是良性的：正交化满足 $\operatorname{Ortho}(cG) = \operatorname{Ortho}(G)$（对任意非零常数 $c$），所以缩放不改变正交化结果。<sup>[F5]</sup> 此外，若 $G$ 的行数大于列数（$m > n$），先对 $G$ 做转置再迭代，迭代完成后再转回来，使迭代始终在行数不超过列数（$m \le n$）的矩阵上运行以减少计算量。</p>
+<p>其中 $\|G\|_F$ 是 Frobenius 范数（矩阵所有元素平方和的平方根），$\varepsilon = 10^{-7}$ 是避免除零的极小常数<sup>[N4]</sup>。归一化后所有奇异值落在 $[0,1]$，因为最大奇异值不超过 $\|G\|_F$。这个缩放是良性的：正交化满足 $\operatorname{Ortho}(cG) = \operatorname{Ortho}(G)$（对任意非零常数 $c$），所以缩放不改变正交化结果。<sup>[F5]</sup> 此外，若 $G$ 的行数大于列数（$m > n$），先对 $G$ 做转置再迭代，迭代完成后再转回来，使迭代始终在行数不超过列数（$m \le n$）的矩阵上运行以减少计算量。</p>
 
 <p>系数 $(a,b,c)$ 有两组常用取值。<sup>[N1, N2, N3, N5]</sup> 基线系数 $(a,b,c) = (2,\ -1.5,\ 0.5)$ 是主源博客给出的简单基线，多次迭代后奇异值收敛到 1。调优系数 $(a,b,c) = (3.4445,\ -4.7750,\ 2.0315)$ 是 Muon 公开实现的默认值，调优原则有两条：让 $a$ 尽量大，因为 $\phi'(0) = a$ 控制小奇异值的初始增长速率；以及让 $\phi^N(x)$ 的长期取值落入期待区间 $[0.7,\ 1.3]$（这是设计目标，在 $x$ 接近 0 或个别区间上并不严格成立），即奇异值不必精确收敛到 1，误差约 0.3 即可不影响训练损失曲线。默认迭代步数 $T = 5$。</p>
 
@@ -211,7 +211,7 @@
 <p><b>调优系数的目标是"快速进入容忍区间"，不是"精确收敛到 1"</b>。调优系数的 $\phi'(0)=3.4445$ 大于基线的 $2$，使小奇异值第一步增长更快；但大系数也让接近 1 的奇异值产生振荡，最终在 $[0.7,\ 1.3]$ 附近波动而非收敛到 1。这种"不精确"是设计选择——正交化的关键是把奇异值谱拉平，不是精确求解。</p>
 </div>
 
-<p>NS 迭代的另一个工程优势是<strong>可在 bfloat16 精度下稳定运行</strong>。<sup>[C8]</sup> 对比之下，SVD 太慢，Shampoo 使用的 coupled Newton iteration 需要至少 float32 精度才能避免数值不稳定。NS 迭代只用矩阵乘法，而现代 GPU 有 bfloat16 专用张量核心，这使得它在工程上可行。</p>
+<p>NS 迭代的另一个工程优势是<strong>可在 bfloat16 精度下稳定运行</strong>。<sup>[C8]</sup> 对比之下，SVD 太慢，Shampoo 使用的 coupled Newton iteration 需要至少 float32 精度才能避免数值不稳定。<sup>[C9]</sup> NS 迭代只用矩阵乘法，而现代 GPU 有 bfloat16 专用张量核心，这使得它在工程上可行。</p>
 
 <h3 id="handcalc-example">2.1 手算例子：把 $\operatorname{diag}(0.9,\ 0.1)$ 拉平</h3>
 
@@ -317,7 +317,7 @@ print(f"基线 O^T O =\n{np.round(O_base.T @ O_base, 4)} (应接近 I)")
 <p><b>教学简化</b>：简化做法是用 numpy 的 float64 计算。可推出：NS 迭代的奇异值拉平机制与精度无关。不可推出：bfloat16 下的精确数值行为与 float64 完全一致。</p>
 </details>
 
-<p>本章展示了 Newton-Schulz 迭代如何只用矩阵乘法把奇异值推向 1。但 NS 迭代只是 Muon 的一环——下一章讲动量、正交化与参数更新的完整组合流程。</p>
+<p>NS 迭代只是 Muon 的一环，只有把动量累积、正交化与参数更新组合起来，才是完整的 Muon 更新流程。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -431,7 +431,7 @@ W_{t+1} ← W_t - η · O_t
 
 <p>Muon 的主要外部证据来自竞争性训练任务 NanoGPT speedrun（以 FineWeb 数据集训练 NanoGPT 达到 val loss 3.28 为目标）：<sup>[N6, N7]</sup> 2024-10-15 从 AdamW 切换到 Muon 首次创造训练速度记录，提速 35%；此后产生的 12 个新记录由 7 位不同研究者创造，Muon 在所有记录中保持为优化器选择。扩展验证中，用 8 张 H100 训练 1.5B 参数 transformer 达到 GPT-2 XL 级 HellaSwag 性能，Muon 需 10 小时而 AdamW 需 13.3 小时；<sup>[N9]</sup> CIFAR-10 训练至 94% 准确率的速度记录从 3.3 A100-seconds 提升到 2.6 A100-seconds。<sup>[N10]</sup> 这些是外部事实数字，说明 Muon 在竞争性任务中的表现，不直接构成机制结论。</p>
 
-<p>本章把动量、正交化与参数更新组合成完整流程，并对比了 SGD-momentum、AdamW 与 Shampoo。但 Muon 并非万能——下一章讲它的适用边界，哪些参数用 Muon、哪些仍用 AdamW。</p>
+<p>Muon 并非万能，它只适用于特定参数类型，其余参数仍需 AdamW——判断依据是参数的形状与优化动力学，而非优化器本身的强弱。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -467,7 +467,7 @@ W_{t+1} ← W_t - η · O_t
 <thead><tr><th>参数类型</th><th>典型形状</th><th>优化器</th><th>原因</th></tr></thead>
 <tbody>
 <tr><td>隐藏层线性层权重</td><td>$[\text{dim}, \text{dim}]$</td><td>Muon</td><td>二维矩阵，正交化使其各方向均等更新</td></tr>
-<tr><td>卷积核（展平后三维）</td><td>$[\text{out}, \text{in}\cdot k^2]$</td><td>Muon</td><td>展平为二维后适用</td></tr>
+<tr><td>卷积核（4D 展平最后三维为 2D）</td><td>$[\text{out}, \text{in}\cdot k^2]$</td><td>Muon</td><td>展平为二维后适用</td></tr>
 <tr><td>bias、LayerNorm scale/shift</td><td>$[\text{dim}]$ 或标量</td><td>AdamW</td><td>一维参数无法定义"奇异值方向"，正交化无意义</td></tr>
 <tr><td>embedding 层</td><td>$[\text{vocab}, \text{dim}]$</td><td>AdamW</td><td>modular norm theory 理论支持不同优化动力学</td></tr>
 <tr><td>输出层（lm_head/分类头）</td><td>$[\text{dim}, \text{vocab}]$</td><td>AdamW</td><td>经验结论，无理论解释</td></tr>
@@ -502,7 +502,7 @@ W_{t+1} ← W_t - η · O_t
 <p>因此 $\|UV^\top\|_F = \sqrt{r}$，$\operatorname{RMS}(UV^\top) = \sqrt{r}/\sqrt{nm} = \sqrt{r/(nm)}$。满秩时 $r = \min(m,n)$，化简得 $\sqrt{1/\max(m,n)}$。</p>
 </details>
 
-<p>所以 $0.2 \cdot \sqrt{\max(m,n)} \cdot O_t$ 的 RMS 为 $0.2 \cdot \sqrt{\max(m,n)} \cdot \sqrt{1/\max(m,n)} = 0.2$，与 AdamW 的典型 update RMS（约 0.2–0.4）对齐。<strong>此缩放因子是 Moonshot 改进，非 Keller Jordan 原始博客内容</strong>；PyTorch <code>torch.optim.Muon</code>（2.9 起内置）提供该选项（<code>adjust_lr_fn='match_rms_adamw'</code>），默认仍为 Keller 原始缩放（<code>adjust_lr_fn='original'</code>）。<sup>[F7]</sup> 对前面的 2×2 例子，$\gamma = 0.2 \cdot \sqrt{2} \approx 0.283$，基线系数收敛后 $O_t \approx I$ 的 RMS 约 0.707，缩放后约 0.2。</p>
+<p>所以 $0.2 \cdot \sqrt{\max(m,n)} \cdot O_t$ 的 RMS 为 $0.2 \cdot \sqrt{\max(m,n)} \cdot \sqrt{1/\max(m,n)} = 0.2$，与 AdamW 的典型 update RMS（约 0.2–0.4）对齐。<strong>此缩放因子是 Moonshot 改进，非 Keller Jordan 原始博客内容</strong>；PyTorch <code>torch.optim.Muon</code>（2.9 起内置）提供该选项（<code>adjust_lr_fn='match_rms_adamw'</code>），默认仍为 Keller 原始缩放（<code>adjust_lr_fn='original'</code>）。<sup>[F7]</sup> 对前面的 $2 \times 2$ 例子，$\gamma = 0.2 \cdot \sqrt{2} \approx 0.283$，基线系数收敛后 $O_t \approx I$ 的 RMS 约 0.707，缩放后约 0.2。</p>
 
 <div class="table-scroll">
 <table>
@@ -549,13 +549,13 @@ W_{t+1} ← W_t - η · O_t
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（Muon 定义）、C2（仅隐藏层 2D，embedding/输出层用 AdamW）、C3（动量在正交化前加入，Nesterov 默认）、C4（更新矩阵条件数高）、C5（正交化放大稀有方向）、C6（与 Shampoo 关系）、C7（QKV 分开）、C8（bfloat16 稳定）：均来自 Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客 https://kellerjordan.github.io/posts/muon/）。C2 中 embedding 用 AdamW 的理论依据为 modular norm theory（Large et al. 2024《Scalable Optimization in the Modular Norm》，arXiv:2405.14813），本文只引用结论。</p>
+<p>C1（Muon 定义）、C2（仅隐藏层 2D，embedding/输出层用 AdamW）、C3（动量在正交化前加入，Nesterov 默认）、C4（更新矩阵条件数高）、C5（正交化放大稀有方向）、C6（与 Shampoo 关系）、C7（QKV 分开）、C8（bfloat16 稳定）、C9（coupled Newton iteration 需至少 float32 精度）：均来自 Keller Jordan 等《Muon: An optimizer for hidden layers in neural networks》（2024，博客 https://kellerjordan.github.io/posts/muon/）。C2 中 embedding 用 AdamW 的理论依据为 modular norm theory（Large et al. 2024《Scalable Optimization in the Modular Norm》，arXiv:2405.14813），本文只引用结论。</p>
 
 <h3>公式与来源（F）</h3>
-<p>F1（NS 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$）、F2（SVD 下 $U\phi(S)V^\top$）、F3（N 步复合 $U\phi^N(S)V^\top$）、F4（正交化目标 $\arg\min\|O-G\|_F$ 等价 $UV^\top$）、F5（谱范数归一化与 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$）、F6（Shampoo 无累积 = $UV^\top$）：来自 Keller Jordan 2024 博客，博客注明该等价由 Bernstein &amp; Newhouse (2024) 观察到（另见 Anil 2024a）。F7（RMS 对齐缩放因子 $\gamma=0.2\sqrt{\max(m,n)}$ 与 $\operatorname{RMS}(UV^\top)=\sqrt{1/\max(m,n)}$）：来自 Moonshot AI《Muon is Scalable for LLM Training》（2025），推导参考苏剑林博客（kexue.fm）。F1–F5 由主源直接给出；F6 由主源给出 SVD 展开步骤，完整推导见上文折叠块；F7 由 Moonshot 给出结论，RMS 推导由上文折叠块补全。</p>
+<p>F1（NS 单步公式 $G'=(aI+b(GG^\top)+c(GG^\top)^2)G$）、F2（SVD 下 $U\phi(S)V^\top$）、F3（N 步复合 $U\phi^N(S)V^\top$）、F4（正交化目标 $\arg\min\|O-G\|_F$ 等价 $UV^\top$）、F5（谱范数归一化与 $\operatorname{Ortho}(cG)=\operatorname{Ortho}(G)$）、F6（Shampoo 无累积 = $UV^\top$）：来自 Keller Jordan 2024 博客，博客注明该等价由 Bernstein &amp; Newhouse (2024) 观察到（另见 Anil 2024a）。F7（RMS 对齐缩放因子 $\gamma=0.2\sqrt{\max(m,n)}$ 与 $\operatorname{RMS}(UV^\top)=\sqrt{1/\max(m,n)}$）：来自 Moonshot AI《Muon is Scalable for LLM Training》（2025，arXiv:2502.16982）。F1–F5 由主源直接给出；F6 由主源给出 SVD 展开步骤，完整推导见上文折叠块；F7 由 Moonshot 给出结论，RMS 推导由上文折叠块补全。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>N1（调优系数 $(3.4445, -4.7750, 2.0315)$）、N2（基线系数 $(2, -1.5, 0.5)$）、N3（迭代步数 5）、N4（$\varepsilon=10^{-7}$）、N5（允许 $\phi^N(x)\in[0.7,1.3]$）、N8（FLOP 开销 NanoGPT 0.7% / Llama 405B 0.5%）、N9（1.5B transformer 10 vs 13.3 H100-hours）、N10（CIFAR-10 3.3→2.6 A100-seconds）：来自 Keller Jordan 2024 博客。N6（2024-10-15 首次记录，提速 35%）、N7（12 个记录，7 位研究者）：来自同一博客。N11（PyTorch <code>torch.optim.Muon</code> 默认 lr=1e-3, weight_decay=0.1, momentum=0.95, nesterov=True, ns_steps=5, adjust_lr_fn 默认 'original'）：来自 PyTorch 官方文档 <code>torch.optim.Muon</code>（2.9 起内置，<code>adjust_lr_fn='match_rms_adamw'</code> 提供 Moonshot RMS 对齐选项）。N12（贡献者 Jordan、Jin、Boza、You、Cesista、Newhouse、Bernstein）：来自博客 Citation。</p>
+<p>N1（调优系数 $(3.4445, -4.7750, 2.0315)$）、N2（基线系数 $(2, -1.5, 0.5)$）、N3（迭代步数 5）、N4（$\varepsilon=10^{-7}$）、N5（允许 $\phi^N(x)\in[0.7,1.3]$）、N8（FLOP 开销 NanoGPT 0.7% / Llama 405B 0.5%）、N9（1.5B transformer 10 vs 13.3 H100-hours）、N10（CIFAR-10 由 3.3 降至 2.6 A100-seconds）：来自 Keller Jordan 2024 博客。N6（2024-10-15 首次记录，提速 35%）、N7（12 个记录，7 位研究者）：来自同一博客。N11（PyTorch <code>torch.optim.Muon</code> 默认 lr=1e-3, weight_decay=0.1, momentum=0.95, nesterov=True, ns_steps=5, adjust_lr_fn 默认 'original'）：来自 PyTorch 官方文档 <code>torch.optim.Muon</code>（2.9 起内置，<code>adjust_lr_fn='match_rms_adamw'</code> 提供 Moonshot RMS 对齐选项）。N12（贡献者 Jordan、Jin、Boza、You、Cesista、Newhouse、Bernstein）：来自博客 Citation。</p>
 
 <h3>构造示例</h3>
 <p>构造示例 $G = \operatorname{diag}(0.9,\ 0.1)$ 为人为构造的教学数字，目的是让奇异值拉平过程可手算：条件数 9（少数方向主导），谱归一化后 $(0.9939,\ 0.1104)$，5 步基线系数 NS 后逼近 $(1,\ 1)$。不代表真实训练数据或工程推荐值。可运行代码用 numpy float64 复现，便于读者独立验证。</p>
@@ -565,7 +565,7 @@ W_{t+1} ← W_t - η · O_t
 
 <h3>简化条件及其限制</h3>
 <p>简化做法是用 numpy 的 float64 计算。可推出：NS 迭代的奇异值拉平机制与计算精度无关。不可推出：bfloat16 下的精确数值行为与 float64 完全一致（真实工程用 bfloat16 在 GPU 上运行，精度行为有差异但机制一致）。</p>
-<p>简化做法是只展示 2×2 对角矩阵。可推出：NS 迭代机制对任意大小矩阵相同。不可推出：大矩阵的收敛速度与 2×2 一致（真实训练中矩阵远大于此，如 $768 \times 768$ 或更大）。</p>
+<p>简化做法是只展示 $2 \times 2$ 对角矩阵。可推出：NS 迭代机制对任意大小矩阵相同。不可推出：大矩阵的收敛速度与 $2 \times 2$ 一致（真实训练中矩阵远大于此，如 $768 \times 768$ 或更大）。</p>
 <p>简化做法是伪代码与代码只展示单步更新与正交化。可推出：Muon 的核心更新机制。不可推出：完整训练流程（未展示学习率调度、权重衰减除 RMS 对齐外、梯度裁剪等工程细节，不能直接作为生产训练代码）。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

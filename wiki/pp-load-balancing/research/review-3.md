@@ -127,3 +127,5 @@ reviewed_content_sha256: 18488e2a5196407c
   - 页面元数据与两页互链：是（第 3 轮核查）
   - 递归生成的前置概念页完成各自质检：四个前置页（model-parallelism、chunked-prefill、kv-cache、ppd-disaggregation）研究目录三轮记录齐全；causal-mask 页研究目录无任何审查记录——该页为三轮审查机制确立（2026-08-18）之前的早期产物，属既有状态，不阻塞本页发布，建议另行安排补审
 - 处置：可发布。首页目录与关系图由 GitHub Pages 构建自动发现本页。
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

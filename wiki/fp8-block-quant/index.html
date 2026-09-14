@@ -62,7 +62,7 @@
 <p><b>主要依据</b>：Micikevicius et al., <i>FP8 Formats for Deep Learning</i>, arXiv:2209.05433（2022）；DeepSeek-AI, <i>DeepSeek-V3 Technical Report</i>, arXiv:2412.19437 §3.3；GLM-5.3-Flash checkpoint 张量头与 transformers finegrained-fp8 quantizer。</p>
 </blockquote>
 
-<p>GLM-5.3-Flash 有 321.3 B 参数，磁盘占用只有 305.8 GiB——平均每个参数 1.02 字节，不到 BF16（2 字节）的 55%<sup>[N4]</sup>。这是 FP8 块量化的效果：权重用 8 位浮点 E4M3 存储，每 $128\times128$ 个权重共享一个缩放因子对准可表示区间。它的链条是「格式 → 缩放 → 分块 → 配套策略 → 实证」：E4M3 的 8 个比特怎么用、为什么需要缩放、逐张量缩放为何不够、分块方案的规则，以及训练侧必须配套的高精度累加。</p>
+<p>GLM-5.3-Flash 有 321.3 B 参数，磁盘占用只有 305.8 GiB——平均每个参数 1.02 字节，约为 BF16（2 字节）的一半<sup>[N4]</sup>。这是 FP8 块量化的效果：权重用 8 位浮点 E4M3 存储，每 $128\times128$ 个权重共享一个缩放因子对准可表示区间。它的链条是「格式 → 缩放 → 分块 → 配套策略 → 实证」：E4M3 的 8 个比特怎么用、为什么需要缩放、逐张量缩放为何不够、分块方案的规则，以及训练侧必须配套的高精度累加。</p>
 
 <p>量化的通用概念（scale、对称量化、量化粒度）见<a href="../quantization-basics/index.html">量化基础</a>。FP8 特有的部分从 E4M3 的位布局开始。</p>
 
@@ -220,7 +220,7 @@ print("值 =", val)</code></pre>
   </div>
   <p><b>验证的机制</b>：位解码公式 $(-1)^S\times2^{E-7}\times(1+M/8)$ 与 torch 的 <code>finfo</code> 常数（max=448、tiny=$2^{-6}$）互相印证<sup>[F1]</sup>。</p>
   <p><b>观察重点</b>：从 $2^{-6}$ 到 $448$ 跨 15 个 binade，加上非规格化区间共 18 个——8 位浮点的动态范围来自指数位，这一点 INT8（无指数、256 个等距格点）做不到。</p>
-  <p><b>简化条件</b>：只查常数与解码，不做 FP8 算术（CPU 上 <code>float8_e4m3fn</code> 的逐元素算术未实现，矩阵乘可用，本页不需要）。</p>
+  <p><b>简化条件</b>：只查常数与解码，不做 FP8 算术（CPU 上 <code>float8_e4m3fn</code> 的逐元素加法等部分算术未实现，矩阵乘可用，本页不需要）。</p>
 </details>
 
 <h3 id="format-questions">本章问题</h3>
@@ -377,7 +377,7 @@ for shape in [(2048, 4096), (16384, 1536)]:
   </div>
   <p><b>验证的机制</b>：量化-反量化的三式（$s$、clamp、乘回）与 <code>quantizer_finegrained_fp8</code> 的实现一致；scale 形状公式对真实权重形状验证<sup>[F2][F4]</sup>。</p>
   <p><b>观察重点</b>：这个 $4\times4$ 块故意塞进 $6.0$ 到 $0.001$ 的宽动态范围——$0.001\times74.67\approx0.075$ 落在粗网格上，最大相对误差 4.6% 出现在小值上。块内动态范围就是块量化的精度边界：块再大（或离群值再极端），小值的相对误差会继续恶化。</p>
-  <p><b>简化条件</b>：块取 $4\times4$ 便于手算（真实块 $128\times128$，机制相同）；<code>float8_e4m3fn</code> 的 cast 在 CPU 上做的是四舍五入到最近可表示值，舍入方式与 GPU 路径相同。</p>
+  <p><b>简化条件</b>：块取 $4\times4$ 便于手算（真实块 $128\times128$，机制相同）；<code>float8_e4m3fn</code> 的 cast 在 CPU 上按就近取偶（round-to-nearest-even）舍入到最近可表示值，GPU 侧舍入细节未验证（见「简化条件及其限制」）。</p>
 </details>
 
 <p><strong>块不是越大越好</strong>。DeepSeek-V3 的附录 B.2 记录了一个反面实验：把激活梯度也按 $128\times128$ 块量化（与权重同粒度），在一个约 16B 参数的 MoE 模型上训练约 300B token 后发散；论文归因于激活梯度存在与 token 相关的离群值，$128\times128$ 的块太粗，只有 $1\times128$ 的逐 token 粒度才隔离得住<sup>[C13]</sup>。粒度必须按张量类型选，一套粒度通吃所有张量不行。</p>
@@ -404,7 +404,7 @@ for shape in [(2048, 4096), (16384, 1536)]:
 
 <h2 id="training-stack">5. 配套策略与实证</h2>
 
-<p><strong>FP32 累加</strong>。块量化解决「存得准」，但乘法算完还得累加：H800 的 FP8 GEMM 硬件累加只保留约 14 位精度，内积维度 $K=4096$ 时（大规模训练的常见规模）最大相对误差接近 2%<sup>[C10]</sup>。DeepSeek-V3 的做法是每累加 128 个元素（$N_C=128$）就把部分和搬到 CUDA Core 的 FP32 寄存器做全精度累加（论文称 promotion）；$N_C$ 取 128 相当于 4 个 WGMMA，是论文给出的最小累加间隔<sup>[C10]</sup>。</p>
+<p><strong>FP32 累加</strong>。块量化解决「存得准」，但乘法算完还得累加：H800 的 FP8 GEMM 硬件累加只保留约 14 位精度，内积维度 $K=4096$ 时最大相对误差接近 2%<sup>[C10]</sup>。DeepSeek-V3 的做法是每累加 128 个元素（$N_C=128$）就把部分和搬到 CUDA Core 的 FP32 寄存器做全精度累加（论文称 promotion）；$N_C$ 取 128 相当于 4 个 WGMMA，是论文给出的最小累加间隔<sup>[C10]</sup>。</p>
 
 <p><strong>E4M3 全用</strong>。此前的惯例是前向用 E4M3、反向梯度用 E5M2 的混搭（即第 2 章的分工）；DeepSeek-V3 在所有张量上统一用 E4M3，理由是分块缩放让小组内的元素「共享指数」，E4M3 的窄动态范围被补偿掉了<sup>[C9]</sup>。效果上，FP8 训练与 BF16 基线的相对 loss 误差始终低于 0.25%（在接近 DeepSeek-V2-Lite 与 V2 的两个规模、约 1T token 上验证）<sup>[C11][N3]</sup>。该结论限于该论文的实验条件。</p>
 

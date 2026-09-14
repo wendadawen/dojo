@@ -313,7 +313,7 @@
     <tr><td>注意力</td><td>双向、变长打包（cu_seqlens）、12 头 × 128（头维 $=$ qkv_hidden/heads $\ne$ hidden/heads $=85.3$）</td><td>KDA 96×128 因果 / MLA 96 头 NoPE 因果</td></tr>
     <tr><td>FFN</td><td>稠密 MLP2：1024→4096→1024，GELU(tanh)</td><td>Stable Latent MoE / 第 0 层 Dense，SiTU-GLU</td></tr>
     <tr><td>位置编码</td><td>2D RoPE + 可学习方格</td><td>NoPE</td></tr>
-    <tr><td>量化</td><td>vision_tower 与 mm_projector 均豁免 MXFP4</td><td>MXFP4 量化目标为路由专家的 w1/w2/w3、latent 下/上投影与 AttnRes res 投影；config 的 ignore 表豁免 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector（报告 §4.1.4 另称 latent MoE 投影与 MoE 路由器保持高精度，与 config 的量化目标不一致）</td></tr>
+    <tr><td>量化</td><td>vision_tower 与 mm_projector 均豁免 MXFP4</td><td>MXFP4 量化目标为路由专家的 w1/w2/w3、latent 下/上投影与 AttnRes res 投影；config 的 ignore 表豁免 self_attn、共享专家、mlp 的 gate/up/down 投影、lm_head、vision_tower、mm_projector（报告 §4.1.4 另称 latent MoE 投影与 MoE 路由器保持高精度，其中 latent MoE 投影与 config 的量化目标不一致；MoE 路由器是裸参数、不属 Linear 量化目标，不构成分歧）</td></tr>
     <tr><td>参数占比</td><td>447.4M（0.016%）</td><td>其余 99.984%</td></tr>
   </table>
   <p>归一化两侧一致（RMSNorm、无 bias）。多图输入时同一图像内所有 patch 互相可见、跨图不互注意——本机实测两图拼接跑与分开跑输出逐元素一致（max diff &lt; 1e-5），印证 cu_seqlens 块对角掩码。</p>
@@ -688,7 +688,7 @@ mla: {
     qa:    {label:'q_a_proj\n7168 → 1536', t:'lin', io:'[2,8,7168] -> [2,8,1536]', f:'x W_{qa}', d:'查询的 LoRA 下投影,压到 q_lora_rank=1536。'},
     qan:   {label:'q_a_layernorm\n1536 → 1536', t:'nrm', io:'[2,8,1536] -> [2,8,1536]', f:'\\mathrm{RMSNorm}', d:'压缩后归一。'},
     qb:    {label:'q_b_proj\n1536 → 18432', t:'lin', io:'[2,8,1536] -> [2,8,18432]', f:'q = (\\cdot) W_{qb}', d:'查询上投影。18432 = 96 头 × 192(q_head_dim = qk_nope_head_dim 128 + qk_rope_head_dim 64)。'},
-    qsplit:{label:'split q\n96×192 → 128+64', t:'shp', io:'[2,8,96,192] -> pass128 + rot64', f:'q \\to (q_{pass}, q_{rot})', d:'每头 192 拆成 nope 部分 128 + rot 部分 64。rot 分量仅作结构拆分,不施加旋转(全模型 NoPE)。'},
+    qsplit:{label:'split q\n96×192 → 128+64', t:'shp', io:'[2,8,96,192] -> pass128 + rot64', f:'q \\to (q_{pass}, q_{rot})', d:'每头 192 拆成 nope 部分 128 + rot 部分 64。rot 分量仅作结构拆分,不施加旋转(语言主干 NoPE)。'},
     // KV 路
     kva:   {label:'kv_a_proj(MQA)\n7168 → 576', t:'lin', io:'[2,8,7168] -> [2,8,576]', f:'x W_{kva}', d:'KV 联合 LoRA 下投影。576 = kv_lora_rank(512) + qk_rope_head_dim(64)。MQA 式:KV 压成一份共享的低秩潜向量。'},
     kvsplit:{label:'split kv\n576 → 512+64', t:'shp', io:'[2,8,576] -> ckv512 + krot64', f:'\\to (c_{kv}, k_{rot})', d:'拆成压缩 KV 潜向量 512 + 共享的 rot 键 64。'},
@@ -774,7 +774,7 @@ fusion: {
   rankSep:46, nodeSep:24,
   legend:[['#1f9d6b','文本侧'],['#16a085','视觉侧'],['#e0922f','扩展计算'],['#556070','校验/输出']],
   nodes:{
-    ids:  {label:'input_ids\n含 163605 占位符', t:'io', io:'[1,T]', f:'\\mathrm{media\\_placeholder\\_token\\_id} = 163605', d:'每张图在序列里是一个特殊占位符 token（image_placeholder = <|kimi_image_placeholder|>）。占位符个数必须等于输入图数：段多于占位符在 occupation 表 broadcast 处即报错，占位符多于段在填充校验处抛 ValueError。纯文本不含占位符，官方 forward 有 pixel_values 非空守卫，完全不进融合函数。'},
+    ids:  {label:'input_ids\n含 163605 占位符', t:'io', io:'[1,T]', f:'\\mathrm{media\\_placeholder\\_token\\_id} = 163605', d:'每张图在序列里是一个特殊占位符 token（image_placeholder = <|kimi_image_placeholder|>）。占位符个数必须等于输入图数：段数大于 1 时任一方向不匹配都在 occupation 表赋值处报形状错误；段数等于 1 且占位符多于段时，broadcast 后到填充校验处抛 ValueError。纯文本不含占位符，官方 forward 有 pixel_values 非空守卫，完全不进融合函数。'},
     temb: {label:'文本 embedding\n[1,T,7168]', t:'io', io:'[1,T] -> [1,T,7168]', f:'x = \\mathrm{Embedding}(\\mathrm{ids})', d:'占位符位置也会被正常查表，其值随后在融合中被覆盖。'},
     vfeat:{label:'视觉特征\n各图 [n_i,7168]', t:'vis', io:'list of [n_i,7168]', f:'n_i = (h_i/2)(w_i/2)', d:'每张图一段，段长 = 该图视觉 token 数（来自"视觉编码器"视图末端）。各图长度可以不同。'},
     occ:  {label:'occupation 表\n占位符位记 n_i', t:'shp', io:'[1,T] -> [1,T]', f:'\\mathrm{occ}_j = n_i\\ (\\mathrm{ids}_j{=}\\mathrm{PH}),\\; 1\\ (\\text{else})', d:'全 1 表，把每个占位符位置改写为对应图的 token 数 n_i——占位符"占 n_i 格"。'},

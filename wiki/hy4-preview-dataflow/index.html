@@ -198,7 +198,7 @@
   <h4>iHC：四条残差流的读写</h4>
   <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
   <tr><td>四条残差流<br>4×6144</td><td><code>[1,T,4,6144]</code></td><td>$x = (x_1,x_2,x_3,x_4)$</td><td>入口由 expand 复制产生，四条初始相同；第一次写回后因 post 门不同而分化。</td></tr>
-  <tr><td>展平 + 逆均方根<br>24576 维</td><td><code>[1,T,4,6144] -&gt; [1,T,24576]</code></td><td>$r = \mathrm{rsqrt}(\overline{\mathrm{flat}(x)^2}+\epsilon)$</td><td>门控输入的归一化因子在整个 24576 维上取均值（UnweightedRMSNorm 只返回 rsqrt，不乘回原值）。</td></tr>
+  <tr><td>展平 + 逆均方根<br>24576 维</td><td><code>[1,T,4,6144] -&gt; [1,T,24576]</code></td><td>$r = \mathrm{rsqrt}(\overline{\mathrm{flat}(x)^2}+\epsilon_{\mathrm{rms}})$</td><td>门控输入的归一化因子在整个 24576 维上取均值（UnweightedRMSNorm 只返回 rsqrt，不乘回原值）。$\epsilon_{\mathrm{rms}}=10^{-5}$，与门控项的 $\epsilon=10^{-6}$ 是两个不同的常量。</td></tr>
   <tr><td>hc_fn<br>24576 → 8</td><td><code>[1,T,24576] -&gt; [1,T,8]</code></td><td>$g = W_{fn}\,\mathrm{flat}(x) \cdot r$</td><td>8 行中前 4 行算 pre logits、后 4 行算 post logits——checkpoint 里只有一个 hc_pre 模块、没有 hc_post 的结构性原因。真实权重 hc_fn [8, 24576]，F32。</td></tr>
   <tr><td>pre 门<br>初始 0.25</td><td><code>-&gt; [1,T,4]</code></td><td>$\sigma(g^{pre} s_{pre} + b^{pre}) + \epsilon$</td><td>初始 $b = -\log 3$、$s = 0.01$，初始门 $\approx 0.25$。实测 mean $0.2500$。</td></tr>
   <tr><td>加权求和<br>→ 单流 6144</td><td><code>[1,T,4,6144] -&gt; [1,T,6144]</code></td><td>$\tilde{x} = \textstyle\sum_i \mathrm{pre}_i\, x_i$</td><td>4 条流各乘 $\approx 0.25$ 的门后相加，不是取均值，初始量级与单条流相当。全程 fp32。</td></tr>
@@ -216,7 +216,7 @@
   <tr><td>+ 偏置 → top-8<br>分组退化</td><td><code>[T,256] -&gt; [T,8]</code></td><td>$\mathrm{top8}(p + b)$</td><td>b 是 e_score_correction_bias（aux-loss-free 平衡偏置，真实值第 1 层 [-0.097, 0.032]、中位数 0.0013）。n_group=1、topk_group=1 使分组路由退化为无组限制。</td></tr>
   <tr><td>gather p → 归一化<br>→ ×2.827</td><td><code>[T,8]</code></td><td>$w_j = p_{(j)}/\textstyle\sum p_{(j)} \times 2.827$</td><td>权重从原始 sigmoid 分数取（不含偏置），归一化后整体放大。实测 token 5：归一化和精确 1.000000，放大后各权重 0.33–0.37。</td></tr>
   <tr><td>路由专家 ×8<br>SwiGLU 截断 ±10</td><td><code>[T,6144] -&gt; [T,6144]</code></td><td>$\mathrm{silu}(\min(g,10))\cdot\mathrm{clip}(u,-10,10)$</td><td>gate 只截上限、up 双向截断。单元实测 $\mathrm{silu}(10)\times(-7) = -69.9968$。每专家参数 37,748,736（gate_up [4096,6144] + down [6144,2048]）。</td></tr>
-  <tr><td>共享专家<br>无门控 无截断</td><td><code>[T,6144] -&gt; [T,6144]</code></td><td>$\mathrm{silu}(W_g x)\odot(W_u x)$</td><td>恒激活，与路由专家同构（中间维 2048），但无 swiglu 截断、无输出标量门，直接与路由结果相加。</td></tr>
+  <tr><td>共享专家<br>无门控 无截断</td><td><code>[T,6144] -&gt; [T,6144]</code></td><td>$\mathrm{silu}(W_g^{\mathrm{sh}} x)\odot(W_u x)$</td><td>恒激活，与路由专家同构（中间维 2048），但无 swiglu 截断、无输出标量门，直接与路由结果相加。</td></tr>
   <tr><td>相加输出</td><td><code>[T,8,6144] -&gt; [1,T,6144]</code></td><td>$y = \textstyle\sum_j w_j E_{(j)}(x) + \mathrm{Shared}(x)$</td><td>单层激活 341,311,744 参数（8/256 路由 + 共享 + 路由器）。路由专家合计 744.10B，占总参数 95.40%。</td></tr>
   </table>
   <p>边：x→r（6144）；r→sel（[T,256]）；sel→w（[T,8]）；x→e（6144）；w→e（权重）；e→out（8 份输出）；x→sh（6144）；sh→out（共享输出）；w→out（加权）</p>
@@ -238,8 +238,8 @@
   <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
   <tr><td>每 token 写入<br>MLA 潜向量</td><td><code>c [576] + k_rope 共享</code></td><td>$c = [512;\ 64]$</td><td>kv_a_proj_with_mqa 的输出。这是 MLA 的原生形态：512 维潜向量 + 64 维共享旋转键，与头数无关。</td></tr>
   <tr><td>vLLM：直接缓存潜向量<br>576 元素 = 1152 B</td><td><code>[T,576] + sink[64]</code></td><td>$576 \times 2\,\mathrm{B}$</td><td>MQA 式存储：每个 token 每层只存 576 个 bf16 元素，另 64 个 per-head sink 常驻（一次性）。解码时在 Kernel 内展开。78 层合计 87.8 KiB/token；1M 上下文约 87.8 GiB。</td></tr>
-  <tr><td>eager：缓存展开 K/V<br>32768 元素 = 65536 B</td><td><code>K[64,T,256] V[64,T,256]</code></td><td>$64\times(256+256)$</td><td>把潜向量经 kv_b_proj 展开成每头独立的 K/V 后缓存。78 层合计 4.88 MiB/token；1M 上下文约 4.88 TiB——这是参考实现口径，部署不可用，也是潜向量口径存在的理由。</td></tr>
-  <tr><td>体积比<br>56.89×</td><td><code>—</code></td><td>$32768/576$</td><td>两种口径存的是同一份信息（kv_b_proj 可逆展开），差距全在「何时展开」。</td></tr>
+  <tr><td>eager：缓存展开 K/V<br>32768 元素 = 65536 B</td><td><code>K[64,T,256] V[64,T,256]</code></td><td>$64\times(256+256)$</td><td>把潜向量经 kv_b_proj 展开成每头独立的 K/V 后缓存。78 层合计 4.88 MiB/token；1M 上下文约 4.88 TiB——这是参考实现口径，部署不可用。</td></tr>
+  <tr><td>体积比<br>56.89×</td><td><code>—</code></td><td>$32768/576$</td><td>两种口径存的是同一份信息：展开后的 K/V 由 576 维潜向量唯一决定，存潜向量不丢信息，差距全在「何时展开」。</td></tr>
   <tr><td>索引器缓存<br>21 层 × 128 维</td><td><code>[T,128] × 21</code></td><td>$21 \times 128\ \mathrm{dims}$</td><td>独立于主 cache：只有 full 层需要（57 个 shared 层不缓存）。vLLM FP8 约 2772 B/token（128 值一组附 4 字节 scale）；eager BF16 5376 B/token。1M 上下文约 2.7–5.2 GiB。</td></tr>
   <tr><td>1M 上下文合计<br>(线性估算)</td><td><code>—</code></td><td>$\approx 90.5\ \mathrm{GiB}\ (\mathrm{vLLM})$</td><td>vLLM：主 87.8 GiB + 索引器 2.7 GiB，合计 $\approx$ 90.5 GiB。eager 口径主 cache 4.88 TiB 不可用。按每 token 线性估算，忽略块对齐开销。</td></tr>
   </table>
@@ -260,7 +260,7 @@
   <h3>iHC：四条残差流的读出与写回</h3>
   <ul>
     <li><b>入口复制</b>：embedding 经 <code>unsqueeze(2).expand(-1,-1,4,-1)</code> 变成 $[B,T,4,6144]$，四条流初始完全相同。等比缩小模型实测：第 0 层输入处四条流与 embeddings 逐位相等。</li>
-    <li><b>pre 门控读出</b>：把四条流展平成 24576 维，先算 $g = W_{fn}\,\mathrm{flat}(x) \cdot \mathrm{rsqrt}\big(\overline{\mathrm{flat}(x)^2} + \epsilon\big)$（$W_{fn}\in\mathbb{R}^{8\times24576}$，前 4 行给 pre、后 4 行给 post），再混合
+    <li><b>pre 门控读出</b>：把四条流展平成 24576 维，先算 $g = W_{fn}\,\mathrm{flat}(x) \cdot \mathrm{rsqrt}\big(\overline{\mathrm{flat}(x)^2} + \epsilon_{\mathrm{rms}}\big)$（$W_{fn}\in\mathbb{R}^{8\times24576}$，$\epsilon_{\mathrm{rms}}=10^{-5}$，与门控项的 $\epsilon=10^{-6}$ 不是同一常量；前 4 行给 pre、后 4 行给 post），再混合
       $$\tilde{x} = \sum_{i=1}^{4}\Big(\sigma\big(g_i^{pre} s_{pre} + b_i^{pre}\big) + \epsilon\Big)\, x_i$$
       全程强制 fp32。初始化使 $b^{pre}=-\log 3$、$s=0.01$，故初始 pre 门 $\approx\sigma(-\log 3)=0.25$——等比缩小模型实测 pre 门 min 0.2491 / max 0.2511 / mean 0.2500，与理论值吻合。</li>
     <li><b>post 门控写回</b>：子层输出 $y$ 按每条流一个标量外积写回
@@ -290,7 +290,7 @@
     <li><b>logits 与稀疏掩码</b>：$\mathrm{logits} = qk^\top/\sqrt{256}$（缩放因子 $=qk\_head\_dim^{-1/2}=0.0625$），再叠加因果掩码与索引器 top-k 掩码（非选中位置填 dtype 最小值）。</li>
     <li><b>sink 只进分母</b>：每头一个可学习标量 $s_h$ 拼到 logits 行尾，
       $$P = \mathrm{softmax}\big([\,\mathrm{logits}-\max;\; s_h-\max\,]\big)[\,:\,:\,T\,]$$
-      输出丢掉 sink 列，行和小于 1，缺口就是 sink 吸收的概率质量。初始 $s_h=0$ 时它不是常数 1 的等价物——等比缩小模型实测（24 token、随机权重）：sink 吸收质量 min 0.059 / mean 0.121 / max 0.502，即 sink 为零时仍平均吃掉 12% 的注意力质量。真实权重的 sink 已大幅训练：第 0 层均值 0.384（范围 $[-6.54, 3.17]$）、第 40 层 0.666、第 77 层 $-0.022$。</li>
+      输出丢掉 sink 列，行和小于 1，缺口就是 sink 吸收的概率质量。初始 $s_h=0$ 时它不是常数 1 的等价物——等比缩小模型实测（24 token、随机权重）：sink 吸收质量 min 0.059 / mean 0.121 / max 0.502，即 sink 初值为零时仍平均吸收 12% 的注意力质量。真实权重的 sink 已大幅训练：第 0 层均值 0.384（范围 $[-6.54, 3.17]$）、第 40 层 0.666、第 77 层 $-0.022$。</li>
     <li><b>逐元素 sigmoid 门</b>：注意力输出先乘 $\sigma(W_g x)$（$64\times256$ 维独立门）再过 o_proj。等比模型实测门值 min 0.389 / max 0.615 / mean 0.500。该门为逐元素门（输出宽度 $64\times256$），不是每头一个标量——<code>linear_gate.weight</code> [16384, 6144] 印证。</li>
     <li><b>全链路对撞</b>：q/kv 投影、展开、掩码、sink softmax、门、o_proj 的独立复算与官方实现输出最大绝对差 0（等比模型）；eager 返回的注意力概率矩阵也逐位一致。</li>
   </ul>
@@ -344,7 +344,7 @@
 
   <h3>checkpoint 是 vLLM 命名的 inner 格式</h3>
   <ul>
-    <li><b>命名一一对应 vLLM</b>：张量名如 <code>hc_attn_layer.hc_pre.hc_fn</code>、<code>self_attn.learnable_sink_param</code>、<code>self_attn.linear_gate.weight</code>、<code>mlp.experts.gate_up_proj</code>（3D 融合、无 <code>.weight</code> 后缀）与 vLLM 模块命名一一对应；vLLM 的 <code>load_weights</code> 直接按此命名加载。transformers 期望的命名（<code>attn_hc.*</code>、<code>sinks</code>、<code>gate_proj</code> 等）与之不同。</li>
+    <li><b>命名一一对应 vLLM</b>：张量名如 <code>hc_attn_layer.hc_pre.hc_fn</code>、<code>self_attn.learnable_sink_param</code>、<code>self_attn.linear_gate.weight</code>、<code>mlp.experts.gate_up_proj</code>（3D 融合、无 <code>.weight</code> 后缀）与 vLLM 的模块结构同源，vLLM 的 <code>load_weights</code> 只需少量键名改写（<code>wk</code> 与 <code>weights_proj</code> 融合、路由偏置改名、专家权重映射）即可加载。transformers 期望的命名（<code>attn_hc.*</code>、<code>sinks</code>、<code>gate_proj</code> 等）与之不同。</li>
     <li><b>只有 hc_pre、没有 hc_post</b>：checkpoint 中每个 iHC 模块只有一组 <code>hc_pre.{hc_fn[8,24576], hc_base[8], hc_scale[2]}</code>。结构上这是自洽的：pre 与 post 两套门控由同一模块计算——hc_fn 的 8 行中前 4 行算 pre logits、后 4 行算 post logits，hc_base 的 8 个元素与 hc_scale 的 2 个元素同样按前后半区分属 pre/post。</li>
     <li><b>hub 的微调补丁只做改名</b>：仓库内的 <code>finetune/llama_factory_support/hy_v4_patches.py</code> 只执行 <code>mlp.router.gate.</code> → <code>mlp.gate.</code> 之类的键名映射与专家权重融合，不含任何 RoPE 置换。</li>
     <li><b>F32 小张量是运行时精度的实存证据</b>：626 个 F32 张量恰为 iHC 门控、主干 sink、主干路由偏置与 hc_head——对应 transformers <code>_keep_in_fp32_modules_strict</code> 清单的核心项，但 k_norm、weights_proj 与 lm_head 在文件中仍是 BF16，即「fp32 计算」发生在加载后而非存储时。</li>
@@ -364,7 +364,7 @@
   <h2 id="verify">6. 核对方式</h2>
   <p>数字来源分四类：</p>
   <p><b>结构与维度</b>：用 HTTP Range 请求读取全部 131 个 safetensors 分片的 JSON 文件头，得到 2006 个张量的名称、形状与 dtype，与 config 及源码推导交叉验证（层数与层型、索引层分布、MoE 形状、iHC 参数形状、MTP 构成、F32 清单等）。</p>
-  <p><b>公式与数值行为</b>：把官方 <code>modeling_hy_v4.py</code> 原样 exec（架构代码零改动，仅以等义桩替换 transformers 框架侧装饰器），构造保留全部结构特征的等比缩小模型（10 层、隐藏维 512、8 头、16 专家 top-8、4 条流、24 token），用 forward hook 捕获官方实现的中间张量，再以独立手写公式复算对撞。iHC 混合与门控、索引器打分与 top-k、MLA 全链路（含 sink softmax 与门）、MoE 路由与专家、dense FFN 均逐张量对撞通过（最大差 0 至 $7.3\times10^{-10}$）；prefill/decode 等价性以五步证据链闭合。MTP 按官方 vLLM 实现的语义拼装缩小版跑通。</p>
+  <p><b>公式与数值行为</b>：把官方 <code>modeling_hy_v4.py</code> 原样 exec（架构代码零改动，仅以等义桩替换 transformers 框架侧装饰器），构造保留全部结构特征的等比缩小模型（10 层、隐藏维 512、8 头、16 专家 top-8、4 条流，序列长度 24；等价性验证另跑 47 token），用 forward hook 捕获官方实现的中间张量，再以独立手写公式复算对撞。iHC 混合与门控、索引器打分与 top-k、MLA 全链路（含 sink softmax 与门）、MoE 路由与专家、dense FFN 均逐张量对撞通过（最大差 0 至 $7.3\times10^{-10}$）；prefill/decode 等价性以五步证据链闭合。MTP 按官方 vLLM 实现的语义拼装缩小版实测通过。</p>
   <p><b>checkpoint 小张量实值</b>：按 <code>data_offsets</code> 用 Range 请求精确下载 sink、路由偏置、hc_base / hc_scale、hc_head、k_norm 等小张量（F32 与 BF16 均按位模式正确解码），覆盖第 0 / 40 / 77 层与 MTP 层。</p>
   <p><b>参数量</b>：2006 个张量头逐一累加得总量与分组；单 token 激活按结构规则（78 组注意力、21 个 full 索引器、77 层 top-8 + 共享、首层 dense）累加，各分组数字与张量头独立核对一致。</p>
 
@@ -687,7 +687,7 @@ ihc: {
   legend:[['#8a93a3','残差流'],['#e0922f','门控参数'],['#16a085','读出 / 写回'],['#556070','末端收束']],
   nodes:{
     st:   {label:'四条残差流\n4×6144', t:'grp', io:'[1,T,4,6144]', f:'x = (x_1,x_2,x_3,x_4)', d:'入口由 expand 复制产生，四条初始相同；第一次写回后因 post 门不同而分化。'},
-    flat: {label:'展平 + 逆均方根\n24576 维', t:'grp', io:'[1,T,4,6144] -> [1,T,24576]', f:'r = \\mathrm{rsqrt}(\\overline{\\mathrm{flat}(x)^2}+\\epsilon)', d:'门控输入的归一化因子在整个 24576 维上取均值（UnweightedRMSNorm 只返回 rsqrt，不乘回原值）。'},
+    flat: {label:'展平 + 逆均方根\n24576 维', t:'grp', io:'[1,T,4,6144] -> [1,T,24576]', f:'r = \\mathrm{rsqrt}(\\overline{\\mathrm{flat}(x)^2}+\\epsilon_{\\mathrm{rms}})', d:'门控输入的归一化因子在整个 24576 维上取均值（UnweightedRMSNorm 只返回 rsqrt，不乘回原值）。$\\epsilon_{\\mathrm{rms}}=10^{-5}$，与门控项的 $\\epsilon=10^{-6}$ 是两个不同的常量。'},
     fn:   {label:'hc_fn\n24576 → 8', t:'gt', io:'[1,T,24576] -> [1,T,8]', f:'g = W_{fn}\\,\\mathrm{flat}(x) \\cdot r', d:'8 行中前 4 行算 pre logits、后 4 行算 post logits——checkpoint 里只有一个 hc_pre 模块、没有 hc_post 的结构性原因。真实权重 hc_fn [8, 24576]，F32。'},
     pre:  {label:'pre 门\n初始 0.25', t:'gt', io:'-> [1,T,4]', f:'\\sigma(g^{pre} s_{pre} + b^{pre}) + \\epsilon', d:'初始 $b = -\\log 3$、$s = 0.01$，初始门 $\\approx 0.25$。实测 mean $0.2500$。'},
     mix:  {label:'加权求和\n→ 单流 6144', t:'sel', io:'[1,T,4,6144] -> [1,T,6144]', f:'\\tilde{x} = \\textstyle\\sum_i \\mathrm{pre}_i\\, x_i', d:'4 条流各乘 $\\approx 0.25$ 的门后相加，不是取均值，初始量级与单条流相当。全程 fp32。'},
@@ -715,7 +715,7 @@ moe: {
     sel:  {label:'+ 偏置 → top-8\n分组退化', t:'gt', io:'[T,256] -> [T,8]', f:'\\mathrm{top8}(p + b)', d:'b 是 e_score_correction_bias（aux-loss-free 平衡偏置，真实值第 1 层 [-0.097, 0.032]、中位数 0.0013）。n_group=1、topk_group=1 使分组路由退化为无组限制。'},
     w:    {label:'gather p → 归一化\n→ ×2.827', t:'gt', io:'[T,8]', f:'w_j = p_{(j)}/\\textstyle\\sum p_{(j)} \\times 2.827', d:'权重从原始 sigmoid 分数取（不含偏置），归一化后整体放大。实测 token 5：归一化和精确 1.000000，放大后各权重 0.33–0.37。'},
     e:    {label:'路由专家 ×8\nSwiGLU 截断 ±10', t:'rexp', io:'[T,6144] -> [T,6144]', f:'\\mathrm{silu}(\\min(g,10))\\cdot\\mathrm{clip}(u,-10,10)', d:'gate 只截上限、up 双向截断。单元实测 $\\mathrm{silu}(10)\\times(-7) = -69.9968$。每专家参数 37,748,736（gate_up [4096,6144] + down [6144,2048]）。'},
-    sh:   {label:'共享专家\n无门控 无截断', t:'sexp', io:'[T,6144] -> [T,6144]', f:'\\mathrm{silu}(W_g x)\\odot(W_u x)', d:'恒激活，与路由专家同构（中间维 2048），但无 swiglu 截断、无输出标量门，直接与路由结果相加。'},
+    sh:   {label:'共享专家\n无门控 无截断', t:'sexp', io:'[T,6144] -> [T,6144]', f:'\\mathrm{silu}(W_g^{\\mathrm{sh}} x)\\odot(W_u x)', d:'恒激活，与路由专家同构（中间维 2048），但无 swiglu 截断、无输出标量门，直接与路由结果相加。'},
     out:  {label:'相加输出', t:'out', io:'[T,8,6144] -> [1,T,6144]', f:'y = \\textstyle\\sum_j w_j E_{(j)}(x) + \\mathrm{Shared}(x)', d:'单层激活 341,311,744 参数（8/256 路由 + 共享 + 路由器）。路由专家合计 744.10B，占总参数 95.40%。'},
   },
   edges:[
@@ -756,8 +756,8 @@ cache: {
   nodes:{
     tok:  {label:'每 token 写入\nMLA 潜向量', t:'idxr', io:'c [576] + k_rope 共享', f:'c = [512;\\ 64]', d:'kv_a_proj_with_mqa 的输出。这是 MLA 的原生形态：512 维潜向量 + 64 维共享旋转键，与头数无关。'},
     vlm:  {label:'vLLM：直接缓存潜向量\n576 元素 = 1152 B', t:'buf', io:'[T,576] + sink[64]', f:'576 \\times 2\\,\\mathrm{B}', d:'MQA 式存储：每个 token 每层只存 576 个 bf16 元素，另 64 个 per-head sink 常驻（一次性）。解码时在 Kernel 内展开。78 层合计 87.8 KiB/token；1M 上下文约 87.8 GiB。'},
-    hf:   {label:'eager：缓存展开 K/V\n32768 元素 = 65536 B', t:'rexp', io:'K[64,T,256] V[64,T,256]', f:'64\\times(256+256)', d:'把潜向量经 kv_b_proj 展开成每头独立的 K/V 后缓存。78 层合计 4.88 MiB/token；1M 上下文约 4.88 TiB——这是参考实现口径，部署不可用，也是潜向量口径存在的理由。'},
-    ratio:{label:'体积比\n56.89×', t:'gt', io:'', f:'32768/576', d:'两种口径存的是同一份信息（kv_b_proj 可逆展开），差距全在「何时展开」。'},
+    hf:   {label:'eager：缓存展开 K/V\n32768 元素 = 65536 B', t:'rexp', io:'K[64,T,256] V[64,T,256]', f:'64\\times(256+256)', d:'把潜向量经 kv_b_proj 展开成每头独立的 K/V 后缓存。78 层合计 4.88 MiB/token；1M 上下文约 4.88 TiB——这是参考实现口径，部署不可用。'},
+    ratio:{label:'体积比\n56.89×', t:'gt', io:'', f:'32768/576', d:'两种口径存的是同一份信息：展开后的 K/V 由 576 维潜向量唯一决定，存潜向量不丢信息，差距全在「何时展开」。'},
     ix:   {label:'索引器缓存\n21 层 × 128 维', t:'ple', io:'[T,128] × 21', f:'21 \\times 128\\ \\mathrm{dims}', d:'独立于主 cache：只有 full 层需要（57 个 shared 层不缓存）。vLLM FP8 约 2772 B/token（128 值一组附 4 字节 scale）；eager BF16 5376 B/token。1M 上下文约 2.7–5.2 GiB。'},
     sum:  {label:'1M 上下文合计\n(线性估算)', t:'out', io:'', f:'\\approx 90.5\\ \\mathrm{GiB}\\ (\\mathrm{vLLM})', d:'vLLM：主 87.8 GiB + 索引器 2.7 GiB，合计 $\\approx$ 90.5 GiB。eager 口径主 cache 4.88 TiB 不可用。按每 token 线性估算，忽略块对齐开销。'},
   },

@@ -281,7 +281,7 @@
 
 <details>
 <summary>补充：为什么把 KVCache 放在 CPU DRAM 而不是 GPU VRAM？</summary>
-<p>GPU VRAM 同时要装模型权重、当前请求的 KVCache、聚合 decode batch 的 KVCache。一条 12,288 token 的请求 KVCache，以 <a href="../../wiki/kv-cache/index.html">KV cache</a> 页面的公式 $B_{\text{kv}}=2\cdot L\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 估算：取 LLaMA2-70B 配置 $L=80,\ H_{\text{kv}}=8,\ d_{\text{head}}=128,\ b=2$（fp16），$B_{\text{kv}}\approx 320\ \text{KiB/token}$，12,288 tokens 约 3.75 GiB。128k 上下文的请求就接近 40 GiB——单一请求的 KVCache 已经占满单卡 VRAM 的一半。把 KVCache 池放到 CPU DRAM/SSD 相当于把 GPU 集群里长期闲置的「邻居」容量纳为己用（推断）；同时 RDMA 互联为 KVCache 搬运提供了独立于 GPU 算力的高带宽通路（推断）。<sup>[C3]</sup></p>
+<p>GPU VRAM 同时要装模型权重、当前请求的 KVCache、聚合 decode batch 的 KVCache。一条 12,288 token 的请求 KVCache，以 <a href="../../wiki/kv-cache/index.html">KV cache</a> 页面的公式 $B_{\text{kv}}=2\cdot L\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$<sup>[F1]</sup> 估算：取 LLaMA2-70B 配置 $L=80,\ H_{\text{kv}}=8,\ d_{\text{head}}=128,\ b=2$（fp16），$B_{\text{kv}}\approx 320\ \text{KiB/token}$，12,288 tokens 约 3.75 GiB。128k 上下文的请求就接近 40 GiB——单一请求的 KVCache 已经占满单卡 VRAM 的一半。把 KVCache 池放到 CPU DRAM/SSD 相当于把 GPU 集群里长期闲置的「邻居」容量纳为己用（推断）；同时 RDMA 互联为 KVCache 搬运提供了独立于 GPU 算力的高带宽通路（推断）。<sup>[C3]</sup></p>
 </details>
 
 <h3>本章问题</h3>
@@ -363,16 +363,16 @@ return (p, d)
 
 <p>两条分支的语义是：</p>
 <ul>
-<li><b>分支 1（cache-aware）</b>：如果实例 $p_i$ 的本地前缀与全局最佳差距不大（best/prefix$_i$ &lt; threshold），就直接用本地 prefix_len 计算 T_prefill，不传输。<sup>[C22]</sup></li>
-<li><b>分支 2（cache-aware and -balancing）</b>：如果 $p_i$ 的本地前缀远逊于全局最佳（best/prefix$_i$ $≥$ threshold），计算把差额部分（transfer_len = best_prefix_len - prefix_len）从 $p_{\text{best}}$ 经 Messenger 拉过来；T_prefill 用 best_prefix_len 计算（假设传输后复用全部最佳前缀）。<sup>[C22]</sup></li>
+<li><b>分支 1（cache-aware）</b>：如果实例 $p_i$ 的本地前缀与全局最佳差距不大（best/prefix$_i$ &lt; 阈值），就直接用本地 prefix_len 计算 T_prefill，不传输。<sup>[C22]</sup></li>
+<li><b>分支 2（cache-aware and -balancing）</b>：如果 $p_i$ 的本地前缀远逊于全局最佳（best/prefix$_i$ $≥$ 阈值），计算把差额部分（transfer_len = best_prefix_len - prefix_len）从 $p_{\text{best}}$ 经 Messenger 拉过来；T_prefill 用 best_prefix_len 计算（假设传输后复用全部最佳前缀）。<sup>[C22]</sup></li>
 </ul>
 
 <p>T_prefill 由离线测试数据拟合的预测模型估计（依请求长度与 prefix_len），T_queue 由已排队请求的 prefill 时间累加得到。<sup>[C24]</sup></p>
 
 <h3>3.3 热点自动迁移</h3>
-<p>Algorithm 1 末尾还有一步容易被忽略：当选定 $p$ 之后，若 best_prefix_len / $p$.prefix_len &gt; threshold，则触发 <code>TransferKVCache(best_matched_instance, p)</code>——把 $p_{\text{best}}$ 上的热点缓存块迁到 $p$。<sup>[C23]</sup></p>
+<p>Algorithm 1 末尾在选定 $p$ 之后还有一步：若 best_prefix_len / $p$.prefix_len &gt; 阈值，则触发 <code>TransferKVCache(best_matched_instance, p)</code>——把 $p_{\text{best}}$ 上的热点缓存块迁到 $p$。<sup>[C23]</sup></p>
 
-<p>这一步看似只是「搬运」，但它的实际作用是热点缓存的 <i>自动复制</i>：当一个无缓存/低缓存的轻负载实例因为传输后 TTFT 最短被选中，下一次再来的同前缀请求就不需要再走远端传输了。同时由于热点块被复制到多节点，原本集中在 $p_{\text{best}}$ 上的 fetch 拥塞被分散。<sup>[§6.2]</sup> Algorithm 1 的两条分支（cache-aware 与 cache-aware and -balancing）与这一热点迁移机制共同实现缓存复用与负载均衡的折中，整个过程不依赖对未来 KVCache 使用频率的精确预测——这是论文 §6.2 中以启发式（heuristic）替代预测模型的工程取舍。</p>
+<p>该步骤的实际作用是热点缓存的 <i>自动复制</i>：当一个无缓存/低缓存的轻负载实例因为传输后 TTFT 最短被选中，下一次再来的同前缀请求就不需要再走远端传输了。同时由于热点块被复制到多节点，原本集中在 $p_{\text{best}}$ 上的 fetch 拥塞被分散。<sup>[§6.2]</sup> Algorithm 1 的两条分支（cache-aware 与 cache-aware and -balancing）与这一热点迁移机制共同实现缓存复用与负载均衡的折中，整个过程不依赖对未来 KVCache 使用频率的精确预测——这是论文 §6.2 中以启发式（heuristic）替代预测模型的工程取舍。</p>
 
 <h3>3.4 贯穿示例：3 实例的 TTFT 估计与策略对比</h3>
 <p>用一个贯穿全章的最小场景跑 Algorithm 1。构造场景如下（所有数字均为构造值，非论文实测，仅用于说明算法流程）：</p>
@@ -390,7 +390,7 @@ return (p, d)
 <tr><td>实例 C</td><td>prefix = 0 tokens，T_queue = 1.0s</td><td>无缓存、轻负载</td></tr>
 <tr><td>$T_{\text{prefill}}(p)$</td><td>$0.5 + (12288 - p)/4000$ s</td><td>prefill 执行时间（构造）</td></tr>
 <tr><td>$T_{\text{transfer}}(t)$</td><td>$t / 10000$ s</td><td>RDMA 传输时间（构造）</td></tr>
-<tr><td>threshold</td><td>2</td><td>本地复用/远端传输权衡</td></tr>
+<tr><td>阈值</td><td>2</td><td>本地复用/远端传输权衡</td></tr>
 </tbody>
 </table>
 </div>
@@ -443,7 +443,7 @@ return (p, d)
 <p>Algorithm 1 的两条分支分别适用于哪种 prefix 匹配情况？为什么需要这两条分支？</p>
 <details>
 <summary>解答：分支 1 处理「本地够用」、分支 2 处理「本地远不够、需要从最佳实例拉」</summary>
-<p>两条分支对应不同的 prefix 匹配差距。<b>分支 1（cache-aware）</b>：当 best_prefix_len/prefix_len$_i$ &lt; threshold，$p_i$ 的本地前缀与全局最佳差距不大（在阈值倍数以内）、直接本地复用的成本可控，直接用本地 prefix_len 计算 T_prefill，不传输；分支 2（cache-aware + balance）：当差距过大，$p_i$ 的本地 prefix 远逊于 best，从 $p_{\text{best}}$ 拉差额（$\text{transfer\_len}=\text{best}-\text{prefix}_i$），并按传输后复用 best_prefix_len 估计 T_prefill。两条分支都需要：分支 1 避免无意义的传输浪费、分支 2 防止因「本地远不够」而把请求拒掉——同时后者也是热点自动迁移的前置条件。</p>
+<p>两条分支对应不同的 prefix 匹配差距。<b>分支 1（cache-aware）</b>：当 best_prefix_len/prefix_len$_i$ &lt; 阈值，$p_i$ 的本地前缀与全局最佳差距不大（在阈值倍数以内）、直接本地复用的成本可控，直接用本地 prefix_len 计算 T_prefill，不传输；分支 2（cache-aware + balance）：当差距过大，$p_i$ 的本地 prefix 远逊于 best，从 $p_{\text{best}}$ 拉差额（$\text{transfer\_len}=\text{best}-\text{prefix}_i$），并按传输后复用 best_prefix_len 估计 T_prefill。两条分支都需要：分支 1 避免无意义的传输浪费、分支 2 防止因「本地远不够」而把请求拒掉——同时后者也是热点自动迁移的前置条件。</p>
 </details>
 </li>
 <li>
@@ -628,7 +628,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 <tr><td>ArXiv Summarization（cache ratio $≈$ 0%）</td><td>Mooncake-[3P+1D] vs vLLM-[4M]</td><td>公共数据集</td><td>+20% 吞吐</td></tr>
 <tr><td>L-Eval（cache ratio &gt; 80%）</td><td>Mooncake-[3P+1D] vs vLLM-[4M]</td><td>公共数据集</td><td>+40% 吞吐</td></tr>
 <tr><td>模拟 16k/32k/64k/128k 上下文</td><td>Mooncake-[3P+1D] vs vLLM-[4M]</td><td>长上下文模拟</td><td>+50% 到 +525% 吞吐</td></tr>
-<tr><td>真实回放 23,000 请求</td><td>Mooncake-[10P+10D] vs vLLM-[20M]</td><td>Kimi 真实负载</td><td>+75% 请求量；TBT SLO 满足率 ~100% vs vLLM 57%</td></tr>
+<tr><td>真实负载回放</td><td>Mooncake-[10P+10D] vs vLLM-[20M]</td><td>Kimi 真实负载</td><td>+75% 请求量；TBT SLO 满足率 ~100% vs vLLM 57%</td></tr>
 </tbody>
 </table>
 </div>
@@ -674,7 +674,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 <tr><td>C7</td><td>decode 受内存带宽约束、时间随 batch 大小次线性增长</td><td>§2</td></tr>
 <tr><td>C8</td><td>decode 阶段常用连续批处理（Orca 等）</td><td>§2（cite [12][13]）</td></tr>
 <tr><td>C9</td><td>MaaS 下 prefill 主要衡量 TTFT，decode 主要衡量 TBT</td><td>§2</td></tr>
-<tr><td>C10</td><td>§1 所述请求处理流程（第 2 章按四步展开）：传可复用 KVCache → 分块/分层完成 prefill 并流式传 KVCache → decode 加入连续批处理</td><td>§1</td></tr>
+<tr><td>C10</td><td>§1 所述请求处理流程（第 2 章按四步展开）：传可复用 KVCache → 分块/分层完成 prefill 并流式传 KVCache → decode 加入连续批处理</td><td>§1；§3（Figure 4）</td></tr>
 <tr><td>C11</td><td>Conductor 预测 KVCache 块未来使用，执行 swapping 与 replication</td><td>§1</td></tr>
 <tr><td>C15</td><td>Mooncake 决定彻底分离而非纯 chunked prefill 的两条理由</td><td>§5</td></tr>
 <tr><td>C16</td><td>跨节点 TP 每层 2 次 RDMA all-reduce，显著降低 MFU</td><td>§5.1</td></tr>
@@ -683,7 +683,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 <tr><td>C19</td><td>CPP 两点收益：通信少且可重叠；同时适合短/长上下文</td><td>§5.1</td></tr>
 <tr><td>C20</td><td>layer-wise prefill 把 KVCache load/store 异步化与计算重叠；prefill 执行时间 $≈$ max(载入时间, 标准 prefill 时间)</td><td>§5.2</td></tr>
 <tr><td>C22</td><td>Algorithm 1 两条分支：本地够用（cache-aware）vs 远端传输（cache-aware + balance）</td><td>Algorithm 1；§6</td></tr>
-<tr><td>C23</td><td>Algorithm 1 末尾热点自动迁移：best/p.prefix_len &gt; threshold 时 TransferKVCache(best, p)</td><td>Algorithm 1；§6.2</td></tr>
+<tr><td>C23</td><td>Algorithm 1 末尾热点自动迁移：best/p.prefix_len &gt; 阈值 时 TransferKVCache(best, p)</td><td>Algorithm 1；§6.2</td></tr>
 <tr><td>C24</td><td>prefill 执行时间由离线测试数据拟合的预测模型估计</td><td>§6.1</td></tr>
 <tr><td>C25</td><td>朴素早拒绝引发 prefill/decode 反相震荡</td><td>§7.3</td></tr>
 <tr><td>C26</td><td>基于预测的早拒绝（请求级 vs 系统级）；Mooncake 采用系统级</td><td>§7.4</td></tr>

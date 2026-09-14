@@ -83,3 +83,5 @@ reviewed_content_sha256: 6231a068311a59af
 - 程序性事项确认（第三轮审查者按规范未读取 research/，由编排者确认）：三轮审查记录（review-1/2/3.md）齐全且修复/复验栏已全部填写；前置概念页（prefix-caching、paged-attention、kv-cache、hetero-pd、beyond-buzz-disaggregation）均为仓库既有已发布页面，非本次递归生成
 - 发布条件逐项核对（check.md 第 5 节）：三轮独立审查完成（三个不同子代理，互不重复）；阻断与重要问题全部关闭（第一轮 0/0、第二轮 1 重要已修复、第三轮 0/0）；轻微问题全部修复（7+4+3 条，无遗留接受项）；学习目标 4 个全部由正文章节完整回答；两级问题块全部作答且独立可读；数学符号全部 LaTeX、结构图 HTML/SVG；validate.py 通过；无可运行代码（页面声明机制无本地可执行部分）；head 元数据完整（description 纯文本、dojo:summary 含公式、type=concept、topics 在词表内、tag）；overview 与 index 相互链接；概念链接有效
 - 处置：可发布
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

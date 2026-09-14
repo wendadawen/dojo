@@ -68,9 +68,9 @@
 <p><b>主要依据</b>：Katharopoulos et al. 2020 "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"（ICML 2020, §3, Eq.2–20）；Choromanski et al. 2020 "Rethinking Attention with Performers"（ICLR 2021, §1–2, Eq.1–7）。</p>
 </blockquote>
 
-<p>让一个标准 Transformer 写一本 30 万字的长篇小说，它在生成第 30 万个字时还要回头计算这个字与前 30 万个字的两两相似度——光是这一步注意力计算就要处理约 $9 \times 10^{10}$ 个 query-key 相似度（$300000^2 \approx 9 \times 10^{10}$，即 $N \times N$ 注意力矩阵的元素数）。线性注意力要解决的问题就是：让注意力不再随序列长度二次膨胀。</p>
+<p>让一个标准 Transformer 写一本 30 万字的长篇小说，它在生成第 30 万个字时还要回头计算这个字与前 30 万个字的相似度——而 softmax 注意力要对全部历史位置两两计算，这一步构造出的 $N \times N$ 注意力矩阵就有约 $9 \times 10^{10}$ 个 query-key 相似度（$300000^2 \approx 9 \times 10^{10}$）。线性注意力要解决的问题就是：让注意力不再随序列长度二次膨胀。</p>
 
-<p>线性注意力把 softmax 注意力里的指数相似度 $\exp(q \cdot k)$ 换成可分解的核函数 $\phi(q) \cdot \phi(k)$，从而让计算量从 $O(N^2)$ 降到 $O(N)$，并使因果掩码下的注意力可写成与序列长度无关的固定大小递归状态。它不是 softmax 注意力的工程优化，而是一类机制上不同的注意力族；它的主要代价是表达力下降，具体来源见第 4 章。</p>
+<p>线性注意力把 softmax 注意力里的指数相似度 $\exp(q^T k)$ 换成可分解的核函数 $\phi(q)^T \phi(k)$，从而让计算量从 $O(N^2)$ 降到 $O(N)$，并使因果掩码下的注意力可写成与序列长度无关的固定大小递归状态。它不是 softmax 注意力的工程优化，而是一类机制上不同的注意力族；它的主要代价是表达力下降，具体来源见第 4 章。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -97,10 +97,10 @@
       </details>
     </li>
     <li>
-      <p>线性注意力相比 softmax 失去了什么？这个代价从公式哪里来？</p>
+      <p>线性注意力相比 softmax 失去了什么？这个代价来自公式的哪一部分？</p>
       <details>
         <summary>解答：失去指数聚焦能力，根源是 softmax 核无穷维</summary>
-        <p>softmax 核 $\exp(q^Tk)$ 的特征映射是无穷维的，无法精确线性化，必须换成有限维非负核（如 $\mathrm{elu}+1$）；线性核只能线性放大差异，没有 $\exp(\cdot)$ 的指数聚焦能力。分析与实验数字见「4. 表达力代价——从公式的哪里来」。</p>
+        <p>softmax 核 $\exp(q^Tk)$ 的特征映射是无穷维的，无法精确线性化，必须换成有限维非负核（如 $\mathrm{elu}+1$）；线性注意力的核只能近似线性地传递差异，没有 $\exp(\cdot)$ 的指数聚焦能力。分析与实验数字见「4. 表达力代价——代价来自公式的哪一部分」。</p>
       </details>
     </li>
   </ol>
@@ -110,7 +110,7 @@
   <h2>最容易误解</h2>
   <ul>
     <li>"线性注意力 = Performer 那种用随机特征近似 softmax 的方法"——Performer 只是线性注意力框架下的一种 $\phi$ 选择；Katharopoulos 的 $\mathrm{elu}+1$ 直接定义新核而非近似 softmax，也属于线性注意力。</li>
-    <li>"复杂度从 $O(N^2)$ 降到 $O(N)$，所以应全面取代 softmax"——经验上 $N$ 较小时 softmax 仍更快（常数项更小、IO 更友好），且表达力更强；线性注意力在长序列和自回归推理场景才占优。</li>
+    <li>"复杂度从 $O(N^2)$ 降到 $O(N)$，所以应全面取代 softmax"——经验上 $N$ 较小时 softmax 仍更快（常数项更小、IO 更友好）、表达力更强（经验判断，未逐篇核对原文）；线性注意力在长序列和自回归推理场景才占优。</li>
     <li>"$\phi$ 可以任意选"——$\phi$ 必须保证 $\mathrm{sim}(q,k) = \phi(q)^T \phi(k)$ 非负，否则归一化分母可能为 0 或负，注意力不再合法。</li>
     <li>"递归状态 $s_i$ 等同于 LSTM 的细胞状态 $c_t$"——$s_i$ 是 $d' \times d$ 的外积累积矩阵而非 $d$ 维向量；"Transformers are RNNs" 只借用 RNN 的"固定状态 + 递推"形式，不继承 LSTM 的门控结构。</li>
   </ul>
@@ -198,7 +198,7 @@ $$Q K^T = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix} \begin{pmatrix} 
 
 <h2 id="kernel-associativity">2. 核函数与结合律——把相似度分解并重排</h2>
 
-<p>softmax 注意力中 $Q K^T$ 的每个元素是 $\exp(Q_i \cdot K_j / \sqrt{d})$（这里恢复 $\sqrt{d}$ 是为了准确性；上一章的略去只用于 $QK^T$ 形状演示）。把它写成"先算相似度、再加权求和"的形式：</p>
+<p>softmax 注意力中 $Q K^T$ 的每个元素是 $\exp(Q_i^T K_j / \sqrt{d})$（这里恢复 $\sqrt{d}$ 是为了准确性；上一章的略去只用于 $QK^T$ 形状演示）。把它写成"先算相似度、再加权求和"的形式：</p>
 
 $$V'_i = \frac{\sum_{j=1}^{N} \mathrm{sim}(Q_i, K_j)\, V_j}{\sum_{j=1}^{N} \mathrm{sim}(Q_i, K_j)}$$
 
@@ -232,7 +232,7 @@ $$(\phi(Q)\, \phi(K)^T)\, V \;=\; \phi(Q)\, (\phi(K)^T V)$$
   <figcaption class="diagram-caption">两行对比同一场乘法 $(\phi(Q)\phi(K)^T)V = \phi(Q)(\phi(K)^TV)$ 的两种计算顺序；行内箭头为计算先后，两种顺序输出同为 $N\times d$。</figcaption>
 </figure>
 
-<p>用本页的 $N=3, d=2$ 例子手算。计算示例。取 $\phi(x) = x + 1$，这是保证非负的最简教学选择（当 $x \geq 0$ 时 $\phi(x) > 0$；此处 $\phi(x) = x + 1$ 不是 Katharopoulos 论文使用的 $\mathrm{elu}+1$，论文版本在「4. 表达力代价——从公式的哪里来」中解释）。先算 $\phi(K)$：</p>
+<p>用本页的 $N=3, d=2$ 例子手算。计算示例。取 $\phi(x) = x + 1$，这是保证非负的最简教学选择（当 $x \geq 0$ 时 $\phi(x) > 0$；此处 $\phi(x) = x + 1$ 不是 Katharopoulos 论文使用的 $\mathrm{elu}+1$，论文版本在「4. 表达力代价——代价来自公式的哪一部分」中解释）。先算 $\phi(K)$：</p>
 
 $$\phi(K) = K + 1 = \begin{pmatrix} 2 & 1 \\ 1 & 2 \\ 2 & 2 \end{pmatrix}$$
 
@@ -252,9 +252,9 @@ $$V'_1 = \frac{\phi(Q_1)^T (\phi(K)^T V)}{\phi(Q_1)^T (\phi(K)^T \mathbf{1})} = 
 <summary>展开：用直接求和验证重排结果一致</summary>
 <p>直接按 $V'_1 = \frac{\sum_j \phi(Q_1)^T \phi(K_j) V_j}{\sum_j \phi(Q_1)^T \phi(K_j)}$ 算：</p>
 <ul>
-<li>$\phi(Q_1)^T \phi(K_1) = (2,1) \cdot (2,1) = 5$</li>
-<li>$\phi(Q_1)^T \phi(K_2) = (2,1) \cdot (1,2) = 4$</li>
-<li>$\phi(Q_1)^T \phi(K_3) = (2,1) \cdot (2,2) = 6$</li>
+<li>$\phi(Q_1)^T \phi(K_1) = (2,1)^T (2,1) = 5$</li>
+<li>$\phi(Q_1)^T \phi(K_2) = (2,1)^T (1,2) = 4$</li>
+<li>$\phi(Q_1)^T \phi(K_3) = (2,1)^T (2,2) = 6$</li>
 </ul>
 <p>分母 $= 5 + 4 + 6 = 15$，与上面一致。分子 $= 5 \cdot (1,0) + 4 \cdot (0,1) + 6 \cdot (1,1) = (11, 10)$，与上面一致。两种计算顺序得到相同结果，但右边只需要存储 $2 \times 2$ 的 $\phi(K)^T V$ 而非 $3 \times 3$ 的 $\phi(Q)\phi(K)^T$。</p>
 </details>
@@ -262,7 +262,7 @@ $$V'_1 = \frac{\phi(Q_1)^T (\phi(K)^T V)}{\phi(Q_1)^T (\phi(K)^T \mathbf{1})} = 
 <p>这个例子展示了关键变化：$N=3$ 时 $N \times N$ 矩阵有 9 个元素，而 $d' \times d$ 聚合只有 4 个；$N=300000$ 时差异是 $9 \times 10^{10}$ vs $4$。复杂度从 $O(N^2 d)$ 降到 $O(N \cdot d \cdot d')$，对 $N$ 是一次而非二次。当 $d' = d$ 时为 $O(N d^2)$。</p>
 
 <div class="callout callout-yellow">
-<p><b>必须满足的前提</b>：$\mathrm{sim}(q, k) = \phi(q)^T \phi(k)$ 必须非负。这意味着 $\phi$ 的选择受到严格约束——下一章会看到，softmax 核 $\exp(q \cdot k)$ 没有有限维正特征映射，所以 softmax 注意力本身<b>不能</b>套用上面的重排，必须换核。</p>
+<p><b>必须满足的前提</b>：$\mathrm{sim}(q, k) = \phi(q)^T \phi(k)$ 必须非负。这意味着 $\phi$ 的选择受到严格约束——下一章会看到，softmax 核 $\exp(q^T k)$ 没有有限维正特征映射，所以 softmax 注意力本身<b>不能</b>套用上面的重排，必须换核。</p>
 </div>
 
 <h3 id="chapter-2-questions">本章问题</h3>
@@ -360,7 +360,7 @@ $$s_3 = s_2 + \phi(K_3) V_3^T = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix} + \
 
 <ul>
 <li>分子：$\phi(Q_3)^T s_3 = (2, 2) \begin{pmatrix} 4 & 3 \\ 3 & 4 \end{pmatrix} = (14, 14)$</li>
-<li>分母：$\phi(Q_3)^T z_3 = (2, 2) \cdot (5, 5) = 20$</li>
+<li>分母：$\phi(Q_3)^T z_3 = (2, 2)^T (5, 5) = 20$</li>
 <li>$V'_3 = (14/20, 14/20) = (0.7, 0.7)$</li>
 </ul>
 
@@ -372,7 +372,7 @@ $$s_3 = s_2 + \phi(K_3) V_3^T = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix} + \
 <ul>
 <li>$\phi(Q_1) = (2, 1)$</li>
 <li>分子：$(2, 1) \begin{pmatrix} 2 & 0 \\ 1 & 0 \end{pmatrix} = (5, 0)$</li>
-<li>分母：$(2, 1) \cdot (2, 1) = 5$</li>
+<li>分母：$(2, 1)^T (2, 1) = 5$</li>
 <li>$V'_1 = (5/5, 0/5) = (1, 0) = V_1$</li>
 </ul>
 <p>第 1 个 token 只有一个 key 可看，所以输出就是 $V_1$ 本身——这是因果掩码的必然结果，也验证了递归形式正确。</p>
@@ -412,9 +412,9 @@ $$s_3 = s_2 + \phi(K_3) V_3^T = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix} + \
 
 <p>本章把因果掩码下的线性注意力写成固定大小递归状态。但 softmax 为什么不能也这样重排——下一章回答代价从哪里来。</p>
 
-<h2 id="expressivity-cost">4. 表达力代价——从公式的哪里来</h2>
+<h2 id="expressivity-cost">4. 表达力代价——代价来自公式的哪一部分</h2>
 
-<p>回到 F2 的关键假设：$\mathrm{sim}(q, k) = \phi(q)^T \phi(k)$ 必须可分解为有限维 $\phi$ 内积且非负。softmax 核 $\exp(q^T k)$ 是否满足？</p>
+<p>回到 F2 的关键假设：$\mathrm{sim}(q, k) = \phi(q)^T \phi(k)$ 必须可分解为有限维 $\phi$ 内积且非负。softmax 核 $\exp(q^T k)$（此处按 Performer 的 $\mathrm{SM}(x, y)$ 定义略去第 2 章 $\mathrm{sim}$ 里的 $\sqrt{d}$ 缩放，该缩放只差一个常数因子）是否满足？</p>
 
 <p><b>不满足</b>。softmax 核 $\exp(q^T k)$ 的特征映射是<b>无穷维</b>的（可由泰勒展开 $\exp(q^T k) = \sum_{n=0}^{\infty} \frac{(q^T k)^n}{n!}$ 看出，需要无穷多个单项式特征）。因此 softmax 注意力本身<b>不能</b>套用 F2 的重排——这正是线性注意力必须换核的原因<sup>[C5]</sup>。</p>
 
@@ -438,25 +438,25 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
 
 <h3 id="weight-comparison">4.3 两种核的权重分布对比</h3>
 
-<p>用本页的 $N=3, d=2$ 例子展示表达力差异。计算示例。取 $Q_3 = (1, 1)$，对比它在三种核下对 $K_1, K_2, K_3$ 的注意力权重。为简化对比，下表 softmax 列暂略 $\sqrt{d}$ 缩放（完整应为 $\exp(Q_3 \cdot K_j / \sqrt{2})$；略去不影响"指数聚焦 vs 线性放大"的定性对比）：</p>
+<p>用本页的 $N=3, d=2$ 例子展示表达力差异。计算示例。取 $Q_3 = (1, 1)$，对比它在三种核下对 $K_1, K_2, K_3$ 的注意力权重。为简化对比，下表 softmax 列暂略 $\sqrt{d}$ 缩放（完整应为 $\exp(Q_3^T K_j / \sqrt{2})$；略去不影响"指数聚焦 vs 线性放大"的定性对比）：</p>
 
 <div class="table-scroll">
 <table>
-<thead><tr><th>$j$</th><th>$Q_3 \cdot K_j$</th><th>softmax 权重 $\frac{e^{Q_3 \cdot K_j}}{\sum e^{Q_3 \cdot K_j}}$</th><th>$\mathrm{elu}{+}1$ 相似度 $\phi(Q_3)^T \phi(K_j)$</th><th>$\mathrm{elu}{+}1$ 权重</th></tr></thead>
+<thead><tr><th>$j$</th><th>$Q_3^T K_j$</th><th>softmax 权重 $\frac{e^{Q_3^T K_j}}{\sum e^{Q_3^T K_j}}$</th><th>$\mathrm{elu}{+}1$ 相似度 $\phi(Q_3)^T \phi(K_j)$</th><th>$\mathrm{elu}{+}1$ 权重</th></tr></thead>
 <tbody>
-<tr><td>1</td><td>1</td><td>$e / (2e + e^2) \approx 0.212$</td><td>$(2,2) \cdot (2,1) = 6$</td><td>$6/20 = 0.300$</td></tr>
-<tr><td>2</td><td>1</td><td>$e / (2e + e^2) \approx 0.212$</td><td>$(2,2) \cdot (1,2) = 6$</td><td>$6/20 = 0.300$</td></tr>
-<tr class="highlight-row"><td>3</td><td>2</td><td>$e^2 / (2e + e^2) \approx 0.576$</td><td>$(2,2) \cdot (2,2) = 8$</td><td>$8/20 = 0.400$</td></tr>
+<tr><td>1</td><td>1</td><td>$e / (2e + e^2) \approx 0.212$</td><td>$(2,2)^T (2,1) = 6$</td><td>$6/20 = 0.300$</td></tr>
+<tr><td>2</td><td>1</td><td>$e / (2e + e^2) \approx 0.212$</td><td>$(2,2)^T (1,2) = 6$</td><td>$6/20 = 0.300$</td></tr>
+<tr class="highlight-row"><td>3</td><td>2</td><td>$e^2 / (2e + e^2) \approx 0.576$</td><td>$(2,2)^T (2,2) = 8$</td><td>$8/20 = 0.400$</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>关键观察：$Q_3$ 与 $K_3$ 的内积（$2$）是与 $K_1, K_2$ 内积（$1$）的 2 倍。softmax 把这个 2 倍差异<b>指数放大</b>成 $0.576 / 0.212 \approx 2.72$ 倍权重比（即 $e^{2-1} = e$；softmax 归一化不改变权重间的比例，所以权重比等于相似度比）；$\mathrm{elu}+1$ 核只放大到 $0.400 / 0.300 \approx 1.33$ 倍。<b>softmax 的"指数聚焦"能力是线性核所没有的</b>——这就是表达力代价的具体来源。</p>
+<p>关键观察：$Q_3$ 与 $K_3$ 的内积（$2$）是与 $K_1, K_2$ 内积（$1$）的 2 倍。softmax 把这个 2 倍差异<b>指数放大</b>成 $0.576 / 0.212 \approx 2.72$ 倍权重比（即 $e^{2-1} = e$；softmax 归一化不改变权重间的比例，所以权重比等于相似度比）；$\mathrm{elu}+1$ 核只放大到 $0.400 / 0.300 \approx 1.33$ 倍。<b>softmax 的"指数聚焦"能力是线性注意力的核所没有的</b>——这就是表达力代价的具体来源。</p>
 
 <p>形式化地说：softmax 的 $\exp(\cdot)$ 把"显著差异"指数放大、把"无关项"指数压制；线性注意力使用的核（如 $\mathrm{elu}+1$）只能近似线性地传递差异，没有这种"聚焦"能力。Katharopoulos 2020 的实验反映了这一代价：MNIST 生成 bits/dim 上 linear 0.644 vs softmax 0.621（线性略差），WSJ 语音识别 PER 上 linear 8.08 vs softmax 5.12（线性明显差）<sup>[N2]</sup>。而在速度一侧，CIFAR-10 自回归图像生成上 linear 比 softmax 快约 4000×<sup>[N1]</sup>。</p>
 
 <div class="callout callout-yellow">
-<p><b>适用边界</b>：线性注意力在 $N$ 较小（$N \lesssim d$）时不占优——经验上 softmax 的常数项更小、IO 模式更友好、表达力更强。线性注意力的优势在两种场景：(1) 长序列训练（$N \gg d$ 时 $O(N d^2)$ 显著小于 $O(N^2 d)$）；(2) 自回归推理（固定大小 $s_i, z_i$ 替代 $O(N)$ KV cache）。如果任务对表达力要求高、序列不长，仍应使用 softmax 注意力。</p>
+<p><b>适用边界</b>：线性注意力在 $N$ 较小（$N \lesssim d$）时不占优——经验上 softmax 的常数项更小、IO 模式更友好、表达力更强（经验判断，未逐篇核对原文）。线性注意力的优势在两种场景：(1) 长序列训练（$N \gg d$ 时 $O(N d^2)$ 显著小于 $O(N^2 d)$）；(2) 自回归推理（固定大小 $s_i, z_i$ 替代 $O(N)$ KV cache）。如果任务对表达力要求高、序列不长，仍应使用 softmax 注意力。</p>
 </div>
 
 <h3 id="chapter-4-questions">本章问题</h3>
@@ -493,7 +493,7 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
 <ul>
 <li><b>C1</b>（softmax 复杂度）：Katharopoulos et al. 2020, §3, Eq.(2) 给出 softmax attention 公式；§3.2 原文 "the computational cost of softmax attention scales with O(N²)"。Choromanski et al. 2020, §2.1, Eq.(1) 给出 $\mathbf{A} = \exp(\mathbf{Q}\mathbf{K}^\top/\sqrt{d})$，时间 $O(L^2 d)$、空间 $O(L^2 + Ld)$。</li>
 <li><b>C2</b>（广义注意力与 sim 非负）：Katharopoulos et al. 2020, §3, Eq.(3)；§3.2 原文 "the only constraint we need to impose to sim(·), in order for equation 3 to define an attention function, is to be non-negative"。</li>
-<li><b>C3</b>（核分解与结合律重排）：Katharopoulos et al. 2020, §3, Eq.(4)(5)(6)；§3.2.1 原文 "we can compute $\sum \phi(K_j) V_j^\top$ and $\sum \phi(K_j)$ once and reuse them for every query"。</li>
+<li><b>C3</b>（核分解与结合律重排）：Katharopoulos et al. 2020, §3, Eq.(4)(5)(6)；§3.2 原文 "we can compute $\sum \phi(K_j) V_j^\top$ and $\sum \phi(K_j)$ once and reuse them for every query"。</li>
 <li><b>C4</b>（因果递归与常数时间推理）：Katharopoulos et al. 2020, §3, Eq.(9)(10)(11)(12)（因果形式）；§3.4, Eq.(16)–(20)（含投影、残差、激活的完整 RNN 形式）。</li>
 <li><b>C5</b>（表达力代价与核选择）：Katharopoulos et al. 2020, §3.2.1, Eq.(7)（$\phi = \mathrm{elu}+1$）；§3.2.1 原文 "We prefer elu(·) over relu(·) to avoid setting the gradients to 0 when x is negative"。Choromanski et al. 2020, §2.3, Eq.(5) + Lemma 1（正随机特征构造）。softmax 核无穷维：泰勒展开 $\exp(q^T k) = \sum_{n=0}^{\infty} (q^T k)^n / n!$ 显然需要无穷多个多项式特征。</li>
 </ul>
@@ -520,13 +520,13 @@ $$\phi(x) = \frac{\exp(-\|x\|^2/2)}{\sqrt{m}} \big(\exp(\omega_1^T x), \ldots, \
 <ul>
 <li>$N=3, d=2$ 构造示例：$Q = K = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix}$, $V = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{pmatrix}$。构造目的：数字小到全可手算（最大值 $2$），令 $Q = K$ 减少变量，所有分量非负使教学简化 $\phi(x) = x + 1$ 可用。</li>
 <li>教学简化 $\phi(x) = x + 1$：当 $x \geq 0$ 时与 $\mathrm{elu}(x)+1$ 等价，便于手算；<b>不可</b>用于负分量（$x = -2$ 时 $x + 1 = -1 < 0$ 违反非负约束）。Katharopoulos 论文实际用 $\mathrm{elu}+1$ 正是为了处理负分量。</li>
-<li>对比表中"暂略 $\sqrt{d}$ 缩放"：完整 softmax 应为 $\exp(Q_3 \cdot K_j / \sqrt{2})$；略去缩放不影响"指数聚焦 vs 线性放大"的定性对比。</li>
+<li>对比表中"暂略 $\sqrt{d}$ 缩放"：完整 softmax 应为 $\exp(Q_3^T K_j / \sqrt{2})$；略去缩放不影响"指数聚焦 vs 线性放大"的定性对比。</li>
 </ul>
 
 <h3>辅助解释与类比边界</h3>
 
 <ul>
-<li>"指数聚焦 vs 线性放大"类比：仅解释 $\exp(\cdot)$ 与线性函数在放大差异时的不同，不保证 softmax 在所有任务上都优于线性核。失效边界：当所有 $Q \cdot K$ 接近相同时，softmax 也无法聚焦，此时两种核表现接近。</li>
+<li>"指数聚焦 vs 线性放大"类比：仅解释 $\exp(\cdot)$ 与线性函数在放大差异时的不同，不保证 softmax 在所有任务上都优于线性注意力的核。失效边界：当所有 $Q^T K$ 接近相同时，softmax 也无法聚焦，此时两种核表现接近。</li>
 <li>"Transformers are RNNs"类比：仅指因果掩码下线性注意力可写成"固定状态 + 递推"形式，与 RNN 在结构上等价；不意味着继承 LSTM 的门控、记忆容量等性质。失效边界：$s_i$ 是 $d' \times d$ 矩阵而非 $d$ 维向量，形状和更新机制都不同。</li>
 </ul>
 

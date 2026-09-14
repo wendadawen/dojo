@@ -285,7 +285,7 @@ $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
 <p>EAGLE-3 在 Vicuna 13B 上比 vanilla decoding 快 5.6x、比 EAGLE-1 快 1.8x <sup>[N3]</sup>；最高加速 6.5x、相比 EAGLE-2 提升约 1.4x；在 SGLang 框架中 batch size 64 时吞吐提升 1.38x <sup>[N2]</sup>。这些数字是辅助参考，核心是两项架构改变让 draft 容量更聚焦于 token 预测、信息输入更全面。</p>
 
-<p>推理时单层 decoder 怎么自回归生成 $\gamma$ 个 token？为什么后续步骤要用自己的输出替代 target feature？后面的构造示例会把这三步逐步手算一遍。</p>
+<p>推理时单层 decoder 怎么自回归生成 $\gamma$ 个 token？为什么后续步骤要用自己的输出替代 target feature？这取决于每一步输入里新位置的 feature 从哪来。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -322,15 +322,15 @@ $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
 <h3 id="draft-step-1">4.2 Draft 步骤 1：用 target 真实 feature</h3>
 
-<p>draft 的第一步可以用 target 真实的 $g_1, \ldots, g_t$，因为这些位置 target 已经算过。输入 $\text{concat}(g_1, \ldots, g_t, e_{t+1})$，过单层 decoder 得到输出 $a_{t+1}$，再过共享 lm_head 得到 $q_1$，采样得到第一个 draft token $x_{t+2}$ <sup>[F2]</sup>：</p>
+<p>draft 的第一步可以用 target 真实的 $g_1, \ldots, g_t$，因为这些位置 target 已经算过。输入 $\text{concat}(g_1, \ldots, g_t, e_{t+1})$，过 FC 与单层 decoder 得到输出 $a_{t+1}$，再过共享 lm_head 得到 $q_1$，采样得到第一个 draft token $x_{t+2}$ <sup>[F2]</sup>：</p>
 
-$$a_{t+1} = \text{DraftLayer}([g_{1:t};\, e_{t+1}]),\qquad q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1}).$$
+$$a_{t+1} = \text{DraftLayer}\big(\mathrm{FC}([g_{1:t};\, e_{t+1}])\big),\qquad q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1}).$$
 
-<p>其中 $\text{DraftLayer}$ 即 §3 的单层 transformer decoder；$[\cdot;\cdot]$ 表示逐位置拼接——把每个位置 $i$ 的 $g_i$ 与该位置的 token embedding 拼成 $2k$ 维向量，而非把整个 $g$ 序列与单个 embedding 拼成一个长向量。</p>
+<p>其中 $\text{DraftLayer}$ 即 §3 的单层 transformer decoder，$\mathrm{FC}$ 是把 $2k$ 维拼接向量降到 $k$ 维的全连接层（与 §3.3 数据流一致：拼接 $\to$ FC $\to$ 单层 decoder）；$[\cdot;\cdot]$ 表示逐位置拼接——把每个位置 $i$ 的 $g_i$ 与该位置的 token embedding 拼成 $2k$ 维向量，而非把整个 $g$ 序列与单个 embedding 拼成一个长向量。</p>
 
 <h3 id="draft-step-2-onward">4.3 Draft 步骤 2 及以后：用 draft 自己的输出替代 target feature</h3>
 
-<p>第二步开始，新位置 $t+1$ 的 target feature $g_{t+1}$ 尚未算出——因为 target 还没验证 draft token。draft 只能用自己的上一步输出 $a_{t+1}$ 替代 $g_{t+1}$ <sup>[C4]</sup>。输入 $\text{concat}(g_1, \ldots, g_t, a_{t+1}, e_{t+2})$，过单层 decoder 得到 $a_{t+2}$，过 lm_head 得到 $q_2$，采样得到 $x_{t+3}$。第三步及之后同理，用 $a_{t+2}$ 替代 $g_{t+2}$，以此类推。</p>
+<p>第二步开始，新位置 $t+1$ 的 target feature $g_{t+1}$ 尚未算出——因为 target 还没验证 draft token。draft 只能用自己的上一步输出 $a_{t+1}$ 替代 $g_{t+1}$ <sup>[C4]</sup>。输入 $\text{concat}(g_1, \ldots, g_t, a_{t+1}, e_{t+2})$，过 FC 与单层 decoder 得到 $a_{t+2}$，过 lm_head 得到 $q_2$，采样得到 $x_{t+3}$。第三步及之后同理，用 $a_{t+2}$ 替代 $g_{t+2}$，以此类推。</p>
 
 <figure class="diagram">
   <div class="dg-stack">
@@ -443,7 +443,7 @@ $$q_3 \approx [0.143,\, 0.166,\, 0.142,\, 0.363,\, 0.187].$$
 <pre><code class="language-text">输入：
   当前前缀 prefix（长度 t）
   target 模型 p（暴露 low/mid/high 三层 feature）
-  EAGLE-3 draft 模型（单层 decoder + W_fuse + 共享 W_lm）
+  EAGLE-3 draft 模型（W_fuse 融合 + 拼接 FC + 单层 decoder + 共享 W_lm）
   草稿长度 γ
 
 Prefill 阶段：
@@ -456,8 +456,8 @@ Draft 阶段（生成 γ 个 draft token）：
   g_seq ← [g_1, g_2, ..., g_t]    # 真实 g 序列
   for i ← 1 to γ:
       e ← embedding(last_sampled)
-      # draft 单层 decoder：输入 concat(g_seq, e)
-      a ← DraftLayer(concat(g_seq, e))    # a ∈ R^k，作为新位置的 g 替代
+      # draft：concat(g_seq, e) 经 FC 降到 k 维后入单层 decoder
+      a ← DraftLayer(FC(concat(g_seq, e)))    # a ∈ R^k，作为新位置的 g 替代
       logits ← W_lm · a
       q ← softmax(logits)
       x ← sample(q)
@@ -688,7 +688,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
   <li><strong>不展开</strong>：vLLM、SGLang、TensorRT-LLM 等框架的 EAGLE-3 集成 API；属部署侧工程。</li>
 </ul>
 
-<p>回到开篇的五个问题：EAGLE 系列复用 target 隐藏状态替代独立小模型，draft 单步成本趋近 0、分布更贴近 target，同时降低成本与提高接受率；EAGLE-3 在 EAGLE-1 基础上做两项改变——直接 token 预测释放容量、多层特征融合补全信息；推理时单层 decoder 第一步用 target 真实 feature、后续自替代，因为新位置的 target feature 在验证前不存在；training-time test 让 draft 训练时体验自替代噪声，K3 用 LK loss 直接优化接受率而非 KL 代理；K3 把预训练 MTP 层 fine-tune 成 EAGLE-3 draft，与 target 共享 QAT 配置。上述论断、公式与数字的来源与范围说明见后文。</p>
+<p>EAGLE 系列复用 target 隐藏状态替代独立小模型，draft 单步成本趋近 0、分布更贴近 target，同时降低成本与提高接受率；EAGLE-3 在 EAGLE-1 基础上做两项改变——直接 token 预测释放容量、多层特征融合补全信息；推理时单层 decoder 第一步用 target 真实 feature、后续自替代，因为新位置的 target feature 在验证前不存在；training-time test 让 draft 训练时体验自替代噪声，K3 用 LK loss 直接优化接受率而非 KL 代理；K3 把预训练 MTP 层 fine-tune 成 EAGLE-3 draft，与 target 共享 QAT 配置。</p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -743,7 +743,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <p>[F1] 多层特征融合 $g_t = W_{\text{fuse}} \cdot [l_t; m_t; h_t] \in \mathbb{R}^k$：Li et al. 2025 §3.1。原文「We concatenate the k-dimensional vectors l, m, and h to form a 3k-dimensional vector, then pass it through a fully connected (FC) layer to reduce it to k-dimensions, obtaining a feature g」；公式记号为本页的形式化写法。K3 实现命名为 $W_{E3}$。</p>
 
-<p>[F2] EAGLE-3 单步 draft 计算 $a_{t+1} = \text{DraftLayer}([g_{1:t};\, e_{t+1}])$、$q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1})$：Li et al. 2025 §3.1。原文「The concatenated vector is then passed through an FC layer to reduce its dimensionality to k, and subsequently inputted into a single layer decoder, producing the output a. Finally, we input a_I into the LM head and sample to obtain the draft token 'do'.」</p>
+<p>[F2] EAGLE-3 单步 draft 计算 $a_{t+1} = \text{DraftLayer}(\mathrm{FC}([g_{1:t};\, e_{t+1}]))$、$q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1})$：Li et al. 2025 §3.1。原文「The concatenated vector is then passed through an FC layer to reduce its dimensionality to k, and subsequently inputted into a single layer decoder, producing the output a. Finally, we input a_I into the LM head and sample to obtain the draft token 'do'.」</p>
 
 <p>[F3] EAGLE-3 训练损失 $L_{E3} = -\sum_{i=1}^{K} \log q(t_{t+i} | g_{1:t}, a_{t+1:t+i-1})$：形式化由本页按 Li et al. 2025 §3.2 的描述（token-level 负对数似然、多步展开）给出，论文未给出该式的显式形式。求和上限用 $K$ 是本页记法，以避免与 hidden size 符号 $k$ 碰撞。</p>
 

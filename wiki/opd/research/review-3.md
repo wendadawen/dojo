@@ -77,3 +77,5 @@ reviewed_content_sha256: a6e8c9b4b35002e6
 - 处置：可发布
 
 依据 check.md §5：三轮审查完成且本轮独立执行；全部来源论断核对有据（C1–C17、F1–F7、N1–N4 均给出原文片段或数值）；无阻断与重要问题；轻微问题已全部关闭；5 个学习目标（分布失配与解法 / 一步机制 / 手算 / 效率与证据 / 边界）分别由第 1、2、2、3、4–5 章完整回答；页面级核心问题 5 条与各章本章问题均有"解答："折叠块且指明论证章节；数学符号全部 LaTeX 化（validate.py 数学字符检查通过）；结构图为 HTML dg-flow；代码运行结果与页面一致；跨页链接（knowledge-distillation、mopd）有效；overview 与 index 相互链接；head 元数据（description、dojo:summary、dojo:type=concept、dojo:topics=训练与优化、dojo:tag=后训练）齐备。判定为可发布，发布结果记录于本文件。
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

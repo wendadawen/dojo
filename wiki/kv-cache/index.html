@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="KV cache 是什么：推理时缓存的注意力 key/value 张量如何让每个新 token 免于重算全部历史，prefill 与 decode 两阶段如何写入和使用缓存，每 token 128 KB 的大小公式，以及它为何成为显存瓶颈。来源：vLLM SOSP 2023 §1、§3、SGLang NeurIPS 2024 §1、§3、Strata OSDI 2026 §1、§2.1。">
-  <meta name="dojo:summary" content="KV cache 缓存每个 token 在每层的注意力 $k/v$ 向量：$k_i = x_i W_K$ 与查询无关，算一次可跨步复用，把生成 $n$ 个 token 的 $O(n^2)$ 量级重算降为 $n$ 次计算加纯读取。prefill 批量写入、decode 每步追加一个 token；大小为 $2 \cdot L_{\text{layers}} \cdot H_{\text{kv}} \cdot d_{\text{head}} \cdot b$ 字节每 token，Llama-3.1-8B 即 128 KB，20K token 手册约 2.4 GB、128K 窗口单请求 16 GB——线性增长乘并发数再与权重争显存，是分页、前缀缓存与分层存储全部机制的定量起点。">
+  <meta name="dojo:summary" content="KV cache 缓存每个 token 在每层的注意力 $k/v$ 向量：$k_i = x_i W_K$ 与查询无关，算一次可跨步复用，把生成 $n$ 个 token 的 $O(n^2)$ 量级重算降为 $n$ 次计算加纯读取。prefill 批量写入、decode 每步追加一个 token；大小为 $2 \cdot L_{\text{layers}} \cdot H_{\text{kv}} \cdot d_{\text{head}} \cdot b$ 字节每 token，Llama-3.1-8B 即 128 KB，20K token 手册约 2.44 GB、128K 窗口单请求 16 GB——线性增长乘并发数再与权重争显存，是分页、前缀缓存与分层存储全部机制的定量起点。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="注意力机制, 推理系统, 内存与缓存">
   <meta name="dojo:tag" content="KV cache">
@@ -87,7 +87,7 @@
       <p>一份上下文的 KV cache 有多大？</p>
       <details>
         <summary>解答：每 token 字节数公式，Llama-3.1-8B 为 128 KB</summary>
-        <p>每 token 的 KV cache 占 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 字节（K 与 V 两份、层数、KV 头数、头维度、每元素字节数）。Llama-3.1-8B（32 层、8 个 KV 头、头维 128、bf16）算得 128 KB/token，20,000 token 手册约 2.44 GB；对照 MHA 模型 OPT-13B 为 800 KB/token。GQA 通过减少 KV 头数直接缩小缓存。见「缓存有多大」一章。</p>
+        <p>每 token 的 KV cache 占 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$ 字节（K 与 V 两份、层数、KV 头数、头维度、每元素字节数）。Llama-3.1-8B（32 层、8 个 KV 头、头维 128）以 bf16（bfloat16，每元素 2 字节）存储，算得 128 KB/token，20,000 token 手册约 2.44 GB；对照 MHA（多头注意力）模型 OPT-13B 为 800 KB/token。GQA（分组查询注意力）通过减少 KV 头数直接缩小缓存。见「缓存有多大」一章。</p>
       </details>
     </li>
     <li>
@@ -222,7 +222,7 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 
 <p>$H_{\text{kv}}$ 的取值区分两种注意力结构。MHA（多头注意力）中 KV 头数等于查询头数，$H_{\text{kv}}=H_q$；GQA（分组查询注意力）中查询头分成 $H_{\text{kv}}$ 组、每组共享一个 KV 头，$H_{\text{kv}}&lt;H_q$——KV cache 直接缩小为 MHA 的 $H_{\text{kv}}/H_q$。本文用作算例的 Llama-3.1-8B 采用 GQA，省下的正是这份显存。</p>
 
-<p>两个算例对照：Llama-3.1-8B 是按本页公式代入的构造算例，OPT-13B 是 vLLM 论文给出的原始算例。Llama-3.1-8B（GQA）：32 层、$H_{\text{kv}}=8$、$d_{\text{head}}=128$、bf16（bfloat16，每元素 2 字节）<sup>[N2]</sup>，代入公式 $2\times 32\times 8\times 128\times 2=131{,}072$ 字节 = 128 KB/token。20,000 token 的手册共 $20{,}000\times 131{,}072\,\text{B}\approx 2.44\,\text{GB}$。OPT-13B（MHA）：40 层、隐藏维 5120（即 $H_{\text{kv}}\cdot d_{\text{head}}=5120$）、FP16，得 $2\times 5120\times 40\times 2=800$ KB/token<sup>[N1]</sup>，单请求最长（2048 token）达 1.6 GB。GQA 的效果直接可见：Llama-3.1-8B 的 $H_{\text{kv}}/H_q=8/32=1/4$，若它是 MHA 结构，每 token 将是 512 KB。</p>
+<p>两个算例对照：Llama-3.1-8B 是按本文公式代入的构造算例，OPT-13B 是 vLLM 论文给出的原始算例。Llama-3.1-8B（GQA）：32 层、$H_{\text{kv}}=8$、$d_{\text{head}}=128$、bf16（bfloat16，每元素 2 字节）<sup>[N2]</sup>，代入公式 $2\times 32\times 8\times 128\times 2=131{,}072$ 字节 = 128 KB/token。20,000 token 的手册共 $20{,}000\times 131{,}072\,\text{B}\approx 2.44\,\text{GB}$。OPT-13B（MHA）：40 层、隐藏维 5120（即 $H_{\text{kv}}\cdot d_{\text{head}}=5120$）、FP16，得 $2\times 5120\times 40\times 2=800$ KB/token<sup>[N1]</sup>，单请求最长（2048 token）达 1.6 GB。GQA 的效果直接可见：Llama-3.1-8B 的 $H_{\text{kv}}/H_q=8/32=1/4$，若它是 MHA 结构，每 token 将是 512 KB。</p>
 
 <details>
 <summary>展开：128 KB/token 的完整代入与两个检查</summary>
@@ -273,7 +273,7 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
     <p>为什么说 KV cache 会"挤爆"显存？三个因素是什么？</p>
     <details>
       <summary>解答：线性增长 $\times$ 并发数 $\times$ 与权重共用显存</summary>
-      <p>第一，缓存随 token 数线性增长：128 KB/token 下 20,000 token 手册约 2.44 GB、128K 窗口单请求 16 GB。第二，并发请求各自持有独立上下文的缓存，总量相乘。第三，显存里静态权重先占大头（13B 模型在 40GB A100 上约 65%），KV cache 只能争夺剩余份额（近 30%）。三因素叠加的结果：40 GB HBM 只够 Llama-3.1-8B 缓存约 0.3M token，几十份长文档即耗尽。</p>
+      <p>第一，缓存随 token 数线性增长：128 KB/token 下 20,000 token 手册约 2.44 GB、128K 窗口单请求 16 GB。第二，并发请求各自持有独立上下文的缓存，总量相乘。第三，显存里静态权重先占大头（13B 模型在 40GB A100 上约 65%），KV cache 只能争夺剩余份额（近 30%）。三因素叠加的结果：40 GB HBM 只够 Llama-3.1-8B 缓存约 0.3M token，十几份长文档即耗尽。</p>
     </details>
   </li>
   <li>
@@ -295,12 +295,12 @@ $$\text{每 token 字节数}=2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C3（KV cache 可复用的依据：K/V 与查询无关）：Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023（arXiv:2309.06180）§1；C2（两阶段）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v1）§2.1；C4（显存分布）、C5（完成后丢弃缓存，SGLang §1、§3、vLLM §4.3）：vLLM 论文 §1 与 SGLang 论文（Zheng et al., NeurIPS 2024, arXiv:2312.07104）§3。"K/V 与查询无关"（C3 标注推断）由注意力公式结构直接得出：$k_i=x_i W_K$ 只依赖第 $i$ 个 token 的输入与参数。$O(n^2)$ 重算量标注为推断（自回归结构直接推论）。</p>
+<p>C3（KV cache 可复用的依据：K/V 与查询无关）：Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023（arXiv:2309.06180）§1；C2（两阶段）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v1）§2.1；C4（显存分布）：vLLM 论文 §1；C5（完成后丢弃缓存）：SGLang 论文（Zheng et al., NeurIPS 2024, arXiv:2312.07104）§1、§3，及 vLLM 论文 §4.3。"K/V 与查询无关"（C3 标注推断）由注意力公式结构直接得出：$k_i=x_i W_K$ 只依赖第 $i$ 个 token 的输入与参数。$O(n^2)$ 重算量标注为推断（自回归结构直接推论）。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1（每 token 字节数 $2\cdot L_{\text{layers}}\cdot H_{\text{kv}}\cdot d_{\text{head}}\cdot b$）：MHA 形式与 vLLM 论文 §3 的 OPT-13B 算式（$2\times 5120\times 40\times 2=800$ KB）一致；GQA 推广形式（用 $H_{\text{kv}}\cdot d_{\text{head}}$ 替代 $d_{\text{hidden}}$）为对多头结构的直接推广，标注推断，经 Llama-3.1-8B 算例复算验证。</p>
 
-<h3>外部数字与实验条件</h3>
+<h3>外部数字与实验条件（N）</h3>
 <p>N1（OPT-13B 800 KB/token、单请求 1.6 GB）：vLLM 论文 §3。N2（Llama-3.1-8B 配置 32 层/8 KV 头/head_dim 128/128K 窗口/bf16）：HuggingFace 模型配置（meta-llama/Llama-3.1-8B-Instruct config.json）。N3（65%/30% 显存分布）：vLLM 论文 §1 Figure 1（13B 模型、A100 40GB）。N4（40GB $\approx$ 0.3M token）：Strata 论文 §1（Llama-8B 口径，与本文 F1 复算一致）。N5（128K $\to$ 16 GB）：F1$\times$N2 推算。</p>
 
 <h3>构造示例</h3>

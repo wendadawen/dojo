@@ -94,14 +94,14 @@
 <p>chunk 大小（token budget）怎么选？选小了有什么代价？</p>
 <details>
 <summary>解答：TBT 更稳 vs 三项开销上升的权衡</summary>
-<p>chunk 越小、每次迭代越短、token 间隔（time-between-tokens, TBT，与 TPOT/TTL 同义）越平稳，但三项代价随块数上升：KV cache 重复读次数按 $\frac{N(N-1)}{2}$ 增长（$N$ 为块数）；算术强度下降导致 GPU 利用率降低；kernel 启动等固定开销摊薄变差。此外 chunk 需对齐 GPU tile（chunk 257 比 256 的 prefill 时间高 32% 的实例），且必须够大以饱和算力（搭车"免费"的论证前提）。工程上由 TBT SLO 与开销的一次性 profiling 决定。完整论证见第 4 章。</p>
+<p>chunk 越小、每次迭代越短、token 间隔（time-between-tokens, TBT，与 TPOT/TTL 同义）越平稳，但三项代价随块数上升：KV cache 重复读次数按 $\frac{N(N-1)}{2}$ 增长（$N$ 为块数）；算术强度下降导致 GPU 利用率降低；kernel 启动等固定开销摊薄变差。此外 chunk 需对齐 GPU tile（chunk 257 比 256 的 prefill 时间高 32% 的实例），且必须够大以饱和算力（搭车"免费"的论证前提）。工程上由 TBT SLO（服务等级目标，service-level objective）与开销的一次性 profiling 决定。完整论证见第 4 章。</p>
 </details>
 </li>
 <li>
 <p>chunked prefill 与流水线并行组合（CPP）为什么能同时消掉流水线气泡？</p>
 <details>
 <summary>解答：等计算量切块使 micro-batch 时长均匀，流水线被填满</summary>
-<p>PP 气泡的来源之一是各 micro-batch 计算时长不均（FTL = First Token Latency，首 token 延迟）。chunked prefill 把长 prefill 切成等计算量的块，每个块作为 micro-batch 进流水线，各 slot 时长均匀，填充期与排空期之外的空转被显著压缩——Sarathi 在 GPT-3 流水线部署上气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍。Beyond the Buzz 论文中 CPP 是 prefill 池在严格 FTL 约束下兼顾高吞吐的最优策略。完整论证见第 5 章。</p>
+<p>PP 气泡的来源之一是各 micro-batch 计算时长不均。chunked prefill 把长 prefill 切成等计算量的块，每个块作为 micro-batch 进流水线，各 slot 时长均匀，填充期与排空期之外的空转被显著压缩——Sarathi 在 GPT-3 流水线部署上气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍。Beyond the Buzz 论文中 CPP 是 prefill 池在严格 FTL（First Token Latency，首 token 延迟）约束下兼顾高吞吐的最优策略。完整论证见第 5 章。</p>
 </details>
 </li>
 </ol>
@@ -123,7 +123,7 @@
 </table>
 </div>
 
-<p>连续批处理（continuous batching，Orca 提出的迭代级调度：每次迭代可加入新请求、移除完成请求）把 prefill 与 decode 混在同一个批里迭代。Sarathi-Serve 观察到：prefill 优先的调度器（如 vLLM 的做法——新请求的 prefill 被尽快执行）会让一次迭代装进整个长 prompt，这次迭代因为上千 token 的计算量而持续很久；期间同批所有进行中的 decode 一个 token 都不产出<sup>[C9]</sup>。对正在看输出的用户来说，token 间隔从毫秒级跳到秒级——Sarathi-Serve 在 vLLM 上实测到持续数秒的 generation stall<sup>[C9]</sup>。</p>
+<p>连续批处理（continuous batching，迭代级调度：每次迭代可加入新请求、移除完成请求）把 prefill 与 decode 混在同一个批里迭代。Sarathi-Serve 观察到：prefill 优先的调度器（如 vLLM 的做法——新请求的 prefill 被尽快执行）会让一次迭代装进整个长 prompt，这次迭代因为上千 token 的计算量而持续很久；期间同批所有进行中的 decode 一个 token 都不产出<sup>[C9]</sup>。对正在看输出的用户来说，token 间隔从毫秒级跳到秒级——Sarathi-Serve 在 vLLM 上实测到持续数秒的 generation stall<sup>[C9]</sup>。</p>
 
 <figure class="diagram">
   <div class="dg-flow">
@@ -247,7 +247,7 @@
 
 <p>Sarathi 的 decode-maximal batching 构造一个混合批次：装一个 prefill chunk，剩余槽位全部填 decode<sup>[C7]</sup>。为什么 decode 搭车近乎免费？因为一次迭代里模型权重只需从显存读一遍：prefill chunk 的巨大矩阵乘正在把算力用满，同批的 decode 请求顺带用同一份权重算自己的小矩阵乘——decode 的边际成本只剩它自己的少量计算与激活访存。Sarathi 的实测：搭车 decode 的成本比纯 decode 批最多低一个数量级<sup>[C7]</sup>。</p>
 
-<p>注意"最多低一个数量级"不是零：搭车 decode 仍占批容量与少量计算，说"完全免费"是错的<sup>[C7]</sup>。这个论证的前提是 chunk 够大以饱和算力——512 token 在 A6000/LLaMA-13B 上就够<sup>[C3, N2]</sup>，chunk 远小于饱和点时"免费"程度弱化。</p>
+<p>"最多低一个数量级"不等于零：搭车 decode 仍占批容量与少量计算，说"完全免费"是错的<sup>[C7]</sup>。这个论证的前提是 chunk 够大以饱和算力——512 token 在 A6000/LLaMA-13B 上就够<sup>[C3, N2]</sup>，chunk 远小于饱和点时"免费"程度弱化。</p>
 
 <p>chunked prefill 与 piggybacking 是相互成就的：一个 prefill 只有一次，但切成 $N$ 块就有 $N$ 个搭车机会。不切块时，一次 prefill 只能构造一次混合批次——那一次迭代装下整个 prompt，同批 decode 在这段长迭代里停摆；切块后每个 chunk 迭代都能带上 decode，搭车机会从 1 次变成 $N$ 次<sup>[C8]</sup>。</p>
 
@@ -310,7 +310,7 @@
 
 <p>前面几章都在单卡（或单实例）语境下讨论。当部署是流水线并行（PP）时，chunked prefill 顺带解决了另一个问题：流水线气泡。</p>
 
-<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，负载性气泡（时长不均）被消除<sup>[C14]</sup>；切块同时使 micro-batch 数增多，结构性的填充期/排空期气泡随之被摊薄（基于证据的推断：由 micro-batch 数增加推出）。Sarathi 在 GPT-3 流水线部署上实测气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。CPP 均的是块与块之间的时长；流水线各 stage 的忙闲不均还有更一般的两类对策（token 维切分与 batch 维配平），整理见 <a href="../pp-load-balancing/index.html">PP 负载均衡</a>。</p>
+<p>回顾<a href="../model-parallelism/index.html">模型并行</a>页的气泡机制：PP 各 stage 串行依赖，气泡来自填充期与排空期的空转；而 Sarathi 的分析进一步指出，LLM 推理的流水线还有第二重气泡来源——各 micro-batch 的计算时长不均（不同请求的 prompt 长度差异大、prefill 与 decode 迭代耗时差异大），快的 micro-batch 被慢的卡住节奏。chunked prefill 把长 prefill 切成等计算量的块，每块作为一个 micro-batch 进流水线：所有 slot 的时长近乎一致，负载性气泡（时长不均）被消除<sup>[C14]</sup>；切块同时使 micro-batch 数增多，结构性的填充期/排空期气泡随之被摊薄（基于证据的推断：由 micro-batch 数增加推出）。Sarathi 在 GPT-3 流水线部署的模拟实验中气泡缩小 6.29 倍、端到端吞吐提升 1.91 倍<sup>[C14, N4]</sup>。这个组合——chunked prefill + PP——就是 CPP（Chunked Pipeline Parallelism）。CPP 均的是块与块之间的时长；流水线各 stage 的忙闲不均还有更一般的两类对策（token 维切分与 batch 维配平），整理见 <a href="../pp-load-balancing/index.html">PP 负载均衡</a>。</p>
 
 <p>CPP 在 Beyond the Buzz 论文（PD 分离设计的系统性研究）中成为 prefill 池的标准答案：分离部署里 FTL（First Token Latency，首 token 延迟）约束只作用于 prefill 池，DeepSeek-R1 在 ISL（Input Sequence Length，输入序列长度）256K、64 GPU（EP（Expert Parallelism，专家并行）$\times$ PP = 64）的模拟中，增大 PP 维度持续降低 FTL 而吞吐基本保持——CPP 是严格 FTL SLA 下兼顾高吞吐的最优策略<sup>[C16]</sup>。同一论文还发现 co-located 基线里的 piggybacking 对注意力架构敏感：DeepSeek-R1 的 MLA（Multi-head Latent Attention，多头潜在注意力）在 chunked piggyback 下每个块都要重算 down/up 投影，产生额外开销（可临时缓存上投影 KV 缓解）<sup>[C17]</sup>——这是第 2 章"切块代价"在特定架构上的又一实例。完整讨论见 <a href="../beyond-buzz-disaggregation/index.html">Beyond the Buzz</a> 论文页。</p>
 
@@ -320,7 +320,7 @@
 <p>为什么等大的块能消掉流水线气泡，而"不等大的原始请求"不能？</p>
 <details>
 <summary>解答：气泡的第二来源是 micro-batch 时长不均，等大块把它抹平</summary>
-<p>PP 气泡有两个来源：一是结构性的填充期/排空期（见模型并行页，靠增大 micro-batch 数摊薄）；二是负载性的时长不均——不同请求的 prompt 长短不一、prefill 与 decode 迭代耗时差几个数量级，一个长 micro-batch 会让后面所有 stage 的节奏被拖住，短 micro-batch 让 stage 空等。chunked prefill 把一切长 prefill 切成等计算量的块，每个 slot 的耗时近乎一致，第二重气泡被消除<sup>[C14]</sup>，第一重也被均匀的 micro-batch 流压缩（基于证据的推断：切块后 micro-batch 数增多，填充期/排空期被摊薄）——Sarathi 实测 GPT-3 流水线部署气泡缩小 6.29 倍、吞吐提升 1.91 倍<sup>[C14, N4]</sup>。原始请求直接当 micro-batch 时长短不一，两重气泡都占。</p>
+<p>PP 气泡有两个来源：一是结构性的填充期/排空期（见模型并行页，靠增大 micro-batch 数摊薄）；二是负载性的时长不均——不同请求的 prompt 长短不一、prefill 与 decode 迭代耗时差几个数量级，一个长 micro-batch 会让后面所有 stage 的节奏被拖住，短 micro-batch 让 stage 空等。chunked prefill 把一切长 prefill 切成等计算量的块，每个 slot 的耗时近乎一致，第二重气泡被消除<sup>[C14]</sup>，第一重也被均匀的 micro-batch 流压缩（基于证据的推断：切块后 micro-batch 数增多，填充期/排空期被摊薄）——Sarathi 的 GPT-3 流水线部署模拟实验中气泡缩小 6.29 倍、吞吐提升 1.91 倍<sup>[C14, N4]</sup>。原始请求直接当 micro-batch 时长短不一，两重气泡都占。</p>
 </details>
 </li>
 <li>
@@ -365,7 +365,7 @@
 
 <h3>公式与来源（F）</h3>
 <ul>
-<li>F1：$\sum_{i=1}^{N}(N-i) = \frac{N(N-1)}{2}$，由 C5 的逐块计数直接求和（本页推导，标注为"由 C5 计数推出"）。</li>
+<li>F1：$\sum_{i=1}^{N}(N-i) = \frac{N(N-1)}{2}$，由 C5 的逐块计数直接求和得到（本页推导，正文以 [C5] 标注来源）。</li>
 </ul>
 
 <h3>外部数字与实验条件（N）</h3>

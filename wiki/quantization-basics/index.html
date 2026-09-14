@@ -71,7 +71,7 @@
 <p><b>主要依据</b>：Gholami et al. 2021《A Survey of Quantization Methods for Efficient Neural Network Inference》(arXiv:2103.13630)；Jacob et al. 2018 CVPR《Quantization and training of neural networks for efficient integer-arithmetic-only inference》；OCP Microscaling Formats v1.0 (Rouhani et al. 2023)。</p>
 </blockquote>
 
-<p>训练一个 7B 模型用 FP16 要 14 GB 显存放权重；部署到消费级显卡（24 GB 还要装 KV cache 与激活）几乎装不下。能不能在精度损失可控的前提下把每个参数从 16 bit 压到 4 bit？这正是量化要解决的问题——用一组 scale（和可选 zero-point）把高精度浮点映射到低精度整数或浮点网格上，让显存和计算按位宽比例下降，代价是网格变粗引入的舍入误差。本文回答：均匀量化如何编码浮点、误差从何而来、对称性与粒度如何适配分布，以及 PTQ、QAT、MXFP4 三条路径各自的机制与边界。</p>
+<p>训练一个 7B 模型用 FP16 要 14 GB 显存放权重；部署到消费级显卡（24 GB 还要同时装 KV cache 与激活）显存余量吃紧。能不能在精度损失可控的前提下把每个参数从 16 bit 压到 4 bit？这正是量化要解决的问题——用一组 scale（和可选 zero-point）把高精度浮点映射到低精度整数或浮点网格上，让显存和计算按位宽比例下降，代价是网格变粗引入的舍入误差。下面依次展开：均匀量化如何编码浮点、误差从何而来、对称性与粒度如何适配分布，以及 PTQ、QAT、MXFP4 三条路径各自的机制与边界。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -116,7 +116,7 @@
 
 <h2 id="why-quantize">1. 量化要解决什么问题——压缩比与精度损失的权衡</h2>
 
-<p>大模型的权重通常以 FP16 或 BF16 存储，每个参数占 2 字节。一个 7B 参数的模型光是权重就要 $7\times10^9 \times 2 = 14$ GB 显存；推理时还要装下 KV cache 与中间激活，部署到 24 GB 的消费级显卡已几乎装不下。把权重压到更低精度是直接减小显存占用的手段。<sup>[N1]</sup></p>
+<p>大模型的权重通常以 FP16 或 BF16 存储，每个参数占 2 字节。一个 7B 参数的模型光是权重就要 $7\times10^9 \times 2 = 14$ GB 显存；推理时还要装下 KV cache 与中间激活，24 GB 消费级显卡的显存余量吃紧。把权重压到更低精度是直接减小显存占用的手段。<sup>[N1]</sup></p>
 
 <p>压缩比由位宽决定：FP16 每参数 2 字节，INT8 每参数 1 字节（2× 压缩），INT4 每参数 0.5 字节（4× 压缩）。同一个 7B 模型在 INT8 下约 7 GB、在 INT4 下约 3.5 GB。计算上 INT8/INT4 在专用硬件（如 GPU 的 INT8 Tensor Core）上吞吐量更高、能耗更低。量化的收益是显存与算力按位宽比例下降。</p>
 
@@ -150,7 +150,7 @@
     </details>
   </li>
 </ol>
-<p>本章明确了量化值得做的动机与压缩比/精度损失的权衡。但还没说怎么把一个浮点数变成低精度整数——下一章给出均匀仿射量化公式并手算。</p>
+<p>量化值得做的动机与压缩比/精度损失的权衡已经清楚，但把浮点数变成低精度整数还需要具体的映射——均匀仿射量化公式与手算。</p>
 
 <h2 id="uniform-quantization">2. 均匀量化怎么把浮点变成整数——仿射变换与对称特例</h2>
 
@@ -208,7 +208,7 @@ $$s = \frac{\max(|x|)}{2^{b-1}-1}, \qquad x_q = \mathrm{clip}\!\big(\mathrm{roun
 
 <details>
 <summary>补充：1.5 为何取 2 而不是 1（舍入约定）</summary>
-<p>本文按"四舍五入"（round half up）约定，0.5 取较大的整数，所以 $\mathrm{round}(1.5)=2$。Python 内置 <code>round</code> 用" banker's rounding"（round half to even），$\mathrm{round}(1.5)=2$ 也得 2（2 是偶数）；但 $\mathrm{round}(2.5)$ 在两种约定下分别是 3 和 2，差异会出现。工程量化库（如 PyTorch 的 <code>torch.round</code>）默认 round half to even。本文手算统一用"四舍五入"以便读者复算；实际工程中两种约定的最终精度差异通常很小。</p>
+<p>本文按"四舍五入"（round half up）约定，0.5 取较大的整数，所以 $\mathrm{round}(1.5)=2$。Python 内置 <code>round</code> 用"banker's rounding"（round half to even），$\mathrm{round}(1.5)=2$ 也得 2（2 是偶数）；但 $\mathrm{round}(2.5)$ 在两种约定下分别是 3 和 2，差异会出现。工程量化库（如 PyTorch 的 <code>torch.round</code>）默认 round half to even。本文手算统一用"四舍五入"以便读者复算；实际工程中两种约定的最终精度差异通常很小。</p>
 </details>
 
 <p>把数字结果翻译成机制结论：每个真实值被舍到最近的 4-bit 等级，单值最大舍入误差不超过 $s/2$；处于网格点上的值（如 5.6）零误差。这正是量化"可接受精度损失"的微观来源——只要 $s$ 足够小，误差就够小；而 $s$ 由位宽 $b$ 与数据范围共同决定，位宽越低 $s$ 越大。</p>
@@ -237,7 +237,7 @@ $$s = \frac{\max(|x|)}{2^{b-1}-1}, \qquad x_q = \mathrm{clip}\!\big(\mathrm{roun
     </details>
   </li>
 </ol>
-<p>本章给出了均匀仿射量化公式与对称特例的手算。但手算产生的误差从何而来还没拆解——下一章给出误差的三个来源。</p>
+<p>均匀仿射量化公式与对称特例的手算已经给出，但手算产生的误差从何而来还需拆解——误差的三个来源。</p>
 
 <h2 id="quantization-error">3. 量化误差从哪来——离散级粗、舍入与裁剪</h2>
 
@@ -291,7 +291,7 @@ $$s = \frac{\max(|x|)}{2^{b-1}-1}, \qquad x_q = \mathrm{clip}\!\big(\mathrm{roun
     </details>
   </li>
 </ol>
-<p>本章拆解了误差三来源与离群值的毒化效应。但还没说如何选择对称性与粒度来适配分布、隔离离群值——下一章对照对称/非对称与三种粒度。</p>
+<p>误差三来源与离群值的毒化效应已经拆解，但如何选择对称性与粒度来适配分布、隔离离群值还需对照——对称/非对称与三种粒度。</p>
 
 <h2 id="symmetry-and-granularity">4. 对称/非对称 与 量化粒度——分布适配与离群值隔离</h2>
 
@@ -373,7 +373,7 @@ $$s = \frac{\beta-\alpha}{q_{\max}-q_{\min}}, \qquad z = \mathrm{round}\!\big(q_
     </details>
   </li>
 </ol>
-<p>本章对照了对称/非对称与三种粒度。但前面都在讲推理时如何压低精度，没说训练时模型是否见过量化误差——下一章讲 PTQ 与 QAT 两条路径及 MXFP4 浮点量化。</p>
+<p>对称/非对称与三种粒度已经对照过，但前面都在讲推理时如何压低精度，训练时模型是否见过量化误差还没涉及——PTQ 与 QAT 两条路径及 MXFP4 浮点量化。</p>
 
 <h2 id="ptq-vs-qat">5. PTQ vs QAT 与 浮点 block-wise 量化——训练时是否见过量化误差</h2>
 
@@ -417,7 +417,7 @@ $$\frac{\partial \hat{w}}{\partial w} \equiv 1,$$
 输出：更新后的高精度权重 w（部署时再按步骤 1-3 量化为低精度）
 </code></pre>
 </div>
-<p>步骤 3 得到的 $\hat{w}$ 是低精度的近似，但用于反向的梯度原样穿过它回到 $w$——这就是 STE"透明窗户"的含义。注意 STE 令导数为 1 不等于"量化没有误差"——误差在前向已经体现在 $\hat{w}\ne w$ 上，STE 只是让训练能进行，不保证最优。</p>
+<p>步骤 3 得到的 $\hat{w}$ 是低精度的近似，但用于反向的梯度原样穿过它回到 $w$——这就是 STE"透明窗户"的含义。STE 令导数为 1 不等于"量化没有误差"——误差在前向已经体现在 $\hat{w}\ne w$ 上，STE 只是让训练能进行，不保证最优。</p>
 </details>
 
 <details class="code-details">
@@ -524,7 +524,7 @@ error   = [-1.2, -3.4, 1.5429, 0.0]
 </div>
 
 <div class="callout callout-purple">
-<p><b>辅助解释</b>。 可以把 STE 暂时理解为"透明的窗户"：前向时量化把权重替换为低精度近似 $\hat{w}$（窗户把它"看"成低精度），反向时 STE 令导数为 1 让梯度原样穿过（窗户对梯度透明）。这个类比只帮助理解 STE 在反向做的事——让梯度绕过不可导的 round/clip。它不保证训练收敛、不覆盖 STE 的其它变体（如 LSQ 让 scale 也参与梯度），也不意味着 STE 是唯一或最优的反向处理；正式判断仍以 $\partial\hat{w}/\partial w\equiv 1$ 这一约定与训练稳定性为准。</p>
+<p><b>辅助解释</b>。可以把 STE 暂时理解为"透明的窗户"：前向时量化把权重替换为低精度近似 $\hat{w}$（窗户把它"看"成低精度），反向时 STE 令导数为 1 让梯度原样穿过（窗户对梯度透明）。这个类比只帮助理解 STE 在反向做的事——让梯度绕过不可导的 round/clip。它不保证训练收敛、不覆盖 STE 的其它变体（如 LSQ 让 scale 也参与梯度），也不意味着 STE 是唯一或最优的反向处理；正式判断仍以 $\partial\hat{w}/\partial w\equiv 1$ 这一约定与训练稳定性为准。</p>
 </div>
 
 <div class="callout callout-yellow">
@@ -547,7 +547,7 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
   <li><strong>per-block scale 天然抑制离群值</strong>。块大小 32 让离群值的影响局限在它所在的块内（与量化误差章离群值问题闭环），且 power-of-two scale 让反量化退化为指数位的加法，硬件无需乘法器。</li>
 </ul>
 
-<p>MXFP4 在大模型部署中已成为事实低位宽方案（如 OpenAI gpt-oss 采用 MXFP4 存储混合专家权重）。完整的 MXFP4 QAT 机制（块结构图、反量化公式、QAT 配置、部署案例）见 <a href="../mxfp4-qat/index.html">MXFP4 量化感知训练</a>。<sup>[C9, N2, C10]</sup></p>
+<p>MXFP4 已被 OCP 规范收录，OpenAI gpt-oss 也用它把 MoE 权重以 MXFP4 存储。完整的 MXFP4 QAT 机制（块结构图、反量化公式、QAT 配置、部署案例）见 <a href="../mxfp4-qat/index.html">MXFP4 量化感知训练</a>。<sup>[C9, N2, C10]</sup></p>
 
 <h3 id="ch5-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -573,7 +573,7 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
     </details>
   </li>
 </ol>
-<p>本章对照了 PTQ 与 QAT，并延伸到 MXFP4 浮点量化。至此量化的基础机制已讲完——末章汇总来源与范围说明。</p>
+<p>PTQ 与 QAT 已经对照，并延伸到 MXFP4 浮点量化；量化的基础机制至此讲完，其余是来源与范围说明。</p>
 
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
@@ -632,7 +632,7 @@ $$\hat{x}_i = s_b \cdot \mathrm{FP4}(q_i),$$
   <li><b>未展开的具体 PTQ 算法</b>：GPTQ、AWQ、SmoothQuant 等具体 PTQ 算法未展开——GPTQ 与 AWQ 只在粒度章的表格、有效位宽折叠块与简化条件中一带而过，SmoothQuant 未提及。这些算法的核心改进是更聪明的 scale/zero-point 选择与权重变换，与本文的"基础均匀量化"是改进关系。可推出：PTQ 是训练后量化路径的总称。不可推出：GPTQ/AWQ 与本文的对称均匀量化完全等价。</li>
 </ul>
 
-<p>本文从"为什么量化"出发，依次给出了均匀仿射量化公式与手算、误差三来源、对称性与粒度选择、PTQ 与 QAT 路径、MXFP4 浮点量化。回到开篇的问题——能否在精度损失可控的前提下把每个参数从 16 bit 压到 4 bit：可以，对称均匀量化加 per-block 粒度与 QAT 补偿是当前主流答案，MXFP4 则是硬件原生支持的 4-bit 浮点方案。量化的根本权衡不变：位宽换显存与算力，代价是网格变粗的舍入误差，所有方法都是在固定压缩比下压低这个误差。</p>
+<p>均匀仿射量化公式与手算、误差三来源、对称性与粒度选择、PTQ 与 QAT 路径、MXFP4 浮点量化，构成了从"为什么量化"到"怎么量化"的完整链条。回到开篇的问题——能否在精度损失可控的前提下把每个参数从 16 bit 压到 4 bit：可以，对称均匀量化加 per-block 粒度与 QAT 补偿是当前主流答案，MXFP4 则是硬件原生支持的 4-bit 浮点方案。量化的根本权衡不变：位宽换显存与算力，代价是网格变粗的舍入误差，所有方法都是在固定压缩比下压低这个误差。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

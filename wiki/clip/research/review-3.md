@@ -58,3 +58,5 @@ reviewed_content_sha256: 5ef26eb8980a3215
 - 全部阻断与重要问题已修复并复验；轻微问题全部修复，无遗留
 - validate.py 通过；KaTeX 渲染 headless Chrome 实测正常；concept 链接（vit/standard-attention/cross-entropy/siglip/moonvit-v2）有效
 - 发布状态：可发布。首页目录与关系图由 GitHub Pages 构建自动发现
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。
