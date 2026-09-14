@@ -59,7 +59,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Ouyang et al., "Training language models to follow instructions with human feedback"（InstructGPT, arXiv:2203.02155）§1、§3.1、§3.2、§3.5；Zhang et al., "Instruction Tuning for Large Language Models: A Survey"（arXiv:2308.10792）摘要、脚注 1、§1；Touvron et al., "Llama 2"（arXiv:2307.09288）§3.1。</p>
+<p><b>主要依据</b>：Ouyang et al., "Training language models to follow instructions with human feedback"（InstructGPT, arXiv:2203.02155）§1、§3.1、§3.2、§3.5；Zhang et al., "Instruction Tuning for Large Language Models: A Survey"（arXiv:2308.10792 v10）摘要与摘要脚注、§1；Touvron et al., "Llama 2"（arXiv:2307.09288）§3.1。</p>
 </blockquote>
 
 <p>给一个预训练语言模型输入「请把这句话翻译成法语：时间就是金钱」，它没有输出译文，而是继续生成下一行类似格式的请求——因为在预训练语料里，这句文本后面跟着的通常是更多网页文本。模型学到的技能里没有「这是在对我提问」。SFT（Supervised Fine-Tuning，监督微调；综述将该术语与 instruction tuning「指令微调」互换使用<sup>[C1]</sup>）补上这一课：把大量「指令 + 人类写下的期望回答」作为训练数据，在预训练模型上继续训练，让「按指令回答」成为参数里的默认行为。本文说明 SFT 为什么必要、数据与训练目标的具体形态、一条样本的损失如何手算、它在后训练流程中的位置，以及实践中的边界与常见误解。</p>
@@ -150,7 +150,8 @@
 $$\mathcal{L}(\theta) = -\frac{1}{|D|}\sum_{(x,y)\in D}\frac{1}{|y|}\sum_{t=1}^{|y|} \log p_\theta(y_t \mid x, y_{&lt;t}),$$<sup>[F1]</sup>
 
 <ul>
-<li>$D$：SFT 训练集，元素为「指令-回答」对 $(x, y)$；</li>
+<li>$D$：SFT 训练集，元素为「指令-回答」对 $(x, y)$；$|D|$ 为训练集样本数；</li>
+<li>$|y|$：回答的 token 数，也是第 3 章样本平均损失的分母；</li>
 <li>$y_t$：回答的第 $t$ 个 token，$y_{&lt;t}$ 是它之前的前缀（含指令 $x$）；</li>
 <li>$p_\theta(y_t\mid x, y_{&lt;t})$：参数为 $\theta$ 的模型在给定指令与回答前缀下，赋予下一个回答 token 的概率。</li>
 </ul>
@@ -159,7 +160,7 @@ $$\mathcal{L}(\theta) = -\frac{1}{|D|}\sum_{(x,y)\in D}\frac{1}{|y|}\sum_{t=1}^{
 
 <p>实践中样本要拼接成序列。Llama 2 的描述是：每个样本由 prompt 与 answer 组成，训练集的所有 prompt 和 answer 被拼接、用特殊 token 分隔以填充序列长度<sup>[C4]</sup>。Llama 2 §3.1 的原文是：采用自回归目标，<b>把用户 prompt 部分 token 的损失置零，因此只在回答 token 上反向传播</b><sup>[C4]</sup>。这个做法称为损失掩码（loss masking）。</p>
 
-<p>为什么 mask？回到公式：要学的是 $p_\theta(y_t\mid x, y_{&lt;t})$——「给定指令，产出回答」。指令 $x$ 在这里是<b>条件</b>，不是要学的内容；模型不需要被训练去预测「指令的下一个 token 是什么」。不 mask 时，模型同时在学两件事：生成类似指令的文本，与给定指令生成回答；而指令在样本里往往占多数 token，梯度的大部分被「学写指令」占据（下一章的手算会给出具体比例）。</p>
+<p>损失掩码针对的是公式里要学的那个量 $p_\theta(y_t\mid x, y_{&lt;t})$——「给定指令，产出回答」。指令 $x$ 在这里是<b>条件</b>，不是要学的内容；模型不需要被训练去预测「指令的下一个 token 是什么」。不 mask 时，模型同时在学两件事：生成类似指令的文本，与给定指令生成回答；而指令在样本里往往占多数 token，梯度的大部分被「学写指令」占据（下一章的手算会给出具体比例）。</p>
 
 <p>贯穿后续计算的构造样本：玩具词表 {翻译, :, cat, 猫, 狗, &lt;eos&gt;}（每个符号视为一个 token）。一条训练样本：指令 $x=$ [翻译, :, cat]，回答 $y=$ [猫, &lt;eos&gt;]，其中 &lt;eos&gt; 是标记回答结束的特殊 token。训练时拼接成序列：</p>
 
@@ -357,14 +358,14 @@ $$\ell_{\text{no-mask}} = \frac{4.6052 + 2.9957 + 3.9120 + 1.2040 + 0.1054}{5} \
 
 <h3>论断与来源（C）</h3>
 <ul>
-<li>C1 SFT/指令微调定义：在 (instruction, output) 对上以监督方式继续训练 LLM：Zhang et al., arXiv:2308.10792, 摘要与 §1；脚注 1（"In this paper, unless specified otherwise, supervised fine-tuning (SFT) and instruction tuning (IT) are used interchangeably"）——同义以该综述的使用惯例为据。</li>
+<li>C1 SFT/指令微调定义：在 (instruction, output) 对上以监督方式继续训练 LLM：Zhang et al., arXiv:2308.10792（v10，2025-10），摘要与 §1；摘要写明 instruction tuning「can also be referred to as supervised fine-tuning (SFT)」，并在脚注给出（"In this paper, unless specified otherwise, supervised fine-tuning (SFT) and instruction tuning (IT) are used interchangeably"）。引文按 v10 核对；v1–v6 的摘要无此脚注、正文通篇以「IT」指称，"SFT" 仅在 InstructGPT 相关小节出现，v8（2024-12）起才改写为两面并称。</li>
 <li>C2 目标错位（词预测误差 vs 指令遵循）：同上 §1（"the mismatch between the training objective and users' objective"）。</li>
 <li>C3 后训练三步流程（SFT $\to$ RM $\to$ PPO）与 RM 从 SFT 模型出发：Ouyang et al., "InstructGPT", arXiv:2203.02155, §3.1 Step 1–3 与 Fig. 2 图注；§3.5（"Starting from the SFT model with the final unembedding layer removed"）。</li>
 <li>C4 样本拼接与损失掩码（prompt 部分损失置零、只在回答 token 上反向传播）：Touvron et al., "Llama 2", arXiv:2307.09288, §3.1 Fine-Tuning Details（"We utilize an autoregressive objective and zero-out the loss on tokens from the user prompt, so as a result, we backpropagate only on answer tokens."）；多轮情形（GAtt 多轮一致性训练的语境，非 SFT 数据的一般规则）：§3.3（"we simply set the loss to 0 for all the tokens from the previous turns, including assistant messages"）。</li>
 <li>C5 数据质量与数量：同上 §3.1 Quality Is All You Need（"SFT annotations in the order of tens of thousands was enough... 27,540 annotations" 及 "setting aside millions of examples... results notably improved"）。</li>
 <li>C6 验证损失过拟合与继续训练的收益：InstructGPT §3.5（"our SFT models overfit on validation loss after 1 epoch; however... training for more epochs helps both the RM score and human preference ratings"）。</li>
 <li>C7 1.3B InstructGPT 输出被偏好于 GPT-3 175B：InstructGPT 摘要与 §1 "Our main findings"（"outputs from the 1.3B parameter InstructGPT model are preferred to outputs from the 175B GPT-3, despite having over 100x fewer parameters. These models have the same architecture, and differ only by the fact that InstructGPT is fine-tuned on our human data."；"This result holds true even when we add a few-shot prompt to GPT-3"）。注：InstructGPT 指完整三阶段后训练产物，非纯 SFT 模型。</li>
-<li>C8 SFT 的收益（弥合目标差距、行为更可控可预测）：综述 §1（"The benefits of SFT are threefold: (1) Finetuning an LLM on the instruction dataset bridges the gap between the next-word prediction objective of LLMs and the users' objective of instruction following; (2) SFT allows for a more controllable and predictable model behavior..."）。</li>
+<li>C8 SFT 的收益（弥合目标差距、行为更可控可预测）：同上 §1（"The benefits of SFT are threefold: (1) Finetuning an LLM on the instruction dataset bridges the gap between the next-word prediction objective of LLMs and the users' objective of instruction following; (2) SFT allows for a more controllable and predictable model behavior..."）。引文按 v10 核对；v6 及更早版本同一段以「IT」指称（"The benefits of IT are threefold… (2) IT allows for a more controllable and predictable model behavior…"），v8 起改写为「SFT」。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>

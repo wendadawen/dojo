@@ -162,7 +162,7 @@
 <p><strong>构造示例</strong>。 设 $h=4$（4 个注意力头）、$d_k=64$（每头 64 维）、$l=1$（1 层）、$n=10$（10 个 token）。数字为便于手算构造，不代表真实模型规模。</p>
 <p>MHA 每 token 每 layer 的 KV cache 元素数：</p>
 <p>$$2\times h\times d_k = 2\times 4\times 64 = 512\text{ 元素/token}.$$</p>
-<p>10 个 token 1 层共 $512\times 10 = 5120$ 元素。用 fp16（每元素 2 字节）存储为 $5120\times 2 = 10240$ 字节 $\approx 10$ KB。这个量级在小配置下无足轻重——但推广到真实规模（$h=128,d_k=128,l=80,n=4096$）时 MHA cache 约 21.5 GB（fp16，$2\times128\times128\times4096\times80\times2\approx 2.15\times10^{10}$ 字节），单条请求就占满可观显存。</p>
+<p>10 个 token 1 层共 $512\times 10 = 5120$ 元素。用 fp16（每元素 2 字节）存储为 $5120\times 2 = 10240$ 字节 $\approx 10$ KB。这个量级在小配置下无足轻重——但推广到真实规模（$h=128,d_k=128,l=80,n=4096$）时 MHA cache 约 21.5 GB（fp16，$2\times128\times128\times4096\times80\times2\approx 2.15\times10^{10}$ 字节），单条请求就占用相当一部分显存。</p>
 </div>
 
 <p>Shazeer 2019 §2.4.1 的性能分析指出，incremental MHA 每步解码的"内存访问量 / 算术运算量"比值随：</p>
@@ -425,7 +425,7 @@
 </tbody>
 </table>
 </div>
-<p>MHA 单条请求的 KV cache 约 21.5 GB，在长序列与多并发下会迅速占满单卡显存——这就是长上下文模型的核心瓶颈。GQA-8 把它压到 1.34 GB，MQA 压到 168 MB。数字为教学推算，真实工程还需考虑 batch、框架开销与 PagedAttention 分页。</p>
+<p>MHA 单条请求的 KV cache 约 21.5 GB，在长序列与多并发下会迅速占用单卡显存——在本例规模下，这可以解释长上下文模型为何受显存制约。GQA-8 把它压到 1.34 GB，MQA 压到 168 MB。数字为教学推算，真实工程还需考虑 batch、框架开销与 PagedAttention 分页。</p>
 </details>
 
 <h3>本章问题</h3>
@@ -457,7 +457,7 @@
 
 <h2 id="boundary-and-mla">5. 边界与后续——MQA/GQA 不解决什么，与 MLA 的根本区别</h2>
 
-<p><strong>MQA/GQA 不解决什么</strong>。两者减的是 KV cache 的头数系数，<em>不</em>解决注意力本身的 $O(n^2)$ 算力——每个 query 头仍要对全部前序 token 做 softmax 加权和，$QK^\top$ 仍是 $n\times n$ 矩阵。它们也不解决训练时的激活内存，也不引入位置信息（位置仍需 RoPE 等外接编码）。当 $h=1$（本来就是单头）时 MQA 与 MHA 完全相同、无收益；当 batch $b$ 极大使 $1/b$ 项主导 $\Theta(n/d+1/b)$ 时，减 $n/d$ 项的收益被稀释（这时应增大 batch 而非改注意力）。以上为通用背景与范围判断，不是上述论文的原文结论。</p>
+<p><strong>MQA/GQA 不解决什么</strong>。两者减的是 KV cache 的头数系数，<em>不</em>解决注意力本身的 $O(n^2)$ 算力——每个 query 头仍要对全部前序 token 做 softmax 加权和，$QK^\top$ 仍是 $n\times n$ 矩阵。它们也不解决训练时的激活内存，也不引入位置信息（位置仍需 RoPE 等外接编码）。当 $h=1$（本来就是单头）时 MQA 与 MHA 完全相同、无收益；当 batch $b$ 极小（$1/b$ 项主导 $\Theta(n/d+1/b)$）时，减 $n/d$ 项的收益被稀释（这时应增大 batch 而非改注意力）。以上为通用背景与范围判断，不是上述论文的原文结论。</p>
 
 <p><strong>与 MLA 的根本区别</strong>。DeepSeek-V2 §2.1.4 Table 1 把四种机制的每 token 每 layer cache 并排：</p>
 
@@ -491,7 +491,7 @@
     <p>MQA/GQA 不解决哪两类问题？</p>
     <details>
       <summary>解答：$O(n^2)$ 算力与位置信息</summary>
-      <p>两者只减 KV cache 的头数系数，不解决注意力本身的 $O(n^2)$ 算力——每个 query 头仍要对全部前序 token 做 softmax 加权和，$QK^\top$ 仍是 $n\times n$ 矩阵（算力瓶颈由 Flash 或 Linear Attention 处理）。也不引入位置信息，位置仍需 RoPE 等外接编码。此外 $h=1$ 时无收益，batch 极大使 $1/b$ 项主导时收益被稀释。</p>
+      <p>两者只减 KV cache 的头数系数，不解决注意力本身的 $O(n^2)$ 算力——每个 query 头仍要对全部前序 token 做 softmax 加权和，$QK^\top$ 仍是 $n\times n$ 矩阵（算力瓶颈由 Flash 或 Linear Attention 处理）。也不引入位置信息，位置仍需 RoPE 等外接编码。此外 $h=1$ 时无收益，batch 极小时 $1/b$ 项主导、收益被稀释。</p>
     </details>
   </li>
   <li>

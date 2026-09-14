@@ -170,7 +170,7 @@
     <p>第 2 轮的 1250 token 里有哪部分是重复计算？</p>
     <details>
       <summary>解答：第 1 轮输入 1000 token 与第 1 轮回复 200 token 本可由 D 上已有 KV 复用，实际却仍被 P 重新计算</summary>
-      <p>第 1 轮的 1000 token 输入与 200 token 回复在 P 上早已处理过、KV 已传到 D；它们在第 2 轮属于"已知信息"。但因 D 上的 KV 对 P 不可达（单向协议）<sup>[C1]</sup>，P 只能整段重算 1250 token，只有末尾追加的 50 token 是真正的新内容<sup>[C3]</sup>。构造示例：1250 token 在 1P_3D 上需要约 156 MiB KV 传输（详见第 5 章类似换算）。</p>
+      <p>第 1 轮的 1000 token 输入由 P prefill、其 KV 已传到 D；200 token 回复的 KV 则由 D 在 decode 阶段就地生成、也留在 D 上。两段在第 2 轮都属于"已知信息"。但因 D 上的 KV 对 P 不可达（单向协议）<sup>[C1]</sup>，P 只能整段重算 1250 token，只有末尾追加的 50 token 是真正的新内容<sup>[C3]</sup>。构造示例：1250 token 在 1P_3D 上需要约 156 MiB KV 传输（详见第 5 章类似换算）。</p>
     </details>
   </li>
   <li>
@@ -211,7 +211,7 @@
 
 <p>理论复杂度差能否在真实 GPU 上兑现？本文在单 H100 上用 Llama-3.1-8B 的微基准给出一组对照数字（co-locate 一个处理 1024 token 的 prefill）<sup>[N1, N2]</sup>：</p>
 
-<p>下图展示 decode batch size 在 10 到 250 之间，三种配置（仅 decode、与 1 个 full prefill 同卡、与 1 个 append-prefill 同卡）的平均 TPOT。蓝线（decoding-only）略低于绿线（+1 append-prefill），原图在 batch 200 处标注 +2%；红线（+1 full prefill）从 batch 50 开始显著抬升，到 batch 200 处 TPOT 抬升约 48%。</p>
+<p>下图展示 decode batch size 在 10 到 250 之间，三种配置（仅 decode、与 1 个 full prefill 同卡、与 1 个 append-prefill 同卡）的平均 TPOT。蓝线（decoding-only）略低于绿线（+1 append-prefill）；红线（+1 full prefill）从 batch 50 开始显著抬升，到 batch 200 处 TPOT 抬升约 48%。原图把 +48% 与 +2% 两处标注放在曲线右端（约 batch 210–230）。</p>
 
 <p>两线差距在 batch 200 处达到一个数量级：full prefill +48%、append-prefill +2%。</p>
 <img src="assets/img-06.webp" alt="单 H100 上 Llama-3.1-8B 干扰微基准：full prefill 让 decode TPOT 在 batch 200 处上升 48%，append-prefill 仅上升 2%">
@@ -489,7 +489,7 @@
 
 <h3 id="weight-knob">5.4 权重旋钮：单参数控制 TTFT-TPOT 取舍</h3>
 
-<p>前文用 balanced 权重；$\mathbf{w}$ 是算子调 TTFT-TPOT 倾向的旋钮。weight 扫描突出这一点：1P_3D、prefill-heavy 切片、QPS 8 与 16，$w_{\text{tpot}}$ 从 1 涨到 6。</p>
+<p>前文用 balanced 权重；$\mathbf{w}$ 是算子调 TTFT-TPOT 倾向的旋钮。权重扫描突出这一点：1P_3D、prefill-heavy 切片、QPS 8 与 16，$w_{\text{tpot}}$ 从 1 涨到 6。</p>
 <img src="assets/img-02.webp" alt="w_tpot 扫描：四个 D-local 比例（0%/20%/50%/95%）在 TTFT-TPOT 平面上形成单调曲线">
 <p><b>图（原文 Figure 6）</b>：$w_{\text{tpot}}$ 扫描结果<sup>[G5]</sup>。横轴为 Turn 2+ 平均 TTFT，纵轴为 Turn 2+ 平均 TPOT；四个操作点标注为 D-local 比例（0% 静态 PD、20% / 50% / 95% D-local）。QPS=8（左）：TTFT -96%、TPOT +7.0%；QPS=16（右）：TTFT -94%、TPOT +12.1%。灰色曲线是 $w_{\text{tpot}}$ 沿轨迹的连续插值——同一族顶点形成 TTFT-TPOT 单调控制面。</p>
 
@@ -565,16 +565,16 @@
 <ul>
 <li><strong>离线表漂移</strong>：决策表基于离线校准；硬件或负载分布远离婚线校准集时表会优雅降级但次优<sup>[C15]</sup>。论文承认未提供自适应更新机制——可与 AMPD（基于实时队列状态的并发工作）组合补齐<sup>[C15]</sup>。</li>
 <li><strong>单节点实验</strong>：主实验在 4×H100 NVLink 单节点上，跨节点慢链路只做了带宽注入模拟<sup>[C19, N11]</sup>。真实多节点部署的可移植性需更多验证。</li>
-<li><strong>主模型 8B 与初始化开销</strong>：replica 对照要求模型单卡放得下，主实验以 Llama-3.1-8B 为主<sup>[N17]</sup>；每个配置切换需要完整 server restart，17×180 测试矩阵在更大模型上成本 prohibitive（附录 C.3）。</li>
+<li><strong>主模型 8B 与初始化开销</strong>：replica 对照要求模型单卡放得下，主实验以 Llama-3.1-8B 为主<sup>[N17]</sup>；每个配置切换需要完整 server restart，17×180 测试矩阵在更大模型上的初始化开销过大（附录 C.3）。</li>
 <li><strong>缓存竞争未深入</strong>：多会话竞争 D 节点 KV 槽位时本地处理优势可能被缓存抖动抵消——论文未深入讨论该现象。</li>
-<li><strong>PPD 是 routing actuator</strong>：它不强制端到端 SLO 界（那是闭环准入控制+批调度的事）；只暴露一个可预测的权重旋钮<sup>[C16]</sup>。若部署需要硬 SLO 约束，需要上层控制器依据观测 P99 驱动 $\mathbf{w}$。</li>
+<li><strong>PPD 是路由执行器（routing actuator）</strong>：它不强制端到端 SLO 界（那是闭环准入控制+批调度的事）；只暴露一个可预测的权重旋钮<sup>[C16]</sup>。若部署需要硬 SLO 约束，需要上层控制器依据观测 P99 驱动 $\mathbf{w}$。</li>
 </ul>
 
 <h3 id="when-to-use">6.3 适用场景与位置</h3>
 <ul>
 <li><strong>适用</strong>：聊天机器人 / agentic 等多轮对话为主的负载；P 资源紧张（1P_3D 类配比收益最大）；跨节点慢链路部署（带宽越慢优势越大）。可与 prefix cache 引擎（vLLM/SGLang）直接叠加（前缀缓存机制见 <a href="../prefix-caching/index.html">前缀缓存</a>）。</li>
 <li><strong>慎用</strong>：单轮为主的负载（Turn 1 恒走 P，无收益）；TPOT 极敏感部署（$x{=}1$ 极限付 7–12% TPOT 代价，需极端权重回退 $x{=}0$）。</li>
-<li><strong>与相邻工作的相对位置</strong>：与 AMPD 共享"把增量 prefill 路由到 D"的高层直觉，但用离线优化框架与微架构干扰分析替代实时队列状态估计；与 Mooncake/MemServe（LMCache）等分布式 KV 存储层处于不同层（PPD 决定调度，后者决定存储位置），可组合<sup>[C14]</sup>；与 DuetServe/Nexus/TaiChi（GPU 内 SM 切分/动态资源再分配）属不同粒度，可在请求级叠加。</li>
+<li><strong>与相邻工作的相对位置</strong>：与 AMPD 共享"把增量 prefill 路由到 D"的高层直觉，但用离线优化框架与微架构干扰分析替代实时队列状态估计；与 Mooncake、MemServe、LMCache 等分布式 KV 缓存/存储层处于不同层（PPD 决定调度，后者决定存储位置），可组合<sup>[C14]</sup>；与 DuetServe/Nexus/TaiChi（GPU 内 SM 切分/动态资源再分配）属不同粒度，可在请求级叠加。</li>
 </ul>
 
 <h3 id="evaluation-questions">本章问题</h3>
@@ -629,7 +629,7 @@
 <tr><td>C13</td><td>$x{=}0$ 降级根因是 KV 传输饱和；3.1 平均轮次下 PPD 削减约 75% KV 传输，约 3× 网络负载差</td><td>§6.2 Root Cause</td></tr>
 <tr><td>C14</td><td>PPD 与分布式 KV 缓存层（Mooncake/MemServe）不同层且可组合</td><td>§7 Relationship with Distributed KV Cache</td></tr>
 <tr><td>C15</td><td>PPD 主要局限：离线表在硬件/负载漂移时优雅降级但次优；AMPD 在线估计可补</td><td>§7</td></tr>
-<tr><td>C16</td><td>PPD 是 routing actuator，不强制端到端 SLO 界</td><td>§6.5 末句</td></tr>
+<tr><td>C16</td><td>PPD 是路由执行器，不强制端到端 SLO 界</td><td>§6.5 末句</td></tr>
 <tr><td>C17</td><td>混合 R+P/D 配置排除：R 无隔离收益 + 减少专用 P/D 资源；胜率仅 6.1%/12.2%/16.1%</td><td>App.A</td></tr>
 <tr><td>C18</td><td>$x{=}1$ 优势随 2–16 轮、8B/14B/30B 模型尺寸泛化，稳定 ~70%</td><td>§4.3、App.C.3</td></tr>
 <tr><td>C19</td><td>带宽模拟：对 PD 路由请求注入 $\Delta t=\max(0,B(\psi)/\beta_{\text{target}}-t_{\text{NVLink}})$ 延迟，PPD 本地路径不注入</td><td>§6.4、App.B.6</td></tr>
@@ -697,7 +697,7 @@
 <p>第 1 章自绘 SVG（"x=0 下多轮请求路径"）展示两个代价的物理形态：辅助说明，不引入新机制声明。第 4 章该段文字"把多目标路由硬塞进单个目标函数的做法不可行"是分析性判断延伸（论文未明说）。</p>
 
 <h3>简化条件及其限制</h3>
-<p>其一，单节点实验：跨节点慢链路只用带宽注入模拟，真实多节点部署的可移植性未验证<sup>[N11, C19]</sup>。其二，离线表依赖负载网格校准——硬件更替或负载分布漂移时表需重新校准，论文未给出自适应更新机制<sup>[C15]</sup>。其三，主模型 8B——replica 对照要求模型单卡放得下，更大模型需权衡初始化开销<sup>[N17]</sup>。其四，缓存槽位竞争未深入——多会话争用 D 节点 KV 槽位时本地处理优势可能被抖动抵消，论文未量化该现象。其五，PPD 是 routing actuator，不强制端到端 SLO 界——硬 SLO 需上层控制器引入<sup>[C16]</sup>。</p>
+<p>其一，单节点实验：跨节点慢链路只用带宽注入模拟，真实多节点部署的可移植性未验证<sup>[N11, C19]</sup>。其二，离线表依赖负载网格校准——硬件更替或负载分布漂移时表需重新校准，论文未给出自适应更新机制<sup>[C15]</sup>。其三，主模型 8B——replica 对照要求模型单卡放得下，更大模型需权衡初始化开销<sup>[N17]</sup>。其四，缓存槽位竞争未深入——多会话争用 D 节点 KV 槽位时本地处理优势可能被抖动抵消，论文未量化该现象。其五，PPD 是路由执行器，不强制端到端 SLO 界——硬 SLO 需上层控制器引入<sup>[C16]</sup>。</p>
 
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

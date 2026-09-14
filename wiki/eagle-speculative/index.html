@@ -67,7 +67,7 @@
 <p><b>主要依据</b>：Li et al. 2024, "EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty", arXiv:2401.15077, ICML 2024；Li et al. 2025, "EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test", arXiv:2503.01840, NeurIPS 2025；Kimi K3 Technical Report（<a href="https://arxiv.org/abs/2607.24653">arXiv:2607.24653</a>）§4.1.4 Draft Model Fine-Tuning。</p>
 </blockquote>
 
-<p>给一个 70B 模型用投机解码加速推理，draft 模型该是什么？传统答案是「找一个独立小语言模型」，比如用 LLaMA2-7B 给 LLaMA2-70B 打草稿。但小模型有两难：太弱（如 TinyLLaMA）难以贴近 target 分布、加速收益有限；太强（如 7B 给 70B 打草稿）draft 单步成本 $c$ 不可忽略，加速比退化。EAGLE 论文给出更具体的原因 <sup>[C1]</sup>：7B draft 的高开销削弱加速收益，TinyLLaMA 则因指令模板不一致而不适合 instruct 模型。EAGLE 系列给出反直觉的答案：<strong>不训练独立小模型，直接复用 target 模型已经算出的隐藏状态作为 draft 输入</strong>。EAGLE-3 把这个思路推到极致：draft 只有单层 transformer decoder，复用 target 的低、中、高三层特征融合作为输入、直接预测 token 分布，并用 training-time test 训练让自己在多步预测中保持接受率不衰减。在 Vicuna 13B 上 EAGLE-3 比 vanilla decoding 快 5.6x。EAGLE-3 如何用单层 decoder 做到这一点？</p>
+<p>给一个 70B 模型用投机解码加速推理，draft 模型该是什么？传统答案是「找一个独立小语言模型」，比如用 LLaMA2-7B 给 LLaMA2-70B 打草稿。但小模型有两难：太弱（如 TinyLLaMA）难以贴近 target 分布、加速收益有限；太强（如 7B 给 70B 打草稿）draft 单步成本 $c$ 不可忽略，加速比退化。EAGLE 论文给出更具体的原因 <sup>[C1]</sup>：7B draft 的高开销削弱加速收益，TinyLLaMA 则因指令模板不一致而不适合 instruct 模型。EAGLE 系列给出反直觉的答案：<strong>不训练独立小模型，直接复用 target 模型已经算出的隐藏状态作为 draft 输入</strong>。EAGLE-3 把这个思路推到极致：draft 只有单层 transformer decoder，复用 target 的低、中、高三层特征融合作为输入、直接预测 token 分布，并用 training-time test 训练让自己在多步预测中保持接受率几乎不衰减。在 Vicuna 13B 上 EAGLE-3 比 vanilla decoding 快 5.6x。EAGLE-3 如何用单层 decoder 做到这一点？</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -83,7 +83,7 @@
       <p>EAGLE-3 在 EAGLE-1 基础上做了哪两项架构改变？每项改变解决什么具体问题？</p>
       <details>
         <summary>解答：直接 token 预测与多层特征融合</summary>
-        <p>改变 1：放弃 feature 预测、直接输出 token 分布——解决 EAGLE-1 中 draft 容量被 feature 回归任务占用、扩大数据提升饱和的瓶颈。改变 2：用 low/mid/high 三层 feature 融合替代 top-layer 单层 feature——解决单层 feature 无法利用其他层信息的问题。见「3. EAGLE-3 的两项架构改变」章。</p>
+        <p>改变 1：放弃 feature 预测、直接输出 token 分布——解决 EAGLE-1 中 draft 容量被 feature 回归任务占用、扩大数据提升饱和的瓶颈。改变 2：用 low/mid/high 三层 feature 融合替代 second-to-top-layer 单层 feature——解决单层 feature 无法利用其他层信息的问题。见「3. EAGLE-3 的两项架构改变」章。</p>
       </details>
     </li>
     <li>
@@ -233,13 +233,13 @@
 
 <p>EAGLE-3 让 draft 直接输出 token 分布 q、不再回归 feature。draft 容量全部用于贴近 target 的 token 分布，扩大训练数据能直接转化为更准的 token 预测。</p>
 
-<h3 id="change-2-multi-layer-fusion">3.2 改变 2：用 low/mid/high 三层 feature 融合替代 top-layer 单层 feature</h3>
+<h3 id="change-2-multi-layer-fusion">3.2 改变 2：用 low/mid/high 三层 feature 融合替代 second-to-top-layer 单层 feature</h3>
 
 <p>EAGLE-1 只用 target 的 second-to-top-layer feature。这一层 feature 主要承载 next-token 预测信息，只用单层无法利用 target 不同层所承载的不同层次信息。EAGLE-3 改为融合 target 的低、中、高三层 feature <sup>[C3]</sup>：</p>
 
 $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
-<p>其中 $k$ 是 target 模型的 hidden size（特征维度），$l_t, m_t, h_t \in \mathbb{R}^k$ 分别是 target 在第 $t$ 个位置上 low/mid/high 三层 feature，$[\cdot;\cdot;\cdot]$ 是拼接得到 $3k$ 维向量，$W_{\text{fuse}} \in \mathbb{R}^{k \times 3k}$ 是融合矩阵（K3 实现为无偏置矩阵 $W_{E3}$），$g_t \in \mathbb{R}^k$ 是融合后的 feature <sup>[F1]</sup>。论文指出融合低、中、高三层 feature 能捕捉不同层次的语义信息，融合后的 $g_t$ 比单层 top-layer feature 信息更丰富 <sup>[C3]</sup>。</p>
+<p>其中 $k$ 是 target 模型的 hidden size（特征维度），$l_t, m_t, h_t \in \mathbb{R}^k$ 分别是 target 在第 $t$ 个位置上 low/mid/high 三层 feature，$[\cdot;\cdot;\cdot]$ 是拼接得到 $3k$ 维向量，$W_{\text{fuse}} \in \mathbb{R}^{k \times 3k}$ 是融合矩阵（K3 实现为无偏置矩阵 $W_{E3}$），$g_t \in \mathbb{R}^k$ 是融合后的 feature <sup>[F1]</sup>。论文指出融合低、中、高三层 feature 能捕捉不同层次的语义信息，融合后的 $g_t$ 比单层 second-to-top-layer feature 信息更丰富 <sup>[C3]</sup>。</p>
 
 <h3 id="arch-summary">3.3 架构总览</h3>
 
@@ -259,7 +259,7 @@ $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
     <div class="dg-arrow">&#8594;</div>
     <div class="dg-node">
       <div class="dg-node-title">拼接与单层 decoder</div>
-      <div class="dg-node-note">拼接 $[g_{1:t};\, e_{t+1}]$（$2k$ 维）$\to$ FC（$k \times 2k$）$\to$ 单层 decoder $\to$ $a_{t+1}$（$k$ 维）</div>
+      <div class="dg-node-note">逐位置拼接 $[g_{1:t};\, e_{2:t+1}]$（每位置 $2k$ 维）$\to$ FC（$k \times 2k$）$\to$ 单层 decoder $\to$ $a_{t+1}$（$k$ 维）</div>
     </div>
     <div class="dg-arrow">&#8594;</div>
     <div class="dg-node">
@@ -297,7 +297,7 @@ $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
     </details>
   </li>
   <li>
-    <p>每项改变解决的具体问题是什么（feature 回归容量瓶颈 + top-layer feature 信息局限）。</p>
+    <p>每项改变解决的具体问题是什么（feature 回归容量瓶颈 + second-to-top-layer feature 信息局限）。</p>
     <details>
       <summary>解答：释放容量与补全信息</summary>
       <p>改变 1 解决容量瓶颈：EAGLE-1 的 draft 容量被「feature 回归任务」占用，要先学会输出接近 target 真实 feature 的 $\hat f$ 再依赖 lm_head 映射，扩大训练数据提升饱和（论文的 scaling law 曲线）；直接预测 token 让容量全部用于贴近 target token 分布，数据扩大能持续转化。改变 2 解决信息局限：second-to-top-layer feature 主要承载 next-token 预测信息，只用单层无法利用其他层承载的不同层次信息；融合低、中、高三层 feature 能捕捉来自不同层的丰富语义信息，比单层 feature 更全面。</p>
@@ -322,9 +322,9 @@ $$g_t = W_{\text{fuse}} \cdot [l_t;\, m_t;\, h_t] \in \mathbb{R}^k.$$
 
 <h3 id="draft-step-1">4.2 Draft 步骤 1：用 target 真实 feature</h3>
 
-<p>draft 的第一步可以用 target 真实的 $g_1, \ldots, g_t$，因为这些位置 target 已经算过。输入 $\text{concat}(g_1, \ldots, g_t, e_{t+1})$，过 FC 与单层 decoder 得到输出 $a_{t+1}$，再过共享 lm_head 得到 $q_1$，采样得到第一个 draft token $x_{t+2}$ <sup>[F2]</sup>：</p>
+<p>draft 的第一步可以用 target 真实的 $g_1, \ldots, g_t$，因为这些位置 target 已经算过。输入逐位置拼接的 $[g_{1:t};\, e_{2:t+1}]$，过 FC 与单层 decoder 得到输出 $a_{t+1}$，再过共享 lm_head 得到 $q_1$，采样得到第一个 draft token $x_{t+2}$ <sup>[F2]</sup>：</p>
 
-$$a_{t+1} = \text{DraftLayer}\big(\mathrm{FC}([g_{1:t};\, e_{t+1}])\big),\qquad q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1}).$$
+$$a_{t+1} = \text{DraftLayer}\big(\mathrm{FC}([g_{1:t};\, e_{2:t+1}])\big),\qquad q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1}).$$
 
 <p>其中 $\text{DraftLayer}$ 即 §3 的单层 transformer decoder，$\mathrm{FC}$ 是把 $2k$ 维拼接向量降到 $k$ 维的全连接层（与 §3.3 数据流一致：拼接 $\to$ FC $\to$ 单层 decoder）；$[\cdot;\cdot]$ 表示逐位置拼接——把每个位置 $i$ 的 $g_i$ 与该位置的 token embedding 拼成 $2k$ 维向量，而非把整个 $g$ 序列与单个 embedding 拼成一个长向量。</p>
 
@@ -580,7 +580,7 @@ Verify 阶段（一次 target 前向）：
 <tr><td>训练时 draft 看到的输入</td><td>ground-truth feature 序列</td><td>第 1 步真实 feature，后续步骤 draft 自己的输出 $a$</td></tr>
 <tr><td>训练目标</td><td>每步与 ground-truth token 对齐</td><td>多步展开，每步与 ground-truth token 对齐</td></tr>
 <tr><td>训练时是否模拟推理噪声</td><td>否</td><td>是（draft 见到自己的近似 $a$ 作为输入）</td></tr>
-<tr><td>推理时深度预测表现</td><td>接受率随深度快速衰减</td><td>接受率随深度缓慢衰减（在多步内保持）</td></tr>
+<tr><td>推理时深度预测表现</td><td>接受率随深度快速衰减</td><td>接受率几乎不变</td></tr>
 </tbody>
 </table>
 </div>
@@ -591,9 +591,9 @@ Verify 阶段（一次 target 前向）：
 
 <p>EAGLE-3 训练 draft 时用 token-level 负对数似然（论文未给出该式的显式形式，下面是按论文描述的形式化）<sup>[F3]</sup>：</p>
 
-$$L_{E3} = -\sum_{i=1}^{K} \log\, q(t_{t+i} \mid g_{1:t},\, a_{t+1:t+i-1}).$$
+$$L_{E3} = -\sum_{i=1}^{K} \log\, q(x_{t+i} \mid g_{1:t},\, a_{t+1:t+i-1}).$$
 
-<p>其中 $K$ 是 TTT unroll 长度，$t_{t+i}$ 是 ground-truth token，$q$ 是 draft 模型在第 $i$ 步的输出分布，$g_{1:t}$ 是 target 真实融合 feature，$a_{t+1:t+i-1}$ 是 draft 自己前几步的输出（作为 $g$ 替代）。这个损失让 draft 在多步展开中每一步都贴近 ground-truth token。（注：$K$ 表 unroll 长度，与前文 hidden size 的 $k$ 区分。）</p>
+<p>其中 $K$ 是 TTT unroll 长度，$x_{t+i}$ 是 ground-truth token，$q$ 是 draft 模型在第 $i$ 步的输出分布，$g_{1:t}$ 是 target 真实融合 feature，$a_{t+1:t+i-1}$ 是 draft 自己前几步的输出（作为 $g$ 替代）。这个损失让 draft 在多步展开中每一步都贴近 ground-truth token。（注：$K$ 表 unroll 长度，与前文 hidden size 的 $k$ 区分。）</p>
 
 <p>K3 报告版改用 LK loss <sup>[F4]</sup>，直接对接受率 $\alpha$ 求负对数：</p>
 
@@ -631,7 +631,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
     <p>写出 $L_{E3}$ 与 $L_{\text{LK}}$ 的公式。</p>
     <details>
       <summary>解答：token-level NLL 与接受率负对数</summary>
-      <p>$L_{E3} = -\sum_{i=1}^{K} \log q(t_{t+i} \mid g_{1:t}, a_{t+1:t+i-1})$，其中 $K$ 是 TTT unroll 长度、$t_{t+i}$ 是 ground-truth token、$a_{t+1:t+i-1}$ 是 draft 自己前几步的输出（作为 $g$ 替代）。$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x), q(x))$，即接受率 $\alpha = \sum_x \min(p, q)$ 的负对数，$p$、$q$ 都在 temperature=1 评估。</p>
+      <p>$L_{E3} = -\sum_{i=1}^{K} \log q(x_{t+i} \mid g_{1:t}, a_{t+1:t+i-1})$，其中 $K$ 是 TTT unroll 长度、$x_{t+i}$ 是 ground-truth token、$a_{t+1:t+i-1}$ 是 draft 自己前几步的输出（作为 $g$ 替代）。$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x), q(x))$，即接受率 $\alpha = \sum_x \min(p, q)$ 的负对数，$p$、$q$ 都在 temperature=1 评估。</p>
     </details>
   </li>
   <li>
@@ -743,9 +743,9 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 
 <p>[F1] 多层特征融合 $g_t = W_{\text{fuse}} \cdot [l_t; m_t; h_t] \in \mathbb{R}^k$：Li et al. 2025 §3.1。原文「We concatenate the k-dimensional vectors l, m, and h to form a 3k-dimensional vector, then pass it through a fully connected (FC) layer to reduce it to k-dimensions, obtaining a feature g」；公式记号为本页的形式化写法。K3 实现命名为 $W_{E3}$。</p>
 
-<p>[F2] EAGLE-3 单步 draft 计算 $a_{t+1} = \text{DraftLayer}(\mathrm{FC}([g_{1:t};\, e_{t+1}]))$、$q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1})$：Li et al. 2025 §3.1。原文「The concatenated vector is then passed through an FC layer to reduce its dimensionality to k, and subsequently inputted into a single layer decoder, producing the output a. Finally, we input a_I into the LM head and sample to obtain the draft token 'do'.」</p>
+<p>[F2] EAGLE-3 单步 draft 计算 $a_{t+1} = \text{DraftLayer}(\mathrm{FC}([g_{1:t};\, e_{2:t+1}]))$、$q_1 = \mathrm{softmax}(W_{\text{lm}} \cdot a_{t+1})$：Li et al. 2025 §3.1。原文「The concatenated vector is then passed through an FC layer to reduce its dimensionality to k, and subsequently inputted into a single layer decoder, producing the output a. Finally, we input a_I into the LM head and sample to obtain the draft token 'do'.」</p>
 
-<p>[F3] EAGLE-3 训练损失 $L_{E3} = -\sum_{i=1}^{K} \log q(t_{t+i} | g_{1:t}, a_{t+1:t+i-1})$：形式化由本页按 Li et al. 2025 §3.2 的描述（token-level 负对数似然、多步展开）给出，论文未给出该式的显式形式。求和上限用 $K$ 是本页记法，以避免与 hidden size 符号 $k$ 碰撞。</p>
+<p>[F3] EAGLE-3 训练损失 $L_{E3} = -\sum_{i=1}^{K} \log q(x_{t+i} | g_{1:t}, a_{t+1:t+i-1})$：形式化由本页按 Li et al. 2025 §3.2 的描述（token-level 负对数似然、多步展开）给出，论文未给出该式的显式形式。求和上限用 $K$ 是本页记法，以避免与 hidden size 符号 $k$ 碰撞。</p>
 
 <p>[F4] K3 LK loss $L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x), q(x))$：K3 报告（arXiv:2607.24653）§4.1.4 Eq.(16)。</p>
 
@@ -770,7 +770,7 @@ $$L_{\text{LK}} = -\log \sum_{x \in V} \min(p(x),\, q(x)).$$
 <p>以下教学数字均为人为构造，目的是便于手算：</p>
 
 <ul>
-  <li>推理时自回归 draft 一章的「prefix = How can、上一步采样 token = I、$\gamma=3$、k = 4、词表 5 token」手算例子：纯粹构造，目的是覆盖「第一步真实 g、后续自替代 a」三步并让 L2 偏差可计算。$g_{\text{how}}, g_{\text{can}}, g_{\text{I}}$ 取一位小数；$W_a, W_{\text{lm}}$ 的非零元素选择让 $W_a \cdot \text{input}$ 的每行只需 2-3 次乘法即可手算。不代表真实模型分布或权重。</li>
+  <li>推理时自回归 draft 一章的「prefix = How can、上一步采样 token = I、$\gamma=3$、k = 4、词表 5 token」手算例子：纯粹构造，目的是覆盖「第一步真实 g、后续自替代 a」三步并让 L2 偏差可计算。$g_{\text{how}}, g_{\text{can}}$ 取一位小数，$g_{\text{I}}$ 取两位小数以拉开与 $a_{\text{I}}$ 的偏差；$W_a, W_{\text{lm}}$ 的非零元素选择让 $W_a \cdot \text{input}$ 的每行只需 2-3 次乘法即可手算。不代表真实模型分布或权重。</li>
   <li>构造示例的 token embedding 用 one-hot：真实模型用学习的 dense embedding（k 维，k 通常 4096+）。本简化是为了手算可行性，不改变「自替代」机制的数学结构。</li>
   <li>构造示例的 draft 单层 decoder 简化为「线性变换 + tanh」：真实 EAGLE-3 draft 是完整的 transformer decoder 层（含 self-attention、MLP、layer norm）。本简化省略的组件不改变「输入 concat(g, e)、输出 a、a 进入下一步作为 g 替代」的机制主线。</li>
   <li>训练 draft 模型一章的 TTT 因果 mask 图示：简化版，只展示「第 1 轮真实、第 2、3 轮自替代」的时序关系，不展示具体的 attention 计算细节。</li>
