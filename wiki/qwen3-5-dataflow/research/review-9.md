@@ -1,0 +1,38 @@
+<!-- review-meta
+round: 9
+page: wiki/qwen3-5-dataflow/index.html
+reviewed_content_sha256: 5f3934287a1340e3
+-->
+# Qwen3.5-397B-A17B 前向数据流审查记录（第 9 轮）
+
+- 页面版本：cc66db6c4f886982355416fd3c28558c06ee94da
+- 审查时间：2026-09-14 14:59
+- 审查者：独立子代理（未参与写作与前序轮次）
+- 适用规范：`guides/model-dataflow.md`（页面 head `dojo:type=dataflow`）
+- 已完整阅读章节：1. 关键规格（含家族变体表与 note）；2. 交互式数据流（含 `<noscript>` 内七张表与各视图边清单）；3. 要点（整体结构 / GDN / 全注意力层 / MoE 路由 / MTP 草稿层 / 长上下文开销）；4. 视觉编码器与多模态融合（4.1–4.8）；5. 与 Qwen3.8-Flash-Next 的架构对比；6. 核对方式；来源与范围说明；页内 `<style>` 与两段 `<script>`（VIEWS 视图数据 + 切换/落点逻辑）
+- 机械项：`.dojo/scripts/validate.py wiki/qwen3-5-dataflow/index.html` → `validation ok`
+- 来源获取方式：官方 `config.json` 与 `model.safetensors.index.json`（huggingface.co，HTTP 直取）、94 个分片 safetensors 头部（HTTP Range 读取）、transformers@36deb0b5 与 vllm-project/vllm 源码原文、官方模型卡、六个家族型号 config、Qwen3.8-Flash-Next config 与模型卡
+
+## 已核对无误（关键回源片段）
+
+- 结构参数逐项与 config.json 一致：`num_hidden_layers 60`、`hidden_size 4096`、`full_attention_interval 4`、`head_dim 256`、`num_attention_heads 32`、`num_key_value_heads 2`、`linear_num_key_heads 16`、`linear_num_value_heads 64`、`linear_key/value_head_dim 128`、`linear_conv_kernel_dim 4`、`num_experts 512`、`num_experts_per_tok 10`、`moe_intermediate_size 1024`、`shared_expert_intermediate_size 1024`、`router_aux_loss_coef 0.001`、`attn_output_gate true`、`partial_rotary_factor 0.25`、`mrope_section [11,11,10]`、`rope_theta 1e7`、`max_position_embeddings 262144`、`vocab_size 248320`、`mtp_num_hidden_layers 1`、`mtp_use_dedicated_embeddings false`、`mamba_ssm_dtype float32`、`tie_word_embeddings false`、vision `depth 27 / hidden 1152 / intermediate 4304 / heads 16 / num_position_embeddings 2304 / out_hidden_size 4096 / spatial_merge_size 2 / deepstack_visual_indexes []`。
+- 权重索引实测（本机重跑，94 分片全量头部）：`total tensors 2924`、`shards 94`、`dtype {BF16: 2834, F32: 90}`、`total_params 403397928944`，与页面第 1 节与第 6 节逐位相等；94 个头部字节合计 365,432，加 94×8 字节长度前缀 = 366,184，与页面「合计 366,184 字节」一致。
+- 层型分布：索引中 `linear_attn` 层号 {0,1,2,4,…,58} 共 45 层、`self_attn` 层号 {3,7,…,59} 共 15 层；`mlp.gate.weight` 与 `shared_expert_gate.weight` 各 61 个；`mtp.*` 张量恰 1553 个；conv1d 仅 `weight`（无 bias）——页面第 1 节「61 个 mlp.gate = 60 主干层 + 1 MTP 层」「1553 个张量」等均相符。
+- 形状原文：`layers.3.self_attn.q_proj.weight [16384, 4096]`、`k_proj/v_proj [512, 4096]`、`layers.0.linear_attn.in_proj_qkv.weight [12288, 4096]`、`in_proj_z.weight [8192, 4096]`、`out_proj.weight [4096, 8192]`、`A_log [64] F32`、`norm.weight [128] F32`、`mlp.experts.gate_up_proj`（打包 1 个/层）、`shared_expert_gate.weight [1, 4096]`、`mtp.layers.0.mlp.experts.N.{gate,up,down}_proj` 逐张量、`visual.patch_embed.proj.weight [1152, 3, 2, 16, 16]`、`visual.merger.norm.weight [1152]`、`embed_tokens.weight [248320, 4096]`。
+- 源码语义：`Qwen3_5MoeAttention.__init__` 中 `q_proj` 恒为 `num_attention_heads*head_dim*2`、`q_norm/k_norm = RMSNorm(head_dim)`，forward 中 `attn_output * torch.sigmoid(gate)`，全仓 `attn_output_gate` 未被读取；`Qwen3_5MoeTopKRouter` 中 `router_top_value /= router_top_value.sum(...)` 无条件重归一化、`self.weight = nn.Parameter(torch.zeros(...))`；`Qwen3_5MoeRMSNormGated` 中 `self.activation = "silu"`；GDN forward 中 `beta = b.sigmoid()`、`g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)`、`query.repeat_interleave(num_v_heads // num_k_heads, dim=2)`、`use_qk_l2norm_in_kernel=True`、`scale = 1/(query.shape[-1]**0.5)`（=1/sqrt(128)）、prefill `torch_chunk_gated_delta_rule` / decode `torch_recurrent_gated_delta_rule`；decode 递归式 `last_state = last_state*g_t; delta=(v_t - (last_state*k_t).sum(-2))*beta_t; last_state += k_t⊗delta; out = (last_state*q_t).sum(-2)`，与页面 $S_t=e^{g_t}S_{t-1}+k_t(\beta_t(v_t-S_{t-1}^{\top}k_t))^{\top}$、$o_t=S_t^{\top}q_t/\sqrt{d_k}$ 一致；`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`。
+- MTP：vLLM `Qwen3NextMultiTokenPredictor.forward` 中 `inputs_embeds = pre_fc_norm_embedding(...)`、`hidden_states = pre_fc_norm_hidden(...)`、`torch.cat([inputs_embeds, hidden_states], dim=-1)`、`self.fc(...)` → 拼接顺序 embedding 在前属实；vLLM 主干 `hidden_states, _ = self.norm(hidden_states, residual); return hidden_states` → 页面「主干末端 norm」属实。
+- 位置编码：`get_rope_index` 中 `current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size`、视频 `repeat_interleave(...); video_grid_thw[:,0] = 1`、文本 `torch.arange(text_len).expand(3,-1) + current_pos`；模型侧 `get_vision_position_ids` 中 `llm_grid_h = grid_thw[1]//spatial_merge_size`、`position_height = arange(llm_grid_h) + start_position`、`vision_position_ids[0] += start_position`，与页面融合表逐式一致（8 文本 + (1,28,28)：196 token、推进 14、下一段起点 22）。
+- 家族六型号 config 实拉取：48/3072/32-2/64/256E-top8-I1024、40/2048/16-2/32/256E-top8-I512、64/5120/24-4/48/dense 17408、32/4096/16-4/32/dense 12288、32/2560/16-4/32/dense 9216+tie=True，全部与页面「家族变体」表逐格相符；六个型号 `mtp_num_hidden_layers` 均为 1。
+- 对比页：Qwen3.8-Flash-Next config（48 层、2560、24-2、512E-top10-I640、`output_gate_type sigmoid`、`hc_count 4`、`ngram_size 3`、`ple_layer_ids [2]` 且文档注明 one-indexed、`indexer_budget 2048`/`indexer_compress_ratio 4`、vision depth 27/out 2560）与 `configuration_qwen4_exp.py` 中 `"qwen_sparse_attention"` 的 layer_type 改写、模型卡（Apache-2.0 对 qwen-community-1.0、Feb 2026 对 Aug 2026、180B/6B）均与第 5 节相符。
+- 算术复算全部通过：403,397,928,944 = 396,346,350,336 + 456,010,480 + 6,595,568,128；16,331,922,176（含 lm_head 不含 embedding）与 17,349,040,896 之差恰等于 embed_tokens 表 1,017,118,720；MTP 1553 张量合计 6,595,568,128；视觉分组 267,890,544+143,451,648+40,119,040+2,654,208+1,770,624+124,416 = 456,010,480；MoE 单层激活 140,513,280、512 专家 6,442,450,944、60 层 386,547,056,640（占 95.82%）；KV 2048 B/token/层、256K 15 层 7.500 GiB；aux loss 均匀下界 0.001×512×(10/512)=0.01；旋转最低频 1e7^(-62/64)=1.66e-7。
+
+## 问题
+
+- [阻断·技术] 第 2 节视图「GDN 层内部」`cst` 节点（标签 `conv 状态 [12288,3]`、`io: [1,12288,3]`、公式 `72.00 KiB (bf16)`）、第 2 节 GDN 层表格 `conv 状态 · [12288,3]` 行、同节 `depthwise` 行「decode 时必须跨步保留 kernel-1=3 个位置的状态」、第 3 节「长上下文开销」正文「卷积状态为 12288 × 3，占 72.00 KiB（bf16）；45 层合计 0.179 GiB」及该表 GDN 状态列：conv 缓存状态的「位置数」写成 3（并据此得 72.00 KiB、0.179 GiB），官方实现是 4（= `linear_conv_kernel_dim`）。｜引文依据：transformers@36deb0b5 `src/transformers/cache_utils.py` `LinearAttentionLayer.lazy_initialization`：`self.conv_states[state_idx] = torch.zeros((*conv_states.shape[:-1], conv_kernel_size), dtype=..., device=...)`，`update_conv_state`：`self.conv_states[state_idx].copy_(full_conv_states[..., -self.conv_kernel_size[state_idx]:])`，`crop` 文档串「restrict the size of the cached states back to their minimal working size, i.e. `conv_kernel_size`」；`modeling_qwen3_5_moe.py` `Qwen3_5MoeGatedDeltaNet.__init__`：`self.conv_kernel_size = config.linear_conv_kernel_dim`、forward：`cache_params.update_conv_state(mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size)`；官方测试 `tests/models/qwen3_5/test_modeling_qwen3_5.py`：`return (batch_size, intermediate_size, config.linear_conv_kernel_dim)`（`intermediate_size = 2*16*128 + 64*128 = 12288`）；`config.json` `linear_conv_kernel_dim = 4`。故缓存状态形状为 [batch, 12288, 4] = 12288×4×2 B = 98,304 B = 96.00 KiB/层；45 层为 4,423,680 B，加递归状态 45×4 MiB = 188,743,680 B，GDN 合计 193,167,360 B = 0.17990 GiB ≈ 0.180 GiB。｜修复要求：`cst` 节点改为 `conv 状态 [12288,4]` / `io: [1,12288,4]` / `96.00 KiB (bf16)`，说明改为「每层 12288 通道、4 个位置（等于 conv kernel）、2 字节」；第 2 节表格两处同步；`depthwise` 行括号改为「decode 时保留 kernel=4 个位置的状态（覆盖前 3 个 token 的上下文）」或删去；第 3 节正文改为「12288 × 4，占 96.00 KiB（bf16）；45 层合计 0.180 GiB」，并把该表 GDN 状态列 0.179→0.180、合计 1.117→1.118 / 7.679→7.680 / 30.179→30.180。｜修复：｜复验：
+
+- [轻微·技术] 第 1 节「家族变体」引言：「系列全家族架构一致（混合层型、GQA、交错 MRoPE、MTP），仅规模与 FFN 形态不同。」与同表 4B 行的「（词表两头共享）」自相矛盾——`tie_word_embeddings` 是词表两头共享参数的取舍，不属于「规模与 FFN 形态」。｜引文依据：Qwen3.5-4B `config.json` `tie_word_embeddings: true`，其余五个家族型号均为 `false`。｜修复要求：把「仅规模与 FFN 形态不同」改为「仅规模、FFN 形态与词表共享取舍不同」，或删去该分句。｜修复：｜复验：
+
+## 结论
+
+- 统计：阻断 1 / 重要 0 / 轻微 1
+- 处置：修复（第 9 轮新增 1 条阻断，修复后须重跑 `.dojo/scripts/validate.py` 并由下一轮从完整页面重新审查；未发现两处数字互相矛盾、算式与结论不符、正文/summary/`<noscript>` 图注数字不一致、公式不可复算、符号歧义、无来源支持的判断写成结论或指向不存在路径的内容）
