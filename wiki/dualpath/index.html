@@ -135,7 +135,7 @@
 </table>
 </div>
 
-<p class="chapter-summary">表 1：不同模型在 agentic 负载下的 cache-compute ratio。Qwen2.5-32B 的 FP16 KV-Cache 比 V3.2（采用 MLA，KV-Cache 已被高度压缩）高出一个数量级。V3.2 因 sparse attention 进一步降低计算量，比值反而比 V3 高。引用依据取 V3.2 660B 的 22 GB/PFLOP（论文 §3 正文给出的代表数字，Table 1 单独列 13-36 GB/PFLOP，16K-64K 区间）。</p>
+<p class="chapter-summary">表 1：不同模型在 agentic 负载下的 cache-compute ratio。Qwen2.5-32B 的 FP16 KV-Cache 比 V3.2（采用 MLA，KV-Cache 已被高度压缩）高出一个数量级。V3.2 因 sparse attention 进一步降低计算量，比值反而比 V3 高。正文代表数字取 V3.2 660B 的 22 GB/PFLOP（论文 §3 正文；Table 1 单独列 13-36 GB/PFLOP，16K-64K 区间）。</p>
 
 <h3 id="hardware-trend">1.2 硬件代际：FLOPS 与 NIC/HBM 的剪刀差</h3>
 
@@ -167,7 +167,7 @@
 <p>trace 显示命中率 98.7% 与 cache-compute ratio 22 GB/PFLOP 是怎么量化的？后者为何按模型差异可达两个数量级？</p>
 <details>
 <summary>解答：命中率由平均轮次、上下文长度、追加长度共同决定；cache-compute ratio 取决于 KV-Cache 大小与单位计算量之比</summary>
-<p>命中率 $1 - \text{append} / \text{context}$ 直接由 trace 给出：157 轮平均、32.7k 上下文、429 追加 → $1 - 429/32721 \approx 98.7\%$（N-1）。cache-compute ratio 取决于 KV-Cache 字节数与计算量之比。MLA 与 DSA 都会显著压缩 KV-Cache（DS V3.2 因 DSA + MLA 双重压缩，ratio 仅 13-36 GB/PFLOP），而 Qwen2.5-32B 仍用 <a href="../../wiki/mqa-gqa/index.html">GQA</a> + FP16 KV-Cache，ratio 跃升到 117-267 GB/PFLOP。代际上，Ampere→Blackwell 算力涨 28.8× 而 PCIe 仅 2.0×，I/O-compute 比下降 14.4×（Fig.3 左侧，N-4）。三者共同决定在 agentic 负载下 SNIC 是主导瓶颈。</p>
+<p>命中率 $1 - \text{append} / \text{context}$ 直接由 trace 给出：157 轮平均、32.7k 上下文、429 追加 → $1 - 429/32721 \approx 98.7\%$（N-1）。cache-compute ratio 取决于 KV-Cache 字节数与计算量之比。MLA 把 KV-Cache 压到低秩表示，DS V3.2 的 13-36 GB/PFLOP 因此远低于仍用 <a href="../../wiki/mqa-gqa/index.html">GQA</a> + FP16 KV-Cache 的 Qwen2.5-32B（117-267 GB/PFLOP）；DSA 并不压缩 KV-Cache，它降低的是计算量，故 V3.2 的 cache-compute ratio 反而高于 V3（论文 §3：「The ratio of DeepSeek-V3.2 is higher than DeepSeek-V3, benefiting from its sparse attention design, lowering computation demands.」）。代际上，Ampere→Blackwell 算力涨 28.8× 而 PCIe 仅 2.0×，I/O-compute 比下降 14.4×（Fig.3 左侧，N-4）。三者共同决定在 agentic 负载下 SNIC 是主导瓶颈。</p>
 </details>
 </li>
 </ol>
@@ -191,7 +191,7 @@
 <p><img src="assets/img-12.webp" alt="PE read path 数据流：步骤 (1)-(9) 在 PE 节点 SNIC→PE DRAM→PE CNIC→PE GPU→PE CNIC→DE CNIC→DE DRAM→DE CNIC→DE GPU 之间搬运 Full Block 与 Layer Block"></p>
 <p><b>图（原文 Figure 4 左）</b>：PE read path。Persistent Storage 的 hit KV-Cache 按 Full Block 粒度经 PE 节点 SNIC (1) 写入 PE DRAM (2)，随后 (3)(4) 把 Layer Block 从 PE DRAM 经 PE CNIC 写入 PE GPU（H2D），PE GPU 进行本层 attention 与 miss token 的 KV 计算，完成后 PE GPU 把新生成的 Layer Block 交回 PE CNIC (5)，再由 PE CNIC 经 RDMA 把 Layer Block 发到 DE 节点 (6)，DE CNIC 把 Layer Block 写入 DE DRAM (7)，再交 DE CNIC 喂 DE GPU (8)(9)。步骤 (3)–(7) 按层重复 $n_\text{layer}$ 次（原文 §4.1 明确：「This process (3-7) repeats $n_\text{layer}$ times」）；步骤 (1)(2) 是按 Full Block 读存储的一次性动作，步骤 (8)(9) 是 decode 阶段前把完整 prompt KV-Cache 从 DE buffer 经 H2D 写入 DE GPU 的一次性动作。</p>
 
-<p>关键时序：第 $k$ 层的 KV-Cache 加载与第 $k$ 层 attention 重叠；第 $k$ 层的 attention 与第 $k$ 层 FFN 重叠；第 $k$ 层 FFN 与第 $k+1$ 层的 KV-Cache 加载重叠。论文把这一流水称为「layer-wise streaming」（§4.1，3-7 步对每层重复）。</p>
+<p>关键时序：第 $k$ 层的 KV-Cache 加载/传输与相邻层的计算重叠（论文 §4.1 只给泛述「During the prefill forward pass, transfers overlap with computation」，未展开逐算子关系，此处不作更细的拆分）。论文把这一流水称为「layer-wise streaming」（§4.1，3-7 步对每层重复）。</p>
 
 <h3 id="de-read-path">2.3 DE read path（path B）</h3>
 
@@ -262,15 +262,15 @@
 
 <p><b>PE CNIC 读方向</b>（F-3）：PE 节点 CNIC 涉及两类入方向流量——PE path 步骤 (3)（PE DRAM buffer → CNIC）与步骤 (5)（PE GPU → PE CNIC）。两条流量合计 $2 T_p D g = \dfrac{2 B s}{g}$。要求 $\dfrac{2 B s}{g} \le B$，等价于 $s \le g/2$。论文原文此处写的是更宽松的 $s \le g$，并据此写「Since $s \le g$ always holds in practice」判断读方向无瓶颈；该条件与 eq.(1) 不一致、疑为原文笔误，原文照录、不据此改写结论。</p>
 
-<p><b>PE CNIC 写方向</b>（F-4）：PE CNIC 把 Layer Block 写入 PE GPU HBM（PE path 步骤 (4)，H2D），加上 DE 节点把 Layer Block 从 DE buffer 经 CNIC 经 RDMA 写入 PE 节点 CNIC（DE path 步骤 (5)），合计 $(T_p + T_c) D g = \dfrac{B s}{g}\left(1 + \dfrac{D}{P}\right)$。要求此式 $\le B$：</p>
+<p><b>PE CNIC 写方向</b>（F-4）：PE path 中 PE CNIC 把从存储读入的 Layer Block 写入 PE GPU HBM（PE path 步骤 (4)，H2D），加上 DE path 中 PE CNIC 把经 RDMA 从 DE 收到的 Layer Block 写入 PE GPU HBM（DE path 步骤 (5)，H2D），合计 $(T_p + T_c) D g = \dfrac{B s}{g}\left(1 + \dfrac{D}{P}\right)$。要求此式 $\le B$：</p>
 
 <p>$$\frac{P}{D} \ge \frac{s}{g - s} \quad \text{(F-5)}$$</p>
 
-<p><b>DE CNIC 读方向</b>（F-6）：DE 节点从 PE 节点 CNIC 经 RDMA 收 Layer Block（PE path 步骤 8），加上 DE path 步骤 (3)/(6) 的入方向。合计 $(T_p + 2 T_c) P g = \dfrac{s}{g}\left(\dfrac{P}{D} + 2\right) B$。要求 $\le B$：</p>
+<p><b>DE CNIC 读方向</b>（F-6）：DE CNIC 从 DE DRAM 读回 Layer Block（PE path 步骤 8，即 DE 侧一次性 H2D 的前半段），加上 DE path 步骤 (3)/(6) 的入方向。合计 $(T_p + 2 T_c) P g = \dfrac{s}{g}\left(\dfrac{P}{D} + 2\right) B$。要求 $\le B$：</p>
 
 <p>$$\frac{P}{D} \le \frac{g - 2 s}{s} \quad \text{(F-7)}$$</p>
 
-<p><b>DE CNIC 写方向</b>（F-8）：DE 节点从 DE buffer 经 CNIC 把 Layer Block 喂给 DE GPU（PE path 步骤 7/9 与 DE path 步骤 7），合计 $(2 T_p + T_c) P g$。要求 $\le B$：</p>
+<p><b>DE CNIC 写方向</b>（F-8）：DE CNIC 把 Layer Block 写入 DE DRAM（PE path 步骤 7）与写入 DE GPU（PE path 步骤 9、DE path 步骤 7），合计 $(2 T_p + T_c) P g$。要求 $\le B$：</p>
 
 <p>$$\frac{P}{D} \le \frac{g - s}{2 s} \quad \text{(F-9)}$$</p>
 
@@ -280,7 +280,7 @@
 
 <details>
 <summary>补充：从链路流量到不等式的关键中间步骤</summary>
-<p>以 PE CNIC 写方向为例：计入 F-4 的两类流量是 PE path 中 PE CNIC 把 Layer Block 写入 PE GPU HBM（PE path 步骤 4），以及 DE path 中 DE 节点经 DE CNIC 走 RDMA 把 Layer Block 写入 PE 节点 CNIC（DE path 步骤 5）。论文只计算 PCIe 侧压力，理由是 PCIe 侧的总流量始终大于或等于交换机方向的流量，因此算 PCIe 侧即构成上界（§4.2）。其他三个不等式采用相同处理，详细见 §4.2。</p>
+<p>以 PE CNIC 写方向为例：计入 F-4 的两类流量是 PE path 中 PE CNIC 把 Layer Block 写入 PE GPU HBM（PE path 步骤 4），以及 DE path 中 PE CNIC 把经 RDMA 从 DE 收到的 Layer Block 写入 PE GPU HBM（DE path 步骤 5）。论文只计算 PCIe 侧压力，理由是 PCIe 侧的总流量始终大于或等于交换机方向的流量，因此算 PCIe 侧即构成上界（§4.2）。其他三个不等式采用相同处理，详细见 §4.2。</p>
 </details>
 
 <h3 id="summary-range">3.3 汇总区间</h3>
@@ -569,16 +569,16 @@
 <li>1.87× 是相对 Basic，不是相对 Oracle</li>
 </ul>
 
-<p>把贯穿示例代入：DS 660B 离线实验最高（含 64K MAL 配置）1.87× over Basic 的加速意味着，把 1024 条含 hit token + miss token 的 trajectory 在同等硬件上从 $T$ 缩短到 $T/1.87$。cache-compute ratio 13-36 GB/PFLOP（DS V3.2 660B，Table 1）原本是 SNIC 单点饱和的量级；DualPath 把所有 6 个节点（2P4D）的 storage NIC 拉进加载后，每秒可加载的 KV-Cache 数据量从 Basic 的 2×400 Gbps（仅 PE 节点能加载）提升到 DualPath 的 6×400 Gbps（PE+DE 共 6 个节点都参与加载），I/O 等待时间相应缩短；DS 27B 1P1D 配置因总节点数仅 2 个，提升幅度受限。</p>
+<p>把贯穿示例代入：DS 660B 离线实验最高（含 64K MAL 配置）1.87× over Basic 的加速（取自该配置的 2048 agents 面板）意味着，把该面板的每条 trajectory 在同等硬件上从 $T$ 缩短到 $T/1.87$。cache-compute ratio 13-36 GB/PFLOP（DS V3.2 660B，Table 1）原本是 SNIC 单点饱和的量级；DualPath 把所有 6 个节点（2P4D）的 storage NIC 拉进加载后，每秒可加载的 KV-Cache 数据量从 Basic 的 2×400 Gbps（仅 PE 节点能加载）提升到 DualPath 的 6×400 Gbps（PE+DE 共 6 个节点都参与加载），I/O 等待时间相应缩短；DS 27B 1P1D 配置因总节点数仅 2 个，提升幅度受限。</p>
 
 <h3 id="append-gen">6.3 append / generation 长度敏感性</h3>
 
 <p>下图（图 9）把每轮的 append 长度按 1×/1.5×/2×/3× 缩放，同样缩放 generation 长度：</p>
 
 <p><img src="assets/img-08.png" alt="DS 660B 64K context 1024 agents 下，append 缩放 1×/1.5×/2×/3× 时 JCT 变化，Basic 随 append 变长逼近 Ours/Oracle，Ours 接近 Oracle 持平"></p>
-<p><b>图（原文 Figure 9）</b>：左：append 长度缩放。Basic 随 append 变长 JCT 显著下降，Ours 与 Oracle 几乎不变。物理含义：append 越长 prefill 的计算越多，I/O 压力被计算压力稀释，DualPath 相对 Basic 的优势收窄。右：generation 长度缩放。趋势类似——generation 越长 prefill 与 decode 的间隔越大，I/O 有更多时间错开，I/O 瓶颈被弱化。</p>
+<p><b>图（原文 Figure 9）</b>：左：append 长度缩放。Basic 随 append 变长 JCT 显著下降，Ours 与 Oracle 几乎不变。物理含义：append 越长 prefill 的计算越多，I/O 压力被计算压力稀释，DualPath 相对 Basic 的绝对 JCT 差距收窄（论文 §7.3 的加速比在不同 append 尺度上为 1.82-1.99×，并未单调收窄）。右：generation 长度缩放。趋势类似——generation 越长 prefill 与 decode 的间隔越大，I/O 有更多时间错开，I/O 瓶颈被弱化。</p>
 
-<p>论文 §7.3 给出的具体数字：1.82-1.99× 跨 append 缩放。Basic 在 append 3× 时相对 DualPath 的加速比收窄（读 Fig.9 估算约 1.85×），DualPath 仍明显领先；append 越长 prefill 的计算压力越大，I/O 主导减弱但 DualPath 仍未被反超——核心收益来自「I/O 主导」的负载场景。</p>
+<p>论文 §7.3 给出的具体数字：1.82-1.99× 跨 append 缩放。Basic 在 append 3× 时相对 DualPath 的绝对 JCT 差距收窄（读 Fig.9 估算约 1.9×），DualPath 仍明显领先；append 越长 prefill 的计算压力越大，I/O 主导减弱但 DualPath 仍未被反超——核心收益来自「I/O 主导」的负载场景。</p>
 
 <h3 id="pd-ratio">6.4 P/D 比例敏感性</h3>
 

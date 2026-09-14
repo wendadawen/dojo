@@ -206,7 +206,7 @@
 
         <rect x="60" y="222" width="640" height="56" rx="8" fill="var(--bg)" stroke="var(--border)"/>
         <foreignObject x="70" y="228" width="620" height="44">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.7 var(--font-mono);color:var(--text);text-align:center;">③ prep_xfer_dlist()：预建 descriptor 列表<br/><span style="color:var(--text-light)">addr[i] = base_addr + i × 1351680，len[i] = 1351680</span></div>
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11.5px/1.7 var(--font-mono);color:var(--text);text-align:center;">③ RoCE 网卡自动选路：创建 agent 前筛出 8 张数据面网卡<br/><span style="color:var(--text-light)">条件：RoCE v2 / IPv4 映射 GID / 网卡 IP 不等于管控 IP</span></div>
         </foreignObject>
       </svg>
       <figcaption>图 2：建连三层握手。控制面走 TCP，数据面（RoCE QP）在元数据交换后由 Mooncake 建立。</figcaption>
@@ -218,7 +218,7 @@
     <ol>
       <li><strong>双投递</strong>：proxy 把同一 request_id 分别发给 P（<code>max_tokens=1</code>）和 D（<code>max_tokens=64</code>）。</li>
       <li><strong>D 分配 block 并告知 P</strong>：362 个 token 需要 6 个 block（每 block 64 slot，$6\times64=384 \geq 362$），D 把 <code>block_ids</code> 经控制面发给 P——相当于告诉 P「写到我的哪几个块」。</li>
-      <li><strong>P prefill</strong>：ViT 把图像编码为 [340, 4096]，拼进文本得到 [362, 4096]，过 80 层语言骨干，每层把 K/V 写进 KV cache，实测 ttft 约 150 ms。</li>
+      <li><strong>P prefill</strong>：ViT 把图像编码为 [340, 4096]，拼进文本得到 [362, 4096]，过 80 层语言骨干，每层把 K/V 写进 KV cache，实测 ttft 约 150 ms（关闭前缀缓存；命中缓存时约 0.126 s，见下方时序表）。</li>
       <li><strong>入队发送</strong>：<code>save_kv_layer()</code> 把 block 放进发送队列。实测走 unified 模式——最后一层算完后一次发全部 block；layerwise 模式（设 <code>VLLM_PD_LAYERWISE_THRESHOLD</code>）可边算边传以隐藏延迟，未启用。</li>
       <li><strong>RDMA WRITE + decode</strong>：P 主动把 6 个 block 写进 D 的显存（descriptor 建链时已预建，请求时只做索引，这是传输能压到毫秒级的原因之一），D 收到完成通知后开始 decode。</li>
     </ol>
@@ -289,7 +289,7 @@
       <figcaption>图 3：block 内布局。K 半块与 V 半块各 66 行（64 行数据 + 2 行 scale 位），每半块 8448 B。</figcaption>
     </figure>
 
-    <p>实测速率（关闭前缀缓存，单 rank 传输 8110080 B）：热路径 4.4 ms（约 1.70 GB/s），冷路径 17.8 ms（约 0.42 GB/s）。日志沿用 GB/s 字样，基数实为 $2^{30}$（GiB）。第 3 节前缀缓存命中那次的 6.9 ms / 1.09 GB/s 同此口径，属另一次运行，条件不同，不与本节直接对比。</p>
+    <p>实测速率（关闭前缀缓存，单 rank 传输 8110080 B）：热路径 4.4 ms（约 1.70 GB/s），冷路径 17.8 ms（约 0.42 GB/s）。热路径指 RDMA 连接与显存映射已预热后的稳态传输、冷路径指该连接建立后的首次传输，两者字节数相同、差在是否已预热（此区分为推断）。日志沿用 GB/s 字样，基数实为 $2^{30}$（GiB）。第 3 节前缀缓存命中那次的 6.9 ms / 1.09 GB/s 同此口径，属另一次运行，条件不同，不与本节直接对比。</p>
 
     <h2>5. 异构可行的条件与脆弱性</h2>
 

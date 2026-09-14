@@ -96,7 +96,7 @@
       <tr><th>进程</th><th>持有的对象</th><th>职责</th></tr>
       <tr>
         <td>APIServer<br>（主进程）</td>
-        <td><code>AsyncLLM</code>、<code>EngineCoreClient</code>（实现类 <code>MPClient</code>）、<code>OutputProcessor</code>、<code>IncrementalDetokenizer</code>（按请求，由 <code>OutputProcessor</code> 持有）、多模态预处理</td>
+        <td><code>AsyncLLM</code>、<code>EngineCoreClient</code>（实现类 <code>AsyncMPClient</code>，<code>MPClient</code> 的子类）、<code>OutputProcessor</code>、<code>IncrementalDetokenizer</code>（按请求，由 <code>OutputProcessor</code> 持有）、多模态预处理</td>
         <td>接收 OpenAI 请求、渲染 prompt、发送请求、接收结果并返回用户</td>
       </tr>
       <tr>
@@ -108,7 +108,7 @@
     <p>两份进程 trace 印证这一划分：APIServer 侧只出现 core_client、output_processor、renderers 等模块，不含调度器与 worker；EngineCore 侧则是 scheduler、gpu_worker、gpu_model_runner。两个进程如何拼成完整引擎——入口、引擎、执行、模型、编译五层与跨层子系统的地图见<a href="../vllm-framework-map/index.html">vLLM 框架全景</a>。</p>
 
     <h2 id="loop">2. 忙等循环与回合结构</h2>
-    <p>EngineCore 进程的入口是 <code>run_busy_loop</code>，它以一个 while 循环交替执行两个动作：</p>
+    <p>EngineCore 进程的主循环是 <code>run_busy_loop</code>——进程由入口 <code>run_engine_core</code> 启动后台进程后进入该循环，循环用一个 while 交替执行两个动作：</p>
 <pre><code class="language-python">def run_busy_loop(self):
     while self._handle_shutdown():
         self._process_input_queue()   # 从输入队列收请求，无活时阻塞等待
@@ -231,7 +231,8 @@ return func(*args, **kwargs)
       <tr><td><code>EngineClient</code>（ABC）</td><td>"引擎客户端"的抽象接口，定义 <code>generate</code>、<code>encode</code>、<code>abort</code> 等能力。位于引擎代际无关的公共层</td></tr>
       <tr><td><code>AsyncLLM</code></td><td><code>EngineClient</code> 的唯一实现，V1 引擎的前端对象。收请求、发请求、收结果；内部持有 EngineCoreClient 与 OutputProcessor，并运行 output_handler 后台循环</td></tr>
       <tr><td><code>EngineCoreClient</code>（ABC）</td><td>"连接 EngineCore 的客户端"抽象。<code>EngineCoreClient</code> 与 <code>EngineClient</code> 是两个不同的接口：后者是引擎总接口，前者专指跨进程通信</td></tr>
-      <tr><td><code>MPClient</code></td><td><code>EngineCoreClient</code> 的 ZMQ 实现，实际部署使用的那个</td></tr>
+      <tr><td><code>MPClient</code></td><td><code>EngineCoreClient</code> 的 ZMQ 客户端抽象基类，自身不被直接实例化</td></tr>
+      <tr><td><code>AsyncMPClient</code></td><td><code>MPClient</code> 的异步子类，<code>AsyncLLM</code> 实际使用的实现（<code>make_async_mp_client</code> 返回它）；同步 / 离线侧对应 <code>SyncMPClient</code></td></tr>
       <tr><td><code>InprocClient</code></td><td><code>EngineCoreClient</code> 的同进程实现（不跨进程的场合）</td></tr>
     </table>
 
@@ -263,7 +264,7 @@ return func(*args, **kwargs)
       </foreignObject>
       <rect x="40" y="120" width="300" height="34" rx="6" fill="none" stroke="var(--blue)" stroke-width="1.2"/>
       <foreignObject x="40" y="127" width="300" height="20">
-        <div xmlns="http://www.w3.org/1999/xhtml" style="text-align:center; font-family:monospace; font-size:13px; line-height:20px; color:var(--text);">EngineCoreClient / MPClient</div>
+        <div xmlns="http://www.w3.org/1999/xhtml" style="text-align:center; font-family:monospace; font-size:13px; line-height:20px; color:var(--text);">EngineCoreClient / AsyncMPClient</div>
       </foreignObject>
       <rect x="40" y="330" width="300" height="34" rx="6" fill="none" stroke="var(--blue)" stroke-width="1.2"/>
       <foreignObject x="40" y="337" width="300" height="20">
@@ -342,7 +343,7 @@ return func(*args, **kwargs)
     <ul>
       <li><code>vllm/v1/engine/async_llm.py</code>：<code>AsyncLLM</code>、<code>_add_request</code>、<code>_run_output_handler</code></li>
       <li><code>vllm/engine/protocol.py</code>：<code>EngineClient</code></li>
-      <li><code>vllm/v1/engine/core_client.py</code>：<code>EngineCoreClient</code>、<code>InprocClient</code>、<code>MPClient</code></li>
+      <li><code>vllm/v1/engine/core_client.py</code>：<code>EngineCoreClient</code>、<code>InprocClient</code>、<code>MPClient</code>、<code>AsyncMPClient</code></li>
       <li><code>vllm/v1/engine/core.py</code>：<code>EngineCore</code>、<code>step</code>、<code>step_with_batch_queue</code>、<code>EngineCoreProc</code>、<code>run_busy_loop</code>、<code>_process_input_queue</code>、<code>_process_engine_step</code>、<code>_handle_shutdown</code>、<code>log_error_detail</code></li>
       <li><code>vllm/v1/engine/utils.py</code>：后端进程创建、<code>get_engine_zmq_addresses</code></li>
       <li><code>vllm/config/vllm.py</code>：<code>async_scheduling</code> 默认开启逻辑、v2 runner 名单、<code>_is_default_v2_model_runner_model</code></li>

@@ -171,9 +171,9 @@ $$T=\mathrm{arange}(n_t)\cdot\text{interval}+s,\qquad H=\mathrm{arange}(g_h/\tex
 <li>图像是单帧（$n_t=1$），$T$ 退化为常数 $s$；视频 $n_t&gt;1$ 时 $T$ 逐帧递增，与上表「视频 $t$ 逐帧递增」一行一致。</li>
 </ul>
 
-<p>跨模态衔接规则：每个模态的位置编号从前一模态最大位置 id 加一开始<sup>[C7]</sup>。视觉 token 的最大位置 id 是 $s+\max(g_h,g_w)/\text{merge}-1$，因此「加一」等价于图像块结束后位置轴推进 $\max(g_h,g_w)/\text{merge}$——这条规则的两面在「位置轴上的省账」一章展开。</p>
+<p>跨模态衔接规则：每个模态的位置编号从前一模态最大位置 id 加一开始<sup>[C7]</sup>。视觉 token 的最大位置 id 是 $\max\big((n_t-1)\cdot\text{interval},\; g_h/\text{merge}-1,\; g_w/\text{merge}-1\big)+s$；图像是单帧网格（$n_t=1$，$t$ 恒为起始值 $s$），最大位置 id 化简为 $s+\max(g_h,g_w)/\text{merge}-1$，因此对图像块「加一」等价于位置轴推进 $\max(g_h,g_w)/\text{merge}$。这条规则的两面在「位置轴上的省账」一章展开。</p>
 
-<p>构造示例。 序列 = 8 个文本 token + 一张 $(1,28,28)$ 的图（196 个视觉 token）+ 5 个文本 token。视觉段 $\text{merge}=2$ 后网格为 $14\times14$：</p>
+<p>构造数据。序列 = 8 个文本 token + 一张 $(1,28,28)$ 的图（196 个视觉 token）+ 5 个文本 token。视觉段 $\text{merge}=2$ 后网格为 $14\times14$：</p>
 
 <div class="table-scroll">
 <table>
@@ -275,7 +275,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 </table>
 </div>
 
-<p>三个分量以 3 为步长在全部 32 个槽位上循环，$T$ 与 $H$ 从最高频槽位铺到最低频、$W$ 的槽位从 2 到 29 也近似覆盖整个范围（不含两端点）；$W$ 比 $T$ 和 $H$ 少一个槽位，因为 32 不能被 3 整除。源码文档字符串说明了改动内容：从分段的 $[TTT\ldots HHH\ldots WWW]$ 改为交错的 $[THWTHW\ldots]$，并保持频率连续性。</p>
+<p>三个分量以 3 为步长在全部 32 个槽位上循环，$T$ 与 $H$ 合起来从最高频槽位铺到最低频（$T$ 落在 $0,3,\ldots,30$，$H$ 落在 $1,4,\ldots,31$，两者各自都不单独覆盖两端点）、$W$ 的槽位从 2 到 29 也近似覆盖整个范围（不含两端点）；$W$ 比 $T$ 和 $H$ 少一个槽位，因为 32 不能被 3 整除。源码文档字符串说明了改动内容：从分段的 $[TTT\ldots HHH\ldots WWW]$ 改为交错的 $[THWTHW\ldots]$，并保持频率连续性。</p>
 
 <p>分段排布（qwen2_vl 一系实现）是另一种分法：把 cos/sin 沿维度切成三段，每段独占。以 Qwen2-VL 官方模型配置（Qwen2-VL-7B 的 config.json，rope_scaling.mrope_section）为例：mrope_section $=[16,24,24]$，频率槽位共 64 个，三者在槽位轴上分别为 $T[0,15]$、$H[16,39]$、$W[40,63]$（对应 cos/sin 维度 $T[0,31]$、$H[32,79]$、$W[80,127]$）。源码写法是 <code>mrope_section*2</code> 得 $[32,48,48]$ 后按 <code>i%3</code> 取段<sup>[C8]</sup>。</p>
 
@@ -306,7 +306,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 
 <h2 id="position-budget">4. 位置轴上的省账——推进量与长序列外推</h2>
 
-<p>回到「位置 id 变三元组」一章结尾的数字：196 个视觉 token 只让位置轴前进 14。规则是图像块结束后位置轴推进 $\max(g_h,g_w)/\text{merge}$，而非推进 token 数<sup>[C10]</sup>。规模越大省得越多（下表为本机实测<sup>[N3, N4]</sup>）：</p>
+<p>回到「位置 id 变三元组」一章结尾的数字：196 个视觉 token 只让位置轴前进 14。规则是图像块结束后位置轴推进 $\max(g_h,g_w)/\text{merge}$，而非推进 token 数<sup>[C10]</sup>。省账的比值恒为 $\min(g_h,g_w)/\text{merge}$，短边越长省得越多（下表为本机实测<sup>[N3, N4]</sup>）：</p>
 
 <div class="table-scroll">
 <table>
@@ -324,7 +324,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
 
 <p>论文把这归为 MRoPE 的实际收益：M-RoPE 降低了图像与视频的位置 id 取值，使模型能在推理时外推到更长序列<sup>[C6]</sup>。两个支撑数字<sup>[N1, N2]</sup>：其一，Qwen2-1.5B + ViT-L 骨干的消融显示 M-RoPE 在多数基准上优于 1D-RoPE、视频基准提升最明显（如 NextQA 46.0 对 43.9、STAR 57.9 对 55.5；个别基准如 RealWorldQA、InfoVQA 小幅下降），论文的措辞是「更好的整体表现，尤其视频基准」；其二，训练时每个视频最多 16K token，推理到 80K token 仍保持性能（Figure 5 语境为 Qwen2-VL-72B 在 Video-MME 中等时长视频）。</p>
 
-<p>回到贯穿示例收尾：8 个文本 + 一张 $(1,28,28)$ 图 + 5 个文本的序列，token 数 209，而位置轴只用到 $22+5-1=26$。若把这张图换成 $(1,84,84)$，token 数变 1777，位置轴仍是 $8+42+5-1=54$——序列长度大幅增加，位置轴几乎没动。token 数与位置轴范围由此解耦。Qwen3.8-Flash-Next 的完整配置与上下文占比实测见<a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>。Qwen3.5-397B-A17B 的 MRoPE 配置与此逐项相同（rotary_dim 64、mrope_section $[11,11,10]$、$\theta=10^7$），其视觉 token 位置推进与长上下文开销见<a href="../qwen3-5-dataflow/index.html">Qwen3.5-397B-A17B 前向数据流</a>。</p>
+<p>回到贯穿示例收尾：8 个文本 + 一张 $(1,28,28)$ 图 + 5 个文本的序列，token 数 209，而位置轴只用到 $22+5-1=26$。若把这张图换成 $(1,84,84)$，token 数变 1777，位置轴增至 $8+42+5-1=54$——序列长度约为原来的 8.5 倍，位置轴只增到约两倍。token 数与位置轴范围由此解耦。Qwen3.8-Flash-Next 的完整配置与上下文占比实测见<a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>。Qwen3.5-397B-A17B 的 MRoPE 配置与此逐项相同（rotary_dim 64、mrope_section $[11,11,10]$、$\theta=10^7$），其视觉 token 位置推进与长上下文开销见<a href="../qwen3-5-dataflow/index.html">Qwen3.5-397B-A17B 前向数据流</a>。</p>
 
 <h3 id="position-budget-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -332,7 +332,7 @@ grid (1,66,120): 1980 个 token, 推进 60</code></pre>
     <p>「前一模态最大位置 id 加一」和「推进 $\max(g_h,g_w)/\text{merge}$」是什么关系？</p>
     <details>
       <summary>解答：同一规则的两种表述</summary>
-      <p>视觉 token 的高、宽分量各自从起始值 $s$ 遍历到 $s+g_h/\text{merge}-1$ 与 $s+g_w/\text{merge}-1$，时间分量恒为 $s$，因此块内最大位置 id 是 $s+\max(g_h,g_w)/\text{merge}-1$；「下一个模态从最大 id 加一开始」即从 $s+\max(g_h,g_w)/\text{merge}$ 开始。论文用前一种表述，实现源码算后一种，数值相同。</p>
+      <p>视觉 token 的高、宽分量各自从起始值 $s$ 遍历到 $s+g_h/\text{merge}-1$ 与 $s+g_w/\text{merge}-1$；图像是单帧网格（$n_t=1$），时间分量恒为 $s$，块内最大位置 id 是 $s+\max(g_h,g_w)/\text{merge}-1$。视频 $n_t>1$ 时时间分量取到 $s+(n_t-1)\cdot\text{interval}$，最大位置 id 由三个分量的最大值决定，「下一个模态从最大 id 加一开始」即从该最大值加一开始；图像块下也就是从 $s+\max(g_h,g_w)/\text{merge}$ 开始。论文与实现都按「最大位置 id 加一」定义衔接，两种写法数值一致。</p>
     </details>
   </li>
   <li>
