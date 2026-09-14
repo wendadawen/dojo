@@ -149,7 +149,7 @@
       <p>两个任务共享一张 GPU 时，stream 优先级、MPS、MIG、Green Context 各自能做什么、不能做什么？</p>
       <details>
         <summary>解答：四种机制都缺运行期细粒度重分配</summary>
-        <p>stream 优先级只是"下一个空位给谁"的提示，不抢占已运行的 kernel；MPS 让多进程 kernel 真并发，动态限额不预留专用资源，要独占 SM 须在客户端创建上下文前配置静态分区；MIG 提供硬件级隔离，但只有固定档位、改配置要停负载；Green Context 在进程内按 SM 圈地，但分区创建后固定。四种机制没有一种能在 kernel 运行期间以微秒级粒度重新分配 SM。完整论证见「6. 分一张卡的四种机制——能力边界对照」。</p>
+        <p>stream 优先级只是"下一个空位给谁"的提示，不抢占已运行的 kernel；MPS 让多进程 kernel 真并发，动态限额不预留专用资源，要独占 SM 须在客户端创建上下文前配置静态分区（CUDA 13.1 引入）；MIG 提供硬件级隔离，但只有固定档位、改配置要停负载；Green Context 在进程内按 SM 圈地，但分区创建后固定。四种机制没有一种能在 kernel 运行期间以微秒级粒度重新分配 SM。完整论证见「6. 分一张卡的四种机制——能力边界对照」。</p>
       </details>
     </li>
   </ol>
@@ -498,7 +498,7 @@ $$C[i][j] = \sum_{k=1}^{K} A[i][k] \cdot B[k][j]$$
 
 <h3 id="sharing-mps">6.2 MPS：多进程真并发，动态限额不预留资源</h3>
 
-<p><strong>MPS</strong>（Multi-Process Service）让多个操作系统进程（各自独立的程序）的 kernel 在同一张卡上真正并发执行 <sup>[C12]</sup>。它有两套资源机制，作用不同。一套是<strong>动态资源供应</strong>（resource provisioning）：给每个客户端设资源限额，官方文档明确，这种限额「<strong>不为任何客户端预留专用资源</strong>，只是限制它最多能用多少」，而且「不同客户端的 kernel 可能执行在同一块 SM 上，取决于负载均衡」<sup>[C12]</sup>。另一套是<strong>静态 SM 分区</strong>（static SM partitioning）：在客户端创建上下文之前，把 SM 划分成各客户端独占的分区，该模式在 Ampere 及更新的架构（含 Hopper）上支持；自 r610 驱动起，静态分区模式下还可获得部分错误隔离（驱动可将 SM 的错误状态归属到出错的分区或客户端）；分区内的 SM「保持为该分区所分配的客户端独占，其他客户端不能自动借用其中空闲的 SM」，而且分区在使用期间不能移除 <sup>[C12]</sup>。所以「不为客户端预留专用资源」只对动态限额这一套成立；MPS 默认形态是多进程共用 SM，允许「可以挤在一起」，只有事先显式配置静态分区才谈得上「各自圈地」。即便分区，干扰（缓存竞争、SM 争抢）依旧存在。</p>
+<p><strong>MPS</strong>（Multi-Process Service）让多个操作系统进程（各自独立的程序）的 kernel 在同一张卡上真正并发执行 <sup>[C12]</sup>。它有两套资源机制，作用不同。一套是<strong>动态资源供应</strong>（resource provisioning）：给每个客户端设资源限额，官方文档明确，这种限额「<strong>不为任何客户端预留专用资源</strong>，只是限制它最多能用多少」，而且「不同客户端的 kernel 可能执行在同一块 SM 上，取决于负载均衡」<sup>[C12]</sup>。另一套是<strong>静态 SM 分区</strong>（static SM partitioning）：这是 CUDA 13.1 才引入的特性（由 MPS 控制守护进程的 <code>-S/--static-partitioning</code> 开关开启，CUDA 12.x 驱动识别不了该开关），开启后在客户端创建上下文之前，把 SM 划分成各客户端独占的分区，该模式在 Ampere 及更新的架构（含 Hopper）上支持；自 r610 驱动起，静态分区模式下还可获得部分错误隔离（驱动可将 SM 的错误状态归属到出错的分区或客户端）；分区内的 SM「保持为该分区所分配的客户端独占，其他客户端不能自动借用其中空闲的 SM」，而且分区在使用期间不能移除 <sup>[C12]</sup>。所以「不为客户端预留专用资源」只对动态限额这一套成立；MPS 默认形态是多进程共用 SM，允许「可以挤在一起」，只有事先显式配置静态分区才谈得上「各自圈地」。即便分区，干扰（缓存竞争、SM 争抢）依旧存在。</p>
 
 <h3 id="sharing-mig">6.3 MIG：硬件级隔离，但档位固定、改配置要停负载</h3>
 
@@ -534,7 +534,7 @@ $$C[i][j] = \sum_{k=1}^{K} A[i][k] \cdot B[k][j]$$
 <thead><tr><th>机制</th><th>切分对象</th><th>粒度</th><th>运行期可否改变</th><th>关键短板</th></tr></thead>
 <tbody>
 <tr><td>stream 优先级 <sup>[C11]</sup></td><td>什么都不切，只是调度提示</td><td>单个 kernel 的先后</td><td>随时</td><td>不抢占已运行的 kernel，不保证顺序</td></tr>
-<tr><td>MPS <sup>[C12]</sup></td><td>多进程并发执行（另有静态 SM 分区）</td><td>进程级；限额是上限</td><td>限额可调整；静态分区须在客户端创建前配置</td><td>动态限额不预留资源，kernel 可落同一 SM</td></tr>
+<tr><td>MPS <sup>[C12]</sup></td><td>多进程并发执行（另有静态 SM 分区，CUDA 13.1 引入）</td><td>进程级；限额是上限</td><td>限额可调整；静态分区须在客户端创建前配置</td><td>动态限额不预留资源，kernel 可落同一 SM</td></tr>
 <tr><td>MIG <sup>[C13]</sup></td><td>硬件级实例（SM+显存+缓存）</td><td>固定七档</td><td>改配置需停负载</td><td>档位粗，无时间复用</td></tr>
 <tr><td>Green Context <sup>[C14]</sup></td><td>进程内 SM 空间分区</td><td>8 的倍数、最小 8 SM</td><td>创建后固定</td><td>kernel 期间不可重配置，无并发/前进保证</td></tr>
 </tbody>
@@ -543,9 +543,9 @@ $$C[i][j] = \sum_{k=1}^{K} A[i][k] \cdot B[k][j]$$
 
 <p>把四行合起来，得到一个<strong>本页归纳</strong>（各分句均有官方来源，合取为推断）<sup>[C16]</sup>：四种机制中没有任何一种能在一个 kernel 运行期间，以微秒级粒度重新分配 SM。优先级不抢占；MPS 动态限额不预留资源、静态分区须提前配置且创建后固定；MIG 和 Green Context 都是空间切分、改起来要停负载或重建上下文。于是共享一张卡只剩两个极端：要么切死（空间固定分区，闲时浪费），要么等（长 kernel 挡短 kernel，队头阻塞）。</p>
 
-<p>这个空位正是「tile 级调度」要补的：如果 kernel 自身被设计成能在 tile 边界让出 SM（第 3 章的刻度），调度粒度就从「整个 kernel」细化到「一个 tile」——ExpertPlex 的 APK 走的就是这条路，具体机制在论文解析页展开。</p>
+<p>这个空位正是「tile 级调度」要补的：如果 kernel 自身被设计成能在 tile 边界让出 SM（第 3 章的刻度），调度粒度就从「整个 kernel」细化到「一个 tile」——ExpertPlex 的自适应常驻内核（Adaptive Persistent Kernel，APK）走的就是这条路，具体机制在论文解析页展开。</p>
 
-<p>本章数字以 H100（Hopper）与 CUDA 12.x 文档为准；跨代际数字（SM 数、分区粒度、MIG 档位）会变，但「无运行期细粒度重分配」这一结构性结论在现有代际上均成立。</p>
+<p>本章数字以 H100（Hopper）与 CUDA 12.x–13.x 文档为准（MPS 静态 SM 分区一项为 CUDA 13.1 引入，超出 12.x 范围，且需 r610 及更新驱动）；跨代际数字（SM 数、分区粒度、MIG 档位）会变，但「无运行期细粒度重分配」这一结构性结论在现有代际上均成立。</p>
 
 <h3 id="sharing-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -575,7 +575,7 @@ $$C[i][j] = \sum_{k=1}^{K} A[i][k] \cdot B[k][j]$$
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>[C1] CUDA C++ Programming Guide，Programming Model / Thread Hierarchy（CTA $\le 1024$ 线程、CTA 驻留单 SM）。 [C2] 同指南 Hardware Multithreading / SIMT（warp=32）；Hopper 每 SM 最多 64 warp 见 Hopper Tuning Guide §1.4.1.1 Occupancy。 [C3] 编程模型语义（CTA 运行至完成）；用户不可抢占由 [C11] 官方语义反推。 [C4] CUDA C++ Programming Guide，Asynchronous Concurrent Execution / Streams。 [C5] NVIDIA H100 Tensor Core GPU Architecture White Paper 及 NVIDIA Hopper Architecture In-Depth（developer.nvidia.com）：132 SM、每 SM 4 个第四代 Tensor Core、50MB L2、80GB HBM3 @ 3.35 TB/s。 [C6][C7][C8][C9] NVIDIA Hopper Tuning Guide §1.4.1.1–§1.4.1.3（228KB/227KB shared memory；TMA 异步拷贝；cluster 上限 8、H100 opt-in 16、占用率代价；warp specialization）。 [C10] CUDA C++ Programming Guide，CUDA Graphs。 [C11] CUDA Driver API，cuStreamCreateWithPriority 描述原文。 [C12] NVIDIA MPS 官方文档：动态资源供应（Execution Resource Provisioning）一节（「不预留专用资源」「不同客户端 kernel 可落同一 SM」）；静态 SM 分区（Static SM Partitioning）一节（Ampere 及更新架构；在客户端创建上下文前划分独占 SM 分区，使用期间不能移除，其他客户端不能自动借用分区内空闲 SM；自 r610 驱动起提供部分错误隔离）。 [C13] NVIDIA MIG User Guide 及 NVIDIA vGPU 参考文档 H100 SXM5 表（七档 profile 含 1g.10gb+me 与实例数；改配置需 GPU 空闲）。 [C14] CUDA Driver API，§Green Contexts（CUDA 12.4+；CC 9.0+ 最小 8、8 的倍数；不保证并发与前进；创建时固定）。 [C15] H100 白皮书（8 GPC 结构）+ Programming Guide（cluster 共同调度）。 [C16] 本页归纳：由 [C11][C12][C13][C14] 合取，正文已标注为推断。 [C17] CUDA C++ Programming Guide，Thread Block Clusters（TMA 可将数据从全局内存组播到 cluster 内多个 block 的 shared memory）。</p>
+<p>[C1] CUDA C++ Programming Guide，Programming Model / Thread Hierarchy（CTA $\le 1024$ 线程、CTA 驻留单 SM）。 [C2] 同指南 Hardware Multithreading / SIMT（warp=32）；Hopper 每 SM 最多 64 warp 见 Hopper Tuning Guide §1.4.1.1 Occupancy。 [C3] 编程模型语义（CTA 运行至完成）；用户不可抢占由 [C11] 官方语义反推。 [C4] CUDA C++ Programming Guide，Asynchronous Concurrent Execution / Streams。 [C5] NVIDIA H100 Tensor Core GPU Architecture White Paper 及 NVIDIA Hopper Architecture In-Depth（developer.nvidia.com）：132 SM、每 SM 4 个第四代 Tensor Core、50MB L2、80GB HBM3；其中 3.35 TB/s 的带宽以 H100 白皮书 / 官方规格页为准（In-Depth 博客记作 3 TB/sec）。 [C6][C7][C8][C9] NVIDIA Hopper Tuning Guide §1.4.1.1–§1.4.1.3（228KB/227KB shared memory；TMA 异步拷贝；cluster 上限 8、H100 opt-in 16、占用率代价；warp specialization）。 [C10] CUDA C++ Programming Guide，CUDA Graphs。 [C11] CUDA Driver API，cuStreamCreateWithPriority 描述原文。 [C12] NVIDIA MPS 官方文档：动态资源供应（Execution Resource Provisioning）一节（「不预留专用资源」「不同客户端 kernel 可落同一 SM」）；静态 SM 分区（Static SM Partitioning）一节（CUDA 13.1 引入，由 MPS 控制守护进程 -S/--static-partitioning 开关开启，CUDA 12.x 驱动不支持；Ampere 及更新架构；在客户端创建上下文前划分独占 SM 分区，使用期间不能移除，其他客户端不能自动借用分区内空闲 SM；自 r610 驱动起提供部分错误隔离）。 [C13] NVIDIA MIG User Guide 及 NVIDIA vGPU 参考文档 H100 SXM5 表（七档 profile 含 1g.10gb+me 与实例数；改配置需 GPU 空闲）。 [C14] CUDA Driver API，§Green Contexts（CUDA 12.4+；CC 9.0+ 最小 8、8 的倍数；不保证并发与前进；创建时固定）。 [C15] H100 白皮书（8 GPC 结构）+ Programming Guide（cluster 共同调度）。 [C16] 本页归纳：由 [C11][C12][C13][C14] 合取，正文已标注为推断。 [C17] CUDA C++ Programming Guide，Thread Block Clusters（TMA 可将数据从全局内存组播到 cluster 内多个 block 的 shared memory）。</p>
 
 <h3>公式与来源（F）</h3>
 <p>[F1] tile 化 GEMM 的读取计数（每元素被读 $N/T$ 次）：标准教材推导（如 Kirk &amp; Hwu《Programming Massively Parallel Processors》tiled GEMM 章的同款推导）；本页按教学推导处理，$4\times4$ 例子在正文与折叠块中可完整复算。</p>

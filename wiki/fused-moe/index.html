@@ -73,7 +73,7 @@
       <p>MoE 层的专家计算为什么不能靠"每个专家一次普通 GEMM"的循环来做？</p>
       <details>
         <summary>解答：三重浪费——小 GEMM 铺不满、调度边界多、数据搬运多</summary>
-        <p>逐专家循环把本该一起调度的计算切成 $E$ 份独立的小 GEMM：每份的 token 行数极少，tile 的行维利用率低、单个专家的 tile 数常常少于 SM 数；专家之间的活被内核边界隔开，启动次数随专家数线性增长；gather 与 scatter 还带来额外的数据搬运。decode 批量越小、专家数越多，三重浪费越大。融合路径把全部专家的 tile 放进同一个网格，三个来源同时消除。完整论证见「1. 朴素实现的问题」一章。</p>
+        <p>逐专家循环把本该一起调度的计算切成 $E$ 份独立的小 GEMM：每份的 token 行数极少，tile 的行维利用率低、单个专家的 tile 数常常少于 SM 数；专家之间的活被内核边界隔开，启动次数随非空专家数增长、上界为专家总数 $E$；gather 与 scatter 还带来额外的数据搬运。decode 批量越小、专家数越多，三重浪费越大。融合路径把全部专家的 tile 放进同一个网格，三个来源同时消除。完整论证见「1. 朴素实现的问题」一章。</p>
       </details>
     </li>
     <li>
@@ -144,7 +144,7 @@
 
 <p><b>第一个来源：小 GEMM 喂不满计算单元。</b>GEMM 把输出矩阵切成 tile，由 SM 并行计算，tile 的行数（BLOCK_SIZE_M）是任务并行度与张量核效率的来源之一，见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型与 kernel 调度</a>。逐专家循环把 $M\cdot k$ 行切到 $E$ 个专家头上：开头场景里 64 行摊给 256 个专家，多数专家拿到零或一行。行数为一两行的矩阵乘退化成 GEMV，一个按 16 行设计的 tile 只装着 2 行有效数据，其余行的算力被白白烧掉；而且单个专家的那份 GEMM 的 tile 总数常常不足 SM 数量，调用期间部分 SM 从头到尾空闲——它们本可以去算别的专家的活，但那些活在下一个内核里。</p>
 
-<p><b>第二个来源：调度边界随专家数线性增多。</b>循环体里每个专家要经历 gather、两次 GEMM、激活、scatter 多次内核启动，次数随 $E$ 线性增长；$E$ 为 256 时一个 MoE 层一次前向就要发起上千次调用。每次启动有固定的提交与同步开销，decode 每个 step、每层都要重复一遍。融合路径把这些步骤收敛为固定个位数次调用：路由一次、对齐一次、两次 GEMM、激活一次、求和一次，不再随专家数变化<sup>[C5, C13]</sup>。</p>
+<p><b>第二个来源：调度边界随非空专家数增多。</b>循环体里每个分到槽位的专家要经历 gather、两次 GEMM、激活、scatter 多次内核启动，启动次数随非空专家数增长、上界为专家总数 $E$；开头场景里 64 个槽位摊到约 57 个专家上，一次前向要发起上百次调用，只有当批量大到几乎所有专家都分到槽位时（如 prefill）才会累计到上千次。每次启动有固定的提交与同步开销，decode 每个 step、每层都要重复一遍。融合路径把这些步骤收敛为固定个位数次调用：路由一次、对齐一次、两次 GEMM、激活一次、求和一次，不再随专家数变化<sup>[C5, C13]</sup>。</p>
 
 <p><b>第三个来源：数据搬运。</b>gather 先把散落的 token 行复制成每个专家自己的连续输入，scatter 再把各专家的结果写回原位；每个专家的中间结果也要先落到自己的缓冲再被读出。融合路径里 token 行不搬家——内核通过索引数组直接定位到原始 hidden_states 的行；中间结果按槽位写入一块统一缓冲，紧接着被第二次 GEMM 按同样的槽位读走。</p>
 
@@ -158,7 +158,7 @@
     <p>朴素逐专家循环的三个浪费来源分别是什么？各自与 GPU 执行模型的哪个事实相关？</p>
     <details>
       <summary>解答：形状退化、调度边界、数据搬运</summary>
-      <p>来源一是形状退化：行数被切到每个专家头上后极少，tile 行维利用率低，且单个专家 GEMM 的 tile 数常少于 SM 数，调用期间部分 SM 空闲——对应"GEMM 按 tile 由 SM 并行计算"的事实。来源二是调度边界：每个专家多次内核启动，次数随 $E$ 线性增长，启动开销串行累积——对应"内核启动有固定开销"的事实。来源三是数据搬运：gather/scatter 与逐专家中间缓冲带来额外访存——token 行本可以直接由索引定位。三者叠加，decode 批量越小浪费越大。</p>
+      <p>来源一是形状退化：行数被切到每个专家头上后极少，tile 行维利用率低，且单个专家 GEMM 的 tile 数常少于 SM 数，调用期间部分 SM 空闲——对应"GEMM 按 tile 由 SM 并行计算"的事实。来源二是调度边界：每个分到槽位的专家多次内核启动，次数随非空专家数增长（上界为专家总数 $E$），启动开销串行累积——对应"内核启动有固定开销"的事实。来源三是数据搬运：gather/scatter 与逐专家中间缓冲带来额外访存——token 行本可以直接由索引定位。三者叠加，decode 批量越小浪费越大。</p>
     </details>
   </li>
   <li>
@@ -301,7 +301,7 @@ $$\text{max\_num\_tokens\_padded} \;=\; M\cdot k \;+\; E\times(B_M-1)$$
 
 <p>vLLM 的融合 MoE 计算由 Triton 内核 fused_moe_kernel 完成<sup>[C1]</sup>。它的矩阵语义：输入 $A$ 是形状 $(*, K)$ 的 token 矩阵，$B$ 是形状 $(E, N, K)$ 的堆叠专家权重，输出 $C$ 形状 $(M, k, N)$；一次调用覆盖全部专家<sup>[C2]</sup>。理解它只需要"一个 program 负责一个 tile"的执行模型（见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型与 kernel 调度</a>）。</p>
 
-<p>网格沿两个维度展开：$\lceil EM/B_M\rceil\times\lceil N/B_N\rceil$，其中 $EM$ 取 sorted_token_ids 的分配长度（按 F1 上界预留，示例 A 为 12），$N$ 是本次 GEMM 的输出宽度<sup>[C7]</sup>。每个 program 负责一个 $(B_M, B_N)$ 的输出 tile；网格里相邻的 M 块按 GROUP_SIZE_M 分组排列，让同组的 program 尽量同时在跑，以提高权重 tile 在 L2 中的复用<sup>[C7]</sup>。$B_M$ 的取值由配置决定，默认随批量增大从 16 到 128<sup>[N1]</sup>。请注意 $EM$ 是分配长度而非 num_tokens_post_padded：构造示例 A 中前者 12、后者 10，网格据此覆盖 6 个 M 块，末尾块因超出有效长度被前序检查直接返回。</p>
+<p>网格沿两个维度展开：$\lceil EM/B_M\rceil\times\lceil N/B_N\rceil$，其中 $EM$ 取 sorted_token_ids 的分配长度（按 F1 上界预留，示例 A 为 12），$N$ 是本次 GEMM 的输出宽度<sup>[C7]</sup>。每个 program 负责一个 $(B_M, B_N)$ 的输出 tile；网格里相邻的 M 块按 GROUP_SIZE_M 分组排列，让同组的 program 尽量同时在跑，以提高权重 tile 在 L2 中的复用<sup>[C7]</sup>。$B_M$ 的取值由配置决定，默认随批量增大从 16 到 128<sup>[N1]</sup>。$EM$ 是分配长度、num_tokens_post_padded 是有效长度，二者不同：构造示例 A 中前者 12、后者 10，网格据此覆盖 6 个 M 块，末尾块因超出有效长度被前序检查直接返回。</p>
 
 <p>program 内部的索引是本页的核心机制。对第 $b$ 个块（专家 $e=\text{expert\_ids}[b]$）中的第 $r$ 行，令槽位 $s=\text{sorted\_token\_ids}[b\cdot B_M+r]$，该 program 计算的输出元素是</p>
 
@@ -702,7 +702,7 @@ y_t3  fused=[2.8186, 0.7046]  naive=[2.8186, 0.7046]
 
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
-<h3>核心论断与来源</h3>
+<h3>论断与来源（C）</h3>
 <ul>
 <li>C1–C2（模块命名、内核矩阵语义）：vLLM v0.28.0（commit 2cf0a69，N2）vllm/model_executor/layers/fused_moe/fused_moe.py L3、L298–299、L356–375（内核 docstring）。</li>
 <li>C3–C4（三数组语义与排序填充目的）：同文件 L421；moe_align_block_size.py L48–72（Returns 与 Example）、L54–57；fused_moe.py L379–383。</li>
@@ -712,13 +712,13 @@ y_t3  fused=[2.8186, 0.7046]  naive=[2.8186, 0.7046]
 <li>C10（EP 写零）：fused_moe.py L423–440；moe_align_block_size.py L23–27。</li>
 <li>C11（调优配置查找）：fused_moe.py L1089–1166、L1159–1166。</li>
 <li>C12（层组成与 TP 切分）：v0.28.0 layer.py L149–161；v0.10.2 layer.py L741。</li>
-<li>C13（topk_softmax）：v0.28.0 router/fused_topk_router.py L31–44；CUDA 内核在 v0.28.0 位于 csrc/libtorch_stable/moe/topk_softmax_kernels.cu（v0.10.2 位于 csrc/moe/topk_softmax_kernels.cu），文件头 L1–2 "Adapted from TensorRT-LLM v0.7.1"、L531–560（张量形状注释）。</li>
+<li>C13（topk_softmax）：v0.28.0 router/fused_topk_router.py L31–44；CUDA 内核在 v0.28.0 位于 csrc/libtorch_stable/moe/topk_softmax_kernels.cu（v0.10.2 位于 csrc/moe/topk_softmax_kernels.cu），文件头 L1–2 "Adapted from TensorRT-LLM v0.7.1"、张量形状注释见同文件 L826 与 L864–866。</li>
 <li>C14（跳过对齐路径）：fused_moe.py L1552–1584。</li>
 <li>C15（缓存复用）：fused_moe.py L1733–1741。</li>
 <li>C16（MegaBlocks 动机）：Gale 等，MegaBlocks: Efficient Sparse Training with Mixture-of-Experts，arXiv:2211.15841 摘要。</li>
 </ul>
 
-<h3>核心公式与来源</h3>
+<h3>公式与来源（F）</h3>
 <ul>
 <li>F1（填充上界）：moe_align_block_size.py L74，默认分支。</li>
 <li>F2（tile 索引公式）：由 fused_moe.py L408–479 指针运算与 L1740–1751 缓存形状推导；正文可运行代码逐元素验证。</li>

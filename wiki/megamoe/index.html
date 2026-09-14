@@ -462,7 +462,7 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)</code></pr
 
 <p>数据缓冲是环形的：L1/L2 的输入输出都在一个固定容量的缓冲里循环复用，每块配一对 full/empty 计数器——生产者写完加 full，消费者用完加 empty，下一轮使用者自旋等待计数到位<sup>[C19]</sup>。L1 的输出缓冲和 L2 的输入缓冲是同一块内存——SwiGLU 把宽度从 $2d$ 减半到 $d$，正好原地容纳<sup>[C13]</sup>。</p>
 
-<p>tile 大小不是拍脑袋定的。配置启发式按"每专家期望 token 数"分档选择 block_m：</p>
+<p>tile 大小由配置启发式决定，按"每专家期望 token 数"分档选择 block_m：</p>
 
 $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}{E},$$
 
@@ -611,7 +611,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 
 <details>
 <summary>补充：X-Stage 论文对调度的再分析与"expert wave"术语</summary>
-<p>第三方论文 X-Stage（arXiv:2607.23264）分析 Mega MoE 时把"本地专家按组分批执行"的组织方式称为 expert wave（专家波）：一个波先做它的 Linear-1，再做激活与 Linear-2，然后进入下一波；不同波的 Linear-1 之间没有神经网络依赖，理论上前一波的远程写回没完成时，后一波的 Linear-1 就可以开始<sup>[C20, C25]</sup>。需要说明：官方源码里没有"expert wave"这个词，调度单元是 task（四相 BlockPhase）与 L1 预热/交替发布，"wave"是论文对这种分批结构的描述用语<sup>[C20]</sup>。该论文还发现：把发布的时间线当作"Combine 是一段完整通信"会低估加速（保守估计上限约 1.5 倍，低于实测 1.56 倍），因为发出远程写后发送方可以继续干活；据此它提出跨波交错 Linear-1 与 Linear-2 的改法，在自己的 84 组配置上比原调度再快 1.18 倍（几何均值）、最高 1.62 倍<sup>[C25]</sup>——这是论文实验修改版的结果，未进入 DeepGEMM 主线。</p>
+<p>第三方论文 X-Stage（arXiv:2607.23264）分析 Mega MoE 时把"本地专家按组分批执行"的组织方式称为 expert wave（专家波）：一个波先做它的 Linear-1，再做激活与 Linear-2，然后进入下一波；不同波的 Linear-1 之间没有神经网络依赖，理论上前一波的远程写回没完成时，后一波的 Linear-1 就可以开始<sup>[C20, C25]</sup>。需要说明：官方源码里没有"expert wave"这个词，调度单元是 task（四相 BlockPhase）与 L1 预热/交替发布，"wave"是论文对这种分批结构的描述用语<sup>[C20]</sup>。该论文还发现：若把 Combine 视为一整段必须完成的同步通信来估算调度时间线，会低估加速（保守上限约 1.5 倍，低于实测 1.56 倍），因为发出远程写后发送方可以继续干活；据此它提出跨波交错 Linear-1 与 Linear-2 的改法，在自己的 84 组配置上比原调度再快 1.18 倍（几何均值）、最高 1.62 倍<sup>[C25]</sup>——这是论文实验修改版的结果，未进入 DeepGEMM 主线。</p>
 </details>
 
 <h3 id="token-journey-questions">本章问题</h3>
@@ -663,7 +663,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 </table>
 </div>
 
-<p>三个读数如下。第一，batch 为 1 时加速最大（V4-Flash 1.96 倍、V4-Pro 1.61 倍）<sup>[N2, N4]</sup>：token 越少、每段工作越薄，串行执行的启动与等待占比越高，融合的相对收益就越大——这正是延迟敏感场景（低并发推理、强化学习采样）的形态。第二，大 batch 下收益收敛到约 1.5 倍：计算本身已经很满，可挤的空闲变少。第三，互联带宽一列在 batch 512 时达到 266/182 GB/s——通信流量真实且可观，Mega MoE 是把它藏进了计算里，而不是让它消失。</p>
+<p>三个读数如下。第一，batch 为 1 时加速最大（V4-Flash 1.96 倍、V4-Pro 1.61 倍）<sup>[N2, N4]</sup>；官方基准只给出加速数值，未对成因作说明。一种可能的解释是（本页推断，非官方说明）：token 越少、每段工作越薄，串行执行的启动与等待占比越高，融合的相对收益就越大——延迟敏感场景（低并发推理、强化学习采样）正落在这一档。第二，大 batch 下收益收敛到约 1.5 倍：计算本身已经很满，可挤的空闲变少。第三，互联带宽一列在 batch 512 时达到 266/182 GB/s——通信流量真实且可观，Mega MoE 是把它藏进了计算里，而不是让它消失。</p>
 
 <h3 id="correctness">5.2 正确性验证</h3>
 
@@ -694,7 +694,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
     <p>官方基准测了什么、加速多少？对照的基线是什么？</p>
     <details>
       <summary>解答：V4-Flash 与 V4-Pro 规格、EP8、四档 batch，加速 1.50–1.96 倍；基线是 DeepEP+分组 GEMM+SwiGLU 非重叠流水线</summary>
-      <p>两组配置：V4-Flash（256 专家、top-$k$ 6、hidden 4096、中间维 2048）与 V4-Pro（384 专家、top-$k$ 6、hidden 7168、中间维 3072），EP8 单节点，batch 为每 rank token 数（1/512/8192/32768），数值为 8 rank 平均。加速相对"legacy"基线——DeepEP dispatch/combine + DeepGEMM 分组 GEMM + TileLang SwiGLU 的非重叠流水线。结果：V4-Flash 加速 1.96/1.73/1.56/1.62 倍，V4-Pro 加速 1.61/1.54/1.50/1.54 倍（按 batch 从小到大）。规律：batch=1 时收益最大（通信占比最高），大 batch 收敛到约 1.5 倍。正确性以与基线逐位一致（无共享专家）或差异小于 $10^{-8}$（有共享专家）验证。</p>
+      <p>两组配置：V4-Flash（256 专家、top-$k$ 6、hidden 4096、中间维 2048）与 V4-Pro（384 专家、top-$k$ 6、hidden 7168、中间维 3072），EP8 单节点，batch 为每 rank token 数（1/512/8192/32768），数值为 8 rank 平均。加速相对"legacy"基线——DeepEP dispatch/combine + DeepGEMM 分组 GEMM + TileLang SwiGLU 的非重叠流水线。结果：V4-Flash 加速 1.96/1.73/1.56/1.62 倍，V4-Pro 加速 1.61/1.54/1.50/1.54 倍（按 batch 从小到大）。规律：batch=1 时收益最大，大 batch 收敛到约 1.5 倍。正确性以与基线逐位一致（无共享专家）或差异小于 $10^{-8}$（有共享专家）验证。</p>
     </details>
   </li>
   <li>

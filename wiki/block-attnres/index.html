@@ -115,7 +115,7 @@
 <p><b>主要依据</b>：Kimi K3 Technical Report §2.2 Eq.(8)(9)(10)（arXiv 2607.24653v2，2026-08-07）；HuggingFace 官方 <code>config.json</code>（<code>attn_res_block_size=12</code>、<code>num_hidden_layers=93</code>）。K3 加权三次的具体位置参考 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对（2026-08-07 修订）。</p>
 </blockquote>
 
-<p>K3 主干 93 层，标准残差把所有前层输出以系数 1 累加进同一个流——第 1 层 embedding 在第 93 层只占 1/93，且无法被后续层按内容找回。Block AttnRes 把它当作深度方向的 RNN 瓶颈：每层用可学习 pseudo-query 对"embedding + 此前块级快照 + 当前块 partial sum"做 softmax 加权检索，把送入归一化的输入从"当前残差流"替换为"attention 检索结果"。它不取消标准残差（K3 仍逐层累加 attention 与 MLP 输出），而是在其上叠加块级加权选择，与 token 方向的 attention、channel 方向的 MoE 同级，构成 K3 的三维信息流。本文直接使用<a href="../residual-connection/index.html">残差连接</a>（把每层输入直接加到该层变换的输出上）的结论；softmax 与 RMSNorm 作为公式零件使用，不展开。</p>
+<p>K3 主干 93 层，标准残差把所有前层输出以系数 1 累加进同一个流——第 1 层 embedding 在第 93 层只占 1/93 的份额（如果后续 $f_l$ 不特意放大它），且无法被后续层按内容找回。Block AttnRes 把它当作深度方向的 RNN 瓶颈：每层用可学习 pseudo-query 对"embedding + 此前块级快照 + 当前块 partial sum"做 softmax 加权检索，把送入归一化的输入从"当前残差流"替换为"attention 检索结果"。它不取消标准残差（K3 仍逐层累加 attention 与 MLP 输出），而是在其上叠加块级加权选择，与 token 方向的 attention、channel 方向的 MoE 同级，构成 K3 的三维信息流。<a href="../residual-connection/index.html">残差连接</a>（把每层输入直接加到该层变换的输出上）的结论在此直接沿用；softmax 与 RMSNorm 作为公式零件使用，不展开。</p>
 
 <section class="learning-goals">
   <h2>核心问题</h2>
@@ -124,7 +124,7 @@
       <p>标准残差在深度方向上为什么是瓶颈？AttnRes 用什么思路替代？</p>
       <details>
       <summary>解答：标准残差把所有前层输出以系数 1 累加进同一残差流，早期信息被层层稀释且无法按内容找回；AttnRes 用 softmax 加权检索替代等权累加。</summary>
-      <p>标准残差展开后 $h_L=h_1+\sum_{l=1}^{L-1}f_l(h_l)$，第 1 层 embedding 在第 $L$ 层只占 $1/L$ 份额，后续层只能被动接收累加好的结果，与 RNN 把历史压进单个 hidden state 是同一种瓶颈。AttnRes 让每层用可学习 pseudo-query 对前序表征做 attention，按内容分配权重。完整论证见「1. 标准残差在深度上的瓶颈——为什么需要 AttnRes」。</p>
+      <p>标准残差展开后 $h_L=h_1+\sum_{l=1}^{L-1}f_l(h_l)$，第 1 层 embedding 在第 $L$ 层只占 $1/L$ 的份额（如果后续 $f_l$ 不特意放大它），后续层只能被动接收累加好的结果，与 RNN 把历史压进单个 hidden state 是同一种瓶颈。AttnRes 让每层用可学习 pseudo-query 对前序表征做 attention，按内容分配权重。完整论证见「1. 标准残差在深度上的瓶颈——为什么需要 AttnRes」。</p>
       </details>
     </li>
     <li>
@@ -287,7 +287,7 @@ $$\phi(q_l, k_i) = \exp\!\bigl(q_l^\top \mathrm{RMSNorm}(k_i)\bigr),\qquad \alph
 
 $$\mathrm{RMSNorm}(x) = \frac{x}{\sqrt{\tfrac{1}{d}\sum_{j=1}^d x_j^2 + \epsilon}} \approx \frac{x}{\|x\|_2 / \sqrt d}.$$
 
-<p>忽略小常数 $\epsilon$，RMSNorm 等价于"把向量缩放到均方根为 1"——也就是只用方向、不用幅值。本文只需要这个结论，不展开推导。RMSNorm 在 kernel 中的作用留给 softmax kernel 中的 RMSNorm 一章详细讨论；本章先把它当作"对 key 做归一化"的零件接受。</p>
+<p>忽略小常数 $\epsilon$，RMSNorm 等价于"把向量缩放到均方根为 1"——也就是只用方向、不用幅值。此处只用到该结论，不展开推导。RMSNorm 在 kernel 中的作用留给 softmax kernel 中的 RMSNorm 一章详细讨论；本章先把它当作"对 key 做归一化"的零件接受。</p>
 
 <p>用两个快速检查验证公式。第一，若所有 key 方向相同（如 $k_i=c_i\cdot u$ 对某个单位向量 $u$），则 $\mathrm{RMSNorm}(k_i)=\sqrt d\cdot u$ 对所有 $i$ 相同，$\alpha_{i\to l}=1/l$——权重均匀，pseudo-query 失去选择性。第二，若 pseudo-query $q_l$ 与某个 key $k_j$ 方向高度一致而与其他 key 正交，则 $\alpha_{j\to l}\to 1$——权重集中在该 key。这两个边界说明：AttnRes 的"选择性"来自 key 之间的方向差异，与幅值无关（因为 RMSNorm 已去掉幅值）。</p>
 
@@ -362,7 +362,7 @@ $$\mathrm{RMSNorm}(x) = \frac{x}{\sqrt{\tfrac{1}{d}\sum_{j=1}^d x_j^2 + \epsilon
     <p>pseudo-query $q_l=w_l$ 与标准 attention 中 $Q=W_Q x$ 的关键区别是什么？</p>
     <details>
     <summary>解答：关键区别是是否依赖输入——pseudo-query 是层自带的参数向量，对该层任何输入都相同；$Q=W_Q x$ 由当前输入线性变换得到，随输入变化。</summary>
-    <p>因此 AttnRes 每层的检索方向是训练学出的固定偏好，而标准 attention 的查询内容随输入动态变化。这也让 pseudo-query 无需随输入重新计算，是该机制开销较低的原因之一。</p>
+    <p>因此 AttnRes 每层的检索方向是训练学出的固定偏好，而标准 attention 的查询内容随输入动态变化；pseudo-query 是层参数，无需随输入重新计算。</p>
     </details>
   </li>
   <li>
@@ -581,7 +581,7 @@ final_hidden ← RMSNorm(output)
   <li>$b_8^{i-1}$：当前 partial block（block 8，9 层）的前 $i-1$ 层 partial sum，即"当前流"</li>
 </ul>
 
-<p>"9 个候选来源（8 块快照 + 当前流）"这个说法对应的就是这个视角：8 个块快照（$b_0$ 即 embedding + $b_1\dots b_7$）+ 当前流（$b_8^{i-1}$）。这是最后一个 block 内 $i\ge 2$ 层的视角——其他 block 的层候选数更少（如 block 1 的 $i\ge 2$ 层只有 $[b_0, b_1^{i-1}]$ 共 2 个候选）。K3 报告 §2.2 以「含 embedding 共 9 个 block」描述该配置；由 Eq.(10)，最后一个 block 内 $i\ge 2$ 层的候选数为 9。具体槽位分配的实现细节 K3 报告未展开，本文不推测。</p>
+<p>"9 个候选来源（8 块快照 + 当前流）"这个说法对应的就是这个视角：8 个块快照（$b_0$ 即 embedding + $b_1\dots b_7$）+ 当前流（$b_8^{i-1}$）。这是最后一个 block 内 $i\ge 2$ 层的视角——其他 block 的层候选数更少（如 block 1 的 $i\ge 2$ 层只有 $[b_0, b_1^{i-1}]$ 共 2 个候选）。K3 报告 §2.2 以「含 embedding 共 9 个 block」描述该配置；由 Eq.(10)，最后一个 block 内 $i\ge 2$ 层的候选数为 9。具体槽位分配的实现细节 K3 报告未展开，不作推测。</p>
 
 <div class="flow-diagram">
   <div class="flow-title">K3 的 Block AttnRes 候选来源（最后一个 block 内 $i\ge 2$ 层的视角）</div>
@@ -634,7 +634,7 @@ final_hidden ← RMSNorm(output)
 
 <p>需要明确标注证据层级<sup>[C8]</sup>：</p>
 <ul>
-  <li><b>K3 报告原文确认</b>：AttnRes 让每个 module 有按内容检索前序表征的能力（§2 第 209 行 "AttnRes enable each module to selectively retrieve representations"）；模型末尾聚合所有 $N$ 个 block 表征<sup>[C7]</sup>（§2.2 第 414 行 "The final output layer then aggregates all N block representations"）。</li>
+  <li><b>K3 报告原文确认</b>：AttnRes 让每个 module 有按内容检索前序表征的能力（§2 第 214 行 "AttnRes enable each module to selectively retrieve representations"）；模型末尾聚合所有 $N$ 个 block 表征<sup>[C7]</sup>（§2.2 第 419 行 "The final output layer then aggregates all N block representations"）。</li>
   <li><b>由架构推出的解读</b>："每个 module（attention 模块与 MLP 模块）各加权一次"由报告 "each module" 与 K3 每层 attention 子层后接 Stable LatentMoE 子层的排布推出；加权次数是否恰为一次，由下一条的源码核对给出。</li>
   <li><b>源码核对（间接证据）</b>：具体"attention 前 / MLP 前 / final norm 前"三次的位置、参数字段名（<code>self_attention_res_norm</code> 等），来自 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对（该 note 2026-08-07 按源码修订）。本页未直接复核源码，标注为间接证据<sup>[N5]</sup>。</li>
 </ul>
@@ -779,7 +779,7 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
 <p>边界：若 $q$ 与 $u$ 不完全一致（$q^\top u < \|q\|$），RMSNorm 后权重比仍由方向决定，但不会归零。若所有 key 方向相同，RMSNorm 后所有 key 相同，softmax 完全均匀——RMSNorm 不能凭空创造选择性。</p>
 </details>
 
-<p>至此本文五个核心问题全部作答：标准残差的深度瓶颈与 AttnRes 思路、Full AttnRes 公式、Block AttnRes 分块机制、K3 具体配置、RMSNorm 设计选择。RMSNorm 的作用是"按方向而非幅值选择来源"，两个失效边界是：所有 key 方向接近时 softmax 仍接近均匀；RMSNorm 不防 exp 溢出（工程上需配合减最大值）。</p>
+<p>RMSNorm 的作用是"按方向而非幅值选择来源"，两个失效边界是：所有 key 方向接近时 softmax 仍接近均匀；RMSNorm 不防 exp 溢出（工程上需配合减最大值）。</p>
 
 <h3 id="chapter-5-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -808,27 +808,27 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
 
 <h2 id="sources-and-teaching-notes">来源与范围说明</h2>
 
-<p>本页引用的 K3 报告参考文献编号依据 arXiv 2607.24653v2；下述 [60] 为该版中的 "Kimi Team. Attention Residuals. Preprint. 2026."（v1 中为 [59]），[147] 为该版中的 RMSNorm 论文（v1 中为 [145]）。</p>
+<p>本页引文编号与行号分属 arXiv 2607.24653 的两种渲染，按同一版本 v2 核对：编号（[60]、[147]）依据 HTML v2——[60] 为该版中的 "Kimi Team (2026) Attention residuals."，[147] 为 RMSNorm 论文（Zhang & Sennrich 2019）；HTML v1 中两者为 [59]、[145]。行号依据 v2 PDF（<code>pdftotext -layout</code>）；同一两篇按 v2 PDF 核对时为 [58]（AttnRes）与 [148]（RMSNorm），v1 PDF 中为 [57] 与 [146]。</p>
 
 <h3>论断与来源（C）</h3>
 <ul>
-  <li><b>C1</b>（标准残差的深度瓶颈与 AttnRes 思路）：K3 报告 §2.2 第 379-383 行。</li>
-  <li><b>C2</b>（Full AttnRes 公式 Eq.8-9）：K3 报告 §2.2 第 385-396 行。</li>
-  <li><b>C3</b>（RMSNorm 防大值主导）：K3 报告 §2.2 第 390-392 行。</li>
-  <li><b>C4</b>（Block AttnRes 分块与候选集合 Eq.10）：K3 报告 §2.2 第 401-413 行。</li>
-  <li><b>C5</b>（内存从 $O(Ld)$ 降到 $O(Nd)$）：K3 报告 §2.2 第 415-417 行。</li>
+  <li><b>C1</b>（标准残差的深度瓶颈与 AttnRes 思路）：K3 报告 §2.2 第 384-388 行。</li>
+  <li><b>C2</b>（Full AttnRes 公式 Eq.8-9）：K3 报告 §2.2 第 390-401 行。</li>
+  <li><b>C3</b>（RMSNorm 防大值主导）：K3 报告 §2.2 第 395-397 行。</li>
+  <li><b>C4</b>（Block AttnRes 分块与候选集合 Eq.10）：K3 报告 §2.2 第 406-418 行。</li>
+  <li><b>C5</b>（内存从 $O(Ld)$ 降到 $O(Nd)$）：K3 报告 §2.2 第 420-422 行。</li>
   <li><b>C6</b>（$N\approx 8$ 经验结论 + K3 的 8 块×12 层）：K3 报告 §2.2 第 423-424 行。$N\approx 8$ 的最优性来自 K3 报告对原 preprint [60] 的转述。</li>
-  <li><b>C7</b>（模型末尾聚合所有 $N$ 个 block 表征）：K3 报告 §2.2 第 414 行。</li>
-  <li><b>C8</b>（K3 加权三次的位置）：K3 报告 §2 第 209 行（"each module"）确认每个 module 有 AttnRes 检索能力 + §2.2 第 414 行确认末尾聚合；"attention 模块与 MLP 模块各一次"为由架构推出的解读；具体三次位置（attention 前 / MLP 前 / final norm 前）与参数字段名（<code>self_attention_res_norm</code> 等）来自 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对（间接证据，本页未直接复核源码）。</li>
+  <li><b>C7</b>（模型末尾聚合所有 $N$ 个 block 表征）：K3 报告 §2.2 第 419 行。</li>
+  <li><b>C8</b>（K3 加权三次的位置）：K3 报告 §2 第 214 行（"each module"）确认每个 module 有 AttnRes 检索能力 + §2.2 第 419 行确认末尾聚合；"attention 模块与 MLP 模块各一次"为由架构推出的解读；具体三次位置（attention 前 / MLP 前 / final norm 前）与参数字段名（<code>self_attention_res_norm</code> 等）来自 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对（间接证据，本页未直接复核源码）。</li>
   <li><b>C9</b>（K3 主干 93 层、$d=7168$、$N=8$、$S=12$）：HuggingFace 官方 <code>config.json</code>（<code>num_hidden_layers=93</code>、<code>attn_res_block_size=12</code>、<code>hidden_size=7168</code>）+ K3 报告 Table 1。</li>
 </ul>
 
 <h3>公式与来源（F）</h3>
 <ul>
-  <li><b>F1</b>（Full AttnRes 的 keys/values）：K3 报告 §2.2 Eq.(8)，第 385-389 行。</li>
-  <li><b>F2</b>（softmax kernel 与权重）：K3 报告 §2.2 Eq.(9)，第 393-396 行。</li>
-  <li><b>F3</b>（Block AttnRes 块内求和 $b_n$ 与 partial sum $b_n^i$）：K3 报告 §2.2 第 401-404 行（文字描述，公式形式由文字推出）。</li>
-  <li><b>F4</b>（Block AttnRes 候选集合 Eq.10）：K3 报告 §2.2 Eq.(10)，第 407-413 行。</li>
+  <li><b>F1</b>（Full AttnRes 的 keys/values）：K3 报告 §2.2 Eq.(8)，第 390-394 行。</li>
+  <li><b>F2</b>（softmax kernel 与权重）：K3 报告 §2.2 Eq.(9)，第 398-401 行。</li>
+  <li><b>F3</b>（Block AttnRes 块内求和 $b_n$ 与 partial sum $b_n^i$）：K3 报告 §2.2 第 406-409 行（文字描述，公式形式由文字推出）。</li>
+  <li><b>F4</b>（Block AttnRes 候选集合 Eq.10）：K3 报告 §2.2 Eq.(10)，第 412-418 行。</li>
   <li><b>F5</b>（RMSNorm 定义）：Zhang & Sennrich 2019（K3 报告引用 [147]）；本页只用定义，不展开推导。</li>
 </ul>
 
@@ -838,7 +838,7 @@ $$\frac{\alpha_1}{\alpha_2} = \exp\!\bigl(\|q\|\cdot(c-1)\bigr).$$
   <li><b>N2</b>：$N\approx 8$ 在多数模型尺度下恢复 Full AttnRes 的大部分收益。来源：K3 报告 §2.2 第 423 行转述 [60]。实验条件：原 preprint [60] 的实验设置。置信状态：K3 报告转述已确认；原 preprint 实验数据未独立核对，标注为间接证据。</li>
   <li><b>N3</b>：K3 主干 hidden_size=7168、num_attention_heads=96、block size=12 层。来源：HuggingFace <code>config.json</code>。实验条件：官方发布的 Kimi K3 权重（huggingface.co/moonshotai/Kimi-K3）<code>config.json</code>。</li>
   <li><b>N4</b>（AttnRes 原 preprint [60] 未获取原文）：$N\approx 8$ 的最优性、原 preprint 的消融实验、pseudo-query 的设计动机等结论只用 K3 报告 §2.2 的转述。来源：K3 报告 §2.2 第 423 行转述 [60]。置信状态：间接证据，原 preprint 原文未核对；若需核对，应获取原 preprint。</li>
-  <li><b>N5</b>（K3 加权三次的具体位置为间接证据）：具体三次位置（attention 前 / MLP 前 / final norm 前）与参数字段名来自 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对，本页未直接复核源码。来源：K3 报告 §2 第 209 行 + §2.2 第 414 行的间接证据。置信状态：若该 note 修订，本页相应描述需同步修订。</li>
+  <li><b>N5</b>（K3 加权三次的具体位置为间接证据）：具体三次位置（attention 前 / MLP 前 / final norm 前）与参数字段名来自 <a href="../kimi-k3-dataflow/index.html">K3 前向数据流 note</a> 对官方源码 <code>modeling_kimi_linear.py</code> 的核对，本页未直接复核源码。来源：K3 报告 §2 第 214 行 + §2.2 第 419 行的间接证据。置信状态：若该 note 修订，本页相应描述需同步修订。</li>
 </ul>
 
 <h3>构造示例</h3>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="前缀缓存是什么：跨请求识别公共前缀并复用其 KV cache。SGLang RadixAttention 的 radix tree 组织与匹配、LRU 叶子优先逐出与引用计数、页大小如何决定命中率、以及 vLLM/Mooncake 的哈希指纹实现。">
-  <meta name="dojo:summary" content="前缀缓存把完成请求的 KV cache 留在显存供后续请求复用：匹配是逐 token 精确前缀（系统提示词、多轮对话历史、few-shot、RAG 文档四类来源）。SGLang 用 radix tree 组织——沿树匹配到分叉点即最长可复用前缀，LRU 从叶子逐出让共享祖先天然长寿，引用计数保护运行请求。命中率除负载与容量外还受页大小制约：按整页计命中，页命中数 $=\left\lfloor\text{共享前缀长度}/\text{页大小}\right\rfloor$，页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%。vLLM/Mooncake 用哈希指纹链实现同一目标。">
+  <meta name="dojo:summary" content="前缀缓存把完成请求的 KV cache 留在显存供后续请求复用：匹配是逐 token 精确前缀（典型来源可归纳为系统提示词、多轮对话历史、few-shot、RAG 文档四类）。SGLang 用 radix tree 组织——沿树匹配到分叉点即最长可复用前缀，LRU 从叶子逐出让共享祖先天然长寿，引用计数保护运行请求。命中率除负载与容量外还受页大小制约：按整页计命中，页命中数 $=\left\lfloor\text{共享前缀长度}/\text{页大小}\right\rfloor$，页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%。vLLM/Mooncake 用哈希指纹链实现同一目标。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="内存与缓存, 推理系统">
   <meta name="dojo:tag" content="KV cache">
@@ -59,7 +59,7 @@
 <p class="reading-time" id="readingTime"></p>
 
 <blockquote class="meta">
-<p><b>主要依据</b>：Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs"（NeurIPS 2024, arXiv:2312.07104）§3.2（RadixAttention）；哈希实现与页大小-命中率关系另引 Xie et al., "Strata"（OSDI 2026, arXiv:2508.18572v1）§6、§3.1、§5.3.2。</p>
+<p><b>主要依据</b>：Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs"（NeurIPS 2024, arXiv:2312.07104）§3（RadixAttention）；哈希实现与页大小-命中率关系另引 Xie et al., "Strata"（OSDI 2026, arXiv:2508.18572v1）§6、§3.1、§5.3.2。</p>
 </blockquote>
 
 <p>一个对话服务，每条请求都以同一段 200 token 的系统提示词开头，一天收到一百万条请求——这一百万次对同一段话的 prefill 计算，有没有必要做一百万次？答案是不必：KV cache 只依赖 token 序列（见 <a href="../kv-cache/index.html">KV cache</a>），开头相同的请求可以共用同一份前缀缓存。既有系统在请求完成后把缓存直接丢弃，SGLang 称这"阻止了跨调用复用、显著拖慢执行"<sup>[C1]</sup>。前缀缓存（prefix caching，文献与商业 API 中也叫 context caching<sup>[C6]</sup>）就是把完成请求的缓存留下来、供后续请求匹配复用的机制。本文讲清五件事：什么能复用、radix tree 怎么组织匹配、缓存满了先丢谁、页大小为什么影响命中率、以及 vLLM/Mooncake 的哈希实现与 SGLang 的树实现有何不同。</p>
@@ -71,7 +71,7 @@
       <p>跨请求到底能复用什么？共享前缀从哪来？</p>
       <details>
         <summary>解答：精确 token 前缀匹配，四类典型来源</summary>
-        <p>两个请求只要开头 token 序列相同，这段前缀的 KV cache 就是同一份数据，可直接复用——匹配是精确的 token 前缀匹配，不是语义相似。四类典型来源：系统提示词（所有请求共享）、多轮对话历史（新一轮输入 $=$ 前几轮全部内容 $+$ 新消息）、few-shot 示例（同批示例的多个查询）、RAG 文档（同一文档的多个问题）。命中部分完全跳过 prefill 计算且不重复占显存。见「什么能复用」一章。</p>
+        <p>两个请求只要开头 token 序列相同，这段前缀的 KV cache 就是同一份数据，可直接复用——匹配是精确的 token 前缀匹配，不是语义相似。常见负载可归纳为四类典型来源：系统提示词（所有请求共享）、多轮对话历史（新一轮输入 $=$ 前几轮全部内容 $+$ 新消息）、few-shot 示例（同批示例的多个查询）、RAG 文档（同一文档的多个问题）。命中部分完全跳过 prefill 计算且不重复占显存。见「什么能复用」一章。</p>
       </details>
     </li>
     <li>
@@ -109,7 +109,7 @@
 
 <p>复用的可行性来自 KV cache 的一个性质（<a href="../kv-cache/index.html">KV cache</a> 第 1 章）：$k_i=x_i W_K$、$v_i=x_i W_V$ 只由第 $i$ 个 token 的输入与模型参数决定，与哪个请求、哪个查询无关。因此两个请求只要<b>从第一个 token 开始</b>的序列相同，这段前缀的 KV cache 就是逐字节相同的数据，一方的缓存另一方直接可用。反过来，只要开头有一个 token 不同，从那个位置起缓存就不可复用——匹配是精确前缀匹配，不是"意思差不多就行"。</p>
 
-<p>哪些负载天然满足"开头相同"？四类典型来源：</p>
+<p>哪些负载天然满足"开头相同"？常见负载可归纳为四类典型来源：</p>
 
 <div class="table-scroll">
 <table>
@@ -312,19 +312,19 @@ $$\text{页命中数}=\left\lfloor\frac{\text{共享前缀长度}}{\text{页大�
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（既有系统完成后丢弃缓存、阻止复用）、C2（RadixAttention 运行时自动复用 + LRU + cache-aware 调度 + 兼容性）、C3（radix tree 压缩边、token-张量映射、页 1 token、非连续分页）、C4（LRU 叶子优先、祖先复用）、C5（引用计数与共享内存池）、C9（生成结果入缓存）：Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs", NeurIPS 2024（arXiv:2312.07104）§1、§3.2。C6（context/prefix caching 被 OpenAI、Google 等采用）、C7（SGLang RadixTree / vLLM+Mooncake 哈希 / LMDeploy 混合 trie / Strata 扩展 HiRadixTree）、C10（delay hit：同前缀请求在首个 miss 未解决时排队、批内重复 prefill）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v1）§2.3、§3.2、§4.1、§6。C8（按页匹配、页大小影响命中率）：Strata 论文 §3.1（"cache matching is performed on a per-page basis"）。"树 vs 哈希"优劣对比为分析性判断，已在正文标注。</p>
+<p>C1（既有系统完成后丢弃缓存、阻止复用）、C2（RadixAttention 运行时自动复用 + LRU + cache-aware 调度 + 兼容性）、C3（radix tree 压缩边、token-张量映射、页 1 token、非连续分页）、C4（LRU 叶子优先、祖先复用）、C5（引用计数与共享内存池）、C9（生成结果入缓存）：Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs", NeurIPS 2024（arXiv:2312.07104）§1、§3。C6（context/prefix caching 被 OpenAI、Google 等采用）、C7（SGLang RadixTree / vLLM+Mooncake 哈希 / LMDeploy 混合 trie / Strata 扩展 HiRadixTree）、C10（delay hit：同前缀请求在首个 miss 未解决时排队、批内重复 prefill）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v1）§2.3、§3.2、§4.1、§6。C8（按页匹配、页大小影响命中率）：Strata 论文 §3.1（"cache matching is performed on a per-page basis"）。"树 vs 哈希"优劣对比为分析性判断，已在正文标注。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1（页命中数 $=\left\lfloor\text{共享前缀长度}/\text{页大小}\right\rfloor$）：按页匹配机制（C8）的直接换算，构造算例专用；非论文给出的显式公式。</p>
 
 <h3>外部数字与实验条件（N）</h3>
-<p>N1（SGLang 页大小 $=$ 1 token）：SGLang 论文 §3.2。N2（页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%、最优页吞吐为 Strata-IO 的 93%）：Strata 论文 §5.3.2（条件：SGLang-HiCache 基线、Qwen2.5-14B、H200、LooGLE、对照为 Strata-IO）。N3（共享 100 token $\times$ 页 1/32/256 算例）：构造示例。N4（分层系统约 95% 命中率）：Strata 论文 §5.2.1（LooGLE、1TB pinned DRAM；本文未正文引用，仅口径备查）。N5（页大小默认值：TensorRT-LLM 典型 32、vLLM 典型 16，32 为 vLLM 在 CUDA GPU 上的最大支持值）：Strata 论文 §2.2、§3.1。</p>
+<p>N1（SGLang 页大小 $=$ 1 token）：SGLang 论文 §3。N2（页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%、最优页吞吐为 Strata-IO 的 93%）：Strata 论文 §5.3.2（条件：SGLang-HiCache 基线、Qwen2.5-14B、H200、LooGLE、对照为 Strata-IO）。N3（共享 100 token $\times$ 页 1/32/256 算例）：构造示例。N4（分层系统约 95% 命中率）：Strata 论文 §5.2.1（LooGLE、1TB pinned DRAM；本文未正文引用，仅口径备查）。N5（页大小默认值：TensorRT-LLM 典型 32、vLLM 典型 16，32 为 vLLM 在 CUDA GPU 上的最大支持值）：Strata 论文 §2.2、§3.1。</p>
 
 <h3>构造示例</h3>
 <p>系统提示词 $S$（200 token）与消息 $m_1$（30 token）、$m_2$（40 token）、另一提示词 $S'$：数字为便于手算的构造选择；三请求走树的过程（R1/R2/R3，总计算 500 对 690 token）与 100 token $\times$ 三种页大小的命中表均为构造算例，机制与来源论断一致。</p>
 
 <h3>辅助解释与类比边界</h3>
-<p>"共享前缀天然长寿"是对 LRU 叶子优先逐出的效果描述（论文机制原文为叶子先逐出、祖先可继续复用），"存活期与引用分支数成正比"为推断标注。"分布式缓存友好"只解释指纹与位置无关这一局部性质，不构成对 Mooncake 架构的完整描述。</p>
+<p>"共享前缀天然长寿"是对 LRU 叶子优先逐出的效果描述（论文机制原文为叶子先逐出、祖先可继续复用），"存活期与引用分支数成正比"为推断标注。"分布式缓存友好"只解释指纹与位置无关这一局部性质，不构成对 Mooncake 架构的完整描述。第 1 章的"四类典型来源"（系统提示词、多轮对话历史、few-shot 示例、RAG 文档）是本文对常见可复用前缀负载的归纳，不是论文给出的分类：SGLang 第 1 章列举的复用场景包括多轮对话、few-shot 示例与 RAG 流程等，未按此四类并列。</p>
 
 <h3>简化条件及其限制</h3>
 <p>其一，树上匹配描述到 token 粒度，SGLang 实现细节（节点锁、异步插入等工程问题）未展开。其二，cache-aware 调度（优先调度与缓存匹配的请求）只在 scope 层面提及一句，策略对比（如最长前缀优先 LPM）归 Strata 一文消融部分。其三，近似缓存（CacheGen/CacheBlend）只作一句排除（要求精确前缀），其机制不覆盖。其四，命中条件的两个前提（页在显存、已算完）在第 4 章末尾说明，相关机制（分层传输、delay hit）归 Strata 一文。</p>
