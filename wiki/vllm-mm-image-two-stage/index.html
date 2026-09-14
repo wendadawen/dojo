@@ -86,11 +86,11 @@
 </div>
 
 <h1 class="title">多模态图片的两阶段处理</h1>
-<p class="page-lead">前端 render 链路用 HF image_processor 完成图片加载与 smart_resize，产出 pixel_values 与 image_grid_thw 随请求发送；EngineCore 的 _execute_mm_encoder 调用 embed_multimodal 跑视觉编码器，结果按图片哈希缓存在 encoder_cache 供 decode 复用。合批时字段类型决定合并方式，拆批仅由 modality、字段集合与 SharedField 数据决定。</p>
+<p class="page-lead">前端 render 链路经连接器加载图片后，由 HF image_processor 完成 smart_resize 与归一化，产出 pixel_values 与 image_grid_thw 随请求发送；EngineCore 的 _execute_mm_encoder 调用 embed_multimodal 跑视觉编码器，结果按图片哈希缓存在 encoder_cache 供 decode 复用。合批时字段类型决定合并方式，拆批仅由 modality、字段集合与 SharedField 数据决定。</p>
 <p class="page-meta">更新于 2026-08-21 · 类型：源码走读结论（vLLM 0.22.2.dev，Qwen3.5，TP=1）</p>
 <p class="reading-time" id="readingTime"></p>
 
-<h2 id="split">1. 分界在哪里：两段各自做什么</h2>
+<h2 id="split">1. 两段处理的职责划分</h2>
     <p>一张图片从进入 vLLM 到产生图像特征，被拆成两段，分属两个进程：</p>
     <table>
       <tr><th>阶段</th><th>进程</th><th>做的事</th><th>产出</th></tr>
@@ -145,7 +145,7 @@
     <p>调度器产出的 <code>SchedulerOutput.scheduled_encoder_inputs</code> 记录本步需要编码的项，结构为 <code>{请求ID: 图片下标列表}</code>。存下标而不存数据：数据可能已在编码缓存中或可从远端获取，调度器只决定"哪些项需要编码"。<code>_batch_mm_inputs_from_scheduler</code> 按下标从各请求的 mm_features 取出数据，整理为三个平行列表：图片哈希、图片数据、以及 (请求ID, 占位符位置) 引用——后者用于把图片映射回所属请求，从而查到该请求使用的 LoRA 适配器。占位符位置即 <code>PlaceholderRange</code>（offset + length），标记图片在 token 序列中的插入点。</p>
 
     <h3 id="batching">合批机制</h3>
-    <p><code>group_and_batch_mm_kwargs</code> 把收集到的项组织成一批批可整体送入编码器的数据。机制分两层：<strong>怎么合并</strong>与<strong>什么时候拆批</strong>。</p>
+    <p><code>group_and_batch_mm_kwargs</code> 把收集到的项组织成一批批可整体送入编码器的数据。机制分两部分：<strong>字段合并方式</strong>与<strong>拆批条件</strong>。</p>
     <p>每个字段（FieldElem）携带一个 field 对象，决定合批时数据的合并方式（<code>reduce_data</code>）：</p>
     <table>
       <tr><th>字段类型</th><th>合并方式</th><th>语义</th></tr>
@@ -162,12 +162,12 @@
     </svg>
 
     <h3 id="encode">编码</h3>
-    <p>每批数据以关键字参数展开传入 <code>model.embed_multimodal</code>，其内部对 image modality 调 <code>_process_image_input</code> 跑视觉编码器 forward，产出每个图片项的特征张量。这些特征张量随后沿统一输入路径并入模型输入：整个 batch 的全部 token 先过 embedding 层，图片位置再以 is_multimodal 掩码被覆写为 ViT 特征（<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）。调用处把模型对象当作 <code>SupportsMultiModal</code> 协议使用——协议只要求对象具有这些多模态方法，不依赖具体模型类，实现该组方法的模型即可复用同一编码调用路径（本页以 Qwen3.5 走读验证）。</p>
+    <p>每批数据以关键字参数展开传入 <code>model.embed_multimodal</code>，其内部对 image modality 调 <code>_process_image_input</code> 跑视觉编码器 forward，产出每个图片项的特征张量。这些特征张量随后沿统一输入路径并入模型输入：整个 batch 的全部 token 先过 embedding 层，图片位置再以 is_multimodal 掩码被覆写为 ViT 特征（<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）。调用处把模型对象当作 <code>SupportsMultiModal</code> 协议使用——协议只要求对象具有这些多模态方法，不依赖具体模型类，按协议约定，实现该组方法的模型即可复用同一编码调用路径（以 Qwen3.5 走读验证）。</p>
 
     <h3 id="cache">缓存</h3>
     <p>编码结果按图片哈希写入 <code>encoder_cache</code>。视觉编码只在图片首次被调度的 prefill 回合执行；decode 回合需要图片特征时直接读缓存（<code>_gather_mm_embeddings</code> 按 PlaceholderRange 取对应片段），不再跑 ViT。同一图片被多个请求使用时也命中同一缓存条目。</p>
 
-    <h2 id="why">4. 为什么这样分</h2>
+    <h2 id="why">4. 分界依据</h2>
     <p>预处理是纯 CPU 工作——图片解码、缩放、归一化，放在 APIServer 可以用独立线程做，不占用引擎进程；视觉编码需要 GPU 与模型权重，必须靠近模型所在进程，且编码结果要立即进入缓存供后续回合使用。把重活留在离 GPU 最近的 EngineCore、轻活留在离请求最近的 APIServer，是这条分界线的一种解读：依据是上述两段的功能分布（CPU 预处理 / GPU 编码），属推断，官方设计文档未直接陈述该动机。这条分界线对应的进程职责划分见<a href="../vllm-v1-two-process-arch/index.html">V1 两进程架构</a>。</p>
 
     <h2 id="ref">来源与范围说明</h2>
@@ -183,7 +183,7 @@
     <h3>验证数据</h3>
     <ul>
       <li>smart_resize 数值：用 Qwen3.5 所用 HF image processor 的配置（patch_size=16、merge_size=2、min_pixels=65536、max_pixels=16777216；transformers 4.57.6）对 980×986 与 480×640 两张图片实跑，网格分别为 [1, 62, 62]（3844 个 patch）与 [1, 30, 40]（1200 个 patch）</li>
-      <li>合批行为：按真实 processor 输出的字段构造输入，对 group_and_batch_mm_kwargs 运行——两张网格不同的图片合为一批（pixel_values 以列表返回）、图片与音频拆为两批、字段集合不同的两张图拆为两批；后两种拆批条件另有社区单元测试覆盖</li>
+      <li>合批行为：按真实 processor 输出的字段构造输入，对 group_and_batch_mm_kwargs 运行——两张网格不同的图片合为一批（pixel_values 以列表返回）、图片与音频拆为两批、字段集合不同的两张图拆为两批；其中字段集合拆批与 SharedField 数据拆批另有社区单元测试覆盖</li>
       <li>进程归属：预处理函数位于 APIServer 侧 render 链路、编码函数位于 EngineCore 的 <code>gpu_model_runner</code> 与模型类，均由源码位置判定（第 1 章）；APIServer 内部 IO 与多模态处理的线程划分为推断，未经运行期验证</li>
       <li>单元测试：社区仓库 <code>tests/multimodal/test_utils.py</code>（test_group_and_batch_mm_items_split_by_fieldset、test_group_and_batch_mm_items_split_by_shared_data；本地安装包未含 tests，依据仓库路径与测试内容核对）</li>
       <li>环境：vLLM 0.22.2.dev、Qwen3.5-0.8B（Qwen3_5ForConditionalGeneration）、TP=1 单机</li>

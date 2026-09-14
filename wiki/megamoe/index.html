@@ -234,9 +234,9 @@ $$y=\sum_{e\in\mathcal{S}} g_{e}\cdot W_2^{(e)}\,\mathrm{SwiGLU}\!\left(W_1^{(e)
   <line x1="110" y1="360" x2="530" y2="360" class="dg-line"/>
   <path d="M538,360 l-10,-5 v10 z" style="fill: var(--text-light)"/>
   <text x="544" y="364" font-size="11">时间</text>
-  <text x="110" y="395" font-size="11" opacity="0.7">同一时间刻度下，重叠执行在更短时间内完成全部五段工作；SM 泳道右端的 L1/L2 表示后续专家的计算接续（示意图，非实测 trace）。</text>
+  <text x="110" y="395" font-size="11" opacity="0.7">同一时间刻度下，重叠执行在更短时间内完成全部五段工作；SM 泳道右端的 L1/L2 表示后续专家的计算接续。</text>
 </svg>
-<figcaption class="diagram-caption">上：传统串行——dispatch/combine 时 SM 空闲，GEMM 时互联空闲。下：Mega MoE——dispatch 组分块拉取、epilogue 组分块写回与 Tensor Core 计算在不同线程组上同时推进，两条泳道同时被填满。</figcaption>
+<figcaption class="diagram-caption">上：传统串行——dispatch/combine 时 SM 空闲，GEMM 时互联空闲。下：Mega MoE——dispatch 组分块拉取、epilogue 组分块写回与 Tensor Core 计算在不同线程组上同时推进，两条泳道同时被填满。（示意图，非实测 trace。）</figcaption>
 </figure>
 
 <p>通信本身也不是小数目。用基准里的 DeepSeek-V4-Pro 规格（hidden $h=7168$、top-$k=6$）<sup>[N3]</sup>算一笔账：激活按 FP8 存储时每元素 1 字节，一个 token 的 dispatch 发送量约为 $k\times h\times 1\,\mathrm{B}=6\times 7168=43008\,\mathrm{B}\approx 43\,\mathrm{KB}$；combine 回传的是 BF16 结果，约 $86\,\mathrm{KB}$。每 rank 512 个 token 时，仅 dispatch 方向就要发出约 $22\,\mathrm{MB}$（$43008\times 512=22{,}020{,}096$ 字节，十进制口径）——这还是每层、每 rank 反复发生的量。这笔账只算数据本体，是按公式 $k\times h\times b_{\mathrm{act}}$ 直接推出的量级估算<sup>[F3]</sup>，不是实测流量；官方基准表中互联带宽一列（batch 512 时 266/182 GB/s<sup>[N2, N4]</sup>）就是这些流量的实测体现。这一规格对应模型的完整前向路径（61 层、HCA/CSA 交替压缩、mHC 四路残差），见 <a href="../deepseek-v4-dataflow/index.html">DeepSeek-V4-Pro 前向数据流</a>。</p>
@@ -454,7 +454,7 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)</code></pr
 <p>注意方向的不对称：dispatch 侧是"元数据推送 + 数据拉取"（接收侧主动来拉），combine 侧是"远程写入"（专家侧把结果直接 push 到源 rank 的槽位）。两个方向并不对称，把两者都理解成"把数据推过去"会错判缓冲压力的承担方——dispatch 的接收节奏由本 rank 控制，combine 的写入节奏由对端控制<sup>[C11, C15]</sup>。</p>
 </div>
 
-<p>在贯穿示例里代入：rank1 的 dispatch 线程组统计后发现，本 rank 的 $E_2$ 要处理 $t_1$（在 rank0）和 $t_2$（本地），$E_3$ 要处理 $t_0$、$t_1$（都在 rank0）。前两步它把"来自 rank0 的 token 计数"写进自己 workspace 的同时，rank0 也把"我贡献了哪些 token-专家对"的源索引写了过来；第三步 rank1 从 rank0 的 input 缓冲里把 $t_0$、$t_1$ 的数据拉进自己的 L1 缓冲，按 $E_2$、$E_3$ 分组摆放——$t_2$ 本来就在本地，直接归组。</p>
+<p>在贯穿示例里代入：rank1 的 dispatch 线程组统计后发现，本 rank 的 $E_2$ 要处理 $t_1$（在 rank0）和 $t_2$（本地），$E_3$ 要处理 $t_0$、$t_1$（都在 rank0）。前两步它把"来自 rank0 的 token 计数"写进自己 workspace 的同时，rank0 也把本 rank 有哪些 token-专家对的源索引写了过来；第三步 rank1 从 rank0 的 input 缓冲里把 $t_0$、$t_1$ 的数据拉进自己的 L1 缓冲，按 $E_2$、$E_3$ 分组摆放——$t_2$ 本来就在本地，直接归组。</p>
 
 <h3 id="gemm-schedule">4.2 两层 GEMM：task 调度与环形缓冲</h3>
 
@@ -723,7 +723,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 <tr><td>C6</td><td>TMEM、2-SM cluster、2-CTA UMMA（tcgen05）</td><td>同上文件行 80、216-222、848、899</td></tr>
 <tr><td>C7</td><td>激活 FP8 E4M3、权重 FP4 E2M1、共享专家 FP8、输出 BF16</td><td>同上文件行 142-146；README API 示例</td></tr>
 <tr><td>C8</td><td>持久 kernel：grid=num_sms，三组线程之和为 block 大小</td><td>sm100_fp8_fp4_mega_moe.hpp（LaunchArgs(num_sms, …)）；.cuh 行 55</td></tr>
-<tr><td>C9</td><td>warp 专用化六类角色分工</td><td>.cuh 行 329-599（dispatch）、669-734（TMA A）、735-793（TMA B）、794-919（MMA）、920-926（调度）、927-1453（epilogue）；heuristics/mega_moe.hpp 线程常量</td></tr>
+<tr><td>C9</td><td>warp 专用化六类角色分工</td><td>.cuh 行 329-668（dispatch，末段 600-668 为 workspace 清理）、669-734（TMA A）、735-793（TMA B）、794-919（MMA）、920-926（调度）、927-1453（epilogue）；heuristics/mega_moe.hpp 线程常量</td></tr>
 <tr><td>C10</td><td>SymBuffer 同布局 + 偏移表 + map 一次加法；最多 72 rank</td><td>layout/sym_buffer.cuh 行 7-42；启动器 num_ranks 推导</td></tr>
 <tr><td>C11</td><td>dispatch 三步：计数远端原子累加、源索引写远端、分块拉取（轮转选源）</td><td>.cuh 行 336-409、414-555（"Round-robin rank selection via iterative min-peeling"）</td></tr>
 <tr><td>C12</td><td>pull 块上限 4096 字节（kPullThreshold）</td><td>heuristics/mega_moe.hpp（"Pull: divide token bytes by 2 until &lt;= kPullThreshold"）</td></tr>
@@ -742,7 +742,7 @@ $$N_{\mathrm{exp}} = \frac{n_{\mathrm{tokens}}\times n_{\mathrm{ranks}}\times k}
 <tr><td>C25</td><td>X-Stage：completion-coupled 估计约 1.5x 低于实测 1.56x；交错改法 1.18x/1.62x（84 组配置）</td><td>xstage-extracts.md §1、§2.2（arXiv:2607.23264，第三方）</td></tr>
 <tr><td>C26</td><td>DG_COMM_KERNEL_DEBUG 调试开关清零对称缓冲</td><td>README Utilities 节</td></tr>
 <tr><td>C27</td><td>仍在开发声明；发布与内部模型无关</td><td>PR #304 Additional notes</td></tr>
-<tr><td>C28</td><td>八位贡献者（LyricZhao/Chenggang Zhao 等）</td><td>PR #304 Contributors</td></tr>
+<tr><td>C28</td><td>八位贡献者</td><td>PR #304 Contributors</td></tr>
 <tr><td>C29</td><td>NVLink barrier 三处：拉取前、归约前、清理后</td><td>.cuh 行 308-311、403-409、1313-1318；layout/mega_moe.cuh 行 129-156</td></tr>
 <tr><td>C30</td><td>寄存器再分配（三组 48/40/208 或 96/88/160，上限 64512）</td><td>.cuh 行 313-322</td></tr>
 </tbody>

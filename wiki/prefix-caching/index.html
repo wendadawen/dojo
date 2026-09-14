@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="前缀缓存是什么：跨请求识别公共前缀并复用其 KV cache。SGLang RadixAttention 的 radix tree 组织与匹配、LRU 叶子优先逐出与引用计数、页大小如何决定命中率、以及 vLLM/Mooncake 的哈希指纹实现。">
-  <meta name="dojo:summary" content="前缀缓存把完成请求的 KV cache 留在显存供后续请求复用：匹配是逐 token 精确前缀（系统提示词、多轮对话历史、few-shot、RAG 文档四类来源）。SGLang 用 radix tree 组织——沿树匹配到分叉点即最长可复用前缀，LRU 从叶子逐出让共享祖先天然长寿，引用计数保护运行请求。命中率除负载与容量外还受页大小制约：按整页计命中，$\lfloor$共享长度$/ $页大小$\rfloor$ 页命中，页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%。vLLM/Mooncake 用哈希指纹链实现同一目标。">
+  <meta name="dojo:summary" content="前缀缓存把完成请求的 KV cache 留在显存供后续请求复用：匹配是逐 token 精确前缀（系统提示词、多轮对话历史、few-shot、RAG 文档四类来源）。SGLang 用 radix tree 组织——沿树匹配到分叉点即最长可复用前缀，LRU 从叶子逐出让共享祖先天然长寿，引用计数保护运行请求。命中率除负载与容量外还受页大小制约：按整页计命中，页命中数 $=\left\lfloor\text{共享前缀长度}/\text{页大小}\right\rfloor$，页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%。vLLM/Mooncake 用哈希指纹链实现同一目标。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="内存与缓存, 推理系统">
   <meta name="dojo:tag" content="KV cache">
@@ -116,7 +116,7 @@
 <thead><tr><th>来源</th><th>共享内容</th><th>典型形态</th></tr></thead>
 <tbody>
 <tr><td>系统提示词</td><td>所有请求相同的开头指令段</td><td>本文开篇的 200 token 系统提示词，百万请求共享</td></tr>
-<tr><td>多轮对话历史</td><td>上一轮的全部输入 + 上一轮输出</td><td>第 $n$ 轮请求 $=$ 第 $n-1$ 轮完整序列 $+$ 新消息</td></tr>
+<tr><td>多轮对话历史</td><td>上一轮的全部输入 $+$ 上一轮输出</td><td>第 $n$ 轮请求 $=$ 第 $n-1$ 轮完整序列 $+$ 新消息</td></tr>
 <tr><td>few-shot 示例</td><td>提示中同一批示例</td><td>同一任务的多个查询共享示例段</td></tr>
 <tr><td>RAG / 文档问答</td><td>同一份检索文档或手册</td><td>多个用户查询同一份 20,000 token 手册</td></tr>
 </tbody>
@@ -230,9 +230,9 @@
   </li>
 </ol>
 
-<h2 id="hit-rate">4. 命中率——页大小是隐藏的自变量</h2>
+<h2 id="hit-rate">4. 命中率——页大小这一独立变量</h2>
 
-<p>前缀缓存的收益最终由命中率决定：命中 token 占总 token 的比例。三个因素共同决定它：负载的共享结构（请求间共享多长的前缀）、缓存容量（逐出压力）、以及<b>页大小</b>这一常被忽略的变量。</p>
+<p>前缀缓存的收益最终由命中率决定：命中 token 占总 token 的比例。三个因素共同决定它：负载的共享结构（请求间共享多长的前缀）、缓存容量（逐出压力）、以及<b>页大小</b>这一独立变量。</p>
 
 <p>页大小影响命中率的机制是按页匹配（<a href="../paged-attention/index.html">PagedAttention</a> 的页）：缓存以页为分配与共享单元，匹配时只有<b>完整落在共享前缀内</b>的页才算命中<sup>[C8]</sup>。页命中数与命中 token 数为：</p>
 
@@ -245,13 +245,13 @@ $$\text{页命中数}=\left\lfloor\frac{\text{共享前缀长度}}{\text{页大�
 <thead><tr><th>页大小</th><th>页命中数</th><th>命中 token 数</th><th>落空部分</th></tr></thead>
 <tbody>
 <tr><td>1（SGLang）</td><td>$\lfloor 100/1\rfloor=100$</td><td>100</td><td>无</td></tr>
-<tr><td>32（TensorRT-LLM 默认；vLLM 默认 16，32 是最大支持值）</td><td>$\lfloor 100/32\rfloor=3$</td><td>96</td><td>最后 4 token</td></tr>
+<tr><td>32（TensorRT-LLM 默认；vLLM 默认 16，32 是最大支持值）<sup>[N5]</sup></td><td>$\lfloor 100/32\rfloor=3$</td><td>96</td><td>最后 4 token</td></tr>
 <tr><td>256（大页）</td><td>$\lfloor 100/256\rfloor=0$</td><td>0</td><td>整段：100 token 均不足一页</td></tr>
 </tbody>
 </table>
 </div>
 
-<p>共享前缀不是页大小整数倍时，尾巴上不足一页的部分全部落空；页越大落空越多，极端时整段共享归零。这不是理论洁癖：Strata 论文的实验里，页 512 配置的 SGLang-HiCache（在 SGLang 上实现分层缓存的对照基线）命中率比 Strata-IO（Strata 启用 GPU 辅助 I/O 的变体）低 2.4%，把基线系统调到其最优页大小（512）吞吐也只为 Strata-IO 的 93%<sup>[N2]</sup>。SGLang 把页大小定为 1 token，匹配粒度即到 token 级、无页对齐损失<sup>[N1]</sup>——代价则是管理开销与跨层传输单元（<a href="../paged-attention/index.html">PagedAttention</a> 第 3、4 章的另一半权衡）。</p>
+<p>共享前缀不是页大小整数倍时，尾巴上不足一页的部分全部落空；页越大落空越多，极端时整段共享归零。该效应在实测中已出现：Strata 论文的实验里，页 512 配置的 SGLang-HiCache（在 SGLang 上实现分层缓存的对照基线）命中率比 Strata-IO（Strata 启用 GPU 辅助 I/O 的变体）低 2.4%，把基线系统调到其最优页大小（512）吞吐也只为 Strata-IO 的 93%<sup>[N2]</sup>。SGLang 把页大小定为 1 token，匹配粒度即到 token 级、无页对齐损失<sup>[N1]</sup>——代价则是管理开销与跨层传输单元（<a href="../paged-attention/index.html">PagedAttention</a> 第 3、4 章的另一半权衡）。</p>
 
 <p>最后一个边界：命中要求页"已在显存且已算完"。在 CPU/SSD 层的命中还要先把页搬回 GPU（分层缓存，搬运效率是 <a href="../strata/index.html">Strata</a> 的主题）；前缀"正在计算中"时到达的同前缀请求也不能直接复用，反而会引发重复计算——这个 delay hit 现象同样在 Strata 一文中处理<sup>[C10]</sup>。</p>
 
@@ -312,13 +312,13 @@ $$\text{页命中数}=\left\lfloor\frac{\text{共享前缀长度}}{\text{页大�
 <h2 id="sources-and-scope-notes">来源与范围说明</h2>
 
 <h3>论断与来源（C）</h3>
-<p>C1（既有系统完成后丢弃缓存、阻止复用）、C2（RadixAttention 运行时自动复用 + LRU + cache-aware 调度 + 兼容性）、C3（radix tree 压缩边、token-张量映射、页 1 token、非连续分页）、C4（LRU 叶子优先、祖先复用）、C5（引用计数与共享内存池）、C9（生成结果入缓存）：Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs", NeurIPS 2024（arXiv:2312.07104）§1、§3.2。C6（context/prefix caching 被 OpenAI、Google 等采用）、C7（SGLang RadixTree / vLLM+Mooncake 哈希 / LMDeploy 混合 trie / Strata 扩展 HiRadixTree）、C10（delay hit：同前缀请求在首个 miss 未解决时排队、批内重复 prefill）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v1）§2.3、§6、§3.2。C8（按页匹配、页大小影响命中率）：Strata 论文 §3.1（"cache matching is performed on a per-page basis"）。"树 vs 哈希"优劣对比为分析性判断，已在正文标注。</p>
+<p>C1（既有系统完成后丢弃缓存、阻止复用）、C2（RadixAttention 运行时自动复用 + LRU + cache-aware 调度 + 兼容性）、C3（radix tree 压缩边、token-张量映射、页 1 token、非连续分页）、C4（LRU 叶子优先、祖先复用）、C5（引用计数与共享内存池）、C9（生成结果入缓存）：Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs", NeurIPS 2024（arXiv:2312.07104）§1、§3.2。C6（context/prefix caching 被 OpenAI、Google 等采用）、C7（SGLang RadixTree / vLLM+Mooncake 哈希 / LMDeploy 混合 trie / Strata 扩展 HiRadixTree）、C10（delay hit：同前缀请求在首个 miss 未解决时排队、批内重复 prefill）：Xie et al., "Strata", OSDI 2026（arXiv:2508.18572v1）§2.3、§3.2、§4.1、§6。C8（按页匹配、页大小影响命中率）：Strata 论文 §3.1（"cache matching is performed on a per-page basis"）。"树 vs 哈希"优劣对比为分析性判断，已在正文标注。</p>
 
 <h3>公式与来源（F）</h3>
 <p>F1（页命中数 $=\left\lfloor\text{共享前缀长度}/\text{页大小}\right\rfloor$）：按页匹配机制（C8）的直接换算，构造算例专用；非论文给出的显式公式。</p>
 
-<h3>外部数字与实验条件</h3>
-<p>N1（SGLang 页大小 $=$ 1 token）：SGLang 论文 §3.2。N2（页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%、最优页吞吐为 Strata-IO 的 93%）：Strata 论文 §5.3.2（条件：SGLang-HiCache 基线、Qwen2.5-14B、H200、LooGLE、对照为 Strata-IO）。N3（共享 100 token $\times$ 页 1/32/256 算例）：构造示例。N4（分层系统约 95% 命中率）：Strata 论文 §5.2.1（LooGLE、1TB pinned DRAM；本文未正文引用，仅口径备查）。</p>
+<h3>外部数字与实验条件（N）</h3>
+<p>N1（SGLang 页大小 $=$ 1 token）：SGLang 论文 §3.2。N2（页 512 配置的 SGLang-HiCache 命中率比 Strata-IO 低 2.4%、最优页吞吐为 Strata-IO 的 93%）：Strata 论文 §5.3.2（条件：SGLang-HiCache 基线、Qwen2.5-14B、H200、LooGLE、对照为 Strata-IO）。N3（共享 100 token $\times$ 页 1/32/256 算例）：构造示例。N4（分层系统约 95% 命中率）：Strata 论文 §5.2.1（LooGLE、1TB pinned DRAM；本文未正文引用，仅口径备查）。N5（页大小默认值：TensorRT-LLM 典型 32、vLLM 典型 16，32 为 vLLM 在 CUDA GPU 上的最大支持值）：Strata 论文 §2.2、§3.1。</p>
 
 <h3>构造示例</h3>
 <p>系统提示词 $S$（200 token）与消息 $m_1$（30 token）、$m_2$（40 token）、另一提示词 $S'$：数字为便于手算的构造选择；三请求走树的过程（R1/R2/R3，总计算 500 对 690 token）与 100 token $\times$ 三种页大小的命中表均为构造算例，机制与来源论断一致。</p>
@@ -327,7 +327,7 @@ $$\text{页命中数}=\left\lfloor\frac{\text{共享前缀长度}}{\text{页大�
 <p>"共享前缀天然长寿"是对 LRU 叶子优先逐出的效果描述（论文机制原文为叶子先逐出、祖先可继续复用），"存活期与引用分支数成正比"为推断标注。"分布式缓存友好"只解释指纹与位置无关这一局部性质，不构成对 Mooncake 架构的完整描述。</p>
 
 <h3>简化条件及其限制</h3>
-<p>其一，树上匹配描述到 token 粒度，SGLang 实现细节（节点锁、异步插入等工程问题）未展开。其二，cache-aware 调度（优先调度与缓存匹配的请求）只在 scope 层面提及一句，策略对比（如 LPM）归 Strata 一文消融部分。其三，近似缓存（CacheGen/CacheBlend）只作一句排除（要求精确前缀），其机制不覆盖。其四，命中条件的两个前提（页在显存、已算完）在第 4 章末尾说明，相关机制（分层传输、delay hit）归 Strata 一文。</p>
+<p>其一，树上匹配描述到 token 粒度，SGLang 实现细节（节点锁、异步插入等工程问题）未展开。其二，cache-aware 调度（优先调度与缓存匹配的请求）只在 scope 层面提及一句，策略对比（如最长前缀优先 LPM）归 Strata 一文消融部分。其三，近似缓存（CacheGen/CacheBlend）只作一句排除（要求精确前缀），其机制不覆盖。其四，命中条件的两个前提（页在显存、已算完）在第 4 章末尾说明，相关机制（分层传输、delay hit）归 Strata 一文。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

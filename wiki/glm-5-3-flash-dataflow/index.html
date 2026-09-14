@@ -916,7 +916,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
     </div>
 
     <div class="callout">
-      <p>上表的 MLA 部分按<strong>潜向量</strong>口径算（每 token 每层 512 维），这是推理框架的做法。官方 transformers 实现走的是另一条路：先 <code>expand_kv</code> 展开成 64 个头再 cache，实测缓存形状为 $[B,64,L,256]$，每 token 每层 32768 个元素即 64 KiB，是潜向量口径的 64 倍<sup>[N11]</sup>。两个口径差 64 倍，长上下文数字取潜向量口径；transformers 的展开口径不代表实际部署时的显存占用。</p>
+      <p>上表的 MLA 部分按<strong>潜向量</strong>口径算（每 token 每层 512 维），这是推理框架的做法。官方 transformers 实现走的是另一条路：先 <code>expand_kv</code> 展开成 64 个头再 cache，实测 K 与 V 各为 $[B,64,L,256]$，每 token 每层合计 32768 个元素即 64 KiB，是潜向量口径的 64 倍<sup>[N11]</sup>。两个口径差 64 倍，长上下文数字取潜向量口径；transformers 的展开口径不代表实际部署时的显存占用。</p>
     </div>
 
     <h2 id="quant">10. FP8 量化的覆盖范围</h2>
@@ -988,7 +988,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
 
     <h3>公式与数据流：实跑官方算子</h3>
 
-    <p>321 B 模型无法在单机 CPU 上加载，但公式可以单独验证。做法是从官方 <code>modeling_glm5_next.py</code> 原样抽取第 63–1330 行（RMSNorm 到 DecoderLayer）执行，架构代码<strong>一行不改</strong>，只把当前 transformers 版本缺失的框架装饰器替换为恒等实现——这些装饰器的官方语义是「装了 kernel hub 就换实现，否则用文件内的 PyTorch 参考实现」，恒等替换后走的正是待验证的参考分支。抽取区间的起止用断言锁定，防止上游文件行号漂移后静默抽错。</p>
+    <p>321 B 模型无法在单机 CPU 上加载，但公式可以单独验证。做法是从官方 <code>modeling_glm5_next.py</code> 原样抽取第 63–1330 行（RMSNorm 到 DecoderLayer）执行，架构代码<strong>一行不改</strong>，只把当前 transformers 版本缺失的框架装饰器替换为恒等实现——这些装饰器的官方语义是「装了 kernel hub 就换实现，否则用文件内的 PyTorch 参考实现」，恒等替换后走的正是待验证的参考分支。</p>
 
     <p>在此基础上用真实 config 的维度喂小随机张量：单个 KDA 层与 DSA 层用完整真实维度（隐藏 4096、64 头、128/256 维），端到端前向缩到 8 层、16 专家但保留全部结构特征（4 层一循环的类型交替、前 3 层 dense、4 路残差流），跑通 prefill 加 4 步 decode，全程无 NaN 或 Inf。</p>
 
@@ -1032,7 +1032,7 @@ h = post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1,-2) @ residual</cod
       <li id="n8"><strong>[N8]</strong> k-pool 候选数与稀疏度换算表。条件：按 <code>index_topk=2048</code>、<code>index_kpool=4</code> 计算，候选池数为 $\lceil L/4\rceil$、选中数为 $\min(512, \lceil L/4\rceil)$。为公式推算而非逐长度实跑（未构造 1M 序列）；换算式本身在 $L\in\{16,40,64\}$ 上经实跑验证（实测得到）。</li>
       <li id="n9"><strong>[N9]</strong> $L\le$ 预算时退化为因果掩码、缩小预算后的稀疏选择与尾巴语义。条件：真实 DSA 层维度；因果退化在 <code>index_topk=2048</code>、$L\in\{16,40\}$ 下实测；稀疏行为在 <code>index_topk=16</code>（其余不变）、$L=64$ 下实测（实测得到）。</li>
       <li id="n10"><strong>[N10]</strong> 长上下文显存对照表与 4288 token 交叉点。条件与依据：KDA 侧循环状态 $[64,128,128]$ 按 fp32 计——源码调用 <code>update_recurrent_state(last_recurrent_state.to(torch.float32))</code>，显式转 fp32；卷积状态按 $[24576,4]$、bf16 计——<code>cache_utils.py</code> 的 <code>lazy_initialization</code> 用 <code>torch.zeros((*conv_states.shape[:-1], conv_kernel_size), dtype=conv_states.dtype)</code> 分配，宽度等于 <code>conv_kernel_size</code>（即 kernel 值 4，非 $kernel-1$），dtype 随激活。共 34 层。DSA 侧每 token 每层计 769 个元素、bf16：MLA 潜向量 $kv\_lora\_rank + qk\_rope\_head\_dim = 512$，加 indexer 的 packed 状态 $index\_head\_dim\times2+1 = 257$——源码把 <code>cat([k, gate_scores, valid_channel])</code> 交给 <code>update_indexer</code> 逐 token 累积，<code>get_pooled_states</code> 每步都要读它重建候选池，属解码必需状态。共 11 层。漏掉这 257 维会把交叉点高估为 4288 token 并使 $L=4096$ 行的符号反转。「假想全 DSA」是为算节省比例构造的基线，非真实存在的配置。实测得到。</li>
-      <li id="n11"><strong>[N11]</strong> transformers 实现的 KV cache 形状为 $[1,64,L,256]$，每 token 每层 32768 个元素。条件：真实 DSA 层，B=1、L=40 prefill 后读取缓存张量形状。这是官方 transformers 的实现口径（<code>expand_kv</code> 后 cache）；推理框架可改为 cache 潜向量，本探针不能证明后者的实现细节。实测得到。</li>
+      <li id="n11"><strong>[N11]</strong> transformers 实现的 KV cache 形状为 K、V 各 $[1,64,L,256]$，每 token 每层合计 32768 个元素。条件：真实 DSA 层，B=1、L=40 prefill 后读取缓存张量形状。这是官方 transformers 的实现口径（<code>expand_kv</code> 后 cache）；推理框架可改为 cache 潜向量，本探针不能证明后者的实现细节。实测得到。</li>
       <li id="n12"><strong>[N12]</strong> 图像与视频掩码划分。条件：按源码的 <code>get_placeholder_mask</code> 判定式，在构造的 12 token 序列上实测（实测得到）。</li>
       <li id="n13"><strong>[N13]</strong> routed 专家占比与激活率。条件：口径需一致——311.65 B 与 96.99% 的分母是含 MTP 层的 321.32 B；304.41 B 只含主干 42 个 MoE 层；96.98% 与 5.54% 的分母是扣除 MTP 层后的主干 313.89 B。混用分母会得到错误比例。统计按 checkpoint 张量名分组进行（实测得到）。</li>
     </ol>

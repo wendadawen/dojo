@@ -29,3 +29,5 @@ reviewed_content_sha256: bc23bc97c067b436
 
 - 统计：阻断 0 / 重要 0 / 轻微 3
 - 处置：可发布
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

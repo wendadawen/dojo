@@ -155,7 +155,7 @@
 <p>这个分工决定了一个不对称：每次需要复用 KV-Cache 的请求，prefill 引擎都要从存储读回自己的 KV-Cache；DE 引擎在这个过程中完全没有承担任何 storage I/O。下图把这种不对称画成视觉对比：</p>
 
 <p><img src="assets/img-13.webp" alt="双路径动机：左 PE 100% 存储、40% GPU；右 DualPath 80% GPU、两侧 100% 存储"></p>
-<p><b>图（原文 Figure 1）</b>：左：现有 PD 分离架构，PE 节点 storage NIC 100% 饱和、GPU 利用率 40%，DE 节点 storage NIC 基本空闲（KV-Cache 读取带宽未被利用）。右：DualPath 双路径，让两侧 SNIC 都参与加载、把 GPU 利用率推回 80%。名字对应两条 KV-Cache 加载路径（页面解释，论文未说明命名由来）。</p>
+<p><b>图（原文 Figure 1）</b>：左：现有 PD 分离架构，PE 节点 storage NIC 100% 饱和、GPU 利用率 40%，DE 节点 storage NIC 基本空闲（KV-Cache 读取带宽未被利用）。右：DualPath 双路径，让两侧 SNIC 都参与加载、把 GPU 利用率推回 80%。名字对应两条 KV-Cache 加载路径（推断；论文未说明命名由来）。</p>
 
 <p>为什么以前没人加第二条路径？论文 §1 简要列了几条原因：Mooncake（FAST'25）走的是「DRAM 池」路线，把 KV-Cache 缓存到分布式 DRAM 再用亲和性调度提高命中率。但 DRAM 池在两类场景不适用：rollout 阶段（agentic RL 训练中的 trajectory 采样）DRAM 被训练状态占用；在在线服务下 working set 可以远超 DRAM 容量（论文 §8.2 给出 DS 660B 在 0.45 APS（每秒 agent 到达率）下 working set 达 681 GB），相对 SSD 不具备成本优势。Strata（论文 reference.bib 中条目为 @misc，无具体会议字段）在 §9 Related Work 段被列为相邻工作，走「层次化存储 + GPU 辅助 I/O 调度」路线；KVPR、TailorKV 同样在 §9 Related Work 段被列，走「单数据路径内压缩 / 重叠」路线——这些工作都未打破「只走一条 SNIC」这一根本假设。</p>
 
@@ -213,9 +213,9 @@
 
 <p>转换关系简单：$n$ 个相邻 Layer Block 在内存布局上连续，可直接拼成一个 Full Block，避免运行时切块拷贝。论文把这个性质作为设计点（§A.5「KV-Cache Block Layout」）。</p>
 
-<p>存储端的 KV-Cache 索引用 trie 树：每个 trie 节点对应一个 Full Block（论文 §A.5 只说明这一存储结构与节点含义）。命中查询时，从请求的 prompt 前缀沿 trie 找到最长 hit 区间，再按 Full Block 读出——查询过程为辅助解释，论文未展开。trie 前缀匹配与业界 prefix cache 的常见做法一致，但这一说法是页面推断（论文未就此对比）；与 layerwise prefill 的耦合让 block_size 远小于传统非分层方案。</p>
+<p>存储端的 KV-Cache 索引用 trie 树：每个 trie 节点对应一个 Full Block（论文 §A.5 只说明这一存储结构与节点含义）。命中查询时，从请求的 prompt 前缀沿 trie 找到最长 hit 区间，再按 Full Block 读出——查询过程为辅助解释，论文未展开。trie 前缀匹配与业界 prefix cache 的常见做法一致，但论文未就此对比，此处为推断；与 layerwise prefill 的耦合让 block_size 远小于传统非分层方案。</p>
 
-<p>PE/DE buffer 则是各引擎 host DRAM 上划出的小块缓存，承担两类中转：storage↔engine 之间（F-1、F-2 描述的每对 PE-DE 存储侧流量都先经过 buffer），以及 engine↔engine 之间（CNIC 的 RDMA 写入也要在 DRAM 上落一次）。论文 §4.1 Decode Phase 段解释：刻意不绕过 buffer 直接走 GPU Direct RDMA，是因为 TTFT 在 agentic 场景下占总时延比例不可忽略，buffer 可以减少 GPU 显存瞬时占用。让 H2D/D2H 也走 CNIC 是第四章流量隔离方案的组成部分（论文 §5 引言段）；这一联系由页面综合两处得出，§4.1 Decode Phase 段未作此表述。</p>
+<p>PE/DE buffer 则是各引擎 host DRAM 上划出的小块缓存，承担两类中转：storage↔engine 之间（F-1、F-2 描述的每对 PE-DE 存储侧流量都先经过 buffer），以及 engine↔engine 之间（CNIC 的 RDMA 写入也要在 DRAM 上落一次）。论文 §4.1 Decode Phase 段解释：刻意不绕过 buffer 直接走 GPU Direct RDMA，是因为 TTFT 在 agentic 场景下占总时延比例不可忽略，buffer 可以减少 GPU 显存瞬时占用。让 H2D/D2H 也走 CNIC 是第四章流量隔离方案的组成部分（论文 §5 引言段）；这一联系为综合两处得出的推断，§4.1 Decode Phase 段未作此表述。</p>
 
 <h3 id="chapter-2-questions">本章问题</h3>
 <ol class="chapter-questions">
@@ -473,7 +473,7 @@
 <li>本组所有 DE 都不够 HBM 时停止 fetch</li>
 </ol>
 
-<p>Z 阈值取 1.05 倍均值来自论文 §6；把 5% 余量解释为容忍 HBM 碎片与估计误差是页面的推断，论文未说明 1.05 的取法。</p>
+<p>Z 阈值取 1.05 倍均值来自论文 §6；把 5% 余量解释为容忍 HBM 碎片与估计误差属推断，论文未说明 1.05 的取法。</p>
 
 <h3 id="path-choice">5.4 KV-Cache 读路径选择</h3>
 
@@ -502,7 +502,7 @@
 <p>为什么 Z 阈值取 1.05 倍均值而不是 1.0？</p>
 <details>
 <summary>解答：留 5% 余量容忍 HBM 碎片与估计误差</summary>
-<p>HBM 分配并非完美连续——已分配的 KV-Cache 块在 HBM 中可能存在碎片，导致实际能装下的请求数低于「按总容量简单算」的结果。1.05 倍均值是页面为覆盖大多数碎片场景给出的解释（推断）。论文没有给出碎片对 Z 影响的精确分析，也未说明 1.05 的取法，因此该系数是工程经验值而非理论最优。</p>
+<p>HBM 分配并非完美连续——已分配的 KV-Cache 块在 HBM 中可能存在碎片，导致实际能装下的请求数低于「按总容量简单算」的结果。留 5% 余量以覆盖大多数碎片场景为推断。论文没有给出碎片对 Z 影响的精确分析，也未说明 1.05 的取法，因此该系数是工程经验值而非理论最优。</p>
 </details>
 </li>
 <li>
@@ -736,7 +736,7 @@
 
 <h3>核心论断与原文定位</h3>
 <p>本节 C/F/N 编号为来源与范围说明自建索引；正文未逐条标注 [C-x] 标记，仅供审计追溯。下表按 C 编号分组列出每条核心论断在原文 §X / Table X / Figure X 中的位置。</p>
-<p>页面所有 C 编号论断均来自 arXiv:2602.21548v2。详细定位：</p>
+<p>所有 C 编号论断均来自 arXiv:2602.21548v2。详细定位：</p>
 <ul>
 <li>C-1 至 C-7（动机三因素）：§1 Intro 末段、§3 Motivation 各段、Table 1、Fig.1、Fig.2、Fig.3</li>
 <li>C-8 至 C-10（双路径数据流与块布局）：§4.1 Dual-Path Loading 各段、§A.5 Block Layout</li>
@@ -752,22 +752,22 @@
 <p>F-1/F-2（每对 PE-DE 流量基本单元）：§4.2 Traffic per PE-DE pair 段。F-3 至 F-12（CNIC/PCIE/DRAM 推导）：§4.2 PE CNIC Bandwidth、DE CNIC Bandwidth、DRAM Pressure、Summary 各段。F-13（Z 阈值）：§6 DE Scheduling Phase 2 段。F-14（working set 估算）：§8.2 Working Set Analysis 段。</p>
 
 <h3>外部数字与实验条件</h3>
-<p>页面 N 编号论断均来自论文正文或 Appendix §A；具体实验条件（数据集 500 trajectories、3FS 存储、8×Hopper GPU/节点、IB 400 Gbps CNIC + 1×400 Gbps SNIC、P/D 默认 2P4D/1P2D/1P1D）见 §7.2 Testbed 与 §A.4 Configuration Parameters 段。</p>
+<p>N 编号论断均来自论文正文或 Appendix §A；具体实验条件（数据集 500 trajectories、3FS 存储、8×Hopper GPU/节点、IB 400 Gbps CNIC + 1×400 Gbps SNIC、P/D 默认 2P4D/1P2D/1P1D）见 §7.2 Testbed 与 §A.4 Configuration Parameters 段。</p>
 
 <h3>原图与原文对应</h3>
-<p>页面内嵌的 14 张原图与原文 Figure 编号一一对应：motivation=Fig.3、teaser=Fig.1、dataflow_peread/ceread=Fig.4（左/右子图）、intrasched=Fig.6、rollout_combined=Fig.7、27b_rollout_diffpd=Fig.8、660b_rollout_var_append=Fig.9、660b-27b-serving-aps=Fig.10、660b_serving_breakdown=Fig.12、serving-aps-avg-jct=Fig.11、read_lb=Fig.13、attn_lb=Fig.14、largescale_rollout=Fig.15。Fig.2 (workload) 与 Fig.5 (intersched) 不在页面复用：trajectory 用文字描述、inter-sched 调度逻辑由 Algorithm 1 伪代码 + 文字承载。全部图片存于本页 assets/ 目录，页面可离线浏览。</p>
+<p>内嵌的 14 张原图与原文 Figure 编号一一对应：motivation=Fig.3、teaser=Fig.1、dataflow_peread/ceread=Fig.4（左/右子图）、intrasched=Fig.6、rollout_combined=Fig.7、27b_rollout_diffpd=Fig.8、660b_rollout_var_append=Fig.9、660b-27b-serving-aps=Fig.10、660b_serving_breakdown=Fig.12、serving-aps-avg-jct=Fig.11、read_lb=Fig.13、attn_lb=Fig.14、largescale_rollout=Fig.15。Fig.2 (workload) 与 Fig.5 (intersched) 未复用：trajectory 用文字描述、inter-sched 调度逻辑由 Algorithm 1 伪代码 + 文字承载。全部图片存于 assets/ 目录，可离线浏览。</p>
 
 <h3>论文事实与分析性判断</h3>
-<p>页面第七章（方法评价）整体是分析性判断，开头已用 callout 标记「不是论文的结论」。其他章节均为论文事实的直接陈述，附原文定位。少数边界性论断（如「DualPath 在非 agentic 场景收益有限」）在正文中标注为推断而非事实。</p>
+<p>第七章（方法评价）整体是分析性判断，开头已用 callout 标记「不是论文的结论」。其他章节均为论文事实的直接陈述，附原文定位。少数边界性论断（如「DualPath 在非 agentic 场景收益有限」）在正文中标注为推断而非事实。</p>
 
 <h3>构造示例</h3>
-<p>Algorithm 1 伪代码完全照搬论文 §6 Algorithm 1，仅作为表述算法流程使用，未声明为可运行代码。$Z = 1.05 \times \text{平均}$ 的 $1.05$ 系数来自论文正文，页面将其含义解释为「留 5% 余量容忍 HBM 碎片与估计误差」（推断），论文未给出推导。贯穿示例 64K MaxLen/append 429/32721 hit + 429 miss 是人为设定的最小直接代入（论文 trace 平均 append 429、context 32721；为便于 P/D 区间与调度章节代入，统一采用 32721 hit + 429 miss 作为代表数字，命中率 1 − 429/32721 $\approx 98.7\%$ 与 trace 一致），与论文 trace 数字部分对应、部分构造。</p>
+<p>Algorithm 1 伪代码完全照搬论文 §6 Algorithm 1，仅作为表述算法流程使用，未声明为可运行代码。$Z = 1.05 \times \text{平均}$ 的 $1.05$ 系数来自论文正文，其含义可解释为「留 5% 余量容忍 HBM 碎片与估计误差」（推断），论文未给出推导。贯穿示例 64K MaxLen/append 429/32721 hit + 429 miss 是人为设定的最小直接代入（论文 trace 平均 append 429、context 32721；为便于 P/D 区间与调度章节代入，统一采用 32721 hit + 429 miss 作为代表数字，命中率 1 − 429/32721 $\approx 98.7\%$ 与 trace 一致），与论文 trace 数字部分对应、部分构造。</p>
 
 <h3>辅助解释与类比边界</h3>
 <p>「第二个 storage NIC」与「compute NIC 闲置资源」是辅助解释，不是论文术语；论文严格用 SNIC 与 CNIC。「双路径」是中文翻译，论文英文是「dual-path」。「PD 分离」中文用，全称 Prefill-Decode Disaggregation，<a href="../../wiki/moe-serving/index.html#s5-prefill-decode-kvcache">moe-serving §5</a> 给出背景。</p>
 
 <h3>简化条件及其限制</h3>
-<p>页面推导假设 PCIe 拓扑良好、调度均衡、计算网无拥塞、存储读带宽饱和（§4.2 引言），这些假设在生产集群上需要验证。第三章的不等式推导是「无新瓶颈」的充分条件，不是「能工作」的必要条件——实际可能存在区间外仍能工作的情况。第四章 vlarb 权重配置按实测给出（§A.1），不同 NIC 厂商或固件版本下可能需要调整。第七章的「解决了什么 / 没解决什么」边界基于论文 §1-9 已陈述内容；论文未做的实验（如非 agentic 工作负载）结论只能由读者自行外推。</p>
+<p>推导假设 PCIe 拓扑良好、调度均衡、计算网无拥塞、存储读带宽饱和（§4.2 引言），这些假设在生产集群上需要验证。第三章的不等式推导是「无新瓶颈」的充分条件，不是「能工作」的必要条件——实际可能存在区间外仍能工作的情况。第四章 vlarb 权重配置按实测给出（§A.1），不同 NIC 厂商或固件版本下可能需要调整。第七章的「解决了什么 / 没解决什么」边界基于论文 §1-9 已陈述内容；论文未做的实验（如非 agentic 工作负载）结论只能自行外推。</p>
 
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>

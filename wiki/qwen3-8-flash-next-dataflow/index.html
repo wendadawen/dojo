@@ -130,9 +130,9 @@
   <table>
     <tr><th>项目</th><th>取值</th><th>config 键 / 核对方式</th></tr>
     <tr><td>总参数量</td><td>179,999,981,424（180.0B）</td><td>131 个分片张量头逐一累加（本机实测得到）</td></tr>
-    <tr><td>语言主干（除 N-gram 表与 MTP）</td><td>125.74B</td><td>官方称「Transformer 参数 125B」，独立算得 125,743,653,760</td></tr>
-    <tr><td>N-gram Embedding 表</td><td>51.20B</td><td>官方称「51B」，独立算得 51,200,245,760</td></tr>
-    <tr><td>单 token 激活</td><td>6.04B（不含 embedding 与 lm_head）</td><td>官方称「激活 6B」，独立算得 6,035,598,720</td></tr>
+    <tr><td>语言主干（除 N-gram 表、视觉编码器与 MTP）</td><td>125.74B</td><td>官方模型卡标为「Total Parameters 125B」，独立算得 125,743,653,760（官方为约数，相差 0.74B / 0.6%）</td></tr>
+    <tr><td>N-gram Embedding 表</td><td>51.20B</td><td>官方模型卡标为「N-gram Embedding Parameters 51B」，独立算得 51,200,245,760</td></tr>
+    <tr><td>单 token 激活</td><td>6.04B（不含 embedding 与 lm_head）</td><td>官方模型卡标为「Activated Parameters 6B」，独立算得 6,035,598,720</td></tr>
     <tr><td>层数与层型</td><td>48 层 = 36 GDN + 12 QSA</td><td><code>layer_types</code>；权重中 <code>linear_attn</code> 恰 36 层、<code>self_attn</code> 恰 12 层</td></tr>
     <tr><td>QSA 所在层（0 起）</td><td>3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47</td><td><code>full_attention_interval=4</code>；张量清单完全一致</td></tr>
     <tr><td>隐藏维度</td><td>2560</td><td><code>hidden_size</code></td></tr>
@@ -144,7 +144,7 @@
     <tr><td>N-gram 注入层（0 起）</td><td>仅第 1 层</td><td><code>ple_layer_ids=[2]</code>（1 起）；权重中仅第 1 层有 <code>ple.*</code></td></tr>
     <tr><td>上下文长度</td><td>262144（原生）</td><td><code>max_position_embeddings</code></td></tr>
     <tr><td><a href="../positional-encoding/">位置编码</a></td><td><a href="../mrope/">交错 MRoPE</a>，仅旋转头维前 64 维</td><td><code>partial_rotary_factor=0.25</code>、<code>mrope_section=[11,11,10]</code>、<code>rope_theta=1e7</code></td></tr>
-    <tr><td><a href="../speculative-decoding/">MTP 草稿层</a></td><td>1 层，按张量头累加 2.61B</td><td><code>mtp_num_hidden_layers</code>；权重前缀 <code>mtp.*</code> 共 31 个张量。官方模型卡称「4B MTP」，与本机按张量头累加所得约 2.61B 不一致，页内以累加值为准</td></tr>
+    <tr><td><a href="../speculative-decoding/">MTP 草稿层</a></td><td>1 层，按张量头累加 2.61B</td><td><code>mtp_num_hidden_layers</code>；权重前缀 <code>mtp.*</code> 共 31 个张量。官方模型卡标为「MTP Parameters 4B」，与本机按张量头累加所得约 2.61B 不一致，此处以累加值为准</td></tr>
     <tr><td>视觉编码器</td><td>27 层 ViT，宽 1152，patch 16，2×2 合并后输出 2560</td><td><code>vision_config</code>；0.449B 参数，展开见第 4 节</td></tr>
     <tr><td>权重精度</td><td>1655 个张量 BF16，3 个 I64 缓冲</td><td>张量头 dtype 统计</td></tr>
   </table>
@@ -243,7 +243,7 @@
   <h3>整体结构：3:1 交替 + 四条残差流</h3>
   <ul>
     <li><b>沿序列</b>：48 层按 <code>full_attention_interval=4</code> 排布，即第 3、7、11…47 层（0 起）为 QSA，其余 36 层为 GDN。真实权重里含 <code>linear_attn.*</code> 的恰好 36 层、含 <code>self_attn.*</code> 的恰好 12 层，层号与 config 完全一致；12 个 QSA 层每层都带 <code>self_attn.indexer.*</code>，与源码中 <code>Qwen4ExpTextAttention.__init__</code> 无条件构造索引器的写法对应。</li>
-    <li><b>沿深度</b>：入口处 <code>hidden_states.repeat(1, 1, 4)</code> 把 embedding 复制成 4 份，残差流此后全程为 $4\times2560=10240$ 宽。每层内部 <code>attn_hyper_connection</code> 与 <code>mlp_hyper_connection</code> 各调用一次：前者把 4 条流归约成 2560 宽送进子层，后者把子层输出按每条流一个标量写回。子层内部维度不受残差条数影响。末端 <code>hyper_connection_mixer</code> 把 4 条流收回 2560 宽再送 <code>lm_head</code>。</li>
+    <li><b>沿深度</b>：入口处 <code>hidden_states.repeat(1, 1, 4)</code> 把 embedding 复制成 4 份，残差流此后全程为 $4\times2560=10240$ 宽。每层内部 <code>attn_hyper_connection</code> 与 <code>mlp_hyper_connection</code> 各包裹一个子层：前者在注意力子层前后读出与写回，后者在 MoE 子层前后读出与写回。读出把 4 条流归约成 2560 宽送进子层，写回把子层输出按每条流一个标量加回四条流。子层内部维度不受残差条数影响。末端 <code>hyper_connection_mixer</code> 把 4 条流收回 2560 宽再送 <code>lm_head</code>。</li>
     <li><b>沿宽度</b>：每层 512 个路由专家取 top-10，另有 1 个共享专家恒激活。路由专家占总参数 67.11%（120.80B / 180.00B），但每 token 只激活 10/512。</li>
     <li><b>额外两路</b>：第 1 层前注入 N-gram 查表特征，这是一条与注意力、FFN 并列的独立信息通道，且只出现一次；多模态输入时另有 27 层视觉 ViT 在进入主干前把像素变成同宽的 token，替换序列中的占位符（见第 4 节）。</li>
   </ul>
@@ -305,6 +305,7 @@
     <tr><td>256K</td><td>6.000 GiB</td><td>0.750 GiB</td><td>0.108 GiB</td><td>6.858 GiB</td></tr>
     <tr><td>1M</td><td>24.000 GiB</td><td>3.000 GiB</td><td>0.108 GiB</td><td>27.108 GiB</td></tr>
   </table>
+  <p style="color:var(--text-light);font-size:14px">表中前三列分项各自四舍五入到三位小数，合计一列按未舍入的分项求和，故三列相加与合计略有出入。</p>
   <p>两个机制各自贡献不同：<b>层型比例</b>让只有 12/48 层需要存 <a href="../kv-cache/">KV</a>，若 48 层全为 QSA 型，1M 上下文下 KV 将达 96 GiB，实际 24 GiB 即降为 1/4；<b>块选择</b>不减少缓存但限制计算，每个查询实际参与注意力的 token 数被钉死在 2048 上下，与序列长度脱钩。GDN 侧的状态为每层 3.00 MiB 递归状态（fp32，由 <code>mamba_ssm_dtype</code> 指定）加 60.00 KiB 卷积状态，36 层合计 0.108 GiB 且完全不随长度增长。</p>
   <p>2048 是 config 默认的 <code>indexer_budget</code>，块选择只在完整块数超过 512 时才实际生效；上下文短于约 2048 时每个查询仍能看到全部因果可见 token。</p>
 
@@ -389,12 +390,13 @@
   <table>
     <tr><th>项目</th><th>依据</th></tr>
     <tr><td>全部 config 数值</td><td>官方 <code>config.json</code>：huggingface.co/Qwen/Qwen3.8-Flash-Next，commit <code>f5d08274</code></td></tr>
+    <tr><td>官方对外参数规模（125B / 6B / 51B / 4B）</td><td>官方模型卡 <code>README.md</code>：huggingface.co/Qwen/Qwen3.8-Flash-Next</td></tr>
     <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方实现 huggingface/transformers commit <code>36deb0b5</code>，<code>src/transformers/models/qwen4_exp/</code> 下 <code>configuration_qwen4_exp.py</code>、<code>modeling_qwen4_exp.py</code>、<code>modular_qwen4_exp.py</code></td></tr>
     <tr><td>张量形状与 dtype、层型分布、参数量</td><td>真实 checkpoint 的 safetensors 文件头（HTTP Range 读取，131 个分片、1658 个张量）</td></tr>
     <tr><td>N-gram 哈希乘子、各头词表大小与偏移的具体数值</td><td>真实 checkpoint 的 I64 缓冲（按 <code>data_offsets</code> 用 Range 精确下载 280 字节，35 个 int64 逐元素核对）</td></tr>
     <tr><td>等价性、选择行为、碰撞率、门控取值、逐层形状、视觉数据流、MRoPE 排布</td><td>本机实测得到</td></tr>
   </table>
-  <p style="color:var(--text-light);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方对外表述的 125B Transformer 参数、51B N-gram 参数、6B 激活参数三项均已独立复现（分别算得 125.74B、51.20B、6.04B）；官方模型卡另称「4B MTP」，本机按张量头累加得约 2.61B，两者不一致，此处以累加值为准。一处需要特别说明的差别：config 中 <code>layer_types</code> 的 <code>full_attention</code> 会被配置类 <code>__post_init__</code> 改写为 <code>qwen_sparse_attention</code>，字面取值与实际行为不同，此处统一按实际行为称 QSA。N-gram 的三个 I64 缓冲已下载真实数值并与源码派生公式逐元素比对通过，据此确认 config 未显式给出的 <code>seed=1234</code>。覆盖范围是语言主干、视觉编码器与多模态融合的完整前向数据流；训练方案、优化器、后训练流程，以及 MTP 草稿层的调度策略不在范围内。</p>
+  <p style="color:var(--text-light);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方对外表述的 125B Transformer 参数、51B N-gram 参数、6B 激活参数三项均已独立复现（分别算得 125.74B、51.20B、6.04B；其中官方 125B 为约数，与本机 125.74B 相差 0.74B / 0.6%）；官方模型卡另称「4B MTP」，本机按张量头累加得约 2.61B，两者不一致，此处以累加值为准。一处需要特别说明的差别：config 中 <code>layer_types</code> 的 <code>full_attention</code> 会被配置类 <code>__post_init__</code> 改写为 <code>qwen_sparse_attention</code>，字面取值与实际行为不同，此处统一按实际行为称 QSA。N-gram 的三个 I64 缓冲已下载真实数值并与源码派生公式逐元素比对通过，据此确认 config 未显式给出的 <code>seed=1234</code>。覆盖范围是语言主干、视觉编码器与多模态融合的完整前向数据流；训练方案、优化器、后训练流程，以及 MTP 草稿层的调度策略不在范围内。</p>
 
 <button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
 

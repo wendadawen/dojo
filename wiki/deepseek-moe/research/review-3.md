@@ -89,3 +89,5 @@ validation ok: /Users/wendadawen/code/dojo/wiki/deepseek-moe/index.html   (exit 
 | 递归生成的前置概念页已完成各自质检 | ⚠ **无法确认**：本页引用的 `moe-serving`、`stable-latent-moe` 两页均存在且链接有效，但各前置页的质检记录不在本轮允许输入范围内（审定规范 §1 限定审查者只读待审页面、外部来源与规范），本轮未读取其 `research/` 记录，无法确认其已完成三轮质检 |
 
 综上：除「轻微问题接受理由/数学符号 LaTeX 化」与「前置页质检状态无法确认」两条外，其余发布条件均满足。修复上述 8 条轻微问题（尤其问题 1、2）并重跑 validate.py 后，可满足 check.md §5 全部可自证条件；前置页质检状态需由编排者补充确认。
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

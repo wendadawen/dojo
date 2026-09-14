@@ -28,11 +28,11 @@
     </header>
 
     <h2>问题背景</h2>
-<p>在线 LLM 服务需要同时满足两个延迟 SLO：TTFT（首字延迟，对应 prefill 阶段）与 TBT（连续 token 间延迟，对应 decode 阶段）。然而 prefill 是计算密集、超线性于输入长度；decode 是访存密集、次线性于 batch 大小。把两个阶段放在同一 GPU 集群里服务时，长 prefill 会抬高同 batch 中所有 decode 序列的延迟，超大 decode batch 又会拖慢新请求的 prefill——两个 SLO 同时被破坏。Mooncake 把两阶段彻底分离到不同集群来解决这一矛盾。</p>
+<p>在线 LLM 服务需要同时满足两个延迟 SLO（Service Level Objective，服务级别目标）：TTFT（首字延迟，对应 prefill 阶段）与 TBT（连续 token 间延迟，对应 decode 阶段）。然而 prefill 是计算密集、超线性于输入长度；decode 是访存密集、次线性于 batch 大小。把两个阶段放在同一 GPU 集群里服务时，长 prefill 会抬高同 batch 中所有 decode 序列的延迟，超大 decode batch 又会拖慢新请求的 prefill——两个 SLO 同时被破坏。Mooncake 把两阶段彻底分离到不同集群来解决这一矛盾。</p>
 
 <h2>核心机制</h2>
 <ul>
-<li><b>PD 分离 + 分布式 KVCache 池</b>：GPU 集群里每节点的 CPU DRAM（必要时 SSD）共同组成全局 KVCache 池，跨节点由 Messenger（GPUDirect RDMA）传输。这把传统本地 KVCache 缓存（如 <a href="../../wiki/paged-attention/index.html">vLLM 的 PagedAttention</a>）从单节点扩展到全集群，并利用 GPU 服务器里长期闲置的邻居容量。</li>
+<li><b>PD 分离 + 分布式 KVCache 池</b>：GPU 集群里每节点的 CPU DRAM（必要时 SSD）共同组成全局 KVCache 池，跨节点由 Messenger（GPUDirect RDMA）传输。这把传统本地 KVCache 缓存（如 vLLM 的本地 <a href="../../wiki/prefix-caching/index.html">prefix caching</a>）从单节点扩展到全集群，并利用 GPU 服务器里长期闲置的邻居容量。</li>
 <li><b>Conductor + cache-aware 调度（Algorithm 1）</b>：对每请求按块哈希链（见 <a href="../../wiki/prefix-caching/index.html">Prefix caching</a>）算出在每个 prefill 实例可复用的前缀长度，估计 TTFT（本地够用则不传、否则从最佳实例拉差额并按传输后复用最佳前缀计算），选 TTFT 最短者；超过 SLO 直接 HTTP 429 拒绝；所选实例的 prefix 远低于全局最佳时，自动把热点缓存迁过来——这是 cache-aware + 负载均衡同时最优的解。</li>
 <li><b>CPP（chunked pipeline parallelism）</b>：长上下文 prefill 把每请求输入切成 $≤$ prefill_chunk 的块，不同块由不同节点流水线同时处理，跨节点通信只在 stage 边界传递 activation 且可与计算重叠。比跨节点 TP（每层 2 次 RDMA all-reduce）和 SP（每层至少 1 次跨节点通信）的 MFU（Model FLOPs Utilization）都高。</li>
 <li><b>Layer-wise prefill</b>：prefill 按层逐层进行，每层 KVCache 在该层 attention 算完后立即异步 store 到 CPU DRAM，下一层 KVCache 在上一层算时已异步载入。prefill 实例执行时间 $≈$ max(载入时间, 标准 prefill 时间)——调度只需考虑 DRAM 容量而无需考虑 VRAM。</li>
@@ -47,7 +47,7 @@
 <li><b>本页面不展开</b>：Transfer Engine / Messenger 的内部实现（RDMA 编程、拓扑探测——论文 v4 仅描述接口与位置）、同名开源仓库的组件生态（论文 §1 仅声明 trace 仓库地址，组件扩展不在本文范围）、异构加速器/PIM 等未来方向（论文 §10 提及）。这些是相关但独立的内容。</li>
 </ul>
 
-<p>主要依据：Ruoyu Qin et al., <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>, FAST '25 / arXiv:2407.00079v4。</p>
+<p>主要依据：Ruoyu Qin et al., <i>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</i>, arXiv:2407.00079v4。</p>
 
     <footer>Dojo · 概览 · 机制细节见完整说明页</footer>
   </main>

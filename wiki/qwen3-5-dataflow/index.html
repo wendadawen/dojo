@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Qwen3.5-397B-A17B 前向数据流：60 层里 45 层 Gated DeltaNet 与 15 层带输出门的全注意力按 3:1 交替、单流残差、512 专家 top-10 softmax 路由加辅助损失、DeepSeek 式 MTP 草稿层、27 层 ViT 与交错 MRoPE。全部数字由官方源码、真实 checkpoint 张量头与本机实测核对。">
+  <meta name="description" content="Qwen3.5-397B-A17B 前向数据流：60 层里 45 层 Gated DeltaNet 与 15 层带输出门的全注意力按 3:1 交替、单流残差、512 专家 top-10 softmax 路由加辅助损失、MTP 草稿层、27 层 ViT 与交错 MRoPE。全部数字由官方源码、真实 checkpoint 张量头与本机实测核对。">
   <meta name="dojo:summary" content="Qwen3.5 旗舰为 403.40B 总参数（语言主干 396.346B + 视觉 0.456B + MTP 6.596B，官方称 397B）的多模态 MoE：每 4 层中 3 层用 Gated DeltaNet 线性注意力、1 层用带 sigmoid 输出门与 QK-norm 的 GQA 全注意力（32 Q 头共享 2 个 KV 头）；残差为标准单流 pre-norm；FFN 为 512 专家 top-10（softmax 后 top-k 重归一化）加 sigmoid 门控共享专家，单 token 激活 16.33B（含词嵌入查表 17.35B，官方称 17B）；MTP 草稿层以 $[\mathrm{norm}(\mathrm{emb});\mathrm{norm}(h)]$ 拼接接入。">
   <meta name="dojo:type" content="dataflow">
   <meta name="dojo:topics" content="模型结构,多模态">
@@ -220,7 +220,7 @@
 <tr><td>10 个路由专家 · SwiGLU I=1024</td><td><code>[T,4096] × 10 -&gt; 加权和</code></td><td>$y_e = \mathrm{silu}(g) \odot u \to d$</td><td>每个专家 gate_up_proj [2048,4096] + down_proj [4096,1024]，激活参数 12,582,912/个。主干专家存为打包 3D 张量 [512,2048,4096] 与 [512,4096,1024]。10 个共 125,829,120。</td></tr>
 <tr><td>共享专家 · 恒激活 I=1024</td><td><code>[T,4096] -&gt; [T,4096]</code></td><td>$\mathrm{SwiGLU}_{\mathrm{shared}}(\tilde{x})$</td><td>不参与路由，每个 token 都执行。gate/up/down 三个投影 [1024,4096]/[1024,4096]/[4096,1024]，共 12,582,912。</td></tr>
 <tr><td>shared_expert · _gate × sigmoid</td><td><code>[T,4096] -&gt; [T,1]</code></td><td>$\sigma(W_g\tilde{x})$</td><td>逐 token 标量门。真实权重 shared_expert_gate.weight 形状 [1, 4096]。一条 FFN 通路里三种门并存：路由权重（向量）、共享门（标量）、注意力输出门（逐头向量）。</td></tr>
-<tr><td>aux loss · (训练期)</td><td><code>路由统计 -&gt; 标量</code></td><td>$\mathcal{L} = 0.001 \cdot E\textstyle\sum_i f_i p_i,\ \textstyle\sum_i f_i = \text{top-}k$</td><td>负载均衡辅助损失，router_aux_loss_coef=0.001；$f_i$ 按源码口径满足 $\sum_i f_i = \text{top-}k$（本代 top-10，故 $\sum_i f_i = 10$）。本机实测随机路由 6 token 的损失 0.023850，均匀分布下界 0.010000。均衡靠训练期梯度，推理时无 bias 修正。</td></tr>
+<tr><td>aux loss · (训练期)</td><td><code>路由统计 -&gt; 标量</code></td><td>$\mathcal{L} = 0.001 \cdot E\textstyle\sum_i f_i p_i,\ \textstyle\sum_i f_i = \text{top-}k$</td><td>负载均衡辅助损失，router_aux_loss_coef=0.001；$E$ 为专家数 512（源码 overall_loss * num_experts）；$f_i$ 按源码口径满足 $\sum_i f_i = \text{top-}k$（本代 top-10，故 $\sum_i f_i = 10$）。本机实测随机路由 6 token 的损失 0.023850，均匀分布下界 0.010000。均衡靠训练期梯度，推理时无 bias 修正。</td></tr>
 <tr><td>相加 · 路由 + 共享</td><td><code>[T,4096]</code></td><td>$y = \textstyle\sum_{e \in \mathrm{top}10} w_e y_e + \sigma(W_g\tilde{x})\,y_{\mathrm{sh}}$</td><td>单层激活 140,513,280（路由专家 125,829,120 + 共享 12,582,912 + 路由器 2,097,152 + 门 4,096），512 路由专家合计 6,442,450,944，激活占 2.18%。</td></tr>
 </table>
 <p>边：x→rt（4096）；rt→rn（[T,10]）；rn→ex（权重）；x→ex（[T,4096]）；x→sh（4096）；x→shg（4096）；shg→sh（标量门）；rt→aux（路由统计）；ex→sum（加权和）；sh→sum（门控输出）</p>
@@ -294,7 +294,7 @@
   <h3>MoE 路由：softmax 竞争 + 辅助损失</h3>
   <ul>
     <li><b>先全局 softmax 再对选中项重归一化，且重归一化无条件</b>：在全部 512 个专家上做 softmax，取 top-10，再把这 10 个概率除以它们的和。路由器没有 <code>norm_topk_prob</code> 开关，重归一化总是执行。本机实测 top-10 原始概率合计仅 $0.17\sim0.24$，重归一化把权重放大约 5 倍，每 token 权重和恒为 1。</li>
-    <li><b>均衡靠辅助损失而非推理期修正</b>：<code>router_aux_loss_coef=0.001</code>，负载均衡损失为 $E\sum_i f_i p_i$ 形式（$f_i$ 为专家入选频率、$p_i$ 为 softmax 概率均值，按源码口径 $\sum_i f_i = \text{top-}k$）。本机实测随机路由下 6 token 的损失为 0.023850，完全均匀分布下界 0.010000。</li>
+    <li><b>均衡靠辅助损失而非推理期修正</b>：<code>router_aux_loss_coef=0.001</code>，负载均衡损失为 $E\sum_i f_i p_i$ 形式（$E$ 为专家数 512，源于源码 <code>overall_loss * num_experts</code>；$f_i$ 为专家入选频率、$p_i$ 为 softmax 概率均值，按源码口径 $\sum_i f_i = \text{top-}k$）。本机实测随机路由下 6 token 的损失为 0.023850，完全均匀分布下界 0.010000。</li>
     <li><b>共享专家带标量门</b>：共享专家不参与路由，输出乘逐 token 的 sigmoid 标量 $\sigma(W_g x)$ 后与路由结果相加。<code>shared_expert_gate</code> 形状 [1, 4096]。一条 FFN 通路里同时存在三种门：路由权重（top-10 向量）、共享专家门（标量）、注意力输出门（逐头向量）。</li>
     <li><b>激活量</b>：单层 MoE 激活 140,513,280（10 个路由专家 125,829,120 + 共享专家 12,582,912 + 路由器 2,097,152 + 门 4,096），512 路由专家合计 6,442,450,944，激活占 2.18%。60 层路由专家合计 386,547,056,640，与张量头累加精确相等。专家前向为 <a href="../swiglu/">SwiGLU</a>：<code>gate_up_proj</code> 为打包 3D 张量 [512, 2048, 4096]。</li>
   </ul>
@@ -401,7 +401,7 @@
     <tr><td>MTP 训练目标（Multi-Token Prediction）</td><td>官方模型卡「Multi-Token Prediction (MTP): trained with multi-steps」</td></tr>
     <tr><td>张量形状与 dtype、层型分布、参数量</td><td>真实 checkpoint 的 safetensors 文件头（HTTP Range 读取，94 个分片、2924 个张量）</td></tr>
     <tr><td>等价性、门控取值、路由行为、逐层形状、视觉数据流、MRoPE 排布、视频位置</td><td>本机实测得到，实测产物清单见 <code>research/measured.md</code></td></tr>
-    <tr><td>第 5 节与 Qwen3.8-Flash-Next 的对比（配置数值、许可、发布日期）</td><td>该型号官方模型卡与 <code>config.json</code>（huggingface.co/Qwen/Qwen3.8-Flash-Next），与姊妹页 <a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>逐项一致；发布日期取 HF 仓库元信息的创建时间 createdAt（该仓库 2026-08-24T08:24:59Z，Qwen3.5 侧 2026-02-16T04:55:12Z），两款模型卡正文对日期均只给到月份</td></tr>
+    <tr><td>第 5 节与 Qwen3.8-Flash-Next 的对比（配置数值、许可、发布日期）</td><td>该型号官方模型卡与 <code>config.json</code>（huggingface.co/Qwen/Qwen3.8-Flash-Next），配置数值与姊妹页 <a href="../qwen3-8-flash-next-dataflow/">Qwen3.8-Flash-Next 前向数据流</a>逐项一致；发布日期取 HF 仓库元信息的创建时间 createdAt（该仓库 2026-08-24T08:24:59Z，Qwen3.5 侧 2026-02-16T04:55:12Z），两款模型卡正文对日期均只给到月份</td></tr>
   </table>
   <p style="color:var(--text-light);font-size:14px">核对说明：全部结构性论断以官方源码与真实 checkpoint 张量头为准，数值结论均由本机脚本实算得出。官方「397B 总参数 / 17B 激活」两项的独立复现：语言主干加视觉塔 396.80B（命名口径，含 MTP 全量为 403.40B）；激活含词嵌入查表 17,349,040,896、不含 16,331,922,176。家族其他型号（122B-A10B / 35B-A3B / 27B / 9B / 4B）的规模数字由各自官方 config 实拉取核对，架构与旗舰一致。覆盖范围：语言主干、视觉编码器、多模态融合与 MTP 结构的完整前向数据流；训练方案、优化器与后训练流程、MTP 的投机解码调度策略，以及 FP8 量化仓库（Qwen3.5-397B-A17B-FP8）不在范围内。</p>
 
@@ -706,7 +706,7 @@ moe: {
     ex:   {label:'10 个路由专家\nSwiGLU I=1024', t:'moe', io:'[T,4096] × 10 -> 加权和', f:'y_e = \\mathrm{silu}(g) \\odot u \\to d', d:'每个专家 gate_up_proj [2048,4096] + down_proj [4096,1024]，激活参数 12,582,912/个。主干专家存为打包 3D 张量 [512,2048,4096] 与 [512,4096,1024]。10 个共 125,829,120。'},
     sh:   {label:'共享专家\n恒激活 I=1024', t:'moe', io:'[T,4096] -> [T,4096]', f:'\\mathrm{SwiGLU}_{\\mathrm{shared}}(\\tilde{x})', d:'不参与路由，每个 token 都执行。gate/up/down 三个投影 [1024,4096]/[1024,4096]/[4096,1024]，共 12,582,912。'},
     shg:  {label:'shared_expert\n_gate × sigmoid', t:'gt', io:'[T,4096] -> [T,1]', f:'\\sigma(W_g\\tilde{x})', d:'逐 token 标量门。真实权重 shared_expert_gate.weight 形状 [1, 4096]。一条 FFN 通路里三种门并存：路由权重（向量）、共享门（标量）、注意力输出门（逐头向量）。'},
-    aux:  {label:'aux loss\n(训练期)', t:'gt', io:'路由统计 -> 标量', f:'\\mathcal{L} = 0.001 \\cdot E\\textstyle\\sum_i f_i p_i,\\ \\textstyle\\sum_i f_i = \\text{top-}k', d:'负载均衡辅助损失，router_aux_loss_coef=0.001；$f_i$ 按源码口径满足 $\\sum_i f_i = \\text{top-}k$（本代 top-10，故 $\\sum_i f_i = 10$）。本机实测随机路由 6 token 的损失 0.023850，均匀分布下界 0.010000。均衡靠训练期梯度，推理时无 bias 修正。'},
+    aux:  {label:'aux loss\n(训练期)', t:'gt', io:'路由统计 -> 标量', f:'\\mathcal{L} = 0.001 \\cdot E\\textstyle\\sum_i f_i p_i,\\ \\textstyle\\sum_i f_i = \\text{top-}k', d:'负载均衡辅助损失，router_aux_loss_coef=0.001；$E$ 为专家数 512（源码 overall_loss * num_experts）；$f_i$ 按源码口径满足 $\\sum_i f_i = \\text{top-}k$（本代 top-10，故 $\\sum_i f_i = 10$）。本机实测随机路由 6 token 的损失 0.023850，均匀分布下界 0.010000。均衡靠训练期梯度，推理时无 bias 修正。'},
     sum:  {label:'相加\n路由 + 共享', t:'out', io:'[T,4096]', f:'y = \\textstyle\\sum_{e \\in \\mathrm{top}10} w_e y_e + \\sigma(W_g\\tilde{x})\\,y_{\\mathrm{sh}}', d:'单层激活 140,513,280（路由专家 125,829,120 + 共享 12,582,912 + 路由器 2,097,152 + 门 4,096），512 路由专家合计 6,442,450,944，激活占 2.18%。'},
   },
   edges:[

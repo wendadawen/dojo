@@ -138,7 +138,7 @@
 
 <p>自回归解码的工作方式是：每次把已生成的 token 序列喂给模型，模型做一次前向传播，得到下一个位置上的概率分布，从中采样一个 token，再把它拼回序列、重复下一步。每一步都依赖上一步的输出，因此必须串行。这里的「一次前向传播」会用到一个叫 KV cache 的机制——把历史 token 的注意力键值缓存下来，避免重复计算——但每一步仍然要把模型的全部权重从显存读一遍。</p>
 
-<p>关键在于单 token 前向传播的瓶颈是什么。一个 70B 参数的模型在 FP16 下权重约 140GB；H100 显卡 HBM 带宽 3.35 TB/s（见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型</a>）。构造数据（教学计算）：把全部权重从 HBM 读到计算单元的理论下限约为 $140\text{ GB} / 3.35\text{ TB/s} \approx 42$ 毫秒，与具体生成什么 token 无关。相比之下，算出一个 token 概率所需的乘加运算量相对很低，计算单元（SM / Tensor Core）大量时间在等权重到达——单步解码是<strong>内存带宽受限</strong>（memory-bandwidth bound），而非计算受限<sup>[C2]</sup>。</p>
+<p>关键在于单 token 前向传播的瓶颈是什么。一个 70B 参数的模型在 FP16 下权重约 140GB；H100 显卡的 HBM（高带宽显存）带宽 3.35 TB/s（见 <a href="../../wiki/gpu-execution-model/index.html">GPU 执行模型</a>）。构造数据（教学计算）：把全部权重从 HBM 读到计算单元的理论下限约为 $140\text{ GB} / 3.35\text{ TB/s} \approx 42$ 毫秒，与具体生成什么 token 无关。相比之下，算出一个 token 概率所需的乘加运算量相对很低，计算单元（SM 即流式多处理器 / Tensor Core）大量时间在等权重到达——单步解码是<strong>内存带宽受限</strong>（memory-bandwidth bound），而非计算受限<sup>[C2]</sup>。</p>
 
 <p>这一点带来一个反直觉的机会。Transformer 的因果注意力让一次前向传播可以同时对序列每个位置输出分布（见 <a href="../../wiki/standard-attention/index.html">标准 Transformer 注意力</a>）。如果把输入序列延长 $\gamma$ 个位置，同一次前向传播就额外给出了 $\gamma$ 个位置上的分布，而墙钟时间几乎不变——因为瓶颈是「把权重读一遍」这件事，读一遍权重之后，多用它算几个位置的乘积几乎不增加时间，多余的算术落在原本空闲的计算单元上。这就是投机解码的硬件前提：</p>
 
@@ -178,7 +178,7 @@
     <p>这条「验证几乎免费」的结论在什么负载条件下不成立？</p>
     <details>
       <summary>解答：高并发批处理下不成立</summary>
-      <p>多个请求把计算单元占满后，「空闲算力」不再存在，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力，总吞吐反而下降（vLLM 实测高查询率下出现 1.4×-1.8× 减速）。</p>
+      <p>多个请求把计算单元占满后，「空闲算力」不再存在，验证 $\gamma+1$ 个位置会挤占本可服务其他请求的算力，总吞吐反而下降：vLLM（开源 LLM 推理框架）实测高查询率下出现 1.4×-1.8× 减速。</p>
     </details>
   </li>
 </ol>
@@ -187,7 +187,7 @@
 
 <h2 id="draft-then-verify">2. Draft-then-Verify——一轮做了什么</h2>
 
-<p>投机解码用两个模型协同：一个小的 draft 模型 $q$（快但可能不准），一个大的 target 模型 $p$（慢但准，其分布 $p$ 是希望最终采样的目标分布）。每轮（一个 "superstep"）做五件事<sup>[C3-C6]</sup>：</p>
+<p>投机解码用两个模型协同：一个小的 draft 模型 $q$（快但可能不准），一个大的 target 模型 $p$（慢但准，其分布 $p$ 是希望最终采样的目标分布）。每轮做五件事<sup>[C3-C6]</sup>：</p>
 
 <svg class="flow-svg" viewBox="0 0 680 660" role="img" aria-label="Draft-then-Verify 一轮流程：draft 采样、target 一次前向验证、逐位接受或拒绝，分支为残差重采样或 bonus token">
   <defs>
@@ -196,19 +196,19 @@
     </marker>
   </defs>
   <rect class="node" x="140" y="16" width="400" height="52" rx="6"></rect>
-  <foreignObject x="140" y="16" width="400" height="52"><div xmlns="http://www.w3.org/1999/xhtml">输入：当前前缀 prefix、draft 模型 $q$、target 模型 $p$、草稿长度 $\gamma$</div></foreignObject>
+  <foreignObject x="140" y="16" width="400" height="52"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">输入：当前前缀 prefix、draft 模型 $q$、target 模型 $p$、草稿长度 $\gamma$</div></foreignObject>
   <rect class="node" x="140" y="104" width="400" height="60" rx="6"></rect>
-  <foreignObject x="140" y="104" width="400" height="60"><div xmlns="http://www.w3.org/1999/xhtml">步骤 1 Draft：$q$ 自回归采样 $\gamma$ 个 token $x_1,\dots,x_\gamma$，保留每步分布 $q_1,\dots,q_\gamma$</div></foreignObject>
+  <foreignObject x="140" y="104" width="400" height="60"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">步骤 1 Draft：$q$ 自回归采样 $\gamma$ 个 token $x_1,\dots,x_\gamma$，保留每步分布 $q_1,\dots,q_\gamma$</div></foreignObject>
   <rect class="node" x="140" y="196" width="400" height="64" rx="6"></rect>
-  <foreignObject x="140" y="196" width="400" height="64"><div xmlns="http://www.w3.org/1999/xhtml">步骤 2 Verify：$p$ 对 $\text{prefix} + (x_1,\dots,x_\gamma)$ 做一次前向，得 $\gamma+1$ 个位置分布 $p_1,\dots,p_{\gamma+1}$</div></foreignObject>
+  <foreignObject x="140" y="196" width="400" height="64"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">步骤 2 Verify：$p$ 对 $\text{prefix} + (x_1,\dots,x_\gamma)$ 做一次前向，得 $\gamma+1$ 个位置分布 $p_1,\dots,p_{\gamma+1}$</div></foreignObject>
   <rect class="node" x="140" y="292" width="400" height="64" rx="6"></rect>
-  <foreignObject x="140" y="292" width="400" height="64"><div xmlns="http://www.w3.org/1999/xhtml">步骤 3 接受/拒绝：对 $i = 1,\dots,\gamma$ 计算 $a_i = \min(1,\, p_i(x_i)/q_i(x_i))$，以概率 $a_i$ 接受 $x_i$</div></foreignObject>
+  <foreignObject x="140" y="292" width="400" height="64"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">步骤 3 接受/拒绝：对 $i = 1,\dots,\gamma$ 计算 $a_i = \min(1,\, p_i(x_i)/q_i(x_i))$，以概率 $a_i$ 接受 $x_i$</div></foreignObject>
   <rect class="node" x="40" y="420" width="290" height="116" rx="6"></rect>
-  <foreignObject x="40" y="420" width="290" height="116"><div xmlns="http://www.w3.org/1999/xhtml">步骤 4 重采样（首个拒绝 $i^\*$）：从残差 $p'_{i^\*} = \mathrm{norm}(\max(0,\, p_{i^\*} - q_{i^\*}))$ 重采样 1 个 token，丢弃其后 draft，产出 $i^\*$ 个</div></foreignObject>
+  <foreignObject x="40" y="420" width="290" height="116"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">步骤 4 重采样（首个拒绝 $i^\*$）：从残差 $p'_{i^\*} = \mathrm{norm}(\max(0,\, p_{i^\*} - q_{i^\*}))$ 重采样 1 个 token，丢弃其后 draft，产出 $i^\*$ 个</div></foreignObject>
   <rect class="node" x="350" y="420" width="290" height="116" rx="6"></rect>
-  <foreignObject x="350" y="420" width="290" height="116"><div xmlns="http://www.w3.org/1999/xhtml">步骤 5 Bonus（全部接受）：从 $p_{\gamma+1}$ 免费采样 1 个 token（复用已做的前向），产出 $\gamma+1$ 个</div></foreignObject>
+  <foreignObject x="350" y="420" width="290" height="116"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">步骤 5 Bonus（全部接受）：从 $p_{\gamma+1}$ 免费采样 1 个 token（复用已做的前向），产出 $\gamma+1$ 个</div></foreignObject>
   <rect class="node" x="140" y="584" width="400" height="56" rx="6"></rect>
-  <foreignObject x="140" y="584" width="400" height="56"><div xmlns="http://www.w3.org/1999/xhtml">本轮产出 $1 \sim \gamma+1$ 个 token（最差：首轮即拒，仍产出 1 个重采样 token）</div></foreignObject>
+  <foreignObject x="140" y="584" width="400" height="56"><div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">本轮产出 $1 \sim \gamma+1$ 个 token（最差：首轮即拒，仍产出 1 个重采样 token）</div></foreignObject>
   <polyline class="edge" points="340,68 340,104" marker-end="url(#sd-arrow)"></polyline>
   <polyline class="edge" points="340,164 340,196" marker-end="url(#sd-arrow)"></polyline>
   <polyline class="edge" points="340,260 340,292" marker-end="url(#sd-arrow)"></polyline>
@@ -679,7 +679,7 @@ $$S = \frac{\mathbb{E}[L]}{1 + \gamma c} = \frac{1 - \alpha^{\gamma+1}}{(1 - \al
 
 <p>[F2] 残差分布 $p'(x) = \max(0, p(x)-q(x)) / \sum_{x'} \max(0, p(x')-q(x'))$：Leviathan et al. 2023 §2.3 Algorithm 1 step 5-6；Chen et al. 2023 §4.2 Modified Rejection Sampling（重采样 $x_{n+1} \sim (q-p)_+$，其中 $(f)_+ = \max(0, f) / \sum_x \max(0, f)$；该文 $q$ 为 target、$p$ 为 draft）。</p>
 
-<p>[F3] 单位置输出分布 $\Pr[\text{emit } x] = \min(q(x), p(x)) + \max(0, p(x)-q(x)) = p(x)$：Leviathan et al. 2023 Appendix A.1 Correctness of Speculative Sampling；Chen et al. 2023 Supplementary Materials, Theorem 1（Modified Rejection Sampling recovers the target distribution，该文 $q$ 为 target）。推导链见正文与折叠块，每步可手算复算，核心恒等式为 $\min(a,b) + \max(0, b-a) = b$。</p>
+<p>[F3] 单位置输出分布 $\Pr[\text{emit } x] = \min(q(x), p(x)) + \max(0, p(x)-q(x)) = p(x)$：Leviathan et al. 2023 Appendix A.1 Correctness of Speculative Sampling；Chen et al. 2023 Supplementary Materials, Theorem 1（Modified Rejection Sampling recovers the target distribution，该文 $q$ 为 target）。推导链见正文与折叠块，每步可手算复算，核心恒等式为 $\min(a,b) + \max(0, b-a) = b$。注：本页用 $\beta$ 表示拒绝概率（$\beta = 1 - \sum_x \min(p(x), q(x))$），与 Leviathan et al. 2023 Appendix A.1 中的 $\beta$（接受概率，Definition 3.1）互为补，对照原文时勿混淆。</p>
 
 <p>[F4] $\alpha = \sum_x \min(p(x), q(x)) = 1 - \mathrm{TV}(p, q)$：$\alpha$ 定义见 Leviathan et al. 2023 §3.1（Definition 3.1）与 §3.2（Corollary 3.6）；TV 关系由 $\min(a,b) = (a+b-|a-b|)/2$ 推出（推导在正文）。</p>
 

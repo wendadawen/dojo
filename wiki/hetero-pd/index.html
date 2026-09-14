@@ -89,7 +89,7 @@
 </div>
 
 <h1 class="title">异构 PD 分离全链路</h1>
-<p class="page-lead">P 侧 NVIDIA 与 D 侧 AMD 的 attention backend、专家并行、网卡全不一样，KV 却能直接 RDMA 对拷。原因有两个：入口由 proxy 双投递、三层握手只交换元数据不动数据；传输层字节原样搬运，唯一硬条件是两侧 KV cache 布局逐字节相同。实测 KV 传输仅占端到端 0.12%，瓶颈在 decode。</p>
+<p class="page-lead">P 侧 NVIDIA 与 D 侧 AMD 的 attention backend、专家并行与网卡实现不同，两侧 KV 仍可直接 RDMA 对拷。原因有两个：入口由 proxy 双投递、三层握手只交换元数据不动数据；传输层字节原样搬运，唯一硬条件是两侧 KV cache 布局逐字节相同。实测 KV 传输仅占端到端 0.12%，瓶颈在 decode。</p>
 <p class="page-meta">更新于 2026-08-22 · 类型：部署实测归档</p>
 <p class="reading-time" id="readingTime"></p>
 
@@ -137,11 +137,11 @@
       <figcaption>图 1：入口拓扑。实线是 HTTP 请求路径，虚线是建连与 KV 传输路径。</figcaption>
     </figure>
 
-    <p>入口是 proxy 的 8000 端口，<strong>直连任一侧的 8021 不会进入 PD 链路</strong>。两种错误入口的表现不同，且都不易察觉：</p>
+    <p>入口是 proxy 的 8000 端口，<strong>直连任一侧的 8021 不会进入 PD 链路</strong>。两种错误入口的表现如下：</p>
 
     <table>
       <tr><th>错误入口</th><th>实际发生什么</th><th>表现</th></tr>
-      <tr><td>直接打 P:8021</td><td>P 单机跑完全部 token，PD 完全没参与</td><td><code>request_decode_time_seconds=0</code>、<code>kv_transfer_e2e_time_ms=0</code>、<code>kv_transfer_params=null</code>；返回结果完全正常，<strong>极易误判为 PD 已生效</strong></td></tr>
+      <tr><td>直接打 P:8021</td><td>P 单机跑完全部 token，PD 完全没参与</td><td><code>request_decode_time_seconds=0</code>、<code>kv_transfer_e2e_time_ms=0</code>、<code>kv_transfer_params=null</code>；返回结果完全正常，<strong>需靠日志（<code>KV send done</code> / <code>KV recv done</code>）判断 PD 是否真正参与</strong></td></tr>
       <tr><td>直接打 D:8021 并手动塞 kv_transfer_params</td><td>D 挂起等 KV，但没有 proxy 通知 P 做 prefill</td><td>等满 120 s（<code>VLLM_TRANSFER_TIME_OUT</code>）后 KV transfer timeout，<code>finish_reason=abort</code>，只产出 1 个 token</td></tr>
     </table>
 
@@ -234,7 +234,9 @@
       <tr><td>15:54:06.545</td><td>D 全部完成：64 token，端到端 2.64 s</td></tr>
     </table>
 
-    <h2>4. KV 的字节构成：1351680 是怎么来的</h2>
+    <p style="color:var(--text-light);font-size:14px">注：ttft 为 P 侧内建计时，其计时起点与表中 proxy 投递时刻不同源，故 0.126 s 与相邻两行时间戳之差 0.113 s 相差 13 ms，属计时口径差异。</p>
+
+    <h2>4. KV 的字节构成：1351680 的推导</h2>
 
     <p>传输的最小单元是 block，一个 block 打包全部 80 层（cross-layer 模式，layer_name 只有 <code>ALL_LAYERS</code> 一个 key）。每个 block 恰好 1351680 字节，可由模型参数直接推导：</p>
 
@@ -326,7 +328,7 @@
 Finished request: ... finish_reason=abort, ttft=120.010s, output_tokens=1</code></pre>
 
     <p>以下日志字符串分别对应 P 侧发送、D 侧接收、建连、选路与失败：</p>
-    <pre><code>L=&lt;service.log 路径&gt;   # 注意 grep -a：日志含二进制字符
+    <pre><code>L=&lt;service.log 路径&gt;   # grep -a：日志含二进制字符
 
 grep -a "\[Prefill Worker\] KV send done"  $L   # P 侧 KV 发送
 grep -a "\[Decode Worker\] KV recv done"   $L   # D 侧 KV 接收
@@ -349,14 +351,14 @@ grep -a "KV transfer timeout\|NIXL transfer failed\|prefill_failed"   $L</code><
 
     <p>两个佐证：前缀缓存命中与关闭两次请求的 KV 字节数完全相同（都是 8110080 B）——block 数只取决于 token 数（362 → 6 blocks），缓存只省 P 的计算，不改变传什么（D 侧把本地命中的头部块数回传、P 侧据此只发增量的设计能进一步压低这部分传输，见 <a href="../increase-kv/index.html">增量 KV 传输</a>）；单请求吞吐上，走 PD 的端到端为 64 token / 3.63 s（约 17.6 tok/s），低于 D 本机跑全程的 23.5 tok/s，因为 PD 模式下 D 每步只算 1 个 token 的 decode，固定开销占比更高。</p>
 
-    <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。<strong>该收益为推断</strong>：本页只实测了单请求链路，多请求并发下的整体吞吐未测，单请求对比无法体现这一收益。</p>
+    <p>所以这套架构的收益不在省传输，而在<strong>让 P 和 D 各自跑满</strong>：P 用大批量（max-num-batched-tokens=32768）做计算密集的 prefill，D 用大并发（max-num-seqs=64）做访存密集的 decode，两者互不干扰，消除 prefill 长 forward 阻塞 decode token 流的问题（TTFT 与 TPOT 不再互相拖累）。<strong>该收益为推断</strong>：实测仅覆盖单请求链路，多请求并发下的整体吞吐未测，单请求对比无法体现这一收益。</p>
 
     <h3>复现要点</h3>
     <ul>
-      <li>入口必须走 proxy 的 8000 端口，不要直连任一侧的 8021。</li>
-      <li>关闭前缀缓存需在两侧都注入 <code>VLLM_ENABLE_PREFIX_CACHING=0</code>，并确认它覆盖了启动环境中的既有取值；两侧环境注入方式不同，需分别验证生效，否则缓存命中会掩盖真实传输量。</li>
+      <li>入口须为 proxy 的 8000 端口；直连任一侧的 8021 不会进入 PD 链路。</li>
+      <li>关闭前缀缓存需在两侧都注入 <code>VLLM_ENABLE_PREFIX_CACHING=0</code>，并确认它覆盖了启动环境中的既有取值；两侧环境注入方式不同，需分别验证生效（缓存命中会掩盖真实传输量）。</li>
       <li>验证 PD 生效：两侧分别 grep <code>KV send done</code> / <code>KV recv done</code>。</li>
-      <li>重启前确认两侧显存已归零（NVIDIA 侧 <code>nvidia-smi --query-gpu=memory.used</code>，AMD 侧 <code>rocm-smi</code>），否则会 OOM；清理残留进程时按进程树精确定位，避免误伤其他管控进程。</li>
+      <li>重启前需确认两侧显存已归零（NVIDIA 侧 <code>nvidia-smi --query-gpu=memory.used</code>，AMD 侧 <code>rocm-smi</code>）；残留进程须按进程树精确清理。</li>
     </ul>
 
     <h2>来源与范围说明</h2>

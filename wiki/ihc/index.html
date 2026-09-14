@@ -71,8 +71,6 @@
 
 <p>这个设计的出发点可以用一个最小情形看清：入口把 embedding 复制 4 份，初始门控下 4 条流保持相等，每一步都退回标准 Pre-Norm 残差的行为——iHC 不是另起炉灶，而是从标准残差出发，把「读多少、写多少」留给训练。</p>
 
-<p>本页先在家族里定位 iHC 改了哪一刀，再走完一个子块的完整数据流，拆开门控计算与初始化，论证为什么把混合矩阵钉死在 $I$，最后落到 Hy4 的配置、权重与代价。</p>
-
 <section class="learning-goals">
   <h2>核心问题</h2>
   <ol class="chapter-questions">
@@ -763,10 +761,10 @@ for l, M in enumerate(mats, 1):
   <foreignObject x="220" y="308" width="240" height="22">
     <div xmlns="http://www.w3.org/1999/xhtml" class="dg-label dg-label-center">$\hat{x}_i = H_{post,i}\,z + x_i$</div>
   </foreignObject>
-  <line x1="190" y1="350" x2="280" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
-  <line x1="290" y1="350" x2="320" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
-  <line x1="390" y1="350" x2="360" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
-  <line x1="490" y1="350" x2="400" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="190" y1="332" x2="280" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="290" y1="332" x2="320" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="390" y1="332" x2="360" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
+  <line x1="490" y1="332" x2="400" y2="370" class="dg-line" marker-end="url(#ihc-arr)"/>
   <rect x="240" y="370" width="200" height="46" class="dg-box"/>
   <text x="340" y="388" font-size="13" text-anchor="middle">head：门控合并</text>
   <foreignObject x="250" y="392" width="180" height="22">
@@ -829,7 +827,7 @@ $$30{,}770{,}717=156\times 196{,}618+98{,}309$$
 
 <details>
 <summary>补充：HPC 融合 kernel（工程扩展）</summary>
-<p>eager 路径的 pre、post、head 分别发出 20、5、15 个 kernel；HPC 实现各融合为 1 个。启用条件：VLLM_ENABLE_HPC_OPS=1、sm100/sm103 架构、hc_mult=4、hidden_size 属于 {4096, 6144}<sup>[C19, N6]</sup>。跨层 post+pre 融合（HpcIHCPostPre）在参考实现中存在，vLLM 尚未移植（源码注释留有待办标记）<sup>[C20]</sup>。</p>
+<p>eager 路径的 pre、post、head 分别发出 20、5、15 个 kernel；HPC 实现各融合为 1 个。启用条件：VLLM_ENABLE_HPC_OPS=1、sm100/sm103 架构、hc_mult=4、hidden_size 属于 {4096, 6144}、需为当前架构编译的 hpc 包（.so）<sup>[C19, N6]</sup>。跨层 post+pre 融合（HpcIHCPostPre）在参考实现中存在，vLLM 尚未移植（源码注释留有待办标记）<sup>[C20]</sup>。</p>
 </details>
 
 <h3 id="hy4-glm">5.3 与 GLM-5.3-Flash 的 mHC 实现对照</h3>
@@ -901,7 +899,7 @@ $$30{,}770{,}717=156\times 196{,}618+98{,}309$$
 <li>C16：实验排序 Identity HC &gt; mHC &gt; mHC lite &gt; mHC orthogonal（Qwen3 1.7B 与 8B dense、150B tokens、从头训练）——同上知乎文章，社区实验。</li>
 <li>C17：Sinkhorn 20 步后行和标准差 0.12；mHC-lite 输入 relative range 达 $10^{13}$（占其实测输入的 27.9%）时列和偏差可达 100%——同上知乎文章，其实验条件。</li>
 <li>C18：流语义一致性（流 $i$ 恒在位置 $i$、$I^L=I$）——同上知乎文章（其论证）。</li>
-<li>C19：HPC 融合（eager 的 pre/post/head 分别 20/5/15 个 kernel 各融合为 1；VLLM_ENABLE_HPC_OPS=1、sm100/sm103、hc_mult=4、hidden 属于 {4096, 6144}）——hpc_ihc.py 模块 docstring 与 _SUPPORTED_* 常量。</li>
+<li>C19：HPC 融合（eager 的 pre/post/head 分别 20/5/15 个 kernel 各融合为 1；VLLM_ENABLE_HPC_OPS=1、sm100/sm103、hc_mult=4、hidden 属于 {4096, 6144}、需为当前架构编译的 hpc 包）——hpc_ihc.py 模块 docstring 与 _SUPPORTED_* 常量。</li>
 <li>C20：跨层 post+pre 融合（HpcIHCPostPre）参考实现存在、vLLM 未移植——hpc_ihc.py 源码 NOTE。</li>
 <li>C21：GLM-5.3-Flash mHC 实现细节（hc_mult=4、每层两站点、fn $[24, 16384]$、pre $=\sigma+\epsilon_{hc}$、post $=2\sigma$、comb 为 softmax 加 Sinkhorn 20 步、head 无权重均值、残差通路参数 35,391,870 占 321B 的 0.011%）——mHC 模块实现见 transformers main <code>modeling_glm5_next.py</code> L219-302；层数等默认值见同仓库 <code>configuration_glm5_next.py</code>（默认 num_hidden_layers=45、hc_mult=4、hc_sinkhorn_iters=20）；总参数约 321B 见 zai-org/GLM-5.3-Flash Hugging Face 模型卡 Model size 栏；事实与汇总经超连接页核对一致。</li>
 </ul>

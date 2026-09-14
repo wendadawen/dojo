@@ -461,7 +461,7 @@ LRU (B=4k=32)            miss   63/1600  =   3.9%</code></pre>
 
 <h3 id="resolve-kernel-why">4.1 为什么必须融合、为什么必须进 CUDA graph</h3>
 
-<p>miss 解析站在每个稀疏注意层的解码关键路径上：给定本层选择集，系统要识别命中、为 miss 挑 victim、拉取缺失记录、更新元数据、把物理槽位交还给注意力后端。这套操作每层每步都要跑一遍——在没有跨层共享选择的模型上，以 78 个稀疏层为例，每生成一个 token 就要跑 78 次。GLM-5.2 用 IndexShare 把 21 个 anchor 与 57 个 shared 层配成组，shared 层跳过解析的全部分阶段、直接复用 anchor 的 slot 表，所以实际每 token 只跑 21 次 Resolve（§3.5、§4.6）。拆成多个 CUDA launch 的代价有两层：launch 延迟本身在每层叠加；更糟的是各步的中间状态（hit/miss 标记、victim 分配、LRU 更新、输出位置向量）都依赖同一份选择集和驻留元数据，跨 kernel 传递就得反复把临时状态写回 HBM 再读出来（§3.4）。</p>
+<p>miss 解析站在每个稀疏注意层的解码关键路径上：给定本层选择集，系统要识别命中、为 miss 挑 victim、拉取缺失记录、更新元数据、把物理槽位交还给注意力后端。这套操作每层每步都要跑一遍——在没有跨层共享选择的模型上，以 78 个稀疏层为例，每生成一个 token 就要跑 78 次。GLM-5.2 用 IndexShare 把 21 个 anchor 与 57 个 shared 层配成组，shared 层跳过解析的全部阶段、直接复用 anchor 的 slot 表，所以实际每 token 只跑 21 次 Resolve（§3.5、§4.6）。拆成多个 CUDA launch 的代价有两层：launch 延迟本身在每层叠加；更糟的是各步的中间状态（hit/miss 标记、victim 分配、LRU 更新、输出位置向量）都依赖同一份选择集和驻留元数据，跨 kernel 传递就得反复把临时状态写回 HBM 再读出来（§3.4）。</p>
 
 <p>HiSparse 的回答是把全部解析做成一个融合 kernel——Resolve——每个稀疏层启动一次，一个 CUDA block 负责一个请求的工作项。整个 kernel 被<a href="../vllm-cudagraph/index.html">捕获</a>进 SGLang 稳态解码的 CUDA graph：图重放时所有元数据更新和 IO 发起都不需要 host 侧分支。这一点是硬约束——CUDA graph 录制的是固定的 GPU 工作序列，任何"看情况再决定"的 host 逻辑都会让捕获失败。Resolve 能进图，是因为它只消费两样东西：indexer 发出的逻辑位置、HiSparse 自己的 GPU 驻留元数据。这也顺便解释了 indexer 无关性：DSA、NSA、Quest 在这一层看到的接口完全一样——<strong>逻辑索引进、物理槽位出</strong>，论文类比为一个软件管理的 TLB（§3.4 原句「logical indices in, physical slots out」）。页面的对应解读：地址翻译$\leftrightarrow$KV 记录定位、页表错失$\leftrightarrow$host 拉取——只对应接口形态，不延伸到 TLB 的其他语义。</p>
 

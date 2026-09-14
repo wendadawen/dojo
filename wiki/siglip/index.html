@@ -86,7 +86,7 @@
     <li><p>为什么 SigLIP 的"逐对独立"在大 batch 下还能保持小 batch 优势——batch size 与损失函数如何解耦，softmax 依赖 hard negative 池而 sigmoid 不依赖？</p>
     <details>
       <summary>解答：batch 解耦机制</summary>
-      <p>softmax 的训练信号依赖 batch 内 hard negative 池——每个对的梯度是"对 hardest negative 的相对优势"，batch 小时难样本常未被采到、梯度噪声大。sigmoid 每对的梯度由 $z_{ij}(t\,x_i\cdot y_j+b)$ 单独决定，与 batch 内其他对无关，因此缩小 batch 不降低信号质量（论文 §1 引言：batch &lt; 16k 时 sigmoid 显著占优）。实验数字见"batch size 解耦与实验边界"一章。</p>
+      <p>softmax 的训练信号依赖 batch 内 hard negative 池——每个对的梯度是"对 hardest negative 的相对优势"（hardest negative 即 batch 内与该图像最相似的负样本文本），batch 小时难样本常未被采到、梯度噪声大。sigmoid 每对的梯度由 $z_{ij}(t\,x_i\cdot y_j+b)$ 单独决定，与 batch 内其他对无关，因此缩小 batch 不降低信号质量（论文 §1 引言：batch &lt; 16k 时 sigmoid 显著占优）。实验数字见"batch size 解耦与实验边界"一章。</p>
     </details></li>
     <li><p>可学习温度 $t$ 与可学习 bias $b$ 在 SigLIP 中各自承担什么职责——为什么 $b$ 初始化为 $-10$、为什么 CLIP 不需要 $b$？</p>
     <details>
@@ -149,8 +149,8 @@
 <p>这带来两个问题：</p>
 
 <ul>
-  <li><strong>小 batch 下梯度噪声大</strong>。每个对的梯度信号是"对 hardest negative 的相对优势"。batch 小时（如 $|B|=256$），hardest negative 往往是"运气不好没采到难样本"——梯度信号弱且噪声大。论文 §1 引言与 §4.1 实证显示 sigmoid 损失在 batch &lt; 16k 时显著优于 softmax。一种直观解释是小 batch 下 softmax 的 hardest negative 池太小（此为合理推断，论文未作此归因）。</li>
-  <li><strong>分布式训练需要 expensive all-gather</strong>。当 batch 被切分到多个设备时，每个设备需要先 all-gather 全部 $|B|$ 个嵌入到本地才能算分母——这是 CLIP 训练在多设备上的核心通信瓶颈。论文 §3.3 专门讨论这一点。</li>
+  <li><strong>小 batch 下梯度噪声大</strong>。每个对的梯度信号是"对 hardest negative 的相对优势"。batch 小时（如 $|B|=256$），批内相似度最高的那个负对往往只是随机采到的普通负样本——真正的难样本没被采进来，梯度信号弱且噪声大。论文 §1 引言与 §4.1 实证显示 sigmoid 损失在 batch &lt; 16k 时显著优于 softmax。一种直观解释是小 batch 下 softmax 的 hardest negative 池太小（此为合理推断，论文未作此归因）。</li>
+  <li><strong>分布式训练需要昂贵的 all-gather</strong>。当 batch 被切分到多个设备时，每个设备需要先 all-gather 全部 $|B|$ 个嵌入到本地才能算分母——这是 CLIP 训练在多设备上的核心通信瓶颈。论文 §3.3 专门讨论这一点。</li>
 </ul>
 
 <details>
@@ -250,7 +250,7 @@
     <summary>解答：配对标签 $z_{ij}$</summary>
     <p>$z_{ij}\in\{+1,-1\}$ 是配对标签：$i=j$（batch 内第 $i$ 张图像与第 $i$ 段文本是配对样本）时 $z_{ii}=+1$；$i\neq j$（不配对）时 $z_{ij}=-1$。与 CLIP 的"对角线为正、非对角线为负"对应，只是 SigLIP 用 $\pm 1$ 显式编码。</p>
   </details></li>
-  <li><p>说出 SigLIP 与 CLIP 的 4 项形式差异（无分母、单向、二分类、有 bias），以及"每个对的梯度不依赖 batch 内其他对"这一关键性质。</p>
+  <li><p>说出 SigLIP 与 CLIP 的 4 项形式差异（无分母、一次性对 $|B|^2$ 对求和、二分类、有 bias），以及"每个对的梯度不依赖 batch 内其他对"这一关键性质。</p>
   <details>
     <summary>解答：4 项差异与逐对独立</summary>
     <p>4 项差异：无 softmax 分母（每对独立）；一次性对 $|B|^2$ 对求和（CLIP 对称两次）；binary cross-entropy on sigmoid（CLIP 为 cross-entropy on softmax）；含可学习 bias $b$（CLIP 无）。关键性质：$\log\sigma(z_{ij}(t\,x_i\cdot y_j+b))$ 只依赖该对的 $x_i, y_j, z_{ij}, t, b$，不含对其他对的求和，因此每对的梯度与 batch 内其他对无关——这是 batch 解耦的形式来源。</p>
@@ -280,15 +280,15 @@
 
 <p><strong>若没有 $b$ 会怎样</strong>？初始模型未训练，$x_i\cdot y_j\approx 0$（嵌入未学到任何结构）。此时每个对的 logit $\approx t\cdot 0=0$，无论正负对，$\log\sigma(z_{ij}\cdot 0)=\log\sigma(0)=\log 0.5$。表面看每对损失相等，但<em>负对数量压倒性多</em>（32767 倍）——总损失被占多数的负对主导，初始优化需要很大的步幅去校正这一偏置。论文 §3.2 称此为"large initial optimization steps attempting to correct this bias"，即过校正。</p>
 
-<p>对 logit $a=z_{ij}(t\,x_i\cdot y_j+b)$，sigmoid 损失的梯度是 $\partial\log\sigma(a)/\partial a=\sigma(-a)=1-\sigma(a)$。若 $a=0$（初始无 $b$ 时），梯度 $=0.5$；正对 $z=+1$ 与负对 $z=-1$ 的梯度<em>绝对值相同但方向相反</em>。但因为负对数量 32767 倍于正对，batch 总损失被占多数的负对主导，初始优化必须用很大的步幅才能把正负对比例校正过来——即论文 §3.2 所说的过校正。</p>
+<p>对 sigmoid 的输入 $a=z_{ij}(t\,x_i\cdot y_j+b)$，sigmoid 损失的梯度是 $\partial\log\sigma(a)/\partial a=\sigma(-a)=1-\sigma(a)$。若 $a=0$（初始无 $b$ 时），梯度 $=0.5$；正对 $z=+1$ 与负对 $z=-1$ 的梯度<em>绝对值相同但方向相反</em>。但因为负对数量 32767 倍于正对，batch 总损失被占多数的负对主导，初始优化必须用很大的步幅才能把正负对比例校正过来——即论文 §3.2 所说的过校正。</p>
 
-<p><strong>$b$ 的作用</strong>：初始 $b=-10$，使初始 logit $a=z_{ij}(t\cdot 0+b)=z_{ij}\cdot(-10)$。正对 $z=+1$ → $a=-10$ → $\sigma(-10)\approx 0.0000454$ → $\log\sigma(-10)\approx -10$；负对 $z=-1$ → $a=10$ → $\sigma(10)\approx 0.99995$ → $\log\sigma(10)\approx -0.00005$。表面上正对单对损失远大于负对单对损失（$-10$ vs $-0.00005$），但因为 $b$ 让初始模型预测偏向<em>负类</em>（$\sigma(b)=\sigma(-10)\approx 0.0000454$，与"负对远多于正对"的数据先验一致），少数正对的大梯度（$\sigma(10)\approx 1$）抵消多数负对的数量优势（每个负对梯度 $\approx 0$）——$b$ 起到了"先验偏置"作用，让训练从合理起点开始。</p>
+<p><strong>$b$ 的作用</strong>：初始 $b=-10$，使初始 sigmoid 的输入 $a=z_{ij}(t\cdot 0+b)=z_{ij}\cdot(-10)$。正对 $z=+1$ → $a=-10$ → $\sigma(-10)\approx 0.0000454$ → $\log\sigma(-10)\approx -10$；负对 $z=-1$ → $a=10$ → $\sigma(10)\approx 0.99995$ → $\log\sigma(10)\approx -0.00005$。表面上正对单对损失远大于负对单对损失（$-10$ vs $-0.00005$），但因为 $b$ 让初始模型预测偏向<em>负类</em>（$\sigma(b)=\sigma(-10)\approx 0.0000454$，与"负对远多于正对"的数据先验一致），少数正对的大梯度（$\sigma(10)\approx 1$）抵消多数负对的数量优势（每个负对梯度 $\approx 0$）——$b$ 起到了"先验偏置"作用，让训练从合理起点开始。</p>
 
 <details>
 <summary>展开：$|B|=4$、$t=10$、$b=-10$、初始 $x_i\cdot y_j=0$ 的完整损失手算</summary>
 <p>构造示例。 设 $|B|=4$，4 张图像 + 4 段文本构成 $4\times 4=16$ 个对，4 个正对（对角线 $i=j$）+ 12 个负对（非对角线 $i\neq j$）。设 $t=10$、$b=-10$，初始时 $x_i\cdot y_j=0$（嵌入未训练）。</p>
-<p>对正对 $(i,i)$：$z_{ii}=+1$，logit $a=z_{ii}(t\cdot 0+b)=1\times(0+(-10))=-10$，$\sigma(-10)=1/(1+e^{10})\approx 0.00004540$，逐对项 $\log\sigma(-10)\approx -10.0000454$。4 个正对逐对项之和 $\approx 4\times(-10.0000454)=-40.0002$。</p>
-<p>对负对 $(i,j), i\neq j$：$z_{ij}=-1$，logit $a=z_{ij}(t\cdot 0+b)=(-1)\times(0+(-10))=10$，$\sigma(10)=1/(1+e^{-10})\approx 0.99995460$，逐对项 $\log\sigma(10)\approx -0.0000454$。12 个负对逐对项之和 $\approx 12\times(-0.0000454)=-0.0005$。</p>
+<p>对正对 $(i,i)$：$z_{ii}=+1$，sigmoid 的输入 $a=z_{ii}(t\cdot 0+b)=1\times(0+(-10))=-10$，$\sigma(-10)=1/(1+e^{10})\approx 0.00004540$，逐对项 $\log\sigma(-10)\approx -10.0000454$。4 个正对逐对项之和 $\approx 4\times(-10.0000454)=-40.0002$。</p>
+<p>对负对 $(i,j), i\neq j$：$z_{ij}=-1$，sigmoid 的输入 $a=z_{ij}(t\cdot 0+b)=(-1)\times(0+(-10))=10$，$\sigma(10)=1/(1+e^{-10})\approx 0.99995460$，逐对项 $\log\sigma(10)\approx -0.0000454$。12 个负对逐对项之和 $\approx 12\times(-0.0000454)=-0.0005$。</p>
 <p>16 个逐对项总计 $=-40.0002+(-0.0005)\approx -40.0007$（每对 $\log\sigma(\cdot)\le 0$，故总计为负）。按 F1 取前导负号并除以 $|B|=4$：$\mathcal{L}_{\text{SigLIP}}=-\frac{1}{4}\times(-40.0007)\approx +10.0002$。</p>
 <p><strong>对照：若 $b=0$（无 bias）</strong>，初始时 $a=z_{ij}(t\cdot 0+0)=0$，$\sigma(0)=0.5$，$\log\sigma(0)=\log 0.5\approx -0.6931$。16 个逐对项总计 $=16\times(-0.6931)=-11.09$，按 F1 取负号除以 4 得 $\mathcal{L}_{\text{SigLIP}}\approx +2.77$。表面看损失更小，但此时正对与负对的梯度绝对值相同（均为 $0.5$）、方向相反，而负对数量是正对的 3 倍，总损失被负对主导，初始优化步幅因此过大、需要过校正。$b=-10$ 通过让初始正对 loss 极大、负对 loss 极小，让模型从"预测偏向负类"的起点（与数据先验一致）开始修正，不需要过校正。</p>
 <p>手算数字是构造示例，使用 $t=10, b=-10$ 与初始 $x_i\cdot y_j=0$ 的简化假设；真实训练中嵌入迅速学到结构，$x_i\cdot y_j$ 不再为 0，$b$ 也会随训练调整。</p>
@@ -391,7 +391,7 @@
 <tbody>
 <tr><td>SigLIP 显著优于 softmax</td><td>batch &lt; 16 k（§1 引言）</td><td>batch $\geq 32\text{k}$ 时优势缩小，但仍不差</td></tr>
 <tr><td>SigLIP 在大 batch 下仍可用</td><td>batch $\leq 32\text{k}$ 接近最优</td><td>batch &gt; 32 k 后 INet-0 几乎不再提升；多语言 retrieval 反而下降；batch = 1 M 边际收益快速消失</td></tr>
-<tr><td>可学习 bias $b$ 抵消初始失衡</td><td>batch 较大、正负比例严重失衡（如 1:32767）</td><td>batch 极小（如 1:1）时 $b$ 作用减弱</td></tr>
+<tr><td>可学习 bias $b$ 抵消初始失衡</td><td>batch 较大、正负比例严重失衡（如 1:32767）</td><td>batch 极小（如 1:1）时 $b$ 作用减弱（推断，论文未作此归因）</td></tr>
 </tbody>
 </table>
 </div>

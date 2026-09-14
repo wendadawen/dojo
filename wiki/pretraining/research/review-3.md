@@ -78,3 +78,5 @@ reviewed_content_sha256: 2d2bc751de18b843
 - 审查者报告的「review-2.md 缺失」经编排者核实为误判：文件存在于 research/ 目录（第 2 轮独立审查记录及其修复结果完整）。
 - 修复后 `.dojo/scripts/validate.py` 通过；headless Chrome 渲染实测 KaTeX 节点正常、0 错误。
 - 结论：可发布。
+
+> 本轮所列问题的处理结果见 `minor-fixes.md`。

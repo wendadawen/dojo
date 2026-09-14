@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="KV cache 的显存布局 NHD 与 HND：同一份缓存数据的两种排列方式。NHD 按 (token, 头, 维) 排列、与投影输出一致、写入零转置；HND 按 (头, token, 维) 排列、单头整页连续，服务低精度 kernel 与页级搬运。含 vLLM KVCacheLayout 枚举、布局协商与 SM100 强制 head-major 的实现细节。">
-  <meta name="dojo:summary" content="KV cache 布局指 $N/H/D$ 三个维度（token 数、KV 头数、每头维度）在显存中的排列顺序：NHD 为 $(p, H_{\mathrm{kv}}, d)$、同一 token 的所有头连续，与投影输出 $xW_K$ 一致、写入零转置；HND 为 $(H_{\mathrm{kv}}, p, d)$、同一头的整页 token 连续，单头取页的传输单元从 $d$ 个元素增至 $p \cdot d$ 个（fp16、$d=128$、$p=32$ 时 256 B 对 8 KB），服务低精度 kernel 与页级搬运。vLLM 用固定逻辑形状 $[L,B,H,N,C]$ 加 stride 置换在同一块显存表达两种布局；SM100 的 trtllm-gen kernel 只接受 head-major，Blackwell 上因此解析为 HND。">
+  <meta name="dojo:summary" content="KV cache 布局指 $N/H/d$ 三个维度（token 数、KV 头数、每头维度）在显存中的排列顺序：NHD 为 $(p, H_{\mathrm{kv}}, d)$、同一 token 的所有头连续，与投影输出 $xW_K$ 一致、写入零转置；HND 为 $(H_{\mathrm{kv}}, p, d)$、同一头的整页 token 连续，单头取页的传输单元从 $d$ 个元素增至 $p \cdot d$ 个（fp16、$d=128$、$p=32$ 时 256 B 对 8 KB），服务低精度 kernel 与页级搬运。vLLM 用固定逻辑形状 $[L,B,H,N,C]$ 加 stride 置换在同一块显存表达两种布局；SM100 的 trtllm-gen kernel 只接受 head-major，Blackwell 上因此解析为 HND。">
   <meta name="dojo:type" content="concept">
   <meta name="dojo:topics" content="内存与缓存, 推理系统">
   <meta name="dojo:tag" content="KV cache">
@@ -78,7 +78,7 @@
 <h2>核心问题</h2>
 <ol class="chapter-questions">
 <li>
-<p>KV cache 的三个维度 $N/H/D$ 各自统计什么？NHD 与 HND 分别把哪个维度排在外层，分页形式的完整形状是什么？</p>
+<p>KV cache 的三个维度 $N/H/d$ 各自统计什么？NHD 与 HND 分别把哪个维度排在外层，分页形式的完整形状是什么？</p>
 <details>
 <summary>解答：三个维度与两种排法的定义</summary>
 <p>$N$ 是 token 数（序列方向）、$H$ 是 KV 头数（GQA 下少于查询头数）、$d$ 是每头维度。布局名的字母顺序就是物理维度从外到内的顺序：NHD 为 $(p, H_{\mathrm{kv}}, d)$、同一 token 的所有头连续；HND 为 $(H_{\mathrm{kv}}, p, d)$、同一头的整页 token 连续。分页形式的完整形状在 NHD 下是 $(n_{\text{page}}, p, H_{\mathrm{kv}}, d)$、HND 下是 $(n_{\text{page}}, H_{\mathrm{kv}}, p, d)$。标准命名只有这两种，"HDN"是拼写串位。完整排布图示与贯穿示例见「一页 KV cache 的三个维度」。</p>
@@ -249,7 +249,7 @@ $$p \cdot H_{\mathrm{kv}} \cdot d,$$
 <h3 id="ch1-questions">本章问题</h3>
 <ol class="chapter-questions">
 <li>
-<p>$N/H/D$ 三个维度分别统计什么？为什么 GQA 模型的 $H_{\mathrm{kv}}$ 不等于查询头数？</p>
+<p>$N/H/d$ 三个维度分别统计什么？为什么 GQA 模型的 $H_{\mathrm{kv}}$ 不等于查询头数？</p>
 <details>
 <summary>解答：三个维度的来源</summary>
 <p>$N$ 统计 token 数（序列方向），$d$ 是每个 KV 头向量的维度，两者由模型结构与配置决定；$H_{\mathrm{kv}}$ 统计 KV 头数。GQA 把查询头分组、每组共享同一套 KV 投影，所以缓存侧只需保存 $H_{\mathrm{kv}}$ 个头的向量，$H_{\mathrm{kv}}$ 小于查询头数；这是 KV cache 能省显存的机制之一，与布局无关——布局只决定这 $H_{\mathrm{kv}}$ 个头在页内怎么排。</p>
@@ -284,7 +284,7 @@ $$X W_K \in \mathbb{R}^{N \times (H_{\mathrm{kv}} \cdot d)}$$
 <ul>
 <li>$X$：$N$ 行，每行一个 token 的隐状态；</li>
 <li>$W_K$：把 $d_{\text{model}}$ 维隐状态投影到 $H_{\mathrm{kv}} \cdot d$ 维，各头的 $d$ 维向量沿输出维拼接；</li>
-<li>$N$：本批 token 数（prefill 为整段提示词，decode 每步为 1）。</li>
+<li>$N$：本批 token 数（prefill 为整段提示词；decode 时一批 $N$ 行对应本步各请求各一个 token）。</li>
 </ul>
 
 <p>行主序内存里，这个输出的每一行连续——恰好是一个 token 的全部头数据。把它 reshape 成 $(N, H_{\mathrm{kv}}, d)$ 就是 NHD 视图，reshape 只是改下标解释、不移动数据。FlashInfer 官方文档的表述是：NHD 更自然，因为它与 $xW_K$、$xW_V$ 的输出一致、无需转置<sup>[C2]</sup>。</p>
@@ -449,7 +449,7 @@ $$X W_K \in \mathbb{R}^{N \times (H_{\mathrm{kv}} \cdot d)}$$
 
 <ul>
 <li><strong>fp16 常规推理</strong>：FlashInfer 的实践表述是两种布局没有显著性能差异，并因可读性优先 NHD<sup>[C4]</sup>；vLLM 的默认偏好也是 NHD（LBNHC）排第一位<sup>[C15]</sup>。</li>
-<li><strong>低精度（fp8/nvfp4）走 trtllm-gen kernel</strong>：HND 是默认且高效路径，NHD 会触发转置拷贝<sup>[C8]</sup>。</li>
+<li><strong>低精度（fp8/nvfp4）走 trtllm-gen kernel</strong>：HND 是默认且高效路径；其中 NVFP4 KV cache 下 NHD 会触发转置拷贝<sup>[C8]</sup>。</li>
 <li><strong>页级大块搬运频繁（offload、换入换出）</strong>：搬运侧用 HND 可把单头取页的传输单元从 $d$ 个元素提到 $p \cdot d$ 个<sup>[C6][C7]</sup>。</li>
 </ul>
 
@@ -493,14 +493,14 @@ $$X W_K \in \mathbb{R}^{N \times (H_{\mathrm{kv}} \cdot d)}$$
 <p>HND 的收益集中在哪些场景？为什么 fp16 下默认仍是 NHD？</p>
 <details>
 <summary>解答：低精度 kernel 与页级搬运；fp16 无显著差异</summary>
-<p>两类场景：一是低精度（fp8/nvfp4）的 trtllm-gen kernel，其 API 默认 kv_layout="HND"，NHD 会触发自动 transpose 与 .contiguous() 拷贝；二是页级大块搬运（offload、换入换出），单头取页的传输单元从 $d$ 个元素升至 $p \cdot d$ 个。fp16 常规推理下 FlashInfer 的实践表述是两种布局无显著性能差异，而 NHD 与投影输出一致、写入零转置，vLLM 默认偏好因此把 NHD（LBNHC）排在第一位。HND 不是普遍更优，而是特定读路径的选择。</p>
+<p>两类场景：一是低精度（fp8/nvfp4）的 trtllm-gen kernel，其 API 默认 kv_layout="HND"；其中 NVFP4 KV cache 下 NHD 会触发自动 transpose 与 .contiguous() 拷贝；二是页级大块搬运（offload、换入换出），单头取页的传输单元从 $d$ 个元素升至 $p \cdot d$ 个。fp16 常规推理下 FlashInfer 的实践表述是两种布局无显著性能差异，而 NHD 与投影输出一致、写入零转置，vLLM 默认偏好因此把 NHD（LBNHC）排在第一位。HND 不是普遍更优，而是特定读路径的选择。</p>
 </details>
 </li>
 </ol>
 
 <h2 id="vllm-impl">4. vLLM 实现：逻辑形状固定，stride 置换切换布局</h2>
 
-<p>前三章的结论若要落地，引擎必须回答：布局切换会不会搬数据？多种注意力后端各有偏好时听谁的？本章按 stride 视图、枚举定义、布局协商、SM100、写入适配的顺序拆 vLLM 的答案（基于 2026-09-03 拉取的 main 分支）。</p>
+<p>前三章的结论若要落地，引擎必须回答：布局切换会不会搬数据？多种注意力后端各有偏好时听谁的？本章拆 vLLM 的答案（基于 2026-09-03 拉取的 main 分支）。</p>
 
 <h3 id="stride-view">4.1 stride：同一块内存的两种视图</h3>
 

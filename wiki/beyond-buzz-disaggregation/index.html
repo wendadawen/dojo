@@ -170,7 +170,7 @@
 
 <h3 id="traffic">2.1 流量：prefill-heavy 收益最大</h3>
 
-<p>图 8 用 DeepSeek-R1 在四种 (ISL, OSL) 组合下比较分离与合设：(16k, 2k) 强 prefill-heavy、(16k, 16k) 平衡偏 prefill、(2k, 2k) 平衡偏 decode、(2k, 16k) generation-heavy<sup>[C18]</sup>。前两张图分离蓝线明显高于合设红线，后两张差距收窄——验证"prefill-heavy 收益最大"的第一结论。</p>
+<p>图 8 用 DeepSeek-R1 在四种 (ISL, OSL) 组合下比较分离与合设：(16k, 2k) 强 prefill-heavy、(16k, 16k) 与 (2k, 2k) 均为 1:1 平衡、(2k, 16k) generation-heavy<sup>[C18]</sup>。前两张图分离蓝线明显高于合设红线，后两张差距收窄——验证"prefill-heavy 收益最大"的第一结论。</p>
 
 <img src="assets/img-07.webp" alt="Fig.8 DeepSeek-R1 在 (ISL/OSL) 为 (16k/2k)、(16k/16k)、(2k/2k)、(2k/16k) 四种组合下的 Pareto。蓝线 Disaggregated、红实线 Co-located Overall、红虚线 Piggybacked Co-located。" style="width:100%; max-width:720px; display:block; margin: 1em auto;">
 
@@ -202,7 +202,7 @@
 <p>为什么 prefill-heavy 流量的分离收益最大？</p>
 <details>
 <summary>解答：分离解除两阶段映射耦合，prefill-heavy 时耦合代价最明显</summary>
-<p>合设部署要同时处理 prefill（compute-bound、批大、算力敏感）与 decode（memory-bound、批小、权重复用敏感）两阶段，单一映射无法同时最优<sup>[C10, C18]</sup>。如果映射偏 decode 速度以满足 TTL SLA，prefill 吞吐被牺牲；如果映射偏 prefill 吞吐，decode 速度恶化。prefill-heavy 流量下被牺牲的 prefill 吞吐是系统的主要瓶颈——分离让 prefill 池独立选自己的映射、消除这一牺牲。generation-heavy 流量下 prefill 占比小，解除耦合的边际收益也小。同一图也支持 piggybacking 在 generation-heavy 下最有前景的镜像结论<sup>[C18]</sup>。这是为什么"是否分离"的决策需要先做流量画像、不能直接套用。</p>
+<p>合设部署要同时处理 prefill（compute-bound、批大、算力敏感）与 decode（memory-bound、批小、权重复用敏感）两阶段，单一映射无法同时最优（基于两阶段负载结构的推断）<sup>[C10, C18, 推断]</sup>。如果映射偏 decode 速度以满足 TTL SLA，prefill 吞吐被牺牲；如果映射偏 prefill 吞吐，decode 速度恶化。prefill-heavy 流量下被牺牲的 prefill 吞吐是系统的主要瓶颈——分离让 prefill 池独立选自己的映射、消除这一牺牲。generation-heavy 流量下 prefill 占比小，解除耦合的边际收益也小。同一图也支持 piggybacking 在 generation-heavy 下最有前景的镜像结论<sup>[C18]</sup>。这是为什么"是否分离"的决策需要先做流量画像、不能直接套用。</p>
 </details>
 </li>
 <li>
@@ -233,11 +233,11 @@
 
 <p>CPP 的机制详见 <a href="../chunked-prefill/index.html">Chunked Prefill</a> 页第 5 章：把长 prefill 切成等计算量的块，每个块作为 micro-batch 进流水线，slot 时长均匀、气泡被压缩。论文把这条作为 prefill 池的最优策略直接使用：长序列上想要严 FTL 又不丢吞吐，CPP 是默认答案。</p>
 
-<p>该结论的边界在于：图 5 是 ISL 256K 极端长序列的设置，对常见 ISL（16k、4k）该结论仍成立但压低 FTL 的空间更小（因为单层 FTL 已经足够低）。</p>
+<p>该结论的边界在于：图 5 是 ISL 256K 极端长序列的设置，对常见 ISL（16k、4k）该结论仍成立但压低 FTL 的空间更小（因为单层 FTL 已经足够低）——这一泛化属页面推断，论文未在短 ISL 上验证。</p>
 
 <h3 id="decode-trajectory">3.2 decode 池的策略：TTL 收紧向小批与高 TP 收敛</h3>
 
-<p>分离部署中 SLA 由 FTL（prefill 完成到首 token 的延迟；范围数百毫秒到数分钟<sup>[N2]</sup>）与 TTL（生成相邻两个 token 的延迟；数毫秒级<sup>[N2]</sup>）共同定义。TTL 约束只作用于 decode 池。沿 Pareto 前沿从低 TPS 端（宽松延迟）走到高 TPS 端（紧延迟），配置轨迹的规律是：批大小从高到低、张量并行度从低到高<sup>[C14]</sup>。具体例子：DeepSeek-R1、ISL 16k、OSL 2k 模拟下，专家并行在 NVLink 域内一致占优，注意力计算从高吞吐区的数据并行转向紧 TTL 下的张量并行，批大小在数百递减<sup>[C14]</sup>。LLaMa-3.1-70B 上 TP 沿 Pareto 从 2$\times$ 扩到 64$\times$，批大小同步递减<sup>[C14, N5]</sup>。</p>
+<p>分离部署中 SLA 由 FTL（prefill 完成到首 token 的延迟；范围数百毫秒到数分钟）与 TTL（生成相邻两个 token 的延迟；数毫秒级）共同定义<sup>[C12, N2]</sup>。TTL 约束只作用于 decode 池。沿 Pareto 前沿从低 TPS 端（宽松延迟）走到高 TPS 端（紧延迟），配置轨迹的规律是：批大小从高到低、张量并行度从低到高<sup>[C14]</sup>。具体例子：DeepSeek-R1、ISL 16k、OSL 2k 模拟下，专家并行在 NVLink 域内一致占优，注意力计算从高吞吐区的数据并行转向紧 TTL 下的张量并行，批大小在数百递减<sup>[C14]</sup>。LLaMa-3.1-70B 上 TP 沿 Pareto 从 2$\times$ 扩到 64$\times$，批大小同步递减<sup>[C14, N5]</sup>。</p>
 
 <p>关键观察是分离的 decode 池可以比合设更激进地采用高 TP。合设下映射必须同时照顾 prefill，TP 不能放得太大（会拖累 prefill 性能）；分离的 decode 池只需要满足 TTL，可以单独追求 TP 极致<sup>[C15]</sup>。效果是分离在中延迟区（即 Pareto 的中段）取得更优性能——这是分离在中延迟区领先合设的机制来源。</p>
 
@@ -338,7 +338,7 @@
 <p>为什么 egress 公式分母是 FTL $\times$ NumGPU 而不是单纯 FTL？</p>
 <details>
 <summary>解答：分母是"总的可传输时间 $\times$ 出口卡数"，每卡实际承担 1/NumGPU</summary>
-<p>分母同时乘 FTL 与 NumGPU_{prefill}：FTL 是所有 prefill GPU 共享的总时间窗，NumGPU_{prefill} 是"分摊"出口带宽的 GPU 数。两者相乘 = 可用于传输的总时间-卡数资源，再除以 KV 总量得到每卡每单位时间字节率<sup>[C8, F1]</sup>。直觉：每张卡都分担总出口流量，总资源（时间 $\times$ 卡数）越大、每卡压力越小。相应地 $NumGPU_{prefill}$ 只计入"唯一切分 KV 的 GPU"——KV 复制的 rank 不承担额外传输（接收方收到的是同一份）。</p>
+<p>分母同时乘 FTL 与 NumGPU_{prefill}：FTL 是所有 prefill GPU 共享的总时间窗，NumGPU_{prefill} 是"分摊"出口带宽的 GPU 数。两者相乘 = 可用于传输的总时间-卡数资源；KV 总量除以该资源得到每卡每单位时间字节率<sup>[C8, F1]</sup>。直觉：每张卡都分担总出口流量，总资源（时间 $\times$ 卡数）越大、每卡压力越小。相应地 $NumGPU_{prefill}$ 只计入"唯一切分 KV 的 GPU"——KV 复制的 rank 不承担额外传输（接收方收到的是同一份）。</p>
 </details>
 </li>
 <li>
@@ -368,7 +368,7 @@
 <ul>
 <li><b>①分与不分的决策</b>。先做流量画像（ISL/OSL）与模型大小判断。prefill-heavy（ISL&gt;&gt;OSL）+ 大模型（&gt;10B）是分离的明显受益区间；小模型（&lt;10B）或 generation-heavy 流量下分离收益有限，应优先评估合设部署的优化空间而非直接上分离<sup>[C2, C24]</sup>。</li>
 <li><b>②若分，动态 rate matching 是必需件不是可选项</b>。最优 ctx:gen GPU 比例随模型与延迟目标大幅变化（DeepSeek-R1 跨度从 3.6 到 0.05）<sup>[C20, G7]</sup>。固定比例在偏离其适用区间时显著退化（3.5 与 0.5 的对照）<sup>[C21, G8]</sup>。小规模 GPU 部署因搜索空间受限，预期有类似退化<sup>[C21]</sup>。</li>
-<li><b>③弹性伸缩</b>。配合动态 rate matching 的另一面——两池规模要能随需求变化调整；静态规模在流量模式变化时会偏离 Pareto 最优<sup>[C3, C25]</sup>。</li>
+<li><b>③弹性伸缩</b>。配合动态 rate matching 的另一面——两池规模要能随需求变化调整；静态规模在流量模式变化时会偏离 Pareto 最优<sup>[C3]</sup>。</li>
 <li><b>④prefill 池优先 CPP</b>。长 ISL 下深 PP 维度持续压 FTL 而吞吐几乎保持（图 5）<sup>[C13, G3]</sup>；对短 ISL 仍可用但收益空间小。</li>
 <li><b>⑤decode 池预留 TP 升级空间</b>。紧 TTL 下分离的 decode 池可更激进地采用高 TP（无需兼顾 prefill 性能）<sup>[C15]</sup>。在硬件规划上预留 NVLink 域内的 TP 扩展能力。</li>
 <li><b>⑥NVLink 域越大越好</b>。更大 NVLink 域给更宽的 EP/TP 选择自由度，分离性能一致增强（DeepSeek-R1 在中延迟区受益于更高 EP 与批、LLaMa-70B 在低延迟受益于高 TP）<sup>[C22]</sup>。</li>
@@ -485,7 +485,7 @@
 <li>模拟器性质：所有图为模拟数据非实测，绝对数字不可直接迁移到任意集群；归一化数字仅传达趋势。</li>
 <li>P50 流量近似：常数 ISL/OSL（取 P50 的最近 2 的幂），附录 C 在论文所测的真实分布上验证；极端多峰分布未验证。</li>
 <li>逐层即时传输：公式与带宽结论都依赖该假设；实际系统的传输滞后会按比例增加所需带宽。</li>
-<li>Blackwell + FP4 语境：外推到其他硬件（如 H100、A100）时带宽数字与最优配置可能不同；FP4 字节数是 mlp 量化精度的代表，论文未给其他精度的对照数字。</li>
+<li>Blackwell + FP4 语境：外推到其他硬件（如 H100、A100）时带宽数字与最优配置可能不同；FP4 精度是论文所用的精度设定，论文未给其他精度的对照数字。</li>
 <li>无 KV 复用：未考虑不同请求共享 KV 段（prefix cache、context cache）；这一省略对短提示的工作负载影响更大（重复片段多）。</li>
 <li>无投机解码：未纳入 speculative decoding 的影响。</li>
 </ul>

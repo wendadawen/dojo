@@ -188,7 +188,7 @@
     <p>Runner 存在 v1/v2 两个实现，但两者都是 <code>GPUModelRunner</code> 类，差异在内部行为。v2 默认仅对单一架构集合启用（如 <code>Qwen3ForCausalLM</code>，且要求非 MoE、非量化、安装了 Triton）；不在名单内的架构（如 <code>Qwen3_5ForConditionalGeneration</code>）走 v1 实现。也可用环境变量强制指定。此区分与引擎的 V0/V1 代际无关——v1/v2 runner 都属于 V1 引擎。</p>
 
     <h2 id="rpc">4. collective_rpc：统一的跨 worker 调用接口</h2>
-    <p>EngineCore 对 worker 的所有调用（<code>execute_model</code>、<code>sample_tokens</code> 等）都走 <code>collective_rpc</code> 这一个入口，传入的是<strong>方法名字符串</strong>。该接口同时接受方法名字符串与可调用对象：字符串可直接广播，函数对象路径先经 cloudpickle 序列化为字节再广播。EngineCore 以方法名字符串调用，不区分卡数——TP=1 与 TP=8 使用同一行调用。</p>
+    <p>EngineCore 对 worker 的执行类调用（<code>execute_model</code>、<code>sample_tokens</code> 等）都走 <code>collective_rpc</code> 这一个入口，传入的是<strong>方法名字符串</strong>。该接口同时接受方法名字符串与可调用对象：字符串可直接广播，函数对象路径先经 cloudpickle 序列化为字节再广播。EngineCore 以方法名字符串调用，不区分卡数——TP=1 与 TP=8 使用同一行调用。</p>
 
     <h3 id="rpc-uni">4.1 UniProcExecutor 路径（TP=1）</h3>
 <pre><code class="language-python"># collective_rpc 内部（非阻塞分支）
@@ -200,7 +200,7 @@ return func(*args, **kwargs)
     <p>TP=1 时 worker 与 EngineCore 同进程，<code>run_method</code> 直接以 <code>getattr</code> 找到方法并调用，没有跨进程开销。</p>
 
     <h3 id="rpc-multi">4.2 MultiprocExecutor 路径（TP&gt;1）</h3>
-    <p>TP&gt;1 时每个 GPU 一个独立 worker 进程（<code>WorkerProc</code>）。调用被序列化后放进广播消息队列 <code>rpc_broadcast_mq</code>：该队列对小消息用共享内存环形缓冲传输，对超过阈值的消息退化为 ZMQ 发布订阅（XPUB/SUB）。每个 worker 从队列收到同一份消息，各自在自己进程内解析并执行，结果写回各自的 response 消息队列。Executor 侧返回一个 future，其内部等待全部 worker 的 response 队列并聚合结果——因此 N 卡场景下调用方拿到的仍是单个 future，其中包含 N 份回复。方法名若传入的是函数对象而非字符串，则先经 cloudpickle 序列化为字节再广播。</p>
+    <p>TP&gt;1 时每个 GPU 一个独立 worker 进程（<code>WorkerProc</code>）。调用被序列化后放进广播消息队列 <code>rpc_broadcast_mq</code>：该队列对小消息用共享内存环形缓冲传输，对超过阈值的消息退化为 ZMQ 发布订阅（XPUB/SUB）。每个 worker 从队列收到同一份消息，各自在自己进程内解析并执行，结果写回各自的 response 消息队列。Executor 侧返回一个 future，其内部等待全部 worker 的 response 队列并聚合结果——因此 N 卡时调用方拿到的仍是单个 future，其中包含 N 份回复。方法名若传入的是函数对象而非字符串，则先经 cloudpickle 序列化为字节再广播。</p>
 
     <h2 id="step-four">5. 每回合四动作与一次请求往返</h2>
     <table>
@@ -211,7 +211,7 @@ return func(*args, **kwargs)
       <tr><td>更新</td><td><code>Scheduler.update_from_output</code></td><td>更新请求状态与 KV cache，产出 <code>EngineCoreOutputs</code></td></tr>
     </table>
     <p>调度器没有 prefill 与 decode 两个阶段：每个请求只维护 <code>num_computed_tokens</code>（已计算数）与 <code>num_tokens_with_spec</code>（目标数），每步在 token 预算内尽量推进前者追上后者。一个 983 token 的 prefill 请求表现为单回合内调度 983 个 token，之后的 decode 每回合只推进 1 个 token。同一个 983 token 的 prefill 回合在模型执行阶段退回 eager，随后的 decode 回合才命中捕获图重放（<a href="../vllm-mm-unified-embeds-cudagraph/index.html">多模态统一输入与 cudagraph</a>）。这一分布同样体现在 trace 中：EngineCore 主线程的高频事件集中在 forward 与 KV cache 管理函数上，调度函数的调用频率远低于前者。</p>
-    <p>两进程间一次请求往返的五要素：输入为 <code>EngineCoreRequest</code>（普通字段经 MsgpackEncoder 序列化，张量走带外共享内存传输）；状态为 <code>EngineCoreProc</code> 的输入与输出两个队列；关键参数为 ZMQ 地址（同机 <code>ipc://</code>，跨机 <code>tcp://host:port</code>）；主要步骤为 <code>add_request_async</code> 经 ZMQ 发送 ADD → <code>_process_input_queue</code> 收到并放入调度器 → 回合执行 → 结果放入输出队列 → APIServer 的 output_handler 循环拉取；输出为 <code>EngineCoreOutputs</code>，经 <code>OutputProcessor</code> 转为 <code>RequestOutput</code> 推给用户。</p>
+    <p>两进程间一次请求往返的五要素：输入为 <code>EngineCoreRequest</code>（普通字段经 MsgpackEncoder 序列化，张量走带外共享内存传输）；状态为 <code>EngineCoreProc</code> 的输入、输出与 abort 三类队列；关键参数为 ZMQ 地址（同机 <code>ipc://</code>，跨机 <code>tcp://host:port</code>）；主要步骤为 <code>add_request_async</code> 经 ZMQ 发送 ADD → <code>_process_input_queue</code> 收到并放入调度器 → 回合执行 → 结果放入输出队列 → APIServer 的 output_handler 循环拉取；输出为 <code>EngineCoreOutputs</code>，经 <code>OutputProcessor</code> 转为 <code>RequestOutput</code> 推给用户。</p>
 
     <h2 id="classes">6. 类与进程大全辨析</h2>
     <p>这套架构中的多个类名后缀相近，按后缀归类如下。</p>
@@ -246,7 +246,7 @@ return func(*args, **kwargs)
       <tr><td><code>MultiprocExecutor</code></td><td>TP&gt;1：每 GPU 一个 worker 进程，广播调用</td></tr>
       <tr><td><code>RayDistributedExecutor</code></td><td>用 Ray actor 管理 worker 的实现（集群部署）</td></tr>
       <tr><td><code>WorkerWrapperBase</code></td><td>worker 的包装壳：延迟初始化、生命周期、<code>__getattr__</code> 门面转发。Executor 实际持有的是它</td></tr>
-      <tr><td><code>WorkerBase</code>（ABC）</td><td>worker 抽象基类</td></tr>
+      <tr><td><code>WorkerBase</code></td><td>worker 基类</td></tr>
       <tr><td><code>Worker</code></td><td>GPU worker（gpu_worker.py）：单卡总管，init_device/load_model/execute_model/sample_tokens/check_health</td></tr>
       <tr><td><code>GPUModelRunner</code></td><td>forward 执行者：准备输入、调用模型、处理输出。worker 内最贴近模型的一层</td></tr>
     </table>
