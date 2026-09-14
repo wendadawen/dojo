@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="NVIDIA P + AMD D 异构 PD 分离实测：proxy 双投递、三层握手、RDMA WRITE 传 KV；每 block 1351680 B 的字节构成、异构可行的条件与脆弱性、失败路径与实测时序。">
-  <meta name="dojo:summary" content="P（NVIDIA，HPC_ATTN）与 D（AMD，HYVL_INT8_ATTN）经 FlexibleConnector + NIXL + Mooncake + RoCE 做 PD 分离：proxy 按 request_id 双投递，P 只出 1 个 token，KV 以 1351680 B/block 原样 RDMA WRITE 推给 D。异构可行的硬条件是两侧 KV 布局逐字节相同；实测 KV 传输仅占端到端 0.12%。">
+  <meta name="dojo:summary" content="P（NVIDIA，HPC_ATTN）与 D（AMD，HYVL_INT8_ATTN）经 FlexibleConnector（内部实现，公开仓库不可核对）+ NIXL + Mooncake + RoCE 做 PD 分离：proxy 按 request_id 双投递，P 只出 1 个 token，KV 以 1351680 B/block 原样 RDMA WRITE 推给 D。异构可行的硬条件是两侧 KV 布局逐字节相同；实测 KV 传输仅占端到端 0.12%。">
   <meta name="dojo:type" content="note">
   <meta name="dojo:topics" content="推理系统">
   <meta name="dojo:tag" content="推理系统">
@@ -244,8 +244,8 @@
 
     <ul>
       <li><strong>KV head 每 rank 1 个</strong>：模型采用 GQA，共 8 个 KV head，TP=8 切下来每 rank 恰好 1 个。</li>
-      <li><strong>132 = 128 + 4</strong>：每行 128 字节数据加 4 字节尾部。K 的 scale 是动态值（per-token-per-head 量化，每个 token 一个 fp32），必须随数据走，内嵌在 block 尾部；V 的 scale 是静态 per-head 值，直接从 checkpoint 的 <code>_v_scale</code> 读，不进 cache，槽位空置（约 3% 浪费）。</li>
-      <li><strong>D 侧读取用零拷贝视图</strong>：<code>split_hyvl_kv_cache()</code> 把 (64, 132) reshape 成 (66, 128)——前 64 行是 KV 数据，每行尾部的 4 B scale 收拢成后 2 行（64 个 fp32，共 256 B），不搬数据。</li>
+      <li><strong>132 = 128 + 4</strong>：每行 128 字节数据加 4 字节尾部。K 的 scale 是动态值（per-token-per-head 量化，每个 token 一个 fp32），必须随数据走，内嵌在每个 token 行的尾部；V 的 scale 是静态 per-head 值，直接从 checkpoint 的 <code>_v_scale</code> 读，不进 cache，槽位空置（约 3% 浪费）。</li>
+      <li><strong>D 侧读取用零拷贝视图</strong>：<code>split_hyvl_kv_cache()</code> 不做数据搬运，按 stride 132 逐行取视图——每行前 128 B 是 int8 量化数据、末 4 B 是该 token 的 fp32 scale；64 行共 64 个 scale（256 B）。整块 8448 B 也等于 66 × 128，reshape 成 (66, 128) 只是同尺寸的重新解释，不改变字节顺序。</li>
     </ul>
 
     <figure>
@@ -257,22 +257,14 @@
           <div xmlns="http://www.w3.org/1999/xhtml" style="font:13px/1.5 var(--font-ui);color:var(--text);text-align:center;">1 层 × 1 KV head = 16896 B（分配视角 $2 \times 64 \times 132$）</div>
         </foreignObject>
 
-        <rect x="70" y="46" width="290" height="34" fill="var(--bg-soft)" stroke="var(--border)"/>
-        <foreignObject x="72" y="52" width="286" height="22">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="font:12px/1.6 var(--font-mono);color:var(--text);text-align:center;">K 数据 · int8 · 64 行 × 128 B</div>
-        </foreignObject>
-        <rect x="70" y="84" width="290" height="20" fill="var(--bg)" stroke="var(--blue)" stroke-dasharray="4 3"/>
-        <foreignObject x="72" y="87" width="286" height="16">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.45 var(--font-mono);color:var(--text-light);text-align:center;">K scale · fp32 · 2 行（64 个，每 token 一个，动态）</div>
+        <rect x="70" y="46" width="290" height="62" fill="var(--bg-soft)" stroke="var(--border)"/>
+        <foreignObject x="74" y="52" width="282" height="52">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.55 var(--font-mono);color:var(--text);text-align:center;">K 半块 · int8 · 64 行 × 132 B<br/><span style="color:var(--text-light)">每行 128 B 数据 + 4 B 行尾 scale</span><br/><span style="color:var(--text-light)">64 个 scale（256 B）· 共 8448 B</span></div>
         </foreignObject>
 
-        <rect x="400" y="46" width="290" height="34" fill="var(--bg-soft)" stroke="var(--border)"/>
-        <foreignObject x="404" y="52" width="282" height="22">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="font:12px/1.5 var(--font-mono);color:var(--text);text-align:center;">V 数据 · fp8_e4m3 · 64 行 × 128 B</div>
-        </foreignObject>
-        <rect x="400" y="84" width="290" height="20" fill="var(--bg)" stroke="var(--border)" stroke-dasharray="4 3"/>
-        <foreignObject x="402" y="87" width="286" height="16">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.45 var(--font-mono);color:var(--text-light);text-align:center;">V scale 槽位 · 空置（静态值在 checkpoint）</div>
+        <rect x="400" y="46" width="290" height="62" fill="var(--bg-soft)" stroke="var(--border)"/>
+        <foreignObject x="404" y="52" width="282" height="52">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.55 var(--font-mono);color:var(--text);text-align:center;">V 半块 · fp8_e4m3 · 64 行 × 132 B<br/><span style="color:var(--text-light)">每行 128 B 数据 + 4 B scale 槽位</span><br/><span style="color:var(--text-light)">静态值在 checkpoint · 槽位空置 · 8448 B</span></div>
         </foreignObject>
 
         <path d="M215,112 C215,140 190,146 190,164" fill="none" stroke="var(--text-light)" stroke-width="1.2" marker-end="url(#arr3)"/>
@@ -286,7 +278,7 @@
           <div xmlns="http://www.w3.org/1999/xhtml" style="font:11px/1.4 var(--font-mono);color:var(--text-light);text-align:center;">6 blocks × 64 slot = 384 $\geq$ 362 prompt token；8 rank 并行共 61.9 MiB</div>
         </foreignObject>
       </svg>
-      <figcaption>图 3：block 内布局。K 半块与 V 半块各 66 行（64 行数据 + 2 行 scale 位），每半块 8448 B。</figcaption>
+      <figcaption>图 3：block 内布局。K、V 半块各 64 行 × 132 B（128 B 数据 + 4 B 行尾 scale），两半块各 8448 B。</figcaption>
     </figure>
 
     <p>实测速率（关闭前缀缓存，单 rank 传输 8110080 B）：热路径 4.4 ms（约 1.70 GB/s），冷路径 17.8 ms（约 0.42 GB/s）。热路径指 RDMA 连接与显存映射已预热后的稳态传输、冷路径指该连接建立后的首次传输，两者字节数相同、差在是否已预热（此区分为推断）。日志沿用 GB/s 字样，基数实为 $2^{30}$（GiB）。第 3 节前缀缓存命中那次的 6.9 ms / 1.09 GB/s 同此口径，属另一次运行，条件不同，不与本节直接对比。</p>
@@ -365,8 +357,8 @@ grep -a "KV transfer timeout\|NIXL transfer failed\|prefill_failed"   $L</code><
     <table>
       <tr><th>内容</th><th>依据</th></tr>
       <tr><td>全部数字、日志与时序</td><td>内部实测记录（异构 PD 部署，2026-08）：两侧服务日志的内建 timing 与 PD 事件日志、config、代码走读、torch profiler 四类数据源</td></tr>
-      <tr><td>握手与传输机制</td><td>vLLM <code>flexible_connector.py</code>：<code>node_info</code> / <code>compat_manifest</code> / <code>export_local_agent()</code> / <code>prep_xfer_dlist()</code> / <code>import_remote_agent()</code> 等（以符号名为准，行号随版本漂移）</td></tr>
-      <tr><td>KV 布局</td><td><code>hpc_attn.py</code> 的 <code>_fp8_per_head_scale_elems_padded()</code>；<code>hyvl_int8_attn.py</code> 的 <code>K_SCALE_BYTES</code> 与 <code>split_hyvl_kv_cache()</code></td></tr>
+      <tr><td>握手与传输机制</td><td>内部实现 <code>flexible_connector.py</code>（内部 vLLM 分支，公开仓库不可核对）：<code>node_info</code> / <code>compat_manifest</code> / <code>export_local_agent()</code> / <code>prep_xfer_dlist()</code> / <code>import_remote_agent()</code> 等（以符号名为准，行号随版本漂移）</td></tr>
+      <tr><td>KV 布局</td><td>内部实现（公开仓库不可核对）：<code>hpc_attn.py</code> 的 <code>_fp8_per_head_scale_elems_padded()</code>；<code>hyvl_int8_attn.py</code> 的 <code>K_SCALE_BYTES</code> 与 <code>split_hyvl_kv_cache()</code></td></tr>
       <tr><td>agent_metadata 内部结构（GID/QP/rkey）</td><td>推断，非代码实证；源记录已标注</td></tr>
     </table>
     <p style="color:var(--text-light);font-size:14px">范围：只覆盖 PD 链路；模型结构（ViT/MoE/config 细节）与 D 侧 kernel 级耗时分析（cos_sin_cache 重复转换、all-reduce 自旋等待）不在其中。相关阅读：<a href="../beyond-buzz-disaggregation/index.html">PD 分离动机</a>、<a href="../kv-cache/index.html">KV cache 基础</a>、<a href="../gpu-communication/index.html">GPU 通信</a>、<a href="../model-parallelism/index.html">并行方式</a>。</p>

@@ -184,7 +184,7 @@
 <tr><td>稀疏注意力 · 窗口 + 压缩</td><td><code>窗口 128 + 压缩 512 -&gt; [1,T,64,512]</code></td><td>$o = \frac{\sum_t e^{q\cdot k_t/\sqrt{d}-m}v_t}{\sum_t e^{q\cdot k_t/\sqrt{d}-m} + e^{\mathrm{sink}-m}}$</td><td>两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。索引为 $-1$ 的占位槽位分子分母都不贡献。</td></tr>
 <tr><td>wo_a · 32768 → 8192（8 组）</td><td><code>[1,T,64,512] -&gt; [1,T,8,1024]</code></td><td>$o\_groups=8,\ o\_lora\_rank=1024$</td><td>按 8 组各降到 1024 维。真实权重形状 [8192, 4096]；分组的设计动机未在来源中说明。</td></tr>
 <tr><td>wo_b · 8192 → 5120</td><td><code>[1,T,8192] -&gt; [1,T,5120]</code></td><td>$y = W_{o_b}o$</td><td>拼回隐藏维。真实权重形状 [5120, 8192]。</td></tr>
-<tr><td>写回四流 · × 系数</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow x_i + \lambda_i y$</td><td>子层输出按每流系数写回残差流。</td></tr>
+<tr><td>写回四流 · post/comb 混合</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow \mathrm{post}_i \odot y + \sum_j \mathrm{comb}_{ij} \odot x_j$</td><td>子层输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。</td></tr>
 </table>
 <p>边：in→hc1（20480）；hc1→wqa（5120）；wqa→qn（1280）；qn→wqb（1280）；wqb→rope（32768）；hc1→wkv（5120）；wkv→kvn（512）；kvn→win（FP8 128 槽）；hc1→cmp（经 Compressor 独立投影）；rope→sa（q）；win→sa（128 位置）；cmp→sa（512 条目）；sink→sa（分母）；sa→woa（32768）；woa→wob（8192）；wob→hc2（5120）</p>
 <h4>压缩条目与两级稀疏选择</h4>
@@ -196,7 +196,7 @@
 <tr><td>选出 2048 块</td><td><code>[1,T,n/8] -&gt; 2048 块</code></td><td>$\text{top-}2048$</td><td>只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。</td></tr>
 <tr><td>候选池 · 2048 × 8 = 16384</td><td><code>16384 个候选位置</code></td><td>$2048 \times 8 = 16384$</td><td>候选位置集合。短上下文下可达条目本身少于 16384，此时候选池不起缩减作用。</td></tr>
 <tr><td>位置级 Top-512</td><td><code>16384 -&gt; [1,T,512]</code></td><td>$\text{top-}512$</td><td>在池内按索引分取前 512 条。Reindex 层重做这一步，Reuse 层直接复用上一次的选择。</td></tr>
-<tr><td>拼进稀疏注意力</td><td><code>窗口 128 + 压缩 512</code></td><td>$\mathcal{T} = \text{窗口} \cup \text{Top-}512$</td><td>两部分槽位在同一次调用里做 softmax，窗口没有额外权重加成——谁的分高谁拿得多。</td></tr>
+<tr><td>拼进稀疏注意力</td><td><code>窗口 128 + 压缩 512</code></td><td>$\mathcal{T} = \text{窗口} \cup \text{Top-}512$</td><td>两部分槽位在同一次调用里做一次 softmax，窗口没有额外权重加成，选中完全由索引分决定。</td></tr>
 </table>
 <p>边：pool0→score（逐条打分）；score→blk（聚合）；pin→blk（保留最新块）；blk→top2048（块分排序）；top2048→cand（展开 8 位置）；cand→top512（池内排序）；top512→sa（512 条）；pool0→sa（可达性决定候选范围）</p>
 <h4>MoE 与超连接写回</h4>
@@ -209,7 +209,7 @@
 <tr><td>6 个路由专家 · 各 2304 × 5120 × 3</td><td><code>[1,T,5120] -&gt; 6 × [1,T,2304]</code></td><td>$\mathrm{w1},\mathrm{w3}{:}\,[2304,5120]\ \ \mathrm{w2}{:}\,[5120,2304]$</td><td>每个专家约 35.39M 参数（fp4 量化存储，I8 打包）。384 个专家全存但每 token 只用 6 个。</td></tr>
 <tr><td>共享专家 · 1 个，每 token 必过</td><td><code>[1,T,5120] -&gt; [1,T,2304]</code></td><td>$\text{shared expert}$</td><td>与路由专家同形（约 35.39M），不参与稀疏选择。</td></tr>
 <tr><td>加权相加</td><td><code>6 × [1,T,2304] + [1,T,2304] -&gt; [1,T,5120]</code></td><td>$y = \sum_{i\in\mathrm{idx}} w_i E_i(x) + E_{\mathrm{shared}}(x)$</td><td>路由专家按权重加权，共享专家恒权相加。</td></tr>
-<tr><td>写回四流</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow x_i + \lambda_i y$</td><td>MoE 输出按每流系数写回四份残差流。</td></tr>
+<tr><td>写回四流 · post/comb 混合</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow \mathrm{post}_i \odot y + \sum_j \mathrm{comb}_{ij} \odot x_j$</td><td>MoE 输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。</td></tr>
 </table>
 <p>边：in→norm（5120）；norm→gate（5120）；bias→gate（384）；gate→sel（384 → 6）；sel→rexp（6 个专家）；norm→shared（5120）；rexp→sum（加权）；shared→sum（恒权）；sum→hc（5120）</p>
 <h4>Engram：n-gram 哈希查表（层 1 与层 14）</h4>
@@ -281,7 +281,7 @@
   <li><b>位置级选择</b>：候选池内的 16384 个位置按索引分取前 512，与窗口槽位拼进同一次稀疏注意力调用。</li>
 </ul>
 <p>不可达的条目（编号不小于 $\lfloor(i+1)/r\rfloor$）在打分阶段就被置为 $-\infty$。注意力本身对选中槽位做加权求和，并把每头一个可学习的汇聚点标量加在分母上——汇聚点只进分母、不参与取最大值，也不携带值向量。</p>
-<p>三种层模式决定了「谁算、谁复用」：Full 层自算主 KV、索引器 K 与 Top-K；Reindex 层复用最近的主 KV 与索引器 K，但自己重算 Top-K（在候选池内）；Reuse 层连 Top-K 一起复用，不算索引分。模式由配置静态决定。</p>
+<p>三种层模式决定各层自算还是复用：Full 层自算主 KV、索引器 K 与 Top-K；Reindex 层复用最近的主 KV 与索引器 K，但自己重算 Top-K（在候选池内）；Reuse 层连 Top-K 一起复用，不算索引分。模式由配置静态决定。</p>
 
 <h2 id="extra">6. Engram 与 DSpark</h2>
 <p><b>Engram</b> 插在层 1 与层 14。它从当前位置往前取长度 2、3、4 的连续片段，各用 8 个哈希函数映射到嵌入表下标，共 24 个下标（每 token 取回 $24\times256=6144$ 个表元素）；取回的向量经一个稠密投影写回残差流，写入强度由「流与查表结果的归一化点积取绝对值开方、保留符号后过 sigmoid」的门控决定。两层嵌入表合计约 196B 参数，但每 token 只取回六千多个元素；真正计入激活的是那个稠密投影——权重 $24\times256\to25600$（输出 5 份 5120）另加门控投影 $2\times4\times5120$，每层约 157.33M。</p>
@@ -553,7 +553,7 @@ attn: {
     sa:  {label:'稀疏注意力\n窗口 + 压缩', t:'attn', io:'窗口 128 + 压缩 512 -> [1,T,64,512]', f:'o = \\frac{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m}v_t}{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m} + e^{\\mathrm{sink}-m}}', d:'两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。索引为 $-1$ 的占位槽位分子分母都不贡献。'},
     woa: {label:'wo_a\n32768 → 8192（8 组）', t:'attn', io:'[1,T,64,512] -> [1,T,8,1024]', f:'o\\_groups=8,\\ o\\_lora\\_rank=1024', d:'按 8 组各降到 1024 维。真实权重形状 [8192, 4096]；分组的设计动机未在来源中说明。'},
     wob: {label:'wo_b\n8192 → 5120', t:'attn', io:'[1,T,8192] -> [1,T,5120]', f:'y = W_{o_b}o', d:'拼回隐藏维。真实权重形状 [5120, 8192]。'},
-    hc2: {label:'写回四流\n× 系数', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow x_i + \\lambda_i y', d:'子层输出按每流系数写回残差流。'}
+    hc2: {label:'写回四流\npost/comb 混合', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow \\mathrm{post}_i \\odot y + \\sum_j \\mathrm{comb}_{ij} \\odot x_j', d:'子层输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。'}
   },
   edges:[
     ['in','hc1','20480'],['hc1','wqa','5120'],['wqa','qn','1280'],['qn','wqb','1280'],
@@ -577,7 +577,7 @@ sparse: {
     top2048:{label:'选出 2048 块', t:'idxr', io:'[1,T,n/8] -> 2048 块', f:'\\text{top-}2048', d:'只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。'},
     cand:{label:'候选池\n2048 × 8 = 16384', t:'sel', io:'16384 个候选位置', f:'2048 \\times 8 = 16384', d:'候选位置集合。短上下文下可达条目本身少于 16384，此时候选池不起缩减作用。'},
     top512:{label:'位置级 Top-512', t:'sel', io:'16384 -> [1,T,512]', f:'\\text{top-}512', d:'在池内按索引分取前 512 条。Reindex 层重做这一步，Reuse 层直接复用上一次的选择。'},
-    sa:   {label:'拼进稀疏注意力', t:'attn', io:'窗口 128 + 压缩 512', f:'\\mathcal{T} = \\text{窗口} \\cup \\text{Top-}512', d:'两部分槽位在同一次调用里做 softmax，窗口没有额外权重加成——谁的分高谁拿得多。'}
+    sa:   {label:'拼进稀疏注意力', t:'attn', io:'窗口 128 + 压缩 512', f:'\\mathcal{T} = \\text{窗口} \\cup \\text{Top-}512', d:'两部分槽位在同一次调用里做一次 softmax，窗口没有额外权重加成，选中完全由索引分决定。'}
   },
   edges:[
     ['pool0','score','逐条打分'],['score','blk','聚合'],['pin','blk','保留最新块'],
@@ -600,7 +600,7 @@ moe: {
     rexp:{label:'6 个路由专家\n各 2304 × 5120 × 3', t:'moe', io:'[1,T,5120] -> 6 × [1,T,2304]', f:'\\mathrm{w1},\\mathrm{w3}{:}\\,[2304,5120]\\ \\ \\mathrm{w2}{:}\\,[5120,2304]', d:'每个专家约 35.39M 参数（fp4 量化存储，I8 打包）。384 个专家全存但每 token 只用 6 个。'},
     shared:{label:'共享专家\n1 个，每 token 必过', t:'moe', io:'[1,T,5120] -> [1,T,2304]', f:'\\text{shared expert}', d:'与路由专家同形（约 35.39M），不参与稀疏选择。'},
     sum: {label:'加权相加', t:'moe', io:'6 × [1,T,2304] + [1,T,2304] -> [1,T,5120]', f:'y = \\sum_{i\\in\\mathrm{idx}} w_i E_i(x) + E_{\\mathrm{shared}}(x)', d:'路由专家按权重加权，共享专家恒权相加。'},
-    hc:  {label:'写回四流', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow x_i + \\lambda_i y', d:'MoE 输出按每流系数写回四份残差流。'}
+    hc:  {label:'写回四流\npost/comb 混合', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow \\mathrm{post}_i \\odot y + \\sum_j \\mathrm{comb}_{ij} \\odot x_j', d:'MoE 输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。'}
   },
   edges:[
     ['in','norm','5120'],['norm','gate','5120'],['bias','gate','384'],
