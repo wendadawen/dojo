@@ -270,9 +270,9 @@
 
 <p>93 层比 K2 的 61 层多了 52%（Table 1）。标准残差连接把所有先前信息压缩到单个状态 <code>h_l</code>——论文 §2.2 把这比作"RNN 在时间上的瓶颈"。93 层的深度下，早期信息会被逐层稀释。</p>
 
-<p><a href="../../wiki/block-attnres/index.html">Attention Residuals（AttnRes）</a>的思路是把注意力的方法论从序列维度用到深度维度：每层用可学习伪查询 <code>q_l = w_l</code> 对所有前层输出做选择性检索，而非均匀累加（§2.2 Eq.8-10）<sup>[F3]</sup>。<a href="../../wiki/block-attnres/index.html">Block AttnRes 概念页</a>已讲清完整机制，包括 pseudo-query、softmax kernel 和 online softmax 合并。</p>
+<p><a href="../../wiki/block-attnres/index.html">Attention Residuals（AttnRes）</a>的思路是把注意力的方法论从序列维度用到深度维度：每层用可学习伪查询 $q_l = w_l$ 对所有前层输出做选择性检索，而非均匀累加（§2.2 Eq.8-10）<sup>[F3]</sup>。<a href="../../wiki/block-attnres/index.html">Block AttnRes 概念页</a>已讲清完整机制，包括 pseudo-query、softmax kernel 和 online softmax 合并。</p>
 
-<p>全 AttnRes 的 $O(L^2d)$ 算术在 <code>L &lt; 100</code> 时可负担，但 $O(Ld)$ 内存和流水线通信开销大（要保存所有层输出）。<strong>Block AttnRes</strong> 将 93 层分为 <strong>8 个 block</strong>（7 个 12 层完整 block + 1 个 9 层部分 block = 93 层，block size = 12，config.json <code>attn_res_block_size=12</code>），块内层输出求和为单个表示，跨 block 做全注意力。开销从 $O(Ld)$ 降到 $O(Nd)$（N=8），论文 §2.2 引 [58] 称"$N \approx 8$ recovers most of the benefit across model scales"。</p>
+<p>全 AttnRes 的 $O(L^2d)$ 算术在 $L &lt; 100$ 时可负担，但 $O(Ld)$ 内存和流水线通信开销大（要保存所有层输出）。<strong>Block AttnRes</strong> 将 93 层分为 <strong>8 个 block</strong>（7 个 12 层完整 block + 1 个 9 层部分 block = 93 层，block size = 12，config.json <code>attn_res_block_size=12</code>），块内层输出求和为单个表示，跨 block 做全注意力。开销从 $O(Ld)$ 降到 $O(Nd)$（N=8），论文 §2.2 引 [60] 称"$N \approx 8$ recovers most of the benefit across model scales"。</p>
 
 <details>
 <summary>补充：93 层如何分为 8 个 block（含部分末尾 block）</summary>
@@ -280,7 +280,7 @@
 <p>block 划分针对 AttnRes 的跨层检索结构，与 KDA/MLA 的 4 层混合 block 不同。AttnRes block 每 12 层一个检索边界，KDA/MLA 每 4 层一个注意力类型切换。</p>
 </details>
 
-<p><strong>代价与边界</strong>：块内 12 层中每一层的输入都是对「embedding ＋此前各 block 汇总表示 ＋当前 block partial sum」的 softmax 加权检索（当前 block partial sum 从块内第 2 层起计入候选）——即每层都能跨 block 检索前序表示。相对全 AttnRes，Block AttnRes 的代价是把候选粒度从单层输出降为块级表征、块内单层输出不再可被单独检索。论文 §2.2 引 [58] 给出 $N \approx 8$ 在多模型规模下够用的经验结论<sup>[C4]</sup>，但未提供 K3 规模下不同 block size 的消融实验。</p>
+<p><strong>代价与边界</strong>：块内 12 层中每一层的输入都是对「embedding ＋此前各 block 汇总表示 ＋当前 block partial sum」的 softmax 加权检索（当前 block partial sum 从块内第 2 层起计入候选）——即每层都能跨 block 检索前序表示。相对全 AttnRes，Block AttnRes 的代价是把候选粒度从单层输出降为块级表征、块内单层输出不再可被单独检索。论文 §2.2 引 [60] 给出 $N \approx 8$ 在多模型规模下够用的经验结论<sup>[C4]</sup>，但未提供 K3 规模下不同 block size 的消融实验。</p>
 
 <p>一个 token 在深度维度的处理——block 内的 12 层中，每一层都"回头看"embedding 与此前各 block 的汇总表示，按内容选择性检索需要的信息；从块内第 2 层起，当前 block 已累加的 partial sum 也加入候选。这让 93 层深网络不会因为层数多而丢失早期信息。</p>
 
@@ -326,7 +326,7 @@
 
 <p><strong>稳定化 2 — SiTU-GLU</strong>（解决激活爆炸）：用 <a href="../../wiki/situ-glu/index.html">Sigmoid Tanh Unit GLU</a> 替换 SwiGLU。SwiGLU 的两个乘法因子都无界，大坐标重合时产生激活异常值。SiTU-GLU 用 $\text{softcap}(x, \beta) = \beta \tanh(x/\beta)$ 约束两个因子，输出界 $|f| \le \beta_1\beta_2 = 100$（$\beta_1=4$、$\beta_2=25$，§2.3.2 Eq.12，config.json <code>activation_situ_beta=4.0, activation_situ_linear_beta=25.0</code>）<sup>[F5]</sup>，同时保留原点附近 Swish 的线性响应。<a href="../../wiki/situ-glu/index.html">SiTU-GLU 概念页</a>已讲清局部展开和输出界推导。</p>
 
-<p><strong>稳定化 3 — Quantile Balancing</strong>（解决负载失衡）：从 router score 分位数直接设定每个专家 bias，使每专家恰好获得目标负载 <code>q = mk/n</code>（§2.3.3 Eq.14）<sup>[F6]</sup>。相比 DeepSeek-V3 的固定步长 sign 更新（需要学习率 $\gamma$ 且在 896 专家下收敛慢），QB 跳到对偶问题的精确坐标最小值，无需学习率超参，几步内均衡。<a href="../../wiki/quantile-balancing/index.html">Quantile Balancing 概念页</a>已讲清对偶推导和直方图估计。</p>
+<p><strong>稳定化 3 — Quantile Balancing</strong>（解决负载失衡）：从 router score 分位数直接设定每个专家 bias，使每专家恰好获得目标负载 $q = mk/n$（§2.3.3 Eq.14）<sup>[F6]</sup>。相比 DeepSeek-V3 的固定步长 sign 更新（需要学习率 $\gamma$ 且在 896 专家下收敛慢），QB 跳到对偶问题的精确坐标最小值，无需学习率超参，几步内均衡。<a href="../../wiki/quantile-balancing/index.html">Quantile Balancing 概念页</a>已讲清对偶推导和直方图估计。</p>
 
 <p><strong>三件稳定化的分工</strong>：RMSNorm 和 SiTU-GLU 解决激活爆炸（稳定化 1+2），QB 解决负载失衡（稳定化 3）<sup>[C6]</sup>。论文 §2.3 只描述组合效果，未提供 896 专家规模下移除单个稳定化的消融实验。三件稳定化作用于不同失效路径：RMSNorm 降低尺度敏感性、SiTU-GLU 约束激活上界、QB 保证负载均衡。</p>
 
