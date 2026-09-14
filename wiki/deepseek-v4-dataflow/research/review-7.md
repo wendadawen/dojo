@@ -1,0 +1,35 @@
+<!-- review-meta
+round: 7
+page: wiki/deepseek-v4-dataflow/index.html
+reviewed_content_sha256: 889d2d99bada7956
+-->
+# DeepSeek-V4-Pro 前向数据流审查记录（第 7 轮）
+
+- 页面版本：8c55f129cab08048488cb70a06b9930a3d788134（git hash-object）
+- 审查时间：2026-09-14 16:58
+- 审查者：独立子代理（未参与写作与前序轮次）
+- 适用规范：`guides/model-dataflow.md`（页面 `dojo:type=dataflow`），表述与分级沿用 `guides/concept/check.md`
+- 已完整阅读章节：1. 关键规格 / 2. 交互式数据流（含 8 个视图的节点·公式·说明、视图内 noscript 静态表、边表、8 个图例）/ 3. 要点（整体结构、CSA、HCA、四细节、mHC、MoE 路由、长上下文效率）/ 4. 本机实测与核对 / 来源与范围说明
+
+## 问题
+
+- [轻微·技术] `index.html` 压缩器视图 overlap_transform 行（静态表第 200 行 / `VIEWS.compressor.nodes.ovl` 第 658 行）：公式 $[Z^a_{mi:m(i+1)}; Z^b_{m(i-1):mi}]$ 两项的「块号 × 维度半」配对与 kernel 相反，也与同一单元格的说明「后 m 个取本块的后半维，前 m 个取上一块的前半维」相反。｜引文依据：`inference/model.py` `Compressor.overlap_transform` 为 `new_tensor[:, :, ratio:] = tensor[:, :, :, d:]`（后 m 槽 ← 本块后半维）、`new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]`（前 m 槽 ← 上一块前半维），写成公式应为 $[Z^a_{m(i-1):mi}; Z^b_{mi:m(i+1)}]$。｜修复要求：把公式两项对调；或保留现写法但注明括号内只表示两个来源集合、其次序与 kernel 无关（2m 个来源经 softmax 加权求和，结果与排序无关，故本条不影响数值结论，仅影响可复算性）。｜修复：｜复验：
+- [轻微·可读性] 压缩器视图 `wkv`/`wg`/`ape`/`st` 形状列与 Indexer 视图因果掩码公式中的符号 c、m 全页未定义：`7168 → c·512`、`[max_bsz, c·ratio, c·512]`、`(ratio, c·512)`、`s ≥ ⌊t/m⌋`、`Softmax over 2m 或 m`。页内出现 `coff` 0 次，读者只能从同格的「512 或 1024」「宽度=8=2m」「宽度=128」反推。｜引文依据：`inference/model.py` `self.overlap = compress_ratio == 4`；`coff = 1 + self.overlap`；`self.wkv = Linear(self.dim, coff * self.head_dim, ...)`；`self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim))`。即 m = 压缩率，c = 1 + overlap（重叠层 2、非重叠层 1）。｜修复要求：在首次出现处写明 m = 压缩率（ratio=4 或 128）、c = 1 + overlap（重叠层 2、非重叠层 1），或直接把形状写成 `512 或 1024`、`ratio` 以避免新符号。｜修复：｜复验：
+- [轻微·表述] 要点「mHC」第 3 条与 mHC 视图 `sink` 节点说明：「logits 尺度为 3 时 20 轮后仍偏离 3.5e-2，需约 231 轮才到 1e-3」把单个矩阵样本的实测写成该尺度下的一般收敛需求，且「尺度」未给出度量方式（标准差／幅值／区间），该数字无法按页面复算。｜引文依据：`inference/kernel.py` `hc_split_sinkhorn_kernel_` 的迭代为「`comb.softmax(-1)+eps` → 列归一化 → 19×(行归一化→列归一化)」，末步列归一化，本人独立复算列和偏差 1.01e-6（与页面「1e-6，来自 hc_eps」一致）、尺度 ≤0.1 时 20 轮即收敛（与页面一致）；但按同一算法对 300 个 std=3 的随机 4×4 logits 复算，行和降到 1e-3 所需轮数中位数 16、范围 5–244（本人最坏样本 244 与页面 231 同量级）。页面结论（20 轮不保证任意输入严格双随机）成立，仅该轮数偏慢端。｜修复要求：补上「尺度」的度量方式与「该样本」限定，或改成给出分布（如「随机 std=3 样本中位数约 16 轮，最坏样本需 200 轮以上」）。｜修复：｜复验：
+
+## 核对依据（已逐条核对的项，第 3 节要求填写原文片段或关键数值）
+
+- 关键规格表逐项对 `inference/config.json` 原文：`compress_ratios` 62 项、前 12 项 `[128,128,4,128,4,128,4,128,4,128,4,128]`、末项 0；`n_layers 61`、`dim 7168`、`n_heads 128`、`head_dim 512`、`rope_head_dim 64`、`q_lora_rank 1536`、`o_groups 16`、`o_lora_rank 1024`、`window_size 128`、`index_topk 1024`、`index_n_heads 64`、`index_head_dim 128`、`n_routed_experts 384`、`n_activated_experts 6`、`moe_inter_dim 3072`、`route_scale 2.5`、`score_func sqrtsoftplus`、`swiglu_limit 10.0`、`hc_mult 4`、`hc_sinkhorn_iters 20`、`n_hash_layers 3`、`compress_rope_theta 160000`、`rope_theta 10000`、`rope_factor 16`、`original_seq_len 65536`、`vocab_size 129280`。HF `config.json` 另有 `max_position_embeddings 1048576`、`num_nextn_predict_layers 1`、`tie_word_embeddings false`、`expert_dtype fp4`。页面「关键规格」「要点」「来源」各表与此逐项一致；HCA 31 / CSA 30 由 128（第 0、1 层 + 29 个奇数层）与 4（30 个偶数层）核算得出，与页面一致。
+- checkpoint 张量头（HTTP Range 读 64 分片 + `model.safetensors.index.json`）：张量总数 145116、`total_size 864704792696`（≈864 GB）——与页面「64 个分片、145116 个张量、864GB」一致；`layers.{0,1,2}.ffn.gate.tid2eid` 仅此三层，`I64 [129280, 6]`；`ffn.gate.bias` 缺失层恰为 0/1/2（主干 58 层有）；含 `attn.indexer.*` 的层恰为 30 个偶数层（2..60）；`layers.2.attn.compressor.wkv.weight BF16 [1024,7168]` 与 `layers.0` 同名张量 `BF16 [512,7168]`；`compressor.ape F32 [4,1024] / [128,512]`；`indexer.compressor.wkv.weight BF16 [256,7168]`；`experts.0.w1.weight I8 [3072,3584]` + `scale F8_E8M0 [3072,224]`；`shared_experts.w1.weight F8_E4M3 [3072,7168]`；`wo_a F8_E4M3 [16384,4096]`、`wo_b [7168,16384]`、`wq_a [1536,7168]`、`wq_b [65536,1536]`、`wkv [512,7168]`、`indexer.wq_b [8192,1536]`、`indexer.weights_proj BF16 [64,7168]`、`attn_sink F32 [128]`、`hc_attn_fn F32 [24,28672]`、`mtp.0.hc_head_fn F32 [4,28672]`、`mtp.0.e_proj/h_proj F8_E4M3 [7168,7168]`、`embed.weight`/`head.weight BF16 [129280,7168]`、`norm.weight BF16 [7168]`。页面各视图标注与此全部一致。
+- 参数表独立复算（本人遍历 64 个分片头逐张量累加，FP4 按每字节两值折算、不计 scale 张量）：路由专家 1547.3962 B、注意力 19.4651 B、共享专家 4.0297 B、embedding 0.9267 B、lm_head 0.9267 B、MoE gate 0.1679 B、mHC 0.0841 B、MTP 25.8401 B，除 `gate.tid2eid`（0.0023 B，页面未计入）外合计 1598.8397 B。与页面表格（1547.396 / 19.465 / 4.030 / 0.927 / 0.927 / 0.168 / 0.084 / 25.840，合计 1598.837 B = 1.599 T）逐项吻合；激活 61×6×66.06M = 24.18 B + 非专家 24.67 B = 48.86 B，与页面及摘要「1.6T / 49B activated」一致；96.8%、1.2%、0.3%、0.1%、0.1%、0.0%、0.0%、1.6%（合计 100.1%，页面已说明为取整余差）均可复算。
+- 长上下文段复算：主注意力 KV cache = 30×262144×576 + 31×8192×576 + 61×128×576 = 4.36 GiB；BF16 GQA8（8 KV 头 ×128 维 ×2 字节 ×K,V）基线 = 61×1048576×4096 B = 244 GiB → 1.79%；576/1024 = 56.2%；Indexer 30×262144×128×2 B = 1.88 GiB（FP4 计 0.47 GiB）；候选集 128+1024=1152、128+32=160、128+512=640、128+8192=8320。均与页面一致。
+- 报告（arXiv:2606.19348v1《DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence》）原文核对：摘要「1.6T parameters (49B activated)」「27% of single-token inference FLOPs and 10% of KV cache compared with DeepSeek-V3.2」；2.3.3「This normalization avoids exploding attention logits and may improve training stability.」；2.3.4「attention computation within the lightning indexer is performed in FP4 precision」「reduces the KV cache size by nearly half compared with pure BF16 storage」「approximately 2% times of that baseline in the 1M-context setting」(baseline = BF16 GQA8, head dim 128)；Eq.6 `A_l = σ(Ã_l)`、Eq.7 `C_l = 2σ(C̃_l)`、Eq.8 `M^(t) = 𝒯_r(𝒯_c(M^(t−1)))`（末步行归一化，与 kernel 相反，页面已标明分歧）；2.4 Muon；5.1 含 on-policy distillation。页面 cite 的节号、公式号与「约 2%」「近一半」「27%」均定位得到且内容相符。
+- 公式与语义复算：`q *= rsqrt(mean(q²)+eps)`、`kv[..., :-rd]` 448 维 FP8、`o_groups=16` 时 4096 = 65536/16、`wo_b` 16384 = 16×1024、`mix_hc = (2+4)×4 = 24`、`shot` 掩码 `s ≥ ⌊t/ratio⌋`、`should_compress = (start_pos+1) % ratio == 0`、`topk = min(index_topk, end_pos//ratio)`、Sinkhorn 顺序与 19 轮、`pre = σ(·)+ε` / `post = 2σ(·)`、`hc_head` 只有 pre、`e_proj(e).unsqueeze(2) + h_proj(h)`、`self.mtp[-1].embed = self.embed` —— 全部与 `inference/model.py`/`kernel.py` 逐行一致。数值例：sigmoid(12)=0.999994、sqrt(softplus(12))=3.46、132=128+512/128、144=128+min(16,512/4)、640=512+128、516=512+4、softmax 宽度 8=2m。
+- 机械项：`.dojo/scripts/validate.py` 返回 `validation ok`；`check_inline_js.py` 返回 `inline script check ok: 1 pages, 3 blocks`；`check_unused_css.py` 返回 `no dead css`；用 validate.py 自带的 `BARE_MATH_RE` 扫描（剥离 `$...$` 后）命中 0 个裸 Unicode 数学字符；无 `【】`/TODO 占位；无 `<pre>` 代码块（页面只引用源码路径，无「可运行代码」可执行项）；`alt` 仅空串，无 `$...$`；页内链接 `../../index.html`、`../hyper-connections/index.html`、`../deepseek-moe/index.html` 三个目标文件均存在；`research/measured.md` 在页面目录下存在（规范允许的实测清单引用，非失效路径）。
+- 无脚本可读性：`.viz` 与 `<noscript>` 为兄弟节点，noscript 内含隐藏 `.viz` 的样式与 8 张静态表（节点/维度/公式/说明 + 边表），脚本失效时主干路径仍可读；`VIEWS` 各视图的 drill 目标（hca/csa/compressor/indexer/moe/mhc/mtp）均存在，无死锚点。
+- 表述维度：逐段通读含图注与全部 tooltip，未发现元话语（「本页将…」「下面来看」）、以「本页」为主语的自我指代、会话指代（我/我们/你）、调试叙事、AI 拼接腔或口语化措辞；未发现同一数字在正文/summary/图注之间不一致（0.76、1.57、0.26、2.4e-7、1.1e-6、0.83、2.62、3.46、0.999994、24.18、66.06、1.38M、0.084、3.5e-2、231、8192、8320、1152、4.36、244、1.79、56.2、48.86、1.599、96.8 各处的静态表与 JS 数据完全同文）。
+
+## 结论
+
+- 统计：阻断 0 / 重要 0 / 轻微 3
+- 处置：修复（3 条轻微问题修复后即可发布；三条均不触及核心结论）
