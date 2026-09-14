@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="552B 主干加 196B Engram 参数、原生 1M 上下文：40 层按 Causal Encoder-Decoder 切成两半，解码器全局 KV 由编码器末层投影；全局 KV 用 CSA2 管理（每 r 个 token 池化一条、同压缩比跨层共享、Top-512 稀疏选择），主 KV 存 FP4、窗口 KV 存 FP8，每 token 缓存 890 字节；prefill 激活 8B、decode 16B。全部数字由官方配置、参考实现、真实 checkpoint 张量头与本机实测核对。">
-  <meta name="dojo:summary" content="552B 主干 + 196B Engram；40 层 = 20 层编码器 + 20 层解码器，解码器全局 KV 由 $H_{L/2}$ 投影而来；主 KV 以 FP4 存储，每条目 288 字节，压缩比 2 的三个 source 层折合 144 B/token、压缩比 1 的层折合 288 B/token，加索引器 K 170 B 得每 token 890 字节；可见集 = 窗口 128 个位置 + 索引器选出的 Top-512 压缩条目，候选池 $2048 \times 8 = 16384$；MoE 384 专家取 top-6 加 1 个共享专家；Engram 插在层 1、14，DSpark 为 3 个草稿块。">
+  <meta name="description" content="552B 主干加 196B Engram 参数、原生 1M 上下文：40 层按 Causal Encoder-Decoder 切成两半，解码器全局 KV 由编码器末层投影；全局 KV 用 CSA2 管理（每 r 个 token 池化一条、按 source 层跨层共享、Top-512 稀疏选择），主 KV 存 FP4、窗口 KV 存 FP8，每 token 缓存 890 字节；prefill 激活 8B、decode 16B。全部数字由官方配置、参考实现、真实 checkpoint 张量头与本机实测核对。">
+  <meta name="dojo:summary" content="552B 主干 + 196B Engram；40 层 = 20 层编码器 + 20 层解码器，解码器全局 KV 由 $H_{L/2}$ 投影而来；主 KV 以 FP4 存储，每条目 288 字节，压缩比 2 的三个 source 层各 144 B/token、合计 432 B/token，压缩比 1 的层 288 B/token，主 KV 合计 720 B/token，加索引器 K 170 B/token 得每 token 890 字节；可见集 = 窗口 128 个位置 + 索引器选出的 Top-512 压缩条目，候选池 $2048 \times 8 = 16384$；MoE 384 专家取 top-6 加 1 个共享专家；Engram 插在层 1、14，DSpark 为 3 个草稿块。">
   <meta name="dojo:type" content="dataflow">
   <meta name="dojo:topics" content="模型结构,内存与缓存">
   <meta name="dojo:tag" content="数据流">
@@ -108,7 +108,7 @@
 </div>
 
 <h1 class="title">DeepSeek-V4.1-Flash 前向数据流</h1>
-<p class="page-lead">DeepSeek-V4.1-Flash 是 552B 主干加 196B Engram 参数、原生支持 1M 上下文的多模态 <a href="../deepseek-moe/index.html">MoE</a> 模型。40 层主干按 Causal Encoder–Decoder 切成两半：前 20 层是因果编码器，后 20 层是解码器，解码器的全局 KV 不由本层隐状态产生，而由编码器末层隐状态投影而来——配合解码器滑动窗口的有界重放，prefill 阶段因此可以止于半栈。全局 KV 由 <a href="../cross-layer-kv-sharing/index.html">CSA2</a>（Compressed Sparse Attention 2，压缩稀疏注意力第 2 版）管理：每 $r$ 个 token 池化成一条压缩条目、同压缩比的层跨层共享、再由索引器从可见条目中稀疏选出至多 512 条；主 KV 以 FP4 存储（每条目 288 字节），窗口 KV 保持 FP8。每 token 全局 KV 缓存 890 字节。另有两个不改变缓存账的模块：<a href="../ngram/index.html">Engram</a> 哈希查表（插在层 1、14）与 <a href="../speculative-decoding/index.html">DSpark</a> 块式推测解码（3 个 MTP 块）。</p>
+<p class="page-lead">DeepSeek-V4.1-Flash 是 552B 主干加 196B Engram 参数、原生支持 1M 上下文的多模态 <a href="../deepseek-moe/index.html">MoE</a> 模型。40 层主干按 Causal Encoder–Decoder 切成两半：前 20 层是因果编码器，后 20 层是解码器，解码器的全局 KV 不由本层隐状态产生，而由编码器末层隐状态投影而来——配合解码器滑动窗口的有界重放，prefill 阶段因此可以止于半栈。全局 KV 由 <a href="../cross-layer-kv-sharing/index.html">CSA2</a>（Compressed Sparse Attention 2，压缩稀疏注意力第 2 版）管理：每 $r$ 个 token 池化成一条压缩条目、按 source 层跨层共享、再由索引器从可见条目中稀疏选出至多 512 条；主 KV 以 FP4 存储（每条目 288 字节），窗口 KV 保持 FP8。每 token 全局 KV 缓存 890 字节。另有两个不改变缓存账的模块：<a href="../ngram/index.html">Engram</a> 哈希查表（插在层 1、14）与 <a href="../speculative-decoding/index.html">DSpark</a> 块式推测解码（3 个 MTP 块）。</p>
 <p class="page-meta">生成于 2026-09-10 · 依据官方推理实现 <code>model.py</code>/<code>kernel.py</code> + <code>inference/config.json</code> + 真实 checkpoint 张量头（48 个分片、96085 个张量）+ 本机实测</p>
 <p class="reading-time" id="readingTime"></p>
 
@@ -135,7 +135,7 @@
   <tr><td>路由打分与偏置</td><td>$\sqrt{\mathrm{softplus}}$ 打分，偏置只影响选择；权重乘 1.5</td><td><code>score_func="sqrtsoftplus"</code>、<code>route_scale=1.5</code>；<code>gate.weight</code> 形状 <code>[384, 5120]</code>，<code>gate.bias</code> 与 <code>gate.bias_vl</code> 各 <code>[384]</code></td></tr>
   <tr><td>超连接</td><td>4 份残差流，Sinkhorn 20 轮，末步列方向</td><td><code>hc_mult=4</code>/<code>hc_sinkhorn_iters=20</code>；<code>hc_attn_fn</code> 形状 <code>[24, 20480]</code> $=24\times(4\times5120)$；实测行、列各 20 次</td></tr>
   <tr><td>Engram</td><td>层 1、14；阶数 2/3/4 每阶 $8$ 头 = 每 token 24 行</td><td><code>engram_layer_ids=[1,14]</code>、<code>engram_max_ngram_size=4</code>、<code>engram_n_heads=8</code>、<code>engram_head_dim=256</code>；实测层分布</td></tr>
-  <tr><td>DSpark</td><td>3 个 MTP 块，每块 5 个草稿位置，目标层 37/38/39</td><td><code>n_mtp_layers=3</code>/<code>dspark_block_size=5</code>/<code>dspark_target_layer_ids</code>；<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> $=5120\times(3\times5120)$</td></tr>
+  <tr><td>DSpark</td><td>3 个 MTP 块顺序作用在同一批 5 个位置，一次前向产出 5 个草稿位置，目标层 37/38/39</td><td><code>n_mtp_layers=3</code>/<code>dspark_block_size=5</code>/<code>dspark_target_layer_ids</code>；<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> $=5120\times(3\times5120)$</td></tr>
   <tr><td>词表与上下文</td><td>词表 129280，上下文 1M</td><td><code>vocab_size</code>；<code>embed.weight</code> 与 <code>head.weight</code> 形状均为 <code>[129280, 5120]</code></td></tr>
   <tr><td>视觉侧</td><td>32 层 ViT，宽 1024，patch 14，下采样 3</td><td><code>vision_n_layers</code>/<code>vision_dim</code>/<code>vision_patch_size</code>/<code>vision_downsample_ratio</code></td></tr>
 </table>
@@ -181,7 +181,7 @@
 <tr><td>窗口 KV · FP8，128 槽</td><td><code>[bsz, 128, 512]</code></td><td>$128 \times 512 \times 1\ \mathrm{B} = 64\ \mathrm{KiB/层}$</td><td>最近 128 个位置的原始键值，环形缓冲、不随序列长度增长。保持 FP8。</td></tr>
 <tr><td>压缩条目 · Top-512 条</td><td><code>[1,T,512,512]</code></td><td>$288\ \mathrm{B}/\text{条目} \times 512$</td><td>该层所属压缩比组的条目中被索引器选中的 512 条。位置取组起点 j·r。压缩条目由 Compressor 的独立投影产生（自带 wkv 与 norm），不复用窗口 KV 的 wkv/kv_norm。点击下钻看选择过程。</td></tr>
 <tr><td>汇聚点 · 每头 1 个标量</td><td><code>[64] F32</code></td><td>$+ e^{\mathrm{sink}-m}\ \text{只进分母}$</td><td>每头一个可学习标量，加在 softmax 分母上，不携带值向量。真实张量 attn.attn_sink 形状 [64]。</td></tr>
-<tr><td>稀疏注意力 · 窗口 + 压缩</td><td><code>窗口 128 + 压缩 512 -&gt; [1,T,64,512]</code></td><td>$o = \frac{\sum_t e^{q\cdot k_t/\sqrt{d}-m}v_t}{\sum_t e^{q\cdot k_t/\sqrt{d}-m} + e^{\mathrm{sink}-m}}$</td><td>两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。索引为 $-1$ 的占位槽位分子分母都不贡献。</td></tr>
+<tr><td>稀疏注意力 · 窗口 + 压缩</td><td><code>窗口 128 + 压缩 512 -&gt; [1,T,64,512]</code></td><td>$o = \frac{\sum_t e^{q\cdot k_t/\sqrt{d}-m}v_t}{\sum_t e^{q\cdot k_t/\sqrt{d}-m} + e^{\mathrm{sink}-m}}$</td><td>两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。$m=\max_t q\cdot k_t/\sqrt{d}$ 是并集分数上的运行最大值，$d$ 为头维 512。索引为 $-1$ 的占位槽位分子分母都不贡献。</td></tr>
 <tr><td>wo_a · 32768 → 8192（8 组）</td><td><code>[1,T,64,512] -&gt; [1,T,8,1024]</code></td><td>$o\_groups=8,\ o\_lora\_rank=1024$</td><td>按 8 组各降到 1024 维。真实权重形状 [8192, 4096]；分组的设计动机未在来源中说明。</td></tr>
 <tr><td>wo_b · 8192 → 5120</td><td><code>[1,T,8192] -&gt; [1,T,5120]</code></td><td>$y = W_{o_b}o$</td><td>拼回隐藏维。真实权重形状 [5120, 8192]。</td></tr>
 <tr><td>写回四流 · post/comb 混合</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow \mathrm{post}_i \odot y + \sum_j \mathrm{comb}_{ij} \odot x_j$</td><td>子层输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。</td></tr>
@@ -190,7 +190,7 @@
 <h4>压缩条目与两级稀疏选择</h4>
 <table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
 <tr><td>全部可达压缩条目 · 随上下文线性增长</td><td><code>[1,T,N_reach,r=2 层约 50 万条]</code></td><td>$n_{\mathrm{reach}}(i) = \lfloor (i+1)/r \rfloor$</td><td>只有「整组 token 都已出现」的条目才可达。1M 上下文、r=2 时约 50 万条；不可达条目在打分前置 $-\infty$。</td></tr>
-<tr><td>索引器打分 · 32 头 × 128 维</td><td><code>[1,T,32,128] x [n,r=128] -&gt; [1,T,n]</code></td><td>$I_{q,j} = \sum_h w_{q,h}\mathrm{ReLU}(q_h\cdot k_j)$</td><td>每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。</td></tr>
+<tr><td>索引器打分 · 32 头 × 128 维</td><td><code>[1,T,32,128] x [n,128] -&gt; [1,T,n]</code></td><td>$I_{q,j} = \sum_h w_{q,h}\mathrm{ReLU}(q_h\cdot k_j)$</td><td>每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。</td></tr>
 <tr><td>块级打分 · 块分 = 块内最大</td><td><code>[1,T,n] -&gt; [1,T,n/8]</code></td><td>$\mathrm{block}(b) = \max_{j\in b} I_{q,j}$</td><td>把位置切成大小 8 的块，每块取块内最大索引分作为块分。</td></tr>
 <tr><td>钉住最新块</td><td><code>—</code></td><td>$\text{pin the newest block}$</td><td>最新块只填了一部分，若不钉住会被更早的完整块以更大块分压过，导致 query 看不到紧邻的历史。</td></tr>
 <tr><td>选出 2048 块</td><td><code>[1,T,n/8] -&gt; 2048 块</code></td><td>$\text{top-}2048$</td><td>只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。</td></tr>
@@ -231,9 +231,9 @@
 <tr><td>按 hc 维取均值 · 4 → 1</td><td><code>[1,T,4,5120] -&gt; [1,T,5120]</code></td><td>$h.\mathrm{mean}(\mathrm{dim}=2)$</td><td>在超连接副本维（大小为 4）上取均值，把三层各自压成 5120 维。</td></tr>
 <tr><td>沿特征维拼接 · 3 → 15360</td><td><code>3 × [1,T,5120] -&gt; [1,T,15360]</code></td><td>$3 \times 5120 = 15360$</td><td>三层的均值结果拼成一个 15360 维向量，作为一次性的草稿输入（不再自回归）。</td></tr>
 <tr><td>main_proj · 15360 → 5120</td><td><code>[1,T,15360] -&gt; [1,T,5120]</code></td><td>$W{:}\,[5120, 15360]$</td><td>真实权重 main_proj.weight 形状 [5120, 15360]，与三层拼接的宽度一致。</td></tr>
-<tr><td>草稿块 1 · 5 个位置</td><td><code>-&gt; [1,5,V]</code></td><td>$\text{block size} = 5$</td><td>块内位置用噪声 token（id 128799）占位，一次前向产出 5 个草稿位置（$V$ 为词表 129280，输出为 5 个位置的词表 logits）。草稿块自身是 MoE：128 专家取 top-3。</td></tr>
-<tr><td>草稿块 2 · 5 个位置</td><td><code>-&gt; [1,5,V]</code></td><td>$\text{block size} = 5$</td><td>同上。共 3 个 MTP 块（n_mtp_layers=3）。</td></tr>
-<tr><td>草稿块 3 · 5 个位置</td><td><code>-&gt; [1,5,V]</code></td><td>$\text{block size} = 5$</td><td>最后一个块，额外带 Markov 头与置信头。</td></tr>
+<tr><td>草稿块 1 · 5 个位置</td><td><code>-&gt; 隐藏态</code></td><td>$\text{block size} = 5$</td><td>三个草稿块顺序作用在同一批 5 个位置上，一次前向共同产出 5 个草稿位置的 logits。本块只输出隐藏态、不接输出头。块内位置用噪声 token（id 128799）占位；草稿块自身是 MoE：128 专家取 top-3。</td></tr>
+<tr><td>草稿块 2 · 5 个位置</td><td><code>-&gt; 隐藏态</code></td><td>$\text{block size} = 5$</td><td>同上，输出隐藏态交给末块。共 3 个 MTP 块（n_mtp_layers=3）。</td></tr>
+<tr><td>草稿块 3 · 5 个位置</td><td><code>-&gt; [1,5,V]</code></td><td>$\text{block size} = 5$</td><td>末块接 Markov 头与置信头，输出 5 个位置的词表 logits（$V$ 为词表 129280）。</td></tr>
 <tr><td>Markov 头 · 秩 256</td><td><code>[1,5,256]</code></td><td>$\mathrm{rank} = 256$</td><td>dspark_markov_rank=256，给草稿序列内部的相邻关系建模。</td></tr>
 <tr><td>置信头</td><td><code>[1,5]</code></td><td>$\text{confidence}$</td><td>输出每个草稿位置的接受置信度，决定这次接受几个草稿。</td></tr>
 <tr><td>草稿 token · 交主干校验</td><td><code>5 个草稿位置</code></td><td>$\text{draft} \to \text{verify}$</td><td>草稿交给主干一次性校验。DSpark 不产生主干缓存，只提高一次前向平均能确认的 token 数。</td></tr>
@@ -271,7 +271,7 @@
 <h2 id="ced">4. CED：解码器的全局 KV 从哪里来</h2>
 <p>报告对这一段给出的形式是 $C_l = H_{L/2}W_l^{KV}$、$Z_l = H_{L/2}W_l^{Z}$（$l > L/2$）：解码器各层的键值条目由编码器末层隐状态投影得到，投影权重逐层不同。共享的是<b>输入</b> $H_{L/2}$，不是投影结果。</p>
 <p>与跨层共享结合后还有一层收窄：真正执行这次投影的只有被指派为 Full 模式的解码器层。本模型的配置里这个层是层 20，参考实现中的表现是「层 20 的压缩器读取它自己的注意力输入」，而第 20 层的注意力输入正是第 19 层的输出，与公式里的 $H_{L/2}$ 对上。</p>
-<p><b>滑动窗口 KV 不能一起省</b>。窗口 KV 是最近位置的原始精度副本，必须由本层经过完整计算后的隐状态生成；第 $l$ 层的窗口 KV 需要第 $l$ 层的隐状态，而后者要等第 $l-1$ 层算完，这条依赖链无法用「读编码器输出」替代。服务端的替代办法是有界重放：只重算最后 $n_{\text{win}}$ 个位置，因为更早的位置已滑出可见集。参考实现中不含该分支，它属服务实现。</p>
+<p><b>滑动窗口 KV 不能一起省</b>。窗口 KV 是最近位置的未压缩逐 token FP8 副本，必须由本层经过完整计算后的隐状态生成；第 $l$ 层的窗口 KV 需要第 $l$ 层的隐状态，而后者要等第 $l-1$ 层算完，这条依赖链无法用「读编码器输出」替代。服务端的替代办法是有界重放：只重算最后 $n_{\text{win}}$ 个位置，因为更早的位置已滑出可见集。参考实现中不含该分支，它属服务实现。</p>
 
 <h2 id="sparse">5. 稀疏选择：从打分到槽位</h2>
 <p>选择的输入是「全部因果可见的压缩条目」，输出是每个 query 的 Top-512 下标。三步：</p>
@@ -285,7 +285,7 @@
 
 <h2 id="extra">6. Engram 与 DSpark</h2>
 <p><b>Engram</b> 插在层 1 与层 14。它从当前位置往前取长度 2、3、4 的连续片段，各用 8 个哈希函数映射到嵌入表下标，共 24 个下标（每 token 取回 $24\times256=6144$ 个表元素）；取回的向量经一个稠密投影写回残差流，写入强度由「流与查表结果的归一化点积取绝对值开方、保留符号后过 sigmoid」的门控决定。两层嵌入表合计约 196B 参数，但每 token 只取回六千多个元素；真正计入激活的是那个稠密投影——权重 $24\times256\to25600$（输出 5 份 5120）另加门控投影 $2\times4\times5120$，每层约 157.33M。</p>
-<p><b>DSpark</b> 是块式推测解码的草稿头：3 个 MTP 块，每块一次前向产出 5 个草稿位置。输入取主干层 37、38、39 的注意力输入，先在超连接副本维取均值，再把三层结果沿特征维拼接（<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> 即此）。草稿块自身是 MoE 结构，128 个专家取 top-3；末块另带 Markov 头（秩 256）与置信头，用于决定接受几个草稿。它不产生主干缓存，只提高 decode 吞吐。</p>
+<p><b>DSpark</b> 是块式推测解码的草稿头：3 个 MTP 块顺序作用在同一批 5 个位置上，一次前向产出 5 个草稿位置。输入取主干层 37、38、39 的注意力输入，先在超连接副本维取均值，再把三层结果沿特征维拼接（<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> 即此）。草稿块自身是 MoE 结构，128 个专家取 top-3；末块另带 Markov 头（秩 256）与置信头，用于决定接受几个草稿。它不产生主干缓存，只提高 decode 吞吐。</p>
 
 <h2 id="verify">7. 核对方式</h2>
 <p><b>结构与形状</b>：用 HTTP Range 请求读取全部 48 个 safetensors 分片的 JSON 头（未下载权重本体），得到 96085 个张量的名称、形状与 dtype。以此交叉验证配置与源码推断：层数、专家数、各模块形状、MTP 张量数。</p>
@@ -550,7 +550,7 @@ attn: {
     win: {label:'窗口 KV\nFP8，128 槽', t:'buf', io:'[bsz, 128, 512]', f:'128 \\times 512 \\times 1\\ \\mathrm{B} = 64\\ \\mathrm{KiB/层}', d:'最近 128 个位置的原始键值，环形缓冲、不随序列长度增长。保持 FP8。'},
     cmp: {label:'压缩条目\nTop-512 条', t:'cmp', drill:'sparse', io:'[1,T,512,512]', f:'288\\ \\mathrm{B}/\\text{条目} \\times 512', d:'该层所属压缩比组的条目中被索引器选中的 512 条。位置取组起点 j·r。压缩条目由 Compressor 的独立投影产生（自带 wkv 与 norm），不复用窗口 KV 的 wkv/kv_norm。点击下钻看选择过程。'},
     sink:{label:'汇聚点\n每头 1 个标量', t:'gt', io:'[64] F32', f:'+ e^{\\mathrm{sink}-m}\\ \\text{只进分母}', d:'每头一个可学习标量，加在 softmax 分母上，不携带值向量。真实张量 attn.attn_sink 形状 [64]。'},
-    sa:  {label:'稀疏注意力\n窗口 + 压缩', t:'attn', io:'窗口 128 + 压缩 512 -> [1,T,64,512]', f:'o = \\frac{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m}v_t}{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m} + e^{\\mathrm{sink}-m}}', d:'两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。索引为 $-1$ 的占位槽位分子分母都不贡献。'},
+    sa:  {label:'稀疏注意力\n窗口 + 压缩', t:'attn', io:'窗口 128 + 压缩 512 -> [1,T,64,512]', f:'o = \\frac{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m}v_t}{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m} + e^{\\mathrm{sink}-m}}', d:'两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。$m=\\max_t q\\cdot k_t/\\sqrt{d}$ 是并集分数上的运行最大值，$d$ 为头维 512。索引为 $-1$ 的占位槽位分子分母都不贡献。'},
     woa: {label:'wo_a\n32768 → 8192（8 组）', t:'attn', io:'[1,T,64,512] -> [1,T,8,1024]', f:'o\\_groups=8,\\ o\\_lora\\_rank=1024', d:'按 8 组各降到 1024 维。真实权重形状 [8192, 4096]；分组的设计动机未在来源中说明。'},
     wob: {label:'wo_b\n8192 → 5120', t:'attn', io:'[1,T,8192] -> [1,T,5120]', f:'y = W_{o_b}o', d:'拼回隐藏维。真实权重形状 [5120, 8192]。'},
     hc2: {label:'写回四流\npost/comb 混合', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow \\mathrm{post}_i \\odot y + \\sum_j \\mathrm{comb}_{ij} \\odot x_j', d:'子层输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。'}
@@ -571,7 +571,7 @@ sparse: {
   legend:[['#16a085','索引器打分与可达集'],['#b7791f','边界处理'],['#1f9d6b','选择结果'],['#3f6fd0','注意力']],
   nodes:{
     pool0:{label:'全部可达压缩条目\n随上下文线性增长', t:'idxr', io:'[1,T,N_reach,r=2 层约 50 万条]', f:'n_{\\mathrm{reach}}(i) = \\lfloor (i+1)/r \\rfloor', d:'只有「整组 token 都已出现」的条目才可达。1M 上下文、r=2 时约 50 万条；不可达条目在打分前置 $-\\infty$。'},
-    score:{label:'索引器打分\n32 头 × 128 维', t:'idxr', io:'[1,T,32,128] x [n,r=128] -> [1,T,n]', f:'I_{q,j} = \\sum_h w_{q,h}\\mathrm{ReLU}(q_h\\cdot k_j)', d:'每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。'},
+    score:{label:'索引器打分\n32 头 × 128 维', t:'idxr', io:'[1,T,32,128] x [n,128] -> [1,T,n]', f:'I_{q,j} = \\sum_h w_{q,h}\\mathrm{ReLU}(q_h\\cdot k_j)', d:'每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。'},
     blk:  {label:'块级打分\n块分 = 块内最大', t:'idxr', io:'[1,T,n] -> [1,T,n/8]', f:'\\mathrm{block}(b) = \\max_{j\\in b} I_{q,j}', d:'把位置切成大小 8 的块，每块取块内最大索引分作为块分。'},
     pin:  {label:'钉住最新块', t:'gt', io:'—', f:'\\text{pin the newest block}', d:'最新块只填了一部分，若不钉住会被更早的完整块以更大块分压过，导致 query 看不到紧邻的历史。'},
     top2048:{label:'选出 2048 块', t:'idxr', io:'[1,T,n/8] -> 2048 块', f:'\\text{top-}2048', d:'只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。'},
@@ -641,9 +641,9 @@ dspark: {
     mean:{label:'按 hc 维取均值\n4 → 1', t:'grp', io:'[1,T,4,5120] -> [1,T,5120]', f:'h.\\mathrm{mean}(\\mathrm{dim}=2)', d:'在超连接副本维（大小为 4）上取均值，把三层各自压成 5120 维。'},
     cat: {label:'沿特征维拼接\n3 → 15360', t:'grp', io:'3 × [1,T,5120] -> [1,T,15360]', f:'3 \\times 5120 = 15360', d:'三层的均值结果拼成一个 15360 维向量，作为一次性的草稿输入（不再自回归）。'},
     proj:{label:'main_proj\n15360 → 5120', t:'dspark', io:'[1,T,15360] -> [1,T,5120]', f:'W{:}\\,[5120, 15360]', d:'真实权重 main_proj.weight 形状 [5120, 15360]，与三层拼接的宽度一致。'},
-    b1:  {label:'草稿块 1\n5 个位置', t:'dspark', io:'-> [1,5,V]', f:'\\text{block size} = 5', d:'块内位置用噪声 token（id 128799）占位，一次前向产出 5 个草稿位置（$V$ 为词表 129280，输出为 5 个位置的词表 logits）。草稿块自身是 MoE：128 专家取 top-3。'},
-    b2:  {label:'草稿块 2\n5 个位置', t:'dspark', io:'-> [1,5,V]', f:'\\text{block size} = 5', d:'同上。共 3 个 MTP 块（n_mtp_layers=3）。'},
-    b3:  {label:'草稿块 3\n5 个位置', t:'dspark', io:'-> [1,5,V]', f:'\\text{block size} = 5', d:'最后一个块，额外带 Markov 头与置信头。'},
+    b1:  {label:'草稿块 1\n5 个位置', t:'dspark', io:'-> 隐藏态', f:'\\text{block size} = 5', d:'三个草稿块顺序作用在同一批 5 个位置上，一次前向共同产出 5 个草稿位置的 logits。本块只输出隐藏态、不接输出头。块内位置用噪声 token（id 128799）占位；草稿块自身是 MoE：128 专家取 top-3。'},
+    b2:  {label:'草稿块 2\n5 个位置', t:'dspark', io:'-> 隐藏态', f:'\\text{block size} = 5', d:'同上，输出隐藏态交给末块。共 3 个 MTP 块（n_mtp_layers=3）。'},
+    b3:  {label:'草稿块 3\n5 个位置', t:'dspark', io:'-> [1,5,V]', f:'\\text{block size} = 5', d:'末块接 Markov 头与置信头，输出 5 个位置的词表 logits（$V$ 为词表 129280）。'},
     markov:{label:'Markov 头\n秩 256', t:'gt', io:'[1,5,256]', f:'\\mathrm{rank} = 256', d:'dspark_markov_rank=256，给草稿序列内部的相邻关系建模。'},
     conf:{label:'置信头', t:'gt', io:'[1,5]', f:'\\text{confidence}', d:'输出每个草稿位置的接受置信度，决定这次接受几个草稿。'},
     out: {label:'草稿 token\n交主干校验', t:'out', io:'5 个草稿位置', f:'\\text{draft} \\to \\text{verify}', d:'草稿交给主干一次性校验。DSpark 不产生主干缓存，只提高一次前向平均能确认的 token 数。'}
