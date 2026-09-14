@@ -114,7 +114,7 @@
 <h2>常见误解</h2>
 <ul>
 <li><b>「Mooncake 等于开源的 Mooncake Transfer Engine」</b>：本文采用的 Mooncake 指 arXiv:2407.00079v4 描述的 Kimi 服务平台整体设计；同名开源仓库（论文 §1 仅声明 trace 仓库地址，组件生态与开源版本不在本文范围）。两者相关但不同，本文以论文含义为准。</li>
-<li><b>「PD 分离就是 Mooncake 的核心创新」</b>：PD 分离此前已有 Splitwise、DistServe、TetriInfer 等并行工作。Mooncake 的核心是把 KVCache 提升为调度中心——全局 KVCache 池、cache-aware 调度、热点自动迁移、过载下的预测早拒绝。PD 分离是基础而非全部。</li>
+<li><b>「PD 分离就是 Mooncake 的核心创新」</b>：PD 分离此前已有 Splitwise、DistServe、TetriInfer 等并行工作<sup>[§9]</sup>。Mooncake 的核心是把 KVCache 提升为调度中心——全局 KVCache 池、cache-aware 调度、热点自动迁移、过载下的预测早拒绝。PD 分离是基础而非全部。</li>
 <li><b>「朴素早拒绝就是常规限流」</b>：常规做法按当前 decode 负载调度，但 prefill 与 decode 之间存在时滞，按当前负载决策会引发反相震荡。Mooncake 用基于系统级预测的早拒绝（假设均匀 decode 时长 $t_d$，预测 $t$ 时刻 decode 负载）来缓解。</li>
 </ul>
 </section>
@@ -224,12 +224,12 @@
 <li><b>块哈希链（hash chain）去重</b>：每个块的 key = Hash(本块 tokens, 前一块 key)。等价 ID 同时意味着「块内容相同 + 此前所有块都相同」，因此能安全地把整个前缀复用到任何请求。这一复用逻辑与 vLLM 已实现的类似（论文未展开其实现细节），Mooncake 把它的范围从单节点扩展为全局池。<sup>[C33, §3 Figure 3]</sup></li>
 </ol>
 
-<p>淘汰策略可选 LRU、LFU 或 LengthAwareCache 等。论文在公开 trace 上的实验表明 LRU 在该 trace 表现最优；trace 上 50,000 块容量对应的命中率约 50%（1,000 块容量仅 30%）。<sup>[N4, N5]</sup> 同时 trace 显示超过 50% 的块从未被访问，部分块被访问数万次——这要求系统显式做热点复制，否则热门前缀会反复因 fetch 拥塞而拖慢。<sup>[N6, C11]</sup></p>
+<p>淘汰策略可选 LRU、LFU 或 LengthAwareCache 等。论文在一段 1 小时、共 23,608 条请求的公开 trace（平均输入 7,590 tokens、平均输出 182 tokens<sup>[N1, N2]</sup>）上做实验，表明 LRU 在该 trace 表现最优；trace 上 50,000 块容量对应的命中率约 50%（1,000 块容量仅 30%）。<sup>[N4, N5]</sup> 同时 trace 显示超过 50% 的块从未被访问，部分块被访问数万次——这要求系统显式做热点复制，否则热门前缀会反复因 fetch 拥塞而拖慢。<sup>[N6, C11]</sup></p>
 
 <p>Messenger 是 GPUDirect RDMA 跨节点传输组件，独立进程部署在每节点；它是基于 RDMA 的组件，跨节点直接读写对端 KVCache 块。论文 v4 仅描述其接口与位置；RDMA 一般特性下的对端 CPU 占用与拷贝路径不在论文范围内。<sup>[§3]</sup></p>
 
 <h3>2.3 请求四步工作流</h3>
-<p>对每个请求，Conductor 先选一对 prefill 与 decode 实例，然后按四步推进（论文图 4）：</p>
+<p>对每个请求，Conductor 先选一对 prefill 与 decode 实例，然后按四步推进（论文图 4）<sup>[C10]</sup>：</p>
 
 <figure class="diagram">
 <div class="dg-flow">
@@ -308,7 +308,7 @@
 <p class="chapter-summary">Algorithm 1 在每个请求上算 prefix 匹配与传输代价，选 TTFT 最短的实例，并在必要时自动迁移热点缓存。</p>
 
 <h3>3.1 块哈希链与 prefix 匹配</h3>
-<p>对每个到达的请求 $R$，Mooncake 的 Conductor 第一步是算它能命中多少 KVCache：<sup>[C10]</sup></p>
+<p>对每个到达的请求 $R$，Mooncake 的 Conductor 第一步是算它能命中多少 KVCache：<sup>[§6.1]</sup></p>
 <ol>
 <li>把 $R$ 的 prompt tokens 按 $B=512$ tokens 切块，得到 $n=\lceil\text{prompt\_len}/B\rceil$ 块；</li>
 <li>对每块算 key = Hash(本块 tokens, 前一块 key)（链式哈希），得 block_keys = $(k_1, k_2, \ldots, k_n)$；</li>
@@ -435,7 +435,7 @@ return (p, d)
 
 <p>策略对比给出的结论：纯缓存优先会让热门实例过载（9.012s）；cache-aware 不考虑传输时选了一个有缓存但队列长、还不需要传的实例（4.524s）；纯负载均衡丢失缓存复用、导致全量重算（4.572s），反而更差；只有 cache-aware + balance 同时权衡两者才选到 3.036s 并附带热点迁移。</p>
 
-<p>真实回放实验支持这个结论。在 8 个 prefill + 8 个 decode 实例上重放 23,000 条真实请求，KVCache-centric 调度把平均 TTFT 从 random 的 92.07s 降到 6.26s，比 cache-aware（14.36s）和 load-balancing（60.41s）都低；其中只有 KVCache-centric（6.26s）与 cache-aware（14.36s）满足 SLO 线（$≈$30s）。<sup>[N8]</sup></p>
+<p>真实回放实验支持这个结论。在 8 个 prefill + 8 个 decode 实例上重放 23,000 条真实请求，KVCache-centric 调度把平均 TTFT 从 random 的 92.07s 降到 6.26s，比 cache-aware（14.36s）和 load-balancing（60.41s）都低；其中只有 KVCache-centric（6.26s）与 cache-aware（14.36s）满足 SLO 线（$≈$30s）。<sup>[N8, N14]</sup></p>
 
 <h3>本章问题</h3>
 <ol class="chapter-questions">
@@ -617,7 +617,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 实验结果（8P+8D、$2\times$ 重放 23,000 条真实请求）：拒绝数 Baseline 4183 → Early Rejection 3771 → Early Rejection+Prediction <b>3589</b>。<sup>[N9]</sup> 基于预测的早拒绝比朴素早拒绝再减少 ~5% 的拒绝数，对应的有效利用率提升来自反相震荡的缓解。</p>
 
 <h3>5.4 端到端结果</h3>
-<p>把整套架构组合起来的端到端实验（论文 §8）结果汇总如下：</p>
+<p>把整套架构组合起来的端到端实验（论文 §8）在一套每节点 8×A800-SXM4-80GB、节点间 RDMA 带宽至多 800 Gbps 的集群上完成<sup>[N15]</sup>，结果汇总如下：</p>
 
 <div class="table-scroll">
 <table>
@@ -674,7 +674,7 @@ text { fill: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; fo
 <tr><td>C7</td><td>decode 受内存带宽约束、时间随 batch 大小次线性增长</td><td>§2</td></tr>
 <tr><td>C8</td><td>decode 阶段常用连续批处理（Orca 等）</td><td>§2（cite [12][13]）</td></tr>
 <tr><td>C9</td><td>MaaS 下 prefill 主要衡量 TTFT，decode 主要衡量 TBT</td><td>§2</td></tr>
-<tr><td>C10</td><td>请求处理三步：传可复用 KVCache → 分块/分层完成 prefill 并流式传 KVCache → decode 加入连续批处理</td><td>§1</td></tr>
+<tr><td>C10</td><td>§1 所述请求处理流程（第 2 章按四步展开）：传可复用 KVCache → 分块/分层完成 prefill 并流式传 KVCache → decode 加入连续批处理</td><td>§1</td></tr>
 <tr><td>C11</td><td>Conductor 预测 KVCache 块未来使用，执行 swapping 与 replication</td><td>§1</td></tr>
 <tr><td>C15</td><td>Mooncake 决定彻底分离而非纯 chunked prefill 的两条理由</td><td>§5</td></tr>
 <tr><td>C16</td><td>跨节点 TP 每层 2 次 RDMA all-reduce，显著降低 MFU</td><td>§5.1</td></tr>
