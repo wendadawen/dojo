@@ -2,13 +2,33 @@
 
 规划用于确定内容范围、证据、文章大纲和术语表，不写 HTML。
 
-产物写入 `wiki/<name>/research/`：
+产物写入 `wiki/<name>/research/`。
+
+该目录**只放 `.md`**，且文件名限定为下表列出的集合——其他名字的文件不应出现在这里；确需新增类别时先改本清单。
+
+规划阶段产出：
 
 ```text
-scope.md      内容范围
-evidence.md   核心论断与证据的对应关系
-outline.md    文章大纲
-glossary.md   术语表
+scope.md         内容范围
+evidence.md      核心论断与证据的对应关系
+outline.md       文章大纲
+glossary.md      术语表
+prereq-audit.md  前置概念盘点（可选，需要系统排查全站覆盖时写）
+sources/         第三方来源的原文摘录，每个来源一个文件（可选）
+official/        官方材料的原文摘录，每个文件一个来源（可选）
+```
+
+`sources/` 存的是 `evidence.md` 里引文的原始片段——官方仓库 README、源码摘录、PR 说明、commit 信息等。页面引用的来源一旦失效或改版，只有这里能回溯，因此每份摘录要带获取时间与版本号或 commit。
+
+后续阶段还会写入：
+
+```text
+draft-check.md      写作自检
+review-{轮次}.md    独立审查记录，从 review-1.md 起连续编号
+minor-fixes.md      轻微问题清理记录
+check-status.md     质检状态汇总，把各轮结论并到一处（可选）
+arbitration.md      审查结论互相矛盾时的裁定记录（可选）
+measured.md         实测产物登记（有本机实测时）
 ```
 
 目标读者不具备该概念及其所属领域的背景知识。
