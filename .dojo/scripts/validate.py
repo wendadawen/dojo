@@ -80,6 +80,9 @@ ASCII_MATH_PATTERNS = (
     re.compile(r"[0-9A-Za-z]\s*\*\s*[0-9A-Za-z]"),
 )
 
+# 正文以文字形式提到的 research/ 文件必须真实存在。
+RESEARCH_MENTION_RE = re.compile(r"research/[\w./-]+\.(?:py|out|json|sh|cuh|hpp|txt)")
+
 # 结构图使用 HTML 或内联 SVG，不使用等宽字符拼出的框线图。
 BOX_DRAWING_RE = re.compile(r"[\u2500-\u257f\u2580-\u259f\u25a0-\u25ff\u2b00-\u2bff]")
 PRE_BLOCK_RE = re.compile(r"<pre\b[^>]*>([\s\S]*?)</pre>", re.IGNORECASE)
@@ -184,6 +187,16 @@ def validate_page(path: Path) -> list[str]:
             target = target / "index.html"
         if not target.exists():
             errors.append(f"broken local reference {ref}")
+
+    # 正文里以文字形式指向的 research/ 文件必须真实存在。
+    # 实测产物已从仓库移除，页面若仍写 research/xxx.py 这类路径，读者无从定位。
+    for mention in RESEARCH_MENTION_RE.findall(text):
+        target = (path.parent / mention).resolve()
+        if not target.exists():
+            errors.append(
+                f"reference to a missing research file: {mention}"
+                " (rewrite as '实测得到' or point to research/measured.md)"
+            )
 
     is_wiki_page = "wiki" in path.parts
     if is_wiki_page and path.name == "index.html":
