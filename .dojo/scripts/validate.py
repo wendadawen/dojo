@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a wiki page (index.html / overview.html) or the page templates.
+"""Validate wiki pages (index.html / overview.html) or the page templates.
 
 Deterministic checks only: shell integrity, template leftovers, duplicate
 ids, same-page anchors and broken local references. Semantic quality is out
@@ -7,11 +7,16 @@ of scope (handled by the independent review).
 
 Usage:
     python3 .dojo/scripts/validate.py wiki/<name>/index.html
+    python3 .dojo/scripts/validate.py wiki/*/index.html wiki/*/overview.html
+    python3 .dojo/scripts/validate.py --all
     python3 .dojo/scripts/validate.py --templates
+
+一次进程可校验多个文件，避免逐页起进程的开销。
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 import sys
 from html import unescape
@@ -400,7 +405,9 @@ def check_template(path: Path) -> list[str]:
 
 
 def main() -> int:
-    args = [arg for arg in sys.argv[1:] if arg != "--templates"]
+    args = [
+        arg for arg in sys.argv[1:] if arg not in {"--templates", "--all"}
+    ]
     check_templates = "--templates" in sys.argv
 
     if check_templates:
@@ -418,25 +425,46 @@ def main() -> int:
         print(f"template validation ok: {len(templates)} templates")
         return 0
 
-    if len(args) != 1:
+    if "--all" in sys.argv:
+        args = sorted(str(p) for p in Path("wiki").glob("**/*.html"))
+
+    if not args:
         print(__doc__)
         return 2
 
-    page = Path(args[0])
-    if page.is_dir():
-        page = page / "index.html"
-    if not page.exists():
-        print(f"error: page not found: {page}")
+    pages: list[Path] = []
+    missing: list[str] = []
+    for arg in args:
+        path = Path(arg)
+        if path.is_dir():
+            path = path / "index.html"
+        if not path.exists():
+            missing.append(str(path))
+            continue
+        pages.append(path)
+    if missing:
+        print("error: page not found: " + ", ".join(missing))
         return 2
 
-    errors = validate_page(page)
-    if errors:
-        print(f"validation failed: {page}")
-        for error in errors:
-            print(f"- {error}")
+    if len(pages) == 1:
+        results = [(pages[0], validate_page(pages[0]))]
+    else:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(lambda p: (p, validate_page(p)), pages))
+
+    failed = [(page, errors) for page, errors in results if errors]
+    if failed:
+        print(f"validation failed: {len(failed)}/{len(results)} pages")
+        for page, errors in failed:
+            print(f"- {page}")
+            for error in errors:
+                print(f"  - {error}")
         return 1
 
-    print(f"validation ok: {page}")
+    if len(pages) == 1:
+        print(f"validation ok: {pages[0]}")
+    else:
+        print(f"validation ok: {len(pages)} pages")
     return 0
 
 
