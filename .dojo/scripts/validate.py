@@ -315,6 +315,7 @@ def validate_page(path: Path) -> list[str]:
         errors.extend(check_box_drawing(text))
         if path.name == "index.html":
             errors.extend(check_research_dir(path.parent / "research"))
+        errors.extend(check_body_centering(text))
 
     return errors
 
@@ -411,6 +412,33 @@ def check_box_drawing(text: str) -> list[str]:
                 f"ascii box-drawing diagram in <pre> block #{index}"
                 f" ({len(hits)} box characters); use HTML diagram or inline SVG"
             )
+    return errors
+
+
+BODY_RULE_RE = re.compile(r"(?:^|[},])\s*body\s*\{([^}]*)\}", re.M | re.S)
+BODY_MARGIN_RE = re.compile(r"margin\s*:\s*([^;}]*)")
+
+
+def check_body_centering(text: str) -> list[str]:
+    """页面内联样式覆盖 body 的 margin 时必须保留横向 auto。
+
+    共享样式用 `body { max-width: 1200px; margin: 0 auto }` 把正文居中，
+    左侧固定目录的 left 也按正文居中计算。页面若在自己的 <style> 里写
+    `body { margin: 0 }`，居中失效、目录会压到标题和正文上；这个覆盖看不到
+    报错，只会在 1440–1920px 的视口里表现为文字重叠。
+    """
+    errors: list[str] = []
+    for block in STYLE_RE.findall(text):
+        for rule in BODY_RULE_RE.findall(block):
+            match = BODY_MARGIN_RE.search(rule)
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if "auto" not in value:
+                errors.append(
+                    f"inline body margin overrides the centering: margin: {value}"
+                    " (use 'margin: 0 auto' so the fixed TOC does not overlap)"
+                )
     return errors
 
 
