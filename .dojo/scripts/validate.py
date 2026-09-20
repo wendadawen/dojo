@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a single concept or paper page (index.html).
+"""Validate a wiki page (index.html / overview.html) or the page templates.
 
 Deterministic checks only: shell integrity, template leftovers, duplicate
 ids, same-page anchors and broken local references. Semantic quality is out
@@ -7,6 +7,7 @@ of scope (handled by the independent review).
 
 Usage:
     python3 .dojo/scripts/validate.py wiki/<name>/index.html
+    python3 .dojo/scripts/validate.py --templates
 """
 
 from __future__ import annotations
@@ -41,6 +42,15 @@ REQUIRED_WIKI_META = (
     "dojo:topics",
     "dojo:tag",
 )
+# 每个 dojo:type 对应唯一的共享样式表，防止页面套错模板后仍能通过校验。
+TYPE_STYLESHEET = {
+    "concept": "dojo-concept.css",
+    "paper": "dojo-paper.css",
+    "note": "dojo-note.css",
+    "dataflow": "dojo-dataflow.css",
+}
+TEMPLATE_DIR = ".dojo/templates"
+STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
 INLINE_MATH_RE = re.compile(
     r"\$\$[\s\S]+?\$\$|"
     r"(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$(?!\$)|"
@@ -221,6 +231,16 @@ def validate_page(path: Path) -> list[str]:
             errors.append(
                 f"unknown type: {raw_type} (allowed: {', '.join(ALLOWED_TYPES)})"
             )
+        elif raw_type in TYPE_STYLESHEET:
+            expected_css = TYPE_STYLESHEET[raw_type]
+            # 部署会给样式链接加 ?v=<sha> 缓存参数，比对时忽略查询串。
+            if not any(
+                ref.split("?", 1)[0].endswith(f"libs/{expected_css}")
+                for ref in inspector.stylesheets
+            ):
+                errors.append(
+                    f"type {raw_type} must reference ../../libs/{expected_css}"
+                )
 
         # 标签取封闭词表内的单一值，防止细粒度标签再次碎片化
         raw_tag = inspector.meta.get("dojo:tag", "")
@@ -334,12 +354,75 @@ def check_box_drawing(text: str) -> list[str]:
     return errors
 
 
+def check_template(path: Path) -> list[str]:
+    """模板必须声明正确类型，且内联样式与共享样式保持一致。
+
+    模板因含占位符不能走 validate_page；但类型写错时，按模板生成的每个
+    页面都会错，因此在模板层面单独拦一道。
+
+    模板必须内联样式：它位于 .dojo/templates/<module>/，相对路径
+    ../../libs/ 会解析到 .dojo/libs，外链拿不到根目录下的共享样式。
+    页面（wiki/<name>/）才外链 libs/dojo-<module>.css。因此模板与共享
+    样式是同一份样式的两个落点，必须同步，否则两边会各自漂移。
+    """
+    errors: list[str] = []
+    module = path.parent.name
+    expected_css = TYPE_STYLESHEET.get(module)
+    if expected_css is None:
+        return errors
+
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    inspector = PageInspector()
+    inspector.feed(text)
+    raw_type = inspector.meta.get("dojo:type", "")
+    if raw_type != module:
+        errors.append(f"template type must be {module}, got: {raw_type or '(missing)'}")
+
+    css_path = Path("libs") / expected_css
+    blocks = STYLE_RE.findall(text)
+    if not blocks:
+        errors.append("template must inline its styles (../../libs resolves to .dojo/libs)")
+        return errors
+    if not css_path.exists():
+        errors.append(f"missing shared stylesheet: {css_path}")
+        return errors
+
+    def normalize(css: str) -> str:
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+        return re.sub(r"\s+", " ", css).strip()
+
+    if normalize(blocks[0]) != normalize(css_path.read_text(encoding="utf-8")):
+        errors.append(
+            f"template inline styles drifted from {css_path}; "
+            "keep the two copies identical"
+        )
+    return errors
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
+    args = [arg for arg in sys.argv[1:] if arg != "--templates"]
+    check_templates = "--templates" in sys.argv
+
+    if check_templates:
+        template_root = Path(TEMPLATE_DIR)
+        templates = sorted(template_root.glob("*/index.html"))
+        failures = [(t, check_template(t)) for t in templates]
+        failures = [(t, errs) for t, errs in failures if errs]
+        if failures:
+            print("template validation failed:")
+            for template, errs in failures:
+                print(f"- {template}")
+                for error in errs:
+                    print(f"  - {error}")
+            return 1
+        print(f"template validation ok: {len(templates)} templates")
+        return 0
+
+    if len(args) != 1:
         print(__doc__)
         return 2
 
-    page = Path(sys.argv[1])
+    page = Path(args[0])
     if page.is_dir():
         page = page / "index.html"
     if not page.exists():
