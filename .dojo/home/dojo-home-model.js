@@ -156,37 +156,6 @@
     return { nodes, edges };
   }
 
-  // 可信度徽章：让读者一眼分辨哪篇经过独立审查、哪篇没有。
-  // 状态由构建期从 research/review-*.md 算出，不依赖页面自述。
-  function reviewBadge(review) {
-    if (!review) return "";
-    const rounds = review.rounds || 0;
-    if (!rounds) {
-      return `<span class="review-badge review-none" title="没有独立审查记录">未审查</span>`;
-    }
-    const openBlocking = review.open_blocking || 0;
-    const openImportant = review.open_important || 0;
-    const hasOpen = openBlocking > 0 || openImportant > 0;
-    const complete = rounds >= 3 && review.stale === false && !hasOpen;
-    const cls = hasOpen ? "review-open" : (complete ? "review-ok" : "review-partial");
-    const parts = [`审查 ${rounds} 轮`];
-    if (review.measured) parts.push("含实测");
-    if (hasOpen) {
-      const bits = [];
-      if (openBlocking) bits.push(`${openBlocking} 阻断`);
-      if (openImportant) bits.push(`${openImportant} 重要`);
-      parts.push(`待修 ${bits.join(" ")}`);
-    } else if (review.stale) {
-      parts.push("审查后已修改");
-    }
-    const title = hasOpen
-      ? `最后一轮审查仍有未关闭的问题：${openBlocking} 阻断、${openImportant} 重要`
-      : review.stale
-        ? `已完成 ${rounds} 轮独立审查，但正文在最后一轮之后改动过`
-        : `已完成 ${rounds} 轮独立审查`;
-    return `<span class="review-badge ${cls}" title="${escapeHtml(title)}">${escapeHtml(parts.join(" · "))}</span>`;
-  }
-
   function renderCard(page) {
     const topic = (page.topics || [])[0] || page.tag || "";
     const summary = page.summary || page.description || "暂无摘要";
@@ -196,7 +165,6 @@
           <span class="card-meta">
             <span class="type-badge type-${escapeHtml(page.type)}">${escapeHtml(typeLabel(page.type))}</span>
             ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
-            ${reviewBadge(page.review)}
             ${page.date ? `<time class="date-chip" datetime="${escapeHtml(page.date)}">${escapeHtml(page.date)}</time>` : ""}
           </span>
           <h2>${escapeHtml(page.title)}</h2>
@@ -212,7 +180,6 @@
     makeGlobalElements,
     makeLocalGraph,
     renderCard,
-    reviewBadge,
     typeLabel,
   };
 }));

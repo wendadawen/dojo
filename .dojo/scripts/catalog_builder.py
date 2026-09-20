@@ -188,31 +188,6 @@ def git_first_seen_dates(root: Path) -> dict[str, str]:
     return dates
 
 
-def review_fields(root: Path, slug: str) -> dict:
-    """审查状态从 research/ 下的记录算出，不往页面里写字段。
-
-    页面本身不标注可信度时，读者无法分辨哪篇经过独立审查、哪篇没有。
-    状态在构建期算出来给首页卡片用；每加一轮审查不需要回填任何页面。
-    """
-    import review_status  # 同目录；按需导入，避免拖慢只做结构校验的 validate
-
-    try:
-        info = review_status.status_of(slug, root)
-    except Exception:  # noqa: BLE001 - 状态算不出来不该让构建失败
-        return {
-            "rounds": 0, "measured": False, "stale": None, "reviewed_at": "",
-            "open_blocking": 0, "open_important": 0,
-        }
-    return {
-        "rounds": info["rounds"],
-        "measured": info["measured"],
-        "stale": info["stale"],
-        "reviewed_at": info["reviewed_at"],
-        "open_blocking": info.get("open_blocking", 0),
-        "open_important": info.get("open_important", 0),
-    }
-
-
 def parse_page(root: Path, page_path: Path) -> dict:
     relative = page_path.relative_to(root).as_posix()
     parser = WikiHTMLParser()
@@ -242,7 +217,6 @@ def parse_page(root: Path, page_path: Path) -> dict:
         "_has_summary": bool(summary_meta),
         "_invalid_topics": invalid_topics,
         "_hrefs": parser.hrefs,
-        "review": review_fields(root, page_path.parent.name),
     }
 
 
