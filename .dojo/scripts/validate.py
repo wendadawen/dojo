@@ -56,6 +56,23 @@ TYPE_STYLESHEET = {
 }
 TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
+
+# research/ 允许的文件名集合（四类页面共用）。目录只放 .md，扩写记录与
+# 审查轮次都按固定名字编号；sources/ 与 official/ 存放引文原始快照。
+RESEARCH_ALLOWED_FILES = {
+    "scope.md",
+    "evidence.md",
+    "outline.md",
+    "glossary.md",
+    "prereq-audit.md",
+    "draft-check.md",
+    "minor-fixes.md",
+    "check-status.md",
+    "arbitration.md",
+    "measured.md",
+}
+RESEARCH_ALLOWED_DIRS = {"sources", "official"}
+REVIEW_FILE_RE = re.compile(r"review-\d+\.md")
 INLINE_MATH_RE = re.compile(
     r"\$\$[\s\S]+?\$\$|"
     r"(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$(?!\$)|"
@@ -96,7 +113,11 @@ ASCII_MATH_PATTERNS = (
 )
 
 # 正文以文字形式提到的 research/ 文件必须真实存在。
-RESEARCH_MENTION_RE = re.compile(r"research/[\w./-]+\.(?:py|out|json|sh|cuh|hpp|txt)")
+# 实测产物与来源快照不随站点发布（CI 用 --exclude='research/' 排除整个目录），
+# 正文里指向它们的路径在线上必然是 404。只有 measured.md 是明确允许的登记文件，
+# 指南要求正文写「实测得到」并指向它，所以单独放行。
+RESEARCH_MENTION_RE = re.compile(r"research/[\w./-]*[\w/-]")
+RESEARCH_ALLOWED_RE = re.compile(r"^research/measured\.md$")
 
 # 结构图使用 HTML 或内联 SVG，不使用等宽字符拼出的框线图。
 BOX_DRAWING_RE = re.compile(r"[\u2500-\u257f\u2580-\u259f\u25a0-\u25ff\u2b00-\u2bff]")
@@ -203,14 +224,23 @@ def validate_page(path: Path) -> list[str]:
         if not target.exists():
             errors.append(f"broken local reference {ref}")
 
-    # 正文里以文字形式指向的 research/ 文件必须真实存在。
-    # 实测产物已从仓库移除，页面若仍写 research/xxx.py 这类路径，读者无从定位。
+    # 正文里以文字形式指向的 research/ 路径必须真实存在，且不能指向目录快照。
+    # research/ 整个目录不发布，正文指向它读者必然打不开；唯一例外是
+    # measured.md——指南规定实测结论以「实测得到」陈述并指向这份登记。
     for mention in RESEARCH_MENTION_RE.findall(text):
+        if RESEARCH_ALLOWED_RE.match(mention):
+            continue
         target = (path.parent / mention).resolve()
         if not target.exists():
             errors.append(
                 f"reference to a missing research file: {mention}"
                 " (rewrite as '实测得到' or point to research/measured.md)"
+            )
+        else:
+            errors.append(
+                f"reference to unpublished research path: {mention}"
+                " (research/ is excluded from the deployed site;"
+                " rewrite as '实测得到' or point to research/measured.md)"
             )
 
     is_wiki_page = "wiki" in path.parts
@@ -283,7 +313,32 @@ def validate_page(path: Path) -> list[str]:
         errors.extend(check_bare_math(inspector))
         errors.extend(check_svg_text_math(text))
         errors.extend(check_box_drawing(text))
+        if path.name == "index.html":
+            errors.extend(check_research_dir(path.parent / "research"))
 
+    return errors
+
+
+def check_research_dir(research: Path) -> list[str]:
+    """research/ 只放符合固定清单的 .md，不混入其他格式与临时文件。
+
+    该目录不随站点发布，但仍要可长期检索：文件名限定为固定集合，审查记录
+    按 review-<轮次>.md 连续编号，引文快照放在 sources/ 与 official/ 下。
+    """
+    errors: list[str] = []
+    if not research.is_dir():
+        return errors
+    for entry in sorted(research.iterdir()):
+        if entry.is_dir():
+            if entry.name not in RESEARCH_ALLOWED_DIRS:
+                errors.append(f"unexpected directory in research/: {entry.name}/")
+            continue
+        if not entry.name.endswith(".md"):
+            errors.append(f"non-markdown file in research/: {entry.name}")
+        elif entry.name in RESEARCH_ALLOWED_FILES or REVIEW_FILE_RE.fullmatch(entry.name):
+            continue
+        else:
+            errors.append(f"unexpected file in research/: {entry.name}")
     return errors
 
 
