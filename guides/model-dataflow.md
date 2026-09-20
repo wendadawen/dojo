@@ -2,13 +2,10 @@
 
 适用于把模型的逐层前向路径写成可查的页面：每个模块的输入输出、张量形状、关键公式，以及这些数字的出处。
 
-本流程与 `guides/note.md` 分开：note 只归档已经确认的结论，本流程要做的是一层层把路径推出来，期间会产生新的推导与新的实测，属于生产而不是归档。
-
 ## 目标
 
 生成 `wiki/<name>/index.html`，读者能顺着它把一次前向从输入走到输出，并在任意一个模块上查到形状、公式和依据。
 
-本流程产出**单文档**，不生成 `overview.html`——数据流要顺着读，概览页会把路径截断。
 
 ## 材料
 
@@ -100,4 +97,4 @@ measured.md   实测产物登记（有本机实测时）
 
 ## 发布
 
-使用 `.dojo/templates/dataflow/index.html`，替换全部占位符和 `<!-- @content -->`，样式引用 `../../libs/dojo-dataflow.css`，本页特有的视图样式写在页内 `<style>` 里。
+使用 `.dojo/templates/dataflow/index.html`，替换全部占位符和 `<!-- @content -->`，页面 `dojo:type` 为 `dataflow`，并外链 `../../libs/dojo-dataflow.css`；本页特有的视图样式写在共享样式之后的页内 `<style>` 里。

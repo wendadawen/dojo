@@ -6,8 +6,6 @@
 
 生成一篇可独立阅读的学习记录，写入 `wiki/<name>/index.html`。
 
-本流程产出**单文档**，不生成 `overview.html`——归档内容一篇读完，不需要再拆一份概览。
-
 ## 范围与结构
 
 - 每篇记录只处理一个中心结论。
@@ -84,4 +82,4 @@ measured.md   实测产物登记（有本机实测时）
 
 ## 发布
 
-使用 `.dojo/templates/note/index.html`，替换全部占位符和 `<!-- @content -->`。页面元数据包括纯文本 `description`、可含 `$...$` 公式的 `dojo:summary`、类型、主题和标签。
+使用 `.dojo/templates/note/index.html`，替换全部占位符和 `<!-- @content -->`，页面 `dojo:type` 为 `note`，并外链 `../../libs/dojo-note.css`。页面元数据包括纯文本 `description`、可含 `$...$` 公式的 `dojo:summary`、类型、主题和标签。
