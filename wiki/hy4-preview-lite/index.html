@@ -59,7 +59,7 @@
 <p class="page-meta">更新于 2026-09-01 · 权重量化 / Hy4 / llama.cpp</p>
 <p class="reading-time" id="readingTime"></p>
 
-<h2 id="what">压缩对象与结果</h2>
+<h2 id="what">1. 压缩对象与结果</h2>
 
 <p>Hy4 preview 是腾讯混元的开源混合专家模型：总参数 770B、激活参数 49B，256 个路由专家，BF16 权重约 1.5 TB。开源社区反馈本地部署门槛过高后，混元团队于 2026 年 9 月 1 日发布轻量版，把权重压缩到 213.66 GiB（官方概称约 214 GB）。同一模型在 HuggingFace AngelSlim 仓库下有三个 GGUF 产物：</p>
 
@@ -116,29 +116,29 @@
 <figcaption class="diagram-caption">箭头为量化流水线方向：BF16 权重经 MIX-STQ1_0 配方逐层分档量化，得到 213.66 GiB 的 GGUF 产物。</figcaption>
 </figure>
 
-<h2 id="sherry">低档格式：Sherry 稀疏三值量化</h2>
+<h2 id="sherry">2. 低档格式：Sherry 稀疏三值量化</h2>
 
 <p>低档位格式由 Sherry 稀疏三值量化提供：每 4 个权重量化到 $\{-d, 0, +d\}$ 且强制组内恰好一个零（3:4 稀疏），合法组合 $\binom{4}{3}\times 2^3=32=2^5$ 恰好用 5 bit 编码——平均 1.25 bit/权重、零浪费，且组大小 4 对齐 SIMD 通道。落到文件是每 256 权重 42 字节（32B 索引 + 8B 符号 + 2B fp16 缩放系数），即 1.3125 bpw。llama.cpp 侧由 STQ1_0 内核实现（PR #22836），同算子对比中 bit 最低的同时速度与 IQ1_M 基本持平、明显快于 IQ1_S。</p>
 
 <p>Hy4 用的是训练后量化：AngelSlim 编码器保持格式逐字节不变，只改两个量化决策——缩放系数取加权最小二乘 $d=\sum w_i x_i q_i/\sum w_i q_i^2$（$x_i$ 为原始权重、$q_i\in\{-1,0,+1\}$ 为其三值、$w_i$ 为 imatrix 权重（imatrix 为 llama.cpp 的校准重要性矩阵）、$d$ 为缩放系数；取代按最大绝对值 amax 定标），零位按 imatrix 加权的增量代价选择（取代按绝对值最小选择），交替 3 轮。在 1200 行真实专家权重上，仅换缩放就使加权平方误差下降 89.7%，imatrix 零位再降剩余部分的 4.1%。格式、编码、字节账与实测的完整展开见 <a href="../sherry-ternary-quant/index.html">Sherry 稀疏三值量化</a>。</p>
 
-<h2 id="mix">层间分档：MIX-STQ1_0 逐层混合精度</h2>
+<h2 id="mix">3. 层间分档：MIX-STQ1_0 逐层混合精度</h2>
 
 <p>层间分档决定比特落在哪一层。各层对量化误差的耐受度不同，MIX-STQ1_0 在不增加平均比特预算的前提下按敏感度逐层分档：路由专家三族占全部参数的 97.7%，其中 gate/up 投影在 29 层压到 STQ1_0（1.3125 bpw）、48 层留在 IQ2_XXS（2.0625 bpw），分界由 imatrix 推导，平均 1.78 bpw（复算）；down 投影直写残差流、误差不被后续门控衰减，刻意高两档用 IQ3_XXS（末 3 层 IQ4_XS）；注意力 Q5_K、MLA 分量 Q8_0，DSA 索引器取 Q8_0/F32，router、norms 与输出层保持 F32。官方称 MIX-STQ1_0 的路由专家权重比 UD-IQ1_M 少占超 5 GiB，整模文件差为 6.17 GiB（UD-IQ1_M 与 STQ1_0 两个 GGUF 的体积差，219.83 − 213.66，复算）。预算视角、配方逐行理由与边界见 <a href="../mixed-precision-quant/index.html">逐层混合精度量化（MIX-STQ1_0）</a>。</p>
 
-<h2 id="quality">效果核对</h2>
+<h2 id="quality">4. 效果核对</h2>
 
 <p>精度方面，厂商自报的评测对比（BF16 对 MIX-STQ1_0）：MCPAtlas 83.7 到 83.2、SWE-Bench 多语言 82.9 到 81.3、MRCR 81.3 到 81.1、IFBench 73.5 到 72.5，按分数对复算的保留率为 98.1% 到 99.8%，差距都在一两分以内，检索类几乎没掉；官方同时报告整体表现优于 UD-IQ1_M 产物，长文理解几乎持平、数学小幅回落。吞吐方面，模型卡给出 8 张 H20 的实测：预填充 204.56 t/s；解码吞吐在英文节与中文节分别记为 20.47 t/s 与 19.52 t/s，同一份模型卡两处不一致。</p>
 
-<h2 id="heterogeneous">异构设备联合推理</h2>
+<h2 id="heterogeneous">5. 异构设备联合推理</h2>
 
 <p>除单机部署外，异构设备也可以联合运行：没有整套同构高端卡时，可将几台配置各异的机器组合起来。混元团队与 prima.cpp 合作验证：一台 4090 笔记本（16 GB 显存）加一台四卡 A4000 服务器，两端显存合计 80 GB、内存合计 64 GB，分处两个局域网；靠 prima.cpp 的异构调度把 MoE 层拆开分配、让计算与权重读取彼此重叠，最终把 213.66 GiB 的模型协同跑到 1.02 token/s，约为笔记本单机 offload 的 6 倍。这验证了另一条路线：面对旗舰模型不必采购整套同构硬件，已有的异构设备也可联合运行。</p>
 
-<h2 id="deployment">部署要点</h2>
+<h2 id="deployment">6. 部署要点</h2>
 
 <p>所有 Hy4 GGUF 产物都不能跑在原版 llama.cpp 上：hyv4 架构补丁（0001，18 个文件）对所有产物必需，STQ1_0 产物还需要量化与 CUDA 内核补丁（0002，25 个文件）。运行时的其余要点来自模型卡：聊天必须加 <code>--jinja</code>（Hy4 模板不匹配任何内置家族）；GGUF 必须放本地盘——llama.cpp 用 mmap，NFS 随机页错误约 12 MB/s，1 分钟的加载会拖成数小时；全量驻留显存约需 435 GiB（Q4_K_M）或 214 GiB（STQ1_0），不够就降 <code>-ngl</code>；自行重新量化时 STQ1_0 强制需要 imatrix。相关资源：量化 GGUF（huggingface.co/AngelSlim/Hy4-preview-GGUF）、基础模型（huggingface.co/tencent/Hy4-preview）、AngelSlim 代码仓库（github.com/Tencent/AngelSlim）。</p>
 
-<h2 id="sources">来源</h2>
+<h2 id="sources">来源与范围说明</h2>
 
 <ul>
 <li>体积、bpw、配方、编码器误差与部署要点：HuggingFace AngelSlim/Hy4-preview-GGUF 模型卡（2026-09 读取）。</li>
