@@ -112,8 +112,14 @@ def collect_pages(paths: list[str]) -> tuple[list[Path], list[str]]:
 
 
 def check_blocks(pages: list[Path], tmp: Path) -> tuple[list[str], int]:
+    """把所有内联脚本写盘后，用一次 node --check 批量校验。
+
+    逐块起 node 进程时，200 多个脚本块要起 200 多次进程，耗时以秒计；
+    每次 node 启动本身是固定开销。合并成一次调用后总耗时降到百毫秒级。
+    """
     errors: list[str] = []
     total = 0
+    targets: list[tuple[str, Path]] = []
     for page in pages:
         text = page.read_text(encoding="utf-8", errors="replace")
         parser = ScriptCollector()
@@ -122,15 +128,44 @@ def check_blocks(pages: list[Path], tmp: Path) -> tuple[list[str], int]:
             total += 1
             target = tmp / f"{page.parent.name}-{page.stem}-{index}.js"
             target.write_text(body, encoding="utf-8")
-            proc = subprocess.run(
-                ["node", "--check", str(target)],
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
-                detail = " ".join((proc.stderr or proc.stdout).split())
-                detail = detail.replace(str(tmp.resolve()) + "/", "")
-                errors.append(f"{page} inline <script> #{index}: {detail}")
+            targets.append((f"{page} inline <script> #{index}", target))
+
+    if not targets:
+        return errors, total
+
+    # node --check 只接受单个文件；若对每个块各起一次 node，200 多次进程
+    # 启动就是全部耗时。这里在单个 node 进程内用 vm.Script 逐个编译：
+    # 只做语法检查、不执行代码，语义与 --check 一致，且失败信息按
+    # FILE: 前缀分段，便于映射回原始页面与脚本块号。
+    script = (
+        "const fs=require('fs'),vm=require('vm');"
+        "let failed=false;"
+        "for(const f of process.argv.slice(1)){"
+        "try{new vm.Script(fs.readFileSync(f,'utf8'),{filename:f});}"
+        "catch(e){failed=true;process.stderr.write('FILE:'+f+'\\n'+e.message.replace(/\\s+/g,' ')+'\\n');}"
+        "}"
+        "process.exit(failed?1:0);"
+    )
+    proc = subprocess.run(
+        ["node", "-e", script, *[str(t) for _, t in targets]],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).replace(str(tmp.resolve()) + "/", "")
+        # 按 FILE: 分段，把每个失败文件映射回原始页面与块号
+        blocks: dict[str, str] = {}
+        current = None
+        for line in detail.splitlines():
+            if line.startswith("FILE:"):
+                current = line[len("FILE:"):].strip()
+                blocks[current] = ""
+            elif current:
+                blocks[current] += (" " if blocks[current] else "") + line.strip()
+        for label, target in targets:
+            message = blocks.get(str(target))
+            if message:
+                errors.append(f"{label}: {' '.join(message.split())}")
     return errors, total
 
 
