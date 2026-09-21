@@ -80,7 +80,10 @@ MAIN = {
     "nodes": [
         n("ids", "input_ids", "int64 [B, T]", "tensor", H.format("814"),
           detail="position_ids 缺省时按 past_seen_tokens 递推"),
-        n("embed", "VocabParallelEmbedding", "120832 → 6144", "op", H.format("825-826"),
+        n("cache_init", "DynamicCache(config)", "use_cache 且无 cache 时新建", "cache",
+          H.format("828-829"),
+          detail="只在 use_cache=True 且未传入 past_key_values 时新建；否则沿用传入的 cache"),
+        n("embed", "embed_tokens  (nn.Embedding)", "120832 → 6144", "op", H.format("826"),
           detail="embed_tokens.weight [120832, 6144] · padding_idx=120002"),
         n("emb_out", "inputs_embeds", "bf16 [B, T, 6144]", "tensor", H.format("826")),
 
@@ -92,12 +95,16 @@ MAIN = {
         n("pos_emb", "position_embeddings (cos, sin)", "fp32 [B, T, 64] × 2", "port",
           H.format("849"),
           detail="跨视图传出：每层 MLA 与 DSA 索引器共用这两张表"),
+        n("causal_mask", "create_causal_mask(**mask_kwargs)",
+          'dict["deepseek_sparse_attention"]', "op", H.format("836-846"),
+          detail="allow_is_causal_skip=False —— 强制建掩码，因为索引器也要用到因果性\n"
+                 "generate 已备好 dict 形态时会跳过这步"),
 
         n("hc_expand", "unsqueeze(2).expand(hc_mult)", "1 → 4 条流", "op", H.format("851"),
           detail="config.hc_mult=4；本处不读权重，只是把单流复制成 4 条残差流"),
         n("hc_streams", "hidden_states", "bf16 [B, T, 4, 6144]", "tensor", H.format("851")),
 
-        n("layers", "78 × HYV4DecoderLayer", "iHC carried 路径", "op", H.format("853-864"),
+        n("layers", "78 × HYV4DecoderLayer", "iHC carried 路径", "op", H.format("854-864"),
           drill="layer",
           detail="enable_ihc=True → 全层走 iHC；L0 dense FFN + L1-77 MoE\n"
                  "indexer_types：21 个 full + 57 个 shared；prev_topk_indices 逐层传递"),
@@ -111,31 +118,36 @@ MAIN = {
 
         n("norm", "norm  (HYV4RMSNorm)", "[6144]", "op", H.format("867"),
           detail="model.norm.weight [6144] · rms_norm_eps=1e-5"),
-        n("last_hidden", "last_hidden_state", "bf16 [B, T, 6144]", "tensor", H.format("869-871"),
+        n("last_hidden", "last_hidden_state", "bf16 [B, T, 6144]", "tensor", H.format("870"),
           detail="BaseModelOutputWithPast.last_hidden_state"),
 
-        n("lmhead", "lm_head  (ParallelLMHead)", "6144 → 120832", "op", H.format("950"),
+        n("lmhead", "lm_head  (nn.Linear)", "6144 → 120832", "op", H.format("950"),
           detail="lm_head.weight [120832, 6144]；enable_lm_head_fp32=True → fp32 GEMM\n"
                  "tie_word_embeddings=False（不共享 embedding 权重）"),
+        n("slice", "hidden_states[:, slice_indices, :]", "只算需要的 logits", "op",
+          H.format("949"),
+          detail="slice(-logits_to_keep, None)；logits_to_keep=0 时取全部位置"),
         n("logits", "logits", "fp32 [B, T, 120832]", "tensor", H.format("950")),
     ],
     "edges": [
-        e("ids", "embed"), e("embed", "emb_out"), e("ids", "rotary"),
+        e("ids", "embed"), e("cache_init", "layers", "past_key_values"),
+        e("embed", "emb_out"), e("ids", "rotary"),
         e("rotary", "pos_emb"), e("pos_emb", "layers", "每层 MLA / 索引器共用"),
+        e("causal_mask", "layers", "attention_mask"),
         e("emb_out", "hc_expand"),
         e("hc_expand", "hc_streams"), e("hc_streams", "layers"),
         e("layers", "layer_out"), e("layer_out", "hc_head"), e("hc_head", "merged"),
-        e("merged", "norm"), e("norm", "last_hidden"), e("last_hidden", "lmhead"),
-        e("lmhead", "logits"),
+        e("merged", "norm"), e("norm", "last_hidden"), e("last_hidden", "slice"),
+        e("slice", "lmhead"), e("lmhead", "logits"),
     ],
     "groups": [
         {"label": "HYV4Model（每次 forward 执行一遍）",
-         "members": ["ids", "embed", "emb_out", "rotary", "pos_emb", "hc_expand",
-                     "hc_streams", "layers", "layer_out", "hc_head", "merged", "norm",
-                     "last_hidden"],
+         "members": ["ids", "cache_init", "embed", "emb_out", "rotary", "pos_emb",
+                     "causal_mask", "hc_expand", "hc_streams", "layers", "layer_out",
+                     "hc_head", "merged", "norm", "last_hidden"],
          "fill": "#f4f7fb", "stroke": "#b6c2d6", "label_color": "#4a5b78"},
         {"label": "HYV4ForCausalLM 额外的 LM head",
-         "members": ["lmhead", "logits"],
+         "members": ["slice", "lmhead", "logits"],
          "fill": "#f2f7f3", "stroke": "#93bfa3", "label_color": "#4b7a5c"},
     ],
     "notes": [],
@@ -155,14 +167,14 @@ LAYER = {
           detail="跨视图传入：由主干的 rotary_emb 算好，本层与 DSA 索引器共用"),
         n("in", "hidden_states", "bf16 [B, T, 4, 6144]", "tensor", H.format("693"),
           detail="上一次迭代的输出；4 条残差流"),
-        n("prepare", "hc_attn_layer.prepare_input", "2D → 3D 广播（仅 L0 需要）", "op",
+        n("prepare", "unsqueeze(2) / reshape 成 3D", "2D 或 2D*hc → 3D（仅 L0 需要）", "op",
           H.format("706"), detail="其余层已是 3D，这一步是 no-op"),
         n("cur", "hidden_states", "bf16 [B, T, 4, 6144]", "tensor"),
 
-        n("pre1", "hc_attn_layer.pre", "24576 → 8 fp32", "op", H.format("706"), drill="ihc",
-          detail="hc_attn_layer.hc_pre.hc_fn [8,24576] fp32·hc_base [8]·hc_scale [2]\n"
-                 "产出 reduced / post / residual 三样"),
-        n("reduced1", "reduced", "bf16 [B, T, 6144]", "tensor", H.format("706"),
+        n("pre1", "attn_hc()", "返回 (post, out)", "op", H.format("706"), drill="ihc",
+          detail="attn_hc.fn [8,24576] fp32 · base [8] · scale [2]（检查点键 hc_attn_layer.hc_pre.*）\n"
+                 "一次调用同时产出 post（4 个门）与压缩后的单流输出"),
+        n("reduced1", "hidden_states", "bf16 [B, T, 6144]", "tensor", H.format("706"),
           detail="post [B,T,4] | residual [B,T,4,6144]"),
 
         n("iln", "input_layernorm", "[6144]", "op", H.format("708"),
@@ -178,14 +190,14 @@ LAYER = {
         n("topk", "topk_indices", "int32 [B, T, 2048]", "tensor", H.format("709"),
           detail="传给下一层作 prev_topk_indices；shared 层直接复用"),
 
-        n("post1", "hc_attn_layer.post", "post × attn_out + residual", "op",
+        n("post1", "post × attn_out + residual", "写回 4 条流", "op",
           H.format("719"),
           detail="post 是 [B,T,4] 逐流标量，与 [B,T,6144] 外积后写回 4 条流；fp32 计算"),
         n("mid", "hidden_states", "bf16 [B, T, 4, 6144]", "tensor", H.format("719")),
 
-        n("pre2", "hc_mlp_layer.pre", "24576 → 8 fp32", "op", H.format("722"), drill="ihc",
-          detail="hc_mlp_layer.hc_pre.hc_fn [8,24576] fp32·hc_base [8]·hc_scale [2]"),
-        n("reduced2", "reduced", "bf16 [B, T, 6144]", "tensor", H.format("722"),
+        n("pre2", "ffn_hc()", "返回 (post, out)", "op", H.format("722"), drill="ihc",
+          detail="ffn_hc.fn [8,24576] fp32 · base [8] · scale [2]（检查点键 hc_mlp_layer.hc_pre.*）"),
+        n("reduced2", "hidden_states", "bf16 [B, T, 6144]", "tensor", H.format("722"),
           detail="post [B,T,4] | residual [B,T,4,6144]"),
 
         n("paln", "post_attention_layernorm", "[6144]", "op", H.format("724"),
@@ -194,9 +206,9 @@ LAYER = {
 
         n("mlp", "self.mlp", "L0: HYV4MLP(18432)\nL1-77: HYV4MoE(2048)", "op",
           H.format("725"), drill="moe"),
-        n("mlp_out", "mlp_out", "bf16 [B, T, 6144]", "tensor", H.format("725")),
+        n("mlp_out", "hidden_states", "bf16 [B, T, 6144]", "tensor", H.format("725")),
 
-        n("post2", "hc_mlp_layer.post", "post × mlp_out + residual", "op", H.format("726"),
+        n("post2", "post × hidden_states + residual", "写回 4 条流", "op", H.format("726"),
           detail="写回 4 条流后作为本层输出"),
         n("out", "hidden_states", "bf16 [B, T, 4, 6144]", "tensor", H.format("728"),
           detail="连同 topk_indices 一起返回给主干循环"),
@@ -239,8 +251,9 @@ ATTN = {
         n("x", "hidden_states", "bf16 [B, T, 6144]", "tensor", H.format("408"),
           detail="iHC 压缩后的单流输入"),
 
-        n("gate", "linear_gate", "6144 → 16384", "op", H.format("420"),
-          detail="linear_gate.weight [16384, 6144]；gated_mla=True, gating_type=elementwise"),
+        n("gate", "gate_proj", "6144 → 16384", "op", H.format("420"),
+          detail="检查点键 linear_gate.weight [16384, 6144]（HF 属性名是 gate_proj）\n"
+                 "gated_mla=True, gating_type=elementwise"),
         n("gate_states", "gate_states", "bf16 [B, T, 64, 256]", "tensor", H.format("420"),
           detail="每头 256 维的门控，最后与 attn_output 逐元素相乘"),
 
@@ -271,7 +284,9 @@ ATTN = {
         n("k_pass_ln", "k_pass", "bf16 [B, 1, T, 512]", "tensor", H.format("429")),
 
         n("rope", "apply_rotary_pos_emb", "非交错 RoPE，只作用于 64 维", "op",
-          H.format("431-434"), detail="rope_theta=1e7；q_rot 与 k_rot 同一次调用"),
+          H.format("431-434"),
+          detail="q*cos + rotate_half(q)*sin；rotate_half 把后半维取负后与前半维互换\n"
+                 "rope_theta=1e7；q_rot 与 k_rot 同一次调用"),
         n("q_rot_pe", "q_rot", "bf16 [B, 64, T, 64]", "tensor"),
         n("k_rot_pe", "k_rot", "bf16 [B, 1, T, 64]", "tensor"),
 
@@ -297,6 +312,9 @@ ATTN = {
         n("mask", "masked_fill", "-inf 掩码", "op", H.format("459-470"),
           detail="eager 路径把未选中位置置 dtype 最小值；flash 路径直接把索引交给 kernel"),
         n("masked", "attention_mask", "bf16 [B, 1, T, T]", "tensor", H.format("459-470")),
+        n("sparse_idx", "sparse_indices = topk_indices", "flash 路径不走掩码", "tensor",
+          H.format("471-472"),
+          detail="仅当 _attn_implementation 不是 eager/sdpa 时：索引原样传入 kernel（indices=…）"),
 
         # eager_attention_forward 内部有 6 步，收成一格、点开看「注意力核心」视图
         n("attncore", "attention_interface", "64 头 · sink 参与归一化", "op",
@@ -331,6 +349,7 @@ ATTN = {
         e("expandkv", "key_states"), e("expandkv", "value_states"),
         e("x", "indexer"), e("qresid", "indexer"), e("indexer", "topk_idx"),
         e("topk_idx", "mask"), e("mask", "masked"),
+        e("topk_idx", "sparse_idx"), e("sparse_idx", "attncore", "flash 路径"),
         e("query_states", "attncore"), e("key_states", "attncore"),
         e("value_states", "attncore"), e("masked", "attncore"), e("sink", "attncore"),
         e("attncore", "attn_out"),
@@ -373,9 +392,9 @@ INDEXER = {
         n("wqb", "wq_b", "2048 → 4096", "op", H.format("232-233"),
           detail="wq_b.weight [4096, 2048] = index_n_heads 32 × head_dim 128"),
         n("q", "q", "bf16 [B, S, 32, 128]", "tensor", H.format("233")),
-        n("qsplit", "split(q_nope, q_pe)", "[64, 64]", "op", H.format("235"),
+        n("qsplit", "q_pass, q_rot = torch.split(...)", "[64, 64]", "op", H.format("235"),
           detail="rope 取后 64 维（与 MLA 主分支的 q 布局相反）"),
-        n("q_pe", "q_pe", "bf16 [B, S, 32, 64]", "tensor", H.format("235")),
+        n("q_pe", "q_rot", "bf16 [B, S, 32, 64]", "tensor", H.format("235")),
 
         n("wk", "wk", "6144 → 128", "op", H.format("238-239"),
           detail="wk.weight [128, 6144] · index_head_dim=128"),
@@ -383,12 +402,13 @@ INDEXER = {
         n("knorm", "k_norm  (LayerNorm)", "[128]", "op", H.format("238-241"),
           detail="k_norm.weight / k_norm.bias [128]；权重在 fp32 常驻"),
         n("k", "k", "bf16 [B, S, 1, 128]", "tensor", H.format("238-241")),
-        n("ksplit", "split(k_nope, k_pe)", "[64, 64]", "op", H.format("241"),
+        n("ksplit", "k_pass, k_rot = torch.split(...)", "[64, 64]", "op", H.format("241"),
           detail="单头 MQA：k 只有 1 个头"),
-        n("k_pe", "k_pe", "bf16 [B, S, 1, 64]", "tensor", H.format("241")),
+        n("k_pe", "k_rot", "bf16 [B, S, 1, 64]", "tensor", H.format("241")),
 
         n("rope", "apply_rotary_pos_emb", "unsqueeze_dim = 2", "op", H.format("243"),
-          detail="与 MLA 主分支共用同一次计算的 cos/sin"),
+          detail="q*cos + rotate_half(q)*sin；rotate_half(x)=cat(-x2, x1)\n"
+                 "unsqueeze_dim=2（索引器的 q/k 是 [B,S,H,D]）；复用主分支算好的 cos/sin"),
         n("q_rot", "q_rot", "bf16 [B, S, 32, 64]", "tensor"),
         n("k_rot", "k_rot", "bf16 [B, S, 1, 64]", "tensor"),
 
@@ -402,8 +422,8 @@ INDEXER = {
           detail="与 MLA 的 KV 缓存相互独立"),
         n("k_cached", "k", "bf16 [B, S, 128]", "tensor"),
 
-        n("dots", "einsum", "q · kᵀ", "op", H.format("250"),
-          detail="torch.matmul(q.float(), k.float().T)；显式升 fp32，跳过 Hadamard 变换"),
+        n("dots", "torch.matmul", "q · kᵀ", "op", H.format("250"),
+          detail="q.float() @ k.float()ᵀ —— 显式升 fp32；跳过 Hadamard 变换与 FP8 量化"),
         n("scores", "scores", "fp32 [B, S, 32, T]", "tensor", H.format("250")),
         n("relu", "relu", "负数截断", "op", H.format("251"),
           detail="负数截断为 0；打分不做 softmax"),
@@ -413,8 +433,8 @@ INDEXER = {
           detail="weights_proj.weight [32, 6144]；乘 n_heads^-0.5 · softmax_scale"),
         n("weights", "weights", "fp32 [B, S, 32]", "tensor", H.format("255-259")),
 
-        n("sum", "einsum", "mhd, mkd -> mhk", "op", H.format("260"),
-          detail="torch.matmul(weights.unsqueeze(-2), scores)：32 头按权重加权求和"),
+        n("sum", "torch.matmul", "mhd, mkd -> mhk", "op", H.format("260"),
+          detail="weights.unsqueeze(-2) @ scores：把 32 个头按权重压成一维"),
         n("index_scores", "index_scores", "fp32 [B, S, T]", "tensor", H.format("260")),
 
         n("causal", "masked_fill", "causal mask", "op", H.format("263-266"),
@@ -479,7 +499,7 @@ IHC = {
           detail="hc_fn [8, 24576] fp32；8 = 2 × hc_mult（pre 4 + post 4）"),
         n("fn_out", "fn(flat)", "fp32 [B, T, 8]", "tensor", H.format("639")),
 
-        n("mixes", "elementwise multiplication", "fn(flat) × rsqrt", "op", H.format("639"),
+        n("mixes", "F.linear(flat, fn) * input_norm(flat)", "逐元素乘", "op", H.format("639"),
           detail="mixes = F.linear(flat, fn) * input_norm(flat)"),
         n("mixes_t", "mixes", "fp32 [B, T, 8]", "tensor", H.format("639")),
 
@@ -499,7 +519,7 @@ IHC = {
 
         n("reduce", "sum(pre × streams)", "4 条流 → 1 条", "op", H.format("649"),
           detail="torch.sum(pre.unsqueeze(-1) * hidden_streams, dim=2)"),
-        n("out", "reduced", "bf16 [B, T, 6144]", "tensor", H.format("651"),
+        n("out", "out.to(hidden_states.dtype)", "bf16 [B, T, 6144]", "tensor", H.format("651"),
           detail="转回 bf16，交给后面的 layernorm 与 self_attn/mlp"),
 
         n("head", "hc_head.forward  (HYV4HyperHead)", "4 条流 → 1 条", "op",
@@ -587,7 +607,7 @@ MOE = {
           H.format("610"),
           detail="每个 token 激活 top-8 路由专家 + 1 个共享专家"),
         n("out", "hidden_states", "bf16 [B, T, 6144]", "tensor", H.format("611"),
-          detail="回到 Decoder 层做 hc_mlp_layer.post 写回"),
+          detail="回到 Decoder 层，由 post 门写回 4 条流"),
     ],
     "edges": [
         e("x", "gate_lin"), e("gate_lin", "router_logits"), e("router_logits", "sigmoid"),
@@ -631,7 +651,7 @@ MTP = {
         n("embed", "embed_tokens", "120832 → 6144", "op", "vLLM mtp.py:501-502",
           detail="与主干共用 embed_tokens.weight [120832, 6144]"),
         n("emb", "inputs_embeds", "bf16 [B, T, 6144]", "tensor", "vLLM mtp.py:502"),
-        n("pos0", "mask_first_position", "首位置屏蔽", "op", "vLLM mtp.py:503",
+        n("pos0", "torch.where(positions == 0, 0, x)", "首位置屏蔽", "op", "vLLM mtp.py:503",
           detail="torch.where((positions == 0).unsqueeze(-1), 0, inputs_embeds)"),
         n("emb_masked", "inputs_embeds", "bf16 [B, T, 6144]", "tensor", "vLLM mtp.py:503"),
 
@@ -665,7 +685,7 @@ MTP = {
 
         n("head", "shared lm_head", "6144 → 120832", "op", "vLLM mtp.py:519-521",
           detail="与主干共用 lm_head，不额外占参数"),
-        n("logits", "draft_logits", "fp32 [B, T, 120832]", "tensor", "vLLM mtp.py:513-521",
+        n("logits", "logits", "fp32 [B, T, 120832]", "tensor", "vLLM mtp.py:513-521",
           detail="投机解码的草稿分布；num_nextn_predict_layers=1"),
     ],
     "edges": [
@@ -726,7 +746,7 @@ EXPERTS = {
         n("where", "torch.where(mask[expert_idx])", "该专家负责的 token 位置", "op",
           H.format("576"),
           detail="取出该专家负责的 token 下标与它在 top-8 里的位次"),
-        n("tok", "hidden_states[token_idx]", "fp32 [tokens, 6144]", "tensor", H.format("576")),
+        n("tok", "hidden_states[token_idx]", "fp32 [tokens, 6144]", "tensor", H.format("577")),
 
         n("eup", "F.linear(·, gate_up_proj[expert_idx])", "6144 → 4096", "op",
           H.format("577"),
@@ -796,8 +816,8 @@ ATTNCORE = {
     "label": "eager_attention",
     "title": "注意力核心：eager_attention_forward（L286-312）",
     "nodes": [
-        n("q", "query", "bf16 [B, 64, T, 256]", "tensor", H.format("287")),
-        n("k", "key", "bf16 [B, 64, T, 256]", "tensor", H.format("288")),
+        n("q", "query", "bf16 [B, 64, T, 256]", "tensor", H.format("286")),
+        n("k", "key", "bf16 [B, 64, T, 256]", "tensor", H.format("287")),
         n("v", "value", "bf16 [B, 64, T, 256]", "tensor", H.format("288")),
 
         n("repeat_kv", "repeat_kv", "每头一份，本模型为 no-op", "op", H.format("294-295"),
@@ -805,8 +825,8 @@ ATTNCORE = {
         n("vr", "value_states", "bf16 [B, 64, T, 256]", "tensor", H.format("295")),
         n("kr", "key_states", "bf16 [B, 64, T, 256]", "tensor", H.format("294")),
 
-        n("qk", "einsum", "mhd, nhd -> mhn", "op", H.format("296"),
-          detail="torch.matmul(query, key.transpose(2,3)) * scaling；scaling = qk_head_dim^-0.5"),
+        n("qk", "torch.matmul", "mhd, nhd -> mhn", "op", H.format("296"),
+          detail="等价于 query @ keyᵀ：matmul(query, key.transpose(2,3)) * scaling，scaling=0.0625"),
         n("scores", "attn_weights", "fp32 [B, 64, T, T]", "tensor", H.format("296")),
 
         n("addmask", "+ attention_mask", "因果 / DSA 稀疏掩码", "op", H.format("297-298"),
@@ -831,8 +851,8 @@ ATTNCORE = {
         n("attn_w", "attn_weights", "bf16 [B, 64, T, T]", "tensor", H.format("309"),
           detail="乘 V 用，同时作为 attention 的第二个返回值"),
 
-        n("av", "einsum", "mhk, mkd -> mhd", "op", H.format("309-311"),
-          detail="dropout(训练时 p=attention_dropout，eval 为 0) → matmul(scores, value)"),
+        n("av", "torch.matmul", "mhk, mkd -> mhd", "op", H.format("309-311"),
+          detail="等价于 scores @ value：先 dropout（训练时 p=attention_dropout）再 matmul"),
         n("out", "attn_output", "bf16 [B, 64, T, 256]", "tensor", H.format("310-311"),
           detail="transpose(1,2).contiguous() 后返回"),
     ],
