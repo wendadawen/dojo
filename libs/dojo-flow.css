@@ -1,0 +1,335 @@
+/* Dojo flow：全屏可交互数据流画布。
+
+   页面只放数据（JSON），渲染、连线、拖动、缩放全部由 dojo-flow.js 负责。
+   这样连线永远跟着节点走，不存在「静态路径与拖动后不一致」的问题。 */
+
+:root {
+  /* 配色对齐参考标准：白底、淡网格、黑线、浅蓝算子框 */
+  --flow-bg: #ffffff;
+  --flow-grid: rgba(150, 150, 150, .16);
+  --flow-grid-bold: rgba(150, 150, 150, .30);
+  /* 连线用深灰而不是纯黑：参考标准的连线色是 (92,100,113)，
+     纯黑在绕行的那几条长边上会显得过重、像「压过节点」。 */
+  --flow-line: #5c6471;
+  --flow-text: #000000;
+  --flow-sub: #1a1a1a;
+  --flow-muted: #6b7280;
+  --flow-border: #e3e3dd;
+  --flow-tensor: #ffffff;
+  --flow-tensor-stroke: #111111;
+  --flow-op: #dde8fa;
+  --flow-op-stroke: #7390bb;
+  --flow-cache: #fdf3d8;
+  --flow-cache-stroke: #d8b264;
+  --flow-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --flow-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body { background: var(--flow-bg); font-family: var(--flow-font); color: var(--flow-text); }
+
+.flow-app { position: fixed; inset: 0; }
+
+/* ============ 画布：整屏就是画布，无边界 ============ */
+.flow-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  background-image:
+    linear-gradient(var(--flow-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--flow-grid) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+.flow-viewport.is-panning { cursor: grabbing; }
+
+.flow-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* 关键：不裁剪。节点拖到画布原始范围之外也必须完整可见。 */
+  overflow: visible;
+}
+
+/* ============ 节点 ============ */
+.flow-node { cursor: grab; }
+.flow-node:active { cursor: grabbing; }
+
+.flow-node .tensor { fill: var(--flow-tensor); stroke: var(--flow-tensor-stroke); stroke-width: 1.4; }
+.flow-node .op { fill: var(--flow-op); stroke: var(--flow-op-stroke); stroke-width: 1.4; }
+.flow-node .cache { fill: var(--flow-cache); stroke: var(--flow-cache-stroke); stroke-width: 1.4; }
+/* 跨视图传进/传出的量：虚线框 + 灰蓝边，与视图内的实线框区分 */
+.flow-node .port {
+  fill: #fbfcfe;
+  stroke: #8b98ab;
+  stroke-width: 1.4;
+  stroke-dasharray: 6 4;
+}
+/* 可下钻的节点：保持实线（参考标准里没有虚线框），用很淡的外圈提示可点击 */
+.flow-node.drill .op { stroke-dasharray: none; }
+.flow-node.drill:hover .op { stroke: #2f6fd0; stroke-width: 2.2; }
+.flow-node.drill .tensor { stroke-dasharray: none; }
+
+.flow-node foreignObject { overflow: visible; }
+
+.flow-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* 行高由 dojo-flow.js 按行写入 .flow-cell，再由 span 继承。
+   这里不能再用 font 简写（它会把 line-height 重置为 normal，撑出 1px 溢出），
+   所以字号与字体分开写，并让 span 成为块级行盒。
+   字号对齐参考标准：相对框明显更大，两行撑满框高。 */
+.flow-cell span { display: block; }
+.flow-cell .nm { color: var(--flow-text); font-weight: 600; font-size: 17px; font-family: var(--flow-font); }
+.flow-cell .sh { color: var(--flow-sub); font-size: 15px; font-family: var(--flow-mono); }
+.flow-cell .dt { color: var(--flow-muted); font-size: 12.5px; font-family: var(--flow-font); }
+
+/* ============ 连线 ============ */
+.flow-edge {
+  fill: none;
+  stroke: var(--flow-line);
+  stroke-width: 1.9;
+}
+
+.flow-arrowhead { fill: var(--flow-line); }
+.flow-dot-head { fill: var(--flow-line); }
+
+.flow-edge-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 2px;
+  background: var(--flow-bg);
+  color: var(--flow-muted);
+  font: 500 10.5px var(--flow-font);
+  white-space: nowrap;
+}
+
+/* ============ 分组与批注 ============ */
+.flow-group { fill: none; stroke: #aab4c4; stroke-dasharray: 6 5; stroke-width: 1.3; }
+.flow-group-label { font: 600 11.5px var(--flow-font); }
+.flow-note { fill: var(--flow-muted); font: 11.5px var(--flow-font); }
+.flow-col-label { font: 600 12.5px var(--flow-font); fill: #4a4f57; }
+
+/* ============ 浮层 ============ */
+.flow-head {
+  position: absolute;
+  top: 68px;
+  left: 14px;
+  z-index: 10;
+  width: 320px;
+  padding: 13px 15px;
+  border: 1px solid var(--flow-border);
+  border-radius: 10px;
+  background: var(--flow-bg);
+  box-shadow: 0 8px 26px rgba(20, 30, 50, .09);
+}
+
+.flow-head h1 { margin: 0 0 5px; font: 600 16px/1.3 var(--flow-font); }
+.flow-head p { margin: 0; color: var(--flow-muted); font: 12.5px/1.6 var(--flow-font); }
+
+.flow-bar {
+  position: absolute;
+  top: 68px;
+  /* 用左右内缩定位而不是 left:50% 居中：标签栏变长后可用的宽度就是
+     这两个内缩值之间的区域，自动避开左侧 config 按钮与右侧缩放控件。 */
+  left: 124px;
+  right: 172px;
+  width: fit-content;
+  max-width: calc(100% - 310px);
+  margin: 0 auto;
+  z-index: 10;
+  display: flex;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid var(--flow-border);
+  border-radius: 999px;
+  background: var(--flow-bg);
+  box-shadow: 0 8px 26px rgba(20, 30, 50, .09);
+  /* 标签用模块名后变长：超出就横向滚动，不换行 */
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.flow-bar::-webkit-scrollbar { display: none; }
+.flow-tab { flex: 0 0 auto; }
+
+.flow-tab {
+  padding: 5px 13px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--flow-muted);
+  cursor: pointer;
+  font: 500 12.5px/1.4 var(--flow-font);
+  white-space: nowrap;
+}
+
+.flow-tab:hover { color: #4a86e8; }
+.flow-tab.on { background: #4a86e8; color: #fff; font-weight: 600; }
+
+.flow-zoom {
+  position: absolute;
+  right: 14px;
+  top: 68px;
+  z-index: 10;
+  display: flex;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid var(--flow-border);
+  border-radius: 999px;
+  background: var(--flow-bg);
+  box-shadow: 0 8px 26px rgba(20, 30, 50, .09);
+}
+
+.flow-zoom button {
+  width: 28px;
+  height: 24px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--flow-muted);
+  cursor: pointer;
+  font: 13px/1 var(--flow-font);
+}
+
+.flow-zoom button:hover { background: #eef2f9; color: #4a86e8; }
+
+/* ============ config.json 浮层 ============ */
+.flow-cfg-btn {
+  position: absolute;
+  top: 68px;
+  right: auto;
+  bottom: auto;
+  left: 14px;
+  z-index: 11;
+  padding: 5px 13px;
+  border: 1px solid var(--flow-border);
+  border-radius: 999px;
+  background: var(--flow-bg);
+  color: var(--flow-muted);
+  box-shadow: 0 8px 26px rgba(20, 30, 50, .09);
+  cursor: pointer;
+  font: 500 12.5px/1.4 var(--flow-font);
+  white-space: nowrap;
+}
+
+.flow-cfg-btn:hover { color: #4a86e8; }
+.flow-cfg-btn.on { background: #4a86e8; border-color: #4a86e8; color: #fff; font-weight: 600; }
+
+.flow-config {
+  position: absolute;
+  top: 68px;
+  right: auto;
+  left: 14px;
+  z-index: 12;
+  width: 460px;
+  max-width: calc(100% - 28px);
+  max-height: calc(100% - 130px);
+  overflow-y: auto;
+  padding: 16px 18px 20px;
+  border: 1px solid var(--flow-border);
+  border-radius: 10px;
+  background: var(--flow-bg);
+  box-shadow: 0 12px 34px rgba(20, 30, 50, .16);
+  font-family: var(--flow-font);
+}
+
+.flow-config .cfg-title {
+  margin: 0 0 4px;
+  font: 600 15px/1.4 var(--flow-font);
+  color: var(--flow-text);
+}
+
+.flow-config .cfg-note {
+  margin: 0 0 12px;
+  color: var(--flow-muted);
+  font: 11.5px/1.6 var(--flow-font);
+}
+
+.flow-config .cfg-group {
+  margin: 0 0 10px;
+  border: 0;
+  padding: 0;
+}
+
+.flow-config .cfg-group > summary {
+  margin: 0;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--flow-border);
+  color: #4a6b96;
+  cursor: pointer;
+  font: 600 12px/1.5 var(--flow-font);
+}
+
+.flow-config table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+.flow-config th,
+.flow-config td {
+  padding: 3px 8px 3px 0;
+  border-bottom: 1px solid rgba(0, 0, 0, .05);
+  text-align: left;
+  vertical-align: top;
+  font: 11.5px/1.6 var(--flow-font);
+}
+.flow-config th {
+  width: 46%;
+  color: var(--flow-sub);
+  font-family: var(--flow-mono);
+  font-weight: 500;
+  word-break: break-all;
+}
+.flow-config td { color: var(--flow-text); }
+
+.flow-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 9;
+  margin: 0;
+  padding: 5px 13px;
+  border: 1px solid var(--flow-border);
+  border-radius: 999px;
+  background: var(--flow-bg);
+  color: var(--flow-muted);
+  font: 11.5px/1.4 var(--flow-font);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* ============ 无脚本回退 ============ */
+.flow-fallback { padding: 70px 24px 40px; max-width: 900px; margin: 0 auto; overflow: auto; height: 100%; box-sizing: border-box; }
+.flow-fallback h2 { font: 600 18px/1.4 var(--flow-font); }
+.flow-fallback table { width: 100%; border-collapse: collapse; font: 13px/1.6 var(--flow-font); }
+.flow-fallback th, .flow-fallback td { padding: 6px 9px; border-bottom: 1px solid var(--flow-border); text-align: left; vertical-align: top; }
+
+@media (max-width: 900px) {
+  .flow-head { width: auto; right: 14px; }
+  /* 窄屏标签栏仍然放在顶部（与桌面一致），但不换行、改横向滚动：
+     换行后高度会到 129px；放底部则会在内容滚动时遮住节点。 */
+  .flow-bar {
+    top: 10px;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    max-width: calc(100% - 28px);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .flow-bar::-webkit-scrollbar { display: none; }
+  .flow-tab { padding: 5px 11px; }
+  /* 窄屏把缩放与 config 都收进顶部一行，画布下方完全留空：
+     浮层留在底部时会盖住画布上的节点（平板上节点正好落在右下角）。 */
+  .flow-zoom { top: 54px; right: 14px; bottom: auto; }
+  .flow-cfg-btn { top: 54px; left: 14px; bottom: auto; }
+}
