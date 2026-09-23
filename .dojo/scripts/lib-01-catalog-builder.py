@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Build homepage catalog data from wiki HTML pages."""
+"""构建首页目录数据，并提供发布用的命令行入口。
+
+被 ci-01-validate.py import（取词表做校验），也可直接执行生成 catalog.json：
+
+    python3 .dojo/scripts/lib-01-catalog-builder.py --root . --output _site/catalog.json
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import posixpath
 import re
+import sys
 import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -27,7 +34,7 @@ def split_topics(value: str) -> list[str]:
     return [item.strip() for item in re.split(r"[,，]", value) if item.strip()]
 
 
-# 主题封闭词表：页面 dojo:topics 只能从中取值，validate.py 同样按此校验。
+# 主题封闭词表：页面 dojo:topics 只能从中取值，ci-01-validate.py 同样按此校验。
 # 需要新增大类时改这里并同步 AGENTS.md。
 ALLOWED_TOPICS = [
     "注意力机制",
@@ -311,3 +318,23 @@ def write_catalog(catalog: dict, output: Path) -> None:
         json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="构建首页目录数据")
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+
+    catalog = build_catalog(args.root)
+    write_catalog(catalog, args.output)
+    print(
+        f"generated {len(catalog['pages'])} pages, "
+        f"{len(catalog['edges'])} edges, "
+        f"{len(catalog['warnings'])} warnings -> {args.output}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

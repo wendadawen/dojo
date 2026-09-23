@@ -6,10 +6,12 @@ ids, same-page anchors and broken local references. Semantic quality is out
 of scope (handled by the independent review).
 
 Usage:
-    python3 .dojo/scripts/validate.py wiki/<name>/index.html
-    python3 .dojo/scripts/validate.py wiki/*/index.html wiki/*/overview.html
-    python3 .dojo/scripts/validate.py --all
-    python3 .dojo/scripts/validate.py --templates
+    python3 .dojo/scripts/ci-01-validate.py wiki/<name>/index.html
+    python3 .dojo/scripts/ci-01-validate.py wiki/*/index.html wiki/*/overview.html
+    python3 .dojo/scripts/ci-01-validate.py --all
+    python3 .dojo/scripts/ci-01-validate.py --templates
+    python3 .dojo/scripts/ci-01-validate.py --copy          # 概览页文案一致性
+    python3 .dojo/scripts/ci-01-validate.py --copy --fix    # 回填到统一说法
 
 一次进程可校验多个文件，避免逐页起进程的开销。
 """
@@ -19,11 +21,17 @@ from __future__ import annotations
 import concurrent.futures
 import re
 import sys
+import importlib
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 
-from catalog_builder import ALLOWED_TAGS, ALLOWED_TOPICS, ALLOWED_TYPES
+# 词表与构建器同源，避免两处各写一份。模块名带连字符，只能用 importlib 加载。
+sys.path.insert(0, str(Path(__file__).parent))
+_catalog = importlib.import_module("lib-01-catalog-builder")
+ALLOWED_TAGS = _catalog.ALLOWED_TAGS
+ALLOWED_TOPICS = _catalog.ALLOWED_TOPICS
+ALLOWED_TYPES = _catalog.ALLOWED_TYPES
 
 
 LOCAL_ASSET_RE = re.compile(r'''(?:href|src)=["']([^"']+)["']''')
@@ -47,15 +55,34 @@ REQUIRED_WIKI_META = (
     "dojo:topics",
     "dojo:tag",
 )
-# 每个 dojo:type 对应唯一的共享样式表，防止页面套错模板后仍能通过校验。
+# 每个 dojo:type 对应的共享样式表，防止页面套错模板后仍能通过校验。
+# 元组第一项是该类型模板必须内联的样式表；页面引用其中任意一项即可。
+# dataflow 有两代：旧页用 cytoscape + dojo-dataflow.css，新页用 ELK + dojo-flow.css。
 TYPE_STYLESHEET = {
-    "concept": "dojo-concept.css",
-    "paper": "dojo-paper.css",
-    "note": "dojo-note.css",
-    "dataflow": "dojo-dataflow.css",
+    "concept": ("dojo-concept.css",),
+    "paper": ("dojo-paper.css",),
+    "note": ("dojo-note.css",),
+    "dataflow": ("dojo-flow.css", "dojo-dataflow.css"),
 }
+TYPE_STYLESHEET_CANONICAL = {k: v[0] for k, v in TYPE_STYLESHEET.items()}
 TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
+# <noscript> 里的 <style> 是无脚本回退的补充规则（例如让画布控件在无 JS 时
+# 显示出来），不是模板的主样式，判断样式来源时要排除。
+NOSCRIPT_RE = re.compile(r"<noscript[\s\S]*?</noscript>", re.I)
+
+# 概览页与索引页的入口文案：历史上 A/B 两代并存，模板已固定为 B 世代。
+# A 世代 eyebrow「概念快速阅读」/ nav「深度教学 →」/ footer「快速阅读」
+# B 世代 eyebrow「概念概览」  / nav「完整说明 →」/ footer「概览」
+OVERVIEW_TERM = {"concept": "概览", "paper": "概览"}
+DETAIL_TERM = {"concept": "完整说明", "paper": "完整解析"}
+TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.S)
+EYEBROW_RE = re.compile(r'(<span class="eyebrow">)(.*?)(</span>)', re.S)
+NAV_BLOCK_RE = re.compile(r"(<nav>.*?</nav>)", re.S)
+FOOTER_BLOCK_RE = re.compile(r"<footer>(.*?)</footer>", re.S)
+OVERVIEW_LINK_RE = re.compile(
+    r'<a class="overview-link"[^>]*title="[^"]*"[^>]*>.*?</a>', re.S
+)
 
 # research/ 允许的文件名集合（四类页面共用）。目录只放 .md，扩写记录与
 # 审查轮次都按固定名字编号；sources/ 与 official/ 存放引文原始快照。
@@ -267,14 +294,16 @@ def validate_page(path: Path) -> list[str]:
                 f"unknown type: {raw_type} (allowed: {', '.join(ALLOWED_TYPES)})"
             )
         elif raw_type in TYPE_STYLESHEET:
-            expected_css = TYPE_STYLESHEET[raw_type]
+            allowed_css = TYPE_STYLESHEET[raw_type]
             # 部署会给样式链接加 ?v=<sha> 缓存参数，比对时忽略查询串。
             if not any(
-                ref.split("?", 1)[0].endswith(f"libs/{expected_css}")
+                ref.split("?", 1)[0].endswith(f"libs/{css}")
+                for css in allowed_css
                 for ref in inspector.stylesheets
             ):
                 errors.append(
-                    f"type {raw_type} must reference ../../libs/{expected_css}"
+                    f"type {raw_type} must reference one of "
+                    + ", ".join(f"../../libs/{css}" for css in allowed_css)
                 )
 
         # 标签取封闭词表内的单一值，防止细粒度标签再次碎片化
@@ -443,21 +472,29 @@ def check_body_centering(text: str) -> list[str]:
 
 
 def check_template(path: Path) -> list[str]:
-    """模板必须声明正确类型，且内联样式与共享样式保持一致。
+    """模板必须声明正确类型，且样式只有一份来源。
 
     模板因含占位符不能走 validate_page；但类型写错时，按模板生成的每个
     页面都会错，因此在模板层面单独拦一道。
 
-    模板必须内联样式：它位于 .dojo/templates/<module>/，相对路径
-    ../../libs/ 会解析到 .dojo/libs，外链拿不到根目录下的共享样式。
-    页面（wiki/<name>/）才外链 libs/dojo-<module>.css。因此模板与共享
-    样式是同一份样式的两个落点，必须同步，否则两边会各自漂移。
+    样式的处理有两种，都允许，但都必须保证「只有一份真相」：
+
+      · 内联：散文类模板这样做。模板位于 .dojo/templates/<module>/，
+        相对路径 ../../libs/ 会解析到 .dojo/libs，直接打开模板看不到样式；
+        内联后模板自身可预览。代价是多一份副本，故必须与共享文件逐字一致。
+
+      · 外链：依赖 JS 的模板这样做。数据流页离开 elk.bundled.js 与
+        dojo-flow.js 就渲染不出任何东西，独立预览本就无意义，内联只是
+        白白多一份副本。直接引用共享文件，从根上不存在漂移。
+
+    两种都不满足（既没内联也没引用）时报错。
     """
     errors: list[str] = []
     module = path.parent.name
-    expected_css = TYPE_STYLESHEET.get(module)
-    if expected_css is None:
+    allowed_css = TYPE_STYLESHEET.get(module)
+    if allowed_css is None:
         return errors
+    canonical_css = TYPE_STYLESHEET_CANONICAL[module]
 
     text = path.read_text(encoding="utf-8", errors="ignore")
     inspector = PageInspector()
@@ -466,13 +503,28 @@ def check_template(path: Path) -> list[str]:
     if raw_type != module:
         errors.append(f"template type must be {module}, got: {raw_type or '(missing)'}")
 
-    css_path = Path("libs") / expected_css
-    blocks = STYLE_RE.findall(text)
-    if not blocks:
-        errors.append("template must inline its styles (../../libs resolves to .dojo/libs)")
+    # 只看模板的主样式：先去掉 <noscript> 段，其中的 <style> 属于无脚本回退。
+    style_scope = NOSCRIPT_RE.sub("", text)
+    blocks = STYLE_RE.findall(style_scope)
+    linked = any(
+        ref.split("?", 1)[0].endswith(f"libs/{css}")
+        for css in allowed_css
+        for ref in inspector.stylesheets
+    )
+    if not blocks and not linked:
+        errors.append(
+            "template must either inline or link the shared stylesheet: "
+            + " or ".join(f"../../libs/{css}" for css in allowed_css)
+        )
         return errors
+
+    css_path = Path("libs") / canonical_css
     if not css_path.exists():
         errors.append(f"missing shared stylesheet: {css_path}")
+        return errors
+
+    # 外链时没有副本，无从漂移，到此为止。
+    if not blocks:
         return errors
 
     def normalize(css: str) -> str:
@@ -487,11 +539,120 @@ def check_template(path: Path) -> list[str]:
     return errors
 
 
+# ---------- 概览页文案一致性 ----------
+
+
+def page_type_of(index_html: str) -> str:
+    match = re.search(r'name="dojo:type"\s+content="([^"]+)"', index_html)
+    return match.group(1) if match else ""
+
+
+def fix_overview_copy(text: str, ty: str) -> str:
+    """把概览页文案回填到模板的说法。"""
+    term = OVERVIEW_TERM.get(ty, "概览")
+    detail = DETAIL_TERM.get(ty, "完整说明")
+    if not term:
+        return text
+
+    text = text.replace("深度教学页", f"{detail}页").replace("深度教学", detail)
+    text = text.replace("快速阅读", "概览")
+
+    def title_sub(match: re.Match) -> str:
+        title = match.group(1).strip()
+        body = re.sub(r"\s*·\s*[^·]+?\s*·\s*Dojo\s*$", "", title)
+        body = re.sub(r"\s*·\s*Dojo\s*$", "", body).strip()
+        if body and body != title:
+            return f"<title>{body} · 概览 · Dojo</title>"
+        return match.group(0)
+
+    text = TITLE_TAG_RE.sub(title_sub, text)
+
+    def eyebrow_sub(match: re.Match) -> str:
+        inner = match.group(2)
+        tail = inner.split("·", 1)[1].strip() if "·" in inner else ""
+        label = "概念概览" if ty == "concept" else "论文概览"
+        body = f"{label} · {tail}" if tail else label
+        return f"{match.group(1)}{body}{match.group(3)}"
+
+    text = EYEBROW_RE.sub(eyebrow_sub, text)
+
+    def nav_sub(match: re.Match) -> str:
+        block = match.group(1)
+        block = block.replace(r"$\leftarrow$", "←").replace(r"$\to$", "→")
+        return re.sub(
+            r'(<a href="index\.html"[^>]*>).*?(</a>)',
+            lambda m: m.group(1) + detail + " →" + m.group(2),
+            block,
+            flags=re.S,
+        )
+
+    text = NAV_BLOCK_RE.sub(nav_sub, text)
+    footer_text = f"Dojo · 概览 · 机制细节见{detail}页"
+    return FOOTER_BLOCK_RE.sub(lambda m: f"<footer>{footer_text}</footer>", text)
+
+
+def fix_index_link(text: str) -> str:
+    if '<a class="overview-link"' not in text:
+        return text
+    return OVERVIEW_LINK_RE.sub(
+        '<a class="overview-link" href="overview.html" title="查看概览">概览</a>',
+        text,
+    )
+
+
+def convert_copy(path: Path, fix: bool) -> list[str]:
+    changes: list[str] = []
+    if path.name == "overview.html":
+        index = path.parent / "index.html"
+        ty = page_type_of(index.read_text(encoding="utf-8")) if index.exists() else ""
+        original = path.read_text(encoding="utf-8")
+        updated = fix_overview_copy(original, ty)
+        if updated != original:
+            changes.append(f"{path}: 概览页文案")
+            if fix:
+                path.write_text(updated, encoding="utf-8")
+    elif path.name == "index.html":
+        original = path.read_text(encoding="utf-8")
+        updated = fix_index_link(original)
+        if updated != original:
+            changes.append(f"{path}: 概览入口链接")
+            if fix:
+                path.write_text(updated, encoding="utf-8")
+    return changes
+
+
+def check_overview_copy(fix: bool) -> int:
+    targets = sorted(Path("wiki").glob("*/overview.html")) + sorted(
+        Path("wiki").glob("*/index.html")
+    )
+    changes: list[str] = []
+    for path in targets:
+        changes.extend(convert_copy(path, fix))
+
+    if not changes:
+        print(f"no copy drift in {len(targets)} files")
+        return 0
+    if fix:
+        print(f"已统一 {len(changes)} 处：")
+        for line in changes:
+            print(f"  {line}")
+        return 0
+    print(f"validation failed: {len(changes)} 处文案不一致")
+    for line in changes:
+        print(f"- {line}")
+    return 1
+
+
 def main() -> int:
     args = [
-        arg for arg in sys.argv[1:] if arg not in {"--templates", "--all"}
+        arg for arg in sys.argv[1:]
+        if arg not in {"--templates", "--all", "--copy", "--fix"}
     ]
     check_templates = "--templates" in sys.argv
+    fix_copy = "--fix" in sys.argv
+
+    if "--copy" in sys.argv:
+        return check_overview_copy(fix_copy)
 
     if check_templates:
         template_root = Path(TEMPLATE_DIR)

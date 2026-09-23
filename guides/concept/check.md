@@ -92,7 +92,7 @@
 - 修改范围限于问题位置及直接受影响的引用位置。
 - 定义、公式和数字修改后重新核对来源。
 - 代码修改后重新运行。
-- 每轮修复完成后运行 `.dojo/scripts/validate.py`。
+- 每轮修复完成后运行 `.dojo/scripts/ci-01-validate.py`。
 - 下一轮从修复后的完整页面重新开始审查。
 - 需要改变范围或大纲的问题返回规划文件处理。
 
@@ -109,10 +109,10 @@
 - 全部学习目标由正文章节完整回答
 - 页面级「核心问题」与每个章节的「本章问题」均有解答折叠块，无只列问题未作答的情况
 - 数学符号全部使用 LaTeX 书写，结构图为 HTML 或内联 SVG
-- `.dojo/scripts/validate.py` 返回成功
+- `.dojo/scripts/ci-01-validate.py` 返回成功
 - 可运行代码的结果与页面描述一致
 - 关键论断和数字已重新核对来源
-- 页面 `<head>` 包含有效的纯文本 `description`、可渲染 `dojo:summary`、`dojo:type=concept`、`dojo:topics`、`dojo:tag`；`dojo:topics` 取值限于 AGENTS.md 列出的固定大类（validate.py 会拒绝词表外的主题）
+- 页面 `<head>` 包含有效的纯文本 `description`、可渲染 `dojo:summary`、`dojo:type=concept`、`dojo:topics`、`dojo:tag`；`dojo:topics` 取值限于 AGENTS.md 列出的固定大类（ci-01-validate.py 会拒绝词表外的主题）
 - `overview.html` 与 `index.html` 相互链接
 - 页面引用的概念链接有效，且被引用的前置概念页真实存在
 - 递归生成的前置概念页已完成各自质检

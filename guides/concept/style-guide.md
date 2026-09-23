@@ -112,7 +112,7 @@ summary、h2、h3 标题内的数学符号使用 `$...$` 行内公式，由 KaTe
 
 图内需要公式或数学符号时，用 `<foreignObject>` 承载一个 `<div xmlns="http://www.w3.org/1999/xhtml" class="dg-label">$...$</div>`，KaTeX 会正常渲染其中的公式。SVG 的 `<text>` 由浏览器直接绘制，KaTeX 不处理其中的 `$...$`，因此 `<text>` 只用于不含数学含义的纯文字，不得用 `R_1 q`、`theta`、`45 deg` 之类的 ASCII 近似写法代替公式。
 
-`.dojo/scripts/validate.py` 对公式定界符之外的数学字符报错，发布前必须清零。
+`.dojo/scripts/ci-01-validate.py` 对公式定界符之外的数学字符报错，发布前必须清零。
 
 ## 12. 用词
 
