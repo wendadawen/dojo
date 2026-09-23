@@ -38,12 +38,55 @@
 
 ## 视图
 
-数据流页允许用交互视图承载多条路径（编码器/解码器、不同压缩模式、prefill/decode 等）。
+数据流页用交互视图承载多条路径（主干/单层/单个模块/算法内核等）。
+
+### 三层架构：内容 × 布局 × 呈现
+
+画一张数据流图 = 内容 × 布局 × 呈现。这三件事的复用性完全不同，必须分开：
+
+| 层 | 职责 | 是否随模型变化 | 落在哪 |
+|---|---|---|---|
+| 内容 | 有哪些步骤、每格写什么、怎么连 | **是**，独一无二 | 每个模型的生成脚本里的一份 `VIEWS` |
+| 布局 | 节点摆哪、线怎么走 | 否，是通用问题 | `libs/dojo-flow.js` + ELK |
+| 呈现 | 页面骨架、交互、样式 | 否，是设计规范 | `dataflow_page.py` + `dojo-flow.css` |
+
+**硬规矩：不许在布局层加模型专属的逻辑。**
+
+这条是踩坑换来的。曾经为了让主干对齐成一列，在布局之后加了一步「移动节点」
+的后处理；节点一动，ELK 算好的连线折点全部失效，只好退化成自己走线，结果
+穿框、并行重叠、绕大圈全来了，修五六轮都按不住。关掉那步之后，九个视图的
+穿框数与像素重合数立刻归零。
+
+所以：布局与连线交给 ELK，谁都不要去"微调"它。
+
+### 视图粒度：该细就细，该粗就粗
+
+粒度按模块的复杂度定，不搞一刀切：
+
+- **粗**（一个模块一格）：`forward` 只有几行、没有分支的，如 `HYV4MLP`（3 行）
+- **中**（在父视图里展开）：十行上下、逻辑线性的，如 `HYV4HyperConnection`
+- **细**（单独开一个视图）：几十行、带循环或条件分支的，如 `HYV4Attention`（87 行）、
+  `HYV4Indexer`（71 行）、`HYV4Experts`（有 `for` 循环 + `one_hot`）
+
+判断依据是源码，不是感觉：用 AST 数一下 `forward` 的行数与控制流数量。
+
+不要把一个"该独立的模块"摊平塞进父视图——实测把 `HYV4Experts` 摊进 MoE 后，
+MoE 视图涨到 40 格、`HYV4Experts` 摊进 MLA 后 MLA 涨到 53 格，两个视图都被
+细节淹没。正确做法是各开一个视图，父视图里只留一格入口（`drill` 指过去）。
+
+### 每条边都要能读出方向
+
+只画终点箭头时，读者无法判断一根线是"进入"还是"离开"某个框。起点也要标：
+
+- 起点圆点 = 从这里出发
+- 终点箭头 = 到这里为止
+- 都没有 = 只是路过
+
+### 其它
 
 - 每个视图只表达一条完整路径，视图之间不共用中间状态。
-- 交互只在降低阅读成本时使用；默认视图必须是首屏可读的主干。
-- 脚本失效时页面仍要能读：视图内容写在 HTML 里，脚本只负责切换显隐。
-- 视图切换不能改变页面正文的结论，正文在任何视图下都成立。
+- 默认视图必须是首屏可读的主干。
+- 脚本失效时页面仍要能读：`dataflow_page.py` 会把节点渲染成表格放进 `<noscript>`。
 
 ## 事实核查
 
@@ -93,8 +136,75 @@ measured.md   实测产物登记（有本机实测时）
 - 交互视图在无脚本时仍可读。
 - 含图或公式的页面在无头浏览器实测过渲染。
 - 已完成一轮独立来源核对，结果在 `research/review-1.md`。
+- 已跑通 `.dojo/scripts/verify_dataflow.py`（节点名 / 形状回查）。
+- 已跑通 `.dojo/scripts/check_flow_geometry.py`：穿框 0、像素级重合 0。
 - `.dojo/scripts/validate.py <页面路径>` 通过。
 
 ## 发布
 
-使用 `.dojo/templates/dataflow/index.html`，替换全部占位符和 `<!-- @content -->`，页面 `dojo:type` 为 `dataflow`，并外链 `../../libs/dojo-dataflow.css`；本页特有的视图样式写在共享样式之后的页内 `<style>` 里。
+数据流页是**数据驱动**的：页面只放 JSON，渲染与交互由共享引擎负责。
+
+### 数据契约
+
+    view  = { id, label, title, nodes[], edges[], groups[]?, notes[]? }
+    node  = { id, name, shape?, detail?, kind, drill? }
+    edge  = { from, to, label? }
+
+    kind：tensor（白底直角）| op（浅蓝圆角）| cache（圆柱）| port（跨视图虚线框）
+
+`name` 的写法是这一页最容易出错的地方，规则只有一条：
+
+> **写源码里被调用的那个符号，不要把部署侧实现的名字搬过来。**
+
+实测踩过的坑：`einsum`（源码里一次都没有，却写了 4 个节点）、
+`VocabParallelEmbedding` / `ParallelLMHead` / `linear_gate`（都是 vLLM 侧命名，
+transformers 里分别叫 `nn.Embedding` / `nn.Linear` / `gate_proj`）。
+
+检查点键名与运行时属性名不一致时（如 `hc_attn_layer.hc_pre.hc_fn` 对应
+`attn_hc.fn`），在 `detail` 里注明，不要把检查点键名当属性名用。
+
+### 生成
+
+写一份生成脚本，只写 `VIEWS` 数据，页面骨架交给共享模块：
+
+    from dataflow_page import build_page
+    build_page(out=Path("wiki/<name>/index.html"), meta={...}, views=VIEWS,
+               config_groups=CONFIG_GROUPS)   # config 面板可选
+
+刻意不做的两件事：不手写节点坐标（交给 ELK 自动布局）、不手写连线折点
+（交给 ELK 的正交路由）。手工定位的代价是每加一个节点都要重排一次。
+
+### 核查
+
+三类断言都要能机器回查，跑 `.dojo/scripts/verify_dataflow.py`：
+
+    python3 .dojo/scripts/verify_dataflow.py wiki/<name>/index.html \
+        --source lib=/path/to/modeling_x.py \
+        --source mtp=/path/to/mtp.py \
+        --shapes /tmp/shapes.json
+
+1. **节点名**：名字里每个标识符都要能在权威源码里 grep 到
+2. **形状**：写出的权重形状要与 safetensors 头一致
+3. **行号**：生成脚本里标注的源码行号不能越界
+
+每条 `--source` 可带标签（`标签=路径`）：带标签的只校验标题含该标签的视图。
+这一条是必要的——MTP 视图的事实来源是 vLLM 的 `mtp.py`，而不是 transformers，
+不加标签会把正确的名字误判成捏造。
+
+几何质量（穿框、线重叠）跑 `.dojo/scripts/check_flow_geometry.py`：
+
+    python3 .dojo/scripts/check_flow_geometry.py
+
+它用无头 Chrome 打开页面，把每条边按 1px 采样后落到像素栅格，逐视图统计：
+采样点落进非端点节点框内的算「穿框」；两条边共用 >60 个像素的算「并排」。
+
+两个坑写在这里，免得重复踩：
+
+- **判据必须来自渲染像素。** 曾用「两条线 x 差 < 3px」推算并行，报 0 处；
+  实际差 2px、重叠 318px，用户一眼就看出是重复的线。
+- **切换视图要等布局完成。** `applyView` 触发 ELK 的异步布局，切完立刻量会
+  量到上一个视图的残留——九个视图会报出同一组数字，看着全绿其实是假通过。
+  探针要等「该视图的边数渲染齐了」再量。
+
+行号只作构建期的核对依据，**不上页面**：页面显示 `name` / `shape` / `detail`，
+不显示 `modeling_x.py:123`。
