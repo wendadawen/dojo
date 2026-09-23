@@ -71,9 +71,9 @@
 
 四项全部通过后交付。
 
-    python3 .dojo/scripts/dataflow-01-verify-facts.py wiki/<name>/index.html \
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
         --source /path/to/modeling_x.py --shapes /tmp/shapes.json
-    python3 .dojo/scripts/dataflow-02-check-geometry.py wiki/<name>/index.html
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --geometry
     python3 .dojo/scripts/ci-01-validate.py --all
 
 节点的每个形状、参数、算子都要定位回源码或权重；形状写成纯文本（`bf16 [B, T, 6144]`），不写 LaTeX，页面不加载 KaTeX。`--source` 可带标签，带标签的来源只作用于标题含该标签的视图，例如 MTP 视图的事实来源可以是部署侧的 `mtp.py`。
