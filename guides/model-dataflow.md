@@ -54,19 +54,13 @@
 
 ## 生成
 
-分两层，只有数据要手写：
+生成器在 `.dojo/scripts/dataflow-02-build.py`，通用，不随模型改。它只做一件事：
+把数据填进 `.dojo/templates/dataflow/index.html`，产出 `wiki/<name>/index.html`。
 
-| 层 | 在哪 | 换模型时 |
-|---|---|---|
-| 页面骨架 | `.dojo/templates/dataflow/index.html` | 不动 |
-| 装配（替换占位符、渲染表格） | `.dojo/scripts/dataflow-02-build.py` | 不动 |
-| 数据（视图、节点、边、config 分组） | `wiki/<name>/build.py` | 只改这里 |
+数据是这一页的视图、节点、边、config 分组——读源码和权重整理出来的内容。
+准备好后调用生成器：
 
-数据脚本长这样：
-
-    import importlib, sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / ".dojo" / "scripts"))
+    import importlib
     build = importlib.import_module("dataflow-02-build")   # 模块名带连字符
 
     VIEWS = [
@@ -78,7 +72,7 @@
     ]
 
     build.page(
-        out=Path(__file__).resolve().parent / "index.html",
+        out=Path("wiki/<name>/index.html"),
         meta={"title": ..., "description": ..., "summary": ...,
               "topics": "模型结构", "tag": "数据流"},
         views=VIEWS,
@@ -86,8 +80,11 @@
         config_note="config.json 原值，共 N 个键",
     )
 
+产出物是自包含的 `index.html`：视图数据内嵌在里面，运行时只外链
+`libs/dojo-flow.js` 与 `libs/elk.bundled.js`。页面就是唯一交付物。
+
 `node()` 的 `src` 参数是构建期的可读标注（源码行号或权重键），供人复核，
-不写进页面。`build.py` 本身不发布，也不需要提交——产物 `index.html` 才是交付物。
+不写进页面。
 
 生成器有自检：
 
