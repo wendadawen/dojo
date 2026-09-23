@@ -706,7 +706,7 @@ MTP = {
          "fill": "#f3f7f4", "stroke": "#9dc0ab", "label_color": "#4b7a5c"},
     ],
     "notes": [
-        {"at": "block", "text": "transformers 显式忽略这部分权重（modeling_hy_v4.py:761）",
+        {"at": "block", "text": "transformers 的加载器显式忽略这部分权重",
          "dx": 16, "dy": 16},
     ],
 }
@@ -1000,105 +1000,33 @@ def build_fallback():
     return "".join(rows)
 
 
-PAGE = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="腾讯混元 Hy4 preview 的算子级前向数据流：主干、Decoder 层、Gated MLA 与 DSA、DSA 索引器、iHC、MoE 与 MTP，每个节点标注源码行号或权重键。">
-  <meta name="dojo:summary" content="Hy4 preview 的算子级前向数据流：78 层、hidden 6144、4 条并行残差流、64 头 Gated MLA、32 头 DSA 索引器选 top-2048、256 选 8 的 MoE。形状与超参逐条对准源码行号、config.json 与 2006 个权重张量。">
-  <meta name="dojo:type" content="dataflow">
-  <meta name="dojo:topics" content="模型结构,注意力机制">
-  <meta name="dojo:tag" content="数据流">
-  <title>Hy4 Preview 前向数据流 · Dojo</title>
-  <link rel="stylesheet" href="../../libs/katex.min.css">
-  <script defer src="../../libs/katex.min.js"></script>
-  <script defer src="../../libs/auto-render.min.js"
-    onload="renderMathInElement(document.body, { delimiters: [
-      {left: '$$', right: '$$', display: true},
-      {left: '$', right: '$', display: false}
-    ], throwOnError: false });"></script>
-  <link rel="stylesheet" href="../../libs/dojo-dataflow.css">
-  <link rel="stylesheet" href="../../libs/dojo-flow.css">
-  <noscript><style>
-    /* 无脚本时画布不可交互，把节点表与 config 面板都直接显示出来 */
-    .flow-config[hidden] { display: block !important; }
-    .flow-cfg-btn, .flow-zoom, .flow-bar { display: none; }
-  </style></noscript>
-</head>
-<body>
-<div class="flow-app" id="flow-app">
-  <noscript>
-    <div class="flow-fallback">__FALLBACK__</div>
-  </noscript>
-  <nav class="flow-bar">__TABS__</nav>
-  <button type="button" class="flow-cfg-btn" id="flow-cfg-btn"
-          aria-expanded="false" aria-controls="flow-config">config.json</button>
-  <div class="flow-zoom">
-    <button type="button" data-act="out" title="缩小">−</button>
-    <span class="flow-zoom-label" style="padding:0 6px;line-height:24px;font-size:12px;color:var(--flow-muted)">100%</span>
-    <button type="button" data-act="in" title="放大">+</button>
-    <button type="button" data-act="reset" title="复位">⟲</button>
-  </div>
-  <section class="flow-config" id="flow-config" hidden>
-    <h2 class="cfg-title">config.json 参数</h2>
-    __CONFIG__
-  </section>
-</div>
-<script>window.DOJO_FLOW_DATA = __DATA__;</script>
-<script src="../../libs/elk.bundled.js"></script>
-<script src="../../libs/dojo-flow.js"></script>
-<script>
-(function () {
-  var app = document.getElementById('flow-app');
-  if (window.DojoFlow && window.DOJO_FLOW_DATA) {
-    window.__flow = window.DojoFlow.mount(app, window.DOJO_FLOW_DATA);
-  }
-  // config.json 浮层：独立于视图切换，点按钮或 Esc 关闭
-  var btn = document.getElementById('flow-cfg-btn');
-  var panel = document.getElementById('flow-config');
-  function setCfg(open) {
-    if (!btn || !panel) return;
-    panel.hidden = !open;
-    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    btn.classList.toggle('on', open);
-  }
-  if (btn && panel) {
-    btn.addEventListener('click', function (e) {
-      e.stopPropagation();
-      setCfg(panel.hidden);
-    });
-    panel.addEventListener('click', function (e) { e.stopPropagation(); });
-    window.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') setCfg(false);
-    });
-    var hash = (location.hash || '').replace('#', '');
-    if (hash === 'config') setCfg(true);
-  }
-})();
-</script>
-</body>
-</html>
-"""
-
-
 def main():
-    tabs = "".join(
-        '<button type="button" class="flow-tab{on}" data-view="{vid}">{label}</button>'.format(
-            on=" on" if i == 0 else "", vid=v["id"], label=v["label"]
-        )
-        for i, v in enumerate(VIEWS)
+    """生成页面。骨架、无脚本回退、参数面板都交给共享的 dataflow_page。"""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from dataflow_page import build_page
+
+    build_page(
+        out=OUT,
+        meta={
+            "title": "Hy4 Preview 前向数据流",
+            "description": "腾讯混元 Hy4 preview 的算子级前向数据流：主干、Decoder 层、"
+                           "Gated MLA 与 DSA、DSA 索引器、iHC、MoE 与 MTP，"
+                           "每个节点标注模块名、形状与依据。",
+            "summary": "Hy4 preview 的算子级前向数据流：78 层、hidden 6144、"
+                       "4 条并行残差流、64 头 Gated MLA、32 头 DSA 索引器选 top-2048、"
+                       "256 选 8 的 MoE。形状与超参逐条对准源代码、config.json "
+                       "与 2006 个权重张量。",
+            "topics": "模型结构,注意力机制",
+            "tag": "数据流",
+        },
+        views=VIEWS,
+        config_groups=CONFIG_GROUPS,
+        config_title="config.json 参数",
+        config_note=f"{CONFIG_VERSION}；config.json 原值，共 59 个键，这里按用途分组全部列出。",
+        config_button="config.json",
     )
-    data = json.dumps({"views": VIEWS}, ensure_ascii=False, separators=(",", ":"))
-    html = (
-        PAGE.replace("__FALLBACK__", build_fallback())
-        .replace("__TABS__", tabs)
-        .replace("__CONFIG__", build_config_panel())
-        .replace("__DATA__", data)
-    )
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(html, encoding="utf-8")
-    print(f"wrote {OUT} ({len(html)} bytes, {len(VIEWS)} views)")
+    print(f"wrote {OUT} ({len(VIEWS)} views)")
 
 
 if __name__ == "__main__":
