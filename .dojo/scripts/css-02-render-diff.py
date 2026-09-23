@@ -5,9 +5,9 @@
 两侧逐元素比对。样式改动只要影响了任何一个元素的任何一项属性都会被报出来，
 比截图比对更细，也不受抗锯齿影响。
 
-    python3 .dojo/scripts/verify_render_diff.py <before-root> <after-root> <相对路径...>
+    python3 .dojo/scripts/css-02-render-diff.py <before-root> <after-root> <相对路径...>
 
-相对路径形如 wiki/rope/index.html。两棵树都要自带 libs/，否则页面加载不到
+相对路径形如 wiki/<name>/index.html。两棵树都要自带 libs/，否则页面加载不到
 共享资源，两边会同样失败而看不出差异。
 
 退出码 0 表示全部一致，1 表示有差异，2 表示用法或环境错误。

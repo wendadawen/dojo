@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""找出页面内嵌 CSS 里没有任何元素会用到的规则。
+"""找出样式里没有任何元素会用到的规则，可用浏览器复核后再删。
 
 判定方式：一条选择器如果含有 class 记号，而其中某个 class 名在"使用面"里
 完全不出现，那它永远匹配不到元素，是死代码。
@@ -13,24 +13,32 @@
 脚本刻意保守：只清理能确证无用的规则。元素选择器、:not()、属性选择器、
 含括号的伪类一律跳过，宁可漏删不误删。
 
-    python3 .dojo/scripts/check_unused_css.py <目标文件...> \
+静态判断会漏掉脚本动态添加的 class，也会漏掉库运行时注入的 class。
+--confirm 在无头 Chrome 里把页面跑起来，收集脚本执行完之后 DOM 上真实存在的
+class 名，逐条复核候选规则；确认匹配不到元素才允许删除。
+
+    python3 .dojo/scripts/css-01-unused.py <目标文件...> \
         [--usage-from <提供使用面的页面...>] [--fix]
 
 按模块处理（推荐，模块之间保持独立）：
 
-    python3 .dojo/scripts/check_unused_css.py --module note \
-        --template .dojo/templates/note/index.html [--fix]
+    python3 .dojo/scripts/css-01-unused.py --module note \
+        --template .dojo/templates/note/index.html [--fix] [--confirm]
 
 --module 会扫描 wiki/ 下所有 dojo:type 等于该值的页面，用它们的并集作为使用面，
 目标自动包含模板（若给了 --template）与这些页面。
 
-退出码 1 表示存在死代码（可用于 CI），0 表示干净，2 表示用法错误。
+退出码 1 表示存在死代码或复核发现候选仍在用（可用于 CI），0 表示干净，
+2 表示用法或环境错误（例如 --confirm 但找不到 Chrome）。
 """
 
 from __future__ import annotations
 
 import re
+import json
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
@@ -42,6 +50,28 @@ COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 
 # 库在运行时注入的 class，静态标记里查不到，必须视为已用
 RUNTIME_PREFIXES = ("katex", "token", "language-", "prism", "line-numbers")
+
+# --confirm 用的无头浏览器
+CHROME_CANDIDATES = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+)
+CLASS_PROBE = """<script>
+window.addEventListener('load', function () {
+  var seen = {};
+  var nodes = document.querySelectorAll('*');
+  for (var i = 0; i < nodes.length; i++) {
+    var list = nodes[i].classList;
+    for (var j = 0; j < list.length; j++) seen[list[j]] = 1;
+  }
+  document.title = 'CLASSES:' + JSON.stringify(Object.keys(seen));
+});
+</script>
+"""
+CLASS_TITLE_RE = re.compile(r"<title>CLASSES:(.*?)</title>", re.S)
 
 
 def harvest(document: str) -> set[str]:
@@ -134,10 +164,76 @@ def pages_of_type(root: Path, kind: str) -> list[Path]:
     ]
 
 
+def find_chrome() -> str | None:
+    for candidate in CHROME_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def live_classes(chrome: str, page: Path) -> set[str]:
+    """把页面跑起来，返回脚本执行完之后 DOM 上真实存在的 class 名。"""
+    document = page.read_text(encoding="utf-8", errors="replace")
+    if "<head>" in document:
+        document = document.replace("<head>", "<head>" + CLASS_PROBE, 1)
+    else:
+        document = CLASS_PROBE + document
+    with tempfile.TemporaryDirectory() as tmp:
+        probe_page = Path(tmp) / page.name
+        probe_page.write_text(document, encoding="utf-8")
+        proc = subprocess.run(
+            [
+                chrome,
+                "--headless=new",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--virtual-time-budget=4000",
+                "--dump-dom",
+                probe_page.as_uri(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    match = CLASS_TITLE_RE.search(proc.stdout)
+    if not match:
+        raise RuntimeError(f"probe did not report on {page}")
+    return set(json.loads(match.group(1)))
+
+
+def confirm_removals(candidates: set[str], pages: list[Path]) -> int:
+    """在真实浏览器里复核候选 class 确实不再出现。
+
+    返回 0 表示全部确认可删；1 表示仍有候选在用（不能删）；2 表示环境错误。
+    """
+    chrome = find_chrome()
+    if chrome is None:
+        print("error: --confirm 需要 Chrome/Chromium，未找到", file=sys.stderr)
+        return 2
+
+    live: set[str] = set()
+    for page in pages:
+        try:
+            live |= live_classes(chrome, page)
+        except Exception as error:  # noqa: BLE001 - 报告后返回
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+
+    survivors = sorted(c for c in candidates if c in live)
+    if survivors:
+        print(f"{len(survivors)} class 在浏览器中仍存在，不能删：")
+        for name in survivors:
+            print(f"  ! .{name}")
+        return 1
+    print(f"复核通过：{len(candidates)} 个候选 class 在 {len(pages)} 个页面上均未出现")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
     fix = "--fix" in args
-    rest = [a for a in args if a != "--fix"]
+    confirm = "--confirm" in args
+    rest = [a for a in args if a not in {"--fix", "--confirm"}]
     module = None
     template = None
     if "--module" in rest:
@@ -173,13 +269,21 @@ def main() -> int:
 
     usage = build_usage(targets, extra)
     total = 0
+    candidates: set[str] = set()
     for path in targets:
         removed = process(path, usage, fix)
         total += len(removed)
+        candidates.update(CLASS_TOKEN_RE.findall("\n".join(removed)))
         if removed:
             print(f"{path}: {len(removed)} rules")
             for selector in removed:
                 print(f"  - {selector}")
+
+    if confirm and candidates:
+        status = confirm_removals(candidates, targets)
+        if status != 0:
+            return status
+
     if total:
         print(f"\n{'cleaned' if fix else 'found'} {total} dead rules in {len(targets)} files")
         return 0 if fix else 1

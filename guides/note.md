@@ -78,7 +78,7 @@ measured.md   实测产物登记（有本机实测时）
 - 图示只表达一个关系。
 - 含图或公式的页面在无头浏览器实测过渲染。
 - 已完成一轮独立来源核对，结果在 `research/review-1.md`。
-- `.dojo/scripts/validate.py <页面路径>` 通过。
+- `.dojo/scripts/ci-01-validate.py <页面路径>` 通过。
 
 ## 发布
 

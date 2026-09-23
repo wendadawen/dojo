@@ -11,7 +11,7 @@ failures inside third-party bundles. A script can be perfectly valid
 JavaScript and still throw the moment the browser runs it.
 
 Usage:
-    python3 .dojo/scripts/check_inline_js.py [path ...]
+    python3 .dojo/scripts/ci-02-check-inline-js.py [path ...]
 
 Paths may be files or directories; directories are scanned for *.html.
 Defaults to wiki/ when no argument is given. Requires node in PATH.

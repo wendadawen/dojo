@@ -12,7 +12,7 @@
   · 并排   —— 两条边共用 >60 个相同像素（视觉上就是一条线）
 
 用法：
-    python3 .dojo/scripts/check_flow_geometry.py [--root .] [--port 0]
+    python3 .dojo/scripts/dataflow-02-check-geometry.py <页面路径>
 
 退出码 0 全部通过；1 有问题；2 环境错误（找不到 Chrome）。
 """
@@ -40,7 +40,6 @@ CHROME_CANDIDATES = (
     "/usr/bin/chromium-browser",
 )
 
-PAGE = "wiki/hy4-preview-dataflow/index.html"
 RESULT_RE = re.compile(r"FLOWGEOM(\{.*?\})FLOWGEOM", re.S)
 
 # 在页面里跑的探针：逐视图量穿框与像素重合
@@ -158,7 +157,7 @@ def serve(root: Path):
 def main() -> int:
     ap = argparse.ArgumentParser(description="数据流页几何自检")
     ap.add_argument("--root", type=Path, default=Path("."))
-    ap.add_argument("--page", default=PAGE, help="相对 root 的页面路径")
+    ap.add_argument("page", help="待查页面，相对 root 的路径，如 wiki/x-dataflow/index.html")
     args = ap.parse_args()
 
     chrome = find_chrome()

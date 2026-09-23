@@ -6,18 +6,18 @@
 
   1. 节点名  —— 名字里出现的标识符，必须在源码里 grep 得到
   2. 形状    —— 写出的权重形状，必须与 safetensors 头一致
-  3. 行号    —— 标注的源码行号，必须落在该文件范围内
+  3. 材料    —— --script 指定的文件必须存在（用于确认构建脚本还在原处）
 
-前两项需要外部材料（源码 / 权重），所以不做进 validate.py（那个是纯静态检查），
+前两项需要外部材料（源码 / 权重），所以不做进 ci-01-validate.py（那个是纯静态检查），
 单独跑这个脚本。
 
 用法：
     # 源码在本地
-    python3 .dojo/scripts/verify_dataflow.py wiki/<name>/index.html \
+    python3 .dojo/scripts/dataflow-01-verify-facts.py wiki/<name>/index.html \
         --source /path/to/modeling_x.py
 
     # 只看节点名（不需要外部材料）
-    python3 .dojo/scripts/verify_dataflow.py wiki/<name>/index.html --names-only
+    python3 .dojo/scripts/dataflow-01-verify-facts.py wiki/<name>/index.html --names-only
 
 退出码：0 全部通过；1 有问题；2 用法错误。
 """
@@ -111,8 +111,12 @@ def check_shapes(views: list[dict], shapes: dict[str, list[int]]) -> list[str]:
     return errors
 
 
-def check_line_numbers(scripts: list[Path]) -> list[str]:
-    """生成脚本里标注的源码行号不能越界。"""
+def check_scripts_exist(scripts: list[Path]) -> list[str]:
+    """--script 指定的构建脚本必须存在。
+
+    早先的名字是 check_line_numbers，承诺校验源码行号；实际没有实现行号
+    解析，只是确认文件存在。名字与行为不符会误导使用者，故改名并如实描述。
+    """
     errors: list[str] = []
     for script in scripts:
         if not script.exists():
@@ -131,7 +135,7 @@ def main() -> int:
     ap.add_argument("--shapes", type=Path,
                     help="形状表 JSON：{tensor_key: [dim...]}，通常来自 safetensors 头")
     ap.add_argument("--script", action="append", default=[], type=Path,
-                    help="生成脚本（用于校验行号），可多次传入")
+                    help="构建脚本路径，确认其存在（可多次传入）")
     ap.add_argument("--names-only", action="store_true",
                     help="只做节点名核查")
     args = ap.parse_args()
@@ -185,7 +189,7 @@ def main() -> int:
         shapes = json.loads(args.shapes.read_text(encoding="utf-8"))
         errors += check_shapes(views, shapes)
     if not args.names_only and args.script:
-        errors += check_line_numbers([Path(p) for p in args.script])
+        errors += check_scripts_exist([Path(p) for p in args.script])
 
     nodes = sum(len(v["nodes"]) for v in views)
     if errors:
