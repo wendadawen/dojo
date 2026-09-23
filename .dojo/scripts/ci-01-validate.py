@@ -1527,12 +1527,23 @@ def run_css_check(argv: list[str]) -> int:
     modules = [module] if module else list(ALLOWED_TYPES)
     total_removed = 0
     for name in modules:
+        if name not in ALLOWED_TYPES:
+            print(
+                f"error: 未知类型 {name!r}（可选：{', '.join(ALLOWED_TYPES)}）",
+                file=sys.stderr,
+            )
+            return 2
         tpl = template or Path(f".dojo/templates/{name}/index.html")
+        # 模板是这一类页面样式的权威副本，缺了就无从检查；静默跳过会让
+        # 模板被误删时无人发觉，所以这里直接报错。
+        if not tpl.exists():
+            print(f"error: 模板不存在：{tpl}", file=sys.stderr)
+            return 2
         pages = pages_of_type(Path("."), name)
         if not pages:
             print(f"error: no pages with dojo:type={name}", file=sys.stderr)
             return 2
-        targets = ([tpl] if tpl.exists() else []) + pages
+        targets = [tpl] + pages
         usage = build_usage(targets, pages)
         candidates: set[str] = set()
         removed_here = 0
@@ -1545,7 +1556,9 @@ def run_css_check(argv: list[str]) -> int:
                 for selector in removed:
                     print(f"  - {selector}")
         if confirm and candidates:
-            status = confirm_removals(candidates, targets)
+            # 复核在真实页面里做：模板含占位符、相对路径也解析不到，
+            # 浏览器跑模板没有意义。
+            status = confirm_removals(candidates, pages)
             if status != 0:
                 return status
         total_removed += removed_here
