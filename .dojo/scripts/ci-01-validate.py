@@ -1,39 +1,102 @@
 #!/usr/bin/env python3
-"""Validate wiki pages (index.html / overview.html) or the page templates.
+"""发布闸门：页面、内联脚本、样式、首页目录，一次跑完。
 
-Deterministic checks only: shell integrity, template leftovers, duplicate
-ids, same-page anchors and broken local references. Semantic quality is out
-of scope (handled by the independent review).
+站点部署前必须全绿的全部机械检查，入口只有一个。内容质量不在这里评
+（那由独立审查负责）。
 
-Usage:
-    python3 .dojo/scripts/ci-01-validate.py wiki/<name>/index.html
-    python3 .dojo/scripts/ci-01-validate.py wiki/*/index.html wiki/*/overview.html
+    # 页面校验（默认；顺带跑内联脚本语法，需要 node，缺失则跳过）
+    python3 .dojo/scripts/ci-01-validate.py <页面...>
     python3 .dojo/scripts/ci-01-validate.py --all
-    python3 .dojo/scripts/ci-01-validate.py --templates
-    python3 .dojo/scripts/ci-01-validate.py --copy          # 概览页文案一致性
-    python3 .dojo/scripts/ci-01-validate.py --copy --fix    # 回填到统一说法
 
-一次进程可校验多个文件，避免逐页起进程的开销。
+    # 专项
+    python3 .dojo/scripts/ci-01-validate.py --templates
+    python3 .dojo/scripts/ci-01-validate.py --copy [--fix]
+    python3 .dojo/scripts/ci-01-validate.py --js <页面...>
+    python3 .dojo/scripts/ci-01-validate.py --css [--module T] [--template P]
+                                                 [--confirm] [--fix]
+    python3 .dojo/scripts/ci-01-validate.py --catalog --output _site/catalog.json
+
+    # 改共享样式前后的渲染比对
+    python3 .dojo/scripts/ci-01-validate.py --diff <before-root> <after-root> <页面...>
+
+各段职责见文件内的分节标题。词表（ALLOWED_TOPICS / ALLOWED_TAGS /
+ALLOWED_TYPES）定义在这里，页面校验与目录构建共用同一份。
 """
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
+import functools
+import http.server
+import json
+import posixpath
 import re
+import shutil
+import socketserver
+import subprocess
 import sys
-import importlib
+import tempfile
+import threading
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-
-# 词表与构建器同源，避免两处各写一份。模块名带连字符，只能用 importlib 加载。
-sys.path.insert(0, str(Path(__file__).parent))
-_catalog = importlib.import_module("lib-01-catalog-builder")
-ALLOWED_TAGS = _catalog.ALLOWED_TAGS
-ALLOWED_TOPICS = _catalog.ALLOWED_TOPICS
-ALLOWED_TYPES = _catalog.ALLOWED_TYPES
+from typing import Optional
+from urllib.parse import urlsplit
 
 
+# ============================================================
+# 词表：页面 dojo:topics / dojo:type / dojo:tag 的封闭取值
+# 页面校验与首页目录构建共用这一份；新增取值要同步 AGENTS.md
+# ============================================================
+# 主题封闭词表：页面 dojo:topics 只能从中取值；新增后同步 AGENTS.md。
+# 需要新增大类时改这里并同步 AGENTS.md。
+ALLOWED_TOPICS = [
+    "注意力机制",
+    "模型结构",
+    "推理系统",
+    "内存与缓存",
+    "并行与通信",
+    "训练与优化",
+    "多模态",
+    "数学基础",
+]
+
+# 页面类型封闭词表：dojo:type 只能从中取值。
+ALLOWED_TYPES = [
+    "concept",
+    "dataflow",
+    "note",
+    "paper",
+]
+
+# 细粒度标签封闭词表：dojo:tag 只取其一，供首页按技术筛选。
+# 与 ALLOWED_TOPICS 的分工——topics 是粗分类，一个页面可属多个；
+# tag 回答「这篇讲什么技术」，单一取值。技术栈名（vLLM、llama.cpp）属于
+# 实现细节、文档形态（速查、论文）由 dojo:type 承担，都不进这里。
+# 新增取值前先确认它至少有 3 个页面，否则标签会重新碎片化。
+ALLOWED_TAGS = [
+    "KV cache",
+    "MoE",
+    "优化器",
+    "位置编码",
+    "并行与通信",
+    "推理加速",
+    "推理系统",
+    "数学与数值",
+    "数据流",
+    "模型架构",
+    "注意力",
+    "网络结构",
+    "视觉与多模态",
+    "训练",
+    "量化",
+]
+# ============================================================
+# 页面校验：结构、元数据、本地引用、数学字符、research 目录、模板
+# ============================================================
 LOCAL_ASSET_RE = re.compile(r'''(?:href|src)=["']([^"']+)["']''')
 ID_RE = re.compile(r"""\bid=["']([^"']+)["']""")
 SAME_PAGE_ANCHOR_RE = re.compile(r"""href=["']#([^"']*)["']""")
@@ -64,7 +127,6 @@ TYPE_STYLESHEET = {
     "note": ("dojo-note.css",),
     "dataflow": ("dojo-flow.css", "dojo-dataflow.css"),
 }
-TYPE_STYLESHEET_CANONICAL = {k: v[0] for k, v in TYPE_STYLESHEET.items()}
 TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
 # <noscript> 里的 <style> 是无脚本回退的补充规则（例如让画布控件在无 JS 时
@@ -494,7 +556,8 @@ def check_template(path: Path) -> list[str]:
     allowed_css = TYPE_STYLESHEET.get(module)
     if allowed_css is None:
         return errors
-    canonical_css = TYPE_STYLESHEET_CANONICAL[module]
+    # 模板内联样式时，与元组第一项比对（每类页面只有一个权威样式表）。
+    canonical_css = allowed_css[0]
 
     text = path.read_text(encoding="utf-8", errors="ignore")
     inspector = PageInspector()
@@ -548,11 +611,15 @@ def page_type_of(index_html: str) -> str:
 
 
 def fix_overview_copy(text: str, ty: str) -> str:
-    """把概览页文案回填到模板的说法。"""
-    term = OVERVIEW_TERM.get(ty, "概览")
-    detail = DETAIL_TERM.get(ty, "完整说明")
-    if not term:
+    """把概览页文案回填到模板的说法。
+
+    只处理 concept / paper 两类。类型未知（拿不到 index.html 的
+    dojo:type）时原样返回——否则会拿「概览 / 完整说明」这套说法去改写
+    其他类型的页面。
+    """
+    if ty not in OVERVIEW_TERM:
         return text
+    detail = DETAIL_TERM[ty]
 
     text = text.replace("深度教学页", f"{detail}页").replace("深度教学", detail)
     text = text.replace("快速阅读", "概览")
@@ -621,6 +688,140 @@ def convert_copy(path: Path, fix: bool) -> list[str]:
     return changes
 
 
+# ---------- 内联脚本语法 ----------
+
+# HTML 规范里浏览器会当作 JavaScript 执行的 type 取值
+JS_MIME_TYPES = frozenset(
+    {
+        "application/ecmascript",
+        "application/javascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/javascript",
+        "text/javascript1.0",
+        "text/javascript1.1",
+        "text/javascript1.2",
+        "text/javascript1.3",
+        "text/javascript1.4",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+        "module",
+    }
+)
+
+# 老式 "<!-- ... //-->" 包裹，去掉注释标记后再交给 node
+LEGACY_OPEN_RE = re.compile(r"^\s*<!--")
+LEGACY_CLOSE_RE = re.compile(r"//-->\s*$")
+
+
+class ScriptCollector(HTMLParser):
+    """收集页面里所有内联脚本的源码。
+
+    用 HTMLParser 而不是正则：它按 HTML 规则解析属性（引号内的 > 不会截断
+    标签）、正确跳过注释里的示例代码，也不要求 </script> 后面直接跟 >。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.blocks: list[str] = []
+        self._attrs: dict[str, str] = {}
+        self._buffer: list[str] = []
+        self._inside = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "script":
+            return
+        self._attrs = {name.lower(): (value or "") for name, value in attrs}
+        self._buffer = []
+        self._inside = True
+
+    def handle_data(self, data: str) -> None:
+        if self._inside:
+            self._buffer.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "script" or not self._inside:
+            return
+        self._inside = False
+        if "src" in self._attrs:
+            return
+        kind = self._attrs.get("type", "").split(";")[0].strip().lower()
+        if kind and kind not in JS_MIME_TYPES:
+            return
+        body = LEGACY_OPEN_RE.sub("", "".join(self._buffer))
+        body = LEGACY_CLOSE_RE.sub("", body)
+        if body.strip():
+            self.blocks.append(body)
+
+
+def check_inline_js(pages: list[Path]) -> tuple[list[str], int, bool]:
+    """内联 <script> 的语法检查。返回 (错误, 块数, 是否执行)。
+
+    只查语法，不执行代码：拼错括号或引号会在这里拦下，但运行时报错
+    （加载顺序、未定义全局、第三方包内部抛错）查不出来。
+
+    逐个块起 node 进程时，200 多个块要起 200 多次进程，耗时以秒计。
+    这里在单个 node 进程内用 vm.Script 逐个编译，语义与 --check 一致，
+    失败信息按 FILE: 前缀分段，便于映射回页面与块号。
+
+    node 不存在时返回「未执行」，由调用方决定是否提示，不阻断其他检查。
+    """
+    if shutil.which("node") is None:
+        return [], 0, False
+
+    errors: list[str] = []
+    total = 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        targets: list[tuple[str, Path]] = []
+        for page in pages:
+            parser = ScriptCollector()
+            parser.feed(page.read_text(encoding="utf-8", errors="replace"))
+            for index, body in enumerate(parser.blocks, start=1):
+                total += 1
+                target = tmp / f"{page.parent.name}-{page.stem}-{index}.js"
+                target.write_text(body, encoding="utf-8")
+                targets.append((f"{page} 内联 <script> #{index}", target))
+
+        if not targets:
+            return errors, total, True
+
+        script = (
+            "const fs=require('fs'),vm=require('vm');"
+            "let failed=false;"
+            "for(const f of process.argv.slice(1)){"
+            "try{new vm.Script(fs.readFileSync(f,'utf8'),{filename:f});}"
+            "catch(e){failed=true;process.stderr.write('FILE:'+f+'\\n'"
+            "+e.message.replace(/\\s+/g,' ')+'\\n');}"
+            "}"
+            "process.exit(failed?1:0);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, *[str(t) for _, t in targets]],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).replace(str(tmp.resolve()) + "/", "")
+            blocks: dict[str, str] = {}
+            current = None
+            for line in detail.splitlines():
+                if line.startswith("FILE:"):
+                    current = line[len("FILE:"):].strip()
+                    blocks[current] = ""
+                elif current:
+                    blocks[current] += (" " if blocks[current] else "") + line.strip()
+            for label, target in targets:
+                message = blocks.get(str(target))
+                if message:
+                    errors.append(f"{label}: {' '.join(message.split())}")
+    return errors, total, True
+
+
 def check_overview_copy(fix: bool) -> int:
     targets = sorted(Path("wiki").glob("*/overview.html")) + sorted(
         Path("wiki").glob("*/index.html")
@@ -643,18 +844,751 @@ def check_overview_copy(fix: bool) -> int:
     return 1
 
 
-def main() -> int:
-    args = [
-        arg for arg in sys.argv[1:]
-        if arg not in {"--templates", "--all", "--copy", "--fix"}
+# ============================================================
+# 样式：死规则检测，以及改样式前后的渲染比对
+# ============================================================
+SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.S | re.I)
+CLASS_ATTR_RE = re.compile(r"""\bclass\s*=\s*["']([^"']*)["']""", re.I)
+IDENT_RE = re.compile(r"[A-Za-z_][\w-]*")
+CLASS_TOKEN_RE = re.compile(r"\.(-?[A-Za-z_][\w-]*)")
+COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+
+# 库在运行时注入的 class，静态标记里查不到，必须视为已用
+RUNTIME_PREFIXES = ("katex", "token", "language-", "prism", "line-numbers")
+
+# --confirm 用的无头浏览器
+CHROME_CANDIDATES = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+)
+CLASS_PROBE = """<script>
+window.addEventListener('load', function () {
+  var seen = {};
+  var nodes = document.querySelectorAll('*');
+  for (var i = 0; i < nodes.length; i++) {
+    var list = nodes[i].classList;
+    for (var j = 0; j < list.length; j++) seen[list[j]] = 1;
+  }
+  document.title = 'CLASSES:' + JSON.stringify(Object.keys(seen));
+});
+</script>
+"""
+CLASS_TITLE_RE = re.compile(r"<title>CLASSES:(.*?)</title>", re.S)
+
+
+def harvest(document: str) -> set[str]:
+    """从一份文档里收集可能被应用到的 class 名。"""
+    names: set[str] = set()
+    for value in CLASS_ATTR_RE.findall(document):
+        names.update(value.split())
+    for script in SCRIPT_RE.findall(document):
+        names.update(IDENT_RE.findall(script))
+    return names
+
+
+def build_usage(targets: list[Path], extra: list[Path]) -> set[str]:
+    names: set[str] = set()
+    for path in list(targets) + list(extra):
+        names |= harvest(path.read_text(encoding="utf-8"))
+    return names
+
+
+def iter_rules(css: str):
+    """遍历 CSS 规则，产出 (选择器, 起始偏移, 结束偏移)。"""
+    text = COMMENT_RE.sub(lambda m: " " * len(m.group(0)), css)
+    stack: list[tuple[str, int]] = []
+    start = 0
+    cursor = 0
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "{":
+            stack.append((text[start:cursor].strip(), cursor))
+        elif char == "}":
+            if stack:
+                selector, _ = stack.pop()
+                if selector and not selector.startswith("@"):
+                    yield selector, start, cursor + 1
+            start = cursor + 1
+        elif char == ";" and not stack:
+            start = cursor + 1
+        cursor += 1
+
+
+def selector_is_dead(selector: str, used: set[str]) -> bool:
+    """判断不了的一律返回 False（保留）。"""
+    if "[" in selector or ":not(" in selector or "(" in selector or "::" in selector:
+        return False
+    tokens = CLASS_TOKEN_RE.findall(selector)
+    if not tokens:
+        return False
+    return any(
+        token not in used
+        and not token.startswith(RUNTIME_PREFIXES)
+        for token in tokens
+    )
+
+
+def split_selectors(selector: str) -> list[str]:
+    return [part.strip() for part in selector.split(",") if part.strip()]
+
+
+def process(path: Path, usage: set[str], fix: bool) -> list[str]:
+    document = path.read_text(encoding="utf-8")
+    removed: list[str] = []
+    for block in reversed(list(STYLE_RE.finditer(document))):
+        css = block.group(1)
+        spans: list[tuple[int, int, str]] = []
+        for selector, local_start, local_end in iter_rules(css):
+            parts = split_selectors(selector)
+            if parts and all(selector_is_dead(part, usage) for part in parts):
+                spans.append((local_start, local_end, selector.strip()))
+        if not spans:
+            continue
+        removed.extend(s for _, _, s in spans)
+        if fix:
+            new_css = css
+            for local_start, local_end, _ in reversed(spans):
+                new_css = new_css[:local_start] + new_css[local_end:]
+            new_css = re.sub(r"\n{3,}", "\n\n", new_css).rstrip() + "\n"
+            document = document[: block.start(1)] + new_css + document[block.end(1) :]
+    if fix and removed:
+        path.write_text(document, encoding="utf-8")
+    return removed
+
+
+def pages_of_type(root: Path, kind: str) -> list[Path]:
+    """wiki/ 下所有 dojo:type 等于 kind 的页面。"""
+    pattern = re.compile(r'name="dojo:type"\s+content="' + re.escape(kind) + r'"')
+    return [
+        path
+        for path in sorted(root.glob("wiki/*/index.html"))
+        if pattern.search(path.read_text(encoding="utf-8"))
     ]
-    check_templates = "--templates" in sys.argv
-    fix_copy = "--fix" in sys.argv
 
-    if "--copy" in sys.argv:
-        return check_overview_copy(fix_copy)
 
-    if check_templates:
+def find_chrome() -> str | None:
+    for candidate in CHROME_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def live_classes(chrome: str, page: Path) -> set[str]:
+    """把页面跑起来，返回脚本执行完之后 DOM 上真实存在的 class 名。"""
+    document = page.read_text(encoding="utf-8", errors="replace")
+    if "<head>" in document:
+        document = document.replace("<head>", "<head>" + CLASS_PROBE, 1)
+    else:
+        document = CLASS_PROBE + document
+    with tempfile.TemporaryDirectory() as tmp:
+        probe_page = Path(tmp) / page.name
+        probe_page.write_text(document, encoding="utf-8")
+        proc = subprocess.run(
+            [
+                chrome,
+                "--headless=new",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--virtual-time-budget=4000",
+                "--dump-dom",
+                probe_page.as_uri(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    match = CLASS_TITLE_RE.search(proc.stdout)
+    if not match:
+        raise RuntimeError(f"probe did not report on {page}")
+    return set(json.loads(match.group(1)))
+
+
+def confirm_removals(candidates: set[str], pages: list[Path]) -> int:
+    """在真实浏览器里复核候选 class 确实不再出现。
+
+    返回 0 表示全部确认可删；1 表示仍有候选在用（不能删）；2 表示环境错误。
+    """
+    chrome = find_chrome()
+    if chrome is None:
+        print("error: --confirm 需要 Chrome/Chromium，未找到", file=sys.stderr)
+        return 2
+
+    live: set[str] = set()
+    for page in pages:
+        try:
+            live |= live_classes(chrome, page)
+        except Exception as error:  # noqa: BLE001 - 报告后返回
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+
+    survivors = sorted(c for c in candidates if c in live)
+    if survivors:
+        print(f"{len(survivors)} class 在浏览器中仍存在，不能删：")
+        for name in survivors:
+            print(f"  ! .{name}")
+        return 1
+    print(f"复核通过：{len(candidates)} 个候选 class 在 {len(pages)} 个页面上均未出现")
+    return 0
+
+
+# ---------- 改样式前后的渲染比对 ----------
+
+# 逐元素取这些计算样式与几何，两侧不同即报出。
+DIFF_PROPS = (
+    "display,position,top,right,bottom,left,float,clear,zIndex,"
+    "width,height,minWidth,minHeight,maxWidth,maxHeight,"
+    "marginTop,marginRight,marginBottom,marginLeft,"
+    "paddingTop,paddingRight,paddingBottom,paddingLeft,"
+    "borderTopWidth,borderRightWidth,borderBottomWidth,borderLeftWidth,"
+    "borderTopStyle,borderRightStyle,borderBottomStyle,borderLeftStyle,"
+    "borderTopColor,borderRightColor,borderBottomColor,borderLeftColor,"
+    "borderTopLeftRadius,borderTopRightRadius,borderBottomLeftRadius,borderBottomRightRadius,"
+    "background,backgroundColor,backgroundImage,backgroundSize,backgroundPosition,"
+    "color,opacity,visibility,overflow,overflowX,overflowY,"
+    "fontFamily,fontSize,fontWeight,fontStyle,lineHeight,letterSpacing,"
+    "textAlign,textDecorationLine,textTransform,whiteSpace,wordBreak,textIndent,"
+    "verticalAlign,listStyleType,listStylePosition,"
+    "flexDirection,flexWrap,justifyContent,alignItems,alignSelf,flexGrow,flexShrink,flexBasis,gap,"
+    "gridTemplateColumns,gridTemplateRows,gridColumn,gridRow,"
+    "transform,transformOrigin,boxShadow,boxSizing,cursor"
+).split(",")
+
+DIFF_PROBE = """
+<script>
+window.addEventListener('load', function () {
+  // 等一拍再测：KaTeX 的 auto-render 在 defer 脚本的 onload 里跑，与 window
+  // load 几乎同时，立刻取字形度量会抖动。用 setTimeout 而不是 document.fonts
+  // .ready——后者在 --virtual-time-budget 下不兑现，探针会永远不执行。
+  setTimeout(function () {
+    var PROPS = %s;
+    function pathOf(el) {
+      var parts = [];
+      var node = el;
+      while (node && node.nodeType === 1) {
+        var index = 0, sib = node;
+        while ((sib = sib.previousElementSibling)) index++;
+        parts.unshift(node.tagName + '[' + index + ']');
+        node = node.parentElement;
+      }
+      return parts.join('/');
+    }
+    var SKIP = {HEAD:1, STYLE:1, LINK:1, SCRIPT:1, META:1, TITLE:1, BASE:1};
+    var rows = [];
+    var nodes = document.querySelectorAll('*');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (SKIP[el.tagName]) continue;
+      var cs = getComputedStyle(el);
+      var style = '';
+      for (var j = 0; j < PROPS.length; j++) style += PROPS[j] + ':' + cs[PROPS[j]] + ';';
+      var r = el.getBoundingClientRect();
+      var box = [r.x, r.y, r.width, r.height].map(function (v) {
+        return Math.round(v * 100) / 100;
+      }).join(',');
+      rows.push(pathOf(el) + '|' + box + '|' + style);
+    }
+    var payload = JSON.stringify({count: nodes.length, rows: rows});
+    var h = 5381;
+    for (var k = 0; k < payload.length; k++) h = ((h * 33) ^ payload.charCodeAt(k)) >>> 0;
+    document.title = 'RD:' + nodes.length + ':' + h;
+    document.documentElement.setAttribute('data-rd-rows', payload);
+  }, 400);
+});
+</script>
+"""
+
+DIFF_TITLE_RE = re.compile(r"<title>RD:(\d+):(\d+)</title>")
+DIFF_ROWS_RE = re.compile(r'data-rd-rows="(.*?)"\s*>', re.S)
+
+
+def make_probe_handler(probe: str):
+    """在响应的 HTML 里注入探针。走 HTTP 而不是 file://——file:// 下外链 CSS
+    不会被加载，验证共享样式时会得到假差异。"""
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - 基类命名
+            path = self.translate_path(self.path)
+            target = Path(path)
+            if target.is_dir():
+                target = target / "index.html"
+            if target.suffix == ".html" and target.exists():
+                body = target.read_text(encoding="utf-8", errors="replace")
+                body = (
+                    body.replace("<head>", "<head>" + probe, 1)
+                    if "<head>" in body else probe + body
+                )
+                payload = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            super().do_GET()
+
+        def log_message(self, *args):  # 静默
+            pass
+
+    return Handler
+
+
+def serve_tree(root: Path):
+    handler = functools.partial(
+        make_probe_handler(DIFF_PROBE % json.dumps(DIFF_PROPS)), directory=str(root)
+    )
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, httpd.server_address[1]
+
+
+def snapshot(chrome: str, url: str, want_rows: bool = False):
+    """返回 (元素数, 计算样式指纹)；want_rows 时额外返回逐元素明细。"""
+    try:
+        proc = subprocess.run(
+            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+             "--virtual-time-budget=8000", "--dump-dom", url],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    match = DIFF_TITLE_RE.search(proc.stdout)
+    if not match:
+        return None
+    digest = (int(match.group(1)), int(match.group(2)))
+    if not want_rows:
+        return digest
+    rows_match = DIFF_ROWS_RE.search(proc.stdout)
+    rows = json.loads(unescape(rows_match.group(1)))["rows"] if rows_match else []
+    return digest + (rows,)
+
+
+def explain_diff(before_rows, after_rows, limit=5) -> list[str]:
+    """逐元素找出第一处差异，并指出是哪个 CSS 属性变了。"""
+    lines = []
+    for index, (left, right) in enumerate(zip(before_rows, after_rows)):
+        if left == right:
+            continue
+        lpath, lbox, lstyle = left.split("|", 2)
+        rpath, rbox, rstyle = right.split("|", 2)
+        lines.append(f"  element #{index}")
+        if lpath != rpath:
+            lines.append(f"    path  {lpath} -> {rpath}")
+        if lbox != rbox:
+            lines.append(f"    box   {lbox} -> {rbox}")
+        lprops = dict(kv.split(":", 1) for kv in lstyle.split(";") if ":" in kv)
+        rprops = dict(kv.split(":", 1) for kv in rstyle.split(";") if ":" in kv)
+        for key in lprops:
+            if lprops.get(key) != rprops.get(key):
+                lines.append(f"    {key}: {lprops.get(key)!r} -> {rprops.get(key)!r}")
+        if len(lines) >= limit * 8:
+            break
+    if len(before_rows) != len(after_rows):
+        lines.append(f"  element count {len(before_rows)} -> {len(after_rows)}")
+    return lines
+
+
+def run_render_diff(args: list[str]) -> int:
+    """--diff 子命令：<before-root> <after-root> <页面...> [--detail] [--jobs N]"""
+    detail = "--detail" in args
+    jobs = 1
+    if "--jobs" in args:
+        index = args.index("--jobs")
+        jobs = max(1, int(args[index + 1]))
+        del args[index : index + 2]
+    args = [a for a in args if a != "--detail"]
+    if len(args) < 3:
+        print("用法：--diff <before-root> <after-root> <相对路径...> [--detail] [--jobs N]")
+        return 2
+    before_root, after_root = Path(args[0]), Path(args[1])
+    pages = args[2:]
+
+    chrome = find_chrome()
+    if chrome is None:
+        print("error: no Chrome/Chromium found", file=sys.stderr)
+        return 2
+
+    before_server, before_port = serve_tree(before_root)
+    after_server, after_port = serve_tree(after_root)
+
+    def check(rel: str):
+        before_file = before_root / rel
+        after_file = after_root / rel
+        if not before_file.exists() or not after_file.exists():
+            return f"ERR  {rel}  (missing on one side)"
+        before = snapshot(chrome, f"http://127.0.0.1:{before_port}/{rel}", detail)
+        after = snapshot(chrome, f"http://127.0.0.1:{after_port}/{rel}", detail)
+        if before is None or after is None:
+            return f"ERR  {rel}  (page did not report; check the probe)"
+        if before[:2] == after[:2]:
+            return f"ok   {rel}  ({before[0]} elements)"
+        lines = [f"DIFF {rel}  before={before[:2]} after={after[:2]}"]
+        if detail and len(before) > 2 and len(after) > 2:
+            lines.extend(explain_diff(before[2], after[2]))
+        return "\n".join(lines)
+
+    failed = 0
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            for line in pool.map(check, pages):
+                print(line, flush=True)
+                if line.startswith(("DIFF", "ERR")):
+                    failed += 1
+    finally:
+        before_server.shutdown()
+        after_server.shutdown()
+
+    print(f"\n{len(pages) - failed}/{len(pages)} pages identical", flush=True)
+    return 1 if failed else 0
+
+
+# ============================================================
+# 首页目录：扫描 wiki 生成 catalog.json（词表在文件顶部）
+# ============================================================
+SPACE_RE = re.compile(r"\s+")
+IGNORED_SCHEMES = {"http", "https", "mailto", "javascript", "data", "tel"}
+
+
+def clean_text(value: str) -> str:
+    return SPACE_RE.sub(" ", value).strip()
+
+
+def split_topics(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[,，]", value) if item.strip()]
+
+
+
+class WikiHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: dict[str, str] = {}
+        self.hrefs: list[str] = []
+        self.title_parts: list[str] = []
+        self.h1_parts: list[str] = []
+        self.paragraphs: list[str] = []
+        self.leads: list[str] = []
+        self._title_depth = 0
+        self._h1_depth = 0
+        self._paragraph_depth = 0
+        self._ignored_depth = 0
+        self._paragraph_parts: list[str] = []
+        self._paragraph_is_lead = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple]) -> None:
+        values = dict(attrs)
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth:
+            return
+        if tag == "meta":
+            name = values.get("name", "").strip().lower()
+            content = values.get("content", "").strip()
+            if name and content:
+                self.meta[name] = content
+        elif tag == "a":
+            href = values.get("href")
+            if href:
+                self.hrefs.append(href.strip())
+        elif tag == "title":
+            self._title_depth += 1
+        elif tag == "h1":
+            self._h1_depth += 1
+        elif tag == "p":
+            self._paragraph_depth += 1
+            self._paragraph_parts = []
+            classes = values.get("class", "").split()
+            self._paragraph_is_lead = bool({"lead", "summary"} & set(classes))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+            return
+        if self._ignored_depth:
+            return
+        if tag == "title" and self._title_depth:
+            self._title_depth -= 1
+        elif tag == "h1" and self._h1_depth:
+            self._h1_depth -= 1
+        elif tag == "p" and self._paragraph_depth:
+            paragraph = clean_text(" ".join(self._paragraph_parts))
+            if paragraph:
+                self.paragraphs.append(paragraph)
+                if self._paragraph_is_lead:
+                    self.leads.append(paragraph)
+            self._paragraph_depth -= 1
+            self._paragraph_parts = []
+            self._paragraph_is_lead = False
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        if self._title_depth:
+            self.title_parts.append(data)
+        if self._h1_depth:
+            self.h1_parts.append(data)
+        if self._paragraph_depth:
+            self._paragraph_parts.append(data)
+
+
+def discover_pages(root: Path) -> list[Path]:
+    return sorted((root / "wiki").glob("*/index.html"))
+
+
+def git_first_seen_dates(root: Path) -> dict[str, str]:
+    """Return {posix path: YYYY-MM-DD} for each wiki file's first commit.
+
+    Uses a single `git log --reverse` pass; a file's date is the earliest
+    commit in which the path appears (added or renamed into place). Falls
+    back to an empty dict when git history is unavailable (e.g. shallow).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "log",
+                "--reverse",
+                "--format=%aI",
+                "--name-only",
+                "--",
+                "wiki/",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+    dates: dict[str, str] = {}
+    current: Optional[str] = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}T.*", stripped):
+            current = stripped[:10]
+        elif stripped.startswith("wiki/") and current:
+            dates.setdefault(stripped, current)
+    return dates
+
+
+def parse_page(root: Path, page_path: Path) -> dict:
+    relative = page_path.relative_to(root).as_posix()
+    parser = WikiHTMLParser()
+    parser.feed(page_path.read_text(encoding="utf-8", errors="ignore"))
+    h1 = clean_text(" ".join(parser.h1_parts))
+    title_tag = clean_text(" ".join(parser.title_parts))
+    title = h1 or title_tag or page_path.parent.name
+    description = (
+        parser.meta.get("description")
+        or (parser.leads[0] if parser.leads else "")
+        or (parser.paragraphs[0] if parser.paragraphs else "")
+    )
+    summary_meta = parser.meta.get("dojo:summary", "").strip()
+    summary = summary_meta or description
+    page_topics = split_topics(parser.meta.get("dojo:topics", ""))
+    invalid_topics = [t for t in page_topics if t not in ALLOWED_TOPICS]
+
+    return {
+        "id": relative,
+        "path": relative,
+        "title": title,
+        "description": clean_text(description),
+        "summary": clean_text(summary),
+        "type": parser.meta.get("dojo:type", "").strip() or "unknown",
+        "topics": page_topics,
+        "tag": parser.meta.get("dojo:tag", "").strip(),
+        "_has_summary": bool(summary_meta),
+        "_invalid_topics": invalid_topics,
+        "_hrefs": parser.hrefs,
+    }
+
+
+def normalize_target(source: str, href: str) -> Optional[str]:
+    parts = urlsplit(href)
+    if parts.scheme.lower() in IGNORED_SCHEMES or parts.netloc or not parts.path:
+        return None
+    base = posixpath.dirname(source)
+    target = posixpath.normpath(posixpath.join(base, parts.path))
+    if parts.path.endswith("/"):
+        target = posixpath.join(target, "index.html")
+    if target.endswith("/overview.html"):
+        target = target[: -len("overview.html")] + "index.html"
+    if not target.startswith("wiki/") or not target.endswith("/index.html"):
+        return None
+    if target == source:
+        return None
+    return target
+
+
+def build_catalog(root: Path) -> dict:
+    root = root.resolve()
+    first_seen = git_first_seen_dates(root)
+    pages = [parse_page(root, path) for path in discover_pages(root)]
+    for page in pages:
+        page["date"] = first_seen.get(page["path"], "")
+    page_ids = {page["id"] for page in pages}
+    edge_counts: Counter = Counter()
+    warnings: list[dict] = []
+
+    for page in pages:
+        if not page.pop("_has_summary"):
+            warnings.append({"type": "missing_summary", "source": page["id"]})
+        if page["type"] == "unknown":
+            warnings.append({"type": "unclassified", "source": page["id"]})
+        if not page["topics"]:
+            warnings.append({"type": "missing_topics", "source": page["id"]})
+        for topic in page.pop("_invalid_topics"):
+            warnings.append({"type": "unknown_topic", "source": page["id"], "topic": topic})
+        if not page["tag"]:
+            warnings.append({"type": "missing_tag", "source": page["id"]})
+        for href in page.pop("_hrefs"):
+            target = normalize_target(page["id"], href)
+            if target is None:
+                continue
+            if target not in page_ids:
+                warnings.append(
+                    {"type": "missing_target", "source": page["id"], "target": target}
+                )
+                continue
+            edge_counts[(page["id"], target)] += 1
+
+    incoming: dict[str, list[str]] = defaultdict(list)
+    outgoing: dict[str, list[str]] = defaultdict(list)
+    edges: list[dict] = []
+    for (source, target), count in sorted(edge_counts.items()):
+        incoming[target].append(source)
+        outgoing[source].append(target)
+        edges.append(
+            {
+                "id": f"{source}::{target}",
+                "source": source,
+                "target": target,
+                "count": count,
+            }
+        )
+
+    for page in pages:
+        page["incoming"] = sorted(incoming[page["id"]])
+        page["outgoing"] = sorted(outgoing[page["id"]])
+        page["incoming_count"] = len(page["incoming"])
+        page["outgoing_count"] = len(page["outgoing"])
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pages": sorted(pages, key=lambda page: (page["title"].casefold(), page["id"])),
+        "edges": edges,
+        "warnings": sorted(
+            warnings,
+            key=lambda item: (
+                item.get("type", ""),
+                item.get("source", ""),
+                item.get("target", ""),
+            ),
+        ),
+    }
+
+
+def write_catalog(catalog: dict, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# 入口调度
+# ============================================================
+
+
+def run_css_check(argv: list[str]) -> int:
+    """--css：对每个页面类型跑死规则检测。
+
+    默认覆盖全部四类（concept / paper / note / dataflow）。用 --module 指定
+    单个类型、--template 指定模板路径；--confirm 在浏览器里复核候选；
+    --fix 直接删。
+    """
+    fix = "--fix" in argv
+    confirm = "--confirm" in argv
+    module = None
+    template = None
+    if "--module" in argv:
+        i = argv.index("--module")
+        module = argv[i + 1]
+    if "--template" in argv:
+        i = argv.index("--template")
+        template = Path(argv[i + 1])
+
+    modules = [module] if module else list(ALLOWED_TYPES)
+    total_removed = 0
+    for name in modules:
+        tpl = template or Path(f".dojo/templates/{name}/index.html")
+        pages = pages_of_type(Path("."), name)
+        if not pages:
+            print(f"error: no pages with dojo:type={name}", file=sys.stderr)
+            return 2
+        targets = ([tpl] if tpl.exists() else []) + pages
+        usage = build_usage(targets, pages)
+        candidates: set[str] = set()
+        removed_here = 0
+        for path in targets:
+            removed = process(path, usage, fix)
+            removed_here += len(removed)
+            candidates.update(CLASS_TOKEN_RE.findall("\n".join(removed)))
+            if removed:
+                print(f"{path}: {len(removed)} rules")
+                for selector in removed:
+                    print(f"  - {selector}")
+        if confirm and candidates:
+            status = confirm_removals(candidates, targets)
+            if status != 0:
+                return status
+        total_removed += removed_here
+        if not removed_here:
+            print(f"no dead css in {len(targets)} files")
+
+    if total_removed:
+        print(f"\n{'cleaned' if fix else 'found'} {total_removed} dead rules")
+        return 0 if fix else 1
+    return 0
+
+
+def run_catalog(argv: list[str]) -> int:
+    """--catalog：构建首页用的 catalog.json。"""
+    parser = argparse.ArgumentParser(prog="ci-01-validate --catalog")
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args([a for a in argv if a != "--catalog"])
+
+    catalog = build_catalog(args.root)
+    write_catalog(catalog, args.output)
+    print(
+        f"generated {len(catalog['pages'])} pages, "
+        f"{len(catalog['edges'])} edges, "
+        f"{len(catalog['warnings'])} warnings -> {args.output}"
+    )
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+
+    if "--diff" in argv:
+        i = argv.index("--diff")
+        return run_render_diff(argv[i + 1:])
+    if "--catalog" in argv:
+        return run_catalog(argv)
+    if "--css" in argv:
+        return run_css_check(argv)
+    if "--copy" in argv:
+        return check_overview_copy("--fix" in argv)
+
+    if "--templates" in argv:
         template_root = Path(TEMPLATE_DIR)
         templates = sorted(template_root.glob("*/index.html"))
         failures = [(t, check_template(t)) for t in templates]
@@ -669,9 +1603,10 @@ def main() -> int:
         print(f"template validation ok: {len(templates)} templates")
         return 0
 
-    if "--all" in sys.argv:
+    args = [a for a in argv if a not in {"--all", "--js"}]
+    js_only = "--js" in argv
+    if "--all" in argv:
         args = sorted(str(p) for p in Path("wiki").glob("**/*.html"))
-
     if not args:
         print(__doc__)
         return 2
@@ -690,11 +1625,32 @@ def main() -> int:
         print("error: page not found: " + ", ".join(missing))
         return 2
 
+    if js_only:
+        js_errors, total, ran = check_inline_js(pages)
+        if not ran:
+            print("error: node not found in PATH; install Node.js to run this check")
+            return 2
+        if js_errors:
+            print(f"inline script check failed: {len(js_errors)} of {total} blocks")
+            for error in js_errors:
+                print(f"- {error}")
+            return 1
+        print(f"inline script check ok: {len(pages)} pages, {total} blocks")
+        return 0
+
     if len(pages) == 1:
         results = [(pages[0], validate_page(pages[0]))]
     else:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(lambda p: (p, validate_page(p)), pages))
+
+    # 内联脚本语法：与逐页检查合并跑一次。没有 node 就跳过，只提示，
+    # 不让缺一个可选工具导致整轮校验失败。
+    js_errors, js_total, js_ran = check_inline_js(pages)
+    if js_errors:
+        results.append((Path("<内联脚本>"), js_errors))
+    if not js_ran:
+        print("note: 未找到 node，跳过内联脚本语法检查")
 
     failed = [(page, errors) for page, errors in results if errors]
     if failed:
@@ -705,10 +1661,11 @@ def main() -> int:
                 print(f"  - {error}")
         return 1
 
+    suffix = f"，内联脚本 {js_total} 块" if js_ran else ""
     if len(pages) == 1:
-        print(f"validation ok: {pages[0]}")
+        print(f"validation ok: {pages[0]}{suffix}")
     else:
-        print(f"validation ok: {len(pages)} pages")
+        print(f"validation ok: {len(pages)} pages{suffix}")
     return 0
 
 

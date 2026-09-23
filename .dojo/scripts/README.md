@@ -1,4 +1,4 @@
-# .dojo 目录
+# 构建脚本
 
 ## 边界
 
@@ -6,58 +6,58 @@
 
 | 目录 | 放什么 |
 |---|---|
-| `.dojo/scripts/` | 通用工具与共享模块，所有页面复用 |
+| `.dojo/scripts/` | 通用工具，所有页面复用 |
 | `.dojo/templates/` | 页面骨架模板 |
 | `.dojo/home/` | 首页资源 |
 
 判断标准：文件里出现具体模型名或页面路径，它就不属于 `.dojo/`，而应放进该页
 自己的 `wiki/<name>/` 目录（生成脚本、图片等）。
 
-## scripts 分组
+## 只有两个脚本
 
-文件名前缀表示分组，编号只用于组内排序。
+分组依据是**在哪跑**，不是技术领域：
 
-| 前缀 | 职责 | 何时跑 |
+- 站点的机械检查、构建，全在 CI 跑，归 `ci-`
+- 数据流页的事实与几何核查需要外部源码和权重，CI 拿不到，只能人工跑，归 `dataflow-`
+
+| 脚本 | 作用 | 何时跑 |
 |---|---|---|
-| `ci-` | 发布闸门：站点级机械校验 | 每次提交，CI 自动跑 |
-| `dataflow-` | 数据流页的事实与几何核查（通用，接受页面路径参数） | 写数据流页时 |
-| `css-` | 样式清理与渲染比对 | 改共享样式时按需跑 |
-| `lib-` | 被其他脚本 import 的模块 | 由调用方执行 |
+| `ci-01-validate.py` | 发布闸门：页面、模板、内联脚本、样式、首页目录，入口只有一个 | CI + 本地 |
+| `dataflow-01-check.py` | 数据流页核查：节点名/形状回查源码；`--geometry` 查连线 | 写数据流页时 |
 
-### ci
+### ci-01-validate.py
 
-| 脚本 | 作用 |
-|---|---|
-| `ci-01-validate.py` | 页面结构、元数据、本地引用、数学字符、research 目录；`--templates` 校验模板；`--copy` 校验概览文案 |
-| `ci-02-check-inline-js.py` | 编译检查页面内联 `<script>`，需要 node |
+    # 页面校验（默认；顺带跑内联脚本语法，需要 node，缺失则跳过并提示）
+    python3 .dojo/scripts/ci-01-validate.py <页面...>
+    python3 .dojo/scripts/ci-01-validate.py --all
 
-### dataflow
+    # 专项
+    python3 .dojo/scripts/ci-01-validate.py --templates      # 模板
+    python3 .dojo/scripts/ci-01-validate.py --copy [--fix]   # 概览文案
+    python3 .dojo/scripts/ci-01-validate.py --js <页面...>   # 只查内联脚本
+    python3 .dojo/scripts/ci-01-validate.py --css [--confirm] [--fix]   # 死 CSS
+    python3 .dojo/scripts/ci-01-validate.py --catalog --output _site/catalog.json
 
-| 脚本 | 作用 |
-|---|---|
-| `dataflow-01-verify-facts.py` | 节点名、形状、来源回查源码与权重 |
-| `dataflow-02-check-geometry.py` | 无头 Chrome 按像素检查连线穿框与重合 |
+    # 改共享样式前后的渲染比对
+    python3 .dojo/scripts/ci-01-validate.py --diff <before-root> <after-root> <页面...> [--detail]
 
-两个脚本都接受页面路径，不绑定具体页面。流程见 `guides/model-dataflow.md`。
+页面校验覆盖：HTML 骨架、模板占位符、重复 id、同页锚点、本地引用、
+`research/` 目录、数学字符、结构图、正文居中、元数据词表、模板与共享 CSS
+一致性。`ALLOWED_TOPICS` / `ALLOWED_TAGS` / `ALLOWED_TYPES` 三张词表也定义在
+这个文件里，页面校验与目录构建共用同一份。
 
-### css
+改样式时的顺序：先 `--diff` 确认改动只影响预期页面，再 `--css` 找死规则。
 
-| 脚本 | 作用 |
-|---|---|
-| `css-01-unused.py` | 找出没有元素会匹配到的样式规则；`--confirm` 用无头 Chrome 复核后再删 |
-| `css-02-render-diff.py` | 逐元素比对两棵站点树的渲染结果 |
+### dataflow-01-check.py
 
-改共享样式时先跑 `css-01-unused.py`（静态找候选），加 `--confirm` 在真实浏览器里
-确认候选确实匹配不到元素，再删。
+    # 事实：节点名与形状回查源码与权重
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
+        --source /path/to/modeling_x.py [--shapes shapes.json] [--names-only]
 
-### lib
+    # 几何：连线穿框与像素重合
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --geometry
 
-| 脚本 | 作用 |
-|---|---|
-| `lib-01-catalog-builder.py` | 首页目录构建逻辑与主题/标签/类型词表；被 `ci-01-validate.py` import，也可直接执行生成 `catalog.json` |
-| `lib-02-dataflow-page.py` | 数据流页的通用骨架与无脚本回退 |
-
-`lib-` 下的模块名带连字符，不能写 `from ... import ...`，用 `importlib` 加载。
+流程见 `guides/model-dataflow.md`。
 
 ## 页面从哪来
 
@@ -72,4 +72,3 @@
 | `.dojo/templates/dataflow/` | 模型前向数据流页（画布 + 参数面板） |
 
 没有生成脚本：页面本身（HTML + 内嵌 JSON）就是唯一的数据来源。
-各类型的写法见对应的 `guides/*.md`。
