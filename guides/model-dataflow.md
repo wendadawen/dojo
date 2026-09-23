@@ -48,5 +48,3 @@
 ## 发布
 
 页面 `dojo:type` 为 `dataflow`，外链 `../../libs/dojo-flow.css`；元数据包括纯文本 `description`、可含 `$...$` 公式的 `dojo:summary`、主题与标签。
-
-未获明确授权，不执行 commit 与 push。
