@@ -13,7 +13,7 @@
 判断标准：文件里出现具体模型名或页面路径，它就不属于 `.dojo/`，而应放进该页
 自己的 `wiki/<name>/` 目录（生成脚本、图片等）。
 
-## 只有两个脚本
+## 只有三个脚本
 
 分组依据是**在哪跑**，不是技术领域：
 
@@ -24,6 +24,7 @@
 |---|---|---|
 | `ci-01-validate.py` | 发布闸门：页面、模板、内联脚本、样式、首页目录，入口只有一个 | CI + 本地 |
 | `dataflow-01-check.py` | 数据流页核查：节点名/形状回查源码；`--geometry` 查连线 | 写数据流页时 |
+| `dataflow-02-build.py` | 数据流页生成器：把数据脚本填进模板产出页面 | 写新数据流页时；CI 跑 `--selftest` |
 
 ### ci-01-validate.py
 
@@ -56,6 +57,14 @@
 
     # 几何：连线穿框与像素重合
     python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --geometry
+
+### dataflow-02-build.py
+
+     # 自检（CI 会跑；用虚构模型数据验证生成器本身可用）
+     python3 .dojo/scripts/dataflow-02-build.py --selftest
+
+平时不单独执行：它是模块，被各页的数据脚本 import。页面骨架仍是
+`.dojo/templates/dataflow/index.html`，这个脚本只负责把数据填进去，不复制骨架。
 
 流程见 `guides/model-dataflow.md`。
 
