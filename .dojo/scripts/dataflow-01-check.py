@@ -336,6 +336,12 @@ def main() -> int:
         print(f"error: 页面不存在: {args.page}", file=sys.stderr)
         return 2
 
+    # 形状表缺失时直接报用法错误。让它抛 FileNotFoundError 会打出一串堆栈，
+    # 使用者容易把「脚本崩了」误读成「核查过了」。
+    if args.shapes and not args.shapes.exists():
+        print(f"error: 形状表不存在: {args.shapes}", file=sys.stderr)
+        return 2
+
     if args.geometry:
         # 页面路径相对站点根解析，二者都取绝对路径，relative_to 才能用
         root = args.root.resolve()
@@ -384,7 +390,13 @@ def main() -> int:
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})
     if not args.names_only and args.shapes:
-        shapes = json.loads(args.shapes.read_text(encoding="utf-8"))
+        # 形状表读不出来就报错退出，不要带着半截数据继续核查——
+        # 那会给出「核查通过」，而形状其实一条都没比对。
+        try:
+            shapes = json.loads(args.shapes.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            print(f"error: 形状表无法解析: {args.shapes}（{error}）", file=sys.stderr)
+            return 2
         errors += check_shapes(views, shapes)
     if not args.names_only and args.script:
         errors += check_scripts_exist([Path(p) for p in args.script])
