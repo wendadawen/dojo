@@ -54,16 +54,47 @@
 
 ## 生成
 
-用 `.dojo/templates/dataflow/index.html`，替换全部 `【】` 占位符，得到
-`wiki/<name>/index.html`。模板就是页面骨架的权威定义：`<head>`、标签栏、缩放控件、
-参数面板、无脚本回退都在里面，照着填即可。
+分两层，只有数据要手写：
+
+| 层 | 在哪 | 换模型时 |
+|---|---|---|
+| 页面骨架 | `.dojo/templates/dataflow/index.html` | 不动 |
+| 装配（替换占位符、渲染表格） | `.dojo/scripts/dataflow-02-build.py` | 不动 |
+| 数据（视图、节点、边、config 分组） | `wiki/<name>/build.py` | 只改这里 |
+
+数据脚本长这样：
+
+    import importlib, sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / ".dojo" / "scripts"))
+    build = importlib.import_module("dataflow-02-build")   # 模块名带连字符
+
+    VIEWS = [
+        build.view("main", "XxxModel", "主干：XxxModel.forward",
+                   nodes=[build.node("x", "input_ids", "int64 [B, T]", "tensor"),
+                          ...],
+                   edges=[build.edge("x", "emb"), ...],
+                   groups=[{"label": "主干", "members": [...], "stroke": "#9db6d8"}]),
+    ]
+
+    build.page(
+        out=Path(__file__).resolve().parent / "index.html",
+        meta={"title": ..., "description": ..., "summary": ...,
+              "topics": "模型结构", "tag": "数据流"},
+        views=VIEWS,
+        config_groups=[("分组名", [("键", "值")])],   # 省略则整块参数面板不生成
+        config_note="config.json 原值，共 N 个键",
+    )
+
+`node()` 的 `src` 参数是构建期的可读标注（源码行号或权重键），供人复核，
+不写进页面。`build.py` 本身不发布，也不需要提交——产物 `index.html` 才是交付物。
+
+生成器有自检：
+
+    python3 .dojo/scripts/dataflow-02-build.py --selftest
 
 页面是自包含的：视图数据以 JSON 形式内嵌在 `index.html` 里（`window.DOJO_FLOW_DATA`），
-运行时只外链 `libs/dojo-flow.js` 与 `libs/elk.bundled.js`。没有单独的生成脚本，
-页面本身就是唯一的数据来源。
-
-参数面板按用途分组，每组一个 `<details class="cfg-group">`；不需要面板时把按钮与
-`<section class="flow-config">` 整段删掉。
+运行时只外链 `libs/dojo-flow.js` 与 `libs/elk.bundled.js`。
 
 不手写节点坐标与连线折点，不做布局后移动节点的后处理，布局与走线交给 ELK。
 
