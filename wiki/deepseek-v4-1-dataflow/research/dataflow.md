@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash
 
 - 描述：DeepSeek-V4.1-Flash 一次 prefill 前向的数据流：文本 token 先查出每个位置的 n-gram 哈希行号，再取词嵌入，进 40 层主干；压缩比大于 0 的层在 128 个位置的滑动窗口之外，另加索引器选出的压缩 KV；前馈是 384 选 6 的 MoE；最后折叠、归一化并投影成下一个 token 的 logits。
-- 摘要：40 层主干；压缩 KV 只由 4 个 source 层（2、8、14、20）产出并按层序共享；窗口 128 个位置另加索引器选出的 Top-512 压缩条目；窗口 KV 与压缩 KV 都按 FP8、FP4 精度量化再反量化之后才参与注意力；MoE 384 个路由专家取 top-6 加 1 个共享专家，路由专家存 fp4、共享专家存 fp8；残差流按 4 份复制，混合系数由 Sinkhorn 迭代 20 轮给出；Engram 插在层 1、14。
+- 摘要：40 层主干；压缩 KV 只由 4 个 source 层（2、8、14、20）产出并按层序共享；窗口 128 个位置另加索引器选出的 Top-512 压缩条目；窗口 KV 按 FP8、压缩 KV 按 FP4 量化再反量化之后才参与注意力；MoE 384 个路由专家取 top-6 加 1 个共享专家，路由专家存 fp4、共享专家存 fp8；残差流按 4 份复制，混合系数由 Sinkhorn 迭代 20 轮给出；Engram 插在层 1、14。
 - 主题：模型结构,注意力机制
 
 ## 资料
@@ -18,11 +18,12 @@
 - 这一次是 prefill：`start_pos` 为 0，一次喂进 T 个 token，T 不小于 1024，且能被各层非零的 `compress_ratio` 整除
 - 文本输入：`images` 和 `token_types` 都不传，于是 `image_mask` 与 `engram_mask` 都是 None
 - 单卡，`world_size` 为 1
+- Expert.forward 这张图画路由专家：调用时传入 weights。共享专家同一次前向也会调用 Expert，不传 weights，不乘路由权重
 - 权重按 `config.json` 的 `dtype` 与 `expert_dtype` 加载：用 `Linear`、`ColumnParallelLinear`、`RowParallelLinear` 建、没写 dtype 的权重取 `dtype`（fp8），路由专家取 `expert_dtype`（fp4），压缩器在 `compress_ratio` 大于 1 时把 `wkv`、`wgate` 提升到 fp32；源码里显式指定了别的精度的按源码，如 wo_a、ParallelHead 的 weight、attn_sink、hc_* 六组参数、索引器的 wk.weight 与 weights_proj.weight、压缩比不大于 1 的压缩器的 wkv
 - 注意力、压缩器与索引器走的是 compress_ratio 为 2 这条分支：source 层 2、8、14 的结构相同；层 20 的 compress_ratio 是 1，压缩器只有一次投影
 - 注意力只有 `sparse_attn` 一个 kernel，窗口 KV 与压缩 KV 拼成一份 KV 之后一次算完
 - 调用的是 `Transformer.forward`，不是 `forward_spec`（MTP/DSpark 草稿路径）
-- 缓存按 `max_batch_size` 分配，`config.json` 里没有这一项，取 `ModelArgs` 默认值 4；它是缓存容量，与本次前向的批大小 B 不是同一个量
+- 缓存按 `max_batch_size` 分配，`config.json` 里没有这一项，取 `ModelArgs` 默认值 4；它是缓存容量，与本次前向的批大小 B 不是同一个量。频率表和 KV 缓存的序列维取 `max_seq_len` 默认值 4096，`config.json` 里也没有这一项
 
 ## config.json
 
@@ -86,26 +87,30 @@
 | ids | 张量 | input_ids | int64 [B, T] | 每个位置都是真实 token，填充不会传进来 | model.py:1243 |
 | ngram | 算子 | self.engram_hash(input_ids, start_pos, engram_mask) | [B, T] → [B, T, 2, 24] |  | model.py:1252 |
 | hash | 张量 | engram_hashes | int64 [B, T, 2, 24] | | model.py:1252 |
-| emb | 算子 | self.embed(input_ids) | 129280 → 5120 |  | model.py:1253 |
+| emb | 算子 | self.embed(input_ids) | int64 [B, T] → bf16 [B, T, 5120] |  | model.py:1253 |
 | h0 | 张量 | h | bf16 [B, T, 5120] | | model.py:1253 |
 | hcexp | 算子 | h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1) | [B, T, 5120] → [B, T, 4, 5120] |  | model.py:1258 |
 | hc | 张量 | h | bf16 [B, T, 4, 5120] | | model.py:1258 |
-| eng | 算子 | layer.engram(h, engram_hashes[:, :,<br>layer.engram.layer_hash_index, :], engram_mask) | [B, T, 4, 5120] 不变 |  | model.py:1262-1263 |
+| eng | 算子 | layer.engram(h, engram_hashes[:, :,<br>layer.engram.layer_hash_index, :], engram_mask) | [B, T, 4, 5120] → [B, T, 4, 5120] |  | model.py:1262-1263 |
+| eh | 张量 | h | bf16 [B, T, 4, 5120] | 层 1、14 在进 Block 之前，Engram 写回的残差 | model.py:1263 |
 | pm0 | 算子 | make_identity_pre_mix(h, self.hc_mult) | [B, T, 4, 5120] → fp32 [B, T, 4] |  | model.py:1260 |
 | pre | 张量 | pre_mix | fp32 [B, T, 4] | 进入第 0 层时的初值，此后每层返回的 ffn_pre 都覆盖它 | model.py:1260 |
-| layers | 算子 | 40 × Block | [B, T, 4, 5120] 不变 |  | model.py:1204，1261-1267 |
+| layers | 算子 | 40 × Block | [B, T, 4, 5120] → [B, T, 4, 5120] |  | model.py:1267 |
+| lpm | 张量 | pre_mix | fp32 [B, T, 4] | 最后一层返回的 pre，送给最后一次 hc_pre | model.py:1267 |
 | hl | 张量 | h | bf16 [B, T, 4, 5120] | | model.py:1267 |
 | avg | 算子 | h.mean(dim=2) | [B, T, 4, 5120] → [B, T, 5120] |  | model.py:1265-1266 |
-| mh | 张量 | main_hidden | bf16 [B, T, 15360] | 由 main_hiddens 里 3 个目标层各 [B, T, 5120] 沿最后一维拼接而来，作为第三个返回值交给调用方 | model.py:1259，1266，1271 |
+| am | 张量 | h.mean(dim=2) | bf16 [B, T, 5120] | 3 个目标层各一份，逐层追加进 main_hiddens | model.py:1266 |
+| mcat | 算子 | torch.cat(main_hiddens, dim=-1) | [B, T, 5120] × 3 → [B, T, 15360] |  | model.py:1271 |
+| mh | 张量 | main_hidden | bf16 [B, T, 15360] | 作为第三个返回值交给调用方 | model.py:1271 |
 | col | 算子 | layer.hc_pre(h, pre_mix) | [B, T, 4, 5120] → [B, T, 5120] |  | model.py:1268 |
 | hc2 | 张量 | h | bf16 [B, T, 5120] | | model.py:1268 |
-| fnorm | 算子 | self.norm (RMSNorm) | [B, T, 5120] 不变 |  | model.py:1269 |
+| fnorm | 算子 | self.norm(h) | bf16 [B, T, 5120] → bf16 [B, T, 5120] |  | model.py:1269 |
 | hn | 张量 | h | bf16 [B, T, 5120] | | model.py:1269 |
-| head | 算子 | self.head (ParallelHead) | 5120 → 129280 |  | model.py:1269 |
+| head | 算子 | self.head(h) | bf16 [B, T, 5120] → fp32 [B, 129280] |  | model.py:1269 |
 | logits | 张量 | logits | fp32 [B, 129280] | | model.py:1269 |
 | samp | 算子 | sample(logits, self.temperature) | fp32 [B, 129280] → int64 [B] |  | model.py:1270 |
 | oids | 张量 | output_ids | int64 [B] | | model.py:1270 |
-| shar | 缓存 | shared_attn | compress_kv、index_k、topk_idxs | 各层之间传递的共享量，每个前向里由靠前的层写、靠后的层读，不重置 | model.py:1166-1180 |
+| shar | 缓存 | shared_attn | compress_kv、index_k、topk_idxs、candidates | 各层之间传递的共享量，每个前向里由靠前的层写、靠后的层读，不重置。candidates 由层 20 写，层 24、28、32、36 读 | model.py:1166-1180 |
 | tret | 张量 | (output_ids, logits, main_hidden) | — | 三个返回值：采样出的 id、logits、拼接后的 main_hidden | model.py:1272 |
 
 ### 连线
@@ -120,16 +125,20 @@
 - pm0 → pre
 - hash → eng
 - layers → eng：上一层 Block 的输出
-- eng → layers：层 1、14 的输入
+- eng → eh
+- eh → layers：层 1、14 的输入
 - hc → layers：层 0 的输入
 - pre → layers
 - shar → layers
 - layers → shar
 - layers → hl
 - layers → avg：第 37、38、39 层的输入
-- avg → mh
+- avg → am
+- am → mcat
+- mcat → mh
 - hl → col
-- layers → col：最后一层返回的 pre_mix
+- layers → lpm
+- lpm → col
 - col → hc2
 - hc2 → fnorm
 - fnorm → hn
@@ -150,31 +159,35 @@
 
 | id | 名字 | 内容 |
 |---|---|---|
+| ngram | 公式 | $engram\_hashes = engram\_hash(input\_ids, start\_pos, engram\_mask)$，input_ids 是词 id，start_pos 为 0，这次 engram_mask 是 None |
 | ngram | 说明 | NgramHashState，把每个位置结尾的 n-gram 哈希成表行号<br>倒数第二维是 Engram 层序号，对应 engram_layer_ids 的 [1, 14]；24 = (4 − 1) × 8 |
 | emb | 公式 | $h = embed.weight[input\_ids]$，input_ids 是词 id，embed.weight 是词表矩阵。单卡 world_size 为 1，按行查 |
 | emb | 说明 | ParallelEmbedding：embed.weight [129280, 5120]，按 rank 沿词表维切分，单卡即整张 |
 | hcexp | 公式 | $h$ 沿新的一维复制 $hc\_mult$ 份，每一份等于原来的 $h$ |
 | hcexp | 说明 | 把残差流复制成 hc_mult 份，供 Hyper-Connections 用 |
+| eng | 公式 | $h = engram(h, engram\_hashes_{:,:,layer\_hash\_index,:}, engram\_mask)$，h 是残差流，engram_mask 这次是 None |
 | eng | 说明 | Engram：层 1、14 在进入本层之前跑，吃的是上一层 Block 的输出，把 n-gram 查表的结果按门控加进残差流 |
 | pm0 | 公式 | $pre\_mix_{:,:,0} = 1$，其余为 0。h 用来取 batch 和序列长度，hc_mult 是份数 |
 | pm0 | 说明 | 第 0 份置 1、其余置 0，作为进入第 0 层时的 pre_mix |
-| layers | 说明 | 层 0 的输入是 hc；层 1、14 在进本层之前先跑 Engram 改写残差流；其余层的输入是上一层 Block 的输出<br>压缩 KV 只在 4 个 source 层（2、8、14、20）算一次，其余 compress_ratio 大于 0 的层从 shared_attn 读。层 0、1 的 compress_ratio 为 0，只有滑动窗口 |
-| avg | 公式 | $\mathrm{mean}(h, \dim=2)$，h 是进入目标层之前的残差流，求和的那一维是 hc 份 |
+| layers | 公式 | $h, pre\_mix = layer(h, start\_pos, pre\_mix, image\_mask)$，layer 是这一层的 Block，image_mask 这次是 None |
+| layers | 说明 | 层 0 的输入是 hc；层 1、14 在进本层之前先跑 Engram 改写残差流；其余层的输入是上一层 Block 的输出<br>压缩 KV 只在 4 个 source 层（2、8、14、20）算一次，其余 compress_ratio 大于 0 的层从 shared_attn 读。层 0、1 的 compress_ratio 为 0，只有滑动窗口。层 20–39 的 compress_ratio 是 1。层 20 的索引器写出 candidates，层 24、28、32、36 只在这些候选块里取 top-512 |
+| avg | 公式 | $\mathrm{mean}(h, \dim=2)$，h 是进入目标层之前的残差流，取均值的那一维是 hc 份 |
+| mcat | 公式 | $main\_hidden = \mathrm{cat}(main\_hiddens, \dim=-1)$，main_hiddens 是 3 个目标层各一份 [B, T, 5120] |
 | avg | 说明 | 进入第 37、38、39 层之前的残差流，按 hc 维取均值 |
 | col | 公式 | $h = \sum_{c=0}^{hc\_mult-1} pre\_mix_c\, h_c$，h_c 是第 c 份残差，pre_mix 是最后一层返回的系数 |
 | col | 说明 | 用最后一层返回的 pre_mix 把 4 份折叠成一份 |
-| fnorm | 公式 | $h = norm.weight \odot h / \sqrt{\mathrm{mean}(h^2) + norm.eps}$，h 是送进来的张量，norm.weight 是权重，norm.eps 是 eps，mean 在最后一维 |
+| fnorm | 公式 | $norm.weight \odot h / \sqrt{\mathrm{mean}(h^2) + norm.eps}$，h 是送进 norm 的隐状态，norm.weight 是权重，norm.eps 是 eps，mean 在最后一维 |
 | fnorm | 说明 | norm.weight [5120] |
 | head | 公式 | $logits = h_{:,-1}\, head.weight^\top$，h 是送进 head 的隐状态，head.weight 是词表矩阵，只取最后一个位置 |
-| head | 说明 | head.weight [129280, 5120]，只取最后一个位置 |
-| samp | 公式 | $logits = logits / temperature$，$probs = \mathrm{softmax}(logits)$，$output\_ids = \mathrm{argmax}(probs / \mathrm{exponential})$。temperature 是 self.temperature，exponential 是同形状的指数分布随机数 |
+| head | 说明 | 输入只取最后一个位置。head.weight [129280, 5120] |
+| samp | 公式 | $logits = logits / \max(temperature, 10^{-5})$，$probs = \mathrm{softmax}(logits)$，$output\_ids = \mathrm{argmax}(probs / \mathrm{exponential})$。temperature 取默认值 1，exponential 是同形状的指数分布随机数 |
 | samp | 说明 | Gumbel-max：概率除以指数分布随机数后取 argmax，等价于按概率采样 |
 
 ### 面板
 
 | 组 | 名字 | 值 |
 |---|---|---|
-| 介绍 | 模型 | DeepSeek-V4.1-Flash 是一个文本解码模型。一次前向从 token 算到下一个 token 的 logits。主干 40 层。残差流复制成 4 份，每层用 Hyper-Connections 在注意力和前馈前后混合这 4 份。注意力除了最近 128 个位置的窗口，还用索引器从压缩 KV 里再取最多 512 条。前馈从 384 个路由专家里取 6 个，再加 1 个共享专家。Engram 加在第 1 层和第 14 层进入之前。 |
+| 介绍 | 模型 | DeepSeek-V4.1-Flash 带一个视觉编码器。这次前向不传图像，从文本 token 算到下一个 token 的 logits。主干 40 层。残差流复制成 4 份，每层用 Hyper-Connections 在注意力和前馈前后混合这 4 份。压缩比大于 0 的层，注意力除了最近 128 个位置的窗口，还用索引器从压缩 KV 里再取最多 512 条。前馈从 384 个路由专家里取 6 个，再加 1 个共享专家。Engram 加在第 1 层和第 14 层进入之前。 |
 | 公式 | 输入嵌入 | $h = embed.weight[input\_ids]$，input_ids 是词 id，embed.weight 是词表矩阵。单卡按行查 |
 | 公式 | 残差流复制 | $h$ 沿新的一维复制 $hc\_mult$ 份，每一份等于原来的 $h$，hc_mult 是 4 |
 | 公式 | 输出 | $logits = h_{:,-1}\, head.weight^\top$，h 是送进 head 的隐状态，head.weight 是词表矩阵，只取最后一个位置 |
@@ -194,28 +207,28 @@
 | hin | 张量 | x | bf16 [B, T, 4, 5120] | 进入本层的残差流，4 份 | model.py:970 |
 | bpre | 张量 | pre_mix | fp32 [B, T, 4] | 上一层返回的 pre_mix，把 4 份折叠成一份时用 | model.py:972 |
 | resid0 | 张量 | residual | bf16 [B, T, 4, 5120] | 进注意力子层之前的残差流 | model.py:981 |
-| mixes_a | 算子 | self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base) | [B, T, 4, 5120] → 三组 fp32 系数 |  | model.py:982 |
+| mixes_a | 算子 | self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base) | [B, T, 4, 5120] → fp32 [B, T, 4] × 2 与 fp32 [B, T, 4, 4] |  | model.py:982 |
 | apre | 张量 | attn_pre | fp32 [B, T, 4] | | model.py:982 |
 | apost | 张量 | attn_post | fp32 [B, T, 4] | | model.py:982 |
 | acomb | 张量 | attn_comb | fp32 [B, T, 4, 4] | | model.py:982 |
 | cpre | 算子 | self.hc_pre(x, pre_mix) | [B, T, 4, 5120] → [B, T, 5120] |  | model.py:983 |
 | x1 | 张量 | x | bf16 [B, T, 5120] | | model.py:983 |
-| an | 算子 | self.attn_norm (RMSNorm) | [B, T, 5120] 不变 |  | model.py:984 |
+| an | 算子 | self.attn_norm(x) | bf16 [B, T, 5120] → bf16 [B, T, 5120] |  | model.py:984 |
 | x2 | 张量 | x | bf16 [B, T, 5120] | | model.py:984 |
-| attn | 算子 | self.attn(x, start_pos, *attn_args) | [B, T, 5120] 不变 |  | model.py:985 |
+| attn | 算子 | self.attn(x, start_pos, *attn_args) | bf16 [B, T, 5120] → bf16 [B, T, 5120] |  | model.py:985 |
 | x3 | 张量 | x | bf16 [B, T, 5120] | | model.py:985 |
 | cpost | 算子 | self.hc_post(x, residual, attn_post, attn_comb) | [B, T, 5120] → [B, T, 4, 5120] |  | model.py:986 |
 | x4 | 张量 | x | bf16 [B, T, 4, 5120] | | model.py:986 |
 | resid1 | 张量 | residual | bf16 [B, T, 4, 5120] | 进前馈子层之前的残差流 | model.py:988 |
-| mixes_f | 算子 | self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base) | [B, T, 4, 5120] → 三组 fp32 系数 |  | model.py:989 |
+| mixes_f | 算子 | self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base) | [B, T, 4, 5120] → fp32 [B, T, 4] × 2 与 fp32 [B, T, 4, 4] |  | model.py:989 |
 | fpre | 张量 | ffn_pre | fp32 [B, T, 4] | 作为返回值交给下一层当 pre_mix | model.py:989 |
 | fpost | 张量 | ffn_post | fp32 [B, T, 4] | | model.py:989 |
 | fcomb | 张量 | ffn_comb | fp32 [B, T, 4, 4] | | model.py:989 |
 | cpre2 | 算子 | self.hc_pre(x, attn_pre) | [B, T, 4, 5120] → [B, T, 5120] |  | model.py:990 |
 | x5 | 张量 | x | bf16 [B, T, 5120] | | model.py:990 |
-| fn | 算子 | self.ffn_norm (RMSNorm) | [B, T, 5120] 不变 |  | model.py:991 |
+| fn | 算子 | self.ffn_norm(x) | bf16 [B, T, 5120] → bf16 [B, T, 5120] |  | model.py:991 |
 | x6 | 张量 | x | bf16 [B, T, 5120] | | model.py:991 |
-| moe_op | 算子 | self.ffn(x, image_mask) | [B, T, 5120] 不变 |  | model.py:992 |
+| moe_op | 算子 | self.ffn(x, image_mask) | bf16 [B, T, 5120] → bf16 [B, T, 5120] |  | model.py:992 |
 | x7 | 张量 | x | bf16 [B, T, 5120] | | model.py:992 |
 | cpost2 | 算子 | self.hc_post(x, residual, ffn_post, ffn_comb) | [B, T, 5120] → [B, T, 4, 5120] |  | model.py:993 |
 | hout | 张量 | x | bf16 [B, T, 4, 5120] | | model.py:993 |
@@ -268,21 +281,23 @@
 
 | id | 名字 | 内容 |
 |---|---|---|
-| mixes_a | 公式 | $mixes = \mathrm{flatten}(x)\, hc\_attn\_fn^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x)^2) + norm\_eps)$<br>$pre_j = \mathrm{sigmoid}(mixes_j \cdot hc\_attn\_scale_0 + hc\_attn\_base_j) + hc\_eps$<br>$post_j = 2\,\mathrm{sigmoid}(mixes_{j+hc\_mult} \cdot hc\_attn\_scale_1 + hc\_attn\_base_{j+hc\_mult})$<br>$comb_{j,k} = \mathrm{Sinkhorn}(\mathrm{softmax}(mixes_{j \cdot hc\_mult + k + 2 hc\_mult} \cdot hc\_attn\_scale_2 + hc\_attn\_base_{j \cdot hc\_mult + k + 2 hc\_mult}) + hc\_eps)$<br>x 是残差流，hc\_attn\_fn、hc\_attn\_scale、hc\_attn\_base 是这一调用的参数，norm_eps 与 hc_eps 是 Block 上的 eps。j、k 从 0 到 hc_mult−1。mixes 与 base 按顺序切成三段：前 hc_mult 个给 pre，接着 hc_mult 个给 post，最后 hc_mult × hc_mult 个给 comb。Sinkhorn 先做一次行归一化（softmax 后加 hc_eps），再做一次列归一化，然后交替做行、列各 19 次，共行 20 次、列 20 次，最后一次落在列方向 |
-| mixes_a | 说明 | 一次投影同时给出 pre、post、comb 三套系数<br>hc_attn_fn [24, 20480]、hc_attn_base [24]、hc_attn_scale [3]，都是 fp32；24 = (2 + 4) × 4，20480 = 4 × 5120 |
+| mixes_a | 公式 | $mixes = \mathrm{flatten}(x, 2)\, hc\_attn\_fn^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x, 2)^2) + norm\_eps)$<br>$pre_j = \mathrm{sigmoid}(mixes_j \cdot hc\_attn\_scale_0 + hc\_attn\_base_j) + hc\_eps$<br>$post_j = 2\,\mathrm{sigmoid}(mixes_{j+hc\_mult} \cdot hc\_attn\_scale_1 + hc\_attn\_base_{j+hc\_mult})$<br>$u_{j,k} = mixes_{j \cdot hc\_mult + k + 2 hc\_mult} \cdot hc\_attn\_scale_2 + hc\_attn\_base_{j \cdot hc\_mult + k + 2 hc\_mult}$<br>$comb = \mathrm{Sinkhorn}(u)$<br>x 是残差流，hc\_attn\_fn、hc\_attn\_scale、hc\_attn\_base 是这一调用的参数，norm_eps 与 hc_eps 是 Block 上的 eps。j、k 从 0 到 hc_mult−1。mixes 与 base 按顺序切成三段：前 hc_mult 个给 pre，接着 hc_mult 个给 post，最后 hc_mult × hc_mult 个给 comb。u 是 mixes 里填进 comb、softmax 之前的那一块，源码里没有单独的名字，Sinkhorn 作用在整张 u 上 |
+| mixes_a | 说明 | 一次投影同时给出 pre、post、comb 三套系数<br>hc_attn_fn [24, 20480]、hc_attn_base [24]、hc_attn_scale [3]，都是 fp32；24 = (2 + 4) × 4，20480 = 4 × 5120<br>Sinkhorn 先对 u 的每一行做 softmax，再加 hc_eps；再按列除以（列和 + hc_eps）；然后行、列交替各再做 19 次，每次除以（和 + hc_eps）。行 20 次、列 20 次，最后一次是列 |
 | cpre | 公式 | $x = \sum_{c=0}^{hc\_mult-1} pre\_mix_c\, x_c$，x_c 是第 c 份残差，pre_mix 是上一层返回的系数 |
 | cpre | 说明 | 按 pre_mix 把 4 份加权求和成 1 份 |
 | an | 公式 | $x = attn\_norm.weight \odot x / \sqrt{\mathrm{mean}(x^2) + attn\_norm.eps}$，x 是送进来的张量，attn\_norm.weight 是权重，attn\_norm.eps 是 eps，mean 在最后一维 |
 | an | 说明 | attn_norm.weight [5120] |
+| attn | 公式 | $x = attn(x, start\_pos)$，x 是 attn_norm 之后的隐状态，这次 attn_args 为空 |
 | attn | 说明 | Attention，本层的窗口 KV 与压缩 KV 都在里面读写；本路径 attn_args 为空 |
 | cpost | 公式 | $x_c = attn\_post_c\, x + \sum_{c'} attn\_comb_{c',c}\, residual_{c'}$，右边的 x 是注意力的输出，residual 是进注意力前的残差，attn_post 与 attn_comb 是 hc_mixes 的系数。c' 是 residual 的份号，c 是写回的份号 |
 | cpost | 说明 | 把子层输出按 post 展开成 4 份，再把 residual 按 comb 混进去 |
-| mixes_f | 公式 | $mixes = \mathrm{flatten}(x)\, hc\_ffn\_fn^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x)^2) + norm\_eps)$<br>$pre_j = \mathrm{sigmoid}(mixes_j \cdot hc\_ffn\_scale_0 + hc\_ffn\_base_j) + hc\_eps$<br>$post_j = 2\,\mathrm{sigmoid}(mixes_{j+hc\_mult} \cdot hc\_ffn\_scale_1 + hc\_ffn\_base_{j+hc\_mult})$<br>$comb_{j,k} = \mathrm{Sinkhorn}(\mathrm{softmax}(mixes_{j \cdot hc\_mult + k + 2 hc\_mult} \cdot hc\_ffn\_scale_2 + hc\_ffn\_base_{j \cdot hc\_mult + k + 2 hc\_mult}) + hc\_eps)$<br>x 是残差流，hc\_ffn\_fn、hc\_ffn\_scale、hc\_ffn\_base 是这一调用的参数，norm_eps 与 hc_eps 是 Block 上的 eps。j、k 从 0 到 hc_mult−1。mixes 与 base 按顺序切成三段：前 hc_mult 个给 pre，接着 hc_mult 个给 post，最后 hc_mult × hc_mult 个给 comb。Sinkhorn 先做一次行归一化（softmax 后加 hc_eps），再做一次列归一化，然后交替做行、列各 19 次，共行 20 次、列 20 次，最后一次落在列方向 |
-| mixes_f | 说明 | hc_ffn_fn [24, 20480]、hc_ffn_base [24]、hc_ffn_scale [3]，形状与注意力那组相同 |
+| mixes_f | 公式 | $mixes = \mathrm{flatten}(x, 2)\, hc\_ffn\_fn^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x, 2)^2) + norm\_eps)$<br>$pre_j = \mathrm{sigmoid}(mixes_j \cdot hc\_ffn\_scale_0 + hc\_ffn\_base_j) + hc\_eps$<br>$post_j = 2\,\mathrm{sigmoid}(mixes_{j+hc\_mult} \cdot hc\_ffn\_scale_1 + hc\_ffn\_base_{j+hc\_mult})$<br>$u_{j,k} = mixes_{j \cdot hc\_mult + k + 2 hc\_mult} \cdot hc\_ffn\_scale_2 + hc\_ffn\_base_{j \cdot hc\_mult + k + 2 hc\_mult}$<br>$comb = \mathrm{Sinkhorn}(u)$<br>x 是残差流，hc\_ffn\_fn、hc\_ffn\_scale、hc\_ffn\_base 是这一调用的参数，norm_eps 与 hc_eps 是 Block 上的 eps。j、k 从 0 到 hc_mult−1。mixes 与 base 按顺序切成三段：前 hc_mult 个给 pre，接着 hc_mult 个给 post，最后 hc_mult × hc_mult 个给 comb。u 是 mixes 里填进 comb、softmax 之前的那一块，源码里没有单独的名字，Sinkhorn 作用在整张 u 上 |
+| mixes_f | 说明 | hc_ffn_fn [24, 20480]、hc_ffn_base [24]、hc_ffn_scale [3]，形状与注意力那组相同<br>Sinkhorn 的做法与注意力那次相同：行 softmax 后加 hc_eps，再列归一化，然后交替各 19 次 |
 | cpre2 | 公式 | $x = \sum_{c=0}^{hc\_mult-1} attn\_pre_c\, x_c$，x_c 是第 c 份残差，attn_pre 是本层注意力 hc_mixes 给出的 pre |
 | cpre2 | 说明 | 用注意力子层算出的 attn_pre |
 | fn | 公式 | $x = ffn\_norm.weight \odot x / \sqrt{\mathrm{mean}(x^2) + ffn\_norm.eps}$，x 是送进来的张量，ffn\_norm.weight 是权重，ffn\_norm.eps 是 eps，mean 在最后一维 |
 | fn | 说明 | ffn_norm.weight [5120] |
+| moe_op | 公式 | $x = ffn(x, image\_mask)$，x 是 ffn_norm 之后的隐状态，这次 image_mask 是 None |
 | moe_op | 说明 | MoE，image_mask 为 None |
 | cpost2 | 公式 | $x_c = ffn\_post_c\, x + \sum_{c'} ffn\_comb_{c',c}\, residual_{c'}$，右边的 x 是前馈的输出，residual 是进前馈前的残差，ffn_post 与 ffn_comb 是 hc_mixes 的系数。c' 是 residual 的份号，c 是写回的份号 |
 | cpost2 | 说明 | 把前馈输出按 ffn_post 展开成 4 份，再把 residual 按 ffn_comb 混进去 |
@@ -291,8 +306,8 @@
 
 | 组 | 名字 | 值 |
 |---|---|---|
-| 公式 | 混合系数 | $mixes = \mathrm{flatten}(x)\, hc\_fn^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x)^2) + norm\_eps)$，x 是残差流。注意力那次 hc_fn、hc_scale、hc_base 是 hc_attn_fn、hc_attn_scale、hc_attn_base，前馈那次是 hc_ffn_fn、hc_ffn_scale、hc_ffn_base |
-| 公式 | pre、post、comb | $pre_j = \mathrm{sigmoid}(mixes_j \cdot hc\_scale_0 + hc\_base_j) + hc\_eps$，$post_j = 2\,\mathrm{sigmoid}(mixes_{j+hc\_mult} \cdot hc\_scale_1 + hc\_base_{j+hc\_mult})$，$comb_{j,k} = \mathrm{Sinkhorn}(\mathrm{softmax}(mixes_{j \cdot hc\_mult + k + 2 hc\_mult} \cdot hc\_scale_2 + hc\_base_{j \cdot hc\_mult + k + 2 hc\_mult}) + hc\_eps)$。hc_scale、hc_base 在注意力是 hc_attn_scale、hc_attn_base，在前馈是 hc_ffn_scale、hc_ffn_base。j、k 从 0 到 hc_mult−1。Sinkhorn 先行归一化、再列归一化，然后交替各 19 次，共行 20 次、列 20 次，最后一次落在列方向 |
+| 公式 | 混合系数 | $mixes = \mathrm{flatten}(x, 2)\, hc\_fn^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x, 2)^2) + norm\_eps)$，x 是残差流。注意力那次 hc_fn、hc_scale、hc_base 是 hc_attn_fn、hc_attn_scale、hc_attn_base，前馈那次是 hc_ffn_fn、hc_ffn_scale、hc_ffn_base |
+| 公式 | pre、post、comb | $pre_j = \mathrm{sigmoid}(mixes_j \cdot hc\_scale_0 + hc\_base_j) + hc\_eps$，$post_j = 2\,\mathrm{sigmoid}(mixes_{j+hc\_mult} \cdot hc\_scale_1 + hc\_base_{j+hc\_mult})$，$u_{j,k} = mixes_{j \cdot hc\_mult + k + 2 hc\_mult} \cdot hc\_scale_2 + hc\_base_{j \cdot hc\_mult + k + 2 hc\_mult}$，再 $comb = \mathrm{Sinkhorn}(u)$。hc_scale、hc_base 在注意力是 hc_attn_scale、hc_attn_base，在前馈是 hc_ffn_scale、hc_ffn_base。j、k 从 0 到 hc_mult−1。Sinkhorn 先对每一行做 softmax 再加 hc_eps，再按列除以（列和 + hc_eps），然后行、列交替各 19 次 |
 | 公式 | 折叠 | 注意力前 $x = \sum_c pre\_mix_c\, x_c$，前馈前 $x = \sum_c attn\_pre_c\, x_c$。c 从 0 到 hc_mult−1 |
 | 公式 | 展开 | 注意力后用 attn_post、attn_comb，前馈后用 ffn_post、ffn_comb：$x_c = post_c\, x + \sum_{c'} comb_{c',c}\, residual_{c'}$。右边的 x 是子层输出，c' 是 residual 的份号，c 是写回的份号 |
 | 配置 | dim | 5120 |
@@ -308,45 +323,46 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | ax | 张量 | x | bf16 [B, T, 5120] | 已经过 attn_norm 的层输入 | model.py:766 |
-| fcall | 张量 | self.freqs_cis | 复数 fp32 [max_seq_len, 32] | 构造时按 max_seq_len 预生成的整张频率表 | model.py:688-698 |
-| fc | 张量 | freqs_cis | 复数 fp32 [T, 32] | 从 self.freqs_cis 里取本次这一段，start_pos 为 0 所以是前 T 行，构造时按 max_seq_len 预生成<br>压缩比为 0 的层用 rope_theta 且不做 YaRN，其余层用 compress_rope_theta 并按 original_seq_len 做 YaRN<br>32 = rope_head_dim / 2，每个位置一行 | model.py:767 |
-| qr_op | 算子 | self.q_norm(self.wq_a(x)) | 5120 → 1280 |  | model.py:770 |
+| fcall | 张量 | self.freqs_cis | 复数 fp32 [max_seq_len, 32] | 构造时按 max_seq_len 预生成的整张频率表。32 = rope_head_dim / 2 | model.py:688-698 |
+| fsl | 算子 | self.freqs_cis[start_pos : start_pos + seqlen] | [max_seq_len, 32] → [T, 32] |  | model.py:767 |
+| fc | 张量 | freqs_cis | 复数 fp32 [T, 32] | 本次这一段。本路径 start_pos 为 0，所以是前 T 行 | model.py:767 |
+| qr_op | 算子 | self.q_norm(self.wq_a(x)) | bf16 [B, T, 5120] → bf16 [B, T, 1280] |  | model.py:770 |
 | qr | 张量 | qr | bf16 [B, T, 1280] | 索引器拿它当 query 的输入 | model.py:770 |
-| qb | 算子 | self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim)) | 1280 → 64 × 512 |  | model.py:771 |
+| qb | 算子 | self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim)) | bf16 [B, T, 1280] → bf16 [B, T, 64, 512] |  | model.py:771 |
 | qpre | 张量 | q | bf16 [B, T, 64, 512] | | model.py:771 |
-| rope_q | 算子 | apply_rotary_emb(q[..., -rd:], freqs_cis) | 末 64 维，形状不变 |  | model.py:772 |
+| rope_q | 算子 | apply_rotary_emb(q[..., -rd:], freqs_cis) | bf16 [B, T, 64, 512] → bf16 [B, T, 64, 512] |  | model.py:772 |
 | q | 张量 | q | bf16 [B, T, 64, 512] | | model.py:772 |
-| wkv_win | 算子 | self.kv_norm(self.wkv(x)) | 5120 → 512 |  | model.py:705 |
+| wkv_win | 算子 | self.kv_norm(self.wkv(x)) | bf16 [B, T, 5120] → bf16 [B, T, 512] |  | model.py:705 |
 | wkv_o | 张量 | kv | bf16 [B, T, 512] | | model.py:705 |
-| wrope | 算子 | apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis) | 末 64 维，形状不变 |  | model.py:706 |
+| wrope | 算子 | apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:706 |
 | wkv_r | 张量 | kv | bf16 [B, T, 512] | | model.py:706 |
-| wquant | 算子 | act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True) | 形状不变 |  | model.py:707 |
+| wquant | 算子 | act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:707 |
 | wkv_q | 张量 | kv | bf16 [B, T, 512] | 存的是 fp8 量化后再反量化的值 | model.py:707 |
-| wwrite | 算子 | self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1) | 写环形缓冲 |  | model.py:712-715 |
+| wwrite | 算子 | self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1) | bf16 [B, T, 512] → [max_batch_size, 128, 512] |  | model.py:712-715 |
 | wchunk | 张量 | window_kv | bf16 [B, T, 512] | prefill 就是本次这块 KV | model.py:716 |
-| widx | 算子 | get_window_topk_idxs(win, bsz, seqlen, start_pos) | T, window_size → int32 [B, T, 128] |  | model.py:720 |
+| widx | 算子 | get_window_topk_idxs(win, bsz, seqlen, start_pos) | [B, T, 5120] → int32 [B, T, 128] |  | model.py:720 |
 | widxs | 张量 | topk_idxs | int32 [B, T, 128] | | model.py:720 |
-| wcache | 缓存 | window_kv_cache | [max_batch_size, 128, 512] | 每层一份，按 max_batch_size 分配；prefill 整块覆盖，decode 时改写 start_pos % 128 那一槽 | model.py:663-668 |
+| wcache | 缓存 | window_kv_cache | [max_batch_size, 128, 512] | 每层一份，按 max_batch_size 分配；prefill 把最后 128 个 token 按 cutoff 绕进环里；decode 时改写 start_pos % 128 那一槽 | model.py:663-668 |
 | comp_op | 算子 | self.compressor(x, start_pos) | [B, T, 5120] → [B, T/r, 512] |  | model.py:747 |
 | lat | 张量 | latent | bf16 [B, T/r, 512] | 压缩器输出的潜在量，还没加 RoPE；r 是这一层的 compress_ratio | model.py:747 |
 | cidx_op | 算子 | self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_len) | [B, T, 5120] → int32 [B, T, 512] |  | model.py:750 |
 | cidxs | 张量 | idxs | int32 [B, T, 512] | 压缩条目下标，已经偏移到拼起来的 KV 里的位置 | model.py:750 |
 | cf | 算子 | self.freqs_cis[: seqlen - seqlen % ratio : ratio] | [max_seq_len, 32] → [T/r, 32] |  | model.py:753-757 |
 | cfq | 张量 | freqs | 复数 fp32 [T/r, 32] | | model.py:753-757 |
-| crope | 算子 | apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs) | 末 64 维，形状不变 |  | model.py:758 |
+| crope | 算子 | apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs) | bf16 [B, T/r, 512] → bf16 [B, T/r, 512] |  | model.py:758 |
 | lat_r | 张量 | latent | bf16 [B, T/r, 512] | | model.py:758 |
-| cquant | 算子 | fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn) | 形状不变 |  | model.py:760 |
+| cquant | 算子 | fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn) | bf16 [B, T/r, 512] → bf16 [B, T/r, 512] |  | model.py:760 |
 | lat_q | 张量 | latent | bf16 [B, T/r, 512] | 存的是 fp4 量化后再反量化的值 | model.py:760 |
-| cwrite | 算子 | self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent | 写压缩缓存 |  | model.py:761 |
+| cwrite | 算子 | self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent | bf16 [B, T/r, 512] → [max_batch_size, max_seq_len / r, 512] |  | model.py:761 |
 | ccache | 缓存 | compress_kv_cache | [max_batch_size, max_seq_len / r, 512] | 2、8、14、20 各有一份，按 max_batch_size 分配；每个 source 层写自己这一份并把它发布给 shared_attn，它之后到下一个 kv source 层之前的层读的是这一份；decode 时每组填满才写一行 | model.py:669-679 |
 | ckv | 张量 | compress_kv | bf16 [B, T/r, 512] | 从 compress_kv_cache 读出的、本次可见的部分 | model.py:763 |
-| cat | 算子 | torch.cat([kv, compress_kv], dim=1) | 两份 KV 沿位置维拼起来 |  | model.py:777 |
+| cat | 算子 | torch.cat([kv, compress_kv], dim=1) | [B, T, 512] 与 [B, T/r, 512] → [B, T + T/r, 512] |  | model.py:777 |
 | kvc | 张量 | kv | bf16 [B, T + T/r, 512] | | model.py:777 |
-| cat2 | 算子 | torch.cat([topk_idxs, compress_idxs], dim=-1) | 两份下标拼起来 |  | model.py:778 |
+| cat2 | 算子 | torch.cat([topk_idxs, compress_idxs], dim=-1) | int32 [B, T, 128] 与 int32 [B, T, 512] → int32 [B, T, 640] |  | model.py:778 |
 | tki | 张量 | topk_idxs | int32 [B, T, 128 + 512] | | model.py:778 |
 | core | 算子 | sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale) | q [B, T, 64, 512] 对 kv [B, T + T/r, 512] → [B, T, 64, 512] |  | model.py:780 |
 | o0 | 张量 | o | bf16 [B, T, 64, 512] | | model.py:780 |
-| unrope | 算子 | apply_rotary_emb(o[..., -rd:], freqs_cis, True) | 末 64 维，形状不变 |  | model.py:781 |
+| unrope | 算子 | apply_rotary_emb(o[..., -rd:], freqs_cis, True) | bf16 [B, T, 64, 512] → bf16 [B, T, 64, 512] |  | model.py:781 |
 | o1 | 张量 | o | bf16 [B, T, 64, 512] | | model.py:781 |
 | grp | 算子 | o.view(bsz, seqlen, self.n_local_groups, -1) | [B, T, 64, 512] → [B, T, 8, 4096] |  | model.py:785 |
 | og | 张量 | o | bf16 [B, T, 8, 4096] | | model.py:785 |
@@ -354,7 +370,7 @@
 | wav | 张量 | wo_a | bf16 [8, 1024, 4096] | | model.py:786 |
 | eins | 算子 | torch.einsum("bsgd,grd->bsgr", o, wo_a) | [B, T, 8, 4096] 与 [8, 1024, 4096] → [B, T, 8, 1024] |  | model.py:787 |
 | ol | 张量 | o | bf16 [B, T, 8, 1024] | | model.py:787 |
-| wb | 算子 | self.wo_b(o.flatten(2)) | 8192 → 5120 |  | model.py:788 |
+| wb | 算子 | self.wo_b(o.flatten(2)) | bf16 [B, T, 8192] → bf16 [B, T, 5120] |  | model.py:788 |
 | axout | 张量 | x | bf16 [B, T, 5120] | | model.py:788-789 |
 
 ### 连线
@@ -364,7 +380,9 @@
 - qr → qb
 - qb → qpre
 - qpre → rope_q
-- fcall → fc
+- fcall → fsl
+- ax → fsl：形状（seqlen）
+- fsl → fc
 - fc → rope_q
 - rope_q → q
 - ax → wkv_win
@@ -384,9 +402,11 @@
 - lat → cidx_op
 - qr → cidx_op
 - ax → cidx_op
+- wchunk → cidx_op：长度（offset）
 - cidx_op → cidxs
 - lat → crope
 - fcall → cf
+- ax → cf：形状（seqlen）
 - cf → cfq
 - cfq → crope
 - crope → lat_r
@@ -411,6 +431,7 @@
 - o1 → grp
 - grp → og
 - og → eins
+- woa → wav
 - wav → eins
 - eins → ol
 - ol → wb
@@ -428,30 +449,42 @@
 | qr_op | 说明 | wq_a.weight [1280, 5120]、q_norm.weight [1280] |
 | qb | 公式 | $q = \mathrm{unflatten}(qr\, wq\_b.weight^\top, (n\_local\_heads, head\_dim))$，qr 是上一行的输出，wq_b.weight 是第二层投影 |
 | qb | 说明 | wq_b.weight [32768, 1280]，64 × 512 = 32768 |
-| rope_q | 公式 | $q_{...,-rd:} = \mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(q_{...,-rd:}) \odot freqs\_cis)$，q 是 query，freqs_cis 是这一段的频率，rd 是 rope_head_dim，写在原地 |
+| fsl | 公式 | $freqs\_cis = self.freqs\_cis[start\_pos : start\_pos + seqlen]$，self.freqs_cis 是整张频率表，左边是切出来的这一段，start_pos 为 0，长度是 T |
+| rope_q | 公式 | $q_{...,-rd:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(q_{...,-rd:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs\_cis))$，q 是 query，freqs_cis 是这一段的频率，rd 是 rope_head_dim，相邻两维配成一对复数，写回原地 |
 | rope_q | 说明 | 只旋转每头 512 维里的后 64 维，前 448 维不动；写在原地 |
 | wkv_win | 公式 | $kv = kv\_norm.weight \odot \dfrac{x\, wkv.weight^\top}{\sqrt{\mathrm{mean}((x\, wkv.weight^\top)^2) + kv\_norm.eps}}$，x 是本层输入，wkv.weight 与 kv_norm.weight 是这一行的两个权重，kv_norm.eps 是 eps |
 | wkv_win | 说明 | wkv.weight [512, 5120]、kv_norm.weight [512] |
-| wrope | 公式 | $kv_{...,-rope\_head\_dim:} = \mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(kv_{...,-rope\_head\_dim:}) \odot freqs\_cis)$，kv 是窗口键，freqs_cis 与 query 用的是同一份 |
+| wrope | 公式 | $kv_{...,-rope\_head\_dim:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(kv_{...,-rope\_head\_dim:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs\_cis))$，kv 是窗口键，freqs_cis 与 query 用的是同一份，相邻两维配成一对复数 |
 | wrope | 说明 | 和 query 用同一份 freqs_cis |
+| wquant | 公式 | $s = \mathrm{fast\_round\_scale}(\max(\mathrm{absmax}(kv), 10^{-4}), 1/448)$，$kv = \mathrm{bf16}(\mathrm{fp8}(\mathrm{clamp}(kv / s, -448, 448)) \cdot s)$。absmax 按每 32 个数一组取，不是逐元素。kv 是加过 RoPE 的窗口键，fast_round_scale 把 scale 收成 2 的幂 |
 | wquant | 说明 | 每 32 个通道一个 E8M0 scale，原地量化再反量化；量化按 fp8 精度（压缩 KV 走 fp4）<br>量化覆盖整条 512 维，含已经加过 RoPE 的末 64 维 |
+| wwrite | 公式 | $cutoff = seqlen \bmod window\_size$，再把 $kv_{:,-window\_size:}$ 按 cutoff 切成两段，写进 window_kv_cache 的环首和环尾。kv 是量化后的窗口键 |
 | wwrite | 说明 | cutoff = seqlen % win，只留最后 win 个 token，尾巴绕回环首 |
-| widx | 说明 | 每个 query 能看的窗口槽位，−1 是空槽；每个 query 各一行，只看到自己的因果窗口 |
+| widx | 公式 | $base = \mathrm{clamp}(t - window\_size + 1, 0) + \{0,\ldots,window\_size-1\}$，$idxs = \mathrm{where}(base > t, -1, base)$。t 是 query 的位置，window_size 是 128。再扩成 batch 并转成 int32 |
+| widx | 说明 | prefill 时每个 query 一行，下标是这次 window_kv（长度 T）里的位置；晚于这个 query 的位置写成 −1 |
+| comp_op | 公式 | $latent = compressor(x, start\_pos)$，x 是本层输入，start_pos 为 0 |
 | comp_op | 说明 | 只有 4 个 source 层（2、8、14、20）算；其余 compress_ratio 大于 0 的层 latent 为 None，直接读已有缓存；层 0、1 的压缩比为 0，整段压缩都不走 |
-| cidx_op | 说明 | 本层是 index source（2、8、14、20、24、28、32、36）就跑自己的 Indexer，其余 compress_ratio 大于 0 的层直接复用 shared_attn.topk_idxs<br>offset 取窗口 KV 的长度（本次是 T），compress_len 是 (start_pos + T) / r |
+| cidx_op | 公式 | $idxs = \_compress\_topk\_idxs(x, qr, latent, start\_pos, offset, compress\_len)$，offset 是窗口 KV 的长度 |
+| cidx_op | 说明 | 本层是 index source（2、8、14、20、24、28、32、36）就跑自己的 Indexer，其余 compress_ratio 大于 0 的层直接复用 shared_attn.topk_idxs<br>offset 是 window_kv 的长度，本次是 T；compress_len 是 (start_pos + T) / r |
 | cf | 公式 | $freqs = freqs\_cis[:seqlen - seqlen \% ratio: ratio]$，第 g 组取位置 $g \times ratio$，ratio 是这一层的 compress_ratio |
 | cf | 说明 | 取压缩位置的频率，一个 latent 顶替一整组，第 g 组取位置 g × r |
-| crope | 公式 | $latent_{...,-rope\_head\_dim:} = \mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(latent_{...,-rope\_head\_dim:}) \odot freqs)$，latent 是压缩潜在量，freqs 是压缩位置的频率 |
+| crope | 公式 | $latent_{...,-rope\_head\_dim:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(latent_{...,-rope\_head\_dim:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs))$，latent 是压缩潜在量，freqs 是压缩位置的频率，相邻两维配成一对复数 |
 | crope | 说明 | 乘压缩位置的 freqs |
+| cquant | 公式 | $s = \mathrm{fp8}(\max(\mathrm{absmax}(latent), 6 \cdot 2^{-9}) / 6)$，$latent = \mathrm{bf16}(\mathrm{fp4}(\mathrm{clamp}(latent / s, -6, 6)) \cdot s)$。absmax 按每 16 个数一组取。latent 是加过 RoPE 的压缩键，scale 存成 E4M3 |
 | cquant | 说明 | E2M1 格式，每 16 个通道一个 E4M3 scale，原地量化再反量化 |
+| cwrite | 公式 | $compress\_kv\_cache_{:B,\ 0:T/r} = latent$，latent 是量化后的压缩键，start_pos 为 0 |
 | cwrite | 说明 | start_pos 为 0，所以从第 0 行起整块写 |
+| cat | 公式 | $kv = \mathrm{cat}([kv, compress\_kv], \dim=1)$，kv 是窗口键，compress_kv 是压缩键 |
 | cat | 说明 | 窗口在前、压缩在后 |
-| cat2 | 说明 | 压缩下标在 _compress_kv 里已经加过窗口长度 T |
+| cat2 | 公式 | $topk\_idxs = \mathrm{cat}([topk\_idxs, compress\_idxs], \dim=-1)$，topk_idxs 是窗口下标，compress_idxs 是压缩下标 |
+| cat2 | 说明 | 压缩下标在 Indexer.forward 的 shift 里已经加上窗口 KV 的长度 T |
 | core | 公式 | $o = \dfrac{\sum_{t} \exp(q \cdot kv_t \cdot softmax\_scale - \max) \, kv_t}{\sum_{t} \exp(q \cdot kv_t \cdot softmax\_scale - \max) + \exp(attn\_sink - \max)}$，t 取 topk_idxs 里的槽位，kv 同时充当 k 和 v，softmax_scale 是 head_dim 的 -1/2 次方，attn_sink 是可学习参数，$\max$ 是这些槽位上 $q \cdot kv_t \cdot softmax\_scale$ 的最大值 |
 | core | 说明 | 单 KV 头，64 个查询头看同一份 KV；attn_sink 是可学习参数 [64]<br>下标为 −1 的槽位分子分母都不贡献 |
-| unrope | 公式 | $o_{...,-rd:} = \mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(o_{...,-rd:}) \odot freqs\_cis^*)$，o 是注意力输出，freqs_cis 取共轭，rd 是 rope_head_dim |
-| unrope | 说明 | 用共轭频率对输出做一次逆旋转，抵消 KV 里已加 RoPE 的键带进注意力输出的那部分旋转，使输出回到与键缓存同一套表示下 |
+| unrope | 公式 | $o_{...,-rd:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(o_{...,-rd:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs\_cis^*))$，o 是注意力输出，freqs_cis 取共轭，rd 是 rope_head_dim，相邻两维配成一对复数 |
+| unrope | 说明 | 用 query 所在位置的共轭频率再转输出的末 64 维，去掉 query 的旋转。值里各键位置的旋转变成相对 query 的位置差 |
+| grp | 公式 | $o = o.\mathrm{view}(bsz, seqlen, n\_local\_groups, -1)$，o 是注意力输出，n_local_groups 是 8 |
 | grp | 说明 | 每 8 个头一组，8 × 512 = 4096 |
+| woa | 公式 | $wo\_a = wo\_a.weight.\mathrm{view}(n\_local\_groups, o\_lora\_rank, -1)$，wo_a.weight 是 [8192, 4096]，n_local_groups 是 8，o_lora_rank 是 1024 |
 | woa | 说明 | wo_a.weight [8192, 4096]，8192 = 8 × 1024 |
 | eins | 公式 | $o_{b,s,g,r} = \sum_d o_{b,s,g,d}\, wo\_a_{g,r,d}$，o 是分组后的注意力输出，wo_a 是 wo_a.weight 按组摊开的结果 |
 | eins | 说明 | 每组只和本组的权重相乘，等效块对角矩阵 |
@@ -488,19 +521,20 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | ax | 张量 | x | bf16 [B, T, 5120] | source 层的注意力输入，与注意力、索引器两张图里的 `ax` 是同一份 | model.py:459 |
-| cf32 | 算子 | x.float() | [B, T, 5120] 不变 |  | model.py:464 |
+| cf32 | 算子 | x.float() | bf16 [B, T, 5120] → fp32 [B, T, 5120] |  | model.py:464 |
 | cxf | 张量 | x | fp32 [B, T, 5120] | | model.py:464 |
 | proj | 算子 | self.wkv(x), self.wgate(x) | [B, T, 5120] → [B, T, 512] × 2 |  | model.py:465 |
 | kv0 | 张量 | kv | fp32 [B, T, 512] | 逐 token 的值投影 | model.py:465 |
 | csc | 张量 | score | fp32 [B, T, 512] | 逐 token 的门控打分 | model.py:465 |
 | pool | 算子 | kv.unflatten(1, (-1, ratio))、score.unflatten(1, (-1, ratio)) 与 (kv * score.softmax(dim=2)).sum(dim=2) | [B, T, 512] → [B, T/r, 512] |  | model.py:473-475 |
 | kvg | 张量 | kv | fp32 [B, T/r, 512] | | model.py:475 |
-| cnorm | 算子 | self.norm(kv.to(dtype)) | 形状不变 |  | model.py:485 |
-| cout | 张量 | self.norm(kv.to(dtype)) | bf16 [B, T/r, 512] | 返回值是还没加 RoPE 的压缩潜在量 | model.py:485 |
+| cnorm | 算子 | self.norm(kv.to(dtype)) | fp32 [B, T/r, 512] → bf16 [B, T/r, 512] |  | model.py:485 |
+| lat | 张量 | self.norm(kv.to(dtype)) | bf16 [B, T/r, 512] | 返回值是还没加 RoPE 的压缩潜在量 | model.py:485 |
 
 ### 连线
 
 - ax → cf32
+- ax → cnorm：dtype
 - cf32 → cxf
 - cxf → proj
 - proj → kv0
@@ -509,13 +543,14 @@
 - csc → pool
 - pool → kvg
 - kvg → cnorm
-- cnorm → cout
+- cnorm → lat
 - cnorm 点开 → RMSNorm.forward
 
 ### 折叠
 
 | id | 名字 | 内容 |
 |---|---|---|
+| cf32 | 公式 | $x = x.\mathrm{float}()$，x 是送进压缩器的隐状态 |
 | cf32 | 说明 | 池化与门控都在 fp32 里算 |
 | proj | 公式 | $kv = x\, wkv.weight^\top$，$score = x\, wgate.weight^\top$，x 是本层输入 |
 | proj | 说明 | wkv.weight [512, 5120] 与 wgate.weight [512, 5120]，压缩比大于 1 时两个权重都是 fp32 |
@@ -544,37 +579,37 @@
 | ax | 张量 | x | bf16 [B, T, 5120] | source 层的注意力输入，与注意力、压缩器两张图里的 `ax` 是同一份 | model.py:533 |
 | qr | 张量 | qr | bf16 [B, T, 1280] | 注意力那边算出的低秩 query，索引器直接拿它当输入 | model.py:527 |
 | lat | 张量 | latent | bf16 [B, T/r, 512] | 压缩器的输出，还没加 RoPE | model.py:527，537 |
-| fcr | 张量 | self.freqs_cis | 复数 fp32 [max_seq_len, 32] | 注意力那边传进来的整张频率表 | model.py:733-734 |
+| fcall | 张量 | self.freqs_cis | 复数 fp32 [max_seq_len, 32] | 注意力那边传进来的整张频率表，与注意力图里的 fcall 是同一份 | model.py:733-734 |
 | fpos | 算子 | self.freqs_cis[: seqlen - seqlen % ratio : ratio] | [max_seq_len, 32] → [T/r, 32] |  | model.py:539-543 |
 | fq | 张量 | freqs | 复数 fp32 [T/r, 32] | | model.py:540-543 |
-| kw | 算子 | self.k_norm(self.wk(latent)) | 512 → 128 |  | model.py:544 |
+| kw | 算子 | self.k_norm(self.wk(latent)) | bf16 [B, T/r, 512] → bf16 [B, T/r, 128] |  | model.py:544 |
 | k0 | 张量 | k | bf16 [B, T/r, 128] | | model.py:544 |
-| krope | 算子 | apply_rotary_emb(k[..., -rd:], freqs) | 末 64 维，形状不变 |  | model.py:545 |
+| krope | 算子 | apply_rotary_emb(k[..., -rd:], freqs) | bf16 [B, T/r, 128] → bf16 [B, T/r, 128] |  | model.py:545 |
 | kr | 张量 | k | bf16 [B, T/r, 128] | | model.py:545 |
-| kq | 算子 | fp4_act_quant(k, fp4_block_size, True) | 形状不变 |  | model.py:546 |
+| kq | 算子 | fp4_act_quant(k, fp4_block_size, True) | bf16 [B, T/r, 128] → bf16 [B, T/r, 128] |  | model.py:546 |
 | kf | 张量 | k | bf16 [B, T/r, 128] | 存的是 fp4 量化后再反量化的值 | model.py:546 |
-| kwrite | 算子 | self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k | 写入索引键缓存 |  | model.py:547-548 |
+| kwrite | 算子 | self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k | bf16 [B, T/r, 128] → [max_batch_size, max_seq_len / r, 128] |  | model.py:547-548 |
 | kcache | 缓存 | k_cache | [max_batch_size, max_seq_len / r, 128] | 2、8、14、20 各有一份，按 max_batch_size 分配；写完发布给 shared_attn，它之后到下一个 kv source 层之前的索引器读的是这一份 | model.py:520-525 |
-| qop | 算子 | self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim)) | 1280 → 32 × 128 |  | model.py:550 |
+| qop | 算子 | self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim)) | bf16 [B, T, 1280] → bf16 [B, T, 32, 128] |  | model.py:550 |
 | iq0 | 张量 | q | bf16 [B, T, 32, 128] | | model.py:550 |
-| qrope | 算子 | apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos]) | 末 64 维，形状不变 |  | model.py:551 |
+| qrope | 算子 | apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos]) | bf16 [B, T, 32, 128] → bf16 [B, T, 32, 128] |  | model.py:551 |
 | iqr | 张量 | q | bf16 [B, T, 32, 128] | | model.py:551 |
-| iq_q | 算子 | fp4_act_quant(q, fp4_block_size, True) | 形状不变 |  | model.py:552 |
+| iq_q | 算子 | fp4_act_quant(q, fp4_block_size, True) | bf16 [B, T, 32, 128] → bf16 [B, T, 32, 128] |  | model.py:552 |
 | iq | 张量 | q | bf16 [B, T, 32, 128] | 存的是 fp4 量化后再反量化的值 | model.py:552 |
 | ik | 张量 | index_k | bf16 [B, T/r, 128] | 从 shared_attn.index_k 读出的、本次可见的部分 | model.py:554 |
-| wproj | 算子 | self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5) | 5120 → 32 |  | model.py:555 |
+| wproj | 算子 | self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5) | bf16 [B, T, 5120] → bf16 [B, T, 32] |  | model.py:555 |
 | iwt | 张量 | weights | bf16 [B, T, 32] | | model.py:555 |
 | idot | 算子 | torch.einsum("bshd,btd->bsht", q, index_k) | [B, T, 32, 128] 与 [B, T/r, 128] → [B, T, 32, T/r] |  | model.py:556 |
 | sc0 | 张量 | index_score | bf16 [B, T, 32, T/r] | | model.py:556 |
 | red | 算子 | (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2) | [B, T, 32, T/r] → [B, T, T/r] |  | model.py:557 |
 | isc | 张量 | index_score | bf16 [B, T, T/r] | | model.py:557 |
-| lens | 算子 | (torch.arange(1, seqlen + 1) // ratio).unsqueeze(-1) | T → int64 [T, 1] |  | model.py:563-564 |
+| lens | 算子 | (torch.arange(1, seqlen + 1) // ratio).unsqueeze(-1) | [B, T, 5120] → int64 [T, 1] |  | model.py:563-564 |
 | lv | 张量 | compress_lens | int64 [T, 1] | | model.py:563-564 |
-| imask | 算子 | index_score.masked_fill_(torch.arange(seqlen // ratio) >= compress_lens, -torch.inf) | 形状不变 |  | model.py:565 |
+| imask | 算子 | index_score.masked_fill_(torch.arange(seqlen // ratio) >= compress_lens, -torch.inf) | bf16 [B, T, T/r] → bf16 [B, T, T/r] |  | model.py:565 |
 | iscm | 张量 | index_score | bf16 [B, T, T/r] | | model.py:565 |
 | topk | 算子 | index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values | bf16 [B, T, T/r] → int64 [B, T, 512] |  | model.py:578-579 |
 | isel | 张量 | idxs | int64 [B, T, 512] | | model.py:579 |
-| shift | 算子 | torch.where(idxs < compress_lens, idxs + offset, -1) | 形状不变 |  | model.py:580 |
+| shift | 算子 | torch.where(idxs < compress_lens, idxs + offset, -1).int() | int64 [B, T, 512] → int32 [B, T, 512] |  | model.py:580 |
 | cidxs | 张量 | idxs | int32 [B, T, 512] | 交给注意力那边拼进 topk_idxs | model.py:580 |
 
 ### 连线
@@ -582,11 +617,12 @@
 - qr → qop
 - qop → iq0
 - iq0 → qrope
-- fcr → qrope
+- fcall → qrope
 - qrope → iqr
 - iqr → iq_q
 - iq_q → iq
-- fcr → fpos
+- fcall → fpos
+- ax → fpos：形状（seqlen）
 - fpos → fq
 - lat → kw
 - kw → k0
@@ -626,20 +662,23 @@
 | fpos | 说明 | 取压缩位置的频率，第 g 组取位置 g × r |
 | kw | 公式 | $k = k\_norm.weight \odot \dfrac{latent\, wk.weight^\top}{\sqrt{\mathrm{mean}((latent\, wk.weight^\top)^2) + k\_norm.eps}}$，latent 是压缩器的输出，wk.weight 与 k_norm.weight 是这一行的两个权重 |
 | kw | 说明 | wk.weight [128, 512]、k_norm.weight [128] |
-| krope | 公式 | $k_{...,-rd:} = \mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(k_{...,-rd:}) \odot freqs)$，k 是索引键，freqs 是压缩位置的频率，rd 是 rope_head_dim |
+| krope | 公式 | $k_{...,-rd:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(k_{...,-rd:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs))$，k 是索引键，freqs 是压缩位置的频率，rd 是 rope_head_dim，相邻两维配成一对复数 |
 | krope | 说明 | 128 维里的最后 64 维加 RoPE |
+| kq | 公式 | $s = \mathrm{fast\_round\_scale}(\max(\mathrm{absmax}(k), 6 \cdot 2^{-126}), 1/6)$，$k = \mathrm{bf16}(\mathrm{fp4}(\mathrm{clamp}(k / s, -6, 6)) \cdot s)$。absmax 按每 32 个数一组取。k 是加过 RoPE 的索引键 |
 | kq | 说明 | E2M1 格式，每 32 个通道一个 E8M0 scale，原地量化再反量化 |
+| kwrite | 公式 | $k\_cache_{:B,\ 0:T/r} = k$，k 是量化后的索引键，start_pos 为 0 |
 | kwrite | 说明 | start_pos 为 0，从第 0 行起整块写；写完把这份缓存发布到 shared_attn.index_k，后面的层直接读 |
 | qop | 公式 | $q = \mathrm{unflatten}(qr\, wq\_b.weight^\top, (n\_local\_heads, index\_head\_dim))$，qr 是注意力低秩 query，wq_b.weight 是索引器的查询投影 |
 | qop | 说明 | wq_b.weight [4096, 1280]，32 × 128 = 4096 |
-| qrope | 公式 | $q_{...,-rd:} = \mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(q_{...,-rd:}) \odot freqs\_cis)$，q 是索引 query，freqs_cis 从 start_pos 取到 end_pos，rd 是 rope_head_dim |
+| qrope | 公式 | $q_{...,-rd:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(q_{...,-rd:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs\_cis))$，q 是索引 query，freqs_cis 从 start_pos 取到 end_pos，rd 是 rope_head_dim，相邻两维配成一对复数 |
 | qrope | 说明 | 乘从 start_pos 取到 end_pos 的 freqs_cis |
+| iq_q | 公式 | $s = \mathrm{fast\_round\_scale}(\max(\mathrm{absmax}(q), 6 \cdot 2^{-126}), 1/6)$，$q = \mathrm{bf16}(\mathrm{fp4}(\mathrm{clamp}(q / s, -6, 6)) \cdot s)$。absmax 按每 32 个数一组取。q 是加过 RoPE 的索引 query |
 | iq_q | 说明 | 索引器的 query 也量化成 fp4 |
 | wproj | 公式 | $weights = (x\, weights\_proj.weight^\top) \cdot softmax\_scale \cdot n\_heads^{-0.5}$，x 是本层输入，softmax_scale 是 index_head_dim 的 -1/2 次方，n_heads 是 index_n_heads |
 | wproj | 说明 | weights_proj.weight [32, 5120]；乘的常数是 $128^{-1/2} \cdot 32^{-1/2}$ |
 | idot | 公式 | $index\_score_{b,s,h,t} = \sum_d q_{b,s,h,d}\, index\_k_{b,t,d}$，q 是索引 query，index_k 是索引键，h 是 einsum 里的头维，d 是 index_head_dim |
 | idot | 说明 | 每个索引头对每个压缩位置记一个点积 |
-| red | 公式 | $index\_score = \sum_i \mathrm{relu}(index\_score_i) \cdot weights_i$，i 是 head 维，weights 是 weights_proj 给出的系数，求和前的 index_score 是上一行的点积 |
+| red | 公式 | $index\_score = \sum_i \mathrm{relu}(s_i) \cdot weights_i$，s 是上一行按头的点积，i 是 head 维，weights 是 weights_proj 给出的系数 |
 | red | 说明 | 先过 ReLU，再按头用 weights 加权求和 |
 | lens | 公式 | $compress\_lens_i = \lfloor (i+1) / ratio \rfloor$，i 从 0 到 seqlen−1，ratio 是 compress_ratio |
 | lens | 说明 | 第 i 个 query 能看到 ⌊(i+1)/r⌋ 个压缩条目 |
@@ -648,7 +687,7 @@
 | topk | 公式 | $idxs = \mathrm{sort}(\mathrm{topk}(index\_score, topk))$，topk 取 min(512, T/ratio)，sort 按位置排回 |
 | topk | 说明 | topk = min(512, T/r)，前提里 T 足够长所以就是 512；取分数最高的 512 个，再按位置顺序排回来 |
 | shift | 公式 | $idxs = \mathrm{where}(idxs < compress\_lens,\ idxs + offset,\ -1)$，idxs 是 topk 的结果，offset 是窗口 KV 的长度 |
-| shift | 说明 | 不小于可达数的置 −1，其余加上 offset 变成拼起来的 KV 里的下标 |
+| shift | 说明 | 不小于可达数的置 −1，其余加上 offset 变成拼起来的 KV 里的下标。offset 由注意力传入，是这次窗口 KV 的长度 T |
 
 ### 面板
 
@@ -674,17 +713,19 @@
 | gate_op | 算子 | self.gate(x, None) | [B×T, 5120] → 权重 [B×T, 6] 与专家下标 [B×T, 6] |  | model.py:892 |
 | gw | 张量 | weights | fp32 [B×T, 6] | | model.py:892 |
 | gi | 张量 | indices | int64 [B×T, 6] | | model.py:892 |
+| bc | 算子 | torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist() | int64 [B×T, 6] → list，长度 384 |  | model.py:894 |
+| counts | 张量 | counts | list，长度 384 | | model.py:894 |
 | y0 | 算子 | torch.zeros_like(x, dtype=torch.float32) | bf16 [B×T, 5120] → fp32 [B×T, 5120] |  | model.py:893 |
 | y | 张量 | y | fp32 [B×T, 5120] | | model.py:893 |
 | mpick | 算子 | torch.where(indices == i) | int64 [B×T, 6] → int64 [n] × 2 |  | model.py:899 |
 | pidx | 张量 | idx, top | int64 [n] 与 int64 [n] | n 是分到第 i 个专家的 token 数 | model.py:899 |
-| mexp | 算子 | expert(x[idx], weights[idx, top, None]) | 5120 → 5120 |  | model.py:900 |
+| mexp | 算子 | expert(x[idx], weights[idx, top, None]) | bf16 [n, 5120] → bf16 [n, 5120] |  | model.py:900 |
 | eout | 张量 | expert(x[idx], weights[idx, top, None]) | bf16 [n, 5120] | | model.py:900 |
-| acc | 算子 | y[idx] += expert(...) | fp32 [B×T, 5120] 上累加 |  | model.py:900 |
+| acc | 算子 | y[idx] += expert(x[idx], weights[idx, top, None]) | fp32 [B×T, 5120] 与 bf16 [n, 5120] → fp32 [B×T, 5120] |  | model.py:900 |
 | y2 | 张量 | y | fp32 [B×T, 5120] | | model.py:900 |
-| shared | 算子 | self.shared_experts(x) | 5120 → 5120 |  | model.py:903 |
+| shared | 算子 | self.shared_experts(x) | bf16 [B×T, 5120] → bf16 [B×T, 5120] |  | model.py:903 |
 | sv | 张量 | self.shared_experts(x) | bf16 [B×T, 5120] | | model.py:903 |
-| madd | 算子 | y += self.shared_experts(x) | 逐元素相加 |  | model.py:903 |
+| madd | 算子 | y += self.shared_experts(x) | fp32 [B×T, 5120] 与 bf16 [B×T, 5120] → fp32 [B×T, 5120] |  | model.py:903 |
 | y3 | 张量 | y | fp32 [B×T, 5120] | | model.py:903 |
 | mback | 算子 | y.type_as(x).view(shape) | [B×T, 5120] → bf16 [B, T, 5120] |  | model.py:904 |
 | mout | 张量 | y | bf16 [B, T, 5120] | | model.py:904 |
@@ -698,7 +739,10 @@
 - gate_op → gi
 - mxf → y0：形状与 device
 - y0 → y
+- gi → bc
+- bc → counts
 - gi → mpick
+- counts → mpick：counts[i] 为 0 则跳过
 - mpick → pidx
 - pidx → mexp：行下标与 top 位置
 - mxf → mexp：x[idx]
@@ -713,32 +757,41 @@
 - sv → madd
 - madd → y3
 - y3 → mback
+- mx → mback：dtype 与 shape
 - mback → mout
 - gate_op 点开 → Gate.forward
 - mexp 点开 → Expert.forward
-- shared 点开 → Expert.forward
 
 ### 折叠
 
 | id | 名字 | 内容 |
 |---|---|---|
+| flat | 公式 | $x = x.\mathrm{view}(-1, dim)$，x 是前馈输入，dim 是 5120 |
 | flat | 说明 | 把批次与序列两维拉平，MoE 按 token 处理 |
+| gate_op | 公式 | $weights, indices = gate(x, None)$，x 是拉平后的隐状态，这次不传 image_mask |
 | gate_op | 说明 | Gate：打分、加偏置选专家、在 top-6 内归一化、乘 route_scale；image_mask 为 None，源码在这个分支上就传 None |
+| y0 | 公式 | $y = \mathrm{zeros\_like}(x)$，x 是拉平后的隐状态，dtype 取 fp32 |
 | y0 | 说明 | 累加器，路由专家的结果都往它上面加 |
-| mpick | 说明 | 挑出分给第 i 个专家的 token，384 个专家各跑一遍；没分到 token 的专家整个跳过 |
-| mexp | 说明 | 每个 token 只过它被分到的那个专家，路由权重按自己的 top 位置取 |
-| acc | 公式 | $y[idx] = y[idx] + expert(x[idx], weights[idx, top])$，idx 与 top 标明这一 token 分到的专家和它在 top-6 里的位置 |
+| bc | 公式 | $counts = \mathrm{bincount}(indices.\mathrm{flatten}(), minlength=n\_routed\_experts).\mathrm{tolist}()$，indices 是专家下标，n_routed_experts 是 384 |
+| bc | 说明 | counts 是 Python list，长度 384。counts[i] 为 0 的专家后面直接跳过 |
+| mpick | 公式 | $idx, top = \mathrm{where}(indices = i)$，indices 是每个 token 的 top-6 专家号，i 是当前专家 |
+| mpick | 说明 | 挑出分给第 i 个专家的 token，384 个专家各跑一遍；counts[i] 为 0 的专家整个跳过 |
+| mexp | 公式 | $eout = expert(x[idx], weights[idx, top, None])$，x 是拉平后的隐状态，weights 是路由权重 |
+| mexp | 说明 | 这一步只处理分给当前专家 i 的 token。一个 token 可以出现在多个专家的 top-6 里，路由权重按它在 top-6 里的位置取 |
+| acc | 公式 | $y[idx] = y[idx] + eout$，y 是累加器，eout 是 expert(x[idx], weights[idx, top, None]) 的返回值，idx 是分到这个专家的 token |
 | acc | 说明 | 一个 token 落在 top-6 的哪几个专家上就加几次 |
-| shared | 说明 | shared_experts 是一个 Expert，每个 token 都过，它的三个权重按主干精度 fp8 存储 |
-| madd | 公式 | $y = y + shared\_experts(x)$，y 是路由专家已经累加的结果，x 是拉平后的隐状态 |
+| shared | 公式 | $sv = shared\_experts(x)$，x 是拉平后的隐状态。这次调用不传 weights |
+| shared | 说明 | shared_experts 是一个 Expert，每个 token 都过。不传 weights，所以不走 Expert.forward 里的 emw。三个权重按主干精度 fp8 存储 |
+| madd | 公式 | $y = y + sv$，y 是路由专家已经累加的结果，sv 是共享专家的输出 |
 | madd | 说明 | 路由专家的和再加上共享专家的输出 |
+| mback | 公式 | $y = y.\mathrm{type\_as}(x).\mathrm{view}(shape)$，x 是拉平后的隐状态，dtype 与进入时相同，shape 是拉平前记下的 [B, T, 5120] |
 | mback | 说明 | 转回输入的 dtype 与形状 |
 
 ### 面板
 
 | 组 | 名字 | 值 |
 |---|---|---|
-| 公式 | 前馈 | $y[idx] = y[idx] + expert(x[idx], weights[idx, top])$，然后 $y = y + shared\_experts(x)$。x 是拉平后的隐状态，weights 是路由权重 |
+| 公式 | 前馈 | $y[idx] = y[idx] + eout$，然后 $y = y + sv$。eout 是路由专家的输出，sv 是共享专家的输出。共享专家不传 weights |
 | 配置 | dim | 5120 |
 | 配置 | moe_inter_dim | 2304 |
 | 配置 | n_routed_experts | 384 |
@@ -752,18 +805,18 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | gx | 张量 | x | bf16 [B×T, 5120] | 拉平后的隐状态 | model.py:811 |
-| lg | 算子 | linear(x.float(), self.weight.float()) / self.gate_temp | 5120 → 384 |  | model.py:811 |
+| lg | 算子 | linear(x.float(), self.weight.float()) / self.gate_temp | bf16 [B×T, 5120] → fp32 [B×T, 384] |  | model.py:811 |
 | s0 | 张量 | scores | fp32 [B×T, 384] | | model.py:811 |
-| act | 算子 | F.softplus(scores).sqrt() | 形状不变 |  | model.py:817 |
+| act | 算子 | F.softplus(scores).sqrt() | fp32 [B×T, 384] → fp32 [B×T, 384] |  | model.py:817 |
 | s | 张量 | scores | fp32 [B×T, 384] | | model.py:817 |
 | bv | 张量 | self.bias | fp32 [384] | 可学习参数，只在挑专家时加到分数上，不改权重的值；image_mask 为 None 时源码直接用 `self.bias` | model.py:818 |
 | gsel | 算子 | (scores + bias).topk(self.topk, dim=-1)[1] | fp32 [B×T, 384] → int64 [B×T, 6] |  | model.py:822 |
 | gi | 张量 | indices | int64 [B×T, 6] | | model.py:822 |
 | gth | 算子 | scores.gather(1, indices) | fp32 [B×T, 384] → fp32 [B×T, 6] |  | model.py:823 |
 | w0 | 张量 | weights | fp32 [B×T, 6] | | model.py:823 |
-| nrm | 算子 | weights /= weights.sum(dim=-1, keepdim=True) + 1e-20 | 形状不变 |  | model.py:824-825 |
+| nrm | 算子 | weights /= weights.sum(dim=-1, keepdim=True) + 1e-20 | fp32 [B×T, 6] → fp32 [B×T, 6] |  | model.py:824-825 |
 | w1 | 张量 | weights | fp32 [B×T, 6] | | model.py:825 |
-| grs | 算子 | weights *= self.route_scale | 形状不变 |  | model.py:826 |
+| grs | 算子 | weights *= self.route_scale | fp32 [B×T, 6] → fp32 [B×T, 6] |  | model.py:826 |
 | gw | 张量 | weights | fp32 [B×T, 6] | | model.py:826 |
 | gret | 张量 | (weights, indices) | — | 两个返回值都交给 MoE | model.py:827 |
 
@@ -823,21 +876,21 @@
 
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
-| ex | 张量 | x | bf16 [n, 5120] | n 是分给这个专家的 token 数；共享专家那里 n 就是全部 token | model.py:842 |
+| ex | 张量 | x | bf16 [n, 5120] | n 是分给这个路由专家的 token 数 | model.py:842 |
 | wts | 张量 | weights | fp32 [n, 1] | 只有路由专家传这个，共享专家不传 | model.py:841 |
-| g1 | 算子 | self.w1(x).float() | 5120 → 2304 |  | model.py:843 |
+| g1 | 算子 | self.w1(x).float() | bf16 [n, 5120] → fp32 [n, 2304] |  | model.py:843 |
 | eact | 张量 | gate | fp32 [n, 2304] | | model.py:843 |
-| u1 | 算子 | self.w3(x).float() | 5120 → 2304 |  | model.py:844 |
+| u1 | 算子 | self.w3(x).float() | bf16 [n, 5120] → fp32 [n, 2304] |  | model.py:844 |
 | up | 张量 | up | fp32 [n, 2304] | | model.py:844 |
-| cl | 算子 | torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit) | 形状不变 |  | model.py:846 |
+| cl | 算子 | torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit) | fp32 [n, 2304] → fp32 [n, 2304] |  | model.py:846 |
 | up2 | 张量 | up | fp32 [n, 2304] | | model.py:846 |
-| cl2 | 算子 | torch.clamp(gate, max=self.swiglu_limit) | 形状不变 |  | model.py:847 |
+| cl2 | 算子 | torch.clamp(gate, max=self.swiglu_limit) | fp32 [n, 2304] → fp32 [n, 2304] |  | model.py:847 |
 | eact2 | 张量 | gate | fp32 [n, 2304] | | model.py:847 |
-| silu | 算子 | F.silu(gate) * up | 形状不变 |  | model.py:848 |
+| silu | 算子 | F.silu(gate) * up | fp32 [n, 2304] → fp32 [n, 2304] |  | model.py:848 |
 | hm | 张量 | F.silu(gate) * up | fp32 [n, 2304] | | model.py:848 |
-| emw | 算子 | weights * x | 形状不变 |  | model.py:850 |
+| emw | 算子 | weights * x | fp32 [n, 2304] → fp32 [n, 2304] |  | model.py:850 |
 | hw | 张量 | weights * x | fp32 [n, 2304] | | model.py:850 |
-| w2 | 算子 | self.w2(x.to(dtype)) | 2304 → 5120 |  | model.py:851 |
+| w2 | 算子 | self.w2(x.to(dtype)) | fp32 [n, 2304] → bf16 [n, 5120] |  | model.py:851 |
 | eout | 张量 | self.w2(x.to(dtype)) | bf16 [n, 5120] | | model.py:851 |
 
 ### 连线
@@ -857,6 +910,7 @@
 - wts → emw
 - emw → hw
 - hw → w2
+- ex → w2：dtype
 - w2 → eout
 
 ### 折叠
@@ -864,7 +918,7 @@
 | id | 名字 | 内容 |
 |---|---|---|
 | g1 | 公式 | $gate = x\, w1.weight^\top$，x 是输入，结果转成 fp32 |
-| g1 | 说明 | 路由专家的 w1.weight 存成 [2304, 2560] 的 fp4，每 32 个通道一个 E8M0 scale；共享专家走这张图时是 [2304, 5120] 的 fp8<br>先转 fp32 再夹 |
+| g1 | 说明 | 路由专家的 w1.weight 存成 [2304, 2560] 的 fp4，每 32 个通道一个 E8M0 scale。结果转成 fp32，夹取在后面的 cl2 |
 | u1 | 公式 | $up = x\, w3.weight^\top$，x 是输入，结果转成 fp32 |
 | u1 | 说明 | w3.weight 与 w1 同一种存法 |
 | cl | 公式 | $up = \mathrm{clamp}(up, -swiglu\_limit, swiglu\_limit)$，swiglu_limit 是 10 |
@@ -874,15 +928,15 @@
 | silu | 公式 | $x = \mathrm{silu}(gate) \odot up$，gate 与 up 是夹过界的两路 |
 | silu | 说明 | SiLU 的结果逐元素乘 up |
 | emw | 公式 | $x = weights \odot x$，weights 是路由权重 |
-| emw | 说明 | 路由权重逐 token 乘上去 |
-| w2 | 公式 | $x = x\, w2.weight^\top$，x 是乘过路由权重并转回存储 dtype 的隐状态 |
+| emw | 说明 | 只在传入 weights 时执行。这张图是路由专家，weights 来自 top-6 里该专家的权重 |
+| w2 | 公式 | $x = x.\mathrm{to}(dtype)\, w2.weight^\top$，dtype 是进入 Expert 时 x 的 dtype（bf16），x 是乘过路由权重的隐状态 |
 | w2 | 说明 | 路由专家的 w2.weight 存成 [5120, 1152] 的 fp4；共享专家是 [5120, 2304] 的 fp8 |
 
 ### 面板
 
 | 组 | 名字 | 值 |
 |---|---|---|
-| 公式 | SwiGLU | $gate = x\, w1.weight^\top$，$up = x\, w3.weight^\top$，夹到 swiglu_limit 以后 $x = weights \odot \mathrm{silu}(gate) \odot up$，再 $x = x\, w2.weight^\top$。x 是输入，weights 是路由权重 |
+| 公式 | SwiGLU | $gate = x\, w1.weight^\top$，$up = x\, w3.weight^\top$，夹到 swiglu_limit 以后 $x = \mathrm{silu}(gate) \odot up$，路由专家再 $x = weights \odot x$，然后 $x = x.\mathrm{to}(dtype)\, w2.weight^\top$。x 是输入，weights 是路由权重，dtype 是进入时 x 的 dtype |
 | 公式 | 夹取 | $up = \mathrm{clamp}(up, -swiglu\_limit, swiglu\_limit)$，$gate = \mathrm{clamp}(gate, \max=swiglu\_limit)$，swiglu_limit 是 10 |
 | 配置 | dim | 5120 |
 | 配置 | moe_inter_dim | 2304 |
@@ -898,27 +952,28 @@
 | hash_ids | 张量 | hash_ids | int64 [B, T, 24] | 本层的 n-gram 哈希行号，24 = (4 − 1) × 8 | model.py:350 |
 | nemb | 算子 | self.embed(hash_ids).flatten(-2) | [B, T, 24] → [B, T, 6144] |  | model.py:353，296-325 |
 | ev | 张量 | self.embed(hash_ids).flatten(-2) | bf16 [B, T, 6144] | | model.py:353 |
-| nwkv | 算子 | self.wkv(...) | 6144 → 25600 |  | model.py:353-354 |
+| nwkv | 算子 | self.wkv(ev) | [B, T, 6144] → [B, T, 25600] |  | model.py:353 |
 | nkv | 张量 | kv | bf16 [B, T, 25600] | | model.py:353 |
+| spl | 算子 | kv.split([self.hc_mult * self.dim, self.dim], dim=-1) | [B, T, 25600] → [B, T, 20480] 与 [B, T, 5120] |  | model.py:354 |
 | key0 | 张量 | key | bf16 [B, T, 20480] | 20480 = 4 × 5120，每份残差流一个键 | model.py:354 |
 | value | 张量 | value | bf16 [B, T, 5120] | 4 份残差流共用同一个值 | model.py:354 |
 | ekey | 算子 | key.float().unflatten(-1, (self.hc_mult, self.dim)) | [B, T, 20480] → fp32 [B, T, 4, 5120] |  | model.py:355 |
 | key | 张量 | key | fp32 [B, T, 4, 5120] | | model.py:355 |
-| ewm | 算子 | self.q_weight.float() * self.k_weight.float() | [4, 5120] 逐元素相乘 |  | model.py:356 |
+| ewm | 算子 | self.q_weight.float() * self.k_weight.float() | [4, 5120] → fp32 [4, 5120] |  | model.py:356 |
 | ew | 张量 | weight | fp32 [4, 5120] | | model.py:356 |
-| nhf | 算子 | x.float() | [B, T, 4, 5120] 不变 |  | model.py:357 |
+| nhf | 算子 | x.float() | bf16 [B, T, 4, 5120] → fp32 [B, T, 4, 5120] |  | model.py:357 |
 | nh | 张量 | h | fp32 [B, T, 4, 5120] | | model.py:357 |
 | rstd | 算子 | torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps) | [B, T, 4, 5120] → fp32 [B, T, 4] |  | model.py:359 |
 | nrs | 张量 | rstd | fp32 [B, T, 4] | | model.py:359 |
 | ndot | 算子 | (h * weight * key).sum(-1) * rstd * self.dim**-0.5 | [B, T, 4, 5120] → [B, T, 4] |  | model.py:360 |
 | d | 张量 | dot | fp32 [B, T, 4] | | model.py:360 |
-| ngate | 算子 | torch.sigmoid(<br>torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot)) | 形状不变 |  | model.py:362 |
+| ngate | 算子 | torch.sigmoid(<br>torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot)) | fp32 [B, T, 4] → fp32 [B, T, 4] |  | model.py:362 |
 | g | 张量 | gate | fp32 [B, T, 4] | | model.py:362 |
 | vf | 算子 | value.float().unsqueeze(-2) | [B, T, 5120] → fp32 [B, T, 1, 5120] |  | model.py:365 |
 | v | 张量 | value.float().unsqueeze(-2) | fp32 [B, T, 1, 5120] | | model.py:365 |
-| nadd | 算子 | h + gate.unsqueeze(-1) * value.float().unsqueeze(-2) | 形状不变 |  | model.py:365 |
+| nadd | 算子 | h + gate.unsqueeze(-1) * v | fp32 [B, T, 4, 5120] → fp32 [B, T, 4, 5120] |  | model.py:365 |
 | sum | 张量 | h + gate.unsqueeze(-1) * value.float().unsqueeze(-2) | fp32 [B, T, 4, 5120] | | model.py:365 |
-| ncast | 算子 | .to(x.dtype) | 形状不变 |  | model.py:365 |
+| ncast | 算子 | .to(x.dtype) | fp32 [B, T, 4, 5120] → bf16 [B, T, 4, 5120] |  | model.py:365 |
 | nout | 张量 | (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype) | bf16 [B, T, 4, 5120] | | model.py:365 |
 
 ### 连线
@@ -929,8 +984,9 @@
 - nemb → ev
 - ev → nwkv
 - nwkv → nkv
-- nkv → key0
-- nkv → value
+- nkv → spl
+- spl → key0
+- spl → value
 - key0 → ekey
 - ekey → key
 - ewm → ew
@@ -951,27 +1007,35 @@
 - nh → nadd
 - nadd → sum
 - sum → ncast
+- nx → ncast：dtype
 - ncast → nout
 
 ### 折叠
 
 | id | 名字 | 内容 |
 |---|---|---|
+| nemb | 公式 | $values = \mathrm{embedding}(hash\_ids, weight)$，$scales = \mathrm{embedding}(hash\_ids, scale)$，$ev = \mathrm{flatten}((values.\mathrm{float}().\mathrm{unflatten}(-1, (-1, 32)) \odot scales.\mathrm{float}().\mathrm{unsqueeze}(-1)).\mathrm{flatten}(-2).\mathrm{to}(bf16))$。weight、scale 是 embed 的参数，32 是 fp8_block_size，256 / 32 = 8。外层 flatten 把 24 与 256 合成 6144 |
 | nemb | 说明 | ParallelEngramEmbedding：表按行分片，查出 fp8 的行再用 scale 反量化成 bf16<br>24 × 256 = 6144；层 1 的表有 384006168 行，层 14 有 384016682 行 |
+| nwkv | 公式 | $kv = ev\, wkv.weight^\top$，ev 是查表并 flatten 后的向量，wkv.weight 是 [25600, 6144] |
 | nwkv | 说明 | wkv.weight [25600, 6144]；输出切成 key 与 value 两段 |
+| spl | 公式 | $key, value = \mathrm{split}(kv, [hc\_mult \cdot dim, dim])$，kv 是 wkv 的输出，hc_mult 是 4，dim 是 5120 |
+| ekey | 公式 | $key = key.\mathrm{float}().\mathrm{unflatten}(-1, (hc\_mult, dim))$，key 是切出来的前 20480 维，hc_mult 是 4，dim 是 5120 |
 | ekey | 说明 | key 转成 fp32，再拆成 hc_mult 份 |
 | ewm | 公式 | $weight = q\_weight \odot k\_weight$，两个参数都是 [hc_mult, dim] |
 | ewm | 说明 | q_weight 与 k_weight 都是 [4, 5120] 的参数，代码里只以乘积形式出现 |
+| nhf | 公式 | $h = x.\mathrm{float}()$，x 是本层残差流 |
 | nhf | 说明 | 归一化与点积都在 fp32 里算 |
 | rstd | 公式 | $rstd = \mathrm{rsqrt}(\mathrm{mean}(h^2) + eps) \cdot \mathrm{rsqrt}(\mathrm{mean}(key^2) + eps)$，h 是 x 转成 fp32 的残差，key 是查表得到的键，eps 是 norm_eps，mean 在最后一维 |
 | rstd | 说明 | 两边各按最后一维求均方，逐 token、逐份归一化 |
 | ndot | 公式 | $dot = \mathrm{sum}(h \odot weight \odot key, -1) \cdot rstd \cdot dim^{-0.5}$，h、weight、key、rstd 是送进来的张量，dim 是 5120 |
 | ndot | 说明 | 归一化点积，再乘 $5120^{-1/2}$ |
-| ngate | 公式 | $gate = \mathrm{sigmoid}(\mathrm{sign}(dot)\sqrt{\max(\|dot\|, clamp\_value)})$，dot 是归一化点积，clamp_value 是 1e-6 |
+| ngate | 公式 | $gate = \mathrm{sigmoid}(\mathrm{copysign}(\sqrt{\max(\lvert dot \rvert, clamp\_value)}, dot))$，dot 是归一化点积，clamp_value 是 1e-6 |
 | ngate | 说明 | 先带符号开方再进 sigmoid，与训练 kernel 一致 |
+| vf | 公式 | $v = value.\mathrm{float}().\mathrm{unsqueeze}(-2)$，value 是查表得到的值 |
 | vf | 说明 | 补一维好按份广播 |
-| nadd | 公式 | $h = h + gate \odot value$，h 是残差流，gate 逐份，value 是 4 份共用的值 |
+| nadd | 公式 | $h = h + \mathrm{unsqueeze}(gate, -1) \odot v$，h 是残差流，gate 逐份，v 是 value 转成 fp32 并在份这一维扩成 1 的结果 |
 | nadd | 说明 | 门控乘值再加回残差流 |
+| ncast | 公式 | $h = h.\mathrm{to}(x.dtype)$，x 是进入 Engram 时的残差 |
 | ncast | 说明 | 转回输入时的 dtype |
 
 ### 面板
@@ -979,8 +1043,8 @@
 | 组 | 名字 | 值 |
 |---|---|---|
 | 公式 | 归一化点积 | $rstd = \mathrm{rsqrt}(\mathrm{mean}(h^2)+eps)\cdot\mathrm{rsqrt}(\mathrm{mean}(key^2)+eps)$，$dot = \mathrm{sum}(h \odot weight \odot key, -1) \cdot rstd \cdot dim^{-0.5}$。h 是 x 转成 fp32 的残差，weight 是 q_weight 与 k_weight 的乘积，key 是查表得到的键，eps 是 norm_eps，dim 是 5120 |
-| 公式 | 门控 | $gate = \mathrm{sigmoid}(\mathrm{sign}(dot)\sqrt{\max(|dot|, clamp\_value)})$，dot 是归一化点积，clamp_value 是 1e-6 |
-| 公式 | 写入 | $h = h + gate \odot value$，h 是残差流，gate 逐份，value 是 4 份共用的值 |
+| 公式 | 门控 | $gate = \mathrm{sigmoid}(\mathrm{copysign}(\sqrt{\max(\lvert dot \rvert, clamp\_value)}, dot))$，dot 是归一化点积，clamp_value 是 1e-6 |
+| 公式 | 写入 | $h = h + \mathrm{unsqueeze}(gate, -1) \odot value.\mathrm{float}().\mathrm{unsqueeze}(-2)$，h 是残差流，gate 是 [B, T, 4]，value 是 [B, T, 5120]，按份广播 |
 | 配置 | dim | 5120 |
 | 配置 | hc_mult | 4 |
 | 配置 | engram_max_ngram_size | 4 |
@@ -997,28 +1061,34 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | ids | 张量 | input_ids | int64 [B, T] | | engram.py:160 |
-| cmap | 算子 | self.token_map[input_ids] | int64 [B, T] 不变 |  | engram.py:164 |
+| cmap | 算子 | self.token_map[input_ids] | int64 [B, T] → int64 [B, T] |  | engram.py:164 |
 | cids | 张量 | compressed | int64 [B, T] | | engram.py:164 |
-| wr | 算子 | self.cache[:batch, start_pos : start_pos + seqlen] = compressed | 写压缩 id 缓存 |  | engram.py:167 |
+| wr | 算子 | self.cache[:batch, start_pos : start_pos + seqlen] = compressed | int64 [B, T] → [max_batch_size, max_seq_len] |  | engram.py:167 |
 | cache | 缓存 | cache | int64 [max_batch_size, max_seq_len] | 按 max_batch_size 分配，取代码默认值 4；存的是压缩后的 id，不是原始 token id<br>decode 时按 start_pos 往后接 | engram.py:155-157 |
-| pos | 算子 | torch.arange(start_pos, start_pos + seqlen).expand(batch, seqlen) | batch, seqlen → int64 [B, T] |  | engram.py:169 |
+| pos | 算子 | torch.arange(start_pos, start_pos + seqlen).expand(batch, seqlen) | int64 [B, T] → int64 [B, T] |  | engram.py:169 |
 | p | 张量 | positions | int64 [B, T] | | engram.py:169 |
 | blk0 | 算子 | torch.zeros_like(positions, dtype=torch.bool) | int64 [B, T] → bool [B, T] |  | engram.py:170 |
 | blk | 张量 | blocked | bool [B, T] | | engram.py:170 |
 | gath | 算子 | self.cache[:batch].gather(1, (positions - shift).clamp_min(0)) | [max_batch_size, max_seq_len] → int64 [B, T] |  | engram.py:172 |
 | src | 张量 | source | int64 [B, T] | | engram.py:172 |
-| upd | 算子 | blocked \| (positions < shift) \| (source == self.DEAD) | 形状不变 |  | engram.py:173 |
+| upd | 算子 | blocked \| (positions < shift) \| (source == self.DEAD) | bool [B, T] → bool [B, T] |  | engram.py:173 |
 | updt | 张量 | blocked | bool [B, T] | | engram.py:173 |
-| rep | 算子 | torch.where(blocked, self.pad_id, source) | 形状不变 |  | engram.py:174 |
-| tk | 张量 | tokens | int64 [B, T, 4] | 第 k 列是往前看 k 个位置的那个 token | engram.py:174-175 |
+| rep | 算子 | torch.where(blocked, self.pad_id, source) | int64 [B, T] → int64 [B, T] |  | engram.py:174 |
+| tok | 张量 | torch.where(blocked, self.pad_id, source) | int64 [B, T] | 每个回看步一份 | engram.py:174 |
+| stk | 算子 | torch.stack(tokens, dim=-1) | int64 [B, T] × 4 → int64 [B, T, 4] |  | engram.py:175 |
+| tk | 张量 | tokens | int64 [B, T, 4] | 第 k 列对应 shift=k，k=0 是当前位置 | engram.py:175 |
 | prod | 算子 | tokens.unsqueeze(2) * self.multipliers | [B, T, 4] 与 [2, 4] → [B, T, 2, 4] |  | engram.py:179 |
 | pr | 张量 | products | int64 [B, T, 2, 4] | | engram.py:179 |
-| roll | 算子 | torch.bitwise_xor(rolling, products[..., i]) | 形状不变 |  | engram.py:180-182 |
+| r0 | 算子 | products[..., 0] | [B, T, 2, 4] → [B, T, 2] |  | engram.py:180 |
+| rinit | 张量 | rolling | int64 [B, T, 2] | 异或循环的初值 | engram.py:180 |
+| roll | 算子 | torch.bitwise_xor(rolling, products[..., i]) | int64 [B, T, 2] → int64 [B, T, 2] |  | engram.py:181-182 |
 | rl | 张量 | rolling | int64 [B, T, 2] | | engram.py:182 |
 | mod | 算子 | rolling.unsqueeze(-1) % self.primes[:, i - 1] | int64 [B, T, 2] → int64 [B, T, 2, 8] |  | engram.py:183 |
-| hs | 张量 | torch.cat(hashes, dim=-1) | int64 [B, T, 2, 24] | hashes 是 3 个桶组各 [B, T, 2, 8]，沿最后一维拼接；24 = (4 − 1) × 8 | engram.py:183-184 |
-| off | 算子 | torch.cat(hashes, dim=-1) + self.offsets | 形状不变 |  | engram.py:184 |
-| hashout | 张量 | torch.cat(hashes, dim=-1) + self.offsets | int64 [B, T, 2, 24] | | engram.py:184 |
+| hpart | 张量 | rolling.unsqueeze(-1) % self.primes[:, i - 1] | int64 [B, T, 2, 8] | 3 个桶组各一份 | engram.py:183 |
+| hcat | 算子 | torch.cat(hashes, dim=-1) | [B, T, 2, 8] × 3 → int64 [B, T, 2, 24] |  | engram.py:184 |
+| hs | 张量 | torch.cat(hashes, dim=-1) | int64 [B, T, 2, 24] | 24 = (4 − 1) × 8 | engram.py:184 |
+| off | 算子 | torch.cat(hashes, dim=-1) + self.offsets | int64 [B, T, 2, 24] → int64 [B, T, 2, 24] |  | engram.py:184 |
+| hash | 张量 | torch.cat(hashes, dim=-1) + self.offsets | int64 [B, T, 2, 24] | | engram.py:184 |
 
 ### 连线
 
@@ -1039,15 +1109,22 @@
 - upd → updt
 - updt → rep
 - src → rep
-- rep → tk
+- rep → tok
+- tok → stk
+- stk → tk
 - tk → prod
 - prod → pr
+- pr → r0
+- r0 → rinit
+- rinit → roll
 - pr → roll
 - roll → rl
 - rl → mod
-- mod → hs
+- mod → hpart
+- hpart → hcat
+- hcat → hs
 - hs → off
-- off → hashout
+- off → hash
 
 ### 折叠
 
@@ -1055,19 +1132,28 @@
 |---|---|---|
 | cmap | 公式 | $compressed = token\_map[input\_ids]$，input_ids 是词 id，token_map 是压缩词表的行号 |
 | cmap | 说明 | token_map 把每个 token id 映到压缩词表的 id，大小写与空白差异都归一到一个 id<br>压缩词表 99092 项，与 config 的 engram_compressed_vocab_size 一致，所有哈希乘数都由它推出 |
+| wr | 公式 | $cache_{:B,\ 0:T} = compressed$，compressed 是压缩后的 id，start_pos 为 0 |
 | wr | 说明 | start_pos 为 0，所以从第 0 列起整块写 |
+| pos | 公式 | $positions = \mathrm{arange}(start\_pos, start\_pos + seqlen).\mathrm{expand}(batch, seqlen)$，start_pos 为 0 |
 | pos | 说明 | start_pos 到 start_pos + seqlen 的位置，扩成 batch 行 |
+| blk0 | 公式 | $blocked = \mathrm{zeros\_like}(positions)$，dtype 是 bool |
 | blk0 | 说明 | 标记哪些位置已经不能往前看 |
+| gath | 公式 | $source = \mathrm{gather}(cache_{:B}, (positions - shift).\mathrm{clamp}(min=0))$，shift 是往前看的步数 |
 | gath | 说明 | 往前看 shift 个位置，越界处夹到 0 |
+| upd | 公式 | $blocked = blocked \lor (positions < shift) \lor (source = DEAD)$，DEAD 是 -1，标记不参与 n-gram 的位置。这次 engram_mask 是 None，不会把 DEAD 写进 cache |
 | upd | 说明 | 位置在序列开头之前就算断掉，之后的回看步也不再往前 |
+| rep | 公式 | $tokens = \mathrm{where}(blocked, pad\_id, source)$，pad_id 是断掉处填的压缩 id |
 | rep | 说明 | 断掉的位置填 pad_id，即 engram_pad_id（2）经 token_map 映出的那个压缩 id，与训练一致 |
-| prod | 公式 | $products = tokens \odot multipliers$，tokens 是各回看步的压缩 id，multipliers 是每层每个回看步的奇数乘数 |
+| prod | 公式 | $products = tokens.\mathrm{unsqueeze}(2) \odot multipliers$，tokens 是各回看步的压缩 id，unsqueeze 把层这一维扩出来，multipliers 是每层每个回看步的奇数乘数 |
 | prod | 说明 | multipliers 每个（Engram 层，回看步）一个奇数乘数，各层用自己的随机种子生成 |
-| roll | 公式 | $rolling = rolling \oplus products$，products 是上一行的乘积，$\oplus$ 是按位异或 |
+| r0 | 公式 | $rolling = products_{...,0}$，products 是 tokens 乘 multipliers 的结果，这一步取出异或循环的初值 |
+| stk | 公式 | $tokens = \mathrm{stack}(tokens, \dim=-1)$，4 个回看步各一份 [B, T]，shift 从 0 到 3 |
+| hcat | 公式 | $hashes = \mathrm{cat}(hashes, \dim=-1)$，3 个桶组各 [B, T, 2, 8] |
+| roll | 公式 | $rolling = rolling \oplus products_{...,i}$，i 从 1 到 3，products 是上一行的乘积，$\oplus$ 是按位异或 |
 | roll | 说明 | 一次异或一个回看步，第 i 步之后得到的是 i+1 元 n-gram 的哈希 |
 | mod | 公式 | $rolling \bmod primes$，primes 是每个（层，桶组，头）的质数 |
 | mod | 说明 | 每个（Engram 层，桶组，头）各有一个质数，互不重复；8 是 engram_n_heads，3 个桶组的结果沿最后一维拼成 24 |
-| off | 公式 | $hash = (rolling \bmod primes) + offsets$，offsets 是该桶在表里的起始行 |
+| off | 公式 | $hash = hs + offsets$，hs 是拼接后的桶下标，offsets 是各桶在表里的起始行 |
 | off | 说明 | 加上各桶在表里的起始偏移，得到整张表的行号 |
 
 ### 面板
@@ -1076,8 +1162,8 @@
 |---|---|---|
 | 公式 | 压缩映射 | $compressed = token\_map[input\_ids]$，input_ids 是词 id，token_map 把同形 token 映到同一个压缩 id，压缩词表 99092 项 |
 | 公式 | n-gram | 第 t 个位置的回看取 $c_{t-k}$，$k = 0 \ldots 3$；越界就填 pad_id |
-| 公式 | 哈希 | $products = tokens \odot multipliers$，再 $rolling = rolling \oplus products$。tokens 是各回看步的压缩 id，multipliers 是乘数，$\oplus$ 是按位异或 |
-| 公式 | 桶 | $hash = (rolling \bmod primes) + offsets$，primes 是每个（层，桶组，头）的质数，offsets 是该桶在表里的起始行 |
+| 公式 | 哈希 | $products = tokens \odot multipliers$。对 $i = 1 \ldots 3$，先 $rolling = rolling \oplus products_{...,i}$，再立刻对这次 rolling 取模。tokens 是各回看步的压缩 id，multipliers 是乘数，$\oplus$ 是按位异或 |
+| 公式 | 桶 | 每一步异或之后 $hashes = rolling \bmod primes$，三步拼起来再 $hash = hs + offsets$。primes 是每个（层，桶组，头）的质数，hs 是拼起来的桶下标，offsets 是该桶在表里的起始行 |
 | 配置 | engram_max_ngram_size | 4 |
 | 配置 | engram_n_heads | 8 |
 | 配置 | engram_head_dim | 256 |
@@ -1093,20 +1179,21 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | rx | 张量 | x | bf16 [..., d] | d 是被归一化的那一维：主干里 norm、attn_norm、ffn_norm 是 5120，q_norm 是 1280，kv_norm 是 512；压缩器的 norm 是 512；索引器的 k_norm 是 128 | model.py:288 |
-| rf32 | 算子 | x.float() | 形状不变 |  | model.py:289-290 |
+| rf32 | 算子 | x.float() | bf16 [..., d] → fp32 [..., d] |  | model.py:289-290 |
 | rxf | 张量 | x | fp32 [..., d] | | model.py:290 |
 | var | 算子 | x.square().mean(-1, keepdim=True) | [..., d] → [..., 1] |  | model.py:291 |
 | vr | 张量 | var | fp32 [..., 1] | | model.py:291 |
-| nr | 算子 | x * torch.rsqrt(var + self.eps) | 形状不变 |  | model.py:292 |
+| nr | 算子 | x * torch.rsqrt(var + self.eps) | fp32 [..., d] → fp32 [..., d] |  | model.py:292 |
 | xn | 张量 | x | fp32 [..., d] | | model.py:292 |
-| rmw | 算子 | self.weight * x | 形状不变 |  | model.py:293 |
+| rmw | 算子 | self.weight * x | fp32 [..., d] → fp32 [..., d] |  | model.py:293 |
 | rw | 张量 | self.weight * x | fp32 [..., d] | | model.py:293 |
-| rback | 算子 | .to(dtype) | 形状不变 |  | model.py:293 |
+| rback | 算子 | .to(dtype) | fp32 [..., d] → bf16 [..., d] |  | model.py:293 |
 | rout | 张量 | (self.weight * x).to(dtype) | bf16 [..., d] | | model.py:293 |
 
 ### 连线
 
 - rx → rf32
+- rx → rback：dtype
 - rf32 → rxf
 - rxf → var
 - var → vr
@@ -1122,6 +1209,7 @@
 
 | id | 名字 | 内容 |
 |---|---|---|
+| rf32 | 公式 | $x = x.\mathrm{float}()$，x 是送进 RMSNorm 的张量 |
 | rf32 | 说明 | 先记下输入的 dtype，最后转回去 |
 | var | 公式 | $var = \mathrm{mean}(x^2)$，x 是转成 fp32 的输入，mean 在最后一维 |
 | var | 说明 | 最后一维上的平方均值 |
@@ -1129,6 +1217,7 @@
 | nr | 说明 | rsqrt 是平方根的倒数，eps 是 norm_eps |
 | rmw | 公式 | $x = weight \odot x$，weight 是 self.weight，x 是上一行归一化后的结果 |
 | rmw | 说明 | weight [d]，每个实例一份，如 norm.weight [5120]、q_norm.weight [1280] |
+| rback | 公式 | $x = x.\mathrm{to}(dtype)$，dtype 是进入 RMSNorm 时 x 的 dtype |
 | rback | 说明 | 转回输入时的 dtype |
 
 ### 面板
@@ -1150,7 +1239,7 @@
 | px | 张量 | x | bf16 [B, T, 5120] | 已经过最后的 RMSNorm | model.py:1008 |
 | plast | 算子 | x[:, -1] | [B, T, 5120] → [B, 5120] |  | model.py:1010-1011 |
 | xp | 张量 | x | bf16 [B, 5120] | | model.py:1011 |
-| lin | 算子 | F.linear(x.float(), self.weight) | 5120 → 129280 |  | model.py:1012 |
+| lin | 算子 | F.linear(x.float(), self.weight) | bf16 [B, 5120] → fp32 [B, 129280] |  | model.py:1012 |
 | logits | 张量 | logits | fp32 [B, 129280] | | model.py:1012 |
 
 ### 连线
