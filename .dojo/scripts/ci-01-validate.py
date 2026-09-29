@@ -73,10 +73,9 @@ ALLOWED_TYPES = [
 ]
 
 # 细粒度标签封闭词表：dojo:tag 只取其一，供首页按技术筛选。
-# 与 ALLOWED_TOPICS 的分工——topics 是粗分类，一个页面可属多个；
-# tag 回答「这篇讲什么技术」，单一取值。技术栈名（vLLM、llama.cpp）属于
-# 实现细节、文档形态（速查、论文）由 dojo:type 承担，都不进这里。
-# 新增取值前先确认它至少有 3 个页面，否则标签会重新碎片化。
+# topics 是粗分类，一个页面可属多个。
+# tag 回答「这篇讲什么技术」，单一取值。
+# 新增取值前先确认它至少有 3 个页面。
 ALLOWED_TAGS = [
     "KV cache",
     "MoE",
@@ -334,11 +333,8 @@ def validate_page(path: Path) -> list[str]:
                 " rewrite as '实测得到' or point to research/measured.md)"
             )
 
-    # guides/examples/ 下的示范页按 wiki 页面的标准检查
     parts = path.parts
-    is_wiki_page = "wiki" in parts or any(
-        parts[i:i + 2] == ("guides", "examples") for i in range(len(parts) - 1)
-    )
+    is_wiki_page = "wiki" in parts
     if is_wiki_page and path.name == "index.html":
         for name in REQUIRED_WIKI_META:
             if not inspector.meta.get(name):

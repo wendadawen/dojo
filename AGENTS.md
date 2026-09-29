@@ -5,7 +5,7 @@
 ## 目录结构
 
 ```text
-guides/       各类学习任务的操作指南，示范在 guides/examples/
+guides/       各类学习任务的操作指南
 wiki/         学习产出的可浏览页面，按需创建（wiki/<name>/index.html）
 .dojo/        通用构建设施（模板、首页资源、通用脚本），不含任何页面专属内容
 index.html    GitHub Pages 首页应用
@@ -24,14 +24,14 @@ index.html    GitHub Pages 首页应用
 | 将已确认的学习结论整理归档 | `guides/note.md` |
 | 推导模型前向数据流并生成 HTML | `guides/model-dataflow.md` |
 
-执行任何任务前，先完整读取对应指南，再开始动手。任务类型能从用户的话里确定时，直接做到交付，不要再问用哪种做法、要不要恢复旧页。「我要了解某某概念」走概念页，按 `guides/concept.md` 做到交付；目录里已有该页也要重写，不在对话里讲解，也不复述旧稿。需求不明确时，只提出一个能够确定任务类型的必要问题。任务类型发生变化时，再读取对应指南。
+执行任何任务前，先完整读取对应指南，再开始动手。任务类型能从用户的话里确定时，按对应指南从第 1 步做到交付。「我要了解某某概念」走概念页，按 `guides/concept.md` 做到交付。需求不明确时，只提出一个能够确定任务类型的必要问题。任务类型发生变化时，再读取对应指南。
 
 ## 项目约束
 
 - 产出统一为 HTML 页面，写入 `wiki/<name>/`；目录与 Graph 由 GitHub Pages 构建扫描 `wiki/*/index.html` 生成。
 - 页面 `<head>` 包含 `description`（纯文本）、`dojo:summary`（可含 `$...$` 公式）、`dojo:type`、`dojo:topics`、`dojo:tag`。
-- `dojo:topics` 只能从固定大类中选：注意力机制、模型结构、推理系统、内存与缓存、并行与通信、训练与优化、多模态、数学基础。需要新大类时，改 `.dojo/scripts/ci-01-validate.py` 的 `ALLOWED_TOPICS`，并同步本文件列出的大类，再使用。
-- `dojo:tag` 取封闭词表中的**单一**值，词表见 `.dojo/scripts/ci-01-validate.py` 的 `ALLOWED_TAGS`。首页按类型和主题筛选，标签参与搜索。它与 `dojo:topics` 的分工是「粗分类」对「这篇讲什么技术」：技术栈名（vLLM、llama.cpp）属于实现细节，文档形态（速查、论文）由 `dojo:type` 承担，都不进词表。新增取值前先确认至少有 3 个页面会用这个标签。
+- `dojo:topics` 是粗分类，一个页面可以有多个，只能从这些大类里选：注意力机制、模型结构、推理系统、内存与缓存、并行与通信、训练与优化、多模态、数学基础。需要新大类时，改 `.dojo/scripts/ci-01-validate.py` 的 `ALLOWED_TOPICS`，并同步本文件列出的大类，再使用。
+- `dojo:tag` 只取一个值，写这篇讲什么技术，词表见 `.dojo/scripts/ci-01-validate.py` 的 `ALLOWED_TAGS`。首页按类型和主题筛选，标签参与搜索。新增标签前先确认至少有 3 个页面会用它。
 - 页面以 `../../libs/` 引用共享库。
 - 页面图片存入 `wiki/<name>/assets/`，用相对路径 `assets/...` 引用。
 - 生成页面后运行 `.dojo/scripts/ci-01-validate.py <页面路径>`。
