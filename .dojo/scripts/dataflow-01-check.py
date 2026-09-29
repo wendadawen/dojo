@@ -462,7 +462,11 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
                 words |= set(NAME_ALIASES.get(n, ())) | {n}
                 words |= {w for w in re.findall(r"[A-Z]?[a-z]+", n) if len(w) >= 3}
             blob = "\n".join(text).lower()
-            if names and not any(w.lower() in blob for w in words):
+            matched = any(w.lower() in blob for w in words)
+            # 「40 × Block」指向 layer(...) 调用时，那一行不出现类名
+            if not matched and re.fullmatch(r"\d+\s*×\s*[A-Za-z_][A-Za-z0-9_]*", row.get("第一行", "").strip()):
+                matched = "layer(" in blob
+            if names and not matched:
                 errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字")
     return errors, checked
 
