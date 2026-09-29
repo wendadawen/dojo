@@ -525,9 +525,8 @@
     if (node.shape) {
       String(node.shape).split('\n').forEach(function (s) { lines.push([s, 'sh']); });
     }
-    // 参考标准的节点最多三行：算子名 / 形状 / 依据。
-    // 第三行放「用哪个权重」「配置开关→行为」「分层构成统计」这类可回查的硬信息，
-    // 它是参考图里信息密度最高的部分，此前被我挪到节点外，导致关键内容读不到。
+    // 算子的公式和说明在折叠里，节点上通常只有名字和形状。
+    // detail 仍画成第三行，旧页面把说明写在节点上时还能显示。
     if (node.detail) {
       String(node.detail).split('\n').forEach(function (s) { lines.push([s, 'dt']); });
     }
@@ -577,7 +576,9 @@
    * 文字就会溢出框外。返回 [{text, cls, lh}]，lh 是该行的行高。
    */
   function wrapLines(node, width) {
-    var maxText = Math.max(40, width - PAD_X * 2);
+    // 有折叠的算子右上角留一枚标记，文字不要钻到标记底下
+    var reserve = (node.kind === 'op' && node.fold && node.fold.length) ? 22 : 0;
+    var maxText = Math.max(40, width - PAD_X * 2 - reserve);
     var out = [];
     nodeLines(node).forEach(function (l) {
       var text = l[0], cls = l[1];
@@ -670,10 +671,12 @@
     this.svg.setAttribute('viewBox', '0 0 ' + rect.width + ' ' + rect.height);
     this.svg.setAttribute('width', rect.width);
     this.svg.setAttribute('height', rect.height);
+    this.positionFold();
   };
 
   FlowView.prototype.applyView = function (id) {
     var self = this;
+    this.closeFold();
     this.view = this.data.views.filter(function (v) { return v.id === id; })[0] || this.data.views[0];
     this.positions = {};
     this.edgeRoutes = {};
@@ -1135,9 +1138,32 @@
       cursor += lh;
     });
 
+    if (n.kind === 'op' && n.fold && n.fold.length) {
+      var mark = el('foreignObject', {
+        x: p.x + p.w - 26, y: p.y + 4, width: 22, height: 22
+      });
+      var wrap = document.createElement('div');
+      wrap.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'flow-fold-btn';
+      btn.textContent = '▾';
+      btn.setAttribute('aria-label', '展开');
+      btn.setAttribute('aria-expanded', 'false');
+      btn.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+        self.toggleFold(n, g, btn);
+      });
+      wrap.appendChild(btn);
+      mark.appendChild(wrap);
+      g.appendChild(mark);
+    }
+
     if (n.drill) {
       g.addEventListener('click', function (e) {
-        if (self.dragMoved) return;
+        if (e.target.closest && e.target.closest('.flow-fold-btn')) return;
         e.stopPropagation();
         // 让目标视图自己决定缩放：applyView 内部会按宽度适配并置中，
         // 这里不要再把 scale 强设成 1，否则跳过去只看到一角。
@@ -1223,58 +1249,104 @@
   FlowView.prototype.applyTransform = function () {
     this.scene.setAttribute('transform',
       'translate(' + this.tx + ',' + this.ty + ') scale(' + this.scale + ')');
+    this.positionFold();
+  };
+
+  FlowView.prototype.closeFold = function () {
+    if (this.foldBtn) {
+      this.foldBtn.classList.remove('on');
+      this.foldBtn.setAttribute('aria-expanded', 'false');
+    }
+    if (this.foldEl) this.foldEl.remove();
+    this.foldEl = null;
+    this.foldBtn = null;
+    this.foldAnchor = null;
+  };
+
+  FlowView.prototype.toggleFold = function (node, anchor, btn) {
+    if (this.foldBtn === btn && this.foldEl) {
+      this.closeFold();
+      return;
+    }
+    this.closeFold();
+    var card = document.createElement('div');
+    card.className = 'flow-fold';
+    card.setAttribute('role', 'dialog');
+    (node.fold || []).forEach(function (sec) {
+      var h = document.createElement('h3');
+      h.textContent = sec.title || '';
+      var body = document.createElement('div');
+      body.className = 'flow-fold-body';
+      String(sec.text || '').split('\n').forEach(function (line, i) {
+        if (i) body.appendChild(document.createElement('br'));
+        renderRich(body, line);
+      });
+      card.appendChild(h);
+      card.appendChild(body);
+    });
+    card.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+    this.app.appendChild(card);
+    this.foldEl = card;
+    this.foldBtn = btn;
+    this.foldAnchor = anchor;
+    btn.classList.add('on');
+    btn.setAttribute('aria-expanded', 'true');
+    this.positionFold();
+  };
+
+  FlowView.prototype.positionFold = function () {
+    if (!this.foldEl || !this.foldAnchor || !this.foldAnchor.isConnected) return;
+    var r = this.foldAnchor.getBoundingClientRect();
+    var app = this.app.getBoundingClientRect();
+    var card = this.foldEl;
+    var margin = 8;
+    var width = Math.min(440, Math.max(280, app.width - 28));
+    card.style.width = width + 'px';
+    var left = r.right - app.left + margin;
+    if (left + width > app.width - 12) left = r.left - app.left - width - margin;
+    if (left < 12) left = 12;
+    var maxH = Math.min(520, Math.max(180, app.height - 24));
+    var top = r.top - app.top;
+    if (top + maxH > app.height - 12) top = app.height - 12 - maxH;
+    if (top < 12) top = 12;
+    card.style.left = left + 'px';
+    card.style.top = top + 'px';
+    card.style.maxHeight = Math.min(maxH, app.height - top - 12) + 'px';
   };
 
   // ---------- 交互 ----------
 
   FlowView.prototype.bindEvents = function () {
     var self = this;
-    var dragging = null, panning = false, lastX = 0, lastY = 0;
-    this.dragMoved = false;
+    var panning = false, lastX = 0, lastY = 0;
 
     this.viewport.addEventListener('mousedown', function (e) {
+      if (e.target.closest && e.target.closest('.flow-fold-btn')) return;
+      self.closeFold();
       var g = e.target.closest ? e.target.closest('.flow-node') : null;
-      self.dragMoved = false;
       lastX = e.clientX; lastY = e.clientY;
-      if (g) {
-        var id = g.getAttribute('data-id');
-        var p = self.positions[id];
-        dragging = { id: id, startX: e.clientX, startY: e.clientY, ox: p.x, oy: p.y };
-      } else {
-        panning = true;
-        self.viewport.classList.add('is-panning');
-      }
+      // 按住节点不改位置。空白处拖动只平移画面。
+      if (g) return;
+      panning = true;
+      self.viewport.classList.add('is-panning');
       e.preventDefault();
     });
 
     window.addEventListener('mousemove', function (e) {
-      if (dragging) {
-        var dx = (e.clientX - dragging.startX) / self.scale;
-        var dy = (e.clientY - dragging.startY) / self.scale;
-        if (Math.abs(e.clientX - dragging.startX) > 2 ||
-            Math.abs(e.clientY - dragging.startY) > 2) {
-          if (!self.dragMoved) {
-            // 只在真正开始拖动时才把节点提到最上层。
-            // 不能在 mousedown 里做：appendChild 会把元素移出再插入，
-            // 浏览器随之丢弃这次 click，节点上的「点击下钻」就永远不触发。
-            var gEl = self.nodeEls[dragging.id];
-            if (gEl) gEl.parentNode.appendChild(gEl);
-          }
-          self.dragMoved = true;
-        }
-        self.moveNode(dragging.id, dragging.ox + dx, dragging.oy + dy);
-      } else if (panning) {
-        self.tx += e.clientX - lastX;
-        self.ty += e.clientY - lastY;
-        lastX = e.clientX; lastY = e.clientY;
-        self.applyTransform();
-      }
+      if (!panning) return;
+      self.tx += e.clientX - lastX;
+      self.ty += e.clientY - lastY;
+      lastX = e.clientX; lastY = e.clientY;
+      self.applyTransform();
     });
 
     window.addEventListener('mouseup', function () {
-      dragging = null;
       panning = false;
       self.viewport.classList.remove('is-panning');
+    });
+
+    window.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') self.closeFold();
     });
 
     // 滚轮缩放：步长与 deltaY 成正比。固定系数会让触控板一次滑动放大几十倍。
@@ -1295,43 +1367,6 @@
       self.applyTransform();
       self.updateZoomLabel();
     }, { passive: false });
-  };
-
-  /** 移动节点并重画受影响的连线。无边界限制，坐标可以是任意实数。 */
-  FlowView.prototype.moveNode = function (id, x, y) {
-    var p = this.positions[id];
-    if (!p) return;
-    p.x = x; p.y = y;
-    // 被拖动的节点：不再用 ELK 的静态折点，改由本地实时重算，
-    // 否则连线会停在原位（ELK 只在布局时算一次，不知道节点被拖走了）。
-    if (!this.movedNodes) this.movedNodes = {};
-    this.movedNodes[id] = true;
-    var g = this.nodeEls[id];
-    if (g) {
-      var shape = g.querySelector('rect, path');
-      if (shape && shape.tagName === 'path') {
-        // 圆柱：整体重画
-        this.nodeLayer.removeChild(g);
-        var n = this.view.nodes.filter(function (v) { return v.id === id; })[0];
-        this.renderNode(n);
-      } else if (shape) {
-        shape.setAttribute('x', x);
-        shape.setAttribute('y', y);
-        var node = this.view.nodes.filter(function (v) { return v.id === id; })[0];
-        // 与 renderNode 一致：用折行后的行列表定位每一行
-        var lines = wrapLines(node, p.w);
-        var block = 0;
-        lines.forEach(function (l) { block += l.lh; });
-        var cursor = y + p.h / 2 - block / 2;
-        Array.prototype.forEach.call(g.querySelectorAll('foreignObject'), function (fo, i) {
-          var lh = lines[i] ? lines[i].lh : 15;
-          fo.setAttribute('x', x + 5);
-          fo.setAttribute('y', cursor);
-          cursor += lh;
-        });
-      }
-    }
-    this.renderEdges();
   };
 
   FlowView.prototype.updateZoomLabel = function () {
