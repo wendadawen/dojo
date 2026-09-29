@@ -159,6 +159,8 @@ RESEARCH_ALLOWED_FILES = {
     "check-status.md",
     "arbitration.md",
     "measured.md",
+    "dataflow.md",
+    "concept.md",
 }
 RESEARCH_ALLOWED_DIRS = {"sources", "official"}
 REVIEW_FILE_RE = re.compile(r"review-\d+\.md")
@@ -332,7 +334,11 @@ def validate_page(path: Path) -> list[str]:
                 " rewrite as '实测得到' or point to research/measured.md)"
             )
 
-    is_wiki_page = "wiki" in path.parts
+    # guides/examples/ 下的示范页按 wiki 页面的标准检查
+    parts = path.parts
+    is_wiki_page = "wiki" in parts or any(
+        parts[i:i + 2] == ("guides", "examples") for i in range(len(parts) - 1)
+    )
     if is_wiki_page and path.name == "index.html":
         for name in REQUIRED_WIKI_META:
             if not inspector.meta.get(name):
