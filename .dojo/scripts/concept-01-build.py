@@ -37,8 +37,8 @@ REPO_ROOT = HERE.parents[1]
 
 META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
 # 固定小节：不是正文章节。其余 ## 标题按出现顺序编号成章。
-RESERVED = ("资料", "范围", "依据", "概览", "引言", "核心问题", "常见误解")
-REQUIRED = ("资料", "范围", "依据", "概览", "引言", "核心问题")
+RESERVED = ("资料", "范围", "依据", "概览", "引言", "核心问题")
+REQUIRED = RESERVED
 GENERATED = ("参考资料", "本章问题")
 DETAIL_PREFIXES = ("补充：", "展开：", "代码：")
 
@@ -393,6 +393,8 @@ def parse(text: str) -> dict:
             name = line[3:].strip()
             if name in GENERATED:
                 fail(no, f"「{name}」由生成器处理，不要自己写")
+            if name == "常见误解":
+                fail(no, "格式里没有「常见误解」一节")
             if name in sections:
                 fail(no, f"「{name}」重复了")
             current = name
@@ -445,7 +447,7 @@ def parse(text: str) -> dict:
     if head[:2] != ["论断", "出处"] or len(basis) < 3:
         fail(basis[0][0], "依据的表头是 | 论断 | 出处 |，下面至少一行")
 
-    rendered = ["资料", "概览", "引言", "核心问题", "常见误解"] + [n for _, n in chapters]
+    rendered = ["资料", "概览", "引言", "核心问题"] + [n for _, n in chapters]
     fence = False
     for name in rendered:
         for no, line in sections.get(name, []):
@@ -492,9 +494,6 @@ def render(doc: dict, ctx: Ctx) -> tuple[str, str, dict]:
     sec = doc["sections"]
     parts = render_blocks(sec["引言"], ctx)
     parts.append(_core_questions(sec["核心问题"], ctx))
-    if any(l.strip() for _, l in sec.get("常见误解", [])):
-        parts.append('<section class="misconceptions">\n<h2>常见误解</h2>\n'
-                     + "\n".join(render_blocks(sec["常见误解"], ctx)) + "\n</section>")
     for k, (no, name) in enumerate(doc["chapters"], 1):
         parts.append(f'<h2 id="s{k}">{k}. {inline(name, no, ctx)}</h2>')
         counter = itertools.count(1)
@@ -763,6 +762,7 @@ def _selftest() -> int:
             ("引用块", doc.replace("补充内容。", "> 引用")),
             ("代码块未结束", doc.replace("print(2 * 1)\n```", "print(2 * 1)")),
             ("自己写本章问题", doc.replace("## 边界", "## 本章问题")),
+            ("写常见误解一节", doc.replace("## 边界", "## 常见误解")),
             ("折叠块前缀", doc.replace("::: 补充：更多", "::: 更多")),
             ("描述含公式", doc.replace("生成器自检页。", "自检 $x$。")),
         ]:

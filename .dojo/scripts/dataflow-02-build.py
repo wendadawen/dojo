@@ -127,7 +127,7 @@ def page(out: Path, meta: dict[str, Any], views: list[dict],
     meta 需要：title / description / summary / topics / tag
     """
     tpl = (template or TEMPLATE).read_text(encoding="utf-8")
-    # 模板按 wiki/<name>/ 写 ../../libs/；页面放在仓库别处时（如 guides/examples/）按实际层级改写
+    # 模板按 wiki/<name>/ 写 ../../libs/；页面目录更深或更浅时按实际层级改写
     target = out.resolve().parent
     if REPO_ROOT in target.parents:
         libs = os.path.relpath(REPO_ROOT / "libs", target).replace(os.sep, "/")
