@@ -8,7 +8,7 @@
 
 1. 收集资料：源码、`config.json`、权重文件头、论文或技术报告，写进计划文件 `research/dataflow.md` 的「资料」一节。写法见[计划文件](model-dataflow/plan.md)。源码优先用 transformers 里的实现，把所用版本写进资料。transformers 里没有这个模型时，用官方仓库的源码。和其他资料对不上时，以这一步选定的源码为准。
 2. 定怎么画，写进 `dataflow.md`：画哪条路径（前提），分哪几张图，每张图有哪些节点和连线，每个节点写什么、对应源码哪一行，面板写哪些公式和配置值。格式见[计划文件](model-dataflow/plan.md)，示范见 `wiki/deepseek-v4-1-dataflow/`。写完后进入第 3 步。
-3. 审查 `dataflow.md`：先运行 `python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/research/dataflow.md --source-root <源码目录>` 回查源码位置（源码目录如 transformers 的包目录）。脚本退出码为 0，并且计划符合[计划文件](model-dataflow/plan.md)的「写法」之后，再按[审查](model-dataflow/review.md)派 20 个独立的子代理。还没符合时回到第 2 步。通过条件写在审查文件里。
+3. 审查 `dataflow.md`：先运行 `python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/research/dataflow.md --source-root <源码目录>` 回查源码位置（源码目录如 transformers 的包目录）。脚本退出码为 0，并且计划符合[计划文件](model-dataflow/plan.md)的「写法」之后，再按[审查](model-dataflow/review.md)派 5 个独立的子代理。还没符合时回到第 2 步。通过条件写在审查文件里。
 4. 生成页面：有一轮审查没有事实错误之后，再运行 `python3 .dojo/scripts/dataflow-02-build.py wiki/<name>/research/dataflow.md`，得到 `wiki/<name>/index.html`。
 5. 检查页面：
    - `python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --shots <目录>` 逐张图截图，看公式能不能正常显示，面板能不能打开。
