@@ -1,4 +1,4 @@
-# RMSNorm：只按均方根缩放的层归一化
+# RMSNorm
 
 - 描述：RMSNorm 去掉 LayerNorm 里的减均值，把一层的加权和除以它们的均方根后再逐维乘增益，加权和的均值为 0 时两者结果相同。
 - 摘要：对一层的加权和 $\mathbf{a}$，LayerNorm 先减均值再除以标准差，RMSNorm 不减均值、直接除以均方根 $\mathrm{RMS}(\mathbf{a})=\sqrt{\frac{1}{n}\sum_{i=1}^{n}a_i^2}$，两者最后都逐维乘增益 $g_i$。$\mathbf{a}$ 的均值为 0 时两者结果相同。
