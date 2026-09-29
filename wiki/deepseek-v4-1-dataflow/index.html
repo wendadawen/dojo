@@ -3,781 +3,107 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="552B 主干加 196B Engram 参数、原生 1M 上下文：40 层按 Causal Encoder-Decoder 切成两半，解码器全局 KV 由编码器末层投影；全局 KV 用 CSA2 管理（每 r 个 token 池化一条、按 source 层跨层共享、Top-512 稀疏选择），主 KV 存 FP4、窗口 KV 存 FP8，每 token 缓存 890 字节；prefill 激活 8B、decode 16B。全部数字由官方配置、参考实现、真实 checkpoint 张量头与本机实测核对。">
-  <meta name="dojo:summary" content="552B 主干 + 196B Engram；40 层 = 20 层编码器 + 20 层解码器，解码器全局 KV 由 $H_{L/2}$ 投影而来；主 KV 以 FP4 存储，每条目 288 字节，压缩比 2 的三个 source 层各 144 B/token、合计 432 B/token，压缩比 1 的层 288 B/token，主 KV 合计 720 B/token，加索引器 K 170 B/token 得每 token 890 字节；可见集 = 窗口 128 个位置 + 索引器选出的 Top-512 压缩条目，候选池 $2048 \times 8 = 16384$；MoE 384 专家取 top-6 加 1 个共享专家；Engram 插在层 1、14，DSpark 为 3 个草稿块。">
+  <meta name="description" content="DeepSeek-V4.1-Flash 一次 prefill 前向的数据流：文本 token 先查出每个位置的 n-gram 哈希行号，再取词嵌入，进 40 层主干；压缩比大于 0 的层在 128 个位置的滑动窗口之外，另加索引器选出的压缩 KV；前馈是 384 选 6 的 MoE；最后折叠、归一化并投影成下一个 token 的 logits。">
+  <meta name="dojo:summary" content="40 层主干；压缩 KV 只由 4 个 source 层（2、8、14、20）产出并按层序共享；窗口 128 个位置另加索引器选出的 Top-512 压缩条目；窗口 KV 与压缩 KV 都按 FP8、FP4 精度量化再反量化之后才参与注意力；MoE 384 个路由专家取 top-6 加 1 个共享专家，路由专家存 fp4、共享专家存 fp8；残差流按 4 份复制，混合系数由 Sinkhorn 迭代 20 轮给出；Engram 插在层 1、14。">
   <meta name="dojo:type" content="dataflow">
-  <meta name="dojo:topics" content="模型结构,内存与缓存">
+  <meta name="dojo:topics" content="模型结构,注意力机制">
   <meta name="dojo:tag" content="数据流">
-  <title>DeepSeek-V4.1-Flash 前向数据流 · Dojo</title>
+  <title>DeepSeek-V4.1-Flash前向数据流 · Dojo</title>
+  <!-- 画布样式：节点、连线、拖拽、缩放、参数面板，全部在这里。
+       旧一代数据流页用 cytoscape + dojo-dataflow.css，新页面不用它。 -->
+  <link rel="stylesheet" href="../../libs/dojo-flow.css">
+  <!-- KaTeX 同步加载：引擎画节点和说明面板时直接调用 katex.render。
+       auto-render 只处理写在 HTML 里的 config.json 面板。 -->
   <link rel="stylesheet" href="../../libs/katex.min.css">
-  <script defer src="../../libs/katex.min.js"></script>
+  <script src="../../libs/katex.min.js"></script>
   <script defer src="../../libs/auto-render.min.js"
-    onload="renderMathInElement(document.body, {
-      delimiters: [
-        {left: '$$', right: '$$', display: true},
-        {left: '$', right: '$', display: false}
-      ],
+    onload="var c = document.getElementById('flow-config'); if (c) renderMathInElement(c, {
+      delimiters: [{left: '$', right: '$', display: false}],
       throwOnError: false
     });"></script>
-  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
-  <link rel="stylesheet" href="../../libs/prism-primer-light.css" id="prism-light">
-  <link rel="stylesheet" href="../../libs/prism-primer-dark.css" id="prism-dark" disabled>
-  <script src="../../libs/cytoscape.min.js"></script>
-<script src="../../libs/dagre.min.js"></script>
-<script src="../../libs/cytoscape-dagre.min.js"></script>
-<script defer src="../../libs/prism.min.js"></script>
-  <script defer src="../../libs/prism-python.min.js"
-    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
-  <link rel="stylesheet" href="../../libs/dojo-dataflow.css">
-<style>
-/* ---------- 页面自定义 ---------- */
-
-  
-  * { box-sizing: border-box; }
-  html { max-width: 100%; overflow-x: hidden; }
-  body { margin: 0 auto; background: linear-gradient(rgba(128, 128, 128, 0.05) 1px, transparent 1px), var(--bg); background-size: 100% 36px; color: var(--text); font: 17px/1.7 var(--font-body); }
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
-  nav { font: 14px/1.4 var(--font-ui); margin-bottom: 2rem; }
-  nav a { color: var(--text-light); text-decoration: none; }
-  nav a:hover { color: var(--blue); }
-  header { padding-bottom: 1.8rem; border-bottom: 1px solid var(--border); }
-  h1, h2, h3 { font-family: var(--font-body); line-height: 1.3; }
-  h1 { margin: .5rem 0 .8rem; font-size: 2.1rem; }
-  h2 { margin: 2.6rem 0 1rem; font-size: 1.5rem; }
-  h3 { margin: 1.6rem 0 .5rem; font-size: 1.1rem; }
-  p { margin: 1rem 0; }
-  a { color: var(--blue); }
-  code { font: .84em/1.5 var(--font-mono); background: var(--bg-soft); padding: .12em .35em; border-radius: 4px; }
-  .table-scroll { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  table { width: 100%; min-width: 760px; border-collapse: collapse; font: 14px/1.55 var(--font-ui); }
-  th, td { padding: .55rem .8rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
-  th { background: var(--bg-soft); white-space: nowrap; }
-  pre { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font: 12.5px/1.6 var(--font-mono); }
-  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--text-muted); font: 13px/1.5 var(--font-ui); }
-  .note { background: var(--bg-soft); border-left: 3px solid var(--blue); padding: .8rem 1rem; margin: 1.2rem 0; font-size: 15px; }
-
-  /* ---------- 可视化区 ---------- */
-  .viz { margin-top: 1.6rem; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-  .viz-head { padding: 12px 18px 4px; background: var(--bg-soft); border-bottom: 1px solid var(--border); }
-  .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
-  .tab { padding: 5px 13px; border: 1px solid var(--border); border-radius: 20px; background: var(--bg); font-size: 12.5px; cursor: pointer; color: var(--text-light); transition: .15s; font-family: var(--font-ui); }
-  .tab:hover { border-color: var(--blue); color: var(--blue); }
-  .tab.on { background: var(--blue); color: #fff; border-color: var(--blue); font-weight: 600; }
-  .crumb { font-size: 12px; color: var(--text-muted); margin: 8px 0 0; font-family: var(--font-ui); }
-  .crumb b { color: var(--blue); }
-  #cy { width: 100%; height: clamp(420px, 46vw, 600px); background: radial-gradient(#e8edf5 1px, transparent 1px); background-size: 22px 22px; }
-  .legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 18px; border-top: 1px solid var(--border); font: 12px/1.6 var(--font-ui); color: var(--text-light); background: var(--bg); }
-  .legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
-  #tip { position: fixed; z-index: 9; max-width: 440px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 34px rgba(20,40,80,.22); padding: 12px 15px; font-size: 13px; line-height: 1.55; pointer-events: none; opacity: 0; transition: opacity .12s; font-family: var(--font-ui); }
-  #tip.show { opacity: 1; }
-  #tip h4 { margin: 0 0 6px; font-size: 13.5px; }
-  #tip .k { color: var(--text-muted); font-size: 11px; letter-spacing: .4px; margin-top: 8px; font-weight: 700; }
-  #tip .io { font-family: var(--font-mono); font-size: 12px; background: var(--bg-soft); border-radius: 5px; padding: 4px 7px; margin-top: 3px; white-space: pre-wrap; word-break: break-word; }
-  #tip .b { color: #0b64c4; font-weight: 700; }
-  #tip .fx { background: #f6f3fc; border-radius: 5px; padding: 6px 8px; margin-top: 3px; overflow-x: auto; }
-  #tip .katex-display { margin: .2em 0; text-align: left; }
-  #tip .hint { color: #c25b1e; font-size: 11.5px; margin-top: 8px; }
-
-  @media (max-width: 640px) {
-    body { font-size: 16px; }
-    .wrap { padding-top: 1.5rem; }
-    h1 { font-size: 1.7rem; }
-    #cy { height: 460px; }
-    .viz { border-radius: 8px; }
-    .viz-head { padding: 10px 12px 4px; }
-    .legend { gap: 9px; padding: 8px 12px; }
-    #tip { max-width: calc(100vw - 24px); }
-  }
-</style>
-
+  <noscript><style>
+    /* 无脚本时画布不可交互，把节点表与参数面板直接显示出来 */
+    .flow-config[hidden] { display: block !important; }
+    .flow-config.flow-info { display: none !important; }
+    .flow-cfg-btn, .flow-zoom, .flow-bar { display: none; }
+  </style></noscript>
 </head>
 <body>
-
-<div class="progress-bar" id="progress"></div>
-
-<nav class="nav">
-  <div class="nav-inner">
-    <span class="nav-brand">DeepSeek-V4.1-Flash 前向数据流</span>
-    <div class="nav-links">
-      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
-      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
-        <span class="icon-moon">◐</span>
-        <span class="icon-sun">☀</span>
-      </button>
-    </div>
+<div class="flow-app" id="flow-app">
+  <noscript>
+    <!-- 无脚本回退：每个视图一张节点表，保证脚本失效时页面仍可读。
+         结构与 build_page 生成的一致：h2 为「标签：标题」，表头为「节点 / 形状 / 参数」。 -->
+    <div class="flow-fallback"><h2>Transformer：Transformer.forward</h2><h3>公式</h3><table><tr><th>输入嵌入</th><td>$h = \mathrm{Embed}(input\_ids)$，h 是词嵌入，Embed 是 embed，词表 129280、维度 5120</td></tr><tr><th>残差流复制</th><td>$h \in \mathbb{R}^{B \times T \times d} \mapsto h \in \mathbb{R}^{B \times T \times 4 \times d}$，把一份残差流复制成 hc_mult = 4 份，4 是 hc_mult，d 是 5120</td></tr><tr><th>输出</th><td>$\mathrm{logits} = \mathrm{fnorm}(h)\,W^\top$，h 是用最后一层返回的 pre_mix 折叠后的隐状态，fnorm 是最后的 RMSNorm，W 是 head.weight</td></tr></table><h3>配置</h3><table><tr><th>vocab_size</th><td>129280</td></tr><tr><th>dim</th><td>5120</td></tr><tr><th>n_layers</th><td>40</td></tr><tr><th>hc_mult</th><td>4</td></tr><tr><th>dspark_target_layer_ids</th><td>[37, 38, 39]</td></tr><tr><th>engram_layer_ids</th><td>[1, 14]</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>input_ids</td><td>int64 [B, T]</td></tr><tr><td>self.engram_hash(input_ids, start_pos, engram_mask)</td><td>[B, T] → [B, T, 2, 24]</td></tr><tr><td>engram_hashes</td><td>int64 [B, T, 2, 24]</td></tr><tr><td>self.embed(input_ids)</td><td>129280 → 5120</td></tr><tr><td>h</td><td>bf16 [B, T, 5120]</td></tr><tr><td>h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)</td><td>[B, T, 5120] → [B, T, 4, 5120]</td></tr><tr><td>h</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>layer.engram(h, engram_hashes[:, :,
+layer.engram.layer_hash_index, :], engram_mask)</td><td>[B, T, 4, 5120] 不变</td></tr><tr><td>make_identity_pre_mix(h, self.hc_mult)</td><td>→ fp32 [B, T, 4]</td></tr><tr><td>pre_mix</td><td>fp32 [B, T, 4]</td></tr><tr><td>40 × Block</td><td>[B, T, 4, 5120] 不变</td></tr><tr><td>h</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>h.mean(dim=2)</td><td>[B, T, 4, 5120] → [B, T, 5120]</td></tr><tr><td>main_hidden</td><td>bf16 [B, T, 15360]</td></tr><tr><td>layer.hc_pre(h, pre_mix)</td><td>[B, T, 4, 5120] → [B, T, 5120]</td></tr><tr><td>h</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.norm (RMSNorm)</td><td>[B, T, 5120] 不变</td></tr><tr><td>h</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.head (ParallelHead)</td><td>5120 → 129280</td></tr><tr><td>logits</td><td>fp32 [B, 129280]</td></tr><tr><td>sample(logits, self.temperature)</td><td>→ [B]</td></tr><tr><td>output_ids</td><td>int64 [B]</td></tr><tr><td>shared_attn</td><td>compress_kv、index_k、topk_idxs</td></tr><tr><td>(output_ids, logits, main_hidden)</td><td>—</td></tr></table><h2>Block：Block.forward</h2><h3>公式</h3><table><tr><th>混合系数</th><td>$\mathrm{mixes} = W\, \hat{x}$，$\hat{x} = \mathrm{flatten}(x) \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x)^2) + \epsilon)$，x 是本子层前的残差流，flatten 把最后两维拉平，W 是 hc_attn_fn 或 hc_ffn_fn，$\epsilon$ 是 norm_eps</td></tr><tr><th>pre、post、comb</th><td>$pre_j = \sigma(m_j s_0 + b_j) + \epsilon$、$post_j = 2\sigma(m_{j+hc} s_1 + b_{j+hc})$、$comb_{j,k} = \mathrm{Sinkhorn}\big(\mathrm{softmax}(m_{j\,hc + k + 2hc}\, s_2 + b_{j\,hc + k + 2hc}) + \epsilon\big)$，hc 是 hc_mult，m 是 mixes，s 是 hc_attn_scale 或 hc_ffn_scale，b 是 hc_attn_base 或 hc_ffn_base，$\sigma$ 是 sigmoid，$\epsilon$ 是 hc_eps；mixes 与 base 都按顺序切成三段用：前 hc 个给 pre、接着 hc 个给 post、最后 hc × hc 个给 comb；Sinkhorn 先做一次行归一化（softmax 后加 $\epsilon$），再做一次列归一化，然后交替做行、列各 19 次，共行 20 次、列 20 次，最后一次落在列方向</td></tr><tr><th>折叠</th><td>$x_{out} = \sum_{c} pre_c x_c$，$x_c$ 是 4 份里的第 c 份，pre 是上面算出的 pre</td></tr><tr><th>展开</th><td>$y_c = post_c\,x + \sum_{c&#x27;} comb_{c&#x27;,c}\,residual_{c&#x27;}$，x 是子层输出，residual 是进本子层前的残差流，$comb_{c&#x27;,c}$ 是第 c&#x27; 份残差加给第 c 份输出的权重，求和在第一维上</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>hc_mult</th><td>4</td></tr><tr><th>hc_sinkhorn_iters</th><td>20</td></tr><tr><th>hc_eps</th><td>1e-06</td></tr><tr><th>norm_eps</th><td>1e-20</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>pre_mix</td><td>fp32 [B, T, 4]</td></tr><tr><td>residual</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)</td><td>[B, T, 4, 5120] → 三组 fp32 系数</td></tr><tr><td>attn_pre</td><td>fp32 [B, T, 4]</td></tr><tr><td>attn_post</td><td>fp32 [B, T, 4]</td></tr><tr><td>attn_comb</td><td>fp32 [B, T, 4, 4]</td></tr><tr><td>self.hc_pre(x, pre_mix)</td><td>[B, T, 4, 5120] → [B, T, 5120]</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.attn_norm (RMSNorm)</td><td>[B, T, 5120] 不变</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.attn(x, start_pos, *attn_args)</td><td>[B, T, 5120] 不变</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.hc_post(x, residual, attn_post, attn_comb)</td><td>[B, T, 5120] → [B, T, 4, 5120]</td></tr><tr><td>x</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>residual</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)</td><td>[B, T, 4, 5120] → 三组 fp32 系数</td></tr><tr><td>ffn_pre</td><td>fp32 [B, T, 4]</td></tr><tr><td>ffn_post</td><td>fp32 [B, T, 4]</td></tr><tr><td>ffn_comb</td><td>fp32 [B, T, 4, 4]</td></tr><tr><td>self.hc_pre(x, attn_pre)</td><td>[B, T, 4, 5120] → [B, T, 5120]</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.ffn_norm (RMSNorm)</td><td>[B, T, 5120] 不变</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.ffn(x, image_mask)</td><td>[B, T, 5120] 不变</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.hc_post(x, residual, ffn_post, ffn_comb)</td><td>[B, T, 5120] → [B, T, 4, 5120]</td></tr><tr><td>x</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>(x, ffn_pre)</td><td>—</td></tr></table><h2>Attention：Attention.forward</h2><h3>公式</h3><table><tr><th>频率</th><td>$\theta_j = \mathrm{base}^{-2j/64}$，j = 0 … 31，base 在压缩比为 0 的层是 rope_theta、其余层是 compress_rope_theta，64 是 rope_head_dim</td></tr><tr><th>YaRN</th><td>$\theta_j&#x27; = (\theta_j/16)\,\rho_j + \theta_j\,(1 - \rho_j)$，16 是 rope_factor，$\rho_j = \mathrm{clamp}\big((j - low)/(high - low), 0, 1\big)$ 是随 j 递增的斜坡，j 不大时 $\rho_j$ 为 0、保留原频率，j 变大后逐步除以 16，low 是 corrected_dim(beta_fast) 向下取整、high 是 corrected_dim(beta_slow) 向上取整；只对压缩比大于 0 的层生效</td></tr><tr><th>query 低秩投影</th><td>$q = W_{qb}\,\mathrm{RMSNorm}(W_{qa}\,x)$，x 是本层输入，$W_{qa}$ 是 wq_a、$W_{qb}$ 是 wq_b，RMSNorm 是 q_norm</td></tr><tr><th>窗口 KV</th><td>$k = \mathrm{RMSNorm}(W_{kv}\,x)$，$W_{kv}$ 是 wkv，RMSNorm 是 kv_norm；x 先过 wkv 再过 kv_norm；每头 512 维里只给后 64 维加 RoPE</td></tr><tr><th>压缩 KV 的位置</th><td>第 g 个 latent 顶替第 $g r$ 到 $(g+1)r - 1$ 个 token，所以它的 RoPE 用位置 $g r$，r 是 compress_ratio</td></tr><tr><th>稀疏注意力</th><td>$o = \dfrac{\sum_{t \in \mathcal{T}} e^{\,q \cdot k_t / \sqrt{512} - m}\, v_t}{\sum_{t \in \mathcal{T}} e^{\,q \cdot k_t / \sqrt{512} - m} + e^{\,\mathrm{sink} - m}}$，$\mathcal{T}$ 是选中的槽位，单 KV 头所以 k 和 v 是同一份，m 是选中槽位里的最大分数，sink 是 attn_sink，512 是 head_dim；分子、分母里每一项减的都是同一个 m</td></tr><tr><th>输出低秩投影</th><td>$x_{out} = W_{ob}\,\mathrm{einsum}(o, W_{oa})$，$W_{oa}$ 按 8 组摊成块对角，$W_{ob}$ 是 wo_b，o 是注意力输出</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>n_heads</th><td>64</td></tr><tr><th>head_dim</th><td>512</td></tr><tr><th>rope_head_dim</th><td>64</td></tr><tr><th>q_lora_rank</th><td>1280</td></tr><tr><th>o_lora_rank</th><td>1024</td></tr><tr><th>o_groups</th><td>8</td></tr><tr><th>window_size</th><td>128</td></tr><tr><th>index_topk</th><td>512</td></tr><tr><th>rope_theta</th><td>10000</td></tr><tr><th>compress_rope_theta</th><td>160000</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>self.freqs_cis</td><td>复数 fp32 [max_seq_len, 32]</td></tr><tr><td>freqs_cis</td><td>复数 fp32 [T, 32]</td></tr><tr><td>self.q_norm(self.wq_a(x))</td><td>5120 → 1280</td></tr><tr><td>qr</td><td>bf16 [B, T, 1280]</td></tr><tr><td>self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))</td><td>1280 → 64 × 512</td></tr><tr><td>q</td><td>bf16 [B, T, 64, 512]</td></tr><tr><td>apply_rotary_emb(q[..., -rd:], freqs_cis)</td><td>末 64 维，形状不变</td></tr><tr><td>q</td><td>bf16 [B, T, 64, 512]</td></tr><tr><td>self.kv_norm(self.wkv(x))</td><td>5120 → 512</td></tr><tr><td>kv</td><td>bf16 [B, T, 512]</td></tr><tr><td>apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)</td><td>末 64 维，形状不变</td></tr><tr><td>kv</td><td>bf16 [B, T, 512]</td></tr><tr><td>act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)</td><td>形状不变</td></tr><tr><td>kv</td><td>bf16 [B, T, 512]</td></tr><tr><td>self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)</td><td>写环形缓冲</td></tr><tr><td>window_kv</td><td>bf16 [B, T, 512]</td></tr><tr><td>get_window_topk_idxs(win, bsz, seqlen, start_pos)</td><td>→ int32 [B, T, 128]</td></tr><tr><td>topk_idxs</td><td>int32 [B, T, 128]</td></tr><tr><td>window_kv_cache</td><td>[max_batch_size, 128, 512]</td></tr><tr><td>self.compressor(x, start_pos)</td><td>5120 → [B, T/r, 512]</td></tr><tr><td>latent</td><td>bf16 [B, T/r, 512]</td></tr><tr><td>self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_len)</td><td>→ int32 [B, T, 512]</td></tr><tr><td>idxs</td><td>int32 [B, T, 512]</td></tr><tr><td>self.freqs_cis[: seqlen - seqlen % ratio : ratio]</td><td>→ [T/r, 32]</td></tr><tr><td>freqs</td><td>复数 fp32 [T/r, 32]</td></tr><tr><td>apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)</td><td>末 64 维，形状不变</td></tr><tr><td>latent</td><td>bf16 [B, T/r, 512]</td></tr><tr><td>fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)</td><td>形状不变</td></tr><tr><td>latent</td><td>bf16 [B, T/r, 512]</td></tr><tr><td>self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent</td><td>写压缩缓存</td></tr><tr><td>compress_kv_cache</td><td>[max_batch_size, max_seq_len / r, 512]</td></tr><tr><td>compress_kv</td><td>bf16 [B, T/r, 512]</td></tr><tr><td>torch.cat([kv, compress_kv], dim=1)</td><td>两份 KV 沿位置维拼起来</td></tr><tr><td>kv</td><td>bf16 [B, T + T/r, 512]</td></tr><tr><td>torch.cat([topk_idxs, compress_idxs], dim=-1)</td><td>两份下标拼起来</td></tr><tr><td>topk_idxs</td><td>int32 [B, T, 128 + 512]</td></tr><tr><td>sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)</td><td>q [B, T, 64, 512] 对 kv [B, T + T/r, 512] → [B, T, 64, 512]</td></tr><tr><td>o</td><td>bf16 [B, T, 64, 512]</td></tr><tr><td>apply_rotary_emb(o[..., -rd:], freqs_cis, True)</td><td>末 64 维，形状不变</td></tr><tr><td>o</td><td>bf16 [B, T, 64, 512]</td></tr><tr><td>o.view(bsz, seqlen, self.n_local_groups, -1)</td><td>[B, T, 64, 512] → [B, T, 8, 4096]</td></tr><tr><td>o</td><td>bf16 [B, T, 8, 4096]</td></tr><tr><td>self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)</td><td>→ [8, 1024, 4096]</td></tr><tr><td>wo_a</td><td>bf16 [8, 1024, 4096]</td></tr><tr><td>torch.einsum(&quot;bsgd,grd-&gt;bsgr&quot;, o, wo_a)</td><td>[B, T, 8, 4096] 与 [8, 1024, 4096] → [B, T, 8, 1024]</td></tr><tr><td>o</td><td>bf16 [B, T, 8, 1024]</td></tr><tr><td>self.wo_b(o.flatten(2))</td><td>8192 → 5120</td></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr></table><h2>Compressor：Compressor.forward</h2><h3>公式</h3><table><tr><th>池化</th><td>$c_j = \sum_{t=jr}^{(j+1)r-1} \mathrm{softmax}_{t&#x27;}\big(s_{t&#x27;}\big)\, v_t$，j 是第 j 组，r 是 compress_ratio，$v_t$ 是 kv 里第 t 个 token 的值投影，$s_t$ 是 score 里第 t 个，softmax 在这一组的 r 个 token 上取</td></tr><tr><th>输出</th><td>$\mathrm{RMSNorm}(c)$，c 是池化结果，先转回 bf16 再算；RMSNorm 是 self.norm</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>head_dim</th><td>512</td></tr><tr><th>norm_eps</th><td>1e-20</td></tr><tr><th>compress_ratios</th><td>前 40 项是主干：层 0、1 为 0，层 2–19 为 2，层 20–39 为 1；末 3 项是 MTP 层，为 0</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>x.float()</td><td>[B, T, 5120] 不变</td></tr><tr><td>x</td><td>fp32 [B, T, 5120]</td></tr><tr><td>self.wkv(x), self.wgate(x)</td><td>5120 → 2 × [B, T, 512]</td></tr><tr><td>kv</td><td>fp32 [B, T, 512]</td></tr><tr><td>score</td><td>fp32 [B, T, 512]</td></tr><tr><td>kv.unflatten(1, (-1, ratio))、score.unflatten(1, (-1, ratio)) 与 (kv * score.softmax(dim=2)).sum(dim=2)</td><td>[B, T, 512] → [B, T/r, 512]</td></tr><tr><td>kv</td><td>fp32 [B, T/r, 512]</td></tr><tr><td>self.norm(kv.to(dtype))</td><td>形状不变</td></tr><tr><td>self.norm(kv.to(dtype))</td><td>bf16 [B, T/r, 512]</td></tr></table><h2>Indexer：Indexer.forward</h2><h3>公式</h3><table><tr><th>索引打分</th><td>$I_{q,j} = \sum_h w_{q,h} \cdot \mathrm{ReLU}(q_h \cdot k_j)$，h 从 0 到 31 是索引头，$q_h$ 是第 h 个量化成 fp4 的索引 query，$k_j$ 是第 j 个压缩条目的 fp4 索引键，$w_{q,h}$ 由 weights_proj 给出并乘上 $128^{-1/2} \cdot 32^{-1/2}$</td></tr><tr><th>可达数</th><td>第 i 个 query 能看到 $\lfloor (i+1)/r \rfloor$ 个压缩条目，r 是 compress_ratio；还看不到的那些置 $-\infty$</td></tr><tr><th>输出</th><td>$idxs = \mathrm{sort}\big(\mathrm{topk}_{512}(I)\big)$，不小于可达数的置 −1，其余加上 offset 变成拼起来的 KV 里的下标</td></tr></table><h3>配置</h3><table><tr><th>index_n_heads</th><td>32</td></tr><tr><th>index_head_dim</th><td>128</td></tr><tr><th>index_topk</th><td>512</td></tr><tr><th>rope_head_dim</th><td>64</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>qr</td><td>bf16 [B, T, 1280]</td></tr><tr><td>latent</td><td>bf16 [B, T/r, 512]</td></tr><tr><td>self.freqs_cis</td><td>复数 fp32 [max_seq_len, 32]</td></tr><tr><td>self.freqs_cis[: seqlen - seqlen % ratio : ratio]</td><td>→ [T/r, 32]</td></tr><tr><td>freqs</td><td>复数 fp32 [T/r, 32]</td></tr><tr><td>self.k_norm(self.wk(latent))</td><td>512 → 128</td></tr><tr><td>k</td><td>bf16 [B, T/r, 128]</td></tr><tr><td>apply_rotary_emb(k[..., -rd:], freqs)</td><td>末 64 维，形状不变</td></tr><tr><td>k</td><td>bf16 [B, T/r, 128]</td></tr><tr><td>fp4_act_quant(k, fp4_block_size, True)</td><td>形状不变</td></tr><tr><td>k</td><td>bf16 [B, T/r, 128]</td></tr><tr><td>self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k</td><td>写入索引键缓存</td></tr><tr><td>k_cache</td><td>[max_batch_size, max_seq_len / r, 128]</td></tr><tr><td>self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))</td><td>1280 → 32 × 128</td></tr><tr><td>q</td><td>bf16 [B, T, 32, 128]</td></tr><tr><td>apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])</td><td>末 64 维，形状不变</td></tr><tr><td>q</td><td>bf16 [B, T, 32, 128]</td></tr><tr><td>fp4_act_quant(q, fp4_block_size, True)</td><td>形状不变</td></tr><tr><td>q</td><td>bf16 [B, T, 32, 128]</td></tr><tr><td>index_k</td><td>bf16 [B, T/r, 128]</td></tr><tr><td>self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)</td><td>5120 → 32</td></tr><tr><td>weights</td><td>bf16 [B, T, 32]</td></tr><tr><td>torch.einsum(&quot;bshd,btd-&gt;bsht&quot;, q, index_k)</td><td>[B, T, 32, 128] 与 [B, T/r, 128] → [B, T, 32, T/r]</td></tr><tr><td>index_score</td><td>bf16 [B, T, 32, T/r]</td></tr><tr><td>(index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)</td><td>[B, T, 32, T/r] → [B, T, T/r]</td></tr><tr><td>index_score</td><td>bf16 [B, T, T/r]</td></tr><tr><td>(torch.arange(1, seqlen + 1) // ratio).unsqueeze(-1)</td><td>→ [T, 1]</td></tr><tr><td>compress_lens</td><td>int64 [T, 1]</td></tr><tr><td>index_score.masked_fill_(torch.arange(seqlen // ratio) &gt;= compress_lens, -torch.inf)</td><td>形状不变</td></tr><tr><td>index_score</td><td>bf16 [B, T, T/r]</td></tr><tr><td>index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values</td><td>→ [B, T, 512]</td></tr><tr><td>idxs</td><td>int64 [B, T, 512]</td></tr><tr><td>torch.where(idxs &lt; compress_lens, idxs + offset, -1)</td><td>形状不变</td></tr><tr><td>idxs</td><td>int32 [B, T, 512]</td></tr></table><h2>MoE：MoE.forward</h2><h3>公式</h3><table><tr><th>前馈</th><td>$y = \sum_{e \in \mathrm{top6}} \mathrm{Expert}_e(x) + \mathrm{Shared}(x)$，x 是拉平后的隐状态，Expert 在内部再乘路由权重 w，Shared 是共享专家</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>moe_inter_dim</th><td>2304</td></tr><tr><th>n_routed_experts</th><td>384</td></tr><tr><th>n_shared_experts</th><td>1</td></tr><tr><th>n_activated_experts</th><td>6</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>x.view(-1, self.dim)</td><td>[B, T, 5120] → [B×T, 5120]</td></tr><tr><td>x</td><td>bf16 [B×T, 5120]</td></tr><tr><td>self.gate(x, None)</td><td>[B×T, 5120] → 权重 [B×T, 6] 与专家下标 [B×T, 6]</td></tr><tr><td>weights</td><td>fp32 [B×T, 6]</td></tr><tr><td>indices</td><td>int64 [B×T, 6]</td></tr><tr><td>torch.zeros_like(x, dtype=torch.float32)</td><td>→ fp32 [B×T, 5120]</td></tr><tr><td>y</td><td>fp32 [B×T, 5120]</td></tr><tr><td>torch.where(indices == i)</td><td>→ 行下标与 top 位置</td></tr><tr><td>idx, top</td><td>int64 [n] 与 int64 [n]</td></tr><tr><td>expert(x[idx], weights[idx, top, None])</td><td>5120 → 5120</td></tr><tr><td>expert(x[idx], weights[idx, top, None])</td><td>bf16 [n, 5120]</td></tr><tr><td>y[idx] += expert(...)</td><td>fp32 [B×T, 5120] 上累加</td></tr><tr><td>y</td><td>fp32 [B×T, 5120]</td></tr><tr><td>self.shared_experts(x)</td><td>5120 → 5120</td></tr><tr><td>self.shared_experts(x)</td><td>bf16 [B×T, 5120]</td></tr><tr><td>y += self.shared_experts(x)</td><td>逐元素相加</td></tr><tr><td>y</td><td>fp32 [B×T, 5120]</td></tr><tr><td>y.type_as(x).view(shape)</td><td>[B×T, 5120] → bf16 [B, T, 5120]</td></tr><tr><td>y</td><td>bf16 [B, T, 5120]</td></tr></table><h2>Gate：Gate.forward</h2><h3>公式</h3><table><tr><th>打分</th><td>$\mathrm{score} = \sqrt{\mathrm{softplus}(x W^\top)}$，x 是拉平后的隐状态，W 是 gate 的 weight，$\mathrm{softplus}(z) = \ln(1 + e^z)$</td></tr><tr><th>选专家</th><td>$\mathrm{idx} = \mathrm{topk}_6(\mathrm{score} + b)$，b 是 bias，它只影响选哪几个专家</td></tr><tr><th>权重</th><td>$w = \dfrac{\mathrm{score}_{\mathrm{idx}}}{\sum \mathrm{score}_{\mathrm{idx}} + 10^{-20}} \times 1.5$，求和只在这 6 个专家上，1.5 是 route_scale</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>n_routed_experts</th><td>384</td></tr><tr><th>n_activated_experts</th><td>6</td></tr><tr><th>score_func</th><td>sqrtsoftplus</td></tr><tr><th>route_scale</th><td>1.5</td></tr><tr><th>norm_topk_prob</th><td>true（默认值）</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B×T, 5120]</td></tr><tr><td>linear(x.float(), self.weight.float()) / self.gate_temp</td><td>5120 → 384</td></tr><tr><td>scores</td><td>fp32 [B×T, 384]</td></tr><tr><td>F.softplus(scores).sqrt()</td><td>形状不变</td></tr><tr><td>scores</td><td>fp32 [B×T, 384]</td></tr><tr><td>self.bias</td><td>fp32 [384]</td></tr><tr><td>(scores + bias).topk(self.topk, dim=-1)[1]</td><td>→ [B×T, 6]</td></tr><tr><td>indices</td><td>int64 [B×T, 6]</td></tr><tr><td>scores.gather(1, indices)</td><td>→ [B×T, 6]</td></tr><tr><td>weights</td><td>fp32 [B×T, 6]</td></tr><tr><td>weights /= weights.sum(dim=-1, keepdim=True) + 1e-20</td><td>形状不变</td></tr><tr><td>weights</td><td>fp32 [B×T, 6]</td></tr><tr><td>weights *= self.route_scale</td><td>形状不变</td></tr><tr><td>weights</td><td>fp32 [B×T, 6]</td></tr><tr><td>(weights, indices)</td><td>—</td></tr></table><h2>Expert：Expert.forward</h2><h3>公式</h3><table><tr><th>SwiGLU</th><td>$\mathrm{Expert}(x) = W_2\Big(w \odot \big(\mathrm{silu}(\mathrm{clamp}_{上}(W_1 x)) \odot \mathrm{clamp}_{\pm}(W_3 x)\big)\Big)$，x 是输入，$W_1$ 是 w1、$W_2$ 是 w2、$W_3$ 是 w3，$w$ 是路由权重，$\odot$ 是逐元素相乘</td></tr><tr><th>夹取</th><td>$\mathrm{clamp}_{\pm}(z) = \min(\max(z, -10), 10)$、$\mathrm{clamp}_{上}(z) = \min(z, 10)$，10 是 swiglu_limit；共享专家不乘 $w$</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>moe_inter_dim</th><td>2304</td></tr><tr><th>swiglu_limit</th><td>10.0</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [n, 5120]</td></tr><tr><td>weights</td><td>fp32 [n, 1]</td></tr><tr><td>self.w1(x).float()</td><td>5120 → 2304</td></tr><tr><td>gate</td><td>fp32 [n, 2304]</td></tr><tr><td>self.w3(x).float()</td><td>5120 → 2304</td></tr><tr><td>up</td><td>fp32 [n, 2304]</td></tr><tr><td>torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)</td><td>形状不变</td></tr><tr><td>up</td><td>fp32 [n, 2304]</td></tr><tr><td>torch.clamp(gate, max=self.swiglu_limit)</td><td>形状不变</td></tr><tr><td>gate</td><td>fp32 [n, 2304]</td></tr><tr><td>F.silu(gate) * up</td><td>形状不变</td></tr><tr><td>F.silu(gate) * up</td><td>fp32 [n, 2304]</td></tr><tr><td>weights * x</td><td>形状不变</td></tr><tr><td>weights * x</td><td>fp32 [n, 2304]</td></tr><tr><td>self.w2(x.to(dtype))</td><td>2304 → 5120</td></tr><tr><td>self.w2(x.to(dtype))</td><td>bf16 [n, 5120]</td></tr></table><h2>Engram：Engram.forward</h2><h3>公式</h3><table><tr><th>归一化点积</th><td>$d = \big(\sum_j h_j w_j key_j\big) \cdot \mathrm{rstd} \cdot 5120^{-1/2}$，$\mathrm{rstd} = \big(\mathrm{mean}_j h_j^2 + \epsilon\big)^{-1/2}\big(\mathrm{mean}_j key_j^2 + \epsilon\big)^{-1/2}$，h 是本层残差流，key 是哈希查表投影出的键，w 是 q_weight 与 k_weight 的逐元素积，$\epsilon$ 是 norm_eps，5120 是 dim</td></tr><tr><th>门控</th><td>$gate = \sigma\big(\mathrm{sign}(d)\sqrt{\max(|d|, 10^{-6})}\big)$，$\sigma$ 是 sigmoid，$10^{-6}$ 是 clamp_value</td></tr><tr><th>写入</th><td>$x \leftarrow h + gate \odot value$，value 是投影出的值，4 份残差流共用同一个 value，只有 gate 逐份不同</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>hc_mult</th><td>4</td></tr><tr><th>engram_max_ngram_size</th><td>4</td></tr><tr><th>engram_n_heads</th><td>8</td></tr><tr><th>engram_head_dim</th><td>256</td></tr><tr><th>engram_layer_ids</th><td>[1, 14]</td></tr><tr><th>engram_num_embeddings</th><td>[384006168, 384016682]</td></tr><tr><th>norm_eps</th><td>1e-20</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 4, 5120]</td></tr><tr><td>hash_ids</td><td>int64 [B, T, 24]</td></tr><tr><td>self.embed(hash_ids).flatten(-2)</td><td>[B, T, 24] → [B, T, 6144]</td></tr><tr><td>self.embed(hash_ids).flatten(-2)</td><td>bf16 [B, T, 6144]</td></tr><tr><td>self.wkv(...)</td><td>6144 → 25600</td></tr><tr><td>kv</td><td>bf16 [B, T, 25600]</td></tr><tr><td>key</td><td>bf16 [B, T, 20480]</td></tr><tr><td>value</td><td>bf16 [B, T, 5120]</td></tr><tr><td>key.float().unflatten(-1, (self.hc_mult, self.dim))</td><td>[B, T, 20480] → fp32 [B, T, 4, 5120]</td></tr><tr><td>key</td><td>fp32 [B, T, 4, 5120]</td></tr><tr><td>self.q_weight.float() * self.k_weight.float()</td><td>[4, 5120] 逐元素相乘</td></tr><tr><td>weight</td><td>fp32 [4, 5120]</td></tr><tr><td>x.float()</td><td>[B, T, 4, 5120] 不变</td></tr><tr><td>h</td><td>fp32 [B, T, 4, 5120]</td></tr><tr><td>torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)</td><td>→ fp32 [B, T, 4]</td></tr><tr><td>rstd</td><td>fp32 [B, T, 4]</td></tr><tr><td>(h * weight * key).sum(-1) * rstd * self.dim**-0.5</td><td>[B, T, 4]</td></tr><tr><td>dot</td><td>fp32 [B, T, 4]</td></tr><tr><td>torch.sigmoid(
+torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot))</td><td>形状不变</td></tr><tr><td>gate</td><td>fp32 [B, T, 4]</td></tr><tr><td>value.float().unsqueeze(-2)</td><td>[B, T, 5120] → fp32 [B, T, 1, 5120]</td></tr><tr><td>value.float().unsqueeze(-2)</td><td>fp32 [B, T, 1, 5120]</td></tr><tr><td>h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)</td><td>形状不变</td></tr><tr><td>h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)</td><td>fp32 [B, T, 4, 5120]</td></tr><tr><td>.to(x.dtype)</td><td>形状不变</td></tr><tr><td>(h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)</td><td>bf16 [B, T, 4, 5120]</td></tr></table><h2>NgramHashState：NgramHashState.forward</h2><h3>公式</h3><table><tr><th>压缩映射</th><td>$c_t = \mathrm{map}(input\_ids_t)$，map 是 token_map；归一化后同形的 token 映到同一个 id，压缩词表有 99092 项</td></tr><tr><th>n-gram</th><td>第 t 个位置的回看取 $c_{t-k}$，$k = 0 \ldots 3$；越界就填 pad_id</td></tr><tr><th>哈希</th><td>$h^{(k)} = c_t m_0 \oplus c_{t-1} m_1 \oplus \cdots \oplus c_{t-k} m_k$，$\oplus$ 是按位异或，$m$ 是 multipliers，第 k 步（k = 1、2、3）得到的是 k + 1 元 n-gram，落在第 k − 1 个桶组里（从 0 数）</td></tr><tr><th>桶</th><td>$id = h^{(k)} \bmod p_{k-1,\,head} + \mathrm{offset}$，每个（Engram 层，桶组，头）各有一个质数 $p$，互不重复，$p_{k-1,\,head}$ 取第 k − 1 个桶组里第 head 个头的那个，offset 是该桶在表里的起始行</td></tr></table><h3>配置</h3><table><tr><th>engram_max_ngram_size</th><td>4</td></tr><tr><th>engram_n_heads</th><td>8</td></tr><tr><th>engram_head_dim</th><td>256</td></tr><tr><th>engram_vocab_size</th><td>16000000</td></tr><tr><th>engram_compressed_vocab_size</th><td>99092</td></tr><tr><th>engram_pad_id</th><td>2</td></tr><tr><th>engram_layer_ids</th><td>[1, 14]</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>input_ids</td><td>int64 [B, T]</td></tr><tr><td>self.token_map[input_ids]</td><td>→ int64 [B, T]</td></tr><tr><td>compressed</td><td>int64 [B, T]</td></tr><tr><td>self.cache[:batch, start_pos : start_pos + seqlen] = compressed</td><td>写压缩 id 缓存</td></tr><tr><td>cache</td><td>int64 [max_batch_size, max_seq_len]</td></tr><tr><td>torch.arange(start_pos, start_pos + seqlen).expand(batch, seqlen)</td><td>→ int64 [B, T]</td></tr><tr><td>positions</td><td>int64 [B, T]</td></tr><tr><td>torch.zeros_like(positions, dtype=torch.bool)</td><td>→ bool [B, T]</td></tr><tr><td>blocked</td><td>bool [B, T]</td></tr><tr><td>self.cache[:batch].gather(1, (positions - shift).clamp_min(0))</td><td>→ int64 [B, T]</td></tr><tr><td>source</td><td>int64 [B, T]</td></tr><tr><td>blocked | (positions &lt; shift) | (source == self.DEAD)</td><td>形状不变</td></tr><tr><td>blocked</td><td>bool [B, T]</td></tr><tr><td>torch.where(blocked, self.pad_id, source)</td><td>形状不变</td></tr><tr><td>tokens</td><td>int64 [B, T, 4]</td></tr><tr><td>tokens.unsqueeze(2) * self.multipliers</td><td>[B, T, 4] 与 [2, 4] → [B, T, 2, 4]</td></tr><tr><td>products</td><td>int64 [B, T, 2, 4]</td></tr><tr><td>torch.bitwise_xor(rolling, products[..., i])</td><td>形状不变</td></tr><tr><td>rolling</td><td>int64 [B, T, 2]</td></tr><tr><td>rolling.unsqueeze(-1) % self.primes[:, i - 1]</td><td>→ [B, T, 2, 8]</td></tr><tr><td>torch.cat(hashes, dim=-1)</td><td>int64 [B, T, 2, 24]</td></tr><tr><td>torch.cat(hashes, dim=-1) + self.offsets</td><td>形状不变</td></tr><tr><td>torch.cat(hashes, dim=-1) + self.offsets</td><td>int64 [B, T, 2, 24]</td></tr></table><h2>RMSNorm：RMSNorm.forward</h2><h3>公式</h3><table><tr><th>RMSNorm</th><td>$y = w \odot h / \sqrt{\mathrm{mean}(h^2) + \epsilon}$，h 是输入，y 是返回值，mean 在最后一维上取，$\epsilon$ 是 norm_eps，w 是 weight，$\odot$ 是逐元素相乘</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>head_dim</th><td>512</td></tr><tr><th>index_head_dim</th><td>128</td></tr><tr><th>norm_eps</th><td>1e-20</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [..., d]</td></tr><tr><td>x.float()</td><td>形状不变</td></tr><tr><td>x</td><td>fp32 [..., d]</td></tr><tr><td>x.square().mean(-1, keepdim=True)</td><td>d → 1</td></tr><tr><td>var</td><td>fp32 [..., 1]</td></tr><tr><td>x * torch.rsqrt(var + self.eps)</td><td>形状不变</td></tr><tr><td>x</td><td>fp32 [..., d]</td></tr><tr><td>self.weight * x</td><td>形状不变</td></tr><tr><td>self.weight * x</td><td>fp32 [..., d]</td></tr><tr><td>.to(dtype)</td><td>形状不变</td></tr><tr><td>(self.weight * x).to(dtype)</td><td>bf16 [..., d]</td></tr></table><h2>ParallelHead：ParallelHead.forward</h2><h3>公式</h3><table><tr><th>词表投影</th><td>$\mathrm{logits} = h W^\top$，h 是最后一个位置的隐状态（已经过最后的 RMSNorm），W 是 head.weight</td></tr></table><h3>配置</h3><table><tr><th>dim</th><td>5120</td></tr><tr><th>vocab_size</th><td>129280</td></tr></table><table><tr><th>节点</th><th>形状 / 参数</th></tr><tr><td>x</td><td>bf16 [B, T, 5120]</td></tr><tr><td>x[:, -1]</td><td>[B, T, 5120] → [B, 5120]</td></tr><tr><td>x</td><td>bf16 [B, 5120]</td></tr><tr><td>F.linear(x.float(), self.weight)</td><td>5120 → 129280</td></tr><tr><td>logits</td><td>fp32 [B, 129280]</td></tr></table></div>
+  </noscript>
+  <nav class="flow-bar"><button type="button" class="flow-tab on" data-view="transformer">Transformer</button><button type="button" class="flow-tab" data-view="block">Block</button><button type="button" class="flow-tab" data-view="attention">Attention</button><button type="button" class="flow-tab" data-view="compressor">Compressor</button><button type="button" class="flow-tab" data-view="indexer">Indexer</button><button type="button" class="flow-tab" data-view="moe">MoE</button><button type="button" class="flow-tab" data-view="gate">Gate</button><button type="button" class="flow-tab" data-view="expert">Expert</button><button type="button" class="flow-tab" data-view="engram">Engram</button><button type="button" class="flow-tab" data-view="ngramhashstate">NgramHashState</button><button type="button" class="flow-tab" data-view="rmsnorm">RMSNorm</button><button type="button" class="flow-tab" data-view="parallelhead">ParallelHead</button></nav>
+  <div class="flow-btns">
+    <!-- 说明面板开关：内容由引擎按当前视图的 info 渲染，视图没有 info 时按钮隐藏 -->
+    <button type="button" class="flow-cfg-btn flow-info-btn" id="flow-info-btn"
+            aria-expanded="false" aria-controls="flow-info" hidden>说明</button>
+    <!-- 参数面板开关：label 写 config.json 之类的名字；不需要参数面板时整段删除 -->
+    <button type="button" class="flow-cfg-btn" id="flow-cfg-btn"
+            aria-expanded="false" aria-controls="flow-config">config.json</button>
   </div>
-</nav>
-
-<aside class="toc" id="toc">
-  <div class="toc-title">目录</div>
-  <ul id="tocList"></ul>
-</aside>
-
-<div class="lightbox" id="lightbox">
-  <img id="lightboxImg" src="" alt="">
-  <div class="lightbox-caption" id="lightboxCaption"></div>
+  <div class="flow-zoom">
+    <button type="button" data-act="out" title="缩小">−</button>
+    <span class="flow-zoom-label" style="padding:0 6px;line-height:24px;font-size:12px;color:var(--flow-muted)">100%</span>
+    <button type="button" data-act="in" title="放大">+</button>
+    <button type="button" data-act="reset" title="复位">⟲</button>
+  </div>
+  <!-- 参数面板：顶部是计划文件「前提」一节，下面按用途分组，每组一个 details，值照抄 config.json。 -->
+  <section class="flow-config" id="flow-config" hidden><h2 class="cfg-title">config.json 参数</h2><div class="cfg-note">前提：这一次前向是 Transformer.forward 的一次调用：推理，不算 loss；这一次是 prefill：start_pos 为 0，一次喂进 T 个 token，T 不小于 1024，且能被各层非零的 compress_ratio 整除；文本输入：images 和 token_types 都不传，于是 image_mask 与 engram_mask 都是 None；单卡，world_size 为 1；权重按 config.json 的 dtype 与 expert_dtype 加载：用 Linear、ColumnParallelLinear、RowParallelLinear 建、没写 dtype 的权重取 dtype（fp8），路由专家取 expert_dtype（fp4），压缩器在 compress_ratio 大于 1 时把 wkv、wgate 提升到 fp32；源码里显式指定了别的精度的按源码，如 wo_a、ParallelHead 的 weight、attn_sink、hc_* 六组参数、索引器的 wk.weight 与 weights_proj.weight、压缩比不大于 1 的压缩器的 wkv；注意力、压缩器与索引器走的是 compress_ratio 为 2 这条分支：source 层 2、8、14 的结构相同；层 20 的 compress_ratio 是 1，压缩器只有一次投影；注意力只有 sparse_attn 一个 kernel，窗口 KV 与压缩 KV 拼成一份 KV 之后一次算完；调用的是 Transformer.forward，不是 forward_spec（MTP/DSpark 草稿路径）；缓存按 max_batch_size 分配，config.json 里没有这一项，取 ModelArgs 默认值 4；它是缓存容量，与本次前向的批大小 B 不是同一个量</div><details class="cfg-group" open><summary>规模</summary><table><tr><th>vocab_size</th><td>129280</td></tr><tr><th>dim</th><td>5120</td></tr><tr><th>n_layers</th><td>40</td></tr><tr><th>n_heads</th><td>64</td></tr><tr><th>head_dim</th><td>512</td></tr><tr><th>rope_head_dim</th><td>64</td></tr><tr><th>norm_eps</th><td>1e-20</td></tr></table></details><details class="cfg-group" open><summary>注意力</summary><table><tr><th>q_lora_rank</th><td>1280</td></tr><tr><th>o_lora_rank</th><td>1024</td></tr><tr><th>o_groups</th><td>8</td></tr><tr><th>window_size</th><td>128</td></tr><tr><th>compress_ratios</th><td>前 40 项是主干：层 0、1 为 0，层 2–19 为 2，层 20–39 为 1；末 3 项是 MTP 层，为 0</td></tr><tr><th>kv_source_layers</th><td>[2, 8, 14, 20]</td></tr><tr><th>index_source_layers</th><td>[2, 8, 14, 20, 24, 28, 32, 36]</td></tr><tr><th>compress_rope_theta</th><td>160000</td></tr></table></details><details class="cfg-group" open><summary>位置编码</summary><table><tr><th>rope_theta</th><td>10000</td></tr><tr><th>rope_factor</th><td>16</td></tr><tr><th>original_seq_len</th><td>65536</td></tr><tr><th>beta_fast</th><td>32</td></tr><tr><th>beta_slow</th><td>1</td></tr></table></details><details class="cfg-group" open><summary>索引器</summary><table><tr><th>index_n_heads</th><td>32</td></tr><tr><th>index_head_dim</th><td>128</td></tr><tr><th>index_topk</th><td>512</td></tr><tr><th>candidate_source_layer</th><td>20</td></tr><tr><th>candidate_topk_blocks</th><td>2048</td></tr><tr><th>candidate_block_size</th><td>8</td></tr></table></details><details class="cfg-group" open><summary>Hyper-Connections</summary><table><tr><th>hc_mult</th><td>4</td></tr><tr><th>hc_sinkhorn_iters</th><td>20</td></tr><tr><th>hc_eps</th><td>1e-06</td></tr></table></details><details class="cfg-group" open><summary>MoE</summary><table><tr><th>n_routed_experts</th><td>384</td></tr><tr><th>n_shared_experts</th><td>1</td></tr><tr><th>n_activated_experts</th><td>6</td></tr><tr><th>moe_inter_dim</th><td>2304</td></tr><tr><th>score_func</th><td>sqrtsoftplus</td></tr><tr><th>route_scale</th><td>1.5</td></tr><tr><th>norm_topk_prob</th><td>true（默认值，config.json 里没有这一项）</td></tr><tr><th>swiglu_limit</th><td>10.0</td></tr></table></details><details class="cfg-group" open><summary>Engram</summary><table><tr><th>engram_layer_ids</th><td>[1, 14]</td></tr><tr><th>engram_max_ngram_size</th><td>4</td></tr><tr><th>engram_n_heads</th><td>8</td></tr><tr><th>engram_head_dim</th><td>256</td></tr><tr><th>engram_vocab_size</th><td>16000000</td></tr><tr><th>engram_num_embeddings</th><td>[384006168, 384016682]</td></tr><tr><th>engram_compressed_vocab_size</th><td>99092</td></tr><tr><th>engram_pad_id</th><td>2</td></tr></table></details><details class="cfg-group" open><summary>DSpark</summary><table><tr><th>dspark_target_layer_ids</th><td>[37, 38, 39]</td></tr></table></details><details class="cfg-group" open><summary>量化</summary><table><tr><th>dtype</th><td>fp8</td></tr><tr><th>expert_dtype</th><td>fp4</td></tr></table></details></section>
+  <section class="flow-config flow-info" id="flow-info" hidden></section>
 </div>
 
-<h1 class="title">DeepSeek-V4.1-Flash 前向数据流</h1>
-<p class="page-lead">DeepSeek-V4.1-Flash 是 552B 主干加 196B Engram 参数、原生支持 1M 上下文的多模态 <a href="../deepseek-moe/index.html">MoE</a> 模型。40 层主干按 Causal Encoder–Decoder 切成两半：前 20 层是因果编码器，后 20 层是解码器，解码器的全局 KV 不由本层隐状态产生，而由编码器末层隐状态投影而来——配合解码器滑动窗口的有界重放，prefill 阶段因此可以止于半栈。全局 KV 由 <a href="../cross-layer-kv-sharing/index.html">CSA2</a>（Compressed Sparse Attention 2，压缩稀疏注意力第 2 版）管理：每 $r$ 个 token 池化成一条压缩条目、按 source 层跨层共享、再由索引器从可见条目中稀疏选出至多 512 条；主 KV 以 FP4 存储（每条目 288 字节），窗口 KV 保持 FP8。每 token 全局 KV 缓存 890 字节。另有两个不改变缓存账的模块：<a href="../ngram/index.html">Engram</a> 哈希查表（插在层 1、14）与 <a href="../speculative-decoding/index.html">DSpark</a> 块式推测解码（3 个 MTP 块）。</p>
-<p class="page-meta">生成于 2026-09-10 · 依据官方推理实现 <code>model.py</code>/<code>kernel.py</code> + <code>inference/config.json</code> + 真实 checkpoint 张量头（48 个分片、96085 个张量）+ 本机实测</p>
-<p class="reading-time" id="readingTime"></p>
+<!-- ============================================================
+     视图数据
 
-<h2 id="specs">1. 关键规格</h2>
-<p>下表每一行都可回溯到具体依据。「依据」列给出配置字段名、源码位置或实测结论，「核对」列说明该数字如何被独立验证。</p>
-<table>
-  <tr><th>项目</th><th>取值</th><th>依据 / 核对方式</th></tr>
-  <tr><td>总参数量</td><td>552B 主干 + 196B Engram</td><td>官方称「552B backbone parameters and 196B Engram parameters」（报告行 320）；实测按 96085 个张量头独立算得 551.57B + 196.93B</td></tr>
-  <tr><td>主干层数</td><td>40 层 = 20 层编码器 + 20 层解码器</td><td><code>n_layers=40</code>；报告行 314–317 的结构描述；运行期实测的层表</td></tr>
-  <tr><td>每 token 激活</td><td>8B（prefill）/ 16B（decode）</td><td>实测：编码器半栈 7.8929B、解码器半栈 7.5758B（均不含嵌入层与输出头）；decode 为两半之和 15.4687B，8B 与 16B 是报告宣称的取整值</td></tr>
-  <tr><td>每 token 全局 KV 缓存</td><td>890 B</td><td>实测：主 KV 720 + 索引器 K 170，按配置与源码常量逐项推出</td></tr>
-  <tr><td>隐藏维</td><td>5120</td><td><code>dim</code>；<code>attn_norm.weight</code> 形状 <code>[5120]</code></td></tr>
-  <tr><td>注意力头配置</td><td>64 个查询头、1 个 KV 头，头维 512</td><td><code>n_heads</code>/<code>head_dim</code>；<code>wq_b.weight</code> 形状 <code>[32768, 1280]</code> $=64\times512$，<code>wkv.weight</code> 形状 <code>[512, 5120]</code></td></tr>
-  <tr><td>查询低秩维</td><td>1280</td><td><code>q_lora_rank</code>；<code>wq_a.weight</code> 形状 <code>[1280, 5120]</code>、<code>q_norm.weight</code> 形状 <code>[1280]</code></td></tr>
-  <tr><td>输出投影分组</td><td>8 组，组内低秩 1024</td><td><code>o_groups=8</code>/<code>o_lora_rank=1024</code>；<code>wo_a.weight</code> 形状 <code>[8192, 4096]</code> $=(8\times1024)\times(8\times512)$、<code>wo_b.weight</code> 形状 <code>[5120, 8192]</code></td></tr>
-  <tr><td><a href="../rope/index.html">位置编码</a></td><td>仅旋转头维<b>末尾</b> 64 维；频率表按<b>层</b>选择</td><td><code>rope_head_dim=64</code>；<code>model.py</code> L680–687 按层分支：<code>compress_ratio=0</code> 的层 0、1 用 <code>rope_theta=10000</code> 且关 YaRN，<code>compress_ratio&gt;0</code> 的层 2–39 用 <code>compress_rope_theta=160000</code> 且开 YaRN（<code>original_seq_len=65536</code> 乘 <code>rope_factor=16</code> 得 1M 上下文）；实测复现该频率表（base 160000 时 low=15、high=25）</td></tr>
-  <tr><td><a href="../sliding-window-attention/index.html">滑动窗口</a></td><td>128</td><td><code>window_size=128</code>；实测的环形缓冲对照（$W=8$、序列长 20 全一致）</td></tr>
-  <tr><td>压缩比分布</td><td>层 2–19 为 2；层 20–39 为 1；层 0、1 无全局 KV</td><td><code>compress_ratios</code>；<code>Compressor.__init__</code> 按 <code>compress_ratios[layer_id]</code> 取比值</td></tr>
-  <tr><td><a href="../cross-layer-kv-sharing/index.html">跨层共享</a></td><td>source 层 2/8/14/20；分组 2–7、8–13、14–19、20–39</td><td><code>kv_source_layers</code>；运行期实测回溯每层读到的缓存属主</td></tr>
-  <tr><td>层模式</td><td>Full = 2/8/14/20；Reindex = 24/28/32/36；其余 30 个压缩层为 Reuse</td><td><code>index_source_layers</code>；同一运行期实测的层表</td></tr>
-  <tr><td>索引器</td><td>32 个头、头维 128，每 query 保留 Top-512</td><td><code>index_n_heads=32</code>/<code>index_head_dim=128</code>/<code>index_topk=512</code></td></tr>
-  <tr><td>候选池</td><td>$2048 \times 8 = 16384$ 个候选位置</td><td><code>candidate_source_layer=20</code>、<code>candidate_topk_blocks=2048</code>、<code>candidate_block_size=8</code>；报告行 565–570</td></tr>
-  <tr><td>MoE</td><td>384 个路由专家取 top-6，另 1 个共享专家；中间维 2304</td><td><code>n_routed_experts</code>/<code>n_activated_experts</code>/<code>n_shared_experts</code>/<code>moe_inter_dim</code>；实测独立重实现 indices 完全一致</td></tr>
-  <tr><td>路由打分与偏置</td><td>$\sqrt{\mathrm{softplus}}$ 打分，偏置只影响选择；权重乘 1.5</td><td><code>score_func="sqrtsoftplus"</code>、<code>route_scale=1.5</code>；<code>gate.weight</code> 形状 <code>[384, 5120]</code>，<code>gate.bias</code> 与 <code>gate.bias_vl</code> 各 <code>[384]</code></td></tr>
-  <tr><td>超连接</td><td>4 份残差流，Sinkhorn 20 轮，末步列方向</td><td><code>hc_mult=4</code>/<code>hc_sinkhorn_iters=20</code>；<code>hc_attn_fn</code> 形状 <code>[24, 20480]</code> $=24\times(4\times5120)$；实测行、列各 20 次</td></tr>
-  <tr><td>Engram</td><td>层 1、14；阶数 2/3/4 每阶 $8$ 头 = 每 token 24 行</td><td><code>engram_layer_ids=[1,14]</code>、<code>engram_max_ngram_size=4</code>、<code>engram_n_heads=8</code>、<code>engram_head_dim=256</code>；实测层分布</td></tr>
-  <tr><td>DSpark</td><td>3 个 MTP 块顺序作用在同一批 5 个位置，一次前向产出 5 个草稿位置，目标层 37/38/39</td><td><code>n_mtp_layers=3</code>/<code>dspark_block_size=5</code>/<code>dspark_target_layer_ids</code>；<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> $=5120\times(3\times5120)$</td></tr>
-  <tr><td>词表与上下文</td><td>词表 129280，上下文 1M</td><td><code>vocab_size</code>；<code>embed.weight</code> 与 <code>head.weight</code> 形状均为 <code>[129280, 5120]</code></td></tr>
-  <tr><td>视觉侧</td><td>32 层 ViT，宽 1024，patch 14，下采样 3</td><td><code>vision_n_layers</code>/<code>vision_dim</code>/<code>vision_patch_size</code>/<code>vision_downsample_ratio</code></td></tr>
-</table>
+     view = { id, label, title, nodes[], edges[], groups[]?, notes[]?, info[]? }
+     info = [{ title, rows: [[键, 值], ...] }]   说明面板，随视图切换
+     node = { id, name, shape?, detail?, kind, drill? }
+     edge = { from, to, label? }
 
-<h2 id="flow">2. 交互式数据流</h2>
-<p>下图是实际前向路径。六个标签页切换粒度：整体总览之外，可下钻到注意力内部、压缩与稀疏选择、MoE 内部、Engram 注入与 DSpark 草稿链。黄色双边框节点可点击下钻，悬停可查看该节点的张量形状、公式与依据。形状与维度取自官方配置与真实 checkpoint 张量头。</p>
+     kind：tensor 张量（白底直角）| op 算子（浅蓝圆角）| cache 缓存（圆柱）| port 跨视图输入输出（虚线框）
 
-<div class="viz">
-  <div class="viz-head">
-    <div class="tabs" id="tabs"></div>
-    <div class="crumb" id="crumb"></div>
-  </div>
-  <div id="cy"></div>
-  <div class="legend" id="legend"></div>
-</div>
-<noscript>
-<style>.viz { display: none; }</style>
-<p>脚本未启用，下面以静态表列出六个视图的节点、维度、公式与说明。</p>
-<h4>整体总览 (40 层)</h4>
-<table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>embed · id → 5120</td><td><code>token id [1,T] -&gt; [1,T,5120]</code></td><td>$x = \mathrm{Embedding}(\mathrm{ids})$</td><td>词嵌入。vocab_size=129280、dim=5120；真实权重 embed.weight 形状 [129280, 5120] BF16。</td></tr>
-<tr><td>Layer 0 · 纯窗口注意力</td><td><code>[1,T,5120] -&gt; [1,T,5120]</code></td><td>$\text{SWA only}$</td><td>层 0 的 compress_ratios 为 0：不生产也不复用全局 KV，只有滑动窗口注意力（窗口 128）。</td></tr>
-<tr><td>Layer 1 · 窗口 + Engram</td><td><code>[1,T,5120] -&gt; [1,T,5120]</code></td><td>$h \leftarrow h + \mathrm{Engram}(h)$</td><td>全模型两个 Engram 注入层之一（另一个是层 14）。24 行 n-gram 哈希查表结果经稠密投影写回残差流。</td></tr>
-<tr><td>Layer 2 · Full：生产主 KV (r=2)</td><td><code>[1,T,5120] -&gt; [1,T,5120]</code></td><td>$C_j = \mathrm{RMSNorm}(\sum_{t=jr}^{(j+1)r-1}\mathrm{softmax}(s_t)v_t)$</td><td>CSA2 的 Full 层：自算主 KV、索引器 K 与 Top-K。压缩比 2，是全模型四个 source 层中的第一个，其缓存被层 2–7 共用。</td></tr>
-<tr><td>Layers 3..19 · 同模式再重复</td><td><code>[1,T,5120] -&gt; [1,T,5120]</code></td><td>$\text{Full} \to \text{Reuse} \times 5$</td><td>层 8、14 是另外两个 Full 层（各生产一份 r=2 的主 KV），其余层复用同组缓存。层 19 的输出即 H_{L/2}。</td></tr>
-<tr><td>H(L/2) · 编码器末层隐状态</td><td><code>[1,T,5120]</code></td><td>$H_{L/2} = \text{out}(\text{Layer 19})$</td><td>解码器全局 KV 的输入。参考实现中层 20 的注意力输入就是它，因此「层 20 的压缩器读自己的输入」等价于「用 H_{L/2} 投影」。</td></tr>
-<tr><td>Layer 20 · Full：生产主 KV (r=1)</td><td><code>[1,T,5120] -&gt; [1,T,5120]</code></td><td>$C_{20} = H_{L/2} W_{20}^{KV}$</td><td>解码器的 Full 层，唯一执行 CED 投影的层。压缩比 1（每 token 一条 288 字节条目），其缓存被层 20–39 共用。</td></tr>
-<tr><td>Layers 21..39 · 含 4 个 Reindex 层</td><td><code>[1,T,5120] -&gt; [1,T,5120]</code></td><td>$\text{Reuse} \to \text{Reindex} \to \text{Reuse}$</td><td>层 24、28、32、36 是 Reindex 层：复用主 KV 与索引器 K，但在候选池内自己重算 Top-K；其余层连 Top-K 一起复用。</td></tr>
-<tr><td>lm_head · 5120 → 129280</td><td><code>[1,T,5120] -&gt; [1,T,129280]</code></td><td>$\mathrm{logits} = W_{lm}\,x$</td><td>输出头。真实权重 head.weight 形状 [129280, 5120] BF16。</td></tr>
-<tr><td>DSpark · 3 个草稿块</td><td><code>[1,T,5120] -&gt; 5 个草稿位置</code></td><td>$\text{draft} \times 3\ \text{blocks}$</td><td>块式推测解码。输入取自层 37、38、39 的注意力输入，不改变主干缓存。点击下钻看草稿链。</td></tr>
-</table>
-<p>边：emb→e0（5120）；e0→e1（5120）；e1→e2（5120）；e2→e3（5120）；e3→hmid（5120）；hmid→d20（5120，同时喂 KV 投影）；d20→d21（5120）；d21→head（5120）；d21→mtp（5120）</p>
-<h4>注意力内部（层 2 / 层 20 的 Full 层结构相同，仅压缩比不同）</h4>
-<table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>残差流入 · 4×5120</td><td><code>[1,T,20480]</code></td><td>$x = (x_1,x_2,x_3,x_4)$</td><td>超连接把残差流复制成 4 份，每份 5120 宽。</td></tr>
-<tr><td>attn 超连接 · 读出</td><td><code>[1,T,20480] -&gt; [1,T,5120]</code></td><td>$\tilde{x} = \textstyle\sum_i \mathrm{sigmoid}(\mathrm{mixes}\cdot\mathrm{scale}+\mathrm{base})_i \odot x_i$</td><td>读出系数由上一层 FFN 的超连接混合提供（层 0 为 one-hot）；本层 hc_attn_fn（形状 [24, 20480]）产出的 post/comb 系数用于本子层写回，其 attn_pre 供本层 FFN 读出。</td></tr>
-<tr><td>wq_a · 5120 → 1280</td><td><code>[1,T,5120] -&gt; [1,T,1280]</code></td><td>$q = W_{q_a}\tilde{x}$</td><td>查询低秩投影。q_lora_rank=1280；真实权重形状 [1280, 5120]。</td></tr>
-<tr><td>q_norm · 1280</td><td><code>[1,T,1280] -&gt; [1,T,1280]</code></td><td>$q \leftarrow \mathrm{RMSNorm}(q)$</td><td>低秩后再归一化。q_norm.weight 形状 [1280]。</td></tr>
-<tr><td>wq_b · 1280 → 32768</td><td><code>[1,T,1280] -&gt; [1,T,64,512]</code></td><td>$64 \times 512 = 32768$</td><td>展开成 64 个查询头、头维 512。真实权重形状 [32768, 1280]。</td></tr>
-<tr><td>RoPE · 仅末尾 64 维</td><td><code>[1,T,64,512]</code></td><td>$\mathrm{rope\_head\_dim}=64$</td><td>只旋转头维的末尾 64 维（源码用 x[..., -rd:] 切片）。频率表按层选择：层 0、1（compress_ratio=0）用 base 10000 且关 YaRN；层 2–39（compress_ratio&gt;0）用 base 160000 且开 YaRN，查询、窗口 KV 与压缩条目共用同一份表。</td></tr>
-<tr><td>wkv · 5120 → 512</td><td><code>[1,T,5120] -&gt; [1,T,512]</code></td><td>$1\ \text{KV head} \times 512$</td><td>只有一个 KV 头、头维 512，64 个查询头共享这一份键值。真实权重形状 [512, 5120]。</td></tr>
-<tr><td>kv_norm · 512</td><td><code>[1,T,512] -&gt; [1,T,512]</code></td><td>$k,v \leftarrow \mathrm{RMSNorm}(\cdot)$</td><td>键值归一化。kv_norm.weight 形状 [512]。</td></tr>
-<tr><td>窗口 KV · FP8，128 槽</td><td><code>[bsz, 128, 512]</code></td><td>$128 \times 512 \times 1\ \mathrm{B} = 64\ \mathrm{KiB/层}$</td><td>最近 128 个位置的原始键值，环形缓冲、不随序列长度增长。保持 FP8。</td></tr>
-<tr><td>压缩条目 · Top-512 条</td><td><code>[1,T,512,512]</code></td><td>$288\ \mathrm{B}/\text{条目} \times 512$</td><td>该层所属压缩比组的条目中被索引器选中的 512 条。位置取组起点 j·r。压缩条目由 Compressor 的独立投影产生（自带 wkv 与 norm），不复用窗口 KV 的 wkv/kv_norm。点击下钻看选择过程。</td></tr>
-<tr><td>汇聚点 · 每头 1 个标量</td><td><code>[64] F32</code></td><td>$+ e^{\mathrm{sink}-m}\ \text{只进分母}$</td><td>每头一个可学习标量，加在 softmax 分母上，不携带值向量。真实张量 attn.attn_sink 形状 [64]。</td></tr>
-<tr><td>稀疏注意力 · 窗口 + 压缩</td><td><code>窗口 128 + 压缩 512 -&gt; [1,T,64,512]</code></td><td>$o = \frac{\sum_t e^{q\cdot k_t/\sqrt{d}-m}v_t}{\sum_t e^{q\cdot k_t/\sqrt{d}-m} + e^{\mathrm{sink}-m}}$</td><td>两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。$m=\max_t q\cdot k_t/\sqrt{d}$ 是并集分数上的运行最大值，$d$ 为头维 512。索引为 $-1$ 的占位槽位分子分母都不贡献。</td></tr>
-<tr><td>wo_a · 32768 → 8192（8 组）</td><td><code>[1,T,64,512] -&gt; [1,T,8,1024]</code></td><td>$o\_groups=8,\ o\_lora\_rank=1024$</td><td>按 8 组各降到 1024 维。真实权重形状 [8192, 4096]；分组的设计动机未在来源中说明。</td></tr>
-<tr><td>wo_b · 8192 → 5120</td><td><code>[1,T,8192] -&gt; [1,T,5120]</code></td><td>$y = W_{o_b}o$</td><td>拼回隐藏维。真实权重形状 [5120, 8192]。</td></tr>
-<tr><td>写回四流 · post/comb 混合</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow \mathrm{post}_i \odot y + \sum_j \mathrm{comb}_{ij} \odot x_j$</td><td>子层输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。</td></tr>
-</table>
-<p>边：in→hc1（20480）；hc1→wqa（5120）；wqa→qn（1280）；qn→wqb（1280）；wqb→rope（32768）；hc1→wkv（5120）；wkv→kvn（512）；kvn→win（FP8 128 槽）；hc1→cmp（经 Compressor 独立投影）；rope→sa（q）；win→sa（128 位置）；cmp→sa（512 条目）；sink→sa（分母）；sa→woa（32768）；woa→wob（8192）；wob→hc2（5120）</p>
-<h4>压缩条目与两级稀疏选择</h4>
-<table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>全部可达压缩条目 · 随上下文线性增长</td><td><code>[1,T,N_reach,r=2 层约 50 万条]</code></td><td>$n_{\mathrm{reach}}(i) = \lfloor (i+1)/r \rfloor$</td><td>只有「整组 token 都已出现」的条目才可达。1M 上下文、r=2 时约 50 万条；不可达条目在打分前置 $-\infty$。</td></tr>
-<tr><td>索引器打分 · 32 头 × 128 维</td><td><code>[1,T,32,128] x [n,128] -&gt; [1,T,n]</code></td><td>$I_{q,j} = \sum_h w_{q,h}\mathrm{ReLU}(q_h\cdot k_j)$</td><td>每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。</td></tr>
-<tr><td>块级打分 · 块分 = 块内最大</td><td><code>[1,T,n] -&gt; [1,T,n/8]</code></td><td>$\mathrm{block}(b) = \max_{j\in b} I_{q,j}$</td><td>把位置切成大小 8 的块，每块取块内最大索引分作为块分。</td></tr>
-<tr><td>钉住最新块</td><td><code>—</code></td><td>$\text{pin the newest block}$</td><td>最新块只填了一部分，若不钉住会被更早的完整块以更大块分压过，导致 query 看不到紧邻的历史。</td></tr>
-<tr><td>选出 2048 块</td><td><code>[1,T,n/8] -&gt; 2048 块</code></td><td>$\text{top-}2048$</td><td>只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。</td></tr>
-<tr><td>候选池 · 2048 × 8 = 16384</td><td><code>16384 个候选位置</code></td><td>$2048 \times 8 = 16384$</td><td>候选位置集合。短上下文下可达条目本身少于 16384，此时候选池不起缩减作用。</td></tr>
-<tr><td>位置级 Top-512</td><td><code>16384 -&gt; [1,T,512]</code></td><td>$\text{top-}512$</td><td>在池内按索引分取前 512 条。Reindex 层重做这一步，Reuse 层直接复用上一次的选择。</td></tr>
-<tr><td>拼进稀疏注意力</td><td><code>窗口 128 + 压缩 512</code></td><td>$\mathcal{T} = \text{窗口} \cup \text{Top-}512$</td><td>两部分槽位在同一次调用里做一次 softmax，窗口没有额外权重加成，选中完全由索引分决定。</td></tr>
-</table>
-<p>边：pool0→score（逐条打分）；score→blk（聚合）；pin→blk（保留最新块）；blk→top2048（块分排序）；top2048→cand（展开 8 位置）；cand→top512（池内排序）；top512→sa（512 条）；pool0→sa（可达性决定候选范围）</p>
-<h4>MoE 与超连接写回</h4>
-<table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>残差流入 · 读出后 5120</td><td><code>[1,T,20480] -&gt; [1,T,5120]</code></td><td>$\tilde{x}$</td><td>由本层 hc_attn_fn 产出的 attn_pre 系数从 4 份残差流读出 5120 维——即「读入 FFN 的系数来自本层注意力产出」这一次序关系。</td></tr>
-<tr><td>ffn_norm</td><td><code>[1,T,5120]</code></td><td>$x \leftarrow \mathrm{RMSNorm}(x)$</td><td>MoE 前的归一化。</td></tr>
-<tr><td>gate 打分 · 384 专家</td><td><code>[1,T,5120] -&gt; [1,T,384]</code></td><td>$\mathrm{score} = \sqrt{\mathrm{softplus}(xW^\top)}$</td><td>真实权重 gate.weight 形状 [384, 5120]。另有 gate.bias 与 gate.bias_vl 各 [384]——图像 span 的 token 用另一套偏置。</td></tr>
-<tr><td>修正偏置 · 只影响选择</td><td><code>[384] F32</code></td><td>$\mathrm{idx} = \mathrm{topk}_6(\mathrm{score}+b)$</td><td>无辅助损失的负载均衡偏置：只参与 topk 排序，不进入权重计算，因此不改变被选中专家的输出尺度。</td></tr>
-<tr><td>top-6 选择</td><td><code>384 -&gt; 6</code></td><td>$w = \frac{\mathrm{score}_{\mathrm{idx}}}{\sum \mathrm{score}_{\mathrm{idx}} + 10^{-20}} \times 1.5$</td><td>选中 6 个路由专家；权重在选中集合内归一化后乘 route_scale=1.5。</td></tr>
-<tr><td>6 个路由专家 · 各 2304 × 5120 × 3</td><td><code>[1,T,5120] -&gt; 6 × [1,T,2304]</code></td><td>$\mathrm{w1},\mathrm{w3}{:}\,[2304,5120]\ \ \mathrm{w2}{:}\,[5120,2304]$</td><td>每个专家约 35.39M 参数（fp4 量化存储，I8 打包）。384 个专家全存但每 token 只用 6 个。</td></tr>
-<tr><td>共享专家 · 1 个，每 token 必过</td><td><code>[1,T,5120] -&gt; [1,T,2304]</code></td><td>$\text{shared expert}$</td><td>与路由专家同形（约 35.39M），不参与稀疏选择。</td></tr>
-<tr><td>加权相加</td><td><code>6 × [1,T,2304] + [1,T,2304] -&gt; [1,T,5120]</code></td><td>$y = \sum_{i\in\mathrm{idx}} w_i E_i(x) + E_{\mathrm{shared}}(x)$</td><td>路由专家按权重加权，共享专家恒权相加。</td></tr>
-<tr><td>写回四流 · post/comb 混合</td><td><code>[1,T,5120] -&gt; [1,T,20480]</code></td><td>$x_i \leftarrow \mathrm{post}_i \odot y + \sum_j \mathrm{comb}_{ij} \odot x_j$</td><td>MoE 输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。</td></tr>
-</table>
-<p>边：in→norm（5120）；norm→gate（5120）；bias→gate（384）；gate→sel（384 → 6）；sel→rexp（6 个专家）；norm→shared（5120）；rexp→sum（加权）；shared→sum（恒权）；sum→hc（5120）</p>
-<h4>Engram：n-gram 哈希查表（层 1 与层 14）</h4>
-<table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>上下文片段 · 长度 2 / 3 / 4</td><td><code>token id 序列</code></td><td>$n\text{-gram},\ n \in \{2,3,4\}$</td><td>从当前位置往前取三种长度的连续片段。</td></tr>
-<tr><td>哈希映射 · 3 × 8 = 24 个下标</td><td><code>-&gt; 24 个表下标</code></td><td>$(4-1) \times 8 = 24$</td><td>每种片段长度用 8 个不同的哈希函数映射，共 24 个下标。</td></tr>
-<tr><td>嵌入表 · 两层合计约 196B</td><td><code>[384006168, 256] 与 [384016682, 256]</code></td><td>$\approx 196\ \mathrm{B}\ \text{参数}$</td><td>engram_vocab_size=16000000、head_dim=256。表很大，但每 token 只按 24 个下标取值，因此不计入激活参数。</td></tr>
-<tr><td>取回 24 行 · 每行 256 维</td><td><code>-&gt; [24, 256]</code></td><td>$24 \times 256 = 6144$</td><td>每 token 实际取回 6144 个表元素，相对 196B 的表可以忽略。</td></tr>
-<tr><td>稠密投影 · 每层 157.33M</td><td><code>[1,T,24,256] -&gt; [1,T,25600]（5 × 5120）</code></td><td>$24\times256\times25600 + 2\times4\times5120 \approx 157.33\ \mathrm{M}$</td><td>把取回的向量经稠密投影写回残差流：投影权重为 $24\times256\to25600$（输出 5 份 5120），另加一个小的门控投影 $2\times4\times5120$，合计每层约 157.33M。这一步是稠密的，只要该层启用 Engram 就整份参与计算——这是 Engram 计入激活参数的部分。</td></tr>
-<tr><td>门控 · 带符号平方根后 sigmoid</td><td><code>[1,T,5120]</code></td><td>$g = \sigma(\mathrm{copysign}(\sqrt{|d|}, d))$</td><td>门控值取残差流与查表结果的归一化点积，先取绝对值开方、保留原符号，再经 sigmoid。与训练内核一致。</td></tr>
-<tr><td>写回残差流</td><td><code>[1,T,5120]</code></td><td>$x \leftarrow x + g \odot \mathrm{proj}$</td><td>按门控加权写回。图像 span 的 token 跳过这一步。</td></tr>
-</table>
-<p>边：ctx→hash（片段）；hash→tab（24 个下标）；tab→row（按行取值）；row→proj（[24,256]）；gate→add（门控）；proj→add（投影结果）；add→ctx（写回后继续前向）</p>
-<h4>DSpark：块式推测解码草稿链</h4>
-<table><tr><th>节点</th><th>维度</th><th>公式</th><th>说明</th></tr>
-<tr><td>层 37 注意力输入</td><td><code>[1,T,4,5120]</code></td><td>$h_{37}$</td><td>取注意力子层的输入（不是输出），此时残差流仍是 4 份。</td></tr>
-<tr><td>层 38 注意力输入</td><td><code>[1,T,4,5120]</code></td><td>$h_{38}$</td><td>同上。</td></tr>
-<tr><td>层 39 注意力输入</td><td><code>[1,T,4,5120]</code></td><td>$h_{39}$</td><td>同上。</td></tr>
-<tr><td>按 hc 维取均值 · 4 → 1</td><td><code>[1,T,4,5120] -&gt; [1,T,5120]</code></td><td>$h.\mathrm{mean}(\mathrm{dim}=2)$</td><td>在超连接副本维（大小为 4）上取均值，把三层各自压成 5120 维。</td></tr>
-<tr><td>沿特征维拼接 · 3 → 15360</td><td><code>3 × [1,T,5120] -&gt; [1,T,15360]</code></td><td>$3 \times 5120 = 15360$</td><td>三层的均值结果拼成一个 15360 维向量，作为一次性的草稿输入（不再自回归）。</td></tr>
-<tr><td>main_proj · 15360 → 5120</td><td><code>[1,T,15360] -&gt; [1,T,5120]</code></td><td>$W{:}\,[5120, 15360]$</td><td>真实权重 main_proj.weight 形状 [5120, 15360]，与三层拼接的宽度一致。</td></tr>
-<tr><td>草稿块 1 · 5 个位置</td><td><code>-&gt; 隐藏态</code></td><td>$\text{block size} = 5$</td><td>三个草稿块顺序作用在同一批 5 个位置上，一次前向共同产出 5 个草稿位置的 logits。本块只输出隐藏态、不接输出头。块内位置用噪声 token（id 128799）占位；草稿块自身是 MoE：128 专家取 top-3。</td></tr>
-<tr><td>草稿块 2 · 5 个位置</td><td><code>-&gt; 隐藏态</code></td><td>$\text{block size} = 5$</td><td>同上，输出隐藏态交给末块。共 3 个 MTP 块（n_mtp_layers=3）。</td></tr>
-<tr><td>草稿块 3 · 5 个位置</td><td><code>-&gt; [1,5,V]</code></td><td>$\text{block size} = 5$</td><td>末块接 Markov 头与置信头，输出 5 个位置的词表 logits（$V$ 为词表 129280）。</td></tr>
-<tr><td>Markov 头 · 秩 256</td><td><code>[1,5,256]</code></td><td>$\mathrm{rank} = 256$</td><td>dspark_markov_rank=256，给草稿序列内部的相邻关系建模。</td></tr>
-<tr><td>置信头</td><td><code>[1,5]</code></td><td>$\text{confidence}$</td><td>输出每个草稿位置的接受置信度，决定这次接受几个草稿。</td></tr>
-<tr><td>草稿 token · 交主干校验</td><td><code>5 个草稿位置</code></td><td>$\text{draft} \to \text{verify}$</td><td>草稿交给主干一次性校验。DSpark 不产生主干缓存，只提高一次前向平均能确认的 token 数。</td></tr>
-</table>
-<p>边：h37→mean（取均值）；h38→mean（取均值）；h39→mean（取均值）；mean→cat（5120）；cat→proj（15360）；proj→b1（5120）；b1→b2（草稿）；b2→b3（草稿）；b3→markov（末块）；b3→conf（末块）；markov→out（修正）；conf→out（接受数）</p>
-</noscript>
-<div id="tip"></div>
-
-<h2 id="points">3. 要点</h2>
-
-<h3>整体结构：两半 + 四个缓存生产者</h3>
-<ul>
-  <li><b>沿深度</b>：40 层被切成前 20 层编码器（层 0–19）与后 20 层解码器（层 20–39）。解码器的全局 KV 不由各自隐状态产生，而由编码器末层隐状态 $H_{L/2}$ 投影得到；与跨层共享结合后只有层 20（解码器的 Full 层）执行这次投影。因此 prefill 跑完编码器就已拿到解码器所需的全局 KV。</li>
-  <li><b>沿缓存</b>：全模型只有 4 个层生产主 KV——层 2、8、14、20，对应压缩比 2、2、2、1。其余压缩层读同组 source 层的缓存，因此主 KV 的份数是 4 而非 40。这一项与压缩比、FP4 一起把每 token 缓存压到 890 字节。</li>
-  <li><b>前两层只有窗口</b>：层 0、1 的压缩比为 0（<code>compress_ratios</code> 前两位），不复用也不生产全局 KV，只有滑动窗口注意力。</li>
-  <li><b>沿宽度</b>：每层 384 个路由专家取 top-6，另加 1 个共享专家恒激活；专家中间维 2304。路由专家占层参数量的绝大部分，但每 token 只动用其中 6 个。</li>
-  <li><b>两条附加路径</b>：<a href="../ngram/index.html">Engram</a> 在层 1、14 把 n-gram 哈希查表结果写进残差流（不产生缓存）；<a href="../speculative-decoding/index.html">DSpark</a> 用层 37、38、39 的注意力输入驱动 3 个草稿块（不改变主干缓存）。</li>
-</ul>
-
-<h3>注意力：单 KV 头 + 低秩投影 + 8 组输出</h3>
-<ul>
-  <li><b>查询侧</b>：<code>wq_a</code> 把 5120 维压到 1280 维低秩，<code>q_norm</code> 归一化后再由 <code>wq_b</code> 展开成 $64 \times 512$ 维（64 个头、头维 512）。</li>
-  <li><b>键值侧</b>：只有 1 个 KV 头、头维 512，由 <code>wkv</code> 一次投影得到，经 <code>kv_norm</code> 归一化。多头查询共享同一份键值——这是把 KV 宽度压到 512 维的关键。</li>
-  <li><b>输出侧</b>：$64 \times 512 = 32768$ 维，先按 8 组各降到 1024 维（<code>wo_a</code>），再拼回 5120 维（<code>wo_b</code>）。<code>o_groups=8</code> 与 <code>o_lora_rank=1024</code> 是官方配置取值；分组的设计动机未在来源中说明，此处只陈述分组这一事实与其形状。</li>
-  <li><b>位置</b>：只旋转头维的<b>末尾</b> 64 维（源码用 <code>x[..., -rd:]</code> 切片，<code>rd = rope_head_dim = 64</code>）。频率表按<b>层</b>选择，不是按路径分：层 0、1（<code>compress_ratio=0</code>）用 base 10000 且关闭 YaRN；层 2–39（<code>compress_ratio&gt;0</code>）用 base 160000 且开启 YaRN，该层的查询、窗口 KV 与压缩条目共用同一份频率表（<code>model.py</code> L680–687 按层分支，L706、L758、L772 三处调用同一个 <code>freqs_cis</code>）。</li>
-</ul>
-
-<h3>可见集：窗口 128 个位置 + Top-512 压缩条目</h3>
-<ul>
-  <li>每个 query 能看到本层窗口内最多 128 个原始位置（FP8 存储），加上该层所属压缩比组中由索引器选出的至多 512 个压缩条目。</li>
-  <li>压缩条目按组编号，组 $j$ 覆盖 token $[jr,(j+1)r)$，位置取 $j\cdot r$；只有整组出现后条目才可达，可达条数是 $\lfloor(i+1)/r\rfloor$。</li>
-  <li>解码器还有一级候选池：建池层（层 20）按块打分选出 2048 个块、每块 8 个位置，共 16384 个候选；后续 Reindex 层只在这个池内选 Top-512。</li>
-</ul>
-
-<h2 id="ced">4. CED：解码器的全局 KV 从哪里来</h2>
-<p>报告对这一段给出的形式是 $C_l = H_{L/2}W_l^{KV}$、$Z_l = H_{L/2}W_l^{Z}$（$l > L/2$）：解码器各层的键值条目由编码器末层隐状态投影得到，投影权重逐层不同。共享的是<b>输入</b> $H_{L/2}$，不是投影结果。</p>
-<p>与跨层共享结合后还有一层收窄：真正执行这次投影的只有被指派为 Full 模式的解码器层。本模型的配置里这个层是层 20，参考实现中的表现是「层 20 的压缩器读取它自己的注意力输入」，而第 20 层的注意力输入正是第 19 层的输出，与公式里的 $H_{L/2}$ 对上。</p>
-<p><b>滑动窗口 KV 不能一起省</b>。窗口 KV 是最近位置的未压缩逐 token FP8 副本，必须由本层经过完整计算后的隐状态生成；第 $l$ 层的窗口 KV 需要第 $l$ 层的隐状态，而后者要等第 $l-1$ 层算完，这条依赖链无法用「读编码器输出」替代。服务端的替代办法是有界重放：只重算最后 $n_{\text{win}}$ 个位置，因为更早的位置已滑出可见集。参考实现中不含该分支，它属服务实现。</p>
-
-<h2 id="sparse">5. 稀疏选择：从打分到槽位</h2>
-<p>选择的输入是「全部因果可见的压缩条目」，输出是每个 query 的 Top-512 下标。三步：</p>
-<ul>
-  <li><b>打分</b>：索引器用 32 个头对条目打分，每头的贡献是 $\mathrm{ReLU}(q_h\cdot k_j)$ 再乘该头权重，按头求和。</li>
-  <li><b>块级筛选</b>：把位置切成大小 8 的块，块分取块内最大索引分，从建池层（层 20）选出 2048 个块。最新块只填了一部分，会被钉住以免被更早的完整块压过。</li>
-  <li><b>位置级选择</b>：候选池内的 16384 个位置按索引分取前 512，与窗口槽位拼进同一次稀疏注意力调用。</li>
-</ul>
-<p>不可达的条目（编号不小于 $\lfloor(i+1)/r\rfloor$）在打分阶段就被置为 $-\infty$。注意力本身对选中槽位做加权求和，并把每头一个可学习的汇聚点标量加在分母上——汇聚点只进分母、不参与取最大值，也不携带值向量。</p>
-<p>三种层模式决定各层自算还是复用：Full 层自算主 KV、索引器 K 与 Top-K；Reindex 层复用最近的主 KV 与索引器 K，但自己重算 Top-K（在候选池内）；Reuse 层连 Top-K 一起复用，不算索引分。模式由配置静态决定。</p>
-
-<h2 id="extra">6. Engram 与 DSpark</h2>
-<p><b>Engram</b> 插在层 1 与层 14。它从当前位置往前取长度 2、3、4 的连续片段，各用 8 个哈希函数映射到嵌入表下标，共 24 个下标（每 token 取回 $24\times256=6144$ 个表元素）；取回的向量经一个稠密投影写回残差流，写入强度由「流与查表结果的归一化点积取绝对值开方、保留符号后过 sigmoid」的门控决定。两层嵌入表合计约 196B 参数，但每 token 只取回六千多个元素；真正计入激活的是那个稠密投影——权重 $24\times256\to25600$（输出 5 份 5120）另加门控投影 $2\times4\times5120$，每层约 157.33M。</p>
-<p><b>DSpark</b> 是块式推测解码的草稿头：3 个 MTP 块顺序作用在同一批 5 个位置上，一次前向产出 5 个草稿位置。输入取主干层 37、38、39 的注意力输入，先在超连接副本维取均值，再把三层结果沿特征维拼接（<code>main_proj.weight</code> 形状 <code>[5120, 15360]</code> 即此）。草稿块自身是 MoE 结构，128 个专家取 top-3；末块另带 Markov 头（秩 256）与置信头，用于决定接受几个草稿。它不产生主干缓存，只提高 decode 吞吐。</p>
-
-<h2 id="verify">7. 核对方式</h2>
-<p><b>结构与形状</b>：用 HTTP Range 请求读取全部 48 个 safetensors 分片的 JSON 头（未下载权重本体），得到 96085 个张量的名称、形状与 dtype。以此交叉验证配置与源码推断：层数、专家数、各模块形状、MTP 张量数。</p>
-<p><b>公式与数值行为</b>：按官方实现逐行语义复现各算子，用官方配置的真实维度在随机张量上实跑。已完成对照包括压缩器池化（与独立重实现逐位一致）、Sinkhorn 迭代（float64 最大差 8.9e-08）、路由打分（indices 完全一致、权重最大差 0）、RoPE 频率、稀疏注意力（与解析解逐元素差 0）、FP4 量化误差。</p>
-<p><b>缓存与激活账</b>：实测按配置与源码常量推出每 token 890 字节；用真实张量头加配置专家数算得半栈 7.8929B / 7.5758B，并分解两者差额。</p>
-<p><b>端到端数据流</b>：构造等比缩小但保留全部结构特征的模型（dim 64、7 层），跑通 prefill 与逐 token decode。由此复现并定位了参考实现的一处行为：压缩比大于 1 的层在解码步的组未填满时读到其他层发布的索引键。</p>
-<p>实测脚本与运行输出不随仓库分发，实测清单（含形状明细）见 <code>wiki/deepseek-v4-1/research/measured.md</code>。</p>
-
-<h2 id="sources">来源与范围说明</h2>
-<table>
-  <tr><th>项目</th><th>依据</th></tr>
-  <tr><td>全部 config 数值</td><td>官方推理配置 <code>inference/config.json</code>（官方 <code>generate.py</code> 中 <code>ModelArgs(**json.load(f))</code> 实际读取的文件）</td></tr>
-  <tr><td>数据流路径、各算子公式、缓存布局</td><td>官方推理实现 <code>inference/model.py</code> 与 <code>inference/kernel.py</code>（机制对应位置：压缩器池化见 <code>model.py</code> L458–485，频率表按层分支见 L680–687，超连接读出与写回见 L982–994，稀疏注意力内核见 <code>kernel.py</code> L310–403）</td></tr>
-  <tr><td>张量形状与 dtype、参数量、层分布</td><td>真实 checkpoint 的 48 个 safetensors 分片头（HTTP Range 读取，共 96085 个张量）</td></tr>
-  <tr><td>设计动机与对外宣称</td><td>DeepSeek-V4.1-Flash 技术报告（页面标注的「报告行 N」即报告文本的该行）</td></tr>
-  <tr><td>池化、Sinkhorn、路由、RoPE、稀疏注意力、FP4 误差、缓存账、激活账、端到端一致性</td><td>本机实测，实测清单见 <code>wiki/deepseek-v4-1/research/measured.md</code></td></tr>
-</table>
-<p style="color:var(--text-light);font-size:14px">核对说明：本页只描述官方参考实现与配置的实际行为，并把报告的宣称（prefill 减半、有界重放）与服务实现的优化分开陈述。训练流程、服务端 KV 分层调度、视觉编码器内部结构与量化 kernel 实现不在本页范围。形状与维度取自官方配置与真实张量头；机制数值结论由本机脚本实算。</p>
-
-<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
-
+     写法见 guides/model-dataflow/plan.md。
+     ============================================================ -->
+<script>window.DOJO_FLOW_DATA = {"views":[{"id":"transformer","label":"Transformer","title":"Transformer.forward","nodes":[{"id":"ids","name":"input_ids","kind":"tensor","shape":"int64 [B, T]","detail":"每个位置都是真实 token，填充不会传进来"},{"id":"ngram","name":"self.engram_hash(input_ids, start_pos, engram_mask)","kind":"op","shape":"[B, T] → [B, T, 2, 24]","detail":"NgramHashState，把每个位置结尾的 n-gram 哈希成表行号\n倒数第二维是 Engram 层序号，对应 engram_layer_ids 的 [1, 14]；24 = (4 − 1) × 8","drill":"ngramhashstate"},{"id":"hash","name":"engram_hashes","kind":"tensor","shape":"int64 [B, T, 2, 24]"},{"id":"emb","name":"self.embed(input_ids)","kind":"op","shape":"129280 → 5120","detail":"ParallelEmbedding：embed.weight [129280, 5120]，按 rank 沿词表维切分，单卡即整张"},{"id":"h0","name":"h","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"hcexp","name":"h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)","kind":"op","shape":"[B, T, 5120] → [B, T, 4, 5120]","detail":"把残差流复制成 hc_mult 份，供 Hyper-Connections 用"},{"id":"hc","name":"h","kind":"tensor","shape":"bf16 [B, T, 4, 5120]"},{"id":"eng","name":"layer.engram(h, engram_hashes[:, :,\nlayer.engram.layer_hash_index, :], engram_mask)","kind":"op","shape":"[B, T, 4, 5120] 不变","detail":"Engram：层 1、14 在进入本层之前跑，吃的是上一层 Block 的输出，把 n-gram 查表的结果按门控加进残差流","drill":"engram"},{"id":"pm0","name":"make_identity_pre_mix(h, self.hc_mult)","kind":"op","shape":"→ fp32 [B, T, 4]","detail":"第 0 份置 1、其余置 0，作为进入第 0 层时的 pre_mix"},{"id":"pre","name":"pre_mix","kind":"tensor","shape":"fp32 [B, T, 4]","detail":"进入第 0 层时的初值，此后每层返回的 ffn_pre 都覆盖它"},{"id":"layers","name":"40 × Block","kind":"op","shape":"[B, T, 4, 5120] 不变","detail":"层 0 的输入是 hc；层 1、14 在进本层之前先跑 Engram 改写残差流；其余层的输入是上一层 Block 的输出\n压缩 KV 只在 4 个 source 层（2、8、14、20）算一次，其余 compress_ratio 大于 0 的层从 shared_attn 读\n层 0、1 的 compress_ratio 为 0，只有滑动窗口","drill":"block"},{"id":"hl","name":"h","kind":"tensor","shape":"bf16 [B, T, 4, 5120]"},{"id":"avg","name":"h.mean(dim=2)","kind":"op","shape":"[B, T, 4, 5120] → [B, T, 5120]","detail":"进入第 37、38、39 层之前的残差流，按 hc 维取均值"},{"id":"mh","name":"main_hidden","kind":"tensor","shape":"bf16 [B, T, 15360]","detail":"由 main_hiddens 里 3 个目标层各 [B, T, 5120] 沿最后一维拼接而来，作为第三个返回值交给调用方"},{"id":"col","name":"layer.hc_pre(h, pre_mix)","kind":"op","shape":"[B, T, 4, 5120] → [B, T, 5120]","detail":"用最后一层返回的 pre_mix 把 4 份折叠成一份"},{"id":"hc2","name":"h","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"fnorm","name":"self.norm (RMSNorm)","kind":"op","shape":"[B, T, 5120] 不变","detail":"norm.weight [5120]","drill":"rmsnorm"},{"id":"hn","name":"h","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"head","name":"self.head (ParallelHead)","kind":"op","shape":"5120 → 129280","detail":"head.weight [129280, 5120]，只取最后一个位置","drill":"parallelhead"},{"id":"logits","name":"logits","kind":"tensor","shape":"fp32 [B, 129280]"},{"id":"samp","name":"sample(logits, self.temperature)","kind":"op","shape":"→ [B]","detail":"Gumbel-max：概率除以指数分布随机数后取 argmax，等价于按概率采样"},{"id":"oids","name":"output_ids","kind":"tensor","shape":"int64 [B]"},{"id":"shar","name":"shared_attn","kind":"cache","shape":"compress_kv、index_k、topk_idxs","detail":"各层之间传递的共享量，每个前向里由靠前的层写、靠后的层读，不重置"},{"id":"tret","name":"(output_ids, logits, main_hidden)","kind":"tensor","shape":"—","detail":"三个返回值：采样出的 id、logits、拼接后的 main_hidden"}],"edges":[{"from":"ids","to":"emb"},{"from":"emb","to":"h0"},{"from":"ids","to":"ngram"},{"from":"ngram","to":"hash"},{"from":"h0","to":"hcexp"},{"from":"hcexp","to":"hc"},{"from":"hc","to":"pm0","label":"形状与 device"},{"from":"pm0","to":"pre"},{"from":"hash","to":"eng"},{"from":"layers","to":"eng","label":"上一层 Block 的输出"},{"from":"eng","to":"layers","label":"层 1、14 的输入"},{"from":"hc","to":"layers","label":"层 0 的输入"},{"from":"pre","to":"layers"},{"from":"shar","to":"layers"},{"from":"layers","to":"shar"},{"from":"layers","to":"hl"},{"from":"layers","to":"avg","label":"第 37、38、39 层的输入"},{"from":"avg","to":"mh"},{"from":"hl","to":"col"},{"from":"layers","to":"col","label":"最后一层返回的 pre_mix"},{"from":"col","to":"hc2"},{"from":"hc2","to":"fnorm"},{"from":"fnorm","to":"hn"},{"from":"hn","to":"head"},{"from":"head","to":"logits"},{"from":"logits","to":"samp"},{"from":"samp","to":"oids"},{"from":"oids","to":"tret"},{"from":"logits","to":"tret"},{"from":"mh","to":"tret"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["输入嵌入","$h = \\mathrm{Embed}(input\\_ids)$，h 是词嵌入，Embed 是 embed，词表 129280、维度 5120"],["残差流复制","$h \\in \\mathbb{R}^{B \\times T \\times d} \\mapsto h \\in \\mathbb{R}^{B \\times T \\times 4 \\times d}$，把一份残差流复制成 hc_mult = 4 份，4 是 hc_mult，d 是 5120"],["输出","$\\mathrm{logits} = \\mathrm{fnorm}(h)\\,W^\\top$，h 是用最后一层返回的 pre_mix 折叠后的隐状态，fnorm 是最后的 RMSNorm，W 是 head.weight"]]},{"title":"配置","rows":[["vocab_size","129280"],["dim","5120"],["n_layers","40"],["hc_mult","4"],["dspark_target_layer_ids","[37, 38, 39]"],["engram_layer_ids","[1, 14]"]]}]},{"id":"block","label":"Block","title":"Block.forward","nodes":[{"id":"hin","name":"x","kind":"tensor","shape":"bf16 [B, T, 4, 5120]","detail":"进入本层的残差流，4 份"},{"id":"bpre","name":"pre_mix","kind":"tensor","shape":"fp32 [B, T, 4]","detail":"上一层返回的 pre_mix，把 4 份折叠成一份时用"},{"id":"resid0","name":"residual","kind":"tensor","shape":"bf16 [B, T, 4, 5120]","detail":"进注意力子层之前的残差流"},{"id":"mixes_a","name":"self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)","kind":"op","shape":"[B, T, 4, 5120] → 三组 fp32 系数","detail":"一次投影同时给出 pre、post、comb 三套系数\nhc_attn_fn [24, 20480]、hc_attn_base [24]、hc_attn_scale [3]，都是 fp32；24 = (2 + 4) × 4，20480 = 4 × 5120"},{"id":"apre","name":"attn_pre","kind":"tensor","shape":"fp32 [B, T, 4]"},{"id":"apost","name":"attn_post","kind":"tensor","shape":"fp32 [B, T, 4]"},{"id":"acomb","name":"attn_comb","kind":"tensor","shape":"fp32 [B, T, 4, 4]"},{"id":"cpre","name":"self.hc_pre(x, pre_mix)","kind":"op","shape":"[B, T, 4, 5120] → [B, T, 5120]","detail":"按 pre_mix 把 4 份加权求和成 1 份"},{"id":"x1","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"an","name":"self.attn_norm (RMSNorm)","kind":"op","shape":"[B, T, 5120] 不变","detail":"attn_norm.weight [5120]","drill":"rmsnorm"},{"id":"x2","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"attn","name":"self.attn(x, start_pos, *attn_args)","kind":"op","shape":"[B, T, 5120] 不变","detail":"Attention，本层的窗口 KV 与压缩 KV 都在里面读写；本路径 attn_args 为空","drill":"attention"},{"id":"x3","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"cpost","name":"self.hc_post(x, residual, attn_post, attn_comb)","kind":"op","shape":"[B, T, 5120] → [B, T, 4, 5120]","detail":"把子层输出按 post 展开成 4 份，再把 residual 按 comb 混进去"},{"id":"x4","name":"x","kind":"tensor","shape":"bf16 [B, T, 4, 5120]"},{"id":"resid1","name":"residual","kind":"tensor","shape":"bf16 [B, T, 4, 5120]","detail":"进前馈子层之前的残差流"},{"id":"mixes_f","name":"self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)","kind":"op","shape":"[B, T, 4, 5120] → 三组 fp32 系数","detail":"hc_ffn_fn [24, 20480]、hc_ffn_base [24]、hc_ffn_scale [3]，形状与注意力那组相同"},{"id":"fpre","name":"ffn_pre","kind":"tensor","shape":"fp32 [B, T, 4]","detail":"作为返回值交给下一层当 pre_mix"},{"id":"fpost","name":"ffn_post","kind":"tensor","shape":"fp32 [B, T, 4]"},{"id":"fcomb","name":"ffn_comb","kind":"tensor","shape":"fp32 [B, T, 4, 4]"},{"id":"cpre2","name":"self.hc_pre(x, attn_pre)","kind":"op","shape":"[B, T, 4, 5120] → [B, T, 5120]","detail":"用的是注意力子层算出的 pre_mix，不是上一层传来的"},{"id":"x5","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"fn","name":"self.ffn_norm (RMSNorm)","kind":"op","shape":"[B, T, 5120] 不变","detail":"ffn_norm.weight [5120]","drill":"rmsnorm"},{"id":"x6","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"moe_op","name":"self.ffn(x, image_mask)","kind":"op","shape":"[B, T, 5120] 不变","detail":"MoE，image_mask 为 None","drill":"moe"},{"id":"x7","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"},{"id":"cpost2","name":"self.hc_post(x, residual, ffn_post, ffn_comb)","kind":"op","shape":"[B, T, 5120] → [B, T, 4, 5120]"},{"id":"hout","name":"x","kind":"tensor","shape":"bf16 [B, T, 4, 5120]"},{"id":"bret","name":"(x, ffn_pre)","kind":"tensor","shape":"—","detail":"第二个返回值是下一层的 pre_mix"}],"edges":[{"from":"hin","to":"resid0"},{"from":"hin","to":"mixes_a"},{"from":"mixes_a","to":"apre"},{"from":"mixes_a","to":"apost"},{"from":"mixes_a","to":"acomb"},{"from":"hin","to":"cpre"},{"from":"bpre","to":"cpre"},{"from":"cpre","to":"x1"},{"from":"x1","to":"an"},{"from":"an","to":"x2"},{"from":"x2","to":"attn"},{"from":"attn","to":"x3"},{"from":"x3","to":"cpost"},{"from":"resid0","to":"cpost"},{"from":"apost","to":"cpost"},{"from":"acomb","to":"cpost"},{"from":"cpost","to":"x4"},{"from":"x4","to":"resid1"},{"from":"x4","to":"mixes_f"},{"from":"mixes_f","to":"fpre"},{"from":"mixes_f","to":"fpost"},{"from":"mixes_f","to":"fcomb"},{"from":"x4","to":"cpre2"},{"from":"apre","to":"cpre2"},{"from":"cpre2","to":"x5"},{"from":"x5","to":"fn"},{"from":"fn","to":"x6"},{"from":"x6","to":"moe_op"},{"from":"moe_op","to":"x7"},{"from":"x7","to":"cpost2"},{"from":"resid1","to":"cpost2"},{"from":"fpost","to":"cpost2"},{"from":"fcomb","to":"cpost2"},{"from":"cpost2","to":"hout"},{"from":"hout","to":"bret"},{"from":"fpre","to":"bret"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["混合系数","$\\mathrm{mixes} = W\\, \\hat{x}$，$\\hat{x} = \\mathrm{flatten}(x) \\cdot \\mathrm{rsqrt}(\\mathrm{mean}(\\mathrm{flatten}(x)^2) + \\epsilon)$，x 是本子层前的残差流，flatten 把最后两维拉平，W 是 hc_attn_fn 或 hc_ffn_fn，$\\epsilon$ 是 norm_eps"],["pre、post、comb","$pre_j = \\sigma(m_j s_0 + b_j) + \\epsilon$、$post_j = 2\\sigma(m_{j+hc} s_1 + b_{j+hc})$、$comb_{j,k} = \\mathrm{Sinkhorn}\\big(\\mathrm{softmax}(m_{j\\,hc + k + 2hc}\\, s_2 + b_{j\\,hc + k + 2hc}) + \\epsilon\\big)$，hc 是 hc_mult，m 是 mixes，s 是 hc_attn_scale 或 hc_ffn_scale，b 是 hc_attn_base 或 hc_ffn_base，$\\sigma$ 是 sigmoid，$\\epsilon$ 是 hc_eps；mixes 与 base 都按顺序切成三段用：前 hc 个给 pre、接着 hc 个给 post、最后 hc × hc 个给 comb；Sinkhorn 先做一次行归一化（softmax 后加 $\\epsilon$），再做一次列归一化，然后交替做行、列各 19 次，共行 20 次、列 20 次，最后一次落在列方向"],["折叠","$x_{out} = \\sum_{c} pre_c x_c$，$x_c$ 是 4 份里的第 c 份，pre 是上面算出的 pre"],["展开","$y_c = post_c\\,x + \\sum_{c'} comb_{c',c}\\,residual_{c'}$，x 是子层输出，residual 是进本子层前的残差流，$comb_{c',c}$ 是第 c' 份残差加给第 c 份输出的权重，求和在第一维上"]]},{"title":"配置","rows":[["dim","5120"],["hc_mult","4"],["hc_sinkhorn_iters","20"],["hc_eps","1e-06"],["norm_eps","1e-20"]]}]},{"id":"attention","label":"Attention","title":"Attention.forward","nodes":[{"id":"ax","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]","detail":"已经过 attn_norm 的层输入"},{"id":"fcall","name":"self.freqs_cis","kind":"tensor","shape":"复数 fp32 [max_seq_len, 32]","detail":"构造时按 max_seq_len 预生成的整张频率表"},{"id":"fc","name":"freqs_cis","kind":"tensor","shape":"复数 fp32 [T, 32]","detail":"从 self.freqs_cis 里取本次这一段，start_pos 为 0 所以是前 T 行，构造时按 max_seq_len 预生成\n压缩比为 0 的层用 rope_theta 且不做 YaRN，其余层用 compress_rope_theta 并按 original_seq_len 做 YaRN\n32 = rope_head_dim / 2，每个位置一行"},{"id":"qr_op","name":"self.q_norm(self.wq_a(x))","kind":"op","shape":"5120 → 1280","detail":"wq_a.weight [1280, 5120]、q_norm.weight [1280]","drill":"rmsnorm"},{"id":"qr","name":"qr","kind":"tensor","shape":"bf16 [B, T, 1280]","detail":"索引器拿它当 query 的输入"},{"id":"qb","name":"self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))","kind":"op","shape":"1280 → 64 × 512","detail":"wq_b.weight [32768, 1280]，64 × 512 = 32768"},{"id":"qpre","name":"q","kind":"tensor","shape":"bf16 [B, T, 64, 512]"},{"id":"rope_q","name":"apply_rotary_emb(q[..., -rd:], freqs_cis)","kind":"op","shape":"末 64 维，形状不变","detail":"只旋转每头 512 维里的后 64 维，前 448 维不动；写在原地"},{"id":"q","name":"q","kind":"tensor","shape":"bf16 [B, T, 64, 512]"},{"id":"wkv_win","name":"self.kv_norm(self.wkv(x))","kind":"op","shape":"5120 → 512","detail":"wkv.weight [512, 5120]、kv_norm.weight [512]","drill":"rmsnorm"},{"id":"wkv_o","name":"kv","kind":"tensor","shape":"bf16 [B, T, 512]"},{"id":"wrope","name":"apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)","kind":"op","shape":"末 64 维，形状不变","detail":"和 query 用同一份 freqs_cis"},{"id":"wkv_r","name":"kv","kind":"tensor","shape":"bf16 [B, T, 512]"},{"id":"wquant","name":"act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)","kind":"op","shape":"形状不变","detail":"每 32 个通道一个 E8M0 scale，原地量化再反量化；量化按 fp8 精度（压缩 KV 走 fp4）\n量化覆盖整条 512 维，含已经加过 RoPE 的末 64 维"},{"id":"wkv_q","name":"kv","kind":"tensor","shape":"bf16 [B, T, 512]","detail":"存的是 fp8 量化后再反量化的值"},{"id":"wwrite","name":"self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)","kind":"op","shape":"写环形缓冲","detail":"cutoff = seqlen % win，只留最后 win 个 token，尾巴绕回环首"},{"id":"wchunk","name":"window_kv","kind":"tensor","shape":"bf16 [B, T, 512]","detail":"prefill 就是本次这块 KV"},{"id":"widx","name":"get_window_topk_idxs(win, bsz, seqlen, start_pos)","kind":"op","shape":"→ int32 [B, T, 128]","detail":"每个 query 能看的窗口槽位，−1 是空槽；每个 query 各一行，只看到自己的因果窗口"},{"id":"widxs","name":"topk_idxs","kind":"tensor","shape":"int32 [B, T, 128]"},{"id":"wcache","name":"window_kv_cache","kind":"cache","shape":"[max_batch_size, 128, 512]","detail":"每层一份，按 max_batch_size 分配；prefill 整块覆盖，decode 时改写 start_pos % 128 那一槽"},{"id":"comp_op","name":"self.compressor(x, start_pos)","kind":"op","shape":"5120 → [B, T/r, 512]","detail":"只有 4 个 source 层（2、8、14、20）算；其余 compress_ratio 大于 0 的层 latent 为 None，直接读已有缓存；层 0、1 的压缩比为 0，整段压缩都不走","drill":"compressor"},{"id":"lat","name":"latent","kind":"tensor","shape":"bf16 [B, T/r, 512]","detail":"压缩器输出的潜在量，还没加 RoPE；r 是这一层的 compress_ratio"},{"id":"cidx_op","name":"self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_len)","kind":"op","shape":"→ int32 [B, T, 512]","detail":"本层是 index source（2、8、14、20、24、28、32、36）就跑自己的 Indexer，其余 compress_ratio 大于 0 的层直接复用 shared_attn.topk_idxs\noffset 取窗口 KV 的长度（本次是 T），compress_len 是 (start_pos + T) / r","drill":"indexer"},{"id":"cidxs","name":"idxs","kind":"tensor","shape":"int32 [B, T, 512]","detail":"压缩条目下标，已经偏移到拼起来的 KV 里的位置"},{"id":"cf","name":"self.freqs_cis[: seqlen - seqlen % ratio : ratio]","kind":"op","shape":"→ [T/r, 32]","detail":"取压缩位置的频率，一个 latent 顶替一整组，第 g 组取位置 g × r"},{"id":"cfq","name":"freqs","kind":"tensor","shape":"复数 fp32 [T/r, 32]"},{"id":"crope","name":"apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)","kind":"op","shape":"末 64 维，形状不变","detail":"用的是压缩位置的频率，不是普通位置"},{"id":"lat_r","name":"latent","kind":"tensor","shape":"bf16 [B, T/r, 512]"},{"id":"cquant","name":"fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)","kind":"op","shape":"形状不变","detail":"E2M1 格式，每 16 个通道一个 E4M3 scale，原地量化再反量化"},{"id":"lat_q","name":"latent","kind":"tensor","shape":"bf16 [B, T/r, 512]","detail":"存的是 fp4 量化后再反量化的值"},{"id":"cwrite","name":"self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent","kind":"op","shape":"写压缩缓存","detail":"start_pos 为 0，所以从第 0 行起整块写"},{"id":"ccache","name":"compress_kv_cache","kind":"cache","shape":"[max_batch_size, max_seq_len / r, 512]","detail":"2、8、14、20 各有一份，按 max_batch_size 分配；每个 source 层写自己这一份并把它发布给 shared_attn，它之后到下一个 kv source 层之前的层读的是这一份；decode 时每组填满才写一行"},{"id":"ckv","name":"compress_kv","kind":"tensor","shape":"bf16 [B, T/r, 512]","detail":"从 compress_kv_cache 读出的、本次可见的部分"},{"id":"cat","name":"torch.cat([kv, compress_kv], dim=1)","kind":"op","shape":"两份 KV 沿位置维拼起来","detail":"窗口在前、压缩在后"},{"id":"kvc","name":"kv","kind":"tensor","shape":"bf16 [B, T + T/r, 512]"},{"id":"cat2","name":"torch.cat([topk_idxs, compress_idxs], dim=-1)","kind":"op","shape":"两份下标拼起来","detail":"压缩下标在 _compress_kv 里已经加过窗口长度 T"},{"id":"tki","name":"topk_idxs","kind":"tensor","shape":"int32 [B, T, 128 + 512]"},{"id":"core","name":"sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)","kind":"op","shape":"q [B, T, 64, 512] 对 kv [B, T + T/r, 512] → [B, T, 64, 512]","detail":"单 KV 头，64 个查询头看同一份 KV\n分母多一项 $e^{\\mathrm{attn\\_sink} - m}$，attn_sink 是可学习参数 [64]\n下标为 −1 的槽位分子分母都不贡献"},{"id":"o0","name":"o","kind":"tensor","shape":"bf16 [B, T, 64, 512]"},{"id":"unrope","name":"apply_rotary_emb(o[..., -rd:], freqs_cis, True)","kind":"op","shape":"末 64 维，形状不变","detail":"用共轭频率对输出做一次逆旋转，抵消 KV 里已加 RoPE 的键带进注意力输出的那部分旋转，使输出回到与键缓存同一套表示下"},{"id":"o1","name":"o","kind":"tensor","shape":"bf16 [B, T, 64, 512]"},{"id":"grp","name":"o.view(bsz, seqlen, self.n_local_groups, -1)","kind":"op","shape":"[B, T, 64, 512] → [B, T, 8, 4096]","detail":"每 8 个头一组，8 × 512 = 4096"},{"id":"og","name":"o","kind":"tensor","shape":"bf16 [B, T, 8, 4096]"},{"id":"woa","name":"self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)","kind":"op","shape":"→ [8, 1024, 4096]","detail":"wo_a.weight [8192, 4096]，8192 = 8 × 1024"},{"id":"wav","name":"wo_a","kind":"tensor","shape":"bf16 [8, 1024, 4096]"},{"id":"eins","name":"torch.einsum(\"bsgd,grd->bsgr\", o, wo_a)","kind":"op","shape":"[B, T, 8, 4096] 与 [8, 1024, 4096] → [B, T, 8, 1024]","detail":"每组只和本组的权重相乘，等效块对角矩阵"},{"id":"ol","name":"o","kind":"tensor","shape":"bf16 [B, T, 8, 1024]"},{"id":"wb","name":"self.wo_b(o.flatten(2))","kind":"op","shape":"8192 → 5120","detail":"wo_b.weight [5120, 8192]"},{"id":"axout","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]"}],"edges":[{"from":"ax","to":"qr_op"},{"from":"qr_op","to":"qr"},{"from":"qr","to":"qb"},{"from":"qb","to":"qpre"},{"from":"qpre","to":"rope_q"},{"from":"fcall","to":"fc"},{"from":"fc","to":"rope_q"},{"from":"rope_q","to":"q"},{"from":"ax","to":"wkv_win"},{"from":"wkv_win","to":"wkv_o"},{"from":"wkv_o","to":"wrope"},{"from":"fc","to":"wrope"},{"from":"wrope","to":"wkv_r"},{"from":"wkv_r","to":"wquant"},{"from":"wquant","to":"wkv_q"},{"from":"wkv_q","to":"wwrite"},{"from":"wwrite","to":"wcache"},{"from":"wkv_q","to":"wchunk"},{"from":"ax","to":"widx","label":"形状（bsz、seqlen）"},{"from":"widx","to":"widxs"},{"from":"ax","to":"comp_op"},{"from":"comp_op","to":"lat"},{"from":"lat","to":"cidx_op"},{"from":"qr","to":"cidx_op"},{"from":"ax","to":"cidx_op"},{"from":"cidx_op","to":"cidxs"},{"from":"lat","to":"crope"},{"from":"fcall","to":"cf"},{"from":"cf","to":"cfq"},{"from":"cfq","to":"crope"},{"from":"crope","to":"lat_r"},{"from":"lat_r","to":"cquant"},{"from":"cquant","to":"lat_q"},{"from":"lat_q","to":"cwrite"},{"from":"cwrite","to":"ccache"},{"from":"ccache","to":"ckv"},{"from":"wchunk","to":"cat"},{"from":"ckv","to":"cat"},{"from":"cat","to":"kvc"},{"from":"widxs","to":"cat2"},{"from":"cidxs","to":"cat2"},{"from":"cat2","to":"tki"},{"from":"q","to":"core"},{"from":"kvc","to":"core"},{"from":"tki","to":"core"},{"from":"core","to":"o0"},{"from":"o0","to":"unrope"},{"from":"fc","to":"unrope"},{"from":"unrope","to":"o1"},{"from":"o1","to":"grp"},{"from":"grp","to":"og"},{"from":"og","to":"eins"},{"from":"wav","to":"eins"},{"from":"eins","to":"ol"},{"from":"ol","to":"wb"},{"from":"wb","to":"axout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["频率","$\\theta_j = \\mathrm{base}^{-2j/64}$，j = 0 … 31，base 在压缩比为 0 的层是 rope_theta、其余层是 compress_rope_theta，64 是 rope_head_dim"],["YaRN","$\\theta_j' = (\\theta_j/16)\\,\\rho_j + \\theta_j\\,(1 - \\rho_j)$，16 是 rope_factor，$\\rho_j = \\mathrm{clamp}\\big((j - low)/(high - low), 0, 1\\big)$ 是随 j 递增的斜坡，j 不大时 $\\rho_j$ 为 0、保留原频率，j 变大后逐步除以 16，low 是 corrected_dim(beta_fast) 向下取整、high 是 corrected_dim(beta_slow) 向上取整；只对压缩比大于 0 的层生效"],["query 低秩投影","$q = W_{qb}\\,\\mathrm{RMSNorm}(W_{qa}\\,x)$，x 是本层输入，$W_{qa}$ 是 wq_a、$W_{qb}$ 是 wq_b，RMSNorm 是 q_norm"],["窗口 KV","$k = \\mathrm{RMSNorm}(W_{kv}\\,x)$，$W_{kv}$ 是 wkv，RMSNorm 是 kv_norm；x 先过 wkv 再过 kv_norm；每头 512 维里只给后 64 维加 RoPE"],["压缩 KV 的位置","第 g 个 latent 顶替第 $g r$ 到 $(g+1)r - 1$ 个 token，所以它的 RoPE 用位置 $g r$，r 是 compress_ratio"],["稀疏注意力","$o = \\dfrac{\\sum_{t \\in \\mathcal{T}} e^{\\,q \\cdot k_t / \\sqrt{512} - m}\\, v_t}{\\sum_{t \\in \\mathcal{T}} e^{\\,q \\cdot k_t / \\sqrt{512} - m} + e^{\\,\\mathrm{sink} - m}}$，$\\mathcal{T}$ 是选中的槽位，单 KV 头所以 k 和 v 是同一份，m 是选中槽位里的最大分数，sink 是 attn_sink，512 是 head_dim；分子、分母里每一项减的都是同一个 m"],["输出低秩投影","$x_{out} = W_{ob}\\,\\mathrm{einsum}(o, W_{oa})$，$W_{oa}$ 按 8 组摊成块对角，$W_{ob}$ 是 wo_b，o 是注意力输出"]]},{"title":"配置","rows":[["dim","5120"],["n_heads","64"],["head_dim","512"],["rope_head_dim","64"],["q_lora_rank","1280"],["o_lora_rank","1024"],["o_groups","8"],["window_size","128"],["index_topk","512"],["rope_theta","10000"],["compress_rope_theta","160000"]]}]},{"id":"compressor","label":"Compressor","title":"Compressor.forward","nodes":[{"id":"ax","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]","detail":"source 层的注意力输入，与注意力、索引器两张图里的 ax 是同一份"},{"id":"cf32","name":"x.float()","kind":"op","shape":"[B, T, 5120] 不变","detail":"池化与门控都在 fp32 里算"},{"id":"cxf","name":"x","kind":"tensor","shape":"fp32 [B, T, 5120]"},{"id":"proj","name":"self.wkv(x), self.wgate(x)","kind":"op","shape":"5120 → 2 × [B, T, 512]","detail":"wkv.weight [512, 5120] 与 wgate.weight [512, 5120]，压缩比大于 1 时两个权重都是 fp32"},{"id":"kv0","name":"kv","kind":"tensor","shape":"fp32 [B, T, 512]","detail":"逐 token 的值投影"},{"id":"csc","name":"score","kind":"tensor","shape":"fp32 [B, T, 512]","detail":"逐 token 的门控打分"},{"id":"pool","name":"kv.unflatten(1, (-1, ratio))、score.unflatten(1, (-1, ratio)) 与 (kv * score.softmax(dim=2)).sum(dim=2)","kind":"op","shape":"[B, T, 512] → [B, T/r, 512]","detail":"把相邻 r 个 token 当成一组，组内用 score 的 softmax 做加权求和"},{"id":"kvg","name":"kv","kind":"tensor","shape":"fp32 [B, T/r, 512]"},{"id":"cnorm","name":"self.norm(kv.to(dtype))","kind":"op","shape":"形状不变","detail":"池化结果先转回 bf16 再 RMSNorm，layers.{i}.attn.compressor.norm.weight [512]","drill":"rmsnorm"},{"id":"cout","name":"self.norm(kv.to(dtype))","kind":"tensor","shape":"bf16 [B, T/r, 512]","detail":"返回值是还没加 RoPE 的压缩潜在量"}],"edges":[{"from":"ax","to":"cf32"},{"from":"cf32","to":"cxf"},{"from":"cxf","to":"proj"},{"from":"proj","to":"kv0"},{"from":"proj","to":"csc"},{"from":"kv0","to":"pool"},{"from":"csc","to":"pool"},{"from":"pool","to":"kvg"},{"from":"kvg","to":"cnorm"},{"from":"cnorm","to":"cout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["池化","$c_j = \\sum_{t=jr}^{(j+1)r-1} \\mathrm{softmax}_{t'}\\big(s_{t'}\\big)\\, v_t$，j 是第 j 组，r 是 compress_ratio，$v_t$ 是 kv 里第 t 个 token 的值投影，$s_t$ 是 score 里第 t 个，softmax 在这一组的 r 个 token 上取"],["输出","$\\mathrm{RMSNorm}(c)$，c 是池化结果，先转回 bf16 再算；RMSNorm 是 self.norm"]]},{"title":"配置","rows":[["dim","5120"],["head_dim","512"],["norm_eps","1e-20"],["compress_ratios","前 40 项是主干：层 0、1 为 0，层 2–19 为 2，层 20–39 为 1；末 3 项是 MTP 层，为 0"]]}]},{"id":"indexer","label":"Indexer","title":"Indexer.forward","nodes":[{"id":"ax","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]","detail":"source 层的注意力输入，与注意力、压缩器两张图里的 ax 是同一份"},{"id":"qr","name":"qr","kind":"tensor","shape":"bf16 [B, T, 1280]","detail":"注意力那边算出的低秩 query，索引器直接拿它当输入"},{"id":"lat","name":"latent","kind":"tensor","shape":"bf16 [B, T/r, 512]","detail":"压缩器的输出，还没加 RoPE"},{"id":"fcr","name":"self.freqs_cis","kind":"tensor","shape":"复数 fp32 [max_seq_len, 32]","detail":"注意力那边传进来的整张频率表"},{"id":"fpos","name":"self.freqs_cis[: seqlen - seqlen % ratio : ratio]","kind":"op","shape":"→ [T/r, 32]","detail":"取压缩位置的频率，第 g 组取位置 g × r"},{"id":"fq","name":"freqs","kind":"tensor","shape":"复数 fp32 [T/r, 32]"},{"id":"kw","name":"self.k_norm(self.wk(latent))","kind":"op","shape":"512 → 128","detail":"wk.weight [128, 512]、k_norm.weight [128]","drill":"rmsnorm"},{"id":"k0","name":"k","kind":"tensor","shape":"bf16 [B, T/r, 128]"},{"id":"krope","name":"apply_rotary_emb(k[..., -rd:], freqs)","kind":"op","shape":"末 64 维，形状不变","detail":"128 维里的最后 64 维加 RoPE"},{"id":"kr","name":"k","kind":"tensor","shape":"bf16 [B, T/r, 128]"},{"id":"kq","name":"fp4_act_quant(k, fp4_block_size, True)","kind":"op","shape":"形状不变","detail":"E2M1 格式，每 32 个通道一个 E8M0 scale，原地量化再反量化"},{"id":"kf","name":"k","kind":"tensor","shape":"bf16 [B, T/r, 128]","detail":"存的是 fp4 量化后再反量化的值"},{"id":"kwrite","name":"self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k","kind":"op","shape":"写入索引键缓存","detail":"start_pos 为 0，从第 0 行起整块写；写完把这份缓存发布到 shared_attn.index_k，后面的层直接读"},{"id":"kcache","name":"k_cache","kind":"cache","shape":"[max_batch_size, max_seq_len / r, 128]","detail":"2、8、14、20 各有一份，按 max_batch_size 分配；写完发布给 shared_attn，它之后到下一个 kv source 层之前的索引器读的是这一份"},{"id":"qop","name":"self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))","kind":"op","shape":"1280 → 32 × 128","detail":"wq_b.weight [4096, 1280]，32 × 128 = 4096"},{"id":"iq0","name":"q","kind":"tensor","shape":"bf16 [B, T, 32, 128]"},{"id":"qrope","name":"apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])","kind":"op","shape":"末 64 维，形状不变","detail":"用的是普通位置，不是压缩位置"},{"id":"iqr","name":"q","kind":"tensor","shape":"bf16 [B, T, 32, 128]"},{"id":"iq_q","name":"fp4_act_quant(q, fp4_block_size, True)","kind":"op","shape":"形状不变","detail":"索引器的 query 也量化成 fp4"},{"id":"iq","name":"q","kind":"tensor","shape":"bf16 [B, T, 32, 128]","detail":"存的是 fp4 量化后再反量化的值"},{"id":"ik","name":"index_k","kind":"tensor","shape":"bf16 [B, T/r, 128]","detail":"从 shared_attn.index_k 读出的、本次可见的部分"},{"id":"wproj","name":"self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)","kind":"op","shape":"5120 → 32","detail":"weights_proj.weight [32, 5120]；乘的常数是 $128^{-1/2} \\cdot 32^{-1/2}$"},{"id":"iwt","name":"weights","kind":"tensor","shape":"bf16 [B, T, 32]"},{"id":"idot","name":"torch.einsum(\"bshd,btd->bsht\", q, index_k)","kind":"op","shape":"[B, T, 32, 128] 与 [B, T/r, 128] → [B, T, 32, T/r]","detail":"每个索引头对每个压缩位置记一个点积"},{"id":"sc0","name":"index_score","kind":"tensor","shape":"bf16 [B, T, 32, T/r]"},{"id":"red","name":"(index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)","kind":"op","shape":"[B, T, 32, T/r] → [B, T, T/r]","detail":"先过 ReLU，再按头用 weights 加权求和"},{"id":"isc","name":"index_score","kind":"tensor","shape":"bf16 [B, T, T/r]"},{"id":"lens","name":"(torch.arange(1, seqlen + 1) // ratio).unsqueeze(-1)","kind":"op","shape":"→ [T, 1]","detail":"第 i 个 query 能看到 ⌊(i+1)/r⌋ 个压缩条目"},{"id":"lv","name":"compress_lens","kind":"tensor","shape":"int64 [T, 1]"},{"id":"imask","name":"index_score.masked_fill_(torch.arange(seqlen // ratio) >= compress_lens, -torch.inf)","kind":"op","shape":"形状不变","detail":"本次还看不到的压缩条目置 −inf，这一步原地改"},{"id":"iscm","name":"index_score","kind":"tensor","shape":"bf16 [B, T, T/r]"},{"id":"topk","name":"index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values","kind":"op","shape":"→ [B, T, 512]","detail":"topk = min(512, T/r)，前提里 T 足够长所以就是 512；取分数最高的 512 个，再按位置顺序排回来"},{"id":"isel","name":"idxs","kind":"tensor","shape":"int64 [B, T, 512]"},{"id":"shift","name":"torch.where(idxs < compress_lens, idxs + offset, -1)","kind":"op","shape":"形状不变","detail":"不小于可达数的置 −1，其余加上 offset 变成拼起来的 KV 里的下标"},{"id":"cidxs","name":"idxs","kind":"tensor","shape":"int32 [B, T, 512]","detail":"交给注意力那边拼进 topk_idxs"}],"edges":[{"from":"qr","to":"qop"},{"from":"qop","to":"iq0"},{"from":"iq0","to":"qrope"},{"from":"fcr","to":"qrope"},{"from":"qrope","to":"iqr"},{"from":"iqr","to":"iq_q"},{"from":"iq_q","to":"iq"},{"from":"fcr","to":"fpos"},{"from":"fpos","to":"fq"},{"from":"lat","to":"kw"},{"from":"kw","to":"k0"},{"from":"k0","to":"krope"},{"from":"fq","to":"krope"},{"from":"krope","to":"kr"},{"from":"kr","to":"kq"},{"from":"kq","to":"kf"},{"from":"kf","to":"kwrite"},{"from":"kwrite","to":"kcache"},{"from":"kcache","to":"ik"},{"from":"ax","to":"wproj"},{"from":"wproj","to":"iwt"},{"from":"iq","to":"idot"},{"from":"ik","to":"idot"},{"from":"idot","to":"sc0"},{"from":"sc0","to":"red"},{"from":"iwt","to":"red"},{"from":"red","to":"isc"},{"from":"ax","to":"lens","label":"形状与 device"},{"from":"lens","to":"lv"},{"from":"isc","to":"imask"},{"from":"lv","to":"imask"},{"from":"imask","to":"iscm"},{"from":"iscm","to":"topk"},{"from":"topk","to":"isel"},{"from":"isel","to":"shift"},{"from":"lv","to":"shift"},{"from":"shift","to":"cidxs"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["索引打分","$I_{q,j} = \\sum_h w_{q,h} \\cdot \\mathrm{ReLU}(q_h \\cdot k_j)$，h 从 0 到 31 是索引头，$q_h$ 是第 h 个量化成 fp4 的索引 query，$k_j$ 是第 j 个压缩条目的 fp4 索引键，$w_{q,h}$ 由 weights_proj 给出并乘上 $128^{-1/2} \\cdot 32^{-1/2}$"],["可达数","第 i 个 query 能看到 $\\lfloor (i+1)/r \\rfloor$ 个压缩条目，r 是 compress_ratio；还看不到的那些置 $-\\infty$"],["输出","$idxs = \\mathrm{sort}\\big(\\mathrm{topk}_{512}(I)\\big)$，不小于可达数的置 −1，其余加上 offset 变成拼起来的 KV 里的下标"]]},{"title":"配置","rows":[["index_n_heads","32"],["index_head_dim","128"],["index_topk","512"],["rope_head_dim","64"]]}]},{"id":"moe","label":"MoE","title":"MoE.forward","nodes":[{"id":"mx","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]","detail":"前馈子层的输入，已经过 ffn_norm"},{"id":"flat","name":"x.view(-1, self.dim)","kind":"op","shape":"[B, T, 5120] → [B×T, 5120]","detail":"把批次与序列两维拉平，MoE 按 token 处理"},{"id":"mxf","name":"x","kind":"tensor","shape":"bf16 [B×T, 5120]"},{"id":"gate_op","name":"self.gate(x, None)","kind":"op","shape":"[B×T, 5120] → 权重 [B×T, 6] 与专家下标 [B×T, 6]","detail":"Gate：打分、加偏置选专家、在 top-6 内归一化、乘 route_scale；image_mask 为 None，源码在这个分支上就传 None","drill":"gate"},{"id":"gw","name":"weights","kind":"tensor","shape":"fp32 [B×T, 6]"},{"id":"gi","name":"indices","kind":"tensor","shape":"int64 [B×T, 6]"},{"id":"y0","name":"torch.zeros_like(x, dtype=torch.float32)","kind":"op","shape":"→ fp32 [B×T, 5120]","detail":"累加器，路由专家的结果都往它上面加"},{"id":"y","name":"y","kind":"tensor","shape":"fp32 [B×T, 5120]"},{"id":"mpick","name":"torch.where(indices == i)","kind":"op","shape":"→ 行下标与 top 位置","detail":"挑出分给第 i 个专家的 token，384 个专家各跑一遍；没分到 token 的专家整个跳过"},{"id":"pidx","name":"idx, top","kind":"tensor","shape":"int64 [n] 与 int64 [n]","detail":"n 是分到第 i 个专家的 token 数"},{"id":"mexp","name":"expert(x[idx], weights[idx, top, None])","kind":"op","shape":"5120 → 5120","detail":"每个 token 只过它被分到的那个专家，路由权重按自己的 top 位置取","drill":"expert"},{"id":"eout","name":"expert(x[idx], weights[idx, top, None])","kind":"tensor","shape":"bf16 [n, 5120]"},{"id":"acc","name":"y[idx] += expert(...)","kind":"op","shape":"fp32 [B×T, 5120] 上累加","detail":"一个 token 落在 top-6 的哪几个专家上就加几次"},{"id":"y2","name":"y","kind":"tensor","shape":"fp32 [B×T, 5120]"},{"id":"shared","name":"self.shared_experts(x)","kind":"op","shape":"5120 → 5120","detail":"shared_experts 是一个 Expert，每个 token 都过，它的三个权重按主干精度 fp8 存储","drill":"expert"},{"id":"sv","name":"self.shared_experts(x)","kind":"tensor","shape":"bf16 [B×T, 5120]"},{"id":"madd","name":"y += self.shared_experts(x)","kind":"op","shape":"逐元素相加","detail":"路由专家的和再加上共享专家的输出"},{"id":"y3","name":"y","kind":"tensor","shape":"fp32 [B×T, 5120]"},{"id":"mback","name":"y.type_as(x).view(shape)","kind":"op","shape":"[B×T, 5120] → bf16 [B, T, 5120]","detail":"转回输入的 dtype 与形状"},{"id":"mout","name":"y","kind":"tensor","shape":"bf16 [B, T, 5120]"}],"edges":[{"from":"mx","to":"flat"},{"from":"flat","to":"mxf"},{"from":"mxf","to":"gate_op"},{"from":"gate_op","to":"gw"},{"from":"gate_op","to":"gi"},{"from":"mxf","to":"y0","label":"形状与 device"},{"from":"y0","to":"y"},{"from":"gi","to":"mpick"},{"from":"mpick","to":"pidx"},{"from":"pidx","to":"mexp","label":"行下标与 top 位置"},{"from":"mxf","to":"mexp","label":"x[idx]"},{"from":"gw","to":"mexp","label":"weights[idx, top]"},{"from":"mexp","to":"eout"},{"from":"eout","to":"acc"},{"from":"y","to":"acc"},{"from":"acc","to":"y2"},{"from":"mxf","to":"shared"},{"from":"shared","to":"sv"},{"from":"y2","to":"madd"},{"from":"sv","to":"madd"},{"from":"madd","to":"y3"},{"from":"y3","to":"mback"},{"from":"mback","to":"mout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["前馈","$y = \\sum_{e \\in \\mathrm{top6}} \\mathrm{Expert}_e(x) + \\mathrm{Shared}(x)$，x 是拉平后的隐状态，Expert 在内部再乘路由权重 w，Shared 是共享专家"]]},{"title":"配置","rows":[["dim","5120"],["moe_inter_dim","2304"],["n_routed_experts","384"],["n_shared_experts","1"],["n_activated_experts","6"]]}]},{"id":"gate","label":"Gate","title":"Gate.forward","nodes":[{"id":"gx","name":"x","kind":"tensor","shape":"bf16 [B×T, 5120]","detail":"拉平后的隐状态"},{"id":"lg","name":"linear(x.float(), self.weight.float()) / self.gate_temp","kind":"op","shape":"5120 → 384","detail":"weight [384, 5120]，打分在 fp32 里算\ngate_temp 取默认值 1.0，config.json 里没有这一项"},{"id":"s0","name":"scores","kind":"tensor","shape":"fp32 [B×T, 384]"},{"id":"act","name":"F.softplus(scores).sqrt()","kind":"op","shape":"形状不变","detail":"score_func 是 sqrtsoftplus：先 softplus 再开方\n$\\mathrm{softplus}(z) = \\ln(1 + e^z)$"},{"id":"s","name":"scores","kind":"tensor","shape":"fp32 [B×T, 384]"},{"id":"bv","name":"self.bias","kind":"tensor","shape":"fp32 [384]","detail":"可学习参数，只在挑专家时加到分数上，不改权重的值；image_mask 为 None 时源码直接用 self.bias"},{"id":"gsel","name":"(scores + bias).topk(self.topk, dim=-1)[1]","kind":"op","shape":"→ [B×T, 6]","detail":"偏置只参与挑专家，不改权重"},{"id":"gi","name":"indices","kind":"tensor","shape":"int64 [B×T, 6]"},{"id":"gth","name":"scores.gather(1, indices)","kind":"op","shape":"→ [B×T, 6]","detail":"权重取自没加偏置的 scores"},{"id":"w0","name":"weights","kind":"tensor","shape":"fp32 [B×T, 6]"},{"id":"nrm","name":"weights /= weights.sum(dim=-1, keepdim=True) + 1e-20","kind":"op","shape":"形状不变","detail":"norm_topk_prob 为 true 时在 top-6 内归一化；加的是 1e-20，不是 norm_eps"},{"id":"w1","name":"weights","kind":"tensor","shape":"fp32 [B×T, 6]"},{"id":"grs","name":"weights *= self.route_scale","kind":"op","shape":"形状不变","detail":"route_scale 是 1.5"},{"id":"gw","name":"weights","kind":"tensor","shape":"fp32 [B×T, 6]"},{"id":"gret","name":"(weights, indices)","kind":"tensor","shape":"—","detail":"两个返回值都交给 MoE"}],"edges":[{"from":"gx","to":"lg"},{"from":"lg","to":"s0"},{"from":"s0","to":"act"},{"from":"act","to":"s"},{"from":"s","to":"gsel"},{"from":"bv","to":"gsel"},{"from":"gsel","to":"gi"},{"from":"s","to":"gth"},{"from":"gi","to":"gth"},{"from":"gth","to":"w0"},{"from":"w0","to":"nrm"},{"from":"nrm","to":"w1"},{"from":"w1","to":"grs"},{"from":"grs","to":"gw"},{"from":"gw","to":"gret"},{"from":"gi","to":"gret"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["打分","$\\mathrm{score} = \\sqrt{\\mathrm{softplus}(x W^\\top)}$，x 是拉平后的隐状态，W 是 gate 的 weight，$\\mathrm{softplus}(z) = \\ln(1 + e^z)$"],["选专家","$\\mathrm{idx} = \\mathrm{topk}_6(\\mathrm{score} + b)$，b 是 bias，它只影响选哪几个专家"],["权重","$w = \\dfrac{\\mathrm{score}_{\\mathrm{idx}}}{\\sum \\mathrm{score}_{\\mathrm{idx}} + 10^{-20}} \\times 1.5$，求和只在这 6 个专家上，1.5 是 route_scale"]]},{"title":"配置","rows":[["dim","5120"],["n_routed_experts","384"],["n_activated_experts","6"],["score_func","sqrtsoftplus"],["route_scale","1.5"],["norm_topk_prob","true（默认值）"]]}]},{"id":"expert","label":"Expert","title":"Expert.forward","nodes":[{"id":"ex","name":"x","kind":"tensor","shape":"bf16 [n, 5120]","detail":"n 是分给这个专家的 token 数；共享专家那里 n 就是全部 token"},{"id":"wts","name":"weights","kind":"tensor","shape":"fp32 [n, 1]","detail":"只有路由专家传这个，共享专家不传"},{"id":"g1","name":"self.w1(x).float()","kind":"op","shape":"5120 → 2304","detail":"路由专家的 w1.weight 存成 [2304, 2560] 的 fp4，每 32 个通道一个 E8M0 scale；共享专家走这张图时是 [2304, 5120] 的 fp8\n先转 fp32 再夹"},{"id":"eact","name":"gate","kind":"tensor","shape":"fp32 [n, 2304]"},{"id":"u1","name":"self.w3(x).float()","kind":"op","shape":"5120 → 2304","detail":"w3.weight 与 w1 同一种存法"},{"id":"up","name":"up","kind":"tensor","shape":"fp32 [n, 2304]"},{"id":"cl","name":"torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)","kind":"op","shape":"形状不变","detail":"up 两头都夹；swiglu_limit 是 10.0\n夹是为了让后面的 fp8、fp4 激活不越界"},{"id":"up2","name":"up","kind":"tensor","shape":"fp32 [n, 2304]"},{"id":"cl2","name":"torch.clamp(gate, max=self.swiglu_limit)","kind":"op","shape":"形状不变","detail":"gate 只夹上界"},{"id":"eact2","name":"gate","kind":"tensor","shape":"fp32 [n, 2304]"},{"id":"silu","name":"F.silu(gate) * up","kind":"op","shape":"形状不变","detail":"SiLU 的结果逐元素乘 up"},{"id":"hm","name":"F.silu(gate) * up","kind":"tensor","shape":"fp32 [n, 2304]"},{"id":"emw","name":"weights * x","kind":"op","shape":"形状不变","detail":"路由权重逐 token 乘上去"},{"id":"hw","name":"weights * x","kind":"tensor","shape":"fp32 [n, 2304]"},{"id":"w2","name":"self.w2(x.to(dtype))","kind":"op","shape":"2304 → 5120","detail":"路由专家的 w2.weight 存成 [5120, 1152] 的 fp4；共享专家是 [5120, 2304] 的 fp8"},{"id":"eout","name":"self.w2(x.to(dtype))","kind":"tensor","shape":"bf16 [n, 5120]"}],"edges":[{"from":"ex","to":"g1"},{"from":"g1","to":"eact"},{"from":"ex","to":"u1"},{"from":"u1","to":"up"},{"from":"up","to":"cl"},{"from":"cl","to":"up2"},{"from":"eact","to":"cl2"},{"from":"cl2","to":"eact2"},{"from":"eact2","to":"silu"},{"from":"up2","to":"silu"},{"from":"silu","to":"hm"},{"from":"hm","to":"emw"},{"from":"wts","to":"emw"},{"from":"emw","to":"hw"},{"from":"hw","to":"w2"},{"from":"w2","to":"eout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["SwiGLU","$\\mathrm{Expert}(x) = W_2\\Big(w \\odot \\big(\\mathrm{silu}(\\mathrm{clamp}_{上}(W_1 x)) \\odot \\mathrm{clamp}_{\\pm}(W_3 x)\\big)\\Big)$，x 是输入，$W_1$ 是 w1、$W_2$ 是 w2、$W_3$ 是 w3，$w$ 是路由权重，$\\odot$ 是逐元素相乘"],["夹取","$\\mathrm{clamp}_{\\pm}(z) = \\min(\\max(z, -10), 10)$、$\\mathrm{clamp}_{上}(z) = \\min(z, 10)$，10 是 swiglu_limit；共享专家不乘 $w$"]]},{"title":"配置","rows":[["dim","5120"],["moe_inter_dim","2304"],["swiglu_limit","10.0"]]}]},{"id":"engram","label":"Engram","title":"Engram.forward","nodes":[{"id":"nx","name":"x","kind":"tensor","shape":"bf16 [B, T, 4, 5120]","detail":"本层的残差流，4 份"},{"id":"hash_ids","name":"hash_ids","kind":"tensor","shape":"int64 [B, T, 24]","detail":"本层的 n-gram 哈希行号，24 = (4 − 1) × 8"},{"id":"nemb","name":"self.embed(hash_ids).flatten(-2)","kind":"op","shape":"[B, T, 24] → [B, T, 6144]","detail":"ParallelEngramEmbedding：表按行分片，查出 fp8 的行再用 scale 反量化成 bf16\n24 × 256 = 6144；层 1 的表有 384006168 行，层 14 有 384016682 行"},{"id":"ev","name":"self.embed(hash_ids).flatten(-2)","kind":"tensor","shape":"bf16 [B, T, 6144]"},{"id":"nwkv","name":"self.wkv(...)","kind":"op","shape":"6144 → 25600","detail":"wkv.weight [25600, 6144]；输出切成 key 与 value 两段"},{"id":"nkv","name":"kv","kind":"tensor","shape":"bf16 [B, T, 25600]"},{"id":"key0","name":"key","kind":"tensor","shape":"bf16 [B, T, 20480]","detail":"20480 = 4 × 5120，每份残差流一个键"},{"id":"value","name":"value","kind":"tensor","shape":"bf16 [B, T, 5120]","detail":"4 份残差流共用同一个值"},{"id":"ekey","name":"key.float().unflatten(-1, (self.hc_mult, self.dim))","kind":"op","shape":"[B, T, 20480] → fp32 [B, T, 4, 5120]"},{"id":"key","name":"key","kind":"tensor","shape":"fp32 [B, T, 4, 5120]"},{"id":"ewm","name":"self.q_weight.float() * self.k_weight.float()","kind":"op","shape":"[4, 5120] 逐元素相乘","detail":"q_weight 与 k_weight 都是 [4, 5120] 的参数，代码里只以乘积形式出现"},{"id":"ew","name":"weight","kind":"tensor","shape":"fp32 [4, 5120]"},{"id":"nhf","name":"x.float()","kind":"op","shape":"[B, T, 4, 5120] 不变","detail":"归一化与点积都在 fp32 里算"},{"id":"nh","name":"h","kind":"tensor","shape":"fp32 [B, T, 4, 5120]"},{"id":"rstd","name":"torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)","kind":"op","shape":"→ fp32 [B, T, 4]","detail":"两边各按最后一维求均方，逐 token、逐份归一化"},{"id":"nrs","name":"rstd","kind":"tensor","shape":"fp32 [B, T, 4]"},{"id":"ndot","name":"(h * weight * key).sum(-1) * rstd * self.dim**-0.5","kind":"op","shape":"[B, T, 4]","detail":"归一化点积，再乘 $5120^{-1/2}$"},{"id":"d","name":"dot","kind":"tensor","shape":"fp32 [B, T, 4]"},{"id":"ngate","name":"torch.sigmoid(\ntorch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot))","kind":"op","shape":"形状不变","detail":"先带符号开方再进 sigmoid，与训练 kernel 一致"},{"id":"g","name":"gate","kind":"tensor","shape":"fp32 [B, T, 4]"},{"id":"vf","name":"value.float().unsqueeze(-2)","kind":"op","shape":"[B, T, 5120] → fp32 [B, T, 1, 5120]","detail":"补一维好按份广播"},{"id":"v","name":"value.float().unsqueeze(-2)","kind":"tensor","shape":"fp32 [B, T, 1, 5120]"},{"id":"nadd","name":"h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)","kind":"op","shape":"形状不变","detail":"门控乘值再加回残差流"},{"id":"sum","name":"h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)","kind":"tensor","shape":"fp32 [B, T, 4, 5120]"},{"id":"ncast","name":".to(x.dtype)","kind":"op","shape":"形状不变","detail":"转回输入时的 dtype"},{"id":"nout","name":"(h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)","kind":"tensor","shape":"bf16 [B, T, 4, 5120]"}],"edges":[{"from":"nx","to":"nhf"},{"from":"nhf","to":"nh"},{"from":"hash_ids","to":"nemb"},{"from":"nemb","to":"ev"},{"from":"ev","to":"nwkv"},{"from":"nwkv","to":"nkv"},{"from":"nkv","to":"key0"},{"from":"nkv","to":"value"},{"from":"key0","to":"ekey"},{"from":"ekey","to":"key"},{"from":"ewm","to":"ew"},{"from":"nh","to":"rstd"},{"from":"key","to":"rstd"},{"from":"rstd","to":"nrs"},{"from":"nh","to":"ndot"},{"from":"ew","to":"ndot"},{"from":"key","to":"ndot"},{"from":"nrs","to":"ndot"},{"from":"ndot","to":"d"},{"from":"d","to":"ngate"},{"from":"ngate","to":"g"},{"from":"value","to":"vf"},{"from":"vf","to":"v"},{"from":"g","to":"nadd"},{"from":"v","to":"nadd"},{"from":"nh","to":"nadd"},{"from":"nadd","to":"sum"},{"from":"sum","to":"ncast"},{"from":"ncast","to":"nout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["归一化点积","$d = \\big(\\sum_j h_j w_j key_j\\big) \\cdot \\mathrm{rstd} \\cdot 5120^{-1/2}$，$\\mathrm{rstd} = \\big(\\mathrm{mean}_j h_j^2 + \\epsilon\\big)^{-1/2}\\big(\\mathrm{mean}_j key_j^2 + \\epsilon\\big)^{-1/2}$，h 是本层残差流，key 是哈希查表投影出的键，w 是 q_weight 与 k_weight 的逐元素积，$\\epsilon$ 是 norm_eps，5120 是 dim"],["门控","$gate = \\sigma\\big(\\mathrm{sign}(d)\\sqrt{\\max(|d|, 10^{-6})}\\big)$，$\\sigma$ 是 sigmoid，$10^{-6}$ 是 clamp_value"],["写入","$x \\leftarrow h + gate \\odot value$，value 是投影出的值，4 份残差流共用同一个 value，只有 gate 逐份不同"]]},{"title":"配置","rows":[["dim","5120"],["hc_mult","4"],["engram_max_ngram_size","4"],["engram_n_heads","8"],["engram_head_dim","256"],["engram_layer_ids","[1, 14]"],["engram_num_embeddings","[384006168, 384016682]"],["norm_eps","1e-20"]]}]},{"id":"ngramhashstate","label":"NgramHashState","title":"NgramHashState.forward","nodes":[{"id":"ids","name":"input_ids","kind":"tensor","shape":"int64 [B, T]"},{"id":"cmap","name":"self.token_map[input_ids]","kind":"op","shape":"→ int64 [B, T]","detail":"token_map 把每个 token id 映到压缩词表的 id，大小写与空白差异都归一到一个 id\n压缩词表 99092 项，与 config 的 engram_compressed_vocab_size 一致，所有哈希乘数都由它推出"},{"id":"cids","name":"compressed","kind":"tensor","shape":"int64 [B, T]"},{"id":"wr","name":"self.cache[:batch, start_pos : start_pos + seqlen] = compressed","kind":"op","shape":"写压缩 id 缓存","detail":"start_pos 为 0，所以从第 0 列起整块写"},{"id":"cache","name":"cache","kind":"cache","shape":"int64 [max_batch_size, max_seq_len]","detail":"按 max_batch_size 分配，取代码默认值 4；存的是压缩后的 id，不是原始 token id\ndecode 时按 start_pos 往后接"},{"id":"pos","name":"torch.arange(start_pos, start_pos + seqlen).expand(batch, seqlen)","kind":"op","shape":"→ int64 [B, T]"},{"id":"p","name":"positions","kind":"tensor","shape":"int64 [B, T]"},{"id":"blk0","name":"torch.zeros_like(positions, dtype=torch.bool)","kind":"op","shape":"→ bool [B, T]","detail":"标记哪些位置已经不能往前看"},{"id":"blk","name":"blocked","kind":"tensor","shape":"bool [B, T]"},{"id":"gath","name":"self.cache[:batch].gather(1, (positions - shift).clamp_min(0))","kind":"op","shape":"→ int64 [B, T]","detail":"往前看 shift 个位置，越界处夹到 0"},{"id":"src","name":"source","kind":"tensor","shape":"int64 [B, T]"},{"id":"upd","name":"blocked | (positions < shift) | (source == self.DEAD)","kind":"op","shape":"形状不变","detail":"位置在序列开头之前就算断掉，之后的回看步也不再往前"},{"id":"updt","name":"blocked","kind":"tensor","shape":"bool [B, T]"},{"id":"rep","name":"torch.where(blocked, self.pad_id, source)","kind":"op","shape":"形状不变","detail":"断掉的位置填 pad_id，即 engram_pad_id（2）经 token_map 映出的那个压缩 id，与训练一致"},{"id":"tk","name":"tokens","kind":"tensor","shape":"int64 [B, T, 4]","detail":"第 k 列是往前看 k 个位置的那个 token"},{"id":"prod","name":"tokens.unsqueeze(2) * self.multipliers","kind":"op","shape":"[B, T, 4] 与 [2, 4] → [B, T, 2, 4]","detail":"multipliers 每个（Engram 层，回看步）一个奇数乘数，各层用自己的随机种子生成"},{"id":"pr","name":"products","kind":"tensor","shape":"int64 [B, T, 2, 4]"},{"id":"roll","name":"torch.bitwise_xor(rolling, products[..., i])","kind":"op","shape":"形状不变","detail":"一次异或一个回看步，第 i 步之后得到的是 i+1 元 n-gram 的哈希"},{"id":"rl","name":"rolling","kind":"tensor","shape":"int64 [B, T, 2]"},{"id":"mod","name":"rolling.unsqueeze(-1) % self.primes[:, i - 1]","kind":"op","shape":"→ [B, T, 2, 8]","detail":"每个（Engram 层，桶组，头）各有一个质数，互不重复；8 是 engram_n_heads，3 个桶组的结果沿最后一维拼成 24"},{"id":"hs","name":"torch.cat(hashes, dim=-1)","kind":"tensor","shape":"int64 [B, T, 2, 24]","detail":"hashes 是 3 个桶组各 [B, T, 2, 8]，沿最后一维拼接；24 = (4 − 1) × 8"},{"id":"off","name":"torch.cat(hashes, dim=-1) + self.offsets","kind":"op","shape":"形状不变","detail":"加上各桶在表里的起始偏移，得到整张表的行号"},{"id":"hashout","name":"torch.cat(hashes, dim=-1) + self.offsets","kind":"tensor","shape":"int64 [B, T, 2, 24]"}],"edges":[{"from":"ids","to":"cmap"},{"from":"cmap","to":"cids"},{"from":"cids","to":"wr"},{"from":"wr","to":"cache"},{"from":"ids","to":"pos","label":"形状与 device"},{"from":"pos","to":"p"},{"from":"p","to":"blk0"},{"from":"blk0","to":"blk"},{"from":"cache","to":"gath"},{"from":"p","to":"gath"},{"from":"gath","to":"src"},{"from":"src","to":"upd"},{"from":"p","to":"upd"},{"from":"blk","to":"upd"},{"from":"upd","to":"updt"},{"from":"updt","to":"rep"},{"from":"src","to":"rep"},{"from":"rep","to":"tk"},{"from":"tk","to":"prod"},{"from":"prod","to":"pr"},{"from":"pr","to":"roll"},{"from":"roll","to":"rl"},{"from":"rl","to":"mod"},{"from":"mod","to":"hs"},{"from":"hs","to":"off"},{"from":"off","to":"hashout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["压缩映射","$c_t = \\mathrm{map}(input\\_ids_t)$，map 是 token_map；归一化后同形的 token 映到同一个 id，压缩词表有 99092 项"],["n-gram","第 t 个位置的回看取 $c_{t-k}$，$k = 0 \\ldots 3$；越界就填 pad_id"],["哈希","$h^{(k)} = c_t m_0 \\oplus c_{t-1} m_1 \\oplus \\cdots \\oplus c_{t-k} m_k$，$\\oplus$ 是按位异或，$m$ 是 multipliers，第 k 步（k = 1、2、3）得到的是 k + 1 元 n-gram，落在第 k − 1 个桶组里（从 0 数）"],["桶","$id = h^{(k)} \\bmod p_{k-1,\\,head} + \\mathrm{offset}$，每个（Engram 层，桶组，头）各有一个质数 $p$，互不重复，$p_{k-1,\\,head}$ 取第 k − 1 个桶组里第 head 个头的那个，offset 是该桶在表里的起始行"]]},{"title":"配置","rows":[["engram_max_ngram_size","4"],["engram_n_heads","8"],["engram_head_dim","256"],["engram_vocab_size","16000000"],["engram_compressed_vocab_size","99092"],["engram_pad_id","2"],["engram_layer_ids","[1, 14]"]]}]},{"id":"rmsnorm","label":"RMSNorm","title":"RMSNorm.forward","nodes":[{"id":"rx","name":"x","kind":"tensor","shape":"bf16 [..., d]","detail":"d 是被归一化的那一维：主干里 norm、attn_norm、ffn_norm 是 5120，q_norm 是 1280，kv_norm 是 512；压缩器的 norm 是 512；索引器的 k_norm 是 128"},{"id":"rf32","name":"x.float()","kind":"op","shape":"形状不变","detail":"先记下输入的 dtype，最后转回去"},{"id":"rxf","name":"x","kind":"tensor","shape":"fp32 [..., d]"},{"id":"var","name":"x.square().mean(-1, keepdim=True)","kind":"op","shape":"d → 1","detail":"最后一维上的平方均值"},{"id":"vr","name":"var","kind":"tensor","shape":"fp32 [..., 1]"},{"id":"nr","name":"x * torch.rsqrt(var + self.eps)","kind":"op","shape":"形状不变","detail":"rsqrt 是平方根的倒数，eps 是 norm_eps"},{"id":"xn","name":"x","kind":"tensor","shape":"fp32 [..., d]"},{"id":"rmw","name":"self.weight * x","kind":"op","shape":"形状不变","detail":"weight [d]，每个实例一份，如 norm.weight [5120]、q_norm.weight [1280]"},{"id":"rw","name":"self.weight * x","kind":"tensor","shape":"fp32 [..., d]"},{"id":"rback","name":".to(dtype)","kind":"op","shape":"形状不变","detail":"转回输入时的 dtype"},{"id":"rout","name":"(self.weight * x).to(dtype)","kind":"tensor","shape":"bf16 [..., d]"}],"edges":[{"from":"rx","to":"rf32"},{"from":"rf32","to":"rxf"},{"from":"rxf","to":"var"},{"from":"var","to":"vr"},{"from":"rxf","to":"nr"},{"from":"vr","to":"nr"},{"from":"nr","to":"xn"},{"from":"xn","to":"rmw"},{"from":"rmw","to":"rw"},{"from":"rw","to":"rback"},{"from":"rback","to":"rout"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["RMSNorm","$y = w \\odot h / \\sqrt{\\mathrm{mean}(h^2) + \\epsilon}$，h 是输入，y 是返回值，mean 在最后一维上取，$\\epsilon$ 是 norm_eps，w 是 weight，$\\odot$ 是逐元素相乘"]]},{"title":"配置","rows":[["dim","5120"],["head_dim","512"],["index_head_dim","128"],["norm_eps","1e-20"]]}]},{"id":"parallelhead","label":"ParallelHead","title":"ParallelHead.forward","nodes":[{"id":"px","name":"x","kind":"tensor","shape":"bf16 [B, T, 5120]","detail":"已经过最后的 RMSNorm"},{"id":"plast","name":"x[:, -1]","kind":"op","shape":"[B, T, 5120] → [B, 5120]","detail":"full_logits 默认 false，只留最后一个位置"},{"id":"xp","name":"x","kind":"tensor","shape":"bf16 [B, 5120]"},{"id":"lin","name":"F.linear(x.float(), self.weight)","kind":"op","shape":"5120 → 129280","detail":"weight [129280, 5120]，fp32 参数，打分在 fp32 里算"},{"id":"logits","name":"logits","kind":"tensor","shape":"fp32 [B, 129280]"}],"edges":[{"from":"px","to":"plast"},{"from":"plast","to":"xp"},{"from":"xp","to":"lin"},{"from":"lin","to":"logits"}],"groups":[],"notes":[],"info":[{"title":"公式","rows":[["词表投影","$\\mathrm{logits} = h W^\\top$，h 是最后一个位置的隐状态（已经过最后的 RMSNorm），W 是 head.weight"]]},{"title":"配置","rows":[["dim","5120"],["vocab_size","129280"]]}]}]};</script>
+<script src="../../libs/elk.bundled.js"></script>
+<script src="../../libs/dojo-flow.js"></script>
 <script>
-// ============ 进度条 + 返回顶部 ============
-const progressBar = document.getElementById('progress');
-const backToTop = document.getElementById('backToTop');
-window.addEventListener('scroll', () => {
-  const h = document.documentElement;
-  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
-  progressBar.style.width = scrolled + '%';
-  backToTop.classList.toggle('visible', h.scrollTop > 400);
-});
-backToTop.addEventListener('click', () => {
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-});
-
-// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
-const themeToggle = document.getElementById('themeToggle');
-const savedTheme = localStorage.getItem('theme') ||
-  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-document.documentElement.setAttribute('data-theme', savedTheme);
-function syncCodeTheme(theme) {
-  const light = document.getElementById('prism-light');
-  const dark = document.getElementById('prism-dark');
-  if (light && dark) {
-    light.disabled = (theme === 'dark');
-    dark.disabled = (theme !== 'dark');
-  }
-}
-syncCodeTheme(savedTheme);
-themeToggle.addEventListener('click', () => {
-  const current = document.documentElement.getAttribute('data-theme');
-  const next = current === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('theme', next);
-  syncCodeTheme(next);
-});
-
-// ============ 自动生成侧边目录 ============
-const tocList = document.getElementById('tocList');
-const headings = document.querySelectorAll('body > h2, body > h3');
-let currentH1Li = null;
-let currentSubUl = null;
-headings.forEach(h => {
-  if (!h.id) {
-    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
-  }
-  const li = document.createElement('li');
-  const a = document.createElement('a');
-  a.href = '#' + h.id;
-  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
-  a.dataset.target = h.id;
-  if (h.tagName === 'H3' && currentH1Li) {
-    a.classList.add('sub');
-    if (!currentSubUl) {
-      currentSubUl = document.createElement('ul');
-      currentH1Li.appendChild(currentSubUl);
-    }
-    li.appendChild(a);
-    currentSubUl.appendChild(li);
-  } else {
-    currentSubUl = null;
-    li.appendChild(a);
-    tocList.appendChild(li);
-    currentH1Li = li;
-  }
-});
-
-// ============ 滚动高亮当前章节 ============
-const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
-function updateActiveToc() {
-  let active = null;
-  for (const s of sections) {
-    if (s.getBoundingClientRect().top < 120) active = s.id;
-  }
-  document.querySelectorAll('.toc a').forEach(a => {
-    a.classList.toggle('active', a.dataset.target === active);
-  });
-}
-window.addEventListener('scroll', updateActiveToc, { passive: true });
-updateActiveToc();
-
-// ============ 阅读时间估计 ============
-const bodyText = document.body.innerText || '';
-const chineseChars = (bodyText.match(/[\u4e00-\u9fff]/g) || []).length;
-const englishWords = (bodyText.match(/[a-zA-Z]+/g) || []).length;
-// 中文 350 字/分钟，英文 200 词/分钟
-const minutes = Math.max(1, Math.ceil(chineseChars / 350 + englishWords / 200));
-const totalChars = chineseChars + englishWords;
-document.getElementById('readingTime').textContent =
-  `全文 ${totalChars.toLocaleString('zh-CN')} 字 · 约 ${minutes} 分钟阅读`;
-
-// ============ 图片点击放大（lightbox）============
-const lightbox = document.getElementById('lightbox');
-const lightboxImg = document.getElementById('lightboxImg');
-const lightboxCaption = document.getElementById('lightboxCaption');
-
-// 给所有文章里的 img 加可点击 class
-document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
-  if (img.id === 'lightboxImg') return;
-  img.classList.add('article-image');
-  img.addEventListener('click', () => {
-    lightboxImg.src = img.src;
-    lightboxCaption.textContent = img.alt || '';
-    lightbox.classList.add('open');
-  });
-});
-
-lightbox.addEventListener('click', () => {
-  lightbox.classList.remove('open');
-});
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') lightbox.classList.remove('open');
-});
-
-// ============ 代码块复制按钮 ============
-document.querySelectorAll('.code-block pre').forEach(pre => {
-  const btn = document.createElement('button');
-  btn.className = 'copy-btn';
-  btn.textContent = '复制';
-  btn.addEventListener('click', async () => {
-    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
-    try {
-      await navigator.clipboard.writeText(code);
-      btn.textContent = '已复制 ✓';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = '复制';
-        btn.classList.remove('copied');
-      }, 1500);
-    } catch (err) {
-      // 降级方案
-      const textarea = document.createElement('textarea');
-      textarea.value = code;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-      btn.textContent = '已复制 ✓';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = '复制';
-        btn.classList.remove('copied');
-      }, 1500);
-    }
-  });
-  pre.parentElement.appendChild(btn);
-});
-
-// ============ 章节折叠按钮 ============
-document.querySelectorAll('body > h2').forEach(h1 => {
-  const btn = document.createElement('span');
-  btn.className = 'collapse-btn';
-  btn.textContent = '▼';
-  btn.title = '折叠/展开';
-  btn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const collapsed = h1.classList.toggle('collapsed');
-    let next = h1.nextElementSibling;
-    while (next && next.tagName !== 'H2') {
-      next.style.display = collapsed ? 'none' : '';
-      next = next.nextElementSibling;
-    }
-  });
-  h1.appendChild(btn);
-});
-
-// ============ 键盘快捷键：j/k 跳章节 ============
-const h1Sections = Array.from(document.querySelectorAll('body > h2'));
-document.addEventListener('keydown', (e) => {
-  // 输入框聚焦时不响应
-  if (e.target.matches('input, textarea')) return;
-
-  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
-    e.preventDefault();
-    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
-    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
-    e.preventDefault();
-    let prev = null;
-    for (const s of h1Sections) {
-      if (s.getBoundingClientRect().top >= 120) break;
-      prev = s;
-    }
-    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-});
-
-// ============ 平滑滚动（点击目录链接）============
-document.querySelectorAll('.toc a').forEach(a => {
-  a.addEventListener('click', (e) => {
-    e.preventDefault();
-    const target = document.getElementById(a.dataset.target);
-    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
-    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  });
-});
-</script>
-
-
-<script>
-cytoscape.use(window.cytoscapeDagre);
-
-var VIEWS = {
-// ---------- 视图1:整体总览 ----------
-overview: {
-  title:'整体总览 (40 层)',
-  rankSep:42, nodeSep:24,
-  legend:[['#1f9d6b','输入/输出'],['#c0392b','编码器层(可下钻)'],['#7a45c9','解码器层 / 草稿头(可下钻)'],['#e0922f','压缩条目(可下钻)'],['#b7791f','全局 KV'],['#8a93a3','层段']],
-  nodes:{
-    emb:  {label:'embed\nid → 5120', t:'io', io:'token id [1,T] -> [1,T,5120]', f:'x = \\mathrm{Embedding}(\\mathrm{ids})', d:'词嵌入。vocab_size=129280、dim=5120；真实权重 embed.weight 形状 [129280, 5120] BF16。'},
-    e0:   {label:'Layer 0\n纯窗口注意力', t:'enc', drill:'attn', io:'[1,T,5120] -> [1,T,5120]', f:'\\text{SWA only}', d:'层 0 的 compress_ratios 为 0：不生产也不复用全局 KV，只有滑动窗口注意力（窗口 128）。'},
-    e1:   {label:'Layer 1\n窗口 + Engram', t:'enc', drill:'engram', io:'[1,T,5120] -> [1,T,5120]', f:'h \\leftarrow h + \\mathrm{Engram}(h)', d:'全模型两个 Engram 注入层之一（另一个是层 14）。24 行 n-gram 哈希查表结果经稠密投影写回残差流。'},
-    e2:   {label:'Layer 2\nFull：生产主 KV (r=2)', t:'cmp', drill:'sparse', io:'[1,T,5120] -> [1,T,5120]', f:'C_j = \\mathrm{RMSNorm}(\\sum_{t=jr}^{(j+1)r-1}\\mathrm{softmax}(s_t)v_t)', d:'CSA2 的 Full 层：自算主 KV、索引器 K 与 Top-K。压缩比 2，是全模型四个 source 层中的第一个，其缓存被层 2–7 共用。'},
-    e3:   {label:'Layers 3..19\n同模式再重复', t:'grp', io:'[1,T,5120] -> [1,T,5120]', f:'\\text{Full} \\to \\text{Reuse} \\times 5', d:'层 8、14 是另外两个 Full 层（各生产一份 r=2 的主 KV），其余层复用同组缓存。层 19 的输出即 H_{L/2}。'},
-    hmid: {label:'H(L/2)\n编码器末层隐状态', t:'gt', io:'[1,T,5120]', f:'H_{L/2} = \\text{out}(\\text{Layer 19})', d:'解码器全局 KV 的输入。参考实现中层 20 的注意力输入就是它，因此「层 20 的压缩器读自己的输入」等价于「用 H_{L/2} 投影」。'},
-    d20:  {label:'Layer 20\nFull：生产主 KV (r=1)', t:'dec', drill:'attn', io:'[1,T,5120] -> [1,T,5120]', f:'C_{20} = H_{L/2} W_{20}^{KV}', d:'解码器的 Full 层，唯一执行 CED 投影的层。压缩比 1（每 token 一条 288 字节条目），其缓存被层 20–39 共用。'},
-    d21:  {label:'Layers 21..39\n含 4 个 Reindex 层', t:'grp', io:'[1,T,5120] -> [1,T,5120]', f:'\\text{Reuse} \\to \\text{Reindex} \\to \\text{Reuse}', d:'层 24、28、32、36 是 Reindex 层：复用主 KV 与索引器 K，但在候选池内自己重算 Top-K；其余层连 Top-K 一起复用。'},
-    head: {label:'lm_head\n5120 → 129280', t:'io', io:'[1,T,5120] -> [1,T,129280]', f:'\\mathrm{logits} = W_{lm}\\,x', d:'输出头。真实权重 head.weight 形状 [129280, 5120] BF16。'},
-    mtp:  {label:'DSpark\n3 个草稿块', t:'dspark', drill:'dspark', io:'[1,T,5120] -> 5 个草稿位置', f:'\\text{draft} \\times 3\\ \\text{blocks}', d:'块式推测解码。输入取自层 37、38、39 的注意力输入，不改变主干缓存。点击下钻看草稿链。'}
-  },
-  edges:[
-    ['emb','e0','5120'],['e0','e1','5120'],['e1','e2','5120'],['e2','e3','5120'],
-    ['e3','hmid','5120'],['hmid','d20','5120（同时喂 KV 投影）'],['d20','d21','5120'],
-    ['d21','head','5120'],['d21','mtp','5120']
-  ]
-},
-
-// ---------- 视图2:注意力内部 ----------
-attn: {
-  title:'注意力内部（层 2 / 层 20 的 Full 层结构相同，仅压缩比不同）',
-  rankSep:40, nodeSep:20,
-  legend:[['#8a93a3','残差流读写'],['#3f6fd0','注意力主体'],['#b7791f','位置与门控'],['#16a085','缓存'],['#e0922f','压缩条目']],
-  nodes:{
-    in:  {label:'残差流入\n4×5120', t:'grp', io:'[1,T,20480]', f:'x = (x_1,x_2,x_3,x_4)', d:'超连接把残差流复制成 4 份，每份 5120 宽。'},
-    hc1: {label:'attn 超连接\n读出', t:'grp', io:'[1,T,20480] -> [1,T,5120]', f:'\\tilde{x} = \\textstyle\\sum_i \\mathrm{sigmoid}(\\mathrm{mixes}\\cdot\\mathrm{scale}+\\mathrm{base})_i \\odot x_i', d:'读出系数由上一层 FFN 的超连接混合提供（层 0 为 one-hot）；本层 hc_attn_fn（形状 [24, 20480]）产出的 post/comb 系数用于本子层写回，其 attn_pre 供本层 FFN 读出。'},
-    wqa: {label:'wq_a\n5120 → 1280', t:'attn', io:'[1,T,5120] -> [1,T,1280]', f:'q = W_{q_a}\\tilde{x}', d:'查询低秩投影。q_lora_rank=1280；真实权重形状 [1280, 5120]。'},
-    qn:  {label:'q_norm\n1280', t:'attn', io:'[1,T,1280] -> [1,T,1280]', f:'q \\leftarrow \\mathrm{RMSNorm}(q)', d:'低秩后再归一化。q_norm.weight 形状 [1280]。'},
-    wqb: {label:'wq_b\n1280 → 32768', t:'attn', io:'[1,T,1280] -> [1,T,64,512]', f:'64 \\times 512 = 32768', d:'展开成 64 个查询头、头维 512。真实权重形状 [32768, 1280]。'},
-    rope:{label:'RoPE\n仅末尾 64 维', t:'gt', io:'[1,T,64,512]', f:'\\mathrm{rope\\_head\\_dim}=64', d:'只旋转头维的末尾 64 维（源码用 x[..., -rd:] 切片）。频率表按层选择：层 0、1（compress_ratio=0）用 base 10000 且关 YaRN；层 2–39（compress_ratio>0）用 base 160000 且开 YaRN，查询、窗口 KV 与压缩条目共用同一份表。'},
-    wkv: {label:'wkv\n5120 → 512', t:'attn', io:'[1,T,5120] -> [1,T,512]', f:'1\\ \\text{KV head} \\times 512', d:'只有一个 KV 头、头维 512，64 个查询头共享这一份键值。真实权重形状 [512, 5120]。'},
-    kvn: {label:'kv_norm\n512', t:'attn', io:'[1,T,512] -> [1,T,512]', f:'k,v \\leftarrow \\mathrm{RMSNorm}(\\cdot)', d:'键值归一化。kv_norm.weight 形状 [512]。'},
-    win: {label:'窗口 KV\nFP8，128 槽', t:'buf', io:'[bsz, 128, 512]', f:'128 \\times 512 \\times 1\\ \\mathrm{B} = 64\\ \\mathrm{KiB/层}', d:'最近 128 个位置的原始键值，环形缓冲、不随序列长度增长。保持 FP8。'},
-    cmp: {label:'压缩条目\nTop-512 条', t:'cmp', drill:'sparse', io:'[1,T,512,512]', f:'288\\ \\mathrm{B}/\\text{条目} \\times 512', d:'该层所属压缩比组的条目中被索引器选中的 512 条。位置取组起点 j·r。压缩条目由 Compressor 的独立投影产生（自带 wkv 与 norm），不复用窗口 KV 的 wkv/kv_norm。点击下钻看选择过程。'},
-    sink:{label:'汇聚点\n每头 1 个标量', t:'gt', io:'[64] F32', f:'+ e^{\\mathrm{sink}-m}\\ \\text{只进分母}', d:'每头一个可学习标量，加在 softmax 分母上，不携带值向量。真实张量 attn.attn_sink 形状 [64]。'},
-    sa:  {label:'稀疏注意力\n窗口 + 压缩', t:'attn', io:'窗口 128 + 压缩 512 -> [1,T,64,512]', f:'o = \\frac{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m}v_t}{\\sum_t e^{q\\cdot k_t/\\sqrt{d}-m} + e^{\\mathrm{sink}-m}}', d:'两部分槽位拼进同一次调用，softmax 在并集上做一次归一化。$m=\\max_t q\\cdot k_t/\\sqrt{d}$ 是并集分数上的运行最大值，$d$ 为头维 512。索引为 $-1$ 的占位槽位分子分母都不贡献。'},
-    woa: {label:'wo_a\n32768 → 8192（8 组）', t:'attn', io:'[1,T,64,512] -> [1,T,8,1024]', f:'o\\_groups=8,\\ o\\_lora\\_rank=1024', d:'按 8 组各降到 1024 维。真实权重形状 [8192, 4096]；分组的设计动机未在来源中说明。'},
-    wob: {label:'wo_b\n8192 → 5120', t:'attn', io:'[1,T,8192] -> [1,T,5120]', f:'y = W_{o_b}o', d:'拼回隐藏维。真实权重形状 [5120, 8192]。'},
-    hc2: {label:'写回四流\npost/comb 混合', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow \\mathrm{post}_i \\odot y + \\sum_j \\mathrm{comb}_{ij} \\odot x_j', d:'子层输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。'}
-  },
-  edges:[
-    ['in','hc1','20480'],['hc1','wqa','5120'],['wqa','qn','1280'],['qn','wqb','1280'],
-    ['wqb','rope','32768'],['hc1','wkv','5120'],['wkv','kvn','512'],
-    ['kvn','win','FP8 128 槽'],['hc1','cmp','经 Compressor 独立投影'],
-    ['rope','sa','q'],['win','sa','128 位置'],['cmp','sa','512 条目'],['sink','sa','分母'],
-    ['sa','woa','32768'],['woa','wob','8192'],['wob','hc2','5120']
-  ]
-},
-
-// ---------- 视图3:压缩与稀疏选择 ----------
-sparse: {
-  title:'压缩条目与两级稀疏选择',
-  rankSep:38, nodeSep:18,
-  legend:[['#16a085','索引器打分与可达集'],['#b7791f','边界处理'],['#1f9d6b','选择结果'],['#3f6fd0','注意力']],
-  nodes:{
-    pool0:{label:'全部可达压缩条目\n随上下文线性增长', t:'idxr', io:'[1,T,N_reach,r=2 层约 50 万条]', f:'n_{\\mathrm{reach}}(i) = \\lfloor (i+1)/r \\rfloor', d:'只有「整组 token 都已出现」的条目才可达。1M 上下文、r=2 时约 50 万条；不可达条目在打分前置 $-\\infty$。'},
-    score:{label:'索引器打分\n32 头 × 128 维', t:'idxr', io:'[1,T,32,128] x [n,128] -> [1,T,n]', f:'I_{q,j} = \\sum_h w_{q,h}\\mathrm{ReLU}(q_h\\cdot k_j)', d:'每头的贡献是 ReLU 内积再乘该头权重，按头求和。索引器 K 由压缩条目投影而来，每条 68 字节（128 维 FP4 + 每 32 通道一个 E8M0）。'},
-    blk:  {label:'块级打分\n块分 = 块内最大', t:'idxr', io:'[1,T,n] -> [1,T,n/8]', f:'\\mathrm{block}(b) = \\max_{j\\in b} I_{q,j}', d:'把位置切成大小 8 的块，每块取块内最大索引分作为块分。'},
-    pin:  {label:'钉住最新块', t:'gt', io:'—', f:'\\text{pin the newest block}', d:'最新块只填了一部分，若不钉住会被更早的完整块以更大块分压过，导致 query 看不到紧邻的历史。'},
-    top2048:{label:'选出 2048 块', t:'idxr', io:'[1,T,n/8] -> 2048 块', f:'\\text{top-}2048', d:'只在建池层（层 20）执行一次；后续 Reindex 层复用这个池。'},
-    cand:{label:'候选池\n2048 × 8 = 16384', t:'sel', io:'16384 个候选位置', f:'2048 \\times 8 = 16384', d:'候选位置集合。短上下文下可达条目本身少于 16384，此时候选池不起缩减作用。'},
-    top512:{label:'位置级 Top-512', t:'sel', io:'16384 -> [1,T,512]', f:'\\text{top-}512', d:'在池内按索引分取前 512 条。Reindex 层重做这一步，Reuse 层直接复用上一次的选择。'},
-    sa:   {label:'拼进稀疏注意力', t:'attn', io:'窗口 128 + 压缩 512', f:'\\mathcal{T} = \\text{窗口} \\cup \\text{Top-}512', d:'两部分槽位在同一次调用里做一次 softmax，窗口没有额外权重加成，选中完全由索引分决定。'}
-  },
-  edges:[
-    ['pool0','score','逐条打分'],['score','blk','聚合'],['pin','blk','保留最新块'],
-    ['blk','top2048','块分排序'],['top2048','cand','展开 8 位置'],['cand','top512','池内排序'],
-    ['top512','sa','512 条'],['pool0','sa','可达性决定候选范围']
-  ]
-},
-
-// ---------- 视图4:MoE 内部 ----------
-moe: {
-  title:'MoE 与超连接写回',
-  rankSep:38, nodeSep:20,
-  legend:[['#8a93a3','残差流读写'],['#b7791f','门控'],['#3f6fd0','专家'],['#1f9d6b','选择']],
-  nodes:{
-    in:  {label:'残差流入\n读出后 5120', t:'grp', io:'[1,T,20480] -> [1,T,5120]', f:'\\tilde{x}', d:'由本层 hc_attn_fn 产出的 attn_pre 系数从 4 份残差流读出 5120 维——即「读入 FFN 的系数来自本层注意力产出」这一次序关系。'},
-    norm:{label:'ffn_norm', t:'grp', io:'[1,T,5120]', f:'x \\leftarrow \\mathrm{RMSNorm}(x)', d:'MoE 前的归一化。'},
-    gate:{label:'gate 打分\n384 专家', t:'gt', io:'[1,T,5120] -> [1,T,384]', f:'\\mathrm{score} = \\sqrt{\\mathrm{softplus}(xW^\\top)}', d:'真实权重 gate.weight 形状 [384, 5120]。另有 gate.bias 与 gate.bias_vl 各 [384]——图像 span 的 token 用另一套偏置。'},
-    bias:{label:'修正偏置\n只影响选择', t:'gt', io:'[384] F32', f:'\\mathrm{idx} = \\mathrm{topk}_6(\\mathrm{score}+b)', d:'无辅助损失的负载均衡偏置：只参与 topk 排序，不进入权重计算，因此不改变被选中专家的输出尺度。'},
-    sel: {label:'top-6 选择', t:'sel', io:'384 -> 6', f:'w = \\frac{\\mathrm{score}_{\\mathrm{idx}}}{\\sum \\mathrm{score}_{\\mathrm{idx}} + 10^{-20}} \\times 1.5', d:'选中 6 个路由专家；权重在选中集合内归一化后乘 route_scale=1.5。'},
-    rexp:{label:'6 个路由专家\n各 2304 × 5120 × 3', t:'moe', io:'[1,T,5120] -> 6 × [1,T,2304]', f:'\\mathrm{w1},\\mathrm{w3}{:}\\,[2304,5120]\\ \\ \\mathrm{w2}{:}\\,[5120,2304]', d:'每个专家约 35.39M 参数（fp4 量化存储，I8 打包）。384 个专家全存但每 token 只用 6 个。'},
-    shared:{label:'共享专家\n1 个，每 token 必过', t:'moe', io:'[1,T,5120] -> [1,T,2304]', f:'\\text{shared expert}', d:'与路由专家同形（约 35.39M），不参与稀疏选择。'},
-    sum: {label:'加权相加', t:'moe', io:'6 × [1,T,2304] + [1,T,2304] -> [1,T,5120]', f:'y = \\sum_{i\\in\\mathrm{idx}} w_i E_i(x) + E_{\\mathrm{shared}}(x)', d:'路由专家按权重加权，共享专家恒权相加。'},
-    hc:  {label:'写回四流\npost/comb 混合', t:'grp', io:'[1,T,5120] -> [1,T,20480]', f:'x_i \\leftarrow \\mathrm{post}_i \\odot y + \\sum_j \\mathrm{comb}_{ij} \\odot x_j', d:'MoE 输出 $y$ 按 post 逐流缩放，旧残差流各份按 comb（Sinkhorn 行列归一化得到的跨流混合矩阵）混入后写回。'}
-  },
-  edges:[
-    ['in','norm','5120'],['norm','gate','5120'],['bias','gate','384'],
-    ['gate','sel','384 -> 6'],['sel','rexp','6 个专家'],['norm','shared','5120'],
-    ['rexp','sum','加权'],['shared','sum','恒权'],['sum','hc','5120']
-  ]
-},
-
-// ---------- 视图5:Engram 注入 ----------
-engram: {
-  title:'Engram：n-gram 哈希查表（层 1 与层 14）',
-  rankSep:36, nodeSep:18,
-  legend:[['#c0392b','哈希与投影'],['#16a085','嵌入表'],['#b7791f','门控'],['#8a93a3','残差流']],
-  nodes:{
-    ctx:  {label:'上下文片段\n长度 2 / 3 / 4', t:'engram', io:'token id 序列', f:'n\\text{-gram},\\ n \\in \\{2,3,4\\}', d:'从当前位置往前取三种长度的连续片段。'},
-    hash: {label:'哈希映射\n3 × 8 = 24 个下标', t:'engram', io:'-> 24 个表下标', f:'(4-1) \\times 8 = 24', d:'每种片段长度用 8 个不同的哈希函数映射，共 24 个下标。'},
-    tab:  {label:'嵌入表\n两层合计约 196B', t:'buf', io:'[384006168, 256] 与 [384016682, 256]', f:'\\approx 196\\ \\mathrm{B}\\ \\text{参数}', d:'engram_vocab_size=16000000、head_dim=256。表很大，但每 token 只按 24 个下标取值，因此不计入激活参数。'},
-    row:  {label:'取回 24 行\n每行 256 维', t:'engram', io:'-> [24, 256]', f:'24 \\times 256 = 6144', d:'每 token 实际取回 6144 个表元素，相对 196B 的表可以忽略。'},
-    proj: {label:'稠密投影\n每层 157.33M', t:'engram', io:'[1,T,24,256] -> [1,T,25600]（5 × 5120）', f:'24\\times256\\times25600 + 2\\times4\\times5120 \\approx 157.33\\ \\mathrm{M}', d:'把取回的向量经稠密投影写回残差流：投影权重为 $24\\times256\\to25600$（输出 5 份 5120），另加一个小的门控投影 $2\\times4\\times5120$，合计每层约 157.33M。这一步是稠密的，只要该层启用 Engram 就整份参与计算——这是 Engram 计入激活参数的部分。'},
-    gate: {label:'门控\n带符号平方根后 sigmoid', t:'gt', io:'[1,T,5120]', f:'g = \\sigma(\\mathrm{copysign}(\\sqrt{|d|}, d))', d:'门控值取残差流与查表结果的归一化点积，先取绝对值开方、保留原符号，再经 sigmoid。与训练内核一致。'},
-    add:  {label:'写回残差流', t:'grp', io:'[1,T,5120]', f:'x \\leftarrow x + g \\odot \\mathrm{proj}', d:'按门控加权写回。图像 span 的 token 跳过这一步。'}
-  },
-  edges:[
-    ['ctx','hash','片段'],['hash','tab','24 个下标'],['tab','row','按行取值'],
-    ['row','proj','[24,256]'],['gate','add','门控'],['proj','add','投影结果'],['add','ctx','写回后继续前向']
-  ]
-},
-
-// ---------- 视图6:DSpark 草稿链 ----------
-dspark: {
-  title:'DSpark：块式推测解码草稿链',
-  rankSep:36, nodeSep:18,
-  legend:[['#7a45c9','主干层与草稿块'],['#8a93a3','拼接与投影'],['#b7791f','判定头'],['#556070','草稿输出']],
-  nodes:{
-    h37: {label:'层 37 注意力输入', t:'dec', io:'[1,T,4,5120]', f:'h_{37}', d:'取注意力子层的输入（不是输出），此时残差流仍是 4 份。'},
-    h38: {label:'层 38 注意力输入', t:'dec', io:'[1,T,4,5120]', f:'h_{38}', d:'同上。'},
-    h39: {label:'层 39 注意力输入', t:'dec', io:'[1,T,4,5120]', f:'h_{39}', d:'同上。'},
-    mean:{label:'按 hc 维取均值\n4 → 1', t:'grp', io:'[1,T,4,5120] -> [1,T,5120]', f:'h.\\mathrm{mean}(\\mathrm{dim}=2)', d:'在超连接副本维（大小为 4）上取均值，把三层各自压成 5120 维。'},
-    cat: {label:'沿特征维拼接\n3 → 15360', t:'grp', io:'3 × [1,T,5120] -> [1,T,15360]', f:'3 \\times 5120 = 15360', d:'三层的均值结果拼成一个 15360 维向量，作为一次性的草稿输入（不再自回归）。'},
-    proj:{label:'main_proj\n15360 → 5120', t:'dspark', io:'[1,T,15360] -> [1,T,5120]', f:'W{:}\\,[5120, 15360]', d:'真实权重 main_proj.weight 形状 [5120, 15360]，与三层拼接的宽度一致。'},
-    b1:  {label:'草稿块 1\n5 个位置', t:'dspark', io:'-> 隐藏态', f:'\\text{block size} = 5', d:'三个草稿块顺序作用在同一批 5 个位置上，一次前向共同产出 5 个草稿位置的 logits。本块只输出隐藏态、不接输出头。块内位置用噪声 token（id 128799）占位；草稿块自身是 MoE：128 专家取 top-3。'},
-    b2:  {label:'草稿块 2\n5 个位置', t:'dspark', io:'-> 隐藏态', f:'\\text{block size} = 5', d:'同上，输出隐藏态交给末块。共 3 个 MTP 块（n_mtp_layers=3）。'},
-    b3:  {label:'草稿块 3\n5 个位置', t:'dspark', io:'-> [1,5,V]', f:'\\text{block size} = 5', d:'末块接 Markov 头与置信头，输出 5 个位置的词表 logits（$V$ 为词表 129280）。'},
-    markov:{label:'Markov 头\n秩 256', t:'gt', io:'[1,5,256]', f:'\\mathrm{rank} = 256', d:'dspark_markov_rank=256，给草稿序列内部的相邻关系建模。'},
-    conf:{label:'置信头', t:'gt', io:'[1,5]', f:'\\text{confidence}', d:'输出每个草稿位置的接受置信度，决定这次接受几个草稿。'},
-    out: {label:'草稿 token\n交主干校验', t:'out', io:'5 个草稿位置', f:'\\text{draft} \\to \\text{verify}', d:'草稿交给主干一次性校验。DSpark 不产生主干缓存，只提高一次前向平均能确认的 token 数。'}
-  },
-  edges:[
-    ['h37','mean','取均值'],['h38','mean','取均值'],['h39','mean','取均值'],
-    ['mean','cat','5120'],['cat','proj','15360'],['proj','b1','5120'],
-    ['b1','b2','草稿'],['b2','b3','草稿'],['b3','markov','末块'],['b3','conf','末块'],
-    ['markov','out','修正'],['conf','out','接受数']
-  ]
-},
-};
-
-var COLOR={io:'#1f9d6b',enc:'#c0392b',dec:'#7a45c9',attn:'#3f6fd0',moe:'#3f6fd0',
-  grp:'#8a93a3',out:'#556070',cmp:'#e0922f',idxr:'#16a085',gt:'#b7791f',
-  sel:'#1f9d6b',buf:'#16a085',engram:'#c0392b',dspark:'#7a45c9'};
-
-var cy = cytoscape({
-  container:document.getElementById('cy'),
-  style:[
-    {selector:'node',style:{
-      'label':'data(label)','text-wrap':'wrap','text-valign':'center','text-halign':'center',
-      'text-justification':'center','font-size':'10.5px','color':'#fff','font-weight':'600',
-      'background-color':'data(c)','shape':'round-rectangle','width':'132px','height':'54px',
-      'border-width':0,'text-max-width':'124px','line-height':1.25
-    }},
-    {selector:'node[drill]',style:{'border-width':3,'border-color':'#ffd24d','border-style':'double'}},
-    {selector:'node:selected',style:{'border-width':3,'border-color':'#122'}},
-    {selector:'edge',style:{
-      'width':2,'line-color':'#9db0cf','target-arrow-color':'#9db0cf',
-      'target-arrow-shape':'triangle','curve-style':'bezier',
-      'label':'data(label)','font-size':'9px','color':'#0b64c4',
-      'font-family':'monospace','text-background-color':'#f6f8fc',
-      'text-background-opacity':1,'text-background-padding':'2px','text-rotation':'autorotate'
-    }},
-  ],
-  minZoom:0.25,maxZoom:2.5,wheelSensitivity:0.25
-});
-
-var tip=document.getElementById('tip');
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function nl(s){return esc(s).replace(/\n/g,'<br>');}
-function renderTeX(t){try{return katex.renderToString(t,{throwOnError:false,displayMode:true,strict:false});}catch(e){return '<code>'+esc(t)+'</code>';}}
-function renderInline(t){try{return katex.renderToString(t,{throwOnError:false,displayMode:false,strict:false});}catch(e){return '<code>'+esc(t)+'</code>';}}
-function renderD(s){var parts=String(s).split(/\$([^$]+)\$/g),out='';for(var i=0;i<parts.length;i++){if(i%2===1)out+=renderInline(parts[i]);else out+=esc(parts[i]);}return out;}
-if (window.renderMathInElement) { renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false}); }
-
-var curView='overview';
-function loadView(name){
-  curView=name;
-  var V=VIEWS[name];
-  var nodes=Object.keys(V.nodes).map(function(id){
-    var o=V.nodes[id];
-    return {data:{id:id,label:o.label,c:COLOR[o.t]||'#556070',drill:o.drill||undefined}};
-  });
-  var edges=V.edges.map(function(e,i){return {data:{id:'edge'+i,source:e[0],target:e[1],label:e[2]}};});
-  cy.elements().remove();
-  cy.add(nodes.concat(edges));
-  cy.layout({name:'dagre',rankDir:'TB',nodeSep:V.nodeSep,rankSep:V.rankSep,edgeSep:10}).run();
-  cy.fit(undefined,30);
-  document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',t.dataset.v===name);});
-  document.getElementById('legend').innerHTML=V.legend.map(function(l){
-    return '<div><span class="sw" style="background:'+l[0]+'"></span>'+l[1]+'</div>';}).join('');
-  var cb=document.getElementById('crumb');
-  if(name==='overview') cb.innerHTML='<b>整体总览</b> — 点击黄框节点下钻到内部';
-  else cb.innerHTML='<span style="cursor:pointer" onclick="loadView(\'overview\')">整体总览</span> ▸ <b>'+V.title+'</b>';
-}
-
-var TABS=[['overview','整体总览'],['attn','注意力内部'],['sparse','压缩与稀疏选择'],['moe','MoE 内部'],['engram','Engram 注入'],['dspark','DSpark 草稿链']];
-document.getElementById('tabs').innerHTML=TABS.map(function(t){
-  return '<span class="tab" data-v="'+t[0]+'" onclick="loadView(\''+t[0]+'\')">'+t[1]+'</span>';}).join('');
-
-cy.on('mouseover','node',function(ev){
-  var o=VIEWS[curView].nodes[ev.target.id()];if(!o)return;
-  var h='<h4>'+esc(o.label.replace(/\n/g,' · '))+'</h4><div class="k">维度</div><div class="io b">'+nl(o.io)+'</div>';
-  if(o.f) h+='<div class="k">公式</div><div class="fx">'+renderTeX(o.f)+'</div>';
-  if(o.d) h+='<div class="k">说明</div><div>'+renderD(o.d)+'</div>';
-  if(o.drill) h+='<div class="hint">点击可下钻查看内部</div>';
-  tip.innerHTML=h;tip.classList.add('show');
-});
-cy.on('mouseout','node',function(){tip.classList.remove('show');});
-cy.on('tap','node',function(ev){
-  var o=VIEWS[curView].nodes[ev.target.id()];
-  if(o&&o.drill){tip.classList.remove('show');loadView(o.drill);}
-});
-document.addEventListener('mousemove',function(e){
-  if(!tip.classList.contains('show'))return;
-  var w=tip.offsetWidth||430,hh=tip.offsetHeight||200;
-  var x=e.clientX+18,y=e.clientY+14;
-  if(x+w>window.innerWidth-12)x=e.clientX-w-18;
-  if(y+hh>window.innerHeight-12)y=Math.max(12,e.clientY-hh-14);
-  tip.style.left=x+'px';tip.style.top=y+'px';
-});
-
-loadView('overview');
-</script>
-
-<script>
-/* 宽表在窄屏内横向滚动，不撑开页面 */
 (function () {
-  document.querySelectorAll('body > table, .viz + noscript table').forEach(function (table) {
-    if (table.parentElement.classList.contains('table-scroll')) return;
-    var wrap = document.createElement('div');
-    wrap.className = 'table-scroll';
-    table.parentNode.insertBefore(wrap, table);
-    wrap.appendChild(table);
+  var app = document.getElementById('flow-app');
+  if (window.DojoFlow && window.DOJO_FLOW_DATA) {
+    window.__flow = window.DojoFlow.mount(app, window.DOJO_FLOW_DATA);
+  }
+  // 说明面板与参数面板占同一块位置，同一时间只开一个；再点一次按钮或按 Esc 关闭。
+  var pairs = [['flow-info-btn', 'flow-info'], ['flow-cfg-btn', 'flow-config']]
+    .map(function (p) { return [document.getElementById(p[0]), document.getElementById(p[1])]; })
+    .filter(function (p) { return p[0] && p[1]; });
+  function setPanel(target) {
+    pairs.forEach(function (p) {
+      var open = p[1] === target;
+      p[1].hidden = !open;
+      p[0].setAttribute('aria-expanded', open ? 'true' : 'false');
+      p[0].classList.toggle('on', open);
+    });
+  }
+  pairs.forEach(function (p) {
+    p[0].addEventListener('click', function (e) {
+      e.stopPropagation();
+      setPanel(p[1].hidden ? p[1] : null);
+    });
+    p[1].addEventListener('click', function (e) { e.stopPropagation(); });
   });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') setPanel(null);
+  });
+  if ((location.hash || '').replace('#', '') === 'config') {
+    setPanel(document.getElementById('flow-config'));
+  }
 })();
 </script>
-
-<script>
-/* 站内文档链接与外部链接在新标签页打开 */
-(function () {
-  document.querySelectorAll('a[href]').forEach(function (a) {
-    var href = a.getAttribute('href') || '';
-    if (!href || href.charAt(0) === '#') return;
-    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
-      a.target = '_blank';
-      a.rel = 'noopener';
-    }
-  });
-})();
-</script>
-
 </body>
 </html>
