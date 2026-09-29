@@ -4,24 +4,34 @@
 数据流页最容易出的错不是排版，而是**写出源码里根本不存在的东西**。
 这个脚本把断言变成可执行的检查：
 
-  1. 节点名  —— 名字里出现的标识符，必须在源码里 grep 得到
-  2. 形状    —— 写出的权重形状，必须与 safetensors 头一致
-  3. 材料    —— --script 指定的文件必须存在（用于确认构建脚本还在原处）
-  4. 几何    —— --geometry 时用无头 Chrome 量连线穿框与重合（见下）
+  1. 源码位置 —— 传入计划文件时，「源码」列指的行不是空行或注释，且含节点名
+  2. 节点名  —— 名字里出现的标识符，必须在源码里 grep 得到
+  3. 形状    —— 写出的权重形状，必须与 safetensors 头一致
+  4. 材料    —— --script 指定的文件必须存在（旧页面用来确认构建脚本还在原处）
+  5. 几何    —— --geometry 时用无头 Chrome 量连线穿框与重合（见下）
+  6. 截图    —— --shots 时逐张图截图，供人看
 
 前三项需要外部材料（源码 / 权重），所以不做进 ci-01-validate.py（那是纯静态
 检查），单独跑这个脚本。
 
 用法：
-    # 源码在本地
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
-        --source /path/to/modeling_x.py
+    # 计划文件的源码位置
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/research/dataflow.md \
+        --source-root /path/to/transformers
 
-    # 只看节点名（不需要外部材料）
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --names-only
+    # 节点名与权重形状
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
+        --source /path/to/modeling_x.py --shapes wiki/<name>/research/sources/shapes.json
+
+    # 只看节点名（仍要 --source）
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
+        --source /path/to/modeling_x.py --names-only
 
     # 几何：连线是否穿框、是否与别的线并排重合
     python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --geometry
+
+    # 截图
+    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --shots <目录>
 
 几何判据必须来自渲染后的像素，不能靠几何推算：曾用「两条线 x 差 < 3px」
 判定并行，报 0 处；实际差 2px、重叠 318px，肉眼一看就是重复的线。
@@ -99,21 +109,25 @@ def check_names(views: list[dict], sources: dict[str, str]) -> list[str]:
     return errors
 
 
-def check_shapes(views: list[dict], shapes: dict[str, list[int]]) -> list[str]:
+def check_shapes(views: list[dict], shapes: dict[str, list[int]]) -> tuple[list[str], int, list[str]]:
     """页面上写的权重形状必须与给定的形状表一致。
 
     shapes 由 --shapes 传入（name -> [dim...]），通常来自 safetensors 头。
+    返回 (错误, 比对上的键数, 页面上写了形状但不在形状表里的键)。
     """
     errors: list[str] = []
-    if not shapes:
-        return errors
+    matched = 0
+    missing: list[str] = []
     for view in views:
         for node in view["nodes"]:
             blob = " ".join(filter(None, [node.get("name"), node.get("detail"), node.get("shape")]))
-            for m in re.finditer(r"([a-z_][a-z0-9_.]*)\s*\[([0-9][0-9,\s]*)\]", blob):
-                key = m.group(1)
+            for m in re.finditer(r"([a-z_](?:[a-z0-9_.]|\{[a-z]+\})*)\s*\[([0-9][0-9,\s]*)\]", blob):
+                # 层号、专家号写成 {i}、{e} 时，按第 0 个去形状表里比对
+                key = re.sub(r"\{[a-z]+\}", "0", m.group(1))
                 if key not in shapes:
+                    missing.append(f"{view['id']}/{node['id']}: {key}")
                     continue
+                matched += 1
                 claimed = [int(x) for x in m.group(2).replace(" ", "").split(",")]
                 expected = shapes[key]
                 if claimed != expected:
@@ -121,6 +135,32 @@ def check_shapes(views: list[dict], shapes: dict[str, list[int]]) -> list[str]:
                         f"[{view['id']}/{node['id']}] {key} 页面写 {claimed}，"
                         f"材料里是 {expected}"
                     )
+    return errors, matched, missing
+
+
+def check_structure(views: list[dict]) -> list[str]:
+    """视图数据自洽：节点 id 不重复，边、分组、批注引用的节点和下钻目标都存在。"""
+    errors: list[str] = []
+    view_ids = {v["id"] for v in views}
+    for v in views:
+        ids = [n["id"] for n in v["nodes"]]
+        known = set(ids)
+        for nid in {i for i in ids if ids.count(i) > 1}:
+            errors.append(f"[{v['id']}/{nid}] 节点 id 重复")
+        for n in v["nodes"]:
+            if n.get("drill") and n["drill"] not in view_ids:
+                errors.append(f"[{v['id']}/{n['id']}] 下钻目标 {n['drill']} 不存在")
+        for e in v["edges"]:
+            for end in (e["from"], e["to"]):
+                if end not in known:
+                    errors.append(f"[{v['id']}] 边 {e['from']} → {e['to']} 的端点 {end} 不存在")
+        for g in v.get("groups") or []:
+            for m in g.get("members", []):
+                if m not in known:
+                    errors.append(f"[{v['id']}] 分组「{g.get('label', '')}」的成员 {m} 不存在")
+        for note in v.get("notes") or []:
+            if note.get("at") not in known:
+                errors.append(f"[{v['id']}] 批注「{note.get('text', '')[:20]}」挂在不存在的节点 {note.get('at')}")
     return errors
 
 
@@ -312,6 +352,139 @@ def run_geometry(page: Path, root: Path) -> int:
     return 0
 
 
+# 节点第一行照源码里的名字写。这里只给仍可能出现的短名留对照，
+# 新的计划文件不再把 hidden_states 改写成 x。
+NAME_ALIASES = {
+    "x": ("hidden_states", "inputs_embeds", "last_hidden_state"),
+    "q": ("query_states", "query"),
+    "k": ("key_states", "key"),
+    "v": ("value_states", "value"),
+}
+SKIP_HEADS = {"资料", "前提", "config.json"}
+
+
+def _plan_rows(text: str):
+    """逐张图产出 (标题, 行号, {列名: 值})，只读「节点」表。"""
+    head = sub = None
+    cols: list[str] = []
+    for no, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("## "):
+            head, sub, cols = s[3:].strip(), None, []
+            yield head, no, None
+        elif s.startswith("### "):
+            sub, cols = s[4:].strip(), []
+        elif head not in SKIP_HEADS and sub == "节点" and s.startswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if not cols:
+                cols = cells
+            elif not set(s) <= set("|-: "):
+                yield head, no, dict(zip(cols, cells))
+
+
+def _refs(cell: str) -> list[tuple[str, int, int]]:
+    """「a.py:1-3，5；b.py:7」→ [(a.py, 1, 3), (a.py, 5, 5), (b.py, 7, 7)]。"""
+    out: list[tuple[str, int, int]] = []
+    for seg in re.split(r"[；;]", cell):
+        fname = ""
+        for piece in re.split(r"[，,]", seg):
+            piece = piece.strip()
+            m = re.fullmatch(r"(?:(\S+?):)?(\d+)(?:-(\d+))?", piece)
+            if not m:
+                continue
+            fname = m.group(1) or fname
+            a = int(m.group(2))
+            out.append((fname, a, int(m.group(3) or a)))
+    return out
+
+
+def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
+    """计划文件的源码位置回查：标题从 def forward 起，节点指的行不是空行或注释，且含节点名。"""
+    files: dict[str, list[str]] = {}
+
+    def lines_of(name: str) -> list[str] | None:
+        if name not in files:
+            hits = [root / name] if "/" in name else list(root.rglob(name))
+            hits = [h for h in hits if h.is_file()]
+            files[name] = hits[0].read_text(encoding="utf-8").splitlines() if len(hits) == 1 else None
+        return files[name]
+
+    errors: list[str] = []
+    checked = 0
+    for head, no, row in _plan_rows(plan.read_text(encoding="utf-8")):
+        if head in SKIP_HEADS:
+            continue
+        where = f"第 {no} 行（{head.split('（')[0]}"
+        if row is None:
+            m = re.search(r"[（(](\S+?):(\d+)-\d+[）)]", head)
+            src = m and lines_of(m.group(1))
+            if m and src is not None and "def forward" not in src[int(m.group(2)) - 1]:
+                errors.append(f"{where}）标题的起始行 {m.group(1)}:{m.group(2)} 不是 def forward")
+            continue
+        refs = _refs(row.get("源码", ""))
+        if not refs:
+            continue
+        checked += 1
+        where += f" / {row.get('id', '?')}）"
+        text = []
+        for fname, a, b in refs:
+            src = lines_of(fname)
+            if src is None:
+                errors.append(f"{where}找不到源码文件 {fname}（或同名文件不止一个，写上相对 --source-root 的路径）")
+                break
+            if a > len(src) or not src[a - 1].strip() or src[a - 1].strip().startswith("#"):
+                errors.append(f"{where}{fname}:{a} 是空行、注释或超出文件")
+            text += [l.split("#")[0] for l in src[a - 1:b]]
+        else:
+            names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", row.get("第一行", "").replace("`", "")))
+            words = set()
+            for n in names:
+                words |= set(NAME_ALIASES.get(n, ())) | {n}
+                words |= {w for w in re.findall(r"[A-Z]?[a-z]+", n) if len(w) >= 3}
+            blob = "\n".join(text).lower()
+            if names and not any(w.lower() in blob for w in words):
+                errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字")
+    return errors, checked
+
+
+def run_shots(page: Path, root: Path, out: Path) -> int:
+    """逐张图截图：<视图>.png 是画布按宽度铺满，<视图>-info.png 是打开说明面板。
+
+    file:// 打不开页面里的相对资源，要起本地服务；#视图 在无头模式下不生效，
+    所以每张图注入一段脚本直接切过去。
+    """
+    chrome = find_chrome()
+    if not chrome:
+        print("error: 找不到 Chrome/Chromium，无法截图", file=sys.stderr)
+        return 2
+    ids = [v["id"] for v in load_views(page)]
+    out.mkdir(parents=True, exist_ok=True)
+    injected = page.with_name("__shot__.html")
+    html = page.read_text(encoding="utf-8")
+    httpd, port = serve_root(root)
+    try:
+        for vid in ids:
+            for suffix, extra in (("", ""), ("-info", "var b=document.getElementById('flow-info-btn');if(b&&!b.hidden)b.click();")):
+                probe = ("<script>window.addEventListener('load',function(){setTimeout(function(){"
+                         f"window.__flow.fitMode='width';window.__flow.applyView('{vid}');{extra}"
+                         "},400);});</script>")
+                injected.write_text(html.replace("</body>", probe + "</body>"), encoding="utf-8")
+                shot = out / f"{vid}{suffix}.png"
+                subprocess.run(
+                    [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+                     "--window-size=1440,900", "--virtual-time-budget=9000",
+                     f"--screenshot={shot.resolve()}",
+                     f"http://127.0.0.1:{port}/{injected.relative_to(root)}"],
+                    capture_output=True, timeout=120,
+                )
+                print(f"  {shot}")
+    finally:
+        httpd.shutdown()
+        injected.unlink(missing_ok=True)
+    print(f"截图完成：{len(ids)} 张图，每张两幅（画布、说明面板）")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="数据流页事实核查")
     ap.add_argument("page", type=Path, help="wiki/<name>/index.html")
@@ -328,13 +501,30 @@ def main() -> int:
                     help="只做节点名核查")
     ap.add_argument("--geometry", action="store_true",
                     help="几何自检：无头 Chrome 量连线穿框与重合")
+    ap.add_argument("--shots", type=Path, metavar="DIR",
+                    help="逐张图截图，存到 DIR")
+    ap.add_argument("--source-root", type=Path, metavar="DIR",
+                    help="传入计划文件 dataflow.md 时，按「源码」列到这个目录下找文件回查")
     ap.add_argument("--root", type=Path, default=Path("."),
-                    help="--geometry 时的站点根目录，默认当前目录")
+                    help="--geometry、--shots 时的站点根目录，默认当前目录")
     args = ap.parse_args()
 
     if not args.page.exists():
         print(f"error: 页面不存在: {args.page}", file=sys.stderr)
         return 2
+
+    if args.page.suffix == ".md":
+        if not args.source_root or not args.source_root.is_dir():
+            print("error: 检查计划文件要用 --source-root 指定源码目录", file=sys.stderr)
+            return 2
+        errors, checked = check_plan_sources(args.page, args.source_root)
+        if errors:
+            print(f"源码位置核查失败：{len(errors)} 处")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print(f"源码位置核查通过：{checked} 个节点")
+        return 0
 
     # 形状表缺失时直接报用法错误。让它抛 FileNotFoundError 会打出一串堆栈，
     # 使用者容易把「脚本崩了」误读成「核查过了」。
@@ -342,10 +532,12 @@ def main() -> int:
         print(f"error: 形状表不存在: {args.shapes}", file=sys.stderr)
         return 2
 
-    if args.geometry:
+    if args.geometry or args.shots:
         # 页面路径相对站点根解析，二者都取绝对路径，relative_to 才能用
         root = args.root.resolve()
         page = args.page if args.page.is_absolute() else (root / args.page)
+        if args.shots:
+            return run_shots(page, root, args.shots)
         return run_geometry(page, root)
 
     views = load_views(args.page)
@@ -379,7 +571,7 @@ def main() -> int:
     labeled_bodies = {label: body for label, body in labeled}
     universal = [body for path, body in sources.items() if path not in labeled_files]
 
-    errors: list[str] = []
+    errors: list[str] = check_structure(views)
     if sources:
         for view in views:
             heading = view.get("title", "") + " " + view.get("label", "")
@@ -389,6 +581,8 @@ def main() -> int:
                 picked = universal
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})
+    notes: list[str] = []
+    shape_matched = 0
     if not args.names_only and args.shapes:
         # 形状表读不出来就报错退出，不要带着半截数据继续核查——
         # 那会给出「核查通过」，而形状其实一条都没比对。
@@ -397,9 +591,17 @@ def main() -> int:
         except (OSError, ValueError) as error:
             print(f"error: 形状表无法解析: {args.shapes}（{error}）", file=sys.stderr)
             return 2
-        errors += check_shapes(views, shapes)
+        shape_errors, shape_matched, shape_missing = check_shapes(views, shapes)
+        errors += shape_errors
+        if shape_matched == 0:
+            errors.append("形状表一个键都没比对上：页面里要写完整键名，如 model.layers.0.mlp.gate_proj.weight [..]")
+        for key in shape_missing:
+            notes.append(f"形状没比对（不在形状表里）：{key}")
     if not args.names_only and args.script:
         errors += check_scripts_exist([Path(p) for p in args.script])
+
+    for note in notes:
+        print(f"  提示：{note}")
 
     nodes = sum(len(v["nodes"]) for v in views)
     if errors:
@@ -412,7 +614,7 @@ def main() -> int:
     if sources:
         checked.append(f"节点名 vs {len(sources)} 份源码")
     if not args.names_only and args.shapes:
-        checked.append("形状 vs 材料")
+        checked.append(f"形状 vs 材料 {shape_matched} 个键")
     print(f"核查通过：{len(views)} 视图 / {nodes} 节点" + (
         "（" + "、".join(checked) + "）" if checked else ""))
     return 0

@@ -35,7 +35,7 @@
   function overlayPad(viewport) {
     var vpr = viewport.getBoundingClientRect();
     var top = 74, bottom = 48, left = SIDE_PAD, right = SIDE_PAD;
-    ['.flow-bar', '.flow-zoom', '.flow-cfg-btn'].forEach(function (sel) {
+    ['.flow-bar', '.flow-zoom', '.flow-btns', '.flow-cfg-btn'].forEach(function (sel) {
       var e = document.querySelector(sel);
       if (!e) return;
       if (e.hidden || e.offsetParent === null) return;
@@ -436,7 +436,35 @@
 
   // ---------- 尺寸估算（SVG 无自动换行，框宽须由内容反推）----------
   // 每行 [文本, 类名, 行高, 单字宽]；类名决定渲染样式。
+  var MATH_RE = /(\$[^$\n]+\$)/;
+
+  // 估宽时公式按渲染后的样子算：去掉 $、花括号和上下标符号，\sqrt 这类命令算一个字符
+  function visibleText(text) {
+    return String(text).replace(/\$([^$\n]+)\$/g, function (_, tex) {
+      return tex.replace(/\\[A-Za-z]+/g, 'x').replace(/[{}^_\\]/g, '');
+    });
+  }
+
+  // 文字里的 $...$ 交给 KaTeX 渲染；KaTeX 没加载时原样显示
+  function renderRich(target, text) {
+    String(text).split(MATH_RE).forEach(function (part) {
+      if (!part) return;
+      if (MATH_RE.test(part) && window.katex) {
+        var span = document.createElement('span');
+        try {
+          window.katex.render(part.slice(1, -1), span, { throwOnError: false });
+        } catch (e) {
+          span.textContent = part;
+        }
+        target.appendChild(span);
+      } else {
+        target.appendChild(document.createTextNode(part));
+      }
+    });
+  }
+
   function textWidth(text, perChar) {
+    text = visibleText(text);
     var w = 0;
     for (var i = 0; i < text.length; i++) {
       w += perChar * (text.charCodeAt(i) > 0x2E80 ? 2 : 1);
@@ -468,7 +496,8 @@
       if (!paragraph) { out.push(''); return; }
       // 按「词」折行：逐字折会把英文标识符从中间切断（实测 MoE 被断成 M / oE）。
       // 中文没有空格，整段会被当成一个词，所以再对超长的词做逐字回退。
-      var tokens = paragraph.match(/[A-Za-z0-9_.:/+\-()\[\]]+|[\s]+|[\s\S]/g) || [];
+      // 公式整体当一个词，不从中间折断
+      var tokens = paragraph.match(/\$[^$\n]+\$|[A-Za-z0-9_.:/+\-()\[\]]+|[\s]+|[\s\S]/g) || [];
       var line = '';
       tokens.forEach(function (tk) {
         if (!line && /^\s+$/.test(tk)) return;      // 行首不留空格
@@ -669,12 +698,65 @@
       this.layoutAuto();
     }
     if (this.tabsEl) {
+      var active = null;
       Array.prototype.forEach.call(this.tabsEl.children, function (btn) {
-        btn.classList.toggle('on', btn.dataset.view === self.view.id);
+        var on = btn.dataset.view === self.view.id;
+        btn.classList.toggle('on', on);
+        if (on) active = btn;
       });
+      if (active) {
+        var left = active.offsetLeft;
+        var right = left + active.offsetWidth;
+        if (left < self.tabsEl.scrollLeft) self.tabsEl.scrollLeft = left;
+        else if (right > self.tabsEl.scrollLeft + self.tabsEl.clientWidth) {
+          self.tabsEl.scrollLeft = right - self.tabsEl.clientWidth;
+        }
+      }
     }
     if (history.replaceState) history.replaceState(null, '', '#' + this.view.id);
+    this.renderInfo();
     if (hasManual) this.render();
+  };
+
+  // 说明面板跟着视图走：分组 + 键值表，与 config.json 面板同一套样式。
+  // 当前视图没有 info 时收起面板、隐藏按钮。
+  FlowView.prototype.renderInfo = function () {
+    var btn = document.getElementById('flow-info-btn');
+    var panel = document.getElementById('flow-info');
+    if (!btn || !panel) return;
+    var groups = this.view.info || [];
+    btn.hidden = !groups.length;
+    if (!groups.length) {
+      panel.hidden = true;
+      btn.classList.remove('on');
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    panel.textContent = '';
+    var title = document.createElement('h2');
+    title.className = 'cfg-title';
+    title.textContent = this.view.label;
+    panel.appendChild(title);
+    groups.forEach(function (g) {
+      var box = document.createElement('details');
+      box.className = 'cfg-group';
+      box.open = true;
+      var sum = document.createElement('summary');
+      sum.textContent = g.title;
+      box.appendChild(sum);
+      var table = document.createElement('table');
+      g.rows.forEach(function (r) {
+        var tr = document.createElement('tr');
+        var th = document.createElement('th');
+        var td = document.createElement('td');
+        renderRich(th, r[0]);
+        renderRich(td, r[1]);
+        tr.appendChild(th);
+        tr.appendChild(td);
+        table.appendChild(tr);
+      });
+      box.appendChild(table);
+      panel.appendChild(box);
+    });
   };
 
   /**
@@ -1045,7 +1127,7 @@
       d.setAttribute('style', 'line-height:' + lh + 'px');
       var span = document.createElement('span');
       span.className = line.cls;
-      span.textContent = line.text;
+      renderRich(span, line.text);
       span.title = line.text;
       d.appendChild(span);
       fo.appendChild(d);
