@@ -12,9 +12,19 @@
   <!-- 画布样式：节点、连线、拖拽、缩放、参数面板，全部在这里。
        旧一代数据流页用 cytoscape + dojo-dataflow.css，新页面不用它。 -->
   <link rel="stylesheet" href="../../libs/dojo-flow.css">
+  <!-- KaTeX 同步加载：引擎画节点和说明面板时直接调用 katex.render。
+       auto-render 只处理写在 HTML 里的 config.json 面板。 -->
+  <link rel="stylesheet" href="../../libs/katex.min.css">
+  <script src="../../libs/katex.min.js"></script>
+  <script defer src="../../libs/auto-render.min.js"
+    onload="var c = document.getElementById('flow-config'); if (c) renderMathInElement(c, {
+      delimiters: [{left: '$', right: '$', display: false}],
+      throwOnError: false
+    });"></script>
   <noscript><style>
     /* 无脚本时画布不可交互，把节点表与参数面板直接显示出来 */
     .flow-config[hidden] { display: block !important; }
+    .flow-config.flow-info { display: none !important; }
     .flow-cfg-btn, .flow-zoom, .flow-bar { display: none; }
   </style></noscript>
 </head>
@@ -34,37 +44,42 @@
     <!-- 视图标签栏：每个视图一个按钮，第一个带 on 类表示默认视图 -->
     <button type="button" class="flow-tab on" data-view="【视图 id】">【视图标签】</button>
   </nav>
-  <!-- 参数面板开关：label 写 config.json 之类的名字；不需要参数面板时整段删除 -->
-  <button type="button" class="flow-cfg-btn" id="flow-cfg-btn"
-          aria-expanded="false" aria-controls="flow-config">config.json</button>
+  <div class="flow-btns">
+    <!-- 说明面板开关：内容由引擎按当前视图的 info 渲染，视图没有 info 时按钮隐藏 -->
+    <button type="button" class="flow-cfg-btn flow-info-btn" id="flow-info-btn"
+            aria-expanded="false" aria-controls="flow-info" hidden>说明</button>
+    <!-- 参数面板开关：label 写 config.json 之类的名字；不需要参数面板时整段删除 -->
+    <button type="button" class="flow-cfg-btn" id="flow-cfg-btn"
+            aria-expanded="false" aria-controls="flow-config">config.json</button>
+  </div>
   <div class="flow-zoom">
     <button type="button" data-act="out" title="缩小">−</button>
     <span class="flow-zoom-label" style="padding:0 6px;line-height:24px;font-size:12px;color:var(--flow-muted)">100%</span>
     <button type="button" data-act="in" title="放大">+</button>
     <button type="button" data-act="reset" title="复位">⟲</button>
   </div>
-  <!-- 参数面板：按用途分组，每组一个 details。数值逐条抄自官方 config，不做加工。 -->
+  <!-- 参数面板：顶部是计划文件「前提」一节，下面按用途分组，每组一个 details，值照抄 config.json。 -->
   <section class="flow-config" id="flow-config" hidden>
     <h2 class="cfg-title">config.json 参数</h2>
-    <div class="cfg-note">【版本与来源说明，例如：transformers_version x.y · dtype bfloat16；config.json 原值，共 N 个键】</div>
+    <div class="cfg-note">【前提：这页画的是哪条路径，来自计划文件的「前提」一节】</div>
     <details class="cfg-group" open><summary>【分组名】</summary>
       <table><tr><th>【键】</th><td>【值】</td></tr></table>
     </details>
   </section>
+  <section class="flow-config flow-info" id="flow-info" hidden></section>
 </div>
 
 <!-- ============================================================
      视图数据
 
-     view = { id, label, title, nodes[], edges[], groups[]?, notes[]? }
+     view = { id, label, title, nodes[], edges[], groups[]?, notes[]?, info[]? }
+     info = [{ title, rows: [[键, 值], ...] }]   说明面板，随视图切换
      node = { id, name, shape?, detail?, kind, drill? }
      edge = { from, to, label? }
 
      kind：tensor 张量（白底直角）| op 算子（浅蓝圆角）| cache 缓存（圆柱）| port 跨视图输入输出（虚线框）
 
-     命名：name 写源码里被调用的符号，不用部署侧实现名或自造变量。
-     粒度：几行无分支的模块一格；几十行或带循环/分支的单独开视图。
-     连线方向由引擎自动加，不用手写；节点坐标与折点都不用写，交给 ELK。
+     写法见 guides/model-dataflow/plan.md。
      ============================================================ -->
 <script>window.DOJO_FLOW_DATA = {"views":[【视图数组】]};</script>
 <script src="../../libs/elk.bundled.js"></script>
@@ -75,25 +90,30 @@
   if (window.DojoFlow && window.DOJO_FLOW_DATA) {
     window.__flow = window.DojoFlow.mount(app, window.DOJO_FLOW_DATA);
   }
-  // 参数面板开关：点按钮或按 Esc 关闭。没有参数面板时这段可删。
-  var btn = document.getElementById('flow-cfg-btn');
-  var panel = document.getElementById('flow-config');
-  function setCfg(open) {
-    if (!btn || !panel) return;
-    panel.hidden = !open;
-    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    btn.classList.toggle('on', open);
+  // 说明面板与参数面板占同一块位置，同一时间只开一个；再点一次按钮或按 Esc 关闭。
+  var pairs = [['flow-info-btn', 'flow-info'], ['flow-cfg-btn', 'flow-config']]
+    .map(function (p) { return [document.getElementById(p[0]), document.getElementById(p[1])]; })
+    .filter(function (p) { return p[0] && p[1]; });
+  function setPanel(target) {
+    pairs.forEach(function (p) {
+      var open = p[1] === target;
+      p[1].hidden = !open;
+      p[0].setAttribute('aria-expanded', open ? 'true' : 'false');
+      p[0].classList.toggle('on', open);
+    });
   }
-  if (btn && panel) {
-    btn.addEventListener('click', function (e) {
+  pairs.forEach(function (p) {
+    p[0].addEventListener('click', function (e) {
       e.stopPropagation();
-      setCfg(panel.hidden);
+      setPanel(p[1].hidden ? p[1] : null);
     });
-    panel.addEventListener('click', function (e) { e.stopPropagation(); });
-    window.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') setCfg(false);
-    });
-    if ((location.hash || '').replace('#', '') === 'config') setCfg(true);
+    p[1].addEventListener('click', function (e) { e.stopPropagation(); });
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') setPanel(null);
+  });
+  if ((location.hash || '').replace('#', '') === 'config') {
+    setPanel(document.getElementById('flow-config'));
   }
 })();
 </script>
