@@ -1,4 +1,4 @@
-# Engram：给语言模型加一条查表取回静态记忆的稀疏轴
+# Engram
 
 - 描述：Engram 是插在 Transformer 少数几层前的一个记忆模块，把每个位置结尾的 n-gram 折叠成规范 id 后用哈希映射成一张静态嵌入表的行号，取回的向量按当前隐状态算出的标量门调制后写回残差流；它与 MoE 的条件计算并列，构成另一条稀疏轴。
 - 摘要：MoE 用条件计算稀疏地激活参数，Engram 用条件记忆稀疏地查表取回静态嵌入。它把位置 $t$ 结尾的 $n$ 元 n-gram 折叠成规范 id，用 $K$ 个哈希头映射到素数大小的桶取回向量拼成 $\mathbf{e}_t$，再用当前隐状态 $\mathbf{h}_t$ 与记忆投影出的键做归一化点积、过 $\sigma$ 函数得到标量门 $\alpha_t=\sigma\!\left(\frac{\mathrm{RMSNorm}(\mathbf{h}_t)^{\top}\mathrm{RMSNorm}(\mathbf{k}_t)}{\sqrt{d}}\right)$，调制后的值写回残差流。每 token 取回的行数是常数，表变大不增加每 token 浮点运算量。

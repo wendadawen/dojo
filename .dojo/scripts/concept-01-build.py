@@ -555,7 +555,6 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
         ("【首页可渲染摘要；公式使用 $...$】", html.escape(meta["summary"])),
         ("【主题，逗号分隔】", html.escape(meta["topics"])),
         ("【内容标签】", html.escape(meta["tag"])),
-        ("【概念名】：【简要说明核心作用】", html.escape(title)),
         ("【概念名】", html.escape(short)),
     ])
 
@@ -612,7 +611,7 @@ def run_code(fences: list[tuple[int, str, str]]) -> tuple[int, list[str]]:
 def _selftest() -> int:
     """用一份与任何真实概念无关的数据跑一遍，确认生成器可用、该报错的地方会报错。"""
     doc = "\n".join([
-        "# 玩具算子：自检用的虚构概念",
+        "# 玩具算子",
         "",
         "- 描述：生成器自检页。",
         "- 摘要：自检，与任何真实概念无关；公式 $y=2x$。",
@@ -722,7 +721,8 @@ def _selftest() -> int:
             ("输出到页面目录", idx == root / "wiki" / "toy" / "index.html" and ov.exists()),
             ("无占位符与标记残留", "【" not in t + o and "@content" not in t + o),
             ("样式改为外链", "dojo-concept.css" in t and "<style>" not in t),
-            ("标题与导航", "<h1 class=\"title\">玩具算子：自检用的虚构概念</h1>" in t
+            ("标题与导航", "<h1 class=\"title\">玩具算子</h1>" in t
+             and "<title>玩具算子</title>" in t
              and '<span class="nav-brand">玩具算子</span>' in t),
             ("章节编号", '<h2 id="s1">1. 定义</h2>' in t and '<h2 id="s2">2. 边界</h2>' in t),
             ("小节编号", '<h3 id="s1-1">1.1 小节</h3>' in t),
