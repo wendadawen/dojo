@@ -14,7 +14,8 @@
 数据结构（与引擎的契约，详见模板注释）
     view  = { id, label, title, nodes[], edges[], groups[]?, notes[]?, info[]? }
     info  = [{ title, rows: [[键, 值], ...] }]  说明面板，随视图切换；view(info=...) 传入
-    node  = { id, name, shape?, detail?, kind, drill? }
+    node  = { id, name, shape?, detail?, kind, drill?, fold? }
+    fold  = [{ title, text }]   算子的折叠，点标记打开；text 里可以有 $...$
     edge  = { from, to, label? }
     group = { label, members[], stroke? }     members 是本视图的节点 id，框在一起
     note  = { at, text, dx?, dy? }            at 是本视图的节点 id，批注画在它右侧
@@ -94,6 +95,10 @@ def build_fallback(views: Iterable[dict]) -> str:
             shape = n.get("shape") or n.get("detail") or ""
             rows.append("<tr><td>{}</td><td>{}</td></tr>".format(
                 html.escape(n["name"]), html.escape(str(shape))))
+            for sec in n.get("fold") or []:
+                rows.append("<tr><td>{} · {}</td><td>{}</td></tr>".format(
+                    html.escape(n["name"]), html.escape(sec.get("title") or ""),
+                    html.escape(sec.get("text") or "")))
         rows.append("</table>")
     return "".join(rows)
 
@@ -260,11 +265,11 @@ def parse_dataflow_md(text: str) -> dict:
             else:
                 section, sub = "view", None
                 views_raw.append({"head": head, "no": no, "nodes": [], "edges": [],
-                                  "drills": [], "panel": []})
+                                  "drills": [], "panel": [], "folds": []})
         elif s.startswith("### "):
             sub = s[4:].strip()
-            if section != "view" or sub not in ("节点", "连线", "面板"):
-                raise SystemExit(f"第 {no} 行：不认识的小节「{sub}」，只能是 节点 / 连线 / 面板")
+            if section != "view" or sub not in ("节点", "连线", "面板", "折叠"):
+                raise SystemExit(f"第 {no} 行：不认识的小节「{sub}」，只能是 节点 / 连线 / 折叠 / 面板")
         elif section is None and s.startswith("-"):
             key, _, value = s[1:].strip().partition("：")
             if not _:
@@ -277,8 +282,9 @@ def parse_dataflow_md(text: str) -> dict:
             scope.append(s[1:].strip().replace("`", ""))
         elif section == "config" and s.startswith("|"):
             config_rows.append((no, s))
-        elif section == "view" and sub in ("节点", "面板") and s.startswith("|"):
-            views_raw[-1]["nodes" if sub == "节点" else "panel"].append((no, s))
+        elif section == "view" and sub in ("节点", "面板", "折叠") and s.startswith("|"):
+            key = {"节点": "nodes", "面板": "panel", "折叠": "folds"}[sub]
+            views_raw[-1][key].append((no, s))
         elif section == "view" and sub == "连线" and s.startswith("-"):
             m = DRILL_RE.match(s)
             if m:
@@ -343,6 +349,18 @@ def parse_dataflow_md(text: str) -> dict:
             if tid is None:
                 raise SystemExit(f"第 {no} 行：点开的目标「{target}」不是任何一张图的标题")
             by_id[nid]["drill"] = tid
+        for no, r in _table(v["folds"], ["id", "名字", "内容"], where + "折叠表"):
+            nid = r["id"]
+            if nid not in by_id:
+                raise SystemExit(f"第 {no} 行：{where}里没有节点「{nid}」")
+            if by_id[nid]["kind"] != "op":
+                raise SystemExit(f"第 {no} 行：折叠只写在算子上，「{nid}」不是算子")
+            if r["名字"] not in ("公式", "说明"):
+                raise SystemExit(f"第 {no} 行：折叠的名字只能是「公式」或「说明」")
+            text = r["内容"]
+            if not text:
+                raise SystemExit(f"第 {no} 行：折叠要写内容")
+            by_id[nid].setdefault("fold", []).append({"title": r["名字"], "text": text})
         info = _grouped(_table(v["panel"], ["组", "名字", "值"], where + "面板"))
         title = re.split(r"[（(]", v["head"], maxsplit=1)[0].strip()
         views.append(view(v["id"], v["label"], title, nodes, edges, info=info))
@@ -498,6 +516,12 @@ def _selftest() -> int:
             "- kv->blk",
             "- blk 点开 → ToyBlock.forward",
             "",
+            "### 折叠",
+            "",
+            "| id | 名字 | 内容 |",
+            "|---|---|---|",
+            "| blk | 公式 | $x + f(x)$，x 是输入 |",
+            "",
             "### 面板",
             "",
             "| 组 | 名字 | 值 |",
@@ -526,6 +550,8 @@ def _selftest() -> int:
             ("计划文件：输出到页面目录", made == Path(tmp) / "toy" / "index.html"),
             ("计划文件：两张图", [v["id"] for v in data["views"]] == ["toymodel", "toyblock"]),
             ("计划文件：点开指向第二张图", main_view["nodes"][1].get("drill") == "toyblock"),
+            ("计划文件：折叠挂在算子上", main_view["nodes"][1].get("fold") == [
+                {"title": "公式", "text": "$x + f(x)$，x 是输入"}]),
             ("计划文件：<br> 换行、反引号去掉", main_view["nodes"][1]["detail"] == "第一行\n第二行"
              and main_view["nodes"][1]["name"] == "2 × ToyBlock"),
             ("计划文件：线上的字与无空格箭头", main_view["edges"][1].get("label") == "hidden"
@@ -542,6 +568,8 @@ def _selftest() -> int:
         for name, broken_plan in [
             ("连线指向不存在的节点应当报错", plan.replace("- ids → blk", "- ids → nope")),
             ("点开的目标不存在应当报错", plan.replace("点开 → ToyBlock.forward", "点开 → Nope")),
+            ("折叠写在张量上应当报错", plan.replace("| blk | 公式 |", "| ids | 公式 |")),
+            ("折叠名字不对应当报错", plan.replace("| blk | 公式 |", "| blk | 残差 |")),
             ("类型写错应当报错", plan.replace("| ids | 张量 |", "| ids | 向量 |")),
             ("缺少页面信息应当报错", plan.replace("- 摘要：生成器自检，与任何真实模型无关。\n", "")),
             ("缺少前提应当报错", plan.replace("## 前提", "## 其它").replace("- 推理\n", "")

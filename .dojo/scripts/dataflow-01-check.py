@@ -8,8 +8,10 @@
   2. 节点名  —— 名字里出现的标识符必须在源码里出现；短词表里的词跳过
   3. 形状    —— 写出的权重形状，必须与 safetensors 头一致
   4. 材料    —— --script 指定的文件必须存在（旧页面用来确认构建脚本还在原处）
-  5. 几何    —— --geometry 时用无头 Chrome 量连线穿框与重合（见下）
-  6. 截图    —— --shots 时逐张图截图，供人看
+  5. 写法    —— 形状箭头两边都要有；折叠的名字只能是「公式」或「说明」；
+               算子没有公式时给出提示
+  6. 几何    —— --geometry 时用无头 Chrome 量连线穿框与重合（见下）
+  7. 截图    —— --shots 时逐张图截画布、说明面板和折叠，供人看
 
 前三项需要外部材料（源码 / 权重），所以不做进 ci-01-validate.py（那是纯静态
 检查），单独跑这个脚本。
@@ -119,7 +121,12 @@ def check_shapes(views: list[dict], shapes: dict[str, list[int]]) -> tuple[list[
     missing: list[str] = []
     for view in views:
         for node in view["nodes"]:
-            blob = " ".join(filter(None, [node.get("name"), node.get("detail"), node.get("shape")]))
+            fold_txt = " ".join(
+                (s.get("text") or "") for s in (node.get("fold") or [])
+            )
+            blob = " ".join(filter(None, [
+                node.get("name"), node.get("detail"), node.get("shape"), fold_txt
+            ]))
             for m in re.finditer(r"([a-z_](?:[a-z0-9_.]|\{[a-z]+\})*)\s*\[([0-9][0-9,\s]*)\]", blob):
                 # 层号、专家号写成 {i}、{e} 时，按第 0 个去形状表里比对
                 key = re.sub(r"\{[a-z]+\}", "0", m.group(1))
@@ -149,6 +156,20 @@ def check_structure(views: list[dict]) -> list[str]:
         for n in v["nodes"]:
             if n.get("drill") and n["drill"] not in view_ids:
                 errors.append(f"[{v['id']}/{n['id']}] 下钻目标 {n['drill']} 不存在")
+            shape = (n.get("shape") or "").strip()
+            if n.get("kind") == "op" and ("→" in shape or "->" in shape):
+                left = re.split(r"→|->", shape, maxsplit=1)[0].strip()
+                if not left:
+                    errors.append(f"[{v['id']}/{n['id']}] 形状变化缺左边：{shape}")
+            for sec in n.get("fold") or []:
+                if n.get("kind") != "op":
+                    errors.append(f"[{v['id']}/{n['id']}] 折叠只写在算子上")
+                    break
+                if sec.get("title") not in ("公式", "说明"):
+                    errors.append(
+                        f"[{v['id']}/{n['id']}] 折叠的名字只能是「公式」或「说明」，"
+                        f"现在是 {sec.get('title')!r}"
+                    )
         for e in v["edges"]:
             for end in (e["from"], e["to"]):
                 if end not in known:
@@ -463,7 +484,11 @@ def run_shots(page: Path, root: Path, out: Path) -> int:
     httpd, port = serve_root(root)
     try:
         for vid in ids:
-            for suffix, extra in (("", ""), ("-info", "var b=document.getElementById('flow-info-btn');if(b&&!b.hidden)b.click();")):
+            for suffix, extra in (
+        ("", ""),
+        ("-info", "var b=document.getElementById('flow-info-btn');if(b&&!b.hidden)b.click();"),
+        ("-fold", "setTimeout(function(){var b=document.querySelector('.flow-fold-btn');if(b)b.click();},1500);"),
+    ):
                 probe = ("<script>window.addEventListener('load',function(){setTimeout(function(){"
                          f"window.__flow.fitMode='width';window.__flow.applyView('{vid}');{extra}"
                          "},400);});</script>")
@@ -480,7 +505,7 @@ def run_shots(page: Path, root: Path, out: Path) -> int:
     finally:
         httpd.shutdown()
         injected.unlink(missing_ok=True)
-    print(f"截图完成：{len(ids)} 张图，每张两幅（画布、说明面板）")
+    print(f"截图完成：{len(ids)} 张图，每张三幅（画布、说明面板、折叠）")
     return 0
 
 
@@ -571,6 +596,13 @@ def main() -> int:
     universal = [body for path, body in sources.items() if path not in labeled_files]
 
     errors: list[str] = check_structure(views)
+    notes: list[str] = []
+    for view in views:
+        for node in view["nodes"]:
+            if node.get("kind") != "op":
+                continue
+            if not any(s.get("title") == "公式" for s in node.get("fold") or []):
+                notes.append(f"[{view['id']}/{node['id']}] 算子还没有公式")
     if sources:
         for view in views:
             heading = view.get("title", "") + " " + view.get("label", "")
@@ -580,7 +612,6 @@ def main() -> int:
                 picked = universal
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})
-    notes: list[str] = []
     shape_matched = 0
     if not args.names_only and args.shapes:
         # 形状表读不出来就报错退出，不要带着半截数据继续核查——

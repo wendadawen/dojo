@@ -24,7 +24,7 @@
 |---|---|---|
 | `ci-01-validate.py` | 发布闸门：页面、模板、内联脚本、样式、首页目录，入口只有一个 | CI + 本地 |
 | `concept-01-build.py` | 概念页生成器：读 `research/concept.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码 | 写概念页时；CI 跑 `--selftest` 和示范页 |
-| `dataflow-01-check.py` | 数据流页核查：节点名/形状回查源码；`--geometry` 查连线；`--shots` 截图 | 写数据流页时 |
+| `dataflow-01-check.py` | 数据流页核查：节点名/形状回查源码；形状箭头两边都要有；`--geometry` 查连线；`--shots` 截图（画布、说明、折叠） | 写数据流页时 |
 | `dataflow-02-build.py` | 数据流页生成器：读计划文件 `research/dataflow.md`，填进模板产出页面 | 写新数据流页时；CI 跑 `--selftest` 和示范页 |
 
 ### ci-01-validate.py
