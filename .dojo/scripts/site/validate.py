@@ -76,13 +76,14 @@ REQUIRED_WIKI_META = (
 )
 # 每个 dojo:type 对应的共享样式表，防止页面套错模板后仍能通过校验。
 # 元组第一项是该类型模板必须内联的样式表；页面引用其中任意一项即可。
-# dataflow 有两代：旧页用 cytoscape + dojo-dataflow.css，新页用 ELK + dojo-flow.css。
+# 这里只放现行的概念页。已暂停的论文、学习记录、数据流三类，它们的表在
+# archive/legacy-validate.py，那里补回表并打开对 outdated 页面的校验。
 TYPE_STYLESHEET = {
     "concept": ("dojo-concept.css",),
-    "paper": ("dojo-paper.css",),
-    "note": ("dojo-note.css",),
-    "dataflow": ("dojo-flow.css", "dojo-dataflow.css"),
 }
+# 页面标了 dojo:status=outdated 就整页跳过，不校验。archive/legacy-validate.py 把它关掉。
+SKIP_OUTDATED = True
+OUTDATED_RE = re.compile(r'name="dojo:status"\s+content="outdated"')
 TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
 # <noscript> 里的 <style> 是无脚本回退的补充规则（例如让画布控件在无 JS 时
@@ -92,8 +93,9 @@ NOSCRIPT_RE = re.compile(r"<noscript[\s\S]*?</noscript>", re.I)
 # 概览页与索引页的入口文案：历史上 A/B 两代并存，模板已固定为 B 世代。
 # A 世代 eyebrow「概念快速阅读」/ nav「深度教学 →」/ footer「快速阅读」
 # B 世代 eyebrow「概念概览」  / nav「完整说明 →」/ footer「概览」
-OVERVIEW_TERM = {"concept": "概览", "paper": "概览"}
-DETAIL_TERM = {"concept": "完整说明", "paper": "完整解析"}
+OVERVIEW_TERM = {"concept": "概览"}
+DETAIL_TERM = {"concept": "完整说明"}
+OVERVIEW_LABEL = {"concept": "概念概览"}
 TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.S)
 EYEBROW_RE = re.compile(r'(<span class="eyebrow">)(.*?)(</span>)', re.S)
 NAV_BLOCK_RE = re.compile(r"(<nav>.*?</nav>)", re.S)
@@ -231,6 +233,16 @@ class PageInspector(HTMLParser):
             self.prose_parts.append((context, data))
 
 
+def is_outdated(path: Path) -> bool:
+    """wiki 页面（含同目录的 overview.html）的 index.html 是否标了 dojo:status=outdated。"""
+    if not SKIP_OUTDATED or "wiki" not in path.parts:
+        return False
+    index = path if path.name == "index.html" else path.parent / "index.html"
+    if not index.exists():
+        return False
+    return bool(OUTDATED_RE.search(index.read_text(encoding="utf-8", errors="ignore")))
+
+
 def validate_page(path: Path) -> list[str]:
     errors: list[str] = []
     text = path.read_text(encoding="utf-8", errors="ignore")
@@ -322,6 +334,11 @@ def validate_page(path: Path) -> list[str]:
         if raw_type and raw_type not in ALLOWED_TYPES:
             errors.append(
                 f"unknown type: {raw_type} (allowed: {', '.join(ALLOWED_TYPES)})"
+            )
+        elif raw_type and raw_type not in TYPE_STYLESHEET:
+            errors.append(
+                f"type {raw_type} is paused: only concept pages are maintained"
+                " (an archived page must carry dojo:status=outdated)"
             )
         elif raw_type in TYPE_STYLESHEET:
             allowed_css = TYPE_STYLESHEET[raw_type]
@@ -581,7 +598,7 @@ def page_type_of(index_html: str) -> str:
 def fix_overview_copy(text: str, ty: str) -> str:
     """把概览页文案回填到模板的说法。
 
-    只处理 concept / paper 两类。类型未知（拿不到 index.html 的
+    只处理 OVERVIEW_TERM 里有的类型。类型未知（拿不到 index.html 的
     dojo:type）时原样返回——否则会拿「概览 / 完整说明」这套说法去改写
     其他类型的页面。
     """
@@ -605,7 +622,7 @@ def fix_overview_copy(text: str, ty: str) -> str:
     def eyebrow_sub(match: re.Match) -> str:
         inner = match.group(2)
         tail = inner.split("·", 1)[1].strip() if "·" in inner else ""
-        label = "概念概览" if ty == "concept" else "论文概览"
+        label = OVERVIEW_LABEL[ty]
         body = f"{label} · {tail}" if tail else label
         return f"{match.group(1)}{body}{match.group(3)}"
 
@@ -796,6 +813,8 @@ def check_overview_copy(fix: bool) -> int:
     )
     changes: list[str] = []
     for path in targets:
+        if is_outdated(path):
+            continue
         changes.extend(convert_copy(path, fix))
 
     if not changes:
@@ -1478,7 +1497,7 @@ def write_catalog(catalog: dict, output: Path) -> None:
 def run_css_check(argv: list[str]) -> int:
     """--css：对每个页面类型跑死规则检测。
 
-    默认覆盖全部四类（concept / paper / note / dataflow）。用 --module 指定
+    默认覆盖 TYPE_STYLESHEET 里的类型（现行只有 concept）。用 --module 指定
     单个类型、--template 指定模板路径；--confirm 在浏览器里复核候选；
     --fix 直接删。
     """
@@ -1493,7 +1512,7 @@ def run_css_check(argv: list[str]) -> int:
         i = argv.index("--template")
         template = Path(argv[i + 1])
 
-    modules = [module] if module else list(ALLOWED_TYPES)
+    modules = [module] if module else list(TYPE_STYLESHEET)
     total_removed = 0
     for name in modules:
         if name not in ALLOWED_TYPES:
@@ -1572,7 +1591,7 @@ def main() -> int:
 
     if "--templates" in argv:
         template_root = Path(TEMPLATE_DIR)
-        templates = sorted(template_root.glob("*/index.html"))
+        templates = sorted(template_root / kind / "index.html" for kind in TYPE_STYLESHEET)
         failures = [(t, check_template(t)) for t in templates]
         failures = [(t, errs) for t, errs in failures if errs]
         if failures:
@@ -1606,6 +1625,12 @@ def main() -> int:
     if missing:
         print("error: page not found: " + ", ".join(missing))
         return 2
+    skipped = [p for p in pages if is_outdated(p)]
+    if skipped:
+        pages = [p for p in pages if p not in skipped]
+        print(f"note: 跳过 {len(skipped)} 个 dojo:status=outdated 的页面")
+        if not pages:
+            return 0
 
     if js_only:
         js_errors, total, ran = check_inline_js(pages)
