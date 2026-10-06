@@ -104,7 +104,7 @@ print(round(o, 4), round(full_o, 4))
 ### 完整的前向算法
 
 外层循环遍历 $K$、$V$ 的块，内层循环遍历 $Q$ 的块。$S=QK^\top$ 的每一行里，第 $j$ 段对应 $K$ 的第 $j$ 块，所以遍历 $K$、$V$ 的块，就是在逐段合并同一行的 softmax。每一步把当前的 $K$、$V$ 块和 $Q$ 块载入片上，在片上算出这一小块的 $S$，更新输出和两个统计量，再写回显存。块的大小由片上存储的容量决定，一块 $K$、$V$ 要能放进片上存储。整个过程放进一次 kernel 调用：载入输入，在片上完成矩阵乘、softmax 等全部步骤，再把结果写回显存，中间的 $S$、$P$ 不出片。算法返回精确的 $\mathrm{softmax}(QK^\top)V$，除输入输出外额外只需要 $O(N)$ 的显存，用来存每行的最大值和求和量。
-依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm；paper/src-v2/src/proofs.tex L5-L20；paper/src-v2/src/proofs.tex L116-L139
+依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm；paper/src-v2/src/proofs.tex L5-L20；paper/src-v2/src/proofs.tex L40-L50；paper/src-v2/src/proofs.tex L116-L139
 
 #### 算法的完整步骤
 
