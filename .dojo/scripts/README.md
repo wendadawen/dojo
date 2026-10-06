@@ -95,7 +95,7 @@
      # 自检（CI 会跑；用虚构模型数据验证生成器本身可用）
      python3 .dojo/scripts/dataflow-02-build.py --selftest
 
-计划文件格式见 `guides/model-dataflow/plan.md`。页面骨架仍是
+计划文件格式见 `guides/archive/model-dataflow/plan.md`。页面骨架仍是
 `.dojo/templates/dataflow/index.html`，这个脚本只负责把数据填进去，不复制骨架。
 
 ## 页面从哪来
@@ -111,4 +111,4 @@ Markdown 填进模板，不手工复制。
 | `.dojo/templates/note/` | 学习记录页 |
 | `.dojo/templates/dataflow/` | 模型前向数据流页（画布 + 参数面板），由 `dataflow-02-build.py` 读 `research/dataflow.md` 生成 |
 
-流程分别见 `guides/concept.md` 和 `guides/model-dataflow.md`。
+流程分别见 `guides/concept.md` 和 `guides/archive/model-dataflow.md`。

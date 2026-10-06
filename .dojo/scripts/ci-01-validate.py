@@ -72,6 +72,13 @@ ALLOWED_TYPES = [
     "paper",
 ]
 
+# 页面状态：dojo:status 可省略（等同 current）。outdated 表示该类页面的指南已归档，
+# 内容保留但不再维护，首页默认隐藏。
+ALLOWED_STATUS = [
+    "current",
+    "outdated",
+]
+
 # 细粒度标签封闭词表：dojo:tag 只取其一，供首页按技术筛选。
 # topics 是粗分类，一个页面可属多个。
 # tag 回答「这篇讲什么技术」，单一取值。
@@ -351,6 +358,13 @@ def validate_page(path: Path) -> list[str]:
                 errors.append(
                     f"unknown topic: {topic} (allowed: {', '.join(ALLOWED_TOPICS)})"
                 )
+
+        raw_status = inspector.meta.get("dojo:status", "")
+        if raw_status and raw_status not in ALLOWED_STATUS:
+            errors.append(
+                f"unknown status: {raw_status} (allowed: {', '.join(ALLOWED_STATUS)};"
+                " 省略即为 current)"
+            )
 
         raw_type = inspector.meta.get("dojo:type", "")
         if raw_type and raw_type not in ALLOWED_TYPES:
@@ -1402,6 +1416,7 @@ def parse_page(root: Path, page_path: Path) -> dict:
         "description": clean_text(description),
         "summary": clean_text(summary),
         "type": parser.meta.get("dojo:type", "").strip() or "unknown",
+        "status": parser.meta.get("dojo:status", "").strip() or "current",
         "topics": page_topics,
         "tag": parser.meta.get("dojo:tag", "").strip(),
         "_has_summary": bool(summary_meta),

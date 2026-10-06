@@ -63,6 +63,7 @@
   function filterPages(pages, state) {
     const query = normalize(state.query);
     const matched = pages
+      .filter((page) => state.showOutdated || !isOutdated(page))
       .filter((page) => !state.type || page.type === state.type)
       .filter((page) => !state.topic || (page.topics || []).includes(state.topic))
       .filter((page) => {
@@ -78,7 +79,12 @@
     return sortPages(matched, state.sort || "newest");
   }
 
-  function getFilterOptions(pages) {
+  function isOutdated(page) {
+    return page.status === "outdated";
+  }
+
+  function getFilterOptions(allPages, showOutdated) {
+    const pages = showOutdated ? allPages : allPages.filter((page) => !isOutdated(page));
     return {
       types: [...new Set(pages.map((page) => page.type).filter(Boolean))].sort(),
       topics: [...new Set(pages.flatMap((page) => page.topics || []))]
@@ -164,6 +170,7 @@
         <button class="card-main" type="button" data-open-path="${escapeHtml(page.path)}">
           <span class="card-meta">
             <span class="type-badge type-${escapeHtml(page.type)}">${escapeHtml(typeLabel(page.type))}</span>
+            ${isOutdated(page) ? '<span class="topic-chip outdated-chip">过时</span>' : ""}
             ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
             ${page.date ? `<time class="date-chip" datetime="${escapeHtml(page.date)}">${escapeHtml(page.date)}</time>` : ""}
           </span>
@@ -177,6 +184,7 @@
     escapeHtml,
     filterPages,
     getFilterOptions,
+    isOutdated,
     makeGlobalElements,
     makeLocalGraph,
     renderCard,

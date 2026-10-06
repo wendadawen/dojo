@@ -7,6 +7,7 @@
     type: document.getElementById("type-filter"),
     topic: document.getElementById("topic-filter"),
     sort: document.getElementById("sort-order"),
+    outdated: document.getElementById("outdated-toggle"),
     tabs: [...document.querySelectorAll("[data-view]")],
     libraryView: document.getElementById("library-view"),
     mapView: document.getElementById("map-view"),
@@ -44,6 +45,7 @@
     type: "",
     topic: "",
     sort: loadStoredSort(),
+    showOutdated: false,
     view: "library",
   };
   let last3dKey = null;
@@ -59,11 +61,15 @@
   }
 
   function populateFilters() {
-    const options = model.getFilterOptions(state.catalog.pages);
+    const options = model.getFilterOptions(state.catalog.pages, state.showOutdated);
     elements.type.innerHTML = optionMarkup("", "全部类型")
       + options.types.map((value) => optionMarkup(value, model.typeLabel(value))).join("");
     elements.topic.innerHTML = optionMarkup("", "全部主题")
       + options.topics.map((value) => optionMarkup(value, value)).join("");
+    elements.type.value = options.types.includes(state.type) ? state.type : "";
+    elements.topic.value = options.topics.includes(state.topic) ? state.topic : "";
+    state.type = elements.type.value;
+    state.topic = elements.topic.value;
   }
 
   function filteredPages() {
@@ -86,9 +92,12 @@
     const pages = filteredPages();
     elements.grid.innerHTML = pages.map(model.renderCard).join("");
     renderMath(elements.grid);
-    elements.count.textContent = pages.length === state.catalog.pages.length
+    const total = state.showOutdated
+      ? state.catalog.pages.length
+      : state.catalog.pages.filter((page) => !model.isOutdated(page)).length;
+    elements.count.textContent = pages.length === total
       ? `共 ${pages.length} 篇`
-      : `${pages.length} / ${state.catalog.pages.length} 篇`;
+      : `${pages.length} / ${total} 篇`;
     elements.empty.hidden = pages.length !== 0;
   }
 
@@ -152,9 +161,15 @@
         (page.outgoing || []).forEach((id) => visibleIds.add(id));
       }
     }
+    if (!state.showOutdated) {
+      const pageById = new Map(state.catalog.pages.map((page) => [page.id, page]));
+      for (const id of [...visibleIds]) {
+        if (model.isOutdated(pageById.get(id) || {})) visibleIds.delete(id);
+      }
+    }
     elements.globalGraph3d.hidden = false;
     try {
-      const mapKey = `${state.query}|${state.type}|${state.topic}`;
+      const mapKey = `${state.query}|${state.type}|${state.topic}|${state.showOutdated}`;
       if (graph.has3d() && mapKey === last3dKey) {
         graph.resume3d();
         setStatus("");
@@ -230,6 +245,11 @@
       });
     }
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
+    elements.outdated.addEventListener("change", () => {
+      state.showOutdated = elements.outdated.checked;
+      populateFilters();
+      applyFilters();
+    });
     elements.clear.addEventListener("click", clearFilters);
     // 悬停卡片时预取对应文档，点开时基本不用等
     const prefetched = new Set();

@@ -4,7 +4,7 @@
 用法（从仓库根运行）：
     python3 .dojo/scripts/dataflow-02-build.py wiki/<name>/research/dataflow.md
 
-计划文件的格式见 guides/model-dataflow/plan.md。页面上的文字全部来自计划文件，
+计划文件的格式见 guides/archive/model-dataflow/plan.md。页面上的文字全部来自计划文件，
 生成器只负责装配：读模板、替换占位符、把节点和面板写进页面。
 
 它不做这些事：
@@ -237,7 +237,7 @@ def _grouped(rows: list[tuple[int, dict]]) -> list[tuple[str, list[tuple[str, st
 
 
 def parse_dataflow_md(text: str) -> dict:
-    """按 guides/model-dataflow/plan.md 的格式读计划文件，返回 page() 需要的参数。"""
+    """按 guides/archive/model-dataflow/plan.md 的格式读计划文件，返回 page() 需要的参数。"""
     meta: dict[str, str] = {"tag": "数据流"}
     sources: list[str] = []
     scope: list[str] = []
@@ -474,7 +474,7 @@ def _selftest() -> int:
         except SystemExit:
             checks.append(("占位符残留时应当报错", True))
 
-        # 5) 从计划文件生成：格式照 guides/model-dataflow/plan.md
+        # 5) 从计划文件生成：格式照 guides/archive/model-dataflow/plan.md
         plan = "\n".join([
             "# ToyModel",
             "",
