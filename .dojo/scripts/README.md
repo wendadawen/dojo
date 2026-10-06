@@ -8,7 +8,7 @@
 |---|---|
 | `.dojo/scripts/` | 工具脚本，按任务类别分子目录 |
 | `.dojo/templates/` | 页面骨架模板 |
-| `.dojo/home/` | 首页资源 |
+| `.dojo/site/` | 首页的 JS 和 CSS，部署时拷成 `_site/assets/` |
 
 判断标准：文件里出现具体模型名或页面路径，它就不属于 `.dojo/`，而应放进该页
 自己的 `wiki/<name>/` 目录（生成脚本、图片等）。
