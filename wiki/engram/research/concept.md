@@ -8,6 +8,18 @@
 ## 资料
 
 - Xin Cheng, Rui Tian, Wangding Zeng, Damai Dai 等（北京大学、DeepSeek-AI）. Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models. arXiv:2601.07372v2 [cs.CL]，2026-07-12. [arXiv:2601.07372](https://arxiv.org/abs/2601.07372)
+  - 摘录（§2.2 词表压缩）：To maximize semantic density, we implement a vocabulary projection layer. Specifically, we pre-compute a surjective function $\mathcal{P}:V\to V^{\prime}$ that collapses raw token IDs into canonical identifiers based on normalized textual equivalence (using NFKC (Whistler, 2025), lowercasing, etc.). In practice, this process achieves a 23% reduction in the effective vocabulary size for a 128k tokenizer (see Appendix C).
+  - 摘录（§2.2 哈希）：Directly parameterizing the combinatorial space of all possible $N$ -grams is intractable. Following Tito Svenstrup et al. (2017), we adopt a hashing-based approach. To mitigate collisions, we employ $K$ distinct hash heads for each $N$ -gram order $n$ . Each head $k$ maps the compressed context to an index within an embedding table $\mathbf{E}_{n,k}$ (of prime size $M_{n,k}$ ) via a deterministic function $\varphi_{n,k}$ :
+  - 摘录（§2.2 实现）：In practice, $\varphi_{n,k}$ is implemented as a lightweight multiplicative-XOR hash.
+  - 摘录（§4.2 U 型）：Our experiments uncover a distinct U-shaped scaling law, revealing that even simple lookup mechanisms, when treated as a first-class modeling primitive, act as essential complements to neural computation.
+  - 摘录（§4.3 配置与卷积初始化）：Engram-27B is strictly derived from the MoE-27B architecture to ensure fair comparison. We reduce the number of routed experts from 72 to 55 and reallocate the freed parameters to a 5.7B-parameter embedding module ( $\rho=74.3\%$ ), keeping the total model size constant at 26.7B.
+  - 摘录（§4.3 优化）：For optimization, the embedding parameters are updated using Adam (Kingma, 2014) with a learning rate scaled by $5\times$ and no weight decay, while the convolution parameters are initialized to zero to strictly preserve the identity mapping at the start of training.
+  - 摘录（§6.2 层敏感性）：Sweeping the insertion depth of a single Engram module confirms that early injection (Layer 2) is optimal, whereas efficacy degrades in deeper layers.
+  - 摘录（§6.2 单层最优）：The sweep shows that Layer 2 achieves the best single-layer performance (Val Loss $=1.770$ ), outperforming Layer 1 and
+  - 摘录（§6.4 推理抑制）：Factual knowledge benchmarks suffer a catastrophic collapse, retaining only 29–44% of the original performance (e.g., TriviaQA at 29%), confirming that the Engram module acts as the primary repository for parametric knowledge. Conversely, reading comprehension tasks are remarkably resilient, retaining 81–93% (e.g., C3 at 93%), suggesting that context-grounded tasks rely primarily on the backbone’s attention mechanism rather than Engram.
+  - 摘录（§7 吞吐设置）：We insert a massive 100B-parameter Engram layer into the second Transformer block, with the entire embedding table resident in host DRAM.
+  - 摘录（§6.4 吞吐结论）：As detailed in Table 4, offloading a 100B-parameter embedding table incurs a negligible throughput penalty, peaking at only $2.8\%$ on the 8B backbone.
+  - 摘录（§6.4 通信量）：Crucially, the effective communication volume per step scales with the number of activated slots rather than the total embedding table size.
 
 ## 短页
 
@@ -230,7 +242,7 @@ MoE 的路由依赖运行时的隐状态，选哪些专家要等算出来才知�
 
 :::
 
-### 什么时候不成立
+### 适用条件与边界
 
 - 门控是唯一一道闸门。取回的记忆与当前上下文是否相符，交给那个标量门判断；而门本身由当前隐状态算出，隐状态没聚合到足够的上下文时，判断就不准。
 - 位置只能折中。插得早，门控拿不到足够的上下文；插得晚，又错过了接手局部重建的时机。
