@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""概念页的机械检查：读 research/concept.md，只查结构、字数、链接、代码块、资料与摘录。
+"""概念页的机械检查：只查结构、字数、链接、代码块、大纲格式与「依据」是否核得上。
 
 用法（从仓库根运行）：
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md --hash
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md --gate
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/outline.md --outline
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/content.md
     python3 .dojo/scripts/concept-02-check.py --selftest
 
 规则全部报错，每条写明位置和原因，一次报完。语义上的判断（事实、范围、重复、文风、读不读得通）
-不在这里，交给 guides/concept/review.md 里的审查者。concept-01-build.py 生成完页面后会自动运行本脚本。
+不在这里，交给 guides/concept/ 里的审查者。concept-01-build.py 生成完页面后会自动运行本脚本。
+
+「依据」怎么核：
+    依据：<文件名> <位置>[；<文件名> <位置>]
+    文件名是 research/sources/ 下的文件。位置有两种写法：
+      - 章节标题里的一段文字，如「2.3 Context-aware」，文件里要有一个标题行含这段文字；
+      - 行号范围，如「L120-L180」，不能超出文件行数。
+    「依据：自行构造」不核，只用于例子和推导，由复算审查者验证。
 """
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import re
 import sys
 import tempfile
-import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -36,60 +40,16 @@ def _load(filename: str, name: str):
 build = _load("concept-01-build.py", "concept_build")
 vocab = _load("ci-01-validate.py", "ci_validate")
 
-SHORT_HEADINGS = ["是什么", "为什么需要", "大概怎么工作"]
+SHORT_SECTIONS = 3
 LAST_CHAPTER = "适用条件与边界"
 NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 URL_RE = re.compile(r"https?://", re.I)
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)\s]+)\)")
 ISBN_RE = re.compile(r"ISBN[\s:：-]*[0-9Xx-]{10,17}")
-REVIEW_FILE_RE = re.compile(r"review-(\d+)\.md")
-GATE_SECTIONS = ["摘录核验", "事实 1", "事实 2", "复算", "缺漏", "范围", "重复", "文风",
-                 "读者 1", "读者 2", "处理"]
-
-
-def _norm(text: str) -> str:
-    """摘录与快照比对前的规范化：全角半角统一、去掉空白、列表符号、连字符断行和 LaTeX 记号。
-
-    只消除抽取原文时带进来的版式噪声，不改词和数字，所以改了词或数字的摘录仍然对不上。
-    """
-    text = unicodedata.normalize("NFKC", text).replace("\u00ad", "")
-    text = re.sub(r"-\s*\n\s*", "", text)
-    text = re.sub(r"\\(?:mathrm|mathbf|mathcal|text|operatorname)\{([^}]*)\}", r"\1", text)
-    text = text.replace("$", "")
-    return re.sub(r"[\s\\{}_^\u2022]", "", text)
-
-
-def check_excerpts(doc: dict, research: Path) -> list[str]:
-    """每条摘录都要能在 research/sources/ 下的快照里逐字找到（规范化之后）。"""
-    sources = research / "sources"
-    files = sorted(p for p in sources.glob("*") if p.is_file()) if sources.is_dir() else []
-    if not files:
-        return ["摘录：research/sources/ 下没有原文快照。取原文时同时存一份，"
-                "摘录才能对着它核对（guides/concept.md「资料与摘录」）"]
-    haystack = "".join(_norm(p.read_text(encoding="utf-8", errors="ignore")) for p in files)
-    errors = []
-    for ref in doc["refs"]:
-        for no, _pos, text in ref["excerpts"]:
-            key = _norm(text)
-            if key and key not in haystack:
-                head = max((m for m in range(len(key), 8, -1) if key[:m] in haystack), default=0)
-                where = (f"前 {head} 个字符吻合，之后对不上" if head
-                         else "开头就对不上")
-                errors.append(f"第 {no} 行：摘录在 research/sources/ 的快照里找不到（{where}）。"
-                              "摘录要逐字抄，不能合并不相邻的句子，也不能改词和数字")
-    return errors
-
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def body_lines(doc: dict) -> list[tuple[int, str]]:
-    """短页和长页的全部行（含折叠块），不含资料。"""
-    out = list(doc["short"]) + list(doc["opening"])
-    for _no, _name, body in doc["chapters"]:
-        out += body
-    return out
+LINES_RE = re.compile(r"[Ll](\d+)(?:\s*[-–~]\s*[Ll]?(\d+))?")
+NUM_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
+NODE_TYPES = ("正文", "公式", "例子", "折叠块")
+SELF_MADE = "自行构造"
 
 
 def outside_fences(lines: list[tuple[int, str]]):
@@ -103,6 +63,14 @@ def outside_fences(lines: list[tuple[int, str]]):
             yield no, line
 
 
+def body_lines(doc: dict) -> list[tuple[int, str]]:
+    """短页和长页的全部行（含折叠块），不含资料。"""
+    out = list(doc["short"]) + list(doc["opening"])
+    for _no, _name, body in doc["chapters"]:
+        out += body
+    return out
+
+
 def page_info(wiki_root: Path, page: str) -> tuple[str, str]:
     """读 wiki/<page>/index.html 的 dojo:type 和 dojo:status。"""
     text = (wiki_root / page / "index.html").read_text(encoding="utf-8")
@@ -113,6 +81,123 @@ def page_info(wiki_root: Path, page: str) -> tuple[str, str]:
 
     return meta("dojo:type"), meta("dojo:status") or "current"
 
+
+# ---------- 依据 ----------
+
+def _headings(path: Path) -> list[str]:
+    """快照里的标题行：Markdown 的 # 行，或 LaTeX 的 \\section 一类。"""
+    out = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = line.strip()
+        m = re.match(r"#{1,6}\s+(.*)", s) or re.match(r"\\(?:sub)*(?:section|paragraph)\*?\{(.*)\}", s)
+        if m:
+            out.append(m.group(1).strip())
+    return out
+
+
+def check_basis_item(item: str, sources: Path, cache: dict) -> str | None:
+    """核一条「文件名 位置」，有问题返回原因，没问题返回 None。"""
+    item = item.strip()
+    m = re.match(r"(\S+)\s+(.+)", item)
+    if not m:
+        return f"「{item}」要写成「文件名 位置」"
+    fname, where = m.group(1), m.group(2).strip()
+    f = sources / fname
+    if not f.is_file():
+        return f"{fname} 不在 research/sources/ 下"
+    lm = LINES_RE.fullmatch(where)
+    if lm:
+        total = len(f.read_text(encoding="utf-8", errors="ignore").splitlines())
+        a = int(lm.group(1))
+        b = int(lm.group(2) or lm.group(1))
+        if a < 1 or b < a or b > total:
+            return f"{fname} 只有 {total} 行，位置 {where} 不对"
+        return None
+    if f not in cache:
+        cache[f] = _headings(f)
+    if not any(where.lower() in h.lower() for h in cache[f]):
+        return f"{fname} 里没有标题含「{where}」；章节写标题里的一段文字，或写行号范围如 L120-L180"
+    return None
+
+
+def check_basis(doc: dict, research: Path) -> list[str]:
+    errors: list[str] = []
+    sources = research / "sources"
+    cache: dict = {}
+    # 每个有正文的段落后面都要有依据：按「依据行出现在段落末尾」来数，
+    # 这里检查被取出的依据本身，以及短页、长页的每一节有没有依据
+    for no, text in doc["basis"].items():
+        if text.strip() == SELF_MADE:
+            continue
+        for item in re.split(r"[;；]", text):
+            if not item.strip():
+                continue
+            why = check_basis_item(item, sources, cache)
+            if why:
+                errors.append(f"第 {no} 行：依据对不上：{why}")
+    if not doc["basis"]:
+        errors.append("依据：全文没有一行「依据：…」，每段正文后面都要写（guides/concept.md「正文」）")
+    return errors
+
+
+def check_numbers(doc: dict, research: Path) -> list[str]:
+    """页面里出现的数字，必须在 research/sources/ 的快照里能找到，或所在段落标了自行构造。
+
+    只在正文里查，公式和代码块里的数字不查，段落依据是「自行构造」的整段不查。
+    """
+    sources = research / "sources"
+    files = [p for p in sorted(sources.glob("*")) if p.is_file()] if sources.is_dir() else []
+    if not files:
+        return ["数字：research/sources/ 下没有快照，无法核对页面里的数字"]
+    hay = " ".join(p.read_text(encoding="utf-8", errors="ignore") for p in files).replace(",", "")
+    errors: list[str] = []
+    for name in ("short", "opening"):
+        errors += _numbers_in(doc[name], hay, doc["basis"])
+    for _no, _name, body in doc["chapters"]:
+        errors += _numbers_in(body, hay, doc["basis"])
+    return errors
+
+
+def _numbers_in(lines: list[tuple[int, str]], hay: str, basis: dict[int, str]) -> list[str]:
+    errors: list[str] = []
+    para: list[tuple[int, str]] = []
+    fence = False
+
+    def flush() -> None:
+        if not para:
+            return
+        last = para[-1][0]
+        # 依据行在段落最后一行之后：取这段之后第一个依据
+        nxt = min((n for n in basis if n > last), default=None)
+        self_made = nxt is not None and basis[nxt].strip() == SELF_MADE and nxt - last <= 2
+        if not self_made:
+            for no, line in para:
+                probe = re.sub(r"\$\$.+?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$", " ", line)
+                probe = re.sub(r"`[^`]*`|\[[^\]]*\]\([^)]*\)", " ", probe)
+                for n in NUM_RE.findall(probe.replace(",", "")):
+                    if n not in hay:
+                        errors.append(f"第 {no} 行：数字 {n} 在 research/sources/ 里找不到；"
+                                      "资料里没有的数字，要么删掉，要么改成自己构造的例子并写「依据：自行构造」")
+        para.clear()
+
+    for no, line in lines:
+        s = line.strip()
+        if s.startswith("```"):
+            fence = not fence
+            flush()
+            continue
+        if fence or s.startswith(("|", ":::", "#", "$$")):
+            flush()
+            continue
+        if not s:
+            flush()
+        else:
+            para.append((no, line))
+    flush()
+    return errors
+
+
+# ---------- 正文 ----------
 
 def check(md: Path, wiki_root: Path | None = None) -> list[str]:
     """返回全部问题，每条一行。生成器本身的格式错误由它自己报，这里不重复。"""
@@ -125,11 +210,9 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
         return [f"格式：{e}"]
 
     out_dir = md.parent.parent
-    # 页面目录名
     if not NAME_RE.fullmatch(out_dir.name):
-        errors.append(f"目录名：{out_dir.name} 要用小写英文、数字和连字符（页面名规则，见 guides/concept.md 步骤 3）")
+        errors.append(f"目录名：{out_dir.name} 要用小写英文、数字和连字符（guides/concept.md 步骤 4）")
 
-    # 页面信息
     meta = doc["meta"]
     for topic in [t.strip() for t in re.split(r"[,，]", meta["topics"]) if t.strip()]:
         if topic not in vocab.ALLOWED_TOPICS:
@@ -139,21 +222,15 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
     elif meta["tag"] not in vocab.ALLOWED_TAGS:
         errors.append(f"标签：「{meta['tag']}」不在词表里（可选：{'、'.join(vocab.ALLOWED_TAGS)}）")
 
-    # 资料与摘录
     for ref in doc["refs"]:
-        if not (re.search(r"https?://", ref["text"]) or ISBN_RE.search(ref["text"])):
-            errors.append(f"第 {ref['no']} 行：资料要带链接，没有网址的教材写 ISBN（guides/concept.md「资料与摘录」）")
-        if not ref["excerpts"]:
-            errors.append(f"第 {ref['no']} 行：这条资料下面没有摘录，每条至少一条（guides/concept.md「资料与摘录」）")
+        if not (URL_RE.search(ref["text"]) or ISBN_RE.search(ref["text"])):
+            errors.append(f"第 {ref['no']} 行：资料要带链接，没有网址的教材写 ISBN（guides/concept.md「资料」）")
 
-    errors += check_excerpts(doc, md.parent)
-
-    # 短页：三节、无折叠块/代码块/表格
-    short_heads = [s[3:].strip() for _no, s in
-                   ((n, l.strip()) for n, l in doc["short"]) if s.startswith("### ")]
-    if short_heads != SHORT_HEADINGS:
-        errors.append(f"短页：三节依次是「{'」「'.join(SHORT_HEADINGS)}」，现在是{short_heads or '没有小标题'}"
-                      "（guides/concept.md「短页」）")
+    # 短页：恰好三节，不放折叠块、代码块、表格。标题文字不查，合不合适交给审大纲
+    short_heads = [s for _no, s in ((n, l.strip()) for n, l in doc["short"]) if s.startswith("### ")]
+    if len(short_heads) != SHORT_SECTIONS:
+        errors.append(f"短页：要恰好 {SHORT_SECTIONS} 节（是什么、为什么需要、怎么做，标题与概念相关），"
+                      f"现在是 {len(short_heads)} 节（guides/concept.md「短页」）")
     for no, line in doc["short"]:
         s = line.strip()
         if s.startswith(":::"):
@@ -163,7 +240,6 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
         elif s.startswith("|"):
             errors.append(f"第 {no} 行：短页不放表格（guides/concept.md「短页」）")
 
-    # 长页最后一章
     if doc["chapters"][-1][1] != LAST_CHAPTER:
         errors.append(f"第 {doc['chapters'][-1][0]} 行：长页最后一章的标题写「{LAST_CHAPTER}」，"
                       f"现在是「{doc['chapters'][-1][1]}」（guides/concept.md「长页」）")
@@ -191,7 +267,10 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
                 errors.append(f"第 {no} 行：wiki/{page} 不是现行的概念页（类型 {ptype}，状态 {status}），"
                               "不能作前置概念链接")
 
-    # 生成并取字数、代码块
+    errors += check_basis(doc, md.parent)
+    errors += check_numbers(doc, md.parent)
+
+    # 字数与代码块
     ctx = build.Ctx(out_dir, wiki_root)
     try:
         _body, _short, stats = build.render(doc, ctx)
@@ -203,7 +282,6 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
     if stats["short"] > build.SHORT_LIMIT:
         errors.append(f"字数：短页 {stats['short']} 字，超出上限 {build.SHORT_LIMIT}（guides/concept.md「短页」）")
 
-    # 代码块：只有 python 代码加紧跟的 text 输出块
     lines = text.splitlines()
     fences = ctx.fences
     for k, (no, lang, code) in enumerate(fences):
@@ -226,38 +304,88 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
 def _adjacent(lines: list[str], fence: tuple[int, str, str], next_no: int) -> bool:
     """fence 的结尾和下一个代码块的开头之间只有空行。"""
     no, _lang, code = fence
-    end = no + code.count("\n") + 2 if code else no + 1  # 开头行 + 代码行 + 结尾行
-    between = lines[end:next_no - 1]
-    return all(not l.strip() for l in between)
+    end = no + code.count("\n") + 2 if code else no + 1
+    return all(not l.strip() for l in lines[end:next_no - 1])
 
 
-# ---------- 门禁 ----------
+# ---------- 大纲 ----------
 
-def gate(md: Path) -> list[str]:
-    """最后一轮审查记录必须通过，且审查之后 concept.md 没有改过。"""
-    research = md.parent
-    rounds = sorted((int(m.group(1)), p) for p in research.glob("review-*.md")
-                    if (m := REVIEW_FILE_RE.fullmatch(p.name)))
-    if not rounds:
-        return ["门禁：research/ 下没有 review-N.md，还没有审查记录"]
-    n, path = rounds[-1]
-    text = path.read_text(encoding="utf-8")
+def check_outline(md: Path) -> list[str]:
+    """大纲：长页和短页各一份，每个节点写四样：写什么、类型、字数、依据。
+
+    格式：
+        ## 长页
+        - 开头｜写什么｜类型｜字数｜依据
+        - ### 章标题｜写什么｜类型｜字数｜依据
+        - #### 小节标题｜写什么｜类型｜字数｜依据
+        ## 短页
+        - ### 节标题｜写什么｜类型｜字数｜依据
+    """
     errors: list[str] = []
-    m = re.search(r"^-\s*concept-sha256:\s*([0-9a-f]{64})\s*$", text, re.M)
-    if not m:
-        errors.append(f"门禁：{path.name} 缺少「- concept-sha256: <哈希>」")
-    elif m.group(1) != sha256(md):
-        errors.append(f"门禁：审查之后 concept.md 改过（{path.name} 记的是 {m.group(1)[:12]}…，"
-                      f"现在是 {sha256(md)[:12]}…），改动没有被审过，重新审一轮")
-    r = re.search(r"^-\s*结果:\s*(\S+)\s*$", text, re.M)
-    if not r or r.group(1) != "通过":
-        errors.append(f"门禁：最后一轮 {path.name} 的结果不是「通过」")
-    heads = set(re.findall(r"^##\s+(.+?)\s*$", text, re.M))
-    for name in GATE_SECTIONS:
-        if name not in heads:
-            errors.append(f"门禁：{path.name} 缺少「## {name}」一节")
-    if re.search(r"未返回", text):
-        errors.append(f"门禁：{path.name} 里有审查者「未返回」，补派后再记录")
+    text = md.read_text(encoding="utf-8")
+    sections: dict[str, list[tuple[int, str]]] = {}
+    cur = None
+    for no, line in enumerate(text.splitlines(), 1):
+        if line.startswith("## "):
+            cur = line[3:].strip()
+            sections[cur] = []
+        elif cur and line.strip():
+            sections[cur].append((no, line.strip()))
+    for name in ("长页", "短页"):
+        if name not in sections:
+            errors.append(f"大纲：缺少「## {name}」一节")
+    if errors:
+        return errors
+
+    sources = md.parent / "sources"
+    cache: dict = {}
+    totals = {"长页": 0, "短页": 0}
+    for name in ("长页", "短页"):
+        nodes = 0
+        shorts = 0
+        last_title = ""
+        for no, line in sections[name]:
+            if not line.startswith("- "):
+                continue
+            parts = [p.strip() for p in line[2:].split("｜")]
+            if len(parts) != 5:
+                errors.append(f"第 {no} 行：节点要写成「标题｜写什么｜类型｜字数｜依据」五样，现在是 {len(parts)} 样")
+                continue
+            title, what, kind, words, basis = parts
+            nodes += 1
+            if not what:
+                errors.append(f"第 {no} 行：「写什么」不能空，一句话写这一节回答什么")
+            elif len(what) > 80:
+                errors.append(f"第 {no} 行：「写什么」只写一句话（80 字内），现在 {len(what)} 字；"
+                              "大纲里不写成句的正文")
+            if kind not in NODE_TYPES:
+                errors.append(f"第 {no} 行：类型是 {'、'.join(NODE_TYPES)} 之一，现在是「{kind}」")
+            wm = re.fullmatch(r"(\d+)", words)
+            if not wm:
+                errors.append(f"第 {no} 行：字数写成一个整数，现在是「{words}」")
+            else:
+                totals[name] += int(wm.group(1)) if kind != "折叠块" else 0
+            if basis.strip() != SELF_MADE:
+                for item in re.split(r"[;；]", basis):
+                    if item.strip():
+                        why = check_basis_item(item, sources, cache)
+                        if why:
+                            errors.append(f"第 {no} 行：依据对不上：{why}")
+                if not basis.strip():
+                    errors.append(f"第 {no} 行：依据不能空，写文件和位置，或写「{SELF_MADE}」")
+            if name == "短页" and title.startswith("### "):
+                shorts += 1
+            last_title = title.lstrip("# ").strip()
+        if nodes == 0:
+            errors.append(f"大纲：「{name}」下没有节点")
+        if name == "短页" and shorts != SHORT_SECTIONS:
+            errors.append(f"大纲：短页要恰好 {SHORT_SECTIONS} 节（标题以「### 」开头），现在是 {shorts} 节")
+        if name == "长页" and last_title != LAST_CHAPTER:
+            errors.append(f"大纲：长页最后一个节点的标题写「{LAST_CHAPTER}」，现在是「{last_title}」")
+    if totals["长页"] > build.LONG_LIMIT:
+        errors.append(f"大纲：长页折叠块外的字数预算合计 {totals['长页']}，超出上限 {build.LONG_LIMIT}")
+    if totals["短页"] > build.SHORT_LIMIT:
+        errors.append(f"大纲：短页的字数预算合计 {totals['短页']}，超出上限 {build.SHORT_LIMIT}")
     return errors
 
 
@@ -269,86 +397,68 @@ def _selftest() -> int:
         "- 描述：自检页。", "- 摘要：自检，与任何真实概念无关。",
         "- 主题：其他领域", "- 标签：通用概念", "",
         "## 资料", "",
-        "- 虚构教材，第 1 版，[示例](https://example.com/book)",
-        "  - 摘录（第 1 章）：The toy operator doubles its input.", "",
+        "- 虚构教材，第 1 版，[示例](https://example.com/book)", "",
         "## 短页", "",
-        "### 是什么", "", "玩具算子把输入乘 2。", "",
-        "### 为什么需要", "", "用来演示。", "",
-        "### 大概怎么工作", "", "读入一个数，输出它的两倍。", "",
-        "## 长页", "", "开头一段。", "",
-        "### 定义", "", "输出是输入的两倍，前置见[前置页](wiki/prereq)。", "",
-        "```python", "print(2 * 1)", "```", "", "```text", "2", "```", "",
-        "### 适用条件与边界", "", "只对数值输入成立。",
+        "### 它是什么", "", "玩具算子把输入乘 2。", "依据：book.md 第 1 章", "",
+        "### 为什么要它", "", "用来演示。", "依据：自行构造", "",
+        "### 怎么用它", "", "读入一个数，输出它的两倍。", "依据：book.md L3-L4", "",
+        "## 长页", "", "开头一段。", "依据：book.md 第 1 章", "",
+        "### 定义", "",
+        "输出是输入的两倍，输入取 3.5 时输出 7.0，前置见[前置页](wiki/prereq)。", "依据：book.md 第 1 章", "",
+        "```python", "print(2 * 1)", "```", "", "```text", "2", "```", "依据：自行构造", "",
+        "### 适用条件与边界", "", "只对数值输入成立。", "依据：book.md 第 1 章",
     ])
+    snap = ("# 第 1 章 玩具算子\n\n玩具算子把输入乘 2。输入取 3.5 时输出 7.0。\n"
+            "它只对数值输入成立。\n\n## 1.2 另一节\n\n更多内容。\n")
     cases = [
         ("通过的页面没有报错", good, None),
-        ("摘录改了一个词", good.replace("doubles its input", "triples its input"), "快照里找不到"),
-        ("摘录改了一个数字", good.replace("The toy operator doubles its input.",
-                                   "The output is 2x, where x = 3.6 here."), "快照里找不到"),
-        ("摘录拼接了不相邻的两句", good.replace("The toy operator doubles its input.",
-                                       "The toy operator doubles its input. Second claim: the output is 2x"),
-         "前"),
-        ("摘录跨行断字仍能对上", good.replace("The toy operator doubles its input.",
-                                      "The toy operator doubles its input. It is defined only for numbers."),
-         None),
-        ("没有快照", good, "没有原文快照"),
         ("资料没有链接", good.replace("，[示例](https://example.com/book)", ""), "资料要带链接"),
-        ("资料没有摘录", good.replace("  - 摘录（第 1 章）：The toy operator doubles its input.\n", ""),
-         "没有摘录"),
-        ("摘录没有位置", good.replace("摘录（第 1 章）", "摘录（）"), "摘录"),
-        ("主题不在词表", good.replace("其他领域", "占星术"), "主题"),
-        ("标签不在词表", good.replace("通用概念", "不存在的标签"), "标签"),
-        ("短页缺一节", good.replace("### 为什么需要\n\n用来演示。\n\n", ""), "三节依次是"),
+        ("短页只有两节", good.replace("### 怎么用它\n\n读入一个数，输出它的两倍。\n依据：book.md L3-L4\n\n", ""),
+         "要恰好 3 节"),
+        ("短页有四节", good.replace("## 长页", "### 多出的一节\n\n内容。\n依据：自行构造\n\n## 长页", 1),
+         "要恰好 3 节"),
+        ("短页标题随便取也不报错", good.replace("它是什么", "完全不同的标题"), None),
         ("短页放折叠块", good.replace("读入一个数，输出它的两倍。",
                                "读入一个数。\n\n::: 详情\n内容\n:::"), "短页不放折叠块"),
         ("短页放表格", good.replace("读入一个数，输出它的两倍。",
                               "|a|b|\n|---|---|\n|1|2|"), "短页不放表格"),
         ("最后一章标题不对", good.replace("### 适用条件与边界", "### 什么时候不成立"), "最后一章"),
-        ("只有一章", good.replace("### 定义", "### 适用条件与边界", 1)
-         .replace("### 适用条件与边界\n\n只对", "### 其他\n\n只对"), "最后一章"),
         ("正文写外部网址", good.replace("输出是输入的两倍", "输出是输入的两倍（https://a.com）"),
          "不写外部网址"),
         ("链接的页面不存在", good.replace("wiki/prereq", "wiki/nope"), "格式"),
         ("链接的不是概念页", good, "不是现行的概念页"),
         ("python 后面没有输出块", good.replace("```text\n2\n```\n", ""), "要紧跟"),
-        ("输出块不紧跟", good.replace("```\n\n```text", "```\n\n中间有一段。\n\n```text"), "要紧跟"),
-        ("孤立的输出块", good.replace("```python\nprint(2 * 1)\n```\n\n", ""), "只用来写 python"),
-        ("其他语言的代码块", good.replace("```python\nprint(2 * 1)\n```\n\n```text\n2\n```",
-                                    "```c\nint x;\n```"), "只能是 python"),
+        ("其他语言的代码块", good.replace("```python\nprint(2 * 1)\n```\n\n```text\n2\n```", "```c\nint x;\n```"),
+         "只能是 python"),
         ("长页超字数", good.replace("开头一段。", "字" * (build.LONG_LIMIT + 1)), "长页折叠块外"),
         ("短页超字数", good.replace("用来演示。", "字" * (build.SHORT_LIMIT + 1)), "短页"),
+        ("依据的文件不存在", good.replace("依据：book.md 第 1 章", "依据：nope.md 第 1 章", 1), "不在 research/sources/ 下"),
+        ("依据的章节找不到", good.replace("依据：book.md 第 1 章", "依据：book.md 第 9 章", 1), "里没有标题含"),
+        ("依据的行号越界", good.replace("book.md L3-L4", "book.md L3-L99"), "只有"),
+        ("依据写成标题的一段文字", good.replace("book.md 第 1 章", "book.md 玩具算子", 1), None),
+        ("一段写两个依据", good.replace("依据：book.md 第 1 章", "依据：book.md 第 1 章；book.md 1.2 另一节", 1), None),
+        ("整页没有依据", "\n".join(l for l in good.split("\n") if not l.startswith("依据：")), "全文没有一行"),
+        ("数字在资料里找不到", good.replace("取 3.5 时输出 7.0", "取 3.5 时输出 8.0"), "数字 8.0"),
+        ("自行构造的段落数字不查", good.replace("用来演示。", "取 4242 试一下。"), None),
+        ("数字在公式里不查", good.replace("开头一段。", "开头一段，$x=9999$。"), None),
     ]
     results: list[tuple[str, bool]] = []
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        wiki = root / "wiki"
+        wiki = Path(tmp) / "wiki"
         (wiki / "prereq").mkdir(parents=True)
-        (wiki / "prereq" / "index.html").write_text(
-            '<meta name="dojo:type" content="concept">', encoding="utf-8")
+        (wiki / "prereq" / "index.html").write_text('<meta name="dojo:type" content="concept">', encoding="utf-8")
         (wiki / "oldie").mkdir()
         (wiki / "oldie" / "index.html").write_text(
-            '<meta name="dojo:type" content="paper"><meta name="dojo:status" content="outdated">',
-            encoding="utf-8")
+            '<meta name="dojo:type" content="paper"><meta name="dojo:status" content="outdated">', encoding="utf-8")
         research = wiki / "toy" / "research"
         (research / "sources").mkdir(parents=True)
-        (research / "sources" / "book.txt").write_text(
-            "Chapter 1.\nThe toy operator doubles its input. It is\nde-\nfined only for numbers.\n"
-            "• Second claim: the output is 2x, where x = 3.5 here.\n", encoding="utf-8")
-        md = research / "concept.md"
+        (research / "sources" / "book.md").write_text(snap, encoding="utf-8")
+        md = research / "content.md"
         for name, doc, want in cases:
             if name == "链接的不是概念页":
                 doc = good.replace("wiki/prereq", "wiki/oldie")
             md.write_text(doc, encoding="utf-8")
-            snap = research / "sources" / "book.txt"
-            if name == "没有快照":
-                saved = snap.read_text(encoding="utf-8"); snap.unlink()
-                (research / "sources").rmdir()
             errs = check(md, wiki)
-            if name == "没有快照":
-                (research / "sources").mkdir(); snap.write_text(saved, encoding="utf-8")
-            if name == "摘录跨行断字仍能对上":
-                results.append((name, not any("快照" in e for e in errs)))
-                continue
             if want is None:
                 results.append((name, not errs))
                 if errs:
@@ -356,38 +466,55 @@ def _selftest() -> int:
             else:
                 results.append((name, any(want in e for e in errs)))
 
-        # 目录名
         bad = wiki / "Bad_Name" / "research"
-        bad.mkdir(parents=True)
-        (bad / "concept.md").write_text(good, encoding="utf-8")
-        results.append(("目录名不合规应当报错",
-                        any("目录名" in e for e in check(bad / "concept.md", wiki))))
+        (bad / "sources").mkdir(parents=True)
+        (bad / "sources" / "book.md").write_text(snap, encoding="utf-8")
+        (bad / "content.md").write_text(good, encoding="utf-8")
+        results.append(("目录名不合规应当报错", any("目录名" in e for e in check(bad / "content.md", wiki))))
 
-        # 门禁
-        md.write_text(good, encoding="utf-8")
-        results.append(("没有审查记录时门禁报错", any("没有审查记录" in e for e in gate(md))))
-        sections = "\n".join(f"## {s}\n\n- 无\n" for s in GATE_SECTIONS)
+        # 没有快照目录：依据与数字都无从核对
+        nosrc = wiki / "nosrc" / "research"
+        nosrc.mkdir(parents=True)
+        (nosrc / "content.md").write_text(good, encoding="utf-8")
+        results.append(("没有 sources 时报错", any("没有快照" in e for e in check(nosrc / "content.md", wiki))))
 
-        def review(name: str, digest: str, result: str, extra: str = "") -> None:
-            (research / name).write_text(
-                f"# 第 1 轮\n\n- concept-sha256: {digest}\n- 结果: {result}\n\n{sections}{extra}",
-                encoding="utf-8")
-
-        review("review-1.md", sha256(md), "通过")
-        results.append(("记录齐全且哈希一致时门禁通过", not gate(md)))
-        review("review-1.md", sha256(md), "未通过")
-        results.append(("结果未通过时门禁报错", any("不是「通过」" in e for e in gate(md))))
-        review("review-1.md", "0" * 64, "通过")
-        results.append(("concept.md 改过时门禁报错", any("改过" in e for e in gate(md))))
-        review("review-1.md", sha256(md), "通过", "\n事实 2：未返回\n")
-        results.append(("有未返回时门禁报错", any("未返回" in e for e in gate(md))))
-        (research / "review-1.md").write_text(
-            f"# 第 1 轮\n\n- concept-sha256: {sha256(md)}\n- 结果: 通过\n\n## 摘录核验\n\n无\n",
-            encoding="utf-8")
-        results.append(("缺节时门禁报错", any("缺少「## 事实 1」" in e for e in gate(md))))
-        review("review-2.md", sha256(md), "通过")
-        (research / "review-1.md").write_text("坏的", encoding="utf-8")
-        results.append(("只认最后一轮", not gate(md)))
+        # 大纲
+        ol_good = "\n".join([
+            "# 大纲", "", "## 长页", "",
+            "- 开头｜讲清它是什么｜正文｜200｜book.md 第 1 章",
+            "- ### 定义｜输出等于输入的两倍｜正文｜300｜book.md 第 1 章",
+            "- #### 一个例子｜取 3.5 走一遍｜例子｜200｜自行构造",
+            "- ### 适用条件与边界｜只对数值输入成立｜正文｜200｜book.md L3-L4", "",
+            "## 短页", "",
+            "- ### 它是什么｜一句话讲定义｜正文｜100｜book.md 第 1 章",
+            "- ### 为什么要它｜讲动机｜正文｜100｜自行构造",
+            "- ### 怎么用它｜讲用法｜正文｜100｜book.md 第 1 章",
+        ])
+        ocases = [
+            ("通过的大纲没有报错", ol_good, None),
+            ("大纲缺短页", ol_good.split("## 短页")[0], "缺少「## 短页」"),
+            ("节点只有四样", ol_good.replace("｜正文｜200｜book.md 第 1 章", "｜正文｜book.md 第 1 章", 1), "五样"),
+            ("类型不对", ol_good.replace("｜例子｜", "｜图｜"), "类型是"),
+            ("字数不是整数", ol_good.replace("｜300｜", "｜三百｜"), "整数"),
+            ("写什么超过一句话", ol_good.replace("输出等于输入的两倍", "字" * 90), "80 字"),
+            ("依据的文件不存在", ol_good.replace("book.md 第 1 章", "x.md 第 1 章", 1), "不在 research/sources/ 下"),
+            ("依据的章节找不到", ol_good.replace("book.md 第 1 章", "book.md 第 7 章", 1), "里没有标题含"),
+            ("依据为空", ol_good.replace("｜自行构造", "｜", 1), "依据不能空"),
+            ("短页不是三节", ol_good.replace("- ### 怎么用它｜讲用法｜正文｜100｜book.md 第 1 章", ""), "恰好 3 节"),
+            ("长页最后一节不对", ol_good.replace("适用条件与边界", "什么时候不成立"), "最后一个节点"),
+            ("长页预算超限", ol_good.replace("｜300｜", f"｜{build.LONG_LIMIT}｜"), "超出上限"),
+            ("折叠块不计入预算", ol_good.replace("｜例子｜200｜", f"｜折叠块｜{build.LONG_LIMIT}｜"), None),
+        ]
+        omd = research / "outline.md"
+        for name, doc, want in ocases:
+            omd.write_text(doc, encoding="utf-8")
+            errs = check_outline(omd)
+            if want is None:
+                results.append((name, not errs))
+                if errs:
+                    print("    意外报错：", errs)
+            else:
+                results.append((name, any(want in e for e in errs)))
 
     failed = [n for n, ok in results if not ok]
     for n, ok in results:
@@ -402,24 +529,20 @@ def _selftest() -> int:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="概念页的机械检查与审查门禁")
-    ap.add_argument("md", nargs="?", type=Path, help="wiki/<name>/research/concept.md")
-    ap.add_argument("--hash", action="store_true", help="打印 concept.md 的 SHA-256，写进审查记录")
-    ap.add_argument("--gate", action="store_true", help="检查最后一轮审查记录通过且 concept.md 未改")
+    ap = argparse.ArgumentParser(description="概念页的机械检查：大纲格式与预算、正文的依据与结构")
+    ap.add_argument("md", nargs="?", type=Path, help="wiki/<name>/research/content.md，加 --outline 时是 outline.md")
+    ap.add_argument("--outline", action="store_true", help="检查大纲 outline.md")
     ap.add_argument("--selftest", action="store_true", help="用虚构数据自检本脚本")
     a = ap.parse_args()
     if a.selftest:
         raise SystemExit(_selftest())
     if a.md is None:
-        ap.error("需要 concept.md 的路径")
+        ap.error("需要 content.md 或 outline.md 的路径")
     if not a.md.exists():
         raise SystemExit(f"文件不存在：{a.md}")
-    if a.hash:
-        print(sha256(a.md))
-        raise SystemExit(0)
-    problems = gate(a.md) if a.gate else check(a.md)
+    problems = check_outline(a.md) if a.outline else check(a.md)
     for p in problems:
         print(p)
-    label = "门禁" if a.gate else "检查"
+    label = "大纲检查" if a.outline else "检查"
     print(f"{label}：{len(problems)} 个问题" if problems else f"{label}通过")
     raise SystemExit(1 if problems else 0)
