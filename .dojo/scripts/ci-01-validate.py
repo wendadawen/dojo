@@ -177,7 +177,7 @@ RESEARCH_ALLOWED_FILES = {
     "conflicts.md",
 }
 RESEARCH_ALLOWED_DIRS = {"sources", "official"}
-REVIEW_FILE_RE = re.compile(r"(?:outline-)?review-\d+\.md")
+REVIEW_FILE_RE = re.compile(r"(?:outline|content)-review-\d+\.md")
 INLINE_MATH_RE = re.compile(
     r"\$\$[\s\S]+?\$\$|"
     r"(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$(?!\$)|"
@@ -439,7 +439,7 @@ def check_research_dir(research: Path) -> list[str]:
     """research/ 只放符合固定清单的 .md，不混入其他格式与临时文件。
 
     该目录不随站点发布，但仍要可长期检索：文件名限定为固定集合，审查记录
-    按 review-<轮次>.md 连续编号，引文快照放在 sources/ 与 official/ 下。
+    按 outline-review-<轮次>.md、content-review-<轮次>.md 连续编号，引文快照放在 sources/ 与 official/ 下。
     """
     errors: list[str] = []
     if not research.is_dir():
