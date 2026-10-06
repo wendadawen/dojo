@@ -61,9 +61,9 @@
     # 自检（CI 会跑；用虚构数据验证生成器本身可用）
     python3 .dojo/scripts/concept-01-build.py --selftest
 
-- 文件格式见 `guides/concept/write.md`。只认那里列出的 Markdown 写法，别的写法直接报错。
-- 格式错误会报出行号：缺固定小节、核心问题不是 3 到 5 个、章节标题带编号、页面文字里写了源码行号、站内链接指向不存在的页面、落单的 `$` 等。
-- 「范围」和「依据」两节只给审查者看，不写进页面。
+- 文件格式见 `guides/concept.md`。只认那里列出的写法，别的写法直接报错。
+- 格式错误会报出行号：缺「资料」「短页」「长页」之一、长页没有开头或没有章、章的标题带编号、折叠块里写标题、站内链接指向不存在的页面、落单的 `$` 等。
+- 每次生成都打印长页折叠块外的字数和短页的字数，超出 `guides/concept.md` 定的上限时写明。长页顶部的阅读时间也按折叠块外的字算。
 
 ### dataflow-01-check.py
 
@@ -106,7 +106,7 @@ Markdown 填进模板，不手工复制。
 
 | 模板 | 产出 |
 |---|---|
-| `.dojo/templates/concept/` | 概念页与概览页，由 `concept-01-build.py` 读 `research/concept.md` 生成 |
+| `.dojo/templates/concept/` | 概念的长页与短页，由 `concept-01-build.py` 读 `research/concept.md` 生成 |
 | `.dojo/templates/paper/` | 论文解析页（含概览页与组件片段） |
 | `.dojo/templates/note/` | 学习记录页 |
 | `.dojo/templates/dataflow/` | 模型前向数据流页（画布 + 参数面板），由 `dataflow-02-build.py` 读 `research/dataflow.md` 生成 |

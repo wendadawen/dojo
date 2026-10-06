@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
-"""概念页的生成器：读 research/concept.md，生成 index.html 和 overview.html。
+"""概念页的生成器：读 research/concept.md，生成长页 index.html 和短页 overview.html。
 
 用法（从仓库根运行）：
     python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/concept.md
     python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/concept.md --run
     python3 .dojo/scripts/concept-01-build.py --selftest
 
-文件格式见 guides/concept/write.md。页面上的文字都来自 concept.md，生成器只做装配：
-把 Markdown 转成 HTML，给章节编号，生成核心问题的折叠块和文末的参考资料。
---run 另外运行后面紧跟 text 代码块的 Python 代码，逐行比对输出；不跟输出块的算源码摘录，不运行。
+文件格式见 guides/concept.md。页面上的文字都来自 concept.md，生成器只做装配：
+把 Markdown 转成 HTML，给长页的章和小节编号，把「资料」生成为长页末尾的参考资料，
+并打印两页折叠块外的字数。--run 另外运行后面紧跟 text 代码块的 Python 代码，逐行比对输出。
 
-它不做这些事：
-  · 不定义页面骨架——骨架是 .dojo/templates/concept/ 下的 index.html 和 overview.html
-  · 不校验事实——那是审查的事
+页面骨架是 .dojo/templates/concept/ 下的 index.html 和 overview.html。
 
-只认下面这些写法，写了别的会报错，不会静默产出错页面：
+只认下面这些写法，写了别的会报错：
   段落、**加粗**、`代码`、[链接](地址)、![图](assets/…)、$行内公式$、$$独立公式$$、
-  - 无序列表、1. 有序列表、表格、``` 代码块、### 小节标题、
-  「::: 补充：/展开：/代码：<标题>」到「:::」的折叠块、<figure>/<div>/<svg> 开头的原样 HTML。
+  - 无序列表、1. 有序列表、表格、``` 代码块、「::: <标题>」到「:::」的折叠块、
+  <figure>/<div>/<svg> 开头的原样 HTML、短页里的 ### 小标题、长页里的 ### 章和 #### 小节。
 """
 
 from __future__ import annotations
 
 import html
 import itertools
+import math
 import os
 import re
 import subprocess
@@ -36,18 +35,18 @@ TEMPLATES = HERE.parent / "templates" / "concept"
 REPO_ROOT = HERE.parents[1]
 
 META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
-# 固定小节：不是正文章节。其余 ## 标题按出现顺序编号成章。
-RESERVED = ("资料", "范围", "依据", "概览", "引言", "核心问题")
-REQUIRED = RESERVED
-GENERATED = ("参考资料", "本章问题")
-DETAIL_PREFIXES = ("补充：", "展开：", "代码：")
+SECTIONS = ("资料", "短页", "长页")
+LONG_LIMIT = 5000
+SHORT_LIMIT = 1000
 
 MATH_RE = re.compile(r"\$\$.+?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$", re.S)
-LINE_REF_RE = re.compile(r"\.(?:py|pyi|cu|cuh|cc|cpp|c|h|hpp|rs|go|js|ts|java)(?::|#L)\d+")
 LIST_RE = re.compile(r"^(\s*)(-|\d+\.)\s+(.*)$")
 RAW_HTML_RE = re.compile(r"^<(figure|div|svg)\b")
 NUMBERED_RE = re.compile(r"^\d+(?:\.\d+)*[.、．\s]")
 CJK_RE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+WORD_RE = re.compile(r"[A-Za-z]+")
+DETAILS_RE = re.compile(r"<details\b(?:(?!<details\b)[\s\S])*?</details>")
 
 Line = tuple[int, str]
 
@@ -178,11 +177,11 @@ def _display_math(lines: list[Line], i: int, out: list[str]) -> int:
     return j + 1
 
 
-def _container(lines: list[Line], i: int, ctx: Ctx, out: list[str]) -> int:
+def _fold(lines: list[Line], i: int, ctx: Ctx, out: list[str]) -> int:
     no, raw = lines[i]
     title = raw.strip()[3:].strip()
-    if not title.startswith(DETAIL_PREFIXES) or len(title) <= 3:
-        fail(no, "折叠块写成「::: 补充：标题」「::: 展开：标题」或「::: 代码：标题」")
+    if not title:
+        fail(no, "折叠块写成「::: <标题>」，标题写明里面是什么")
     depth, j, fence = 1, i + 1, False
     while j < len(lines):
         t = lines[j][1].strip()
@@ -200,7 +199,8 @@ def _container(lines: list[Line], i: int, ctx: Ctx, out: list[str]) -> int:
     inner = render_blocks(lines[i + 1:j], ctx)
     if not inner:
         fail(no, "折叠块是空的")
-    cls = ' class="code-details"' if title.startswith("代码：") else ""
+    only_code = all(b.startswith('<div class="code-block">') for b in inner)
+    cls = ' class="code-details"' if only_code else ""
     out.append(f"<details{cls}>\n<summary>{inline(title, no, ctx)}</summary>\n"
                + "\n".join(inner) + "\n</details>")
     ctx.details += 1
@@ -343,8 +343,8 @@ def _paragraph(lines: list[Line], i: int, ctx: Ctx, out: list[str]) -> int:
     return j
 
 
-def render_blocks(lines: list[Line], ctx: Ctx, heading=None) -> list[str]:
-    """一段 Markdown 行转成 HTML 块。heading 为 None 时不允许出现标题。"""
+def render_blocks(lines: list[Line], ctx: Ctx, heading=None, level: str = "") -> list[str]:
+    """一段 Markdown 行转成 HTML 块。只允许 level 这一级标题，交给 heading 渲染。"""
     out: list[str] = []
     i = 0
     while i < len(lines):
@@ -357,14 +357,14 @@ def render_blocks(lines: list[Line], ctx: Ctx, heading=None) -> list[str]:
         elif s.startswith("$$"):
             i = _display_math(lines, i, out)
         elif s.startswith(":::"):
-            i = _container(lines, i, ctx, out)
+            i = _fold(lines, i, ctx, out)
         elif RAW_HTML_RE.match(s):
             i = _raw_html(lines, i, out)
         elif s.startswith("#"):
-            m = re.fullmatch(r"###\s+(.+)", s)
-            if heading is None or not m:
-                fail(no, "这里不能写标题" if heading is None else "小节标题用 ###")
-            out.append(heading(m.group(1).strip(), no))
+            m = re.fullmatch(r"(#+)\s+(.+)", s)
+            if heading is None or not m or m.group(1) != level:
+                fail(no, f"这里只能写 {level} 标题" if level else "这里不能写标题")
+            out.append(heading(m.group(2).strip(), no))
             i += 1
         elif s.startswith("|"):
             i = _table(lines, i, ctx, out)
@@ -380,10 +380,9 @@ def render_blocks(lines: list[Line], ctx: Ctx, heading=None) -> list[str]:
 # ---------- 整份文件 ----------
 
 def parse(text: str) -> dict:
-    """按 guides/concept/write.md 的格式切分：标题、页面信息、各小节的原始行。"""
+    """按 guides/concept.md 的格式切分：标题、页面信息、资料、短页、长页。"""
     title, meta = "", {}
     sections: dict[str, list[Line]] = {}
-    order: list[Line] = []
     current, fence = None, False
     for no, line in enumerate(text.splitlines(), 1):
         s = line.strip()
@@ -391,15 +390,12 @@ def parse(text: str) -> dict:
             fence = not fence
         if not fence and line.startswith("## "):
             name = line[3:].strip()
-            if name in GENERATED:
-                fail(no, f"「{name}」由生成器处理，不要自己写")
-            if name == "常见误解":
-                fail(no, "格式里没有「常见误解」一节")
+            if name not in SECTIONS:
+                fail(no, f"只有「资料」「短页」「长页」三节，没有「{name}」")
             if name in sections:
                 fail(no, f"「{name}」重复了")
             current = name
             sections[name] = []
-            order.append((no, name))
         elif current is not None:
             sections[current].append((no, line))
         elif line.startswith("# "):
@@ -409,27 +405,21 @@ def parse(text: str) -> dict:
         elif s:
             m = re.match(r"-\s*([^：:]+)[：:]\s*(.*)", s)
             if not title or not m or m.group(1).strip() not in META_KEYS:
-                fail(no, "开头先写「# 标题」，下面只写 描述、摘要、主题、标签 四行")
+                fail(no, "开头先写「# 概念名」，下面只写 描述、摘要、主题、标签 四行")
             meta[META_KEYS[m.group(1).strip()]] = m.group(2).strip()
 
     if not title:
-        fail(0, "缺少「# 标题」")
-    if "$" in title:
-        fail(0, "标题不写公式")
+        fail(0, "缺少「# 概念名」")
+    if "$" in title or "：" in title:
+        fail(0, "# 后面只写概念名")
     for zh, key in META_KEYS.items():
         if not meta.get(key):
             fail(0, f"缺少页面信息：{zh}")
     if "$" in meta["description"]:
         fail(0, "描述是纯文本，公式写到摘要里")
-    for name in REQUIRED:
+    for name in SECTIONS:
         if not any(l.strip() for _, l in sections.get(name, [])):
             fail(0, f"缺少「{name}」一节")
-    chapters = [(no, name) for no, name in order if name not in RESERVED]
-    if not chapters:
-        fail(0, "没有正文章节")
-    for no, name in chapters:
-        if NUMBERED_RE.match(name):
-            fail(no, "章节标题不写编号，生成器会编号")
 
     refs = []
     for no, line in sections["资料"]:
@@ -440,61 +430,59 @@ def parse(text: str) -> dict:
             fail(no, "资料每条写成「- 」开头的一行")
         refs.append((no, s[2:].strip()))
 
-    basis = [l for l in sections["依据"] if l[1].strip()]
-    if not basis or not basis[0][1].strip().startswith("|"):
-        fail(sections["依据"][0][0] if sections["依据"] else 0, "依据写成表格：| 论断 | 出处 |")
-    head = split_row(basis[0][1])
-    if head[:2] != ["论断", "出处"] or len(basis) < 3:
-        fail(basis[0][0], "依据的表头是 | 论断 | 出处 |，下面至少一行")
+    opening, chapters = split_long(sections["长页"])
+    if not any(l.strip() for _, l in opening):
+        fail(sections["长页"][0][0], "长页在第一个 ### 之前要有开头")
+    if not chapters:
+        fail(sections["长页"][0][0], "长页至少有一章：### <章标题>")
+    for no, name, _ in chapters:
+        if NUMBERED_RE.match(name):
+            fail(no, "章的标题不写编号，生成器会编号")
 
-    rendered = ["资料", "概览", "引言", "核心问题"] + [n for _, n in chapters]
-    fence = False
-    for name in rendered:
-        for no, line in sections.get(name, []):
-            if line.strip().startswith("```"):
-                fence = not fence
-            elif not fence and LINE_REF_RE.search(line):
-                fail(no, "页面上不写源码行号，行号只写在「依据」里")
-    for key in ("description", "summary"):
-        if LINE_REF_RE.search(meta[key]):
-            fail(0, "页面上不写源码行号，行号只写在「依据」里")
-
-    return {"title": title, "meta": meta, "sections": sections,
-            "chapters": chapters, "refs": refs}
+    return {"title": title, "meta": meta, "short": sections["短页"],
+            "opening": opening, "chapters": chapters, "refs": refs}
 
 
-def _core_questions(lines: list[Line], ctx: Ctx) -> str:
-    qs: list[tuple[int, str, list[Line]]] = []
+def split_long(lines: list[Line]) -> tuple[list[Line], list[tuple[int, str, list[Line]]]]:
+    """长页按 ### 切成开头和各章。折叠块和代码块里的行不参与切分。"""
+    opening: list[Line] = []
+    chapters: list[tuple[int, str, list[Line]]] = []
+    fence, depth = False, 0
     for no, line in lines:
         s = line.strip()
-        if s.startswith("### "):
-            qs.append((no, s[4:].strip(), []))
-        elif qs:
-            qs[-1][2].append((no, line))
-        elif s:
-            fail(no, "核心问题一节里，每个问题写成「### 问题」")
-    if not 3 <= len(qs) <= 5:
-        fail(lines[0][0], f"核心问题要 3 到 5 个，现在是 {len(qs)} 个")
-    items = []
-    for no, q, body in qs:
-        k = next((n for n, (_, l) in enumerate(body) if l.strip()), None)
-        if k is None or not body[k][1].strip().startswith("解答："):
-            fail(no, "问题下面第一行写「解答：<一句话要点>」")
-        rest = render_blocks(body[k + 1:], ctx)
-        if not rest:
-            fail(body[k][0], "解答要点下面还要写完整答案")
-        items.append(f"<li>\n<p>{inline(q, no, ctx)}</p>\n<details>\n"
-                     f"<summary>{inline(body[k][1].strip(), body[k][0], ctx)}</summary>\n"
-                     + "\n".join(rest) + "\n</details>\n</li>")
-    return ('<section class="learning-goals">\n<h2>核心问题</h2>\n<ol class="chapter-questions">\n'
-            + "\n".join(items) + "\n</ol>\n</section>")
+        if s.startswith("```"):
+            fence = not fence
+        elif not fence and s.startswith(":::"):
+            depth += -1 if s == ":::" else 1
+        elif not fence and re.match(r"###\s", s):
+            if depth:
+                fail(no, "折叠块里不能写标题")
+            chapters.append((no, s[4:].strip(), []))
+            continue
+        (chapters[-1][2] if chapters else opening).append((no, line))
+    return opening, chapters
+
+
+def _open_counts(fragment: str) -> tuple[int, int]:
+    """折叠块外的汉字数和英文单词数，一段公式算一个词。"""
+    while DETAILS_RE.search(fragment):
+        fragment = DETAILS_RE.sub(" ", fragment)
+    text = MATH_RE.sub(" x ", html.unescape(re.sub(r"<[^>]+>", " ", fragment)))
+    return len(HAN_RE.findall(text)), len(WORD_RE.findall(text))
+
+
+def count_words(fragment: str) -> int:
+    return sum(_open_counts(fragment))
+
+
+def reading_minutes(fragment: str) -> int:
+    han, words = _open_counts(fragment)
+    return max(1, math.ceil(han / 350 + words / 200))
 
 
 def render(doc: dict, ctx: Ctx) -> tuple[str, str, dict]:
-    sec = doc["sections"]
-    parts = render_blocks(sec["引言"], ctx)
-    parts.append(_core_questions(sec["核心问题"], ctx))
-    for k, (no, name) in enumerate(doc["chapters"], 1):
+    parts = render_blocks(doc["opening"], ctx)
+    for k, (no, name, body) in enumerate(doc["chapters"], 1):
         parts.append(f'<h2 id="s{k}">{k}. {inline(name, no, ctx)}</h2>')
         counter = itertools.count(1)
 
@@ -502,14 +490,19 @@ def render(doc: dict, ctx: Ctx) -> tuple[str, str, dict]:
             j = next(counter)
             return f'<h3 id="s{k}-{j}">{k}.{j} {inline(text, line_no, ctx)}</h3>'
 
-        parts += render_blocks(sec[name], ctx, heading=sub)
+        parts += render_blocks(body, ctx, heading=sub, level="####")
+    reading = "\n\n".join(parts)
     parts.append('<h2 id="references">参考资料</h2>\n<ol>\n'
                  + "\n".join(f"<li>{inline(t, no, ctx)}</li>" for no, t in doc["refs"])
                  + "\n</ol>")
-    overview = render_blocks(sec["概览"], ctx,
-                             heading=lambda t, no: f"<h2>{inline(t, no, ctx)}</h2>")
-    stats = {"chapters": len(doc["chapters"]), "details": ctx.details}
-    return "\n\n".join(parts), "\n\n".join(overview), stats
+    short = render_blocks(doc["short"], ctx, level="###",
+                          heading=lambda t, no: f"<h2>{inline(t, no, ctx)}</h2>")
+    short_html = "\n\n".join(short)
+    lead = html.escape(doc["meta"]["description"])
+    stats = {"chapters": len(doc["chapters"]), "details": ctx.details,
+             "long": count_words(reading), "minutes": reading_minutes(reading),
+             "short": count_words(lead + " " + short_html)}
+    return "\n\n".join(parts), short_html, stats
 
 
 def _fill(tpl: str, out_dir: Path, pairs: list[tuple[str, str]]) -> str:
@@ -536,9 +529,8 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
         out_dir = md.parent.parent
     ctx = Ctx(out_dir, wiki_root or REPO_ROOT / "wiki")
     doc = parse(md.read_text(encoding="utf-8"))
-    body, overview, stats = render(doc, ctx)
+    body, short, stats = render(doc, ctx)
     meta, title = doc["meta"], doc["title"]
-    short = title.split("：", 1)[0].strip()
     tdir = templates or TEMPLATES
 
     index_tpl = (tdir / "index.html").read_text(encoding="utf-8")
@@ -554,7 +546,9 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
         ("【首页可渲染摘要；公式使用 $...$】", html.escape(meta["summary"])),
         ("【主题，逗号分隔】", html.escape(meta["topics"])),
         ("【内容标签】", html.escape(meta["tag"])),
-        ("【概念名】", html.escape(short)),
+        ("【正文字数】", f"{stats['long']:,}"),
+        ("【阅读分钟】", str(stats["minutes"])),
+        ("【概念名】", html.escape(title)),
     ])
 
     overview_tpl = (tdir / "overview.html").read_text(encoding="utf-8")
@@ -562,8 +556,8 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
     if not ov_marker:
         raise SystemExit("overview.html 模板里没有 @content 标记")
     overview_html = _fill(overview_tpl, out_dir, [
-        (ov_marker.group(0), overview),
-        ("【概念名】", html.escape(short)),
+        (ov_marker.group(0), short),
+        ("【概念名】", html.escape(title)),
         ("【主题标签】", html.escape(meta["tag"])),
         ("【定位摘要：这个概念是什么、解决什么问题】", html.escape(meta["description"])),
     ])
@@ -576,10 +570,7 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
 
 
 def run_code(fences: list[tuple[int, str, str]]) -> tuple[int, list[str]]:
-    """运行后面紧跟 text 代码块的 python 代码，把 text 块当预期输出逐行比对。
-
-    后面不跟输出块的 python 代码是源码摘录，不运行。
-    """
+    """运行后面紧跟 text 代码块的 python 代码，把 text 块当预期输出逐行比对。"""
     problems, ran = [], 0
     for k, (no, lang, code) in enumerate(fences):
         nxt = fences[k + 1] if k + 1 < len(fences) else None
@@ -605,6 +596,14 @@ def run_code(fences: list[tuple[int, str, str]]) -> tuple[int, list[str]]:
     return ran, problems
 
 
+def report(index_path: Path, overview_path: Path, stats: dict) -> str:
+    long_note = "" if stats["long"] <= LONG_LIMIT else f"，超出上限 {LONG_LIMIT}"
+    short_note = "" if stats["short"] <= SHORT_LIMIT else f"，超出上限 {SHORT_LIMIT}"
+    return (f"已生成 {index_path} 和 {overview_path.name}：长页 {stats['chapters']} 章、"
+            f"{stats['details']} 个折叠块，折叠块外 {stats['long']} 字{long_note}；"
+            f"短页 {stats['short']} 字{short_note}")
+
+
 # ---------- 自检 ----------
 
 def _selftest() -> int:
@@ -621,48 +620,18 @@ def _selftest() -> int:
         "",
         "- 虚构论文：[示例](https://example.com/paper)",
         "",
-        "## 范围",
-        "",
-        "- 讲：RANGE-ONLY 玩具算子",
-        "",
-        "## 依据",
-        "",
-        "| 论断 | 出处 |",
-        "|---|---|",
-        "| 输出是输入的两倍 | toy.py:12 BASIS-ONLY |",
-        "",
-        "## 概览",
+        "## 短页",
         "",
         "### 是什么",
         "",
         "玩具算子把输入乘 2，前置见[前置页](wiki/prereq)。",
         "",
-        "## 引言",
+        "## 长页",
         "",
         "开头一段，",
         "换行接着写。",
         "",
-        "## 核心问题",
-        "",
-        "### 它做什么？",
-        "",
-        "解答：乘 2",
-        "",
-        "输出 $y=2x$，见第一章。",
-        "",
-        "### 为什么？",
-        "",
-        "解答：自检",
-        "",
-        "因为要自检。",
-        "",
-        "### 何时不成立？",
-        "",
-        "解答：从不",
-        "",
-        "自检里总成立。",
-        "",
-        "## 定义",
+        "### 定义",
         "",
         "公式如下：",
         "$$",
@@ -678,9 +647,9 @@ def _selftest() -> int:
         "| $1$ | $2$ |",
         "| $\\|x\\|$ | a\\|b |",
         "",
-        "### 小节",
+        "#### 小节",
         "",
-        "::: 代码：验证乘 2",
+        "::: 例子的完整过程",
         "```python",
         "print(2 * 1)",
         "```",
@@ -690,7 +659,7 @@ def _selftest() -> int:
         "```",
         ":::",
         "",
-        "## 边界",
+        "### 边界",
         "",
         "源码摘录不运行：",
         "",
@@ -699,8 +668,11 @@ def _selftest() -> int:
         "    return self.missing(x)",
         "```",
         "",
-        "::: 补充：更多",
-        "补充内容。",
+        "::: 推导",
+        "折叠块里的字不计入。",
+        "::: 更深一层",
+        "嵌套折叠。",
+        ":::",
         ":::",
     ])
 
@@ -723,23 +695,24 @@ def _selftest() -> int:
             ("标题与导航", "<h1 class=\"title\">玩具算子</h1>" in t
              and "<title>玩具算子</title>" in t
              and '<span class="nav-brand">玩具算子</span>' in t),
-            ("章节编号", '<h2 id="s1">1. 定义</h2>' in t and '<h2 id="s2">2. 边界</h2>' in t),
+            ("开头在第一章之前", t.index("开头一段，换行接着写。") < t.index('<h2 id="s1">')),
+            ("章编号", '<h2 id="s1">1. 定义</h2>' in t and '<h2 id="s2">2. 边界</h2>' in t),
             ("小节编号", '<h3 id="s1-1">1.1 小节</h3>' in t),
-            ("核心问题带解答", t.count("<summary>解答：") == 3 and 'class="learning-goals"' in t),
-            ("代码折叠块", '<details class="code-details">' in t and "language-python" in t),
-            ("普通折叠块", "<summary>补充：更多</summary>" in t),
+            ("只有代码的折叠块", '<details class="code-details">' in t and "language-python" in t),
+            ("普通折叠块与嵌套", "<summary>推导</summary>" in t and "<summary>更深一层</summary>" in t),
             ("公式原样保留、< 转义", "y = 2x,\\qquad a&lt;b" in t),
             ("表格右对齐", 'style="text-align:right"' in t),
             ("表格里公式的竖线不拆", "$\\|x\\|$" in t and "a|b" in t),
             ("嵌套列表", t.count("<ul>") == 2 and "<b>加粗</b>" in t),
-            ("中文换行不留空格", "开头一段，换行接着写。" in t),
             ("参考资料", '<h2 id="references">参考资料</h2>' in t
              and 'href="https://example.com/paper"' in t),
-            ("范围和依据不进页面", "RANGE-ONLY" not in t + o and "BASIS-ONLY" not in t + o
-             and "toy.py" not in t + o),
-            ("概览：小标题与站内链接", "<h2>是什么</h2>" in o and 'href="../prereq/index.html"' in o),
-            ("概览：摘要进 lead", '<p class="lead">生成器自检页。</p>' in o),
-            ("统计", stats == {"chapters": 2, "details": 2}),
+            ("短页：小标题与站内链接", "<h2>是什么</h2>" in o and 'href="../prereq/index.html"' in o),
+            ("短页：描述进 lead", '<p class="lead">生成器自检页。</p>' in o),
+            ("短页内容不进长页", "玩具算子把输入乘 2" not in t),
+            ("阅读时间写进长页", f"正文 {stats['long']:,} 字" in t),
+            ("折叠块外字数不含折叠块", count_words("<p>一二</p><details><summary>三</summary>"
+                                          "<details>四</details></details>") == 2),
+            ("统计", stats["chapters"] == 2 and stats["details"] == 3),
         ]
         ran, problems = run_code(ctx.fences)
         checks.append(("--run：只跑带输出块的代码，输出一致", ran == 1 and not problems))
@@ -750,20 +723,22 @@ def _selftest() -> int:
         checks.append(("幂等", again.read_text(encoding="utf-8") == t))
 
         for name, broken in [
-            ("缺少范围", doc.replace("## 范围", "## 其他章").replace("- 讲：RANGE-ONLY 玩具算子", "文字")),
-            ("正文写行号", doc.replace("补充内容。", "见 toy.py:12。")),
-            ("章节标题写编号", doc.replace("## 定义", "## 1. 定义")),
+            ("缺少短页", doc.replace("## 短页", "### 短页")),
+            ("多出一节", doc.replace("## 长页", "## 其他\n\n文字\n\n## 长页")),
+            ("长页没有开头", doc.replace("开头一段，\n换行接着写。\n", "")),
+            ("长页没有章", doc.replace("### 定义", "定义").replace("### 边界", "边界")
+             .replace("#### 小节", "小节")),
+            ("章的标题写编号", doc.replace("### 定义", "### 1. 定义")),
+            ("标题带一句话", doc.replace("# 玩具算子", "# 玩具算子：乘二")),
             ("缺少标签", doc.replace("- 标签：数学与数值\n", "")),
-            ("核心问题不足 3 个", doc.replace("### 何时不成立？", "何时不成立？")),
-            ("解答缺要点行", doc.replace("解答：乘 2", "乘 2")),
+            ("开头写小节标题", doc.replace("开头一段，", "#### 开头小节\n\n开头一段，")),
+            ("折叠块里写标题", doc.replace("折叠块里的字不计入。", "### 藏起来的章")),
+            ("折叠块没有标题", doc.replace("::: 推导", ":::")),
             ("站内链接指向不存在的页面", doc.replace("wiki/prereq", "wiki/nope")),
             ("相对路径链接", doc.replace("wiki/prereq", "../prereq/index.html")),
-            ("落单的 $", doc.replace("因为要自检。", "花了 $5。")),
-            ("引用块", doc.replace("补充内容。", "> 引用")),
+            ("落单的 $", doc.replace("嵌套折叠。", "花了 $5。")),
+            ("引用块", doc.replace("嵌套折叠。", "> 引用")),
             ("代码块未结束", doc.replace("print(2 * 1)\n```", "print(2 * 1)")),
-            ("自己写本章问题", doc.replace("## 边界", "## 本章问题")),
-            ("写常见误解一节", doc.replace("## 边界", "## 常见误解")),
-            ("折叠块前缀", doc.replace("::: 补充：更多", "::: 更多")),
             ("描述含公式", doc.replace("生成器自检页。", "自检 $x$。")),
         ]:
             md.write_text(broken, encoding="utf-8")
@@ -799,7 +774,7 @@ if __name__ == "__main__":
     if not a.md.exists():
         raise SystemExit(f"文件不存在：{a.md}")
     index_path, overview_path, stats, ctx = build(a.md, a.out)
-    print(f"已生成 {index_path} 和 {overview_path.name}：{stats['chapters']} 章，{stats['details']} 个折叠块")
+    print(report(index_path, overview_path, stats))
     if a.run:
         ran, problems = run_code(ctx.fences)
         for p in problems:
