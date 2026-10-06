@@ -76,12 +76,13 @@ REQUIRED_WIKI_META = (
 )
 # 每个 dojo:type 对应的共享样式表，防止页面套错模板后仍能通过校验。
 # 元组第一项是该类型模板必须内联的样式表；页面引用其中任意一项即可。
-# 这里只放现行的概念页。已暂停的论文、学习记录、数据流三类，它们的表在
+# 这里只放概念页。已暂停的论文、学习记录、数据流三类，它们的表在
 # archive/legacy-validate.py，那里补回表并打开对 outdated 页面的校验。
 TYPE_STYLESHEET = {
     "concept": ("dojo-concept.css",),
 }
-# 页面标了 dojo:status=outdated 就整页跳过，不校验。archive/legacy-validate.py 把它关掉。
+# 页面标了 dojo:status=outdated 就整页跳过，不校验：旧概念页和已暂停类别的页面都是。
+# archive/legacy-validate.py 把它关掉。
 SKIP_OUTDATED = True
 OUTDATED_RE = re.compile(r'name="dojo:status"\s+content="outdated"')
 TEMPLATE_DIR = ".dojo/templates"
@@ -1607,7 +1608,8 @@ def main() -> int:
     args = [a for a in argv if a not in {"--all", "--js"}]
     js_only = "--js" in argv
     if "--all" in argv:
-        args = sorted(str(p) for p in Path("wiki").glob("**/*.html"))
+        # research/ 不发布，里面的资料快照（抓取的网页等）不是站点页面
+        args = sorted(str(p) for p in Path("wiki").glob("**/*.html") if "research" not in p.parts)
     if not args:
         print(__doc__)
         return 2

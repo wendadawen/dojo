@@ -31,7 +31,7 @@
 | `site/validate.py` | 发布闸门，入口只有一个 |
 | `concept/build.py` | 概念页生成器：读 `research/content.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码；生成后自动运行 `check.py` |
 | `concept/check.py` | 概念页机械检查：`--outline` 查大纲格式与字数预算；默认查正文的依据、数字、结构、链接 |
-| `archive/legacy-validate.py` | 论文、学习记录、数据流三类旧页面的校验：补回它们的样式表和文案，并关掉对 outdated 页面的跳过 |
+| `archive/legacy-validate.py` | 全部 outdated 页面的校验：补回论文、学习记录、数据流的样式表和文案，并关掉对 outdated 页面的跳过 |
 | `archive/dataflow-check.py` | 数据流页核查 |
 | `archive/dataflow-build.py` | 数据流页生成器 |
 
@@ -51,7 +51,7 @@
     # 改共享样式前后的渲染比对
     python3 .dojo/scripts/site/validate.py --diff <before-root> <after-root> <页面...> [--detail]
 
-只维护现行的概念页：标了 `dojo:status=outdated` 的页面整页跳过并提示数量；`dojo:type` 不是 `concept` 又没标 outdated 的页面报错。`--templates`、`--css`、`--copy` 同样只管概念页。
+只校验现行页面：标了 `dojo:status=outdated` 的页面整页跳过并提示数量。旧概念页、论文、学习记录、数据流都标了，目前只有 FlashAttention 在校验范围内。`dojo:type` 不是 `concept` 又没标 outdated 的页面报错。`--templates`、`--css`、`--copy` 只管概念页，`--all` 不含各页 `research/` 里的资料快照。
 
 页面校验覆盖：HTML 骨架、模板占位符、重复 id、同页锚点、本地引用、
 `research/` 目录、数学字符、结构图、正文居中、元数据词表、模板与共享 CSS
@@ -92,7 +92,7 @@
 
 已暂停类别的脚本，CI 不跑。用法见各脚本文件头部的说明。
 
-    # 校验旧页面（论文、学习记录、数据流），结果与拆分前的 validate.py 一致
+    # 校验所有 outdated 页面，结果与拆分前的 validate.py 一致
     python3 .dojo/scripts/archive/legacy-validate.py --all-outdated
     python3 .dojo/scripts/archive/legacy-validate.py wiki/<name>/index.html
 

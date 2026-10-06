@@ -32,8 +32,8 @@ ALLOWED_TYPES = [
     "paper",
 ]
 
-# 页面状态：dojo:status 可省略（等同 current）。outdated 表示该类页面的指南已归档，
-# 内容保留但不再维护，首页默认隐藏。
+# 页面状态：dojo:status 可省略（等同 current）。outdated 表示内容保留但不再维护：
+# 指南已归档的类别，或按旧写法写的概念页。首页默认隐藏，校验脚本跳过。
 ALLOWED_STATUS = [
     "current",
     "outdated",

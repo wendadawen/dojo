@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""已暂停类别（论文、学习记录、数据流）页面的校验。
+"""所有 dojo:status=outdated 页面的校验：旧概念页，以及已暂停的论文、学习记录、数据流。
 
-site/validate.py 只维护现行的概念页，对 dojo:status=outdated 的页面整页跳过。
-这里把三个暂停类别的样式表、概览文案补回去，并关掉跳过，用来在需要时校验那些旧页面：
+site/validate.py 对 dojo:status=outdated 的页面整页跳过。
+这里把三个暂停类别的样式表、概览文案补回去（旧概念页本来就在 validate.py 的表里），
+并关掉跳过，用来在需要时校验那些旧页面：
 
     python3 .dojo/scripts/archive/legacy-validate.py <页面...>
     python3 .dojo/scripts/archive/legacy-validate.py --all-outdated
