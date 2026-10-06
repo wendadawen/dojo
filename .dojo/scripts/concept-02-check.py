@@ -140,13 +140,33 @@ def check_basis(doc: dict, research: Path) -> list[str]:
     return errors
 
 
+TEXT_SUFFIXES = {".tex", ".txt", ".md", ".bbl", ".rst", ".html", ".htm"}
+MAX_TEXT_BYTES = 2_000_000
+
+
+def _text_files(sources: Path) -> list[Path]:
+    """sources/ 下用来核对数字的文本：递归读，只读论文源码、文本快照这类，
+    跳过仓库（代码和二进制太多）、PDF、图片和过大的文件。"""
+    if not sources.is_dir():
+        return []
+    out = []
+    for p in sorted(sources.rglob("*")):
+        if not p.is_file() or p.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        rel = p.relative_to(sources).parts
+        if rel[0] == "repo" or p.stat().st_size > MAX_TEXT_BYTES:
+            continue
+        out.append(p)
+    return out
+
+
 def check_numbers(doc: dict, research: Path) -> list[str]:
     """页面里出现的数字，必须在 research/sources/ 的快照里能找到，或所在段落标了自行构造。
 
     只在正文里查，公式和代码块里的数字不查，段落依据是「自行构造」的整段不查。
     """
     sources = research / "sources"
-    files = [p for p in sorted(sources.glob("*")) if p.is_file()] if sources.is_dir() else []
+    files = _text_files(sources)
     if not files:
         return ["数字：research/sources/ 下没有快照，无法核对页面里的数字"]
     hay = " ".join(p.read_text(encoding="utf-8", errors="ignore") for p in files).replace(",", "")

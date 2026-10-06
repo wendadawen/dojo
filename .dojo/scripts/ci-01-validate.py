@@ -174,10 +174,10 @@ RESEARCH_ALLOWED_FILES = {
     "dataflow.md",
     "concept.md",
     "content.md",
-    "index.md",
+    "conflicts.md",
 }
 RESEARCH_ALLOWED_DIRS = {"sources", "official"}
-REVIEW_FILE_RE = re.compile(r"review-\d+\.md")
+REVIEW_FILE_RE = re.compile(r"(?:outline-)?review-\d+\.md")
 INLINE_MATH_RE = re.compile(
     r"\$\$[\s\S]+?\$\$|"
     r"(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$(?!\$)|"
