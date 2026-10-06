@@ -76,4 +76,4 @@ measured.md   实测产物登记（有本机实测时）
 
 ## 发布
 
-从 `.dojo/templates/note/index.html` 复制页面，替换占位符和 `<!-- @content -->`。
+从 `.dojo/templates/archive/note/index.html` 复制页面，替换占位符和 `<!-- @content -->`。

@@ -8,7 +8,7 @@
 生成器只负责装配：读模板、替换占位符、把节点和面板写进页面。
 
 它不做这些事：
-  · 不定义页面骨架——骨架是 .dojo/templates/dataflow/index.html，唯一真相源
+  · 不定义页面骨架——骨架是 .dojo/templates/archive/dataflow/index.html，唯一真相源
   · 不校验事实——那是审查和 dataflow-check.py 的事
 
 数据结构（与引擎的契约，详见模板注释）
@@ -33,8 +33,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 # 模板相对仓库根的路径，从任意位置调用都能找到。
-TEMPLATE = Path(__file__).resolve().parents[2] / "templates" / "dataflow" / "index.html"
-REPO_ROOT = TEMPLATE.parents[3]
+TEMPLATE = Path(__file__).resolve().parents[2] / "templates" / "archive" / "dataflow" / "index.html"
+REPO_ROOT = TEMPLATE.parents[4]
 
 
 def node(nid: str, name: str, shape: str | None = None, kind: str = "op",

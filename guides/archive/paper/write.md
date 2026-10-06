@@ -4,7 +4,7 @@
 
 ## 1. 输入与写作边界
 
-输入为 `research/` 下的 scope.md、evidence.md、outline.md、glossary.md，以及外壳 `.dojo/templates/paper/index.html` 和组件库 `.dojo/templates/paper/components.html`。四份规划都满足完成条件后再写。写法按本文件和 outline.md。
+输入为 `research/` 下的 scope.md、evidence.md、outline.md、glossary.md，以及外壳 `.dojo/templates/archive/paper/index.html` 和组件库 `.dojo/templates/archive/paper/components.html`。四份规划都满足完成条件后再写。写法按本文件和 outline.md。
 
 按 outline.md 落实：页面开头、章节标题和顺序、各章职责、前置知识引用位置、贯穿示例的推进、表达材料及职责、原图选择、正文与折叠块分工、误解和边界的处理位置。证据不足或无法消歧的论断留在规划文件里。
 
@@ -24,8 +24,8 @@ wiki/<name>/
 
 ```bash
 mkdir -p wiki/<name>/research
-cp .dojo/templates/paper/index.html wiki/<name>/index.html
-cp .dojo/templates/paper/overview.html wiki/<name>/overview.html
+cp .dojo/templates/archive/paper/index.html wiki/<name>/index.html
+cp .dojo/templates/archive/paper/overview.html wiki/<name>/overview.html
 ```
 
 按 outline.md 从组件库选择组件，复制到 `<!-- @content -->` 处并替换【…】占位符。页面上的组件都在 outline.md 里选过。

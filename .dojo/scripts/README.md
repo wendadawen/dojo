@@ -7,7 +7,7 @@
 | 目录 | 放什么 |
 |---|---|
 | `.dojo/scripts/` | 工具脚本，按任务类别分子目录 |
-| `.dojo/templates/` | 页面骨架模板 |
+| `.dojo/templates/` | 页面骨架模板；已暂停类别的在 `archive/` 下 |
 | `.dojo/site/` | 首页的 JS 和 CSS，部署时拷成 `_site/assets/` |
 
 判断标准：文件里出现具体模型名或页面路径，它就不属于 `.dojo/`，而应放进该页
@@ -105,6 +105,6 @@
 | 模板 | 产出 |
 |---|---|
 | `.dojo/templates/concept/` | 概念的长页与短页，由 `concept/build.py` 读 `research/content.md` 生成 |
-| `.dojo/templates/paper/` | 论文解析页（已暂停） |
-| `.dojo/templates/note/` | 学习记录页（已暂停） |
-| `.dojo/templates/dataflow/` | 模型前向数据流页（已暂停），`archive/dataflow-build.py` 读 `research/dataflow.md` 生成 |
+| `.dojo/templates/archive/paper/` | 论文解析页（已暂停） |
+| `.dojo/templates/archive/note/` | 学习记录页（已暂停） |
+| `.dojo/templates/archive/dataflow/` | 模型前向数据流页（已暂停），`archive/dataflow-build.py` 读 `research/dataflow.md` 生成 |
