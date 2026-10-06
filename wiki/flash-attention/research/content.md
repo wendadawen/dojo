@@ -13,17 +13,17 @@
 
 ### 少读写，算得一样
 
-FlashAttention 是一种计算注意力的方法。它得到的结果与标准注意力完全相同，只是计算过程中不再把 $N\times N$ 的大矩阵写回显存。所有步骤在一次 kernel 调用里完成，输入读一次，输出写一次。
+FlashAttention 是一种计算注意力的方法。它得到的结果与标准注意力完全相同，只是计算过程中不再把 $N\times N$ 的大矩阵写回显存。所有步骤在一次 kernel 调用里完成。
 依据：paper/src-v2/src/intro.tex L31-L41
 
 ### 慢的是搬数据，不是做乘法
 
-GPU 的计算速度已经远超显存的读写速度，注意力里的 softmax 这类操作受显存读写限制：耗时由读写的数据量决定，不由乘法的次数决定。标准注意力要把两个 $N\times N$ 的矩阵写进显存再读回来，读写量随 $N$ 平方增长，所以只减少乘法次数并不能让它变快。
-依据：paper/src-v2/src/background.tex Hardware Performance；paper/src-v2/src/background.tex Standard Attention Implementation
+GPU 的计算速度已经远超显存的读写速度，注意力里的 softmax 这类操作受显存读写限制：耗时由读写的数据量决定，不由乘法的次数决定。标准注意力要把两个 $N\times N$ 的矩阵写进显存再读回来，读写量随 $N$ 平方增长，所以许多只减少乘法次数的近似方法，并没有带来实际的加速。
+依据：paper/src-v2/src/background.tex Hardware Performance；paper/src-v2/src/background.tex Standard Attention Implementation；paper/src-v2/src/intro.tex L12-L14
 
 ### 分块算、边算边修正、反向重算
 
-做法有三点。把输入切成小块，每次只在片上存储里算一块。softmax 需要整行的最大值和求和，所以每块额外记下这两个量，处理下一块时修正已有的结果。反向时不存 $S$、$P$，只存输出和这两个量，需要时在片上重新算出来。
+把输入切成小块，每次只在片上存储里算一块。softmax 需要整行的最大值和求和，所以每块额外记下这两个量，处理下一块时修正已有的结果。反向时不存 $S$、$P$，只存输出和这两个量，需要时在片上重新算出来。
 依据：paper/src-v2/src/algo.tex Tiling；paper/src-v2/src/algo.tex Recomputation
 
 ## 长页
@@ -33,7 +33,7 @@ GPU 的计算速度已经远超显存的读写速度，注意力里的 softmax �
 
 ### 注意力慢在读写，不在计算
 
-先固定符号。输入 $Q$、$K$、$V$ 都是 $N\times d$ 的矩阵，$N$ 是序列长度，$d$ 是头维度，通常 $N$ 远大于 $d$。标准注意力分三步：先算 $S=QK^\top$，再对 $S$ 的每一行做 softmax 得到 $P$，最后算 $O=PV$，其中 $S$、$P$ 都是 $N\times N$ 的矩阵，$O$ 是 $N\times d$ 的输出。
+输入 $Q$、$K$、$V$ 都是 $N\times d$ 的矩阵，$N$ 是序列长度，$d$ 是头维度，通常 $N$ 远大于 $d$。标准注意力分三步：先算 $S=QK^\top$，再对 $S$ 的每一行做 softmax 得到 $P$，最后算 $O=PV$，其中 $S$、$P$ 都是 $N\times N$ 的矩阵，$O$ 是 $N\times d$ 的输出。
 依据：paper/src-v2/src/background.tex Standard Attention Implementation
 
 GPU 的存储分两级。高带宽显存（HBM）容量大、速度慢，片上存储（SRAM）容量小、速度快，快约一个数量级，容量却小几个数量级。GPU 上一次运算称为一个 kernel：它从显存读入输入，在片上算完，再把输出写回显存。
@@ -60,7 +60,7 @@ GPU 的存储分两级。高带宽显存（HBM）容量大、速度慢，片上�
 
 $$m=\max(m^{(1)},m^{(2)}),\qquad \ell=e^{m^{(1)}-m}\ell^{(1)}+e^{m^{(2)}-m}\ell^{(2)}$$
 
-输出 $O$ 是各行 softmax 与 $V$ 的乘积，所以每处理完一块，已有的输出也要用同样的系数乘以新的归一化再更新：旧输出先乘上旧的求和量还原成未归一化的值，按新的最大值重新缩放，加上这一块的贡献，再除以新的求和量。
+输出 $O$ 是各行 softmax 与 $V$ 的乘积。显存里保存的是已经除过求和量的输出，所以每处理完一块，已有的输出也要更新：先乘上旧的求和量还原成未归一化的值，按新的最大值重新缩放，加上这一块的贡献，再除以新的求和量。逐行的公式见 3.1 的折叠块。
 依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm
 
 #### 一个能手算的例子
@@ -111,7 +111,7 @@ print(round(o, 4), round(full_o, 4))
 ::: 前向算法的逐行描述
 设片上存储大小为 $M$，取 $K$、$V$ 的块大小 $B_c=\lceil M/(4d)\rceil$，$Q$ 的块大小 $B_r=\min(\lceil M/(4d)\rceil,d)$。在显存里把输出 $O$ 和求和量 $\ell$ 初始化为 0，最大值 $m$ 初始化为负无穷。把 $Q$ 切成 $T_r=\lceil N/B_r\rceil$ 块，把 $K$、$V$ 切成 $T_c=\lceil N/B_c\rceil$ 块。
 
-对每个 $K$、$V$ 块 $j$：载入 $K_j$、$V_j$。对每个 $Q$ 块 $i$：载入 $Q_i$、$O_i$、$\ell_i$、$m_i$；在片上算 $S_{ij}=Q_iK_j^\top$；算这一小块每行的最大值 $\tilde m_{ij}$、减最大值后取指数的矩阵 $\tilde P_{ij}$、每行的和 $\tilde\ell_{ij}$；合并得到新的最大值 $m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij})$ 和新的求和量 $\ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}$；更新输出 $O_i\leftarrow\mathrm{diag}(\ell_i^{\mathrm{new}})^{-1}\left(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\mathrm{new}}}O_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde P_{ij}V_j\right)$；把 $O_i$、$\ell_i$、$m_i$ 写回显存。
+对每个 $K$、$V$ 块 $j$：载入 $K_j$、$V_j$。对每个 $Q$ 块 $i$：载入 $Q_i$、$O_i$、$\ell_i$、$m_i$；在片上算 $S_{ij}=Q_iK_j^\top$；算这一小块每行的最大值 $\tilde m_{ij}$、减最大值后取指数的矩阵 $\tilde P_{ij}$、每行的和 $\tilde\ell_{ij}$；合并得到新的最大值 $m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij})$ 和新的求和量 $\ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}$；更新输出（$\mathrm{diag}(v)$ 表示以向量 $v$ 为对角线的矩阵，左乘它等于按行缩放）$O_i\leftarrow\mathrm{diag}(\ell_i^{\mathrm{new}})^{-1}\left(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\mathrm{new}}}O_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde P_{ij}V_j\right)$；把 $O_i$、$\ell_i$、$m_i$ 写回显存。
 
 遍历完所有块后返回 $O$。
 依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm
@@ -119,18 +119,18 @@ print(round(o, 4), round(full_o, 4))
 
 ### 反向：重算代替存储
 
-反向传播要用到注意力矩阵 $S$ 和 $P$ 来计算对 $Q$、$K$、$V$ 的梯度。标准做法是前向时把它们存下来，占 $O(N^2)$ 显存。FlashAttention 只存输出 $O$ 和 softmax 的统计量（最大值 $m$ 与求和量 $\ell$），反向时从 $Q$、$K$、$V$ 的块在片上重新算出 $S$ 和 $P$。这类似选择性的梯度检查点。
+反向传播要用到注意力矩阵 $S$ 和 $P$ 来计算对 $Q$、$K$、$V$ 的梯度。标准做法是前向时把它们存下来，占 $O(N^2)$ 显存。FlashAttention 只存输出 $O$ 和 softmax 的统计量（最大值 $m$ 与求和量 $\ell$），反向时从 $Q$、$K$、$V$ 的块在片上重新算出 $S$ 和 $P$。这类似选择性的梯度检查点，即不存中间值、反向时重新计算。
 依据：paper/src-v2/src/algo.tex Recomputation
 
 重算会增加运算次数，但避免了把 $S$、$P$ 从显存读回来。由于注意力受访存限制，省下的读写比多出的运算更值，反向反而更快。
 依据：paper/src-v2/src/algo.tex Recomputation
 
-这也解释了为什么单靠把多个操作融合成一个 kernel 不够：训练时反向需要的中间值仍要写回显存，朴素融合的收益被抵消。要把整个过程融合起来，必须有重算来去掉对中间矩阵的存储。
-依据：paper/src-v2/src/background.tex L48-L55
+单靠把多个操作融合成一个 kernel，在训练时收益有限：反向需要的中间值仍要写回显存，朴素融合的收益被抵消。FlashAttention 用重算避免存储这些中间值。
+依据：paper/src-v2/src/background.tex L48-L55；paper/src-v2/src/algo.tex Recomputation
 
 ### 读写次数的分析
 
-设片上存储的大小为 $M$。标准注意力需要 $\Theta(Nd+N^2)$ 次显存读写，FlashAttention 需要 $\Theta(N^2d^2M^{-1})$ 次。$d$ 通常在 64 到 128，$M$ 约 100KB，$d^2$ 远小于 $M$，所以后者少得多。FlashAttention 的运算量其实更大，因为反向要重算，但读写少很多，速度反而更快，说明决定注意力速度的是读写次数，不是运算量。
+设片上存储的大小为 $M$。标准注意力需要 $\Theta(Nd+N^2)$ 次显存读写，FlashAttention 需要 $\Theta(N^2d^2M^{-1})$ 次。$d$ 通常在 64 到 128，$M$ 约 100KB，$d^2$ 远小于 $M$，所以后者少得多。FlashAttention 的运算量其实更大，因为反向要重算，但读写少很多，速度反而更快，说明读写次数是决定注意力速度的主要因素。
 依据：paper/src-v2/src/theory.tex Analysis: IO Complexity
 
 #### 两个读写次数的量级
@@ -138,14 +138,14 @@ print(round(o, 4), round(full_o, 4))
 标准注意力三步各自读写：算 $S$ 时读 $Q$、$K$ 写 $S$，是 $\Theta(Nd+N^2)$；算 $P$ 时读 $S$ 写 $P$，是 $\Theta(N^2)$；算 $O$ 时读 $P$、$V$ 写 $O$，是 $\Theta(Nd+N^2)$。合计 $\Theta(Nd+N^2)$。
 
 FlashAttention 中 $K$、$V$ 的每个元素只从显存读一次，而 $Q$ 和 $O$ 要被整个遍历 $T_c$ 次，每次读写 $\Theta(Nd)$，合计 $\Theta(NdT_c)$。块大小受片上存储限制，$B_c=O(M/d)$，所以 $T_c=\Theta(Nd/M)$，读写次数为 $\Theta(N^2d^2M^{-1})$，与片上存储容量成反比：存储越大，块越大，遍历越少。
-依据：paper/src-v2/src/theory.tex Analysis: IO Complexity；paper/src-v2/src/proofs.tex L85-L115
+依据：paper/src-v2/src/theory.tex Analysis: IO Complexity；paper/src-v2/src/proofs.tex L85-L139
 
 #### 为什么渐近上不能再少
 
-存在一个下界：对 $[d,Nd]$ 范围内所有可能的 $M$，不存在精确注意力算法能在读写次数上渐近地低于 $N^2d^2M^{-1}$。证明用到的事实是，当 $M=\Theta(Nd)$ 时，任何算法都至少要读完输入，读写次数不会低于 $Nd$。这个下界是对整个 $M$ 范围成立的，不针对某个具体的 $M$。
-依据：paper/src-v2/src/theory.tex Analysis: IO Complexity
+不存在一个精确注意力算法，能在 $[d,Nd]$ 范围内所有的片上存储大小 $M$ 上同时做到 $o(N^2d^2M^{-1})$ 次显存读写。证明用反证法：若存在，则在 $M=\Theta(Nd)$ 时读写次数是 $o(Nd)$，而输入 $Q$、$K$、$V$ 和输出 $O$ 本身就至少要 $Nd$ 次读写，二者矛盾。按每个 $M$ 分别给出下界，论文留作未来工作。
+依据：paper/src-v2/src/theory.tex Analysis: IO Complexity；paper/src-v2/src/proofs.tex L149-L165
 
 ### 适用条件与边界
 
-FlashAttention 的收益依赖于注意力受访存限制这一条件，换成计算受限的场景就没有这个收益。它的结果是精确的，不是近似：输出与标准注意力一致。它的实现需要为每一种新的注意力写一个专门的 CUDA kernel，要用比 PyTorch 低得多的语言，而且实现不一定能迁移到不同的 GPU 架构上。
+FlashAttention 通过减少显存读写来加速，这对受访存限制的操作才有意义，注意力正属于这一类。它的结果是精确的，不是近似：输出与标准注意力一致。它的实现需要为每一种新的注意力写一个专门的 CUDA kernel。CUDA 是编写 GPU 程序的底层语言，比 PyTorch 这类高层框架低得多，写起来工程量大，而且实现不一定能迁移到不同的 GPU 架构上。
 依据：paper/src-v2/src/discussion.tex L1-L8；paper/src-v2/src/background.tex Hardware Performance；paper/src-v2/src/algo.tex Efficient Attention Algorithm
