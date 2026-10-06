@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""概念页的生成器：读 research/concept.md，生成长页 index.html 和短页 overview.html。
+"""概念页的生成器：读 research/content.md，生成长页 index.html 和短页 overview.html。
 
 用法（从仓库根运行）：
-    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/concept.md
-    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/concept.md --run
+    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md
+    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md --run
     python3 .dojo/scripts/concept-01-build.py --selftest
 
-文件格式见 guides/concept.md。页面上的文字都来自 concept.md，生成器只做装配：
-把 Markdown 转成 HTML，给长页的章和小节编号，把「资料」生成为长页末尾的参考资料，
+文件格式见 guides/concept.md。页面上的文字都来自 content.md，生成器只做装配：
+把 Markdown 转成 HTML，给长页的章和小节编号，把「资料」生成为长页末尾的参考资料，把每段后面的「依据：」行取出并从页面里丢掉，
 并打印两页折叠块外的字数。--run 另外运行后面紧跟 text 代码块的 Python 代码，逐行比对输出。
 
 页面骨架是 .dojo/templates/concept/ 下的 index.html 和 overview.html。
@@ -47,7 +47,7 @@ CJK_RE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 WORD_RE = re.compile(r"[A-Za-z]+")
 DETAILS_RE = re.compile(r"<details\b(?:(?!<details\b)[\s\S])*?</details>")
-EXCERPT_RE = re.compile(r"摘录[（(](.+?)[）)][：:]\s*(.*)")
+BASIS_RE = re.compile(r"^依据[：:]\s*(.*)$")
 
 Line = tuple[int, str]
 
@@ -381,7 +381,10 @@ def render_blocks(lines: list[Line], ctx: Ctx, heading=None, level: str = "") ->
 # ---------- 整份文件 ----------
 
 def parse(text: str) -> dict:
-    """按 guides/concept.md 的格式切分：标题、页面信息、资料、短页、长页。"""
+    """按 guides/concept.md 的格式切分：标题、页面信息、资料、短页、长页。
+
+    每段正文后面的「依据：」行在这里取出，从正文里删掉；返回的 basis 是「依据所在行号 → 依据」。
+    """
     title, meta = "", {}
     sections: dict[str, list[Line]] = {}
     current, fence = None, False
@@ -427,21 +430,25 @@ def parse(text: str) -> dict:
         s = line.strip()
         if not s:
             continue
-        if not s.startswith("- "):
-            fail(no, "资料每条写成「- 」开头的一行，摘录缩进两格写在它下面")
-        if line.startswith("- "):
-            refs.append({"no": no, "text": s[2:].strip(), "excerpts": []})
-            continue
-        if not refs:
-            fail(no, "摘录要写在某条资料下面")
-        m = EXCERPT_RE.match(s[2:].strip())
-        if not m:
-            fail(no, "摘录写成「  - 摘录（位置）：原文」，括号用中文或英文的圆括号，位置里可以再带括号")
-        if not m.group(1).strip():
-            fail(no, "摘录的位置不能空：括号里写章节、页码、表号或公式号")
-        if not m.group(2).strip():
-            fail(no, "摘录的原文不能空：冒号后面逐字抄原文")
-        refs[-1]["excerpts"].append((no, m.group(1).strip(), m.group(2).strip()))
+        if not line.startswith("- "):
+            fail(no, "资料每条写成顶格的「- 」开头的一行，只写出处，不写摘录")
+        refs.append({"no": no, "text": s[2:].strip()})
+
+    basis: dict[int, str] = {}
+    for name in ("短页", "长页"):
+        kept: list[Line] = []
+        fence = False
+        for no, line in sections[name]:
+            if line.strip().startswith("```"):
+                fence = not fence
+            m = None if fence else BASIS_RE.match(line.strip())
+            if m:
+                if not m.group(1).strip():
+                    fail(no, "「依据：」后面要写文件和位置，或写「自行构造」")
+                basis[no] = m.group(1).strip()
+            else:
+                kept.append((no, line))
+        sections[name] = kept
 
     opening, chapters = split_long(sections["长页"])
     if not any(l.strip() for _, l in opening):
@@ -453,7 +460,7 @@ def parse(text: str) -> dict:
             fail(no, "章的标题不写编号，生成器会编号")
 
     return {"title": title, "meta": meta, "short": sections["短页"],
-            "opening": opening, "chapters": chapters, "refs": refs}
+            "opening": opening, "chapters": chapters, "refs": refs, "basis": basis}
 
 
 def split_long(lines: list[Line]) -> tuple[list[Line], list[tuple[int, str, list[Line]]]]:
@@ -535,7 +542,7 @@ def _fill(tpl: str, out_dir: Path, pairs: list[tuple[str, str]]) -> str:
 
 def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
           templates: Path | None = None) -> tuple[Path, Path, dict, Ctx]:
-    """research/concept.md → 页面目录下的 index.html 和 overview.html。"""
+    """research/content.md → 页面目录下的 index.html 和 overview.html。"""
     if out_dir is None:
         if md.parent.name != "research":
             raise SystemExit(f"{md} 不在 research/ 下，用 -o 指定输出目录")
@@ -632,18 +639,19 @@ def _selftest() -> int:
         "## 资料",
         "",
         "- 虚构论文：[示例](https://example.com/paper)",
-        "  - 摘录（第 1 章）：A fictional sentence.",
         "",
         "## 短页",
         "",
         "### 是什么",
         "",
         "玩具算子把输入乘 2，前置见[前置页](wiki/prereq)。",
+        "依据：book.txt 第 1 节",
         "",
         "## 长页",
         "",
         "开头一段，",
         "换行接着写。",
+        "依据：book.txt 第 1 节",
         "",
         "### 定义",
         "",
@@ -655,6 +663,7 @@ def _selftest() -> int:
         "- $y$：输出",
         "- 嵌套：",
         "  - 第二层 **加粗**",
+        "依据：自行构造",
         "",
         "| 输入 | 输出 |",
         "|---|---:|",
@@ -698,7 +707,7 @@ def _selftest() -> int:
         (wiki / "prereq" / "index.html").write_text("<html></html>", encoding="utf-8")
         pdir = root / "wiki" / "toy" / "research"
         pdir.mkdir(parents=True)
-        md = pdir / "concept.md"
+        md = pdir / "content.md"
         md.write_text(doc, encoding="utf-8")
         idx, ov, stats, ctx = build(md, wiki_root=wiki)
         t, o = idx.read_text(encoding="utf-8"), ov.read_text(encoding="utf-8")
@@ -727,6 +736,9 @@ def _selftest() -> int:
             ("折叠块外字数不含折叠块", count_words("<p>一二</p><details><summary>三</summary>"
                                           "<details>四</details></details>") == 2),
             ("统计", stats["chapters"] == 2 and stats["details"] == 3),
+            ("依据行不出现在页面里", "依据" not in t + o and "book.txt" not in t + o),
+            ("依据行被取出", sorted(parse(doc)["basis"].values()).count("book.txt 第 1 节") == 2
+             and "自行构造" in parse(doc)["basis"].values()),
         ]
         ran, problems = run_code(ctx.fences)
         checks.append(("--run：只跑带输出块的代码，输出一致", ran == 1 and not problems))
@@ -754,11 +766,9 @@ def _selftest() -> int:
             ("引用块", doc.replace("嵌套折叠。", "> 引用")),
             ("代码块未结束", doc.replace("print(2 * 1)\n```", "print(2 * 1)")),
             ("描述含公式", doc.replace("生成器自检页。", "自检 $x$。")),
-            ("摘录没有位置", doc.replace("摘录（第 1 章）", "摘录（）")),
-            ("摘录没有原文", doc.replace("A fictional sentence.", "")),
-            ("摘录写在所有资料之前", doc.replace("- 虚构论文：[示例](https://example.com/paper)\n"
-                                         "  - 摘录（第 1 章）：A fictional sentence.",
-                                         "  - 摘录（第 1 章）：A fictional sentence.")),
+            ("依据行后面是空的", doc.replace("依据：自行构造", "依据：")),
+            ("资料下面缩进写摘录", doc.replace("- 虚构论文：[示例](https://example.com/paper)",
+                                       "- 虚构论文：[示例](https://example.com/paper)\n  - 摘录：原文")),
         ]:
             md.write_text(broken, encoding="utf-8")
             try:
@@ -780,8 +790,8 @@ def _selftest() -> int:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="读 research/concept.md，生成页面目录下的 index.html 和 overview.html")
-    ap.add_argument("md", nargs="?", type=Path, help="wiki/<name>/research/concept.md")
+    ap = argparse.ArgumentParser(description="读 research/content.md，生成页面目录下的 index.html 和 overview.html")
+    ap.add_argument("md", nargs="?", type=Path, help="wiki/<name>/research/content.md")
     ap.add_argument("-o", "--out", type=Path, help="输出目录，默认 wiki/<name>/")
     ap.add_argument("--run", action="store_true", help="运行文中的 Python 代码并核对输出")
     ap.add_argument("--selftest", action="store_true", help="用虚构数据自检生成器")
@@ -789,7 +799,7 @@ if __name__ == "__main__":
     if a.selftest:
         raise SystemExit(_selftest())
     if a.md is None:
-        ap.error("需要 concept.md 的路径")
+        ap.error("需要 content.md 的路径")
     if not a.md.exists():
         raise SystemExit(f"文件不存在：{a.md}")
     index_path, overview_path, stats, ctx = build(a.md, a.out)
