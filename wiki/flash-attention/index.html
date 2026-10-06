@@ -90,7 +90,14 @@
 
 <details>
 <summary>四个数、两块的手算</summary>
-<p>取一行 $x=(1,2,3,4)$，$V$ 取 $(10,20,30,40)$ 的四个标量，分成两块 $(1,2)$ 和 $(3,4)$。块 1 的最大值是 2，求和量 $e^{-1}+1\approx1.3679$；块 2 的最大值是 4，求和量也是 $e^{-1}+1\approx1.3679$。合并时整行最大值取 4，块 1 的修正系数是 $e^{2-4}$，所以整行求和量 $=e^{-2}\times1.3679+1.3679\approx1.553$，与直接对整行算得的 $\ell$ 相同。每块各自的输出 $o_k$ 是该块内 softmax 与 $V$ 的乘积，即 $o_1\approx17.3106$、$o_2\approx37.3106$。按块合并时，用 $\ell^{(1)}e^{m^{(1)}-m}o_1$ 与 $\ell^{(2)}e^{m^{(2)}-m}o_2$ 相加，再除以整行求和量，得到的 $O$ 与整行直接算的 $34.9265$ 相同。</p>
+<p>取一行 $x=(1,2,3,4)$，$V$ 取 $(10,20,30,40)$ 的四个标量，分成两块 $(1,2)$ 和 $(3,4)$。按下面五步算，再用代码核对。</p>
+<ol>
+<li>各块自己算最大值和求和量：块 1 的最大值 $m^{(1)}=2$，求和量 $\ell^{(1)}=e^{-1}+1\approx1.3679$；块 2 的最大值 $m^{(2)}=4$，求和量 $\ell^{(2)}=e^{-1}+1\approx1.3679$。</li>
+<li>各块自己的输出 $o_k$ 是该块内 softmax 与 $V$ 的乘积：$o_1\approx17.3106$，$o_2\approx37.3106$。</li>
+<li>合并最大值：整行最大值 $m=\max(m^{(1)},m^{(2)})=4$，块 1 的修正系数是 $e^{m^{(1)}-m}=e^{2-4}$。</li>
+<li>合并求和量：$\ell=e^{-2}\times1.3679+1.3679\approx1.553$，与直接对整行算得的 $\ell$ 相同。</li>
+<li>合并输出：用 $\ell^{(1)}e^{m^{(1)}-m}o_1$ 与 $\ell^{(2)}e^{m^{(2)}-m}o_2$ 相加，再除以 $\ell$，得到 $O\approx34.9265$，与整行直接算的相同。</li>
+</ol>
 <div class="code-block"><pre><code class="language-python">import math
 
 x = [1.0, 2.0, 3.0, 4.0]
@@ -123,8 +130,30 @@ print(round(o, 4), round(full_o, 4))</code></pre></div>
 
 <details>
 <summary>前向算法的逐行描述</summary>
-<p>设片上存储大小为 $M$，取 $K$、$V$ 的块大小 $B_c=\lceil M/(4d)\rceil$，$Q$ 的块大小 $B_r=\min(\lceil M/(4d)\rceil,d)$。在显存里把输出 $O$ 和求和量 $\ell$ 初始化为 0，最大值 $m$ 初始化为负无穷。把 $Q$ 切成 $T_r=\lceil N/B_r\rceil$ 块，把 $K$、$V$ 切成 $T_c=\lceil N/B_c\rceil$ 块。</p>
-<p>对每个 $K$、$V$ 块 $j$：载入 $K_j$、$V_j$。对每个 $Q$ 块 $i$：载入 $Q_i$、$O_i$、$\ell_i$、$m_i$；在片上算 $S_{ij}=Q_iK_j^\top$；算这一小块每行的最大值 $\tilde m_{ij}$、减最大值后取指数的矩阵 $\tilde P_{ij}$、每行的和 $\tilde\ell_{ij}$；合并得到新的最大值 $m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij})$ 和新的求和量 $\ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}$；更新输出（$\mathrm{diag}(v)$ 表示以向量 $v$ 为对角线的矩阵，左乘它等于按行缩放）$O_i\leftarrow\mathrm{diag}(\ell_i^{\mathrm{new}})^{-1}\left(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\mathrm{new}}}O_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde P_{ij}V_j\right)$；把 $O_i$、$\ell_i$、$m_i$ 写回显存。第一块处理时 $m=-\infty$、$\ell=0$，旧值项的系数 $e^{m_i-m_i^{\mathrm{new}}}$ 为 0，更新结果就是这一块自己的值。</p>
+<p>先做准备：</p>
+<ol>
+<li>设片上存储大小为 $M$，$K$、$V$ 的块大小取 $B_c=\lceil M/(4d)\rceil$，$Q$ 的块大小取 $B_r=\min(\lceil M/(4d)\rceil,d)$。</li>
+<li>在显存里把输出 $O$ 和求和量 $\ell$ 初始化为 0，最大值 $m$ 初始化为负无穷。</li>
+<li>把 $Q$ 切成 $T_r=\lceil N/B_r\rceil$ 块，把 $K$、$V$ 切成 $T_c=\lceil N/B_c\rceil$ 块。</li>
+</ol>
+<p>然后是两层循环。外层对每个 $K$、$V$ 块 $j$ 载入 $K_j$、$V_j$；内层对每个 $Q$ 块 $i$，依次做：</p>
+<ol>
+<li>载入 $Q_i$、$O_i$、$\ell_i$、$m_i$。</li>
+<li>在片上算 $S_{ij}=Q_iK_j^\top$。</li>
+<li>算这一小块每行的最大值 $\tilde m_{ij}$、减最大值后取指数的矩阵 $\tilde P_{ij}$、每行的和 $\tilde\ell_{ij}$。</li>
+<li>
+<p>合并出新的最大值和新的求和量：</p>
+<p>$$m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij})$$</p>
+<p>$$\ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}$$</p>
+</li>
+<li>
+<p>更新输出：</p>
+<p>$$O_i\leftarrow\mathrm{diag}(\ell_i^{\mathrm{new}})^{-1}\left(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\mathrm{new}}}O_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde P_{ij}V_j\right)$$</p>
+<p>其中 $\mathrm{diag}(v)$ 表示以向量 $v$ 为对角线的矩阵，左乘它等于按行缩放。</p>
+</li>
+<li>把 $O_i$、$\ell_i$、$m_i$ 写回显存。</li>
+</ol>
+<p>第一块处理时 $m=-\infty$、$\ell=0$，旧值项的系数 $e^{m_i-m_i^{\mathrm{new}}}$ 为 0，更新结果就是这一块自己的值。</p>
 <p>遍历完所有块后返回 $O$。</p>
 </details>
 
