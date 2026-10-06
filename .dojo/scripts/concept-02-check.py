@@ -18,6 +18,7 @@ import importlib.util
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -44,6 +45,39 @@ ISBN_RE = re.compile(r"ISBN[\s:：-]*[0-9Xx-]{10,17}")
 REVIEW_FILE_RE = re.compile(r"review-(\d+)\.md")
 GATE_SECTIONS = ["摘录核验", "事实 1", "事实 2", "复算", "缺漏", "范围", "重复", "文风",
                  "读者 1", "读者 2", "处理"]
+
+
+def _norm(text: str) -> str:
+    """摘录与快照比对前的规范化：全角半角统一、去掉空白、列表符号、连字符断行和 LaTeX 记号。
+
+    只消除抽取原文时带进来的版式噪声，不改词和数字，所以改了词或数字的摘录仍然对不上。
+    """
+    text = unicodedata.normalize("NFKC", text).replace("\u00ad", "")
+    text = re.sub(r"-\s*\n\s*", "", text)
+    text = re.sub(r"\\(?:mathrm|mathbf|mathcal|text|operatorname)\{([^}]*)\}", r"\1", text)
+    text = text.replace("$", "")
+    return re.sub(r"[\s\\{}_^\u2022]", "", text)
+
+
+def check_excerpts(doc: dict, research: Path) -> list[str]:
+    """每条摘录都要能在 research/sources/ 下的快照里逐字找到（规范化之后）。"""
+    sources = research / "sources"
+    files = sorted(p for p in sources.glob("*") if p.is_file()) if sources.is_dir() else []
+    if not files:
+        return ["摘录：research/sources/ 下没有原文快照。取原文时同时存一份，"
+                "摘录才能对着它核对（guides/concept.md「资料与摘录」）"]
+    haystack = "".join(_norm(p.read_text(encoding="utf-8", errors="ignore")) for p in files)
+    errors = []
+    for ref in doc["refs"]:
+        for no, _pos, text in ref["excerpts"]:
+            key = _norm(text)
+            if key and key not in haystack:
+                head = max((m for m in range(len(key), 8, -1) if key[:m] in haystack), default=0)
+                where = (f"前 {head} 个字符吻合，之后对不上" if head
+                         else "开头就对不上")
+                errors.append(f"第 {no} 行：摘录在 research/sources/ 的快照里找不到（{where}）。"
+                              "摘录要逐字抄，不能合并不相邻的句子，也不能改词和数字")
+    return errors
 
 
 def sha256(path: Path) -> str:
@@ -111,6 +145,8 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
             errors.append(f"第 {ref['no']} 行：资料要带链接，没有网址的教材写 ISBN（guides/concept.md「资料与摘录」）")
         if not ref["excerpts"]:
             errors.append(f"第 {ref['no']} 行：这条资料下面没有摘录，每条至少一条（guides/concept.md「资料与摘录」）")
+
+    errors += check_excerpts(doc, md.parent)
 
     # 短页：三节、无折叠块/代码块/表格
     short_heads = [s[3:].strip() for _no, s in
@@ -246,6 +282,16 @@ def _selftest() -> int:
     ])
     cases = [
         ("通过的页面没有报错", good, None),
+        ("摘录改了一个词", good.replace("doubles its input", "triples its input"), "快照里找不到"),
+        ("摘录改了一个数字", good.replace("The toy operator doubles its input.",
+                                   "The output is 2x, where x = 3.6 here."), "快照里找不到"),
+        ("摘录拼接了不相邻的两句", good.replace("The toy operator doubles its input.",
+                                       "The toy operator doubles its input. Second claim: the output is 2x"),
+         "前"),
+        ("摘录跨行断字仍能对上", good.replace("The toy operator doubles its input.",
+                                      "The toy operator doubles its input. It is defined only for numbers."),
+         None),
+        ("没有快照", good, "没有原文快照"),
         ("资料没有链接", good.replace("，[示例](https://example.com/book)", ""), "资料要带链接"),
         ("资料没有摘录", good.replace("  - 摘录（第 1 章）：The toy operator doubles its input.\n", ""),
          "没有摘录"),
@@ -284,13 +330,25 @@ def _selftest() -> int:
             '<meta name="dojo:type" content="paper"><meta name="dojo:status" content="outdated">',
             encoding="utf-8")
         research = wiki / "toy" / "research"
-        research.mkdir(parents=True)
+        (research / "sources").mkdir(parents=True)
+        (research / "sources" / "book.txt").write_text(
+            "Chapter 1.\nThe toy operator doubles its input. It is\nde-\nfined only for numbers.\n"
+            "• Second claim: the output is 2x, where x = 3.5 here.\n", encoding="utf-8")
         md = research / "concept.md"
         for name, doc, want in cases:
             if name == "链接的不是概念页":
                 doc = good.replace("wiki/prereq", "wiki/oldie")
             md.write_text(doc, encoding="utf-8")
+            snap = research / "sources" / "book.txt"
+            if name == "没有快照":
+                saved = snap.read_text(encoding="utf-8"); snap.unlink()
+                (research / "sources").rmdir()
             errs = check(md, wiki)
+            if name == "没有快照":
+                (research / "sources").mkdir(); snap.write_text(saved, encoding="utf-8")
+            if name == "摘录跨行断字仍能对上":
+                results.append((name, not any("快照" in e for e in errs)))
+                continue
             if want is None:
                 results.append((name, not errs))
                 if errs:

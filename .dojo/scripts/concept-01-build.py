@@ -47,7 +47,7 @@ CJK_RE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 WORD_RE = re.compile(r"[A-Za-z]+")
 DETAILS_RE = re.compile(r"<details\b(?:(?!<details\b)[\s\S])*?</details>")
-EXCERPT_RE = re.compile(r"摘录[（(]([^）)]+)[）)][：:]\s*(.*)")
+EXCERPT_RE = re.compile(r"摘录[（(](.+?)[）)][：:]\s*(.*)")
 
 Line = tuple[int, str]
 
@@ -435,8 +435,12 @@ def parse(text: str) -> dict:
         if not refs:
             fail(no, "摘录要写在某条资料下面")
         m = EXCERPT_RE.match(s[2:].strip())
-        if not m or not m.group(2).strip():
-            fail(no, "摘录写成「  - 摘录（位置）：原文」，位置和原文都不能空")
+        if not m:
+            fail(no, "摘录写成「  - 摘录（位置）：原文」，括号用中文或英文的圆括号，位置里可以再带括号")
+        if not m.group(1).strip():
+            fail(no, "摘录的位置不能空：括号里写章节、页码、表号或公式号")
+        if not m.group(2).strip():
+            fail(no, "摘录的原文不能空：冒号后面逐字抄原文")
         refs[-1]["excerpts"].append((no, m.group(1).strip(), m.group(2).strip()))
 
     opening, chapters = split_long(sections["长页"])
@@ -751,6 +755,7 @@ def _selftest() -> int:
             ("代码块未结束", doc.replace("print(2 * 1)\n```", "print(2 * 1)")),
             ("描述含公式", doc.replace("生成器自检页。", "自检 $x$。")),
             ("摘录没有位置", doc.replace("摘录（第 1 章）", "摘录（）")),
+            ("摘录没有原文", doc.replace("A fictional sentence.", "")),
             ("摘录写在所有资料之前", doc.replace("- 虚构论文：[示例](https://example.com/paper)\n"
                                          "  - 摘录（第 1 章）：A fictional sentence.",
                                          "  - 摘录（第 1 章）：A fictional sentence.")),
