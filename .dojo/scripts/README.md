@@ -24,8 +24,8 @@
 | 脚本 | 作用 | 何时跑 |
 |---|---|---|
 | `ci-01-validate.py` | 发布闸门：页面、模板、内联脚本、样式、首页目录，入口只有一个 | CI + 本地 |
-| `concept-01-build.py` | 概念页生成器：读 `research/concept.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码；生成后自动运行 `concept-02-check.py` | 写概念页时；CI 跑 `--selftest` 和示范页 |
-| `concept-02-check.py` | 概念页机械检查：只查结构、字数、链接、代码块、资料与摘录；`--gate` 查审查门禁；`--hash` 取 `concept.md` 的哈希 | 写概念页时；CI 跑 `--selftest` |
+| `concept-01-build.py` | 概念页生成器：读 `research/content.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码；生成后自动运行 `concept-02-check.py` | 写概念页时；CI 跑 `--selftest` 和示范页 |
+| `concept-02-check.py` | 概念页机械检查：`--outline` 查大纲格式与字数预算；默认查正文的依据、数字、结构、链接 | 写概念页时；CI 跑 `--selftest` |
 | `dataflow-01-check.py` | （已归档）数据流页核查 | — |
 | `dataflow-02-build.py` | （已归档）数据流页生成器 | — |
 
@@ -54,11 +54,11 @@
 
 ### concept-01-build.py
 
-    # 读 research/concept.md，生成 wiki/<name>/index.html 和 overview.html
-    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/concept.md
+    # 读 research/content.md，生成 wiki/<name>/index.html 和 overview.html
+    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md
 
     # 另外运行文中后面跟着 text 输出块的 Python 代码，逐行比对输出
-    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/concept.md --run
+    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md --run
 
     # 自检（CI 会跑；用虚构数据验证生成器本身可用）
     python3 .dojo/scripts/concept-01-build.py --selftest
@@ -70,15 +70,15 @@
 
 ### concept-02-check.py
 
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md          # 机械检查
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md --hash   # 取 SHA-256
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md --gate   # 审查门禁
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/outline.md --outline   # 大纲
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/content.md             # 正文
     python3 .dojo/scripts/concept-02-check.py --selftest
 
 - 全部规则都报错，一次报完，每条写明行号、原因和 `guides/concept.md` 里的依据。
-- 只查机械能判准的事：页面目录名；主题和标签在词表内；每条资料有链接（或 ISBN）和至少一条摘录；短页恰好三节且没有折叠块、代码块、表格；长页最后一章叫「适用条件与边界」且前面至少有一章；正文不写外部网址；站内链接只指向现行的概念页；折叠块外字数不超上限；代码块只能是 python 加紧跟的 text 输出块。
-- 事实、范围、重复、文风、读不读得通，脚本不判断，由 `guides/concept/review.md` 里的审查者负责。
-- `--gate` 只看最后一份 `review-N.md`：结果为通过、记录的哈希与现在的 `concept.md` 一致、十个审查者的节齐全、没有「未返回」。
+- 大纲：长页、短页各一节；每个节点五样「标题｜写什么｜类型｜字数｜依据」，「写什么」一句话；类型限正文、公式、例子、折叠块；短页恰好三节；长页最后一个节点叫「适用条件与边界」；字数预算合计不超上限，折叠块不计入。
+- 正文：每段后面的「依据」指向 `research/sources/` 里存在的文件，位置是标题里的一段文字或行号范围；正文里的数字必须在 sources 里出现，「自行构造」的段落不查；短页恰好三节，不检查标题文字；站内链接只指向现行概念页；字数上限；代码块只能是 python 加紧跟的输出块。
+- 事实、范围、重复、文风、读不读得通，脚本不判断，由 `guides/concept/` 里的审查者负责。
+- `research/sources/` 不进 git，`sources/` 整体不进 git，只提交 `sources/index.md`。
 
 ### dataflow-01-check.py
 
@@ -121,7 +121,7 @@ Markdown 填进模板，不手工复制。
 
 | 模板 | 产出 |
 |---|---|
-| `.dojo/templates/concept/` | 概念的长页与短页，由 `concept-01-build.py` 读 `research/concept.md` 生成 |
+| `.dojo/templates/concept/` | 概念的长页与短页，由 `concept-01-build.py` 读 `research/content.md` 生成 |
 | `.dojo/templates/paper/` | 论文解析页（含概览页与组件片段） |
 | `.dojo/templates/note/` | 学习记录页 |
 | `.dojo/templates/dataflow/` | 模型前向数据流页（画布 + 参数面板），由 `dataflow-02-build.py` 读 `research/dataflow.md` 生成 |

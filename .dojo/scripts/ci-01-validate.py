@@ -173,6 +173,8 @@ RESEARCH_ALLOWED_FILES = {
     "measured.md",
     "dataflow.md",
     "concept.md",
+    "content.md",
+    "index.md",
 }
 RESEARCH_ALLOWED_DIRS = {"sources", "official"}
 REVIEW_FILE_RE = re.compile(r"review-\d+\.md")
