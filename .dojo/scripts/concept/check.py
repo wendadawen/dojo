@@ -2,12 +2,12 @@
 """概念页的机械检查：只查结构、字数、链接、代码块、大纲格式与「依据」是否核得上。
 
 用法（从仓库根运行）：
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/outline.md --outline
-    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/content.md
-    python3 .dojo/scripts/concept-02-check.py --selftest
+    python3 .dojo/scripts/concept/check.py wiki/<name>/research/outline.md --outline
+    python3 .dojo/scripts/concept/check.py wiki/<name>/research/content.md
+    python3 .dojo/scripts/concept/check.py --selftest
 
 规则全部报错，每条写明位置和原因，一次报完。语义上的判断（事实、范围、重复、文风、读不读得通）
-不在这里，交给 guides/concept/ 里的审查者。concept-01-build.py 生成完页面后会自动运行本脚本。
+不在这里，交给 guides/concept/ 里的审查者。build.py 生成完页面后会自动运行本脚本。
 
 「依据」怎么核：
     依据：<文件名> <位置>[；<文件名> <位置>]
@@ -26,19 +26,19 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[1]
+REPO_ROOT = HERE.parents[2]
 
 
-def _load(filename: str, name: str):
-    spec = importlib.util.spec_from_file_location(name, HERE / filename)
+def _load(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-build = _load("concept-01-build.py", "concept_build")
-vocab = _load("ci-01-validate.py", "ci_validate")
+build = _load(HERE / "build.py", "concept_build")
+vocab = _load(HERE.parent / "site" / "validate.py", "site_validate")
 
 SHORT_SECTIONS = 3
 LAST_CHAPTER = "适用条件与边界"

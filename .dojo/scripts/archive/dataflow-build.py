@@ -2,14 +2,14 @@
 """数据流页的生成器：读计划文件 research/dataflow.md，生成页面。
 
 用法（从仓库根运行）：
-    python3 .dojo/scripts/dataflow-02-build.py wiki/<name>/research/dataflow.md
+    python3 .dojo/scripts/archive/dataflow-build.py wiki/<name>/research/dataflow.md
 
 计划文件的格式见 guides/archive/model-dataflow/plan.md。页面上的文字全部来自计划文件，
 生成器只负责装配：读模板、替换占位符、把节点和面板写进页面。
 
 它不做这些事：
   · 不定义页面骨架——骨架是 .dojo/templates/dataflow/index.html，唯一真相源
-  · 不校验事实——那是审查和 dataflow-01-check.py 的事
+  · 不校验事实——那是审查和 dataflow-check.py 的事
 
 数据结构（与引擎的契约，详见模板注释）
     view  = { id, label, title, nodes[], edges[], groups[]?, notes[]?, info[]? }
@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 # 模板相对仓库根的路径，从任意位置调用都能找到。
-TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "dataflow" / "index.html"
+TEMPLATE = Path(__file__).resolve().parents[2] / "templates" / "dataflow" / "index.html"
 REPO_ROOT = TEMPLATE.parents[3]
 
 

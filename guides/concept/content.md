@@ -55,4 +55,4 @@
 - 站内链接写成 `[名字](wiki/<页面名>)`。正文里不写外部网址。
 - 图片放在 `wiki/<name>/assets/`，写成 `![说明](assets/<文件名>)`。结构图可以直接写 `<figure>`、`<div>` 或 `<svg>` 开头的 HTML。
 
-写完运行 `python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md --run`。它会生成两页、核对代码输出，并自动运行机械检查：依据的文件和位置存在、正文里的数字在 sources 里出现、结构和字数合规。报错就改，直到没有报错，再审正文。
+写完运行 `python3 .dojo/scripts/concept/build.py wiki/<name>/research/content.md --run`。它会生成两页、核对代码输出，并自动运行机械检查：依据的文件和位置存在、正文里的数字在 sources 里出现、结构和字数合规。报错就改，直到没有报错，再审正文。

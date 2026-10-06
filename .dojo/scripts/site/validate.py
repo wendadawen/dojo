@@ -5,19 +5,19 @@
 （那由独立审查负责）。
 
     # 页面校验（默认；顺带跑内联脚本语法，需要 node，缺失则跳过）
-    python3 .dojo/scripts/ci-01-validate.py <页面...>
-    python3 .dojo/scripts/ci-01-validate.py --all
+    python3 .dojo/scripts/site/validate.py <页面...>
+    python3 .dojo/scripts/site/validate.py --all
 
     # 专项
-    python3 .dojo/scripts/ci-01-validate.py --templates
-    python3 .dojo/scripts/ci-01-validate.py --copy [--fix]
-    python3 .dojo/scripts/ci-01-validate.py --js <页面...>
-    python3 .dojo/scripts/ci-01-validate.py --css [--module T] [--template P]
+    python3 .dojo/scripts/site/validate.py --templates
+    python3 .dojo/scripts/site/validate.py --copy [--fix]
+    python3 .dojo/scripts/site/validate.py --js <页面...>
+    python3 .dojo/scripts/site/validate.py --css [--module T] [--template P]
                                                  [--confirm] [--fix]
-    python3 .dojo/scripts/ci-01-validate.py --catalog --output _site/catalog.json
+    python3 .dojo/scripts/site/validate.py --catalog --output _site/catalog.json
 
     # 改共享样式前后的渲染比对
-    python3 .dojo/scripts/ci-01-validate.py --diff <before-root> <after-root> <页面...>
+    python3 .dojo/scripts/site/validate.py --diff <before-root> <after-root> <页面...>
 
 各段职责见文件内的分节标题。词表（ALLOWED_TOPICS / ALLOWED_TAGS /
 ALLOWED_TYPES）定义在这里，页面校验与目录构建共用同一份。
@@ -1598,7 +1598,7 @@ def run_css_check(argv: list[str]) -> int:
 
 def run_catalog(argv: list[str]) -> int:
     """--catalog：构建首页用的 catalog.json。"""
-    parser = argparse.ArgumentParser(prog="ci-01-validate --catalog")
+    parser = argparse.ArgumentParser(prog="site/validate.py --catalog")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args([a for a in argv if a != "--catalog"])

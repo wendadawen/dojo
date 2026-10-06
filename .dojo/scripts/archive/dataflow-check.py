@@ -13,27 +13,27 @@
   6. 几何    —— --geometry 时用无头 Chrome 量连线穿框与重合（见下）
   7. 截图    —— --shots 时逐张图截画布、说明面板和折叠，供人看
 
-前三项需要外部材料（源码 / 权重），所以不做进 ci-01-validate.py（那是纯静态
+前三项需要外部材料（源码 / 权重），所以不做进 site/validate.py（那是纯静态
 检查），单独跑这个脚本。
 
 用法：
     # 计划文件的源码位置
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/research/dataflow.md \
+    python3 .dojo/scripts/archive/dataflow-check.py wiki/<name>/research/dataflow.md \
         --source-root /path/to/transformers
 
     # 节点名与权重形状
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
+    python3 .dojo/scripts/archive/dataflow-check.py wiki/<name>/index.html \
         --source /path/to/modeling_x.py --shapes wiki/<name>/research/sources/shapes.json
 
     # 只看节点名（仍要 --source）
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html \
+    python3 .dojo/scripts/archive/dataflow-check.py wiki/<name>/index.html \
         --source /path/to/modeling_x.py --names-only
 
     # 几何：连线是否穿框、是否与别的线并排重合
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --geometry
+    python3 .dojo/scripts/archive/dataflow-check.py wiki/<name>/index.html --geometry
 
     # 截图
-    python3 .dojo/scripts/dataflow-01-check.py wiki/<name>/index.html --shots <目录>
+    python3 .dojo/scripts/archive/dataflow-check.py wiki/<name>/index.html --shots <目录>
 
 几何判据必须来自渲染后的像素，不能靠几何推算。
 

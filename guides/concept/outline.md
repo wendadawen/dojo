@@ -40,4 +40,4 @@
 - 短页固定三节，意思是「是什么」「为什么需要」「怎么做」，标题要和概念相关，不用这三个词。
 - 长页和短页互相独立，大纲里不写两页的对应关系。
 
-写完运行 `python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/outline.md --outline`，报错就改，直到没有报错，再审大纲。
+写完运行 `python3 .dojo/scripts/concept/check.py wiki/<name>/research/outline.md --outline`，报错就改，直到没有报错，再审大纲。

@@ -2,9 +2,9 @@
 """概念页的生成器：读 research/content.md，生成长页 index.html 和短页 overview.html。
 
 用法（从仓库根运行）：
-    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md
-    python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md --run
-    python3 .dojo/scripts/concept-01-build.py --selftest
+    python3 .dojo/scripts/concept/build.py wiki/<name>/research/content.md
+    python3 .dojo/scripts/concept/build.py wiki/<name>/research/content.md --run
+    python3 .dojo/scripts/concept/build.py --selftest
 
 文件格式见 guides/concept.md。页面上的文字都来自 content.md，生成器只做装配：
 把 Markdown 转成 HTML，给长页的章和小节编号，把「资料」生成为长页末尾的参考资料，把每段后面的「依据：」行取出并从页面里丢掉，
@@ -31,8 +31,8 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEMPLATES = HERE.parent / "templates" / "concept"
-REPO_ROOT = HERE.parents[1]
+TEMPLATES = HERE.parents[1] / "templates" / "concept"
+REPO_ROOT = HERE.parents[2]
 
 META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
 SECTIONS = ("资料", "短页", "长页")
@@ -806,8 +806,8 @@ if __name__ == "__main__":
     print(report(index_path, overview_path, stats))
     failed = False
     if a.out is None:
-        # 自动运行机械检查：规则见 concept-02-check.py，全部报错
-        checker = subprocess.run([sys.executable, str(HERE / "concept-02-check.py"), str(a.md)],
+        # 自动运行机械检查：规则见 check.py，全部报错
+        checker = subprocess.run([sys.executable, str(HERE / "check.py"), str(a.md)],
                                  capture_output=True, text=True)
         print(checker.stdout.rstrip())
         failed = checker.returncode != 0

@@ -72,7 +72,7 @@ measured.md   实测产物登记（有本机实测时）
 - 正文里的路径都在仓库里。
 - 含图或公式的页面在无头浏览器实测过渲染。
 - 已完成一轮独立来源核对，结果在 `research/review-1.md`。
-- `.dojo/scripts/ci-01-validate.py <页面路径>` 通过。
+- `.dojo/scripts/site/validate.py <页面路径>` 通过。
 
 ## 发布
 

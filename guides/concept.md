@@ -15,7 +15,7 @@
 3. **审大纲**：3 个审查者，最多 3 轮，见[审大纲](concept/review-outline.md)。
 4. **写正文**：写 `research/content.md`，每段后面附一行依据，见[正文](concept/content.md)。
 5. **审正文**：5 个审查者，最多 5 轮，见[审正文](concept/review-content.md)。
-6. **生成**：运行 `python3 .dojo/scripts/concept-01-build.py wiki/<name>/research/content.md --run`，生成两页，并自动运行机械检查。再运行 `python3 .dojo/scripts/ci-01-validate.py wiki/<name>/index.html wiki/<name>/overview.html`。
+6. **生成**：运行 `python3 .dojo/scripts/concept/build.py wiki/<name>/research/content.md --run`，生成两页，并自动运行机械检查。再运行 `python3 .dojo/scripts/site/validate.py wiki/<name>/index.html wiki/<name>/overview.html`。
 
 每一步完成再进入下一步。`<name>` 用小写英文和连字符。交付时回复里只写这次生成的页面路径。
 
@@ -58,6 +58,6 @@
 
 ## 页面信息与前置概念
 
-- 主题从 `AGENTS.md` 列的大类里选，标签从 `.dojo/scripts/ci-01-validate.py` 的 `ALLOWED_TAGS` 里选，没有贴切的用「通用概念」。
+- 主题从 `AGENTS.md` 列的大类里选，标签从 `.dojo/scripts/site/validate.py` 的 `ALLOWED_TAGS` 里选，没有贴切的用「通用概念」。
 - 写前置概念的链接前，打开那页读一遍，确认它讲的是概念本身、不是某个具体系统，才能链接；讲具体系统的当作没有。没有现行页面的，按这份指南先生成它，一路往下到基线为止。
 - 页面里的链接写成 `[名字](wiki/<页面名>)`，只能链接现行的概念页。出处不写进正文，只列在「资料」里。
