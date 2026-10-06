@@ -13,19 +13,21 @@
 判断标准：文件里出现具体模型名或页面路径，它就不属于 `.dojo/`，而应放进该页
 自己的 `wiki/<name>/` 目录（生成脚本、图片等）。
 
-## 只有四个脚本
+## 脚本
 
 分组依据是**在哪跑**，不是技术领域：
 
 - 站点的机械检查、构建，全在 CI 跑，归 `ci-`
 - 写某类页面时才用的生成与核查，按页面类型归 `concept-`、`dataflow-`；CI 只跑它们的自检和示范页
+- 数据流相关脚本对应的页面和指南已归档（见 `guides/archive/`），脚本保留，CI 不再跑
 
 | 脚本 | 作用 | 何时跑 |
 |---|---|---|
 | `ci-01-validate.py` | 发布闸门：页面、模板、内联脚本、样式、首页目录，入口只有一个 | CI + 本地 |
-| `concept-01-build.py` | 概念页生成器：读 `research/concept.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码 | 写概念页时；CI 跑 `--selftest` 和示范页 |
-| `dataflow-01-check.py` | 数据流页核查：节点名/形状回查源码；形状箭头两边都要有；`--geometry` 查连线；`--shots` 截图（画布、说明、折叠） | 写数据流页时 |
-| `dataflow-02-build.py` | 数据流页生成器：读计划文件 `research/dataflow.md`，填进模板产出页面 | 写新数据流页时；CI 跑 `--selftest` 和示范页 |
+| `concept-01-build.py` | 概念页生成器：读 `research/concept.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码；生成后自动运行 `concept-02-check.py` | 写概念页时；CI 跑 `--selftest` 和示范页 |
+| `concept-02-check.py` | 概念页机械检查：只查结构、字数、链接、代码块、资料与摘录；`--gate` 查审查门禁；`--hash` 取 `concept.md` 的哈希 | 写概念页时；CI 跑 `--selftest` |
+| `dataflow-01-check.py` | （已归档）数据流页核查 | — |
+| `dataflow-02-build.py` | （已归档）数据流页生成器 | — |
 
 ### ci-01-validate.py
 
@@ -62,8 +64,21 @@
     python3 .dojo/scripts/concept-01-build.py --selftest
 
 - 文件格式见 `guides/concept.md`。只认那里列出的写法，别的写法直接报错。
-- 格式错误会报出行号：缺「资料」「短页」「长页」之一、长页没有开头或没有章、章的标题带编号、折叠块里写标题、站内链接指向不存在的页面、落单的 `$` 等。
+- 格式错误会报出行号：缺「资料」「短页」「长页」之一、长页没有开头或没有章、章的标题带编号、摘录缺位置或原文、折叠块里写标题、站内链接指向不存在的页面、落单的 `$` 等。
 - 每次生成都打印长页折叠块外的字数和短页的字数，超出 `guides/concept.md` 定的上限时写明。长页顶部的阅读时间也按折叠块外的字算。
+- 生成完成后自动运行 `concept-02-check.py`，检查不过时退出码为 1。
+
+### concept-02-check.py
+
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md          # 机械检查
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md --hash   # 取 SHA-256
+    python3 .dojo/scripts/concept-02-check.py wiki/<name>/research/concept.md --gate   # 审查门禁
+    python3 .dojo/scripts/concept-02-check.py --selftest
+
+- 全部规则都报错，一次报完，每条写明行号、原因和 `guides/concept.md` 里的依据。
+- 只查机械能判准的事：页面目录名；主题和标签在词表内；每条资料有链接（或 ISBN）和至少一条摘录；短页恰好三节且没有折叠块、代码块、表格；长页最后一章叫「适用条件与边界」且前面至少有一章；正文不写外部网址；站内链接只指向现行的概念页；折叠块外字数不超上限；代码块只能是 python 加紧跟的 text 输出块。
+- 事实、范围、重复、文风、读不读得通，脚本不判断，由 `guides/concept/review.md` 里的审查者负责。
+- `--gate` 只看最后一份 `review-N.md`：结果为通过、记录的哈希与现在的 `concept.md` 一致、十个审查者的节齐全、没有「未返回」。
 
 ### dataflow-01-check.py
 

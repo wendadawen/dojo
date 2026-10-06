@@ -47,6 +47,7 @@ CJK_RE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 WORD_RE = re.compile(r"[A-Za-z]+")
 DETAILS_RE = re.compile(r"<details\b(?:(?!<details\b)[\s\S])*?</details>")
+EXCERPT_RE = re.compile(r"摘录[（(]([^）)]+)[）)][：:]\s*(.*)")
 
 Line = tuple[int, str]
 
@@ -421,14 +422,22 @@ def parse(text: str) -> dict:
         if not any(l.strip() for _, l in sections.get(name, [])):
             fail(0, f"缺少「{name}」一节")
 
-    refs = []
+    refs: list[dict] = []
     for no, line in sections["资料"]:
         s = line.strip()
         if not s:
             continue
         if not s.startswith("- "):
-            fail(no, "资料每条写成「- 」开头的一行")
-        refs.append((no, s[2:].strip()))
+            fail(no, "资料每条写成「- 」开头的一行，摘录缩进两格写在它下面")
+        if line.startswith("- "):
+            refs.append({"no": no, "text": s[2:].strip(), "excerpts": []})
+            continue
+        if not refs:
+            fail(no, "摘录要写在某条资料下面")
+        m = EXCERPT_RE.match(s[2:].strip())
+        if not m or not m.group(2).strip():
+            fail(no, "摘录写成「  - 摘录（位置）：原文」，位置和原文都不能空")
+        refs[-1]["excerpts"].append((no, m.group(1).strip(), m.group(2).strip()))
 
     opening, chapters = split_long(sections["长页"])
     if not any(l.strip() for _, l in opening):
@@ -493,7 +502,7 @@ def render(doc: dict, ctx: Ctx) -> tuple[str, str, dict]:
         parts += render_blocks(body, ctx, heading=sub, level="####")
     reading = "\n\n".join(parts)
     parts.append('<h2 id="references">参考资料</h2>\n<ol>\n'
-                 + "\n".join(f"<li>{inline(t, no, ctx)}</li>" for no, t in doc["refs"])
+                 + "\n".join(f"<li>{inline(r['text'], r['no'], ctx)}</li>" for r in doc["refs"])
                  + "\n</ol>")
     short = render_blocks(doc["short"], ctx, level="###",
                           heading=lambda t, no: f"<h2>{inline(t, no, ctx)}</h2>")
@@ -619,6 +628,7 @@ def _selftest() -> int:
         "## 资料",
         "",
         "- 虚构论文：[示例](https://example.com/paper)",
+        "  - 摘录（第 1 章）：A fictional sentence.",
         "",
         "## 短页",
         "",
@@ -740,6 +750,10 @@ def _selftest() -> int:
             ("引用块", doc.replace("嵌套折叠。", "> 引用")),
             ("代码块未结束", doc.replace("print(2 * 1)\n```", "print(2 * 1)")),
             ("描述含公式", doc.replace("生成器自检页。", "自检 $x$。")),
+            ("摘录没有位置", doc.replace("摘录（第 1 章）", "摘录（）")),
+            ("摘录写在所有资料之前", doc.replace("- 虚构论文：[示例](https://example.com/paper)\n"
+                                         "  - 摘录（第 1 章）：A fictional sentence.",
+                                         "  - 摘录（第 1 章）：A fictional sentence.")),
         ]:
             md.write_text(broken, encoding="utf-8")
             try:
@@ -775,9 +789,17 @@ if __name__ == "__main__":
         raise SystemExit(f"文件不存在：{a.md}")
     index_path, overview_path, stats, ctx = build(a.md, a.out)
     print(report(index_path, overview_path, stats))
+    failed = False
+    if a.out is None:
+        # 自动运行机械检查：规则见 concept-02-check.py，全部报错
+        checker = subprocess.run([sys.executable, str(HERE / "concept-02-check.py"), str(a.md)],
+                                 capture_output=True, text=True)
+        print(checker.stdout.rstrip())
+        failed = checker.returncode != 0
     if a.run:
         ran, problems = run_code(ctx.fences)
         for p in problems:
             print(p)
         print(f"运行了 {ran} 段代码，{len(problems)} 段有问题")
-        raise SystemExit(1 if problems else 0)
+        failed = failed or bool(problems)
+    raise SystemExit(1 if failed else 0)
