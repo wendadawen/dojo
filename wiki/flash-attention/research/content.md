@@ -103,15 +103,15 @@ print(round(o, 4), round(full_o, 4))
 
 ### 完整的前向算法
 
-外层循环遍历 $K$、$V$ 的块，内层循环遍历 $Q$ 的块。每一步把当前的 $K$、$V$ 块和 $Q$ 块载入片上，在片上算出这一小块的 $S$，更新输出和两个统计量，再写回显存。块的大小由片上存储的容量决定，一块 $K$、$V$ 要能放进片上存储。整个过程放进一次 kernel 调用：载入输入，在片上完成矩阵乘、softmax 等全部步骤，再把结果写回显存，中间的 $S$、$P$ 不出片。算法返回精确的 $\mathrm{softmax}(QK^\top)V$，除输入输出外额外只需要 $O(N)$ 的显存，用来存每行的最大值和求和量。
-依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm；paper/src-v2/src/proofs.tex L5-L20
+外层循环遍历 $K$、$V$ 的块，内层循环遍历 $Q$ 的块。$S=QK^\top$ 的每一行里，第 $j$ 段对应 $K$ 的第 $j$ 块，所以遍历 $K$、$V$ 的块，就是在逐段合并同一行的 softmax。每一步把当前的 $K$、$V$ 块和 $Q$ 块载入片上，在片上算出这一小块的 $S$，更新输出和两个统计量，再写回显存。块的大小由片上存储的容量决定，一块 $K$、$V$ 要能放进片上存储。整个过程放进一次 kernel 调用：载入输入，在片上完成矩阵乘、softmax 等全部步骤，再把结果写回显存，中间的 $S$、$P$ 不出片。算法返回精确的 $\mathrm{softmax}(QK^\top)V$，除输入输出外额外只需要 $O(N)$ 的显存，用来存每行的最大值和求和量。
+依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm；paper/src-v2/src/proofs.tex L5-L20；paper/src-v2/src/proofs.tex L116-L139
 
 #### 算法的完整步骤
 
 ::: 前向算法的逐行描述
 设片上存储大小为 $M$，取 $K$、$V$ 的块大小 $B_c=\lceil M/(4d)\rceil$，$Q$ 的块大小 $B_r=\min(\lceil M/(4d)\rceil,d)$。在显存里把输出 $O$ 和求和量 $\ell$ 初始化为 0，最大值 $m$ 初始化为负无穷。把 $Q$ 切成 $T_r=\lceil N/B_r\rceil$ 块，把 $K$、$V$ 切成 $T_c=\lceil N/B_c\rceil$ 块。
 
-对每个 $K$、$V$ 块 $j$：载入 $K_j$、$V_j$。对每个 $Q$ 块 $i$：载入 $Q_i$、$O_i$、$\ell_i$、$m_i$；在片上算 $S_{ij}=Q_iK_j^\top$；算这一小块每行的最大值 $\tilde m_{ij}$、减最大值后取指数的矩阵 $\tilde P_{ij}$、每行的和 $\tilde\ell_{ij}$；合并得到新的最大值 $m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij})$ 和新的求和量 $\ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}$；更新输出（$\mathrm{diag}(v)$ 表示以向量 $v$ 为对角线的矩阵，左乘它等于按行缩放）$O_i\leftarrow\mathrm{diag}(\ell_i^{\mathrm{new}})^{-1}\left(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\mathrm{new}}}O_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde P_{ij}V_j\right)$；把 $O_i$、$\ell_i$、$m_i$ 写回显存。
+对每个 $K$、$V$ 块 $j$：载入 $K_j$、$V_j$。对每个 $Q$ 块 $i$：载入 $Q_i$、$O_i$、$\ell_i$、$m_i$；在片上算 $S_{ij}=Q_iK_j^\top$；算这一小块每行的最大值 $\tilde m_{ij}$、减最大值后取指数的矩阵 $\tilde P_{ij}$、每行的和 $\tilde\ell_{ij}$；合并得到新的最大值 $m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij})$ 和新的求和量 $\ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}$；更新输出（$\mathrm{diag}(v)$ 表示以向量 $v$ 为对角线的矩阵，左乘它等于按行缩放）$O_i\leftarrow\mathrm{diag}(\ell_i^{\mathrm{new}})^{-1}\left(\mathrm{diag}(\ell_i)e^{m_i-m_i^{\mathrm{new}}}O_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde P_{ij}V_j\right)$；把 $O_i$、$\ell_i$、$m_i$ 写回显存。第一块处理时 $m=-\infty$、$\ell=0$，旧值项的系数 $e^{m_i-m_i^{\mathrm{new}}}$ 为 0，更新结果就是这一块自己的值。
 
 遍历完所有块后返回 $O$。
 依据：paper/src-v2/src/algo.tex Efficient Attention Algorithm
@@ -122,10 +122,10 @@ print(round(o, 4), round(full_o, 4))
 反向传播要用到注意力矩阵 $S$ 和 $P$ 来计算对 $Q$、$K$、$V$ 的梯度。标准做法是前向时把它们存下来，占 $O(N^2)$ 显存。FlashAttention 只存输出 $O$ 和 softmax 的统计量（最大值 $m$ 与求和量 $\ell$），反向时从 $Q$、$K$、$V$ 的块在片上重新算出 $S$，再用已存的整行统计量得到 $P$：$P_{ij}=\mathrm{diag}(\ell_i)^{-1}\exp(S_{ij}-m_i)$。这类似选择性的梯度检查点，即不存中间值、反向时重新计算。
 依据：paper/src-v2/src/algo.tex Recomputation；paper/src-v2/src/algo_details.tex L293
 
-重算会增加运算次数，但避免了把 $S$、$P$ 从显存读回来。多出的运算换来更少的显存读写，反向反而更快。
+重算会增加运算次数，但避免了把 $S$、$P$ 从显存读回来，反向反而更快。
 依据：paper/src-v2/src/algo.tex Recomputation
 
-单靠把多个操作融合成一个 kernel，在训练时收益有限：反向需要的中间值仍要写回显存，朴素融合的效果因此下降。FlashAttention 用重算避免存储这些中间值。
+把作用于同一输入的多个操作融合成一个 kernel，输入就只需从显存读一次，这叫 kernel 融合。但在训练时，反向需要的中间值仍要写回显存，朴素融合的效果因此下降。FlashAttention 用重算避免存储这些中间值。
 依据：paper/src-v2/src/background.tex L48-L55；paper/src-v2/src/algo.tex Recomputation
 
 ### 读写次数的分析
