@@ -50,6 +50,8 @@ LINES_RE = re.compile(r"[Ll](\d+)(?:\s*[-–~]\s*[Ll]?(\d+))?")
 NUM_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
 NODE_TYPES = ("正文", "公式", "例子", "折叠块")
 SELF_MADE = "自行构造"
+# 只认真正的依据行写法：「依据：」后面是「自行构造」，或「文件名.扩展名 位置」。正文里自然出现的「判断依据：……」不算
+BASIS_MID_RE = re.compile(r"\S.*依据[：:]\s*(?:自行构造|[\w./-]+\.(?:tex|md|txt|html|pdf)\b)")
 
 
 def outside_fences(lines: list[tuple[int, str]]):
@@ -290,6 +292,12 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
     errors += check_basis(doc, md.parent)
     errors += check_numbers(doc, md.parent)
 
+    # 依据必须单独成行：接在句子后面的「依据：」不会被生成器取出，会留在页面上
+    for no, line in outside_fences(body_lines(doc)):
+        if BASIS_MID_RE.search(line):
+            errors.append(f"第 {no} 行：「依据：」要单独写成一行，放在这段正文的下一行，"
+                          "不能接在句子后面，否则它会出现在页面上（guides/concept/content.md「怎么写」）")
+
     # 字数与代码块
     ctx = build.Ctx(out_dir, wiki_root)
     try:
@@ -458,6 +466,12 @@ def _selftest() -> int:
         ("依据写成标题的一段文字", good.replace("book.md 第 1 章", "book.md 玩具算子", 1), None),
         ("一段写两个依据", good.replace("依据：book.md 第 1 章", "依据：book.md 第 1 章；book.md 1.2 另一节", 1), None),
         ("整页没有依据", "\n".join(l for l in good.split("\n") if not l.startswith("依据：")), "全文没有一行"),
+        ("依据接在句子后面", good.replace("玩具算子把输入乘 2。\n依据：book.md 第 1 章", "玩具算子把输入乘 2。依据：book.md 第 1 章"),
+         "要单独写成一行"),
+        ("长页里依据接在句子后面", good.replace("只对数值输入成立。\n依据：book.md 第 1 章", "只对数值输入成立。依据：book.md 第 1 章"),
+         "要单独写成一行"),
+        ("正文里自然出现的「依据：」不报", good.replace("只对数值输入成立。", "判断的依据：资料里写得很清楚。"), None),
+        ("代码块里的依据不查", good.replace("print(2 * 1)", "print(2 * 1)  # 依据：无"), None),
         ("数字在资料里找不到", good.replace("取 3.5 时输出 7.0", "取 3.5 时输出 8.0"), "数字 8.0"),
         ("自行构造的段落数字不查", good.replace("用来演示。", "取 4242 试一下。"), None),
         ("数字在公式里不查", good.replace("开头一段。", "开头一段，$x=9999$。"), None),
