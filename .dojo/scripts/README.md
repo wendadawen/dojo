@@ -19,14 +19,15 @@
 
 | 目录 | 服务谁 | CI |
 |---|---|---|
-| `site/` | 整个站点：页面校验、模板、首页目录、样式。与页面类型无关的词表（主题、标签、类型、状态）也在这里 | 跑 |
+| `site/` | 整个站点：页面校验、模板、首页目录、样式，以及词表 `vocab.py`（主题、标签、类型、状态） | 跑 |
 | `concept/` | 概念页：从 `research/` 生成页面，检查大纲与正文 | 跑自检 |
 | `archive/` | 已暂停的页面类别（目前只有数据流） | 不跑 |
 
-依赖方向只有一个：`concept/` 读 `site/` 的词表，反过来不行。`archive/` 谁也不依赖。
+依赖方向只有一个：`concept/check.py` 读 `site/vocab.py`，反过来不行。`archive/` 谁也不依赖。
 
 | 脚本 | 作用 |
 |---|---|
+| `site/vocab.py` | 页面元数据的封闭词表，校验、目录、概念页检查共用 |
 | `site/validate.py` | 发布闸门，入口只有一个 |
 | `concept/build.py` | 概念页生成器：读 `research/content.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码；生成后自动运行 `check.py` |
 | `concept/check.py` | 概念页机械检查：`--outline` 查大纲格式与字数预算；默认查正文的依据、数字、结构、链接 |
@@ -51,8 +52,8 @@
 
 页面校验覆盖：HTML 骨架、模板占位符、重复 id、同页锚点、本地引用、
 `research/` 目录、数学字符、结构图、正文居中、元数据词表、模板与共享 CSS
-一致性。`ALLOWED_TOPICS` / `ALLOWED_TAGS` / `ALLOWED_TYPES` 三张词表也定义在
-这个文件里，页面校验与目录构建共用同一份。
+一致性。三张词表 `ALLOWED_TOPICS` / `ALLOWED_TAGS` / `ALLOWED_TYPES` 以及
+`ALLOWED_STATUS` 在同目录的 `vocab.py`，页面校验与目录构建共用同一份。
 
 改样式时的顺序：先 `--diff` 确认改动只影响预期页面，再 `--css` 找死规则。
 

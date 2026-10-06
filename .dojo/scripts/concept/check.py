@@ -38,7 +38,8 @@ def _load(path: Path, name: str):
 
 
 build = _load(HERE / "build.py", "concept_build")
-vocab = _load(HERE.parent / "site" / "validate.py", "site_validate")
+sys.path.insert(0, str(HERE.parent / "site"))
+import vocab  # noqa: E402
 
 SHORT_SECTIONS = 3
 LAST_CHAPTER = "适用条件与边界"

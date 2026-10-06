@@ -28,8 +28,8 @@ index.html    GitHub Pages 首页应用
 
 - 产出统一为 HTML 页面，写入 `wiki/<name>/`；目录与 Graph 由 GitHub Pages 构建扫描 `wiki/*/index.html` 生成。
 - 页面 `<head>` 包含 `description`（纯文本）、`dojo:summary`（可含 `$...$` 公式）、`dojo:type`、`dojo:topics`、`dojo:tag`。
-- `dojo:topics` 是粗分类，一个页面可以有多个，只能从这些大类里选：注意力机制、模型结构、推理系统、内存与缓存、并行与通信、训练与优化、多模态、数学基础、算法与数据结构、计算机系统、概率与统计、其他领域。概念不属于前面任何一类时用「其他领域」。需要新大类时，改 `.dojo/scripts/site/validate.py` 的 `ALLOWED_TOPICS`，并同步本文件列出的大类，再使用。
-- `dojo:tag` 只取一个值，写这篇讲什么技术，词表见 `.dojo/scripts/site/validate.py` 的 `ALLOWED_TAGS`。首页按类型和主题筛选，标签参与搜索。新领域的头几个概念先用「通用概念」，同一领域攒够 3 个再新增专属标签，并把已有页面改过去。
+- `dojo:topics` 是粗分类，一个页面可以有多个，只能从这些大类里选：注意力机制、模型结构、推理系统、内存与缓存、并行与通信、训练与优化、多模态、数学基础、算法与数据结构、计算机系统、概率与统计、其他领域。概念不属于前面任何一类时用「其他领域」。需要新大类时，改 `.dojo/scripts/site/vocab.py` 的 `ALLOWED_TOPICS`，并同步本文件列出的大类，再使用。
+- `dojo:tag` 只取一个值，写这篇讲什么技术，词表见 `.dojo/scripts/site/vocab.py` 的 `ALLOWED_TAGS`。首页按类型和主题筛选，标签参与搜索。新领域的头几个概念先用「通用概念」，同一领域攒够 3 个再新增专属标签，并把已有页面改过去。
 - 页面以 `../../libs/` 引用共享库。
 - 页面图片存入 `wiki/<name>/assets/`，用相对路径 `assets/...` 引用。
 - 生成页面后运行 `.dojo/scripts/site/validate.py <页面路径>`。
