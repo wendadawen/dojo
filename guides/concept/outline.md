@@ -1,6 +1,6 @@
 # 大纲
 
-读完 `sources/`，写 `wiki/<name>/research/outline.md`。大纲就是两个页面的骨架：先把结构定下来、审过，再写正文。
+读完 `sources/`，写 `wiki/<name>/research/outline.md`。
 
 ## 先想清楚
 

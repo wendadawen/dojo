@@ -10,8 +10,6 @@
 | 对照资料 | `outline-sources.md` | `outline.md`、`sources/` |
 | 篇幅与冗余 | `outline-size.md` | `outline.md` |
 
-读者不看 sources，是为了让他按真实读者的疑问去读，而不是按资料的结构去读。
-
 ## 什么算「必须改」
 
 只有这三类，其余都不算：
