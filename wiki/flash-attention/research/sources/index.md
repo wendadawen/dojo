@@ -1,0 +1,4 @@
+- paper/flashattention-v2.pdf｜论文｜https://arxiv.org/abs/2205.14135｜arXiv v2（2022-06-23，最新版）｜2026-10-06｜FlashAttention 原论文：用分块和 IO 感知减少 HBM 与 SRAM 之间的读写，精确计算注意力
+- paper/src-v2/｜论文｜https://arxiv.org/e-print/2205.14135v2｜arXiv v2 LaTeX 源码｜2026-10-06｜同一篇论文的 LaTeX 源码，含算法、IO 复杂度证明和实验表格
+- repo/｜仓库｜https://github.com/Dao-AILab/flash-attention｜commit 47e91f1f7dd8a22649cee0dd9a182b69ffe782ef（2026-10-05）｜2026-10-06｜原作者维护的官方实现仓库，含 FlashAttention 与后续版本的实现和说明
+- blog/crfm-2023-01-13.txt｜博客｜https://crfm.stanford.edu/2023/01/13/flashattention.html｜发表于 2023-01-13｜2026-10-06｜原作者 Tri Dao 的博客：把 FlashAttention 加速到长序列，说明长上下文为何有用（纯文本快照，原始 HTML 为 blog/crfm-2023-01-13.html）
