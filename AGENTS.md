@@ -1,36 +1,21 @@
 # Dojo
 
-技术学习仓库：整理论文解析、概念说明、问题解答与学习记录。
-
-## 目录结构
+技术学习知识库。
 
 ```text
-guides/       各类学习任务的操作指南
-wiki/         学习产出的可浏览页面，按需创建（wiki/<name>/index.html）
-.dojo/        通用构建设施（模板、首页资源、通用脚本），不含任何页面专属内容
-index.html    GitHub Pages 首页应用
+guides/       任务指南
+wiki/         页面，每页一个目录 wiki/<name>/
+.dojo/        模板、首页源码、脚本
+libs/         页面共用的前端库
+index.html    首页
 ```
 
-`.dojo/` 下只放通用设施，不出现具体模型名或页面名。某页专属的内容（生成脚本、
-图片）放进该页自己的 `wiki/<name>/` 目录。分组说明见 `.dojo/scripts/README.md`。
+## 任务
 
-## 任务路由
+用户想了解或学习某个概念，读 `guides/concept.md`，按它的六步做完，每步开始前读 `guides/concept/` 下对应的文档。需求不清楚时，只问一个能确定是哪个概念的问题。
 
-| 任务类型 | 读取并执行 |
-|---|---|
-| 了解某个概念、系统学习概念、把概念写成页面 | `guides/concept.md` |
+## 约束
 
-目前只维护按新流程生成的概念页。论文解析、学习记录、问题解答、模型数据流的指南已移到 `guides/archive/`，这几类页面和按旧写法写的概念页，在元数据里都标为 `dojo:status=outdated`，首页默认不显示，校验脚本也跳过。新流程生成的页面不写 `dojo:status`；旧概念页随复习慢慢按新流程重写。这几类任务等概念页稳定后再恢复，恢复前不要按归档指南生成新页面。
-
-执行任何任务前，先完整读取 `guides/concept.md`，再开始动手，按它的六步流程做到交付；每一步开始前，读该步骤对应的 `guides/concept/` 下的文档。需求不明确时，只提出一个能够确定是哪个概念的必要问题。
-
-## 项目约束
-
-- 产出统一为 HTML 页面，写入 `wiki/<name>/`；目录与 Graph 由 GitHub Pages 构建扫描 `wiki/*/index.html` 生成。
-- 页面 `<head>` 包含 `description`（纯文本）、`dojo:summary`（可含 `$...$` 公式）、`dojo:type`、`dojo:topics`、`dojo:tag`。
-- `dojo:topics` 是粗分类，一个页面可以有多个，只能从这些大类里选：注意力机制、模型结构、推理系统、内存与缓存、并行与通信、训练与优化、多模态、数学基础、算法与数据结构、计算机系统、概率与统计、其他领域。概念不属于前面任何一类时用「其他领域」。需要新大类时，改 `.dojo/scripts/site/vocab.py` 的 `ALLOWED_TOPICS`，并同步本文件列出的大类，再使用。
-- `dojo:tag` 只取一个值，写这篇讲什么技术，词表见 `.dojo/scripts/site/vocab.py` 的 `ALLOWED_TAGS`。首页按类型和主题筛选，标签参与搜索。新领域的头几个概念先用「通用概念」，同一领域攒够 3 个再新增专属标签，并把已有页面改过去。
-- 页面以 `../../libs/` 引用共享库。
-- 页面图片存入 `wiki/<name>/assets/`，用相对路径 `assets/...` 引用。
-- 生成页面后运行 `.dojo/scripts/site/validate.py <页面路径>`。
+- 页面写入 `wiki/<name>/`，用 `guides/concept.md` 里的脚本生成，不手写 HTML。
+- 主题和标签只能取 `.dojo/scripts/site/vocab.py` 里的词表，写在 `content.md` 开头。都不合适，主题用「其他领域」，标签用「通用概念」。
 - 未获明确授权，不执行 commit、push、仓库重命名或部署。
