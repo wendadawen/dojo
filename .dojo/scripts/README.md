@@ -21,7 +21,10 @@
 | 脚本 | 作用 |
 |---|---|
 | `site/vocab.py` | 页面元数据的封闭词表，校验、目录、概念页检查共用 |
-| `site/validate.py` | 发布闸门，入口只有一个 |
+| `site/validate.py` | 发布闸门，入口只有一个，只做调度 |
+| `site/page.py` | 页面、模板、内联脚本的校验 |
+| `site/styles.py` | 死 CSS 检测，以及改共享样式前后的渲染比对（`--confirm`、`--diff` 需要 Chrome） |
+| `site/catalog.py` | 扫描 `wiki/*/index.html` 生成首页的 `catalog.json` |
 | `concept/build.py` | 概念页生成器：读 `research/content.md`，产出 `index.html` 和 `overview.html`；`--run` 跑文中代码；生成后自动运行 `check.py` |
 | `concept/check.py` | 概念页机械检查：`--outline` 查大纲格式与字数预算；默认查正文的依据、数字、结构、链接 |
 | `archive/legacy-validate.py` | 全部 outdated 页面的校验：补回论文、学习记录、数据流的样式表和文案，并关掉对 outdated 页面的跳过 |

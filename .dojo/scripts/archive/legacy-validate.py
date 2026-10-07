@@ -13,23 +13,20 @@ site/validate.py 对 dojo:status=outdated 的页面整页跳过。
 
 from __future__ import annotations
 
-import importlib.util
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("site_validate", HERE.parent / "site" / "validate.py")
-validate = importlib.util.module_from_spec(spec)
-sys.modules["site_validate"] = validate
-spec.loader.exec_module(validate)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "site"))
+import page  # noqa: E402
+import validate  # noqa: E402
 
 # dataflow 有两代：旧页用 cytoscape + dojo-dataflow.css，新页用 ELK + dojo-flow.css。
-validate.TYPE_STYLESHEET.update({
+page.TYPE_STYLESHEET.update({
     "paper": ("dojo-paper.css",),
     "note": ("dojo-note.css",),
     "dataflow": ("dojo-flow.css", "dojo-dataflow.css"),
 })
-validate.SKIP_OUTDATED = False
+page.SKIP_OUTDATED = False
 
 
 def main() -> int:
@@ -38,7 +35,7 @@ def main() -> int:
         argv = [a for a in argv if a != "--all-outdated"]
         argv += sorted(
             str(p) for p in Path("wiki").glob("*/index.html")
-            if validate.OUTDATED_RE.search(p.read_text(encoding="utf-8", errors="ignore"))
+            if page.OUTDATED_RE.search(p.read_text(encoding="utf-8", errors="ignore"))
         )
     if not argv:
         print(__doc__)
