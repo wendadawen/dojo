@@ -21,15 +21,13 @@ from check_basis import (  # noqa: E402
     LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, check_basis_list,
 )
 
-NODE_TYPES = ("正文", "公式", "例子", "折叠块")
-
 
 # ---------- 解析 ----------
 
 def parse(md: Path) -> dict:
-    """返回 {sections, nodes, sources}。
+    """返回 {sections, nodes, bad, sources}。
     sections 是「## 长页」「## 短页」下的行；nodes 是按页分的节点列表，每个节点是
-    (行号, 标题, 写什么, 类型, 字数, 依据)；格式不对的节点记在 bad 里。
+    (行号, 标题, 写什么, 字数, 依据)；格式不对的节点记在 bad 里。
     """
     sections: dict[str, list[tuple[int, str]]] = {}
     cur = None
@@ -46,7 +44,7 @@ def parse(md: Path) -> dict:
             if not line.startswith("- "):
                 continue
             parts = [p.strip() for p in line[2:].split("｜")]
-            if len(parts) != 5:
+            if len(parts) != 4:
                 bad.append((no, len(parts)))
             else:
                 nodes[name].append((no, *parts))
@@ -59,8 +57,8 @@ def has_both_pages(o: dict) -> list[str]:
     return [f"大纲：缺少「## {n}」一节" for n in ("长页", "短页") if n not in o["sections"]]
 
 
-def node_has_five_parts(o: dict) -> list[str]:
-    return [f"第 {no} 行：节点要写成「标题｜写什么｜类型｜字数｜依据」五样，现在是 {n} 样" for no, n in o["bad"]]
+def node_has_four_parts(o: dict) -> list[str]:
+    return [f"第 {no} 行：节点要写成「标题｜写什么｜字数｜依据」四样，现在是 {n} 样" for no, n in o["bad"]]
 
 
 def each_page_has_nodes(o: dict) -> list[str]:
@@ -78,14 +76,9 @@ def what_is_one_short_sentence(o: dict) -> list[str]:
     return errors
 
 
-def type_is_allowed(o: dict) -> list[str]:
-    return [f"第 {no} 行：类型是 {'、'.join(NODE_TYPES)} 之一，现在是「{kind}」"
-            for page in o["nodes"].values() for no, _t, _w, kind, *_ in page if kind not in NODE_TYPES]
-
-
 def words_is_integer(o: dict) -> list[str]:
     return [f"第 {no} 行：字数写成一个整数，现在是「{words}」"
-            for page in o["nodes"].values() for no, _t, _w, _k, words, _b in page if not re.fullmatch(r"\d+", words)]
+            for page in o["nodes"].values() for no, _t, _w, words, _b in page if not re.fullmatch(r"\d+", words)]
 
 
 def basis_matches_sources(o: dict) -> list[str]:
@@ -116,18 +109,18 @@ def long_ends_with_boundary(o: dict) -> list[str]:
 
 
 def budget_within_limit(o: dict) -> list[str]:
+    """字数预算只算折叠块外的正文，折叠块不单独写预算。"""
     errors = []
     for name, limit in (("长页", LONG_LIMIT), ("短页", SHORT_LIMIT)):
-        total = sum(int(words) for _no, _t, _w, kind, words, _b in o["nodes"][name]
-                    if words.isdigit() and kind != "折叠块")
+        total = sum(int(words) for _no, _t, _w, words, _b in o["nodes"][name] if words.isdigit())
         if total > limit:
-            errors.append(f"大纲：{name}{'折叠块外' if name == '长页' else ''}的字数预算合计 {total}，超出上限 {limit}")
+            errors.append(f"大纲：{name}的字数预算合计 {total}，超出上限 {limit}")
     return errors
 
 
 RULES = [
-    has_both_pages, node_has_five_parts, each_page_has_nodes, what_is_one_short_sentence,
-    type_is_allowed, words_is_integer, basis_matches_sources, short_has_three_sections,
+    has_both_pages, node_has_four_parts, each_page_has_nodes, what_is_one_short_sentence,
+    words_is_integer, basis_matches_sources, short_has_three_sections,
     long_ends_with_boundary, budget_within_limit,
 ]
 
@@ -146,14 +139,14 @@ def check(md: Path) -> list[str]:
 
 GOOD = "\n".join([
     "# 大纲", "", "## 长页", "",
-    "- 开头｜讲清它是什么｜正文｜200｜book.md 第 1 章",
-    "- ### 定义｜输出等于输入的两倍｜正文｜300｜book.md 第 1 章",
-    "- #### 一个例子｜取 3.5 走一遍｜例子｜200｜自行构造",
-    "- ### 适用条件与边界｜只对数值输入成立｜正文｜200｜book.md L3-L4", "",
+    "- 开头｜讲清它是什么｜200｜book.md 第 1 章",
+    "- ### 定义｜输出等于输入的两倍｜300｜book.md 第 1 章",
+    "- #### 一个例子｜取 3.5 走一遍，过程折叠｜200｜自行构造",
+    "- ### 适用条件与边界｜只对数值输入成立｜200｜book.md L3-L4", "",
     "## 短页", "",
-    "- ### 它是什么｜一句话讲定义｜正文｜100｜book.md 第 1 章",
-    "- ### 为什么要它｜讲动机｜正文｜100｜自行构造",
-    "- ### 怎么用它｜讲用法｜正文｜100｜book.md 第 1 章",
+    "- ### 它是什么｜一句话讲定义｜100｜book.md 第 1 章",
+    "- ### 为什么要它｜讲动机｜100｜自行构造",
+    "- ### 怎么用它｜讲用法｜100｜book.md 第 1 章",
 ])
 SNAPSHOT = ("# 第 1 章 玩具算子\n\n玩具算子把输入乘 2。输入取 3.5 时输出 7.0。\n"
             "它只对数值输入成立。\n\n## 1.2 另一节\n\n更多内容。\n")
@@ -162,17 +155,16 @@ SNAPSHOT = ("# 第 1 章 玩具算子\n\n玩具算子把输入乘 2。输入取 
 CASES = [
     ("通过的大纲没有报错", GOOD, None),
     ("缺短页", GOOD.split("## 短页")[0], "缺少「## 短页」"),
-    ("节点只有四样", GOOD.replace("｜正文｜200｜book.md 第 1 章", "｜正文｜book.md 第 1 章", 1), "五样"),
-    ("类型不对", GOOD.replace("｜例子｜", "｜图｜"), "类型是"),
+    ("节点只有三样", GOOD.replace("｜200｜book.md 第 1 章", "｜book.md 第 1 章", 1), "四样"),
+    ("还带着旧的类型一栏", GOOD.replace("｜200｜book.md 第 1 章", "｜正文｜200｜book.md 第 1 章", 1), "四样"),
     ("字数不是整数", GOOD.replace("｜300｜", "｜三百｜"), "整数"),
     ("写什么超过一句话", GOOD.replace("输出等于输入的两倍", "字" * 90), "80 字"),
     ("依据的文件不存在", GOOD.replace("book.md 第 1 章", "x.md 第 1 章", 1), "不在 research/sources/ 下"),
     ("依据的章节找不到", GOOD.replace("book.md 第 1 章", "book.md 第 7 章", 1), "里没有标题含"),
     ("依据为空", GOOD.replace("｜自行构造", "｜", 1), "依据不能空"),
-    ("短页不是三节", GOOD.replace("- ### 怎么用它｜讲用法｜正文｜100｜book.md 第 1 章", ""), "恰好 3 节"),
+    ("短页不是三节", GOOD.replace("- ### 怎么用它｜讲用法｜100｜book.md 第 1 章", ""), "恰好 3 节"),
     ("长页最后一节不对", GOOD.replace("适用条件与边界", "什么时候不成立"), "最后一个节点"),
     ("长页预算超限", GOOD.replace("｜300｜", f"｜{LONG_LIMIT}｜"), "超出上限"),
-    ("折叠块不计入预算", GOOD.replace("｜例子｜200｜", f"｜折叠块｜{LONG_LIMIT}｜"), None),
 ]
 
 
