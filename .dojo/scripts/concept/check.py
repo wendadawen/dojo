@@ -123,12 +123,47 @@ def check_basis_item(item: str, sources: Path, cache: dict) -> str | None:
     return None
 
 
+def _paragraphs_without_basis(doc: dict) -> list[str]:
+    """每段正文后面都要有依据行。
+
+    依据行已被 parse 从正文里取走，只留下行号。一段文字之后出现过依据行，这段就有依据；
+    同一区块里一句引导加后面的有序列表，共用区块末尾的那一行。区块由标题、折叠块的
+    开头结尾隔开。只管文字：代码块、公式、表格、图片不算段落。
+    """
+    errors: list[str] = []
+    basis = sorted(doc["basis"])
+    parts = [doc["short"], doc["opening"]] + [body for _no, _name, body in doc["chapters"]]
+    for lines in parts:
+        fence = False
+        pending: int | None = None  # 当前区块里第一段还没遇到依据行的文字
+        last = 0                    # 上一个处理过的行号
+        for no, line in lines + [(10**9, "###")]:  # 末尾补一个区块边界
+            s = line.strip()
+            if pending is not None and any(last < n < no for n in basis):
+                pending = None
+            last = no
+            if s.startswith("```"):
+                fence = not fence
+                continue
+            if fence or not s or s.startswith(("$$", "|", "!", "<")):
+                continue
+            if s.startswith(("#", ":::")):
+                if pending is not None:
+                    errors.append(_NO_BASIS.format(pending))
+                pending = None
+            elif pending is None:
+                pending = no
+    return errors
+
+
+_NO_BASIS = "第 {} 行：这段正文后面没有「依据：」行（guides/concept/content.md「怎么写」）"
+
+
 def check_basis(doc: dict, research: Path) -> list[str]:
     errors: list[str] = []
     sources = research / "sources"
     cache: dict = {}
-    # 每个有正文的段落后面都要有依据：按「依据行出现在段落末尾」来数，
-    # 这里检查被取出的依据本身，以及短页、长页的每一节有没有依据
+    errors += _paragraphs_without_basis(doc)
     for no, text in doc["basis"].items():
         if text.strip() == SELF_MADE:
             continue
@@ -164,7 +199,8 @@ def _text_files(sources: Path) -> list[Path]:
 
 
 def check_numbers(doc: dict, research: Path) -> list[str]:
-    """页面里出现的数字，必须在 research/sources/ 的快照里能找到，或所在段落标了自行构造。
+    """页面里出现的数字，必须在 research/sources/ 的快照里作为一个完整的数出现过，
+    或所在段落标了自行构造。
 
     只在正文里查，公式和代码块里的数字不查，段落依据是「自行构造」的整段不查。
     """
@@ -173,15 +209,16 @@ def check_numbers(doc: dict, research: Path) -> list[str]:
     if not files:
         return ["数字：research/sources/ 下没有快照，无法核对页面里的数字"]
     hay = " ".join(p.read_text(encoding="utf-8", errors="ignore") for p in files).replace(",", "")
+    hay_numbers = set(NUM_RE.findall(hay))
     errors: list[str] = []
     for name in ("short", "opening"):
-        errors += _numbers_in(doc[name], hay, doc["basis"])
+        errors += _numbers_in(doc[name], hay_numbers, doc["basis"])
     for _no, _name, body in doc["chapters"]:
-        errors += _numbers_in(body, hay, doc["basis"])
+        errors += _numbers_in(body, hay_numbers, doc["basis"])
     return errors
 
 
-def _numbers_in(lines: list[tuple[int, str]], hay: str, basis: dict[int, str]) -> list[str]:
+def _numbers_in(lines: list[tuple[int, str]], hay: set[str], basis: dict[int, str]) -> list[str]:
     errors: list[str] = []
     para: list[tuple[int, str]] = []
     fence = False
@@ -476,6 +513,12 @@ def _selftest() -> int:
         ("数字在资料里找不到", good.replace("取 3.5 时输出 7.0", "取 3.5 时输出 8.0"), "数字 8.0"),
         ("自行构造的段落数字不查", good.replace("用来演示。", "取 4242 试一下。"), None),
         ("数字在公式里不查", good.replace("开头一段。", "开头一段，$x=9999$。"), None),
+        ("短页有一段没写依据", good.replace("用来演示。\n依据：自行构造\n", "用来演示。\n"), "后面没有「依据：」行"),
+        ("长页有一段没写依据", good.replace("只对数值输入成立。\n依据：book.md 第 1 章", "只对数值输入成立。"),
+         "后面没有「依据：」行"),
+        ("引导句和后面的列表共用一行依据", good.replace("只对数值输入成立。",
+                                             "分两步：\n\n1. 读入。\n2. 输出。"), None),
+        ("小整数不能靠子串命中", good.replace("开头一段。", "开头一段，共有 7 个。"), "数字 7"),
     ]
     results: list[tuple[str, bool]] = []
     with tempfile.TemporaryDirectory() as tmp:
