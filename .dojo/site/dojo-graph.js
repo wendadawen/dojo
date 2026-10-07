@@ -23,8 +23,6 @@
       muted: cssVar("--muted", "#686a64"),
       surface: cssVar("--surface", "#fffefa"),
       accent: cssVar("--accent", "#284f44"),
-      paper: cssVar("--paper-node", "#9b5c35"),
-      note: cssVar("--note-node", "#7a6230"),
       line: cssVar("--graph-line", "#7d807a"),
       incoming: cssVar("--incoming", "#2f6f9f"),
       outgoing: cssVar("--outgoing", "#b45f3d"),
@@ -177,9 +175,6 @@
     if (!global3d) return;
     const color = colors();
     const focusId = selectedId || hoveredId;
-    const nodeBaseColor = (node) => (
-      node.type === "paper" ? color.paper : node.type === "note" ? color.note : color.accent
-    );
     const focusedLink = (link) => focusId
       && (nodeId(link.source) === focusId || nodeId(link.target) === focusId);
     const linkDirection = (link) => {
@@ -195,7 +190,7 @@
     setLabelEmphasis(focusId);
     global3d
       .nodeColor((node) => {
-        const base = nodeBaseColor(node);
+        const base = color.accent;
         if (focusId) return isNeighbor(node.id, focusId) ? base : colorWithAlpha(base, .1);
         return node.match === false ? colorWithAlpha(base, .3) : base;
       })

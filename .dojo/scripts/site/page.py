@@ -1,6 +1,6 @@
 """页面与模板的校验：HTML 结构、元数据、本地引用、数学字符、research/ 目录、模板，以及内联脚本语法。
 
-由 validate.py 调度，也可以被 archive/legacy-validate.py 改写表后复用。
+由 validate.py 调度。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from vocab import ALLOWED_STATUS, ALLOWED_TAGS, ALLOWED_TOPICS, ALLOWED_TYPES  # noqa: E402
+from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
 
 
 # ============================================================
@@ -42,42 +42,13 @@ REQUIRED_WIKI_META = (
     "dojo:topics",
     "dojo:tag",
 )
-# 每个 dojo:type 对应的共享样式表，防止页面套错模板后仍能通过校验。
-# 元组第一项是该类型模板必须内联的样式表；页面引用其中任意一项即可。
-# 这里只放概念页。已暂停的论文、学习记录、数据流三类，它们的表在
-# archive/legacy-validate.py，那里补回表并打开对 outdated 页面的校验。
-TYPE_STYLESHEET = {
-    "concept": ("dojo-concept.css",),
-}
-# 页面标了 dojo:status=outdated 就整页跳过，不校验：旧概念页和已暂停类别的页面都是。
-# archive/legacy-validate.py 把它关掉。
-SKIP_OUTDATED = True
-OUTDATED_RE = re.compile(r'name="dojo:status"\s+content="outdated"')
+# 概念页要引用的共享样式表。
+CONCEPT_STYLESHEET = "dojo-concept.css"
 TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
-# <noscript> 里的 <style> 是无脚本回退的补充规则（例如让画布控件在无 JS 时
-# 显示出来），不是模板的主样式，判断样式来源时要排除。
 
-# 概览页与索引页的入口文案：历史上 A/B 两代并存，模板已固定为 B 世代。
-# A 世代 eyebrow「概念快速阅读」/ nav「深度教学 →」/ footer「快速阅读」
-# B 世代 eyebrow「概念概览」  / nav「完整说明 →」/ footer「概览」
-
-# research/ 允许的文件名集合。目录只放 .md，审查轮次按固定名字编号，sources/ 存放资料。
-RESEARCH_ALLOWED_FILES = {
-    "scope.md",
-    "evidence.md",
-    "outline.md",
-    "glossary.md",
-    "prereq-audit.md",
-    "draft-check.md",
-    "minor-fixes.md",
-    "check-status.md",
-    "arbitration.md",
-    "measured.md",
-    "dataflow.md",
-    "content.md",
-    "conflicts.md",
-}
+# research/ 允许的文件：大纲、正文、资料冲突记录、各轮审查记录，以及 sources/。
+RESEARCH_ALLOWED_FILES = {"outline.md", "content.md", "conflicts.md"}
 RESEARCH_ALLOWED_DIRS = {"sources"}
 REVIEW_FILE_RE = re.compile(r"(?:outline|content)-review-\d+\.md")
 INLINE_MATH_RE = re.compile(
@@ -119,12 +90,9 @@ ASCII_MATH_PATTERNS = (
     re.compile(r"[0-9A-Za-z]\s*\*\s*[0-9A-Za-z]"),
 )
 
-# 正文以文字形式提到的 research/ 文件必须真实存在。
-# 实测产物与来源快照不随站点发布（CI 用 --exclude='research/' 排除整个目录），
-# 正文里指向它们的路径在线上必然是 404。只有 measured.md 是明确允许的登记文件，
-# 指南要求正文写「实测得到」并指向它，所以单独放行。
+# 页面正文里不能提到 research/ 下的路径：research/ 不随站点发布（CI 用 --exclude='research/' 排除），
+# 读者点不开。
 RESEARCH_MENTION_RE = re.compile(r"research/[\w./-]*[\w/-]")
-RESEARCH_ALLOWED_RE = re.compile(r"^research/measured\.md$")
 
 # 结构图使用 HTML 或内联 SVG，不使用等宽字符拼出的框线图。
 BOX_DRAWING_RE = re.compile(r"[\u2500-\u257f\u2580-\u259f\u25a0-\u25ff\u2b00-\u2bff]")
@@ -189,14 +157,12 @@ class PageInspector(HTMLParser):
             self.prose_parts.append((context, data))
 
 
-def is_outdated(path: Path) -> bool:
-    """wiki 页面（含同目录的 overview.html）的 index.html 是否标了 dojo:status=outdated。"""
-    if not SKIP_OUTDATED or "wiki" not in path.parts:
-        return False
-    index = path if path.name == "index.html" else path.parent / "index.html"
-    if not index.exists():
-        return False
-    return bool(OUTDATED_RE.search(index.read_text(encoding="utf-8", errors="ignore")))
+def _links_stylesheet(inspector: "PageInspector") -> bool:
+    """是否引用了共享样式表。部署会给链接加 ?v=<sha>，比对时忽略查询串。"""
+    return any(
+        ref.split("?", 1)[0].endswith(f"libs/{CONCEPT_STYLESHEET}")
+        for ref in inspector.stylesheets
+    )
 
 
 def validate_page(path: Path) -> list[str]:
@@ -241,23 +207,8 @@ def validate_page(path: Path) -> list[str]:
         if not target.exists():
             errors.append(f"本地引用不存在：{ref}")
 
-    # 正文里以文字形式指向的 research/ 路径必须真实存在，且不能指向目录快照。
-    # research/ 整个目录不发布，正文指向它读者必然打不开；唯一例外是
-    # measured.md——指南规定实测结论以「实测得到」陈述并指向这份登记。
     for mention in RESEARCH_MENTION_RE.findall(text):
-        if RESEARCH_ALLOWED_RE.match(mention):
-            continue
-        target = (path.parent / mention).resolve()
-        if not target.exists():
-            errors.append(
-                f"引用了不存在的 research 文件：{mention}"
-                "（改写成「实测得到」，或指向 research/measured.md）"
-            )
-        else:
-            errors.append(
-                f"引用了不发布的 research 路径：{mention}"
-                "（research/ 不随站点发布，改写成「实测得到」，或指向 research/measured.md）"
-            )
+        errors.append(f"页面里提到了不发布的路径：{mention}")
 
     parts = path.parts
     is_wiki_page = "wiki" in parts
@@ -278,35 +229,10 @@ def validate_page(path: Path) -> list[str]:
                     f"主题不在词表里：{topic}（可选：{'、'.join(ALLOWED_TOPICS)}）"
                 )
 
-        raw_status = inspector.meta.get("dojo:status", "")
-        if raw_status and raw_status not in ALLOWED_STATUS:
-            errors.append(
-                f"状态不在词表里：{raw_status}（可选：{'、'.join(ALLOWED_STATUS)}；"
-                "省略即为 current）"
-            )
-
-        raw_type = inspector.meta.get("dojo:type", "")
-        if raw_type and raw_type not in ALLOWED_TYPES:
-            errors.append(
-                f"类型不在词表里：{raw_type}（可选：{'、'.join(ALLOWED_TYPES)}）"
-            )
-        elif raw_type and raw_type not in TYPE_STYLESHEET:
-            errors.append(
-                f"类型 {raw_type} 已暂停，只维护概念页"
-                "（归档的页面要标 dojo:status=outdated）"
-            )
-        elif raw_type in TYPE_STYLESHEET:
-            allowed_css = TYPE_STYLESHEET[raw_type]
-            # 部署会给样式链接加 ?v=<sha> 缓存参数，比对时忽略查询串。
-            if not any(
-                ref.split("?", 1)[0].endswith(f"libs/{css}")
-                for css in allowed_css
-                for ref in inspector.stylesheets
-            ):
-                errors.append(
-                    f"类型 {raw_type} 的页面要引用 "
-                    + " 或 ".join(f"../../libs/{css}" for css in allowed_css)
-                )
+        if inspector.meta.get("dojo:type") != "concept":
+            errors.append("dojo:type 必须是 concept")
+        if not _links_stylesheet(inspector):
+            errors.append(f"页面要引用 ../../libs/{CONCEPT_STYLESHEET}")
 
         # 标签取封闭词表内的单一值，防止细粒度标签再次碎片化
         raw_tag = inspector.meta.get("dojo:tag", "")
@@ -474,28 +400,19 @@ def check_body_centering(text: str) -> list[str]:
 
 
 def check_template(path: Path) -> list[str]:
-    """模板必须声明正确类型，并引用共享样式表。模板含占位符，不能走 validate_page。"""
+    """模板必须声明 dojo:type=concept，并引用共享样式表。模板含占位符，不能走 validate_page。"""
     errors: list[str] = []
-    module = path.parent.name
-    allowed_css = TYPE_STYLESHEET.get(module)
-    if allowed_css is None:
-        return errors
-
     text = path.read_text(encoding="utf-8", errors="ignore")
     inspector = PageInspector()
     inspector.feed(text)
     raw_type = inspector.meta.get("dojo:type", "")
-    if raw_type != module:
-        errors.append(f"模板的类型必须是 {module}，现在是：{raw_type or '（缺失）'}")
+    if raw_type != "concept":
+        errors.append(f"模板的类型必须是 concept，现在是：{raw_type or '（缺失）'}")
 
-    if not any(
-        ref.split("?", 1)[0].endswith(f"libs/{css}")
-        for css in allowed_css
-        for ref in inspector.stylesheets
-    ):
-        errors.append("模板要引用共享样式表：" + " 或 ".join(f"../../libs/{css}" for css in allowed_css))
-    elif not (Path("libs") / allowed_css[0]).exists():
-        errors.append(f"共享样式表不存在：libs/{allowed_css[0]}")
+    if not _links_stylesheet(inspector):
+        errors.append(f"模板要引用 ../../libs/{CONCEPT_STYLESHEET}")
+    elif not (Path("libs") / CONCEPT_STYLESHEET).exists():
+        errors.append(f"共享样式表不存在：libs/{CONCEPT_STYLESHEET}")
     return errors
 
 

@@ -19,7 +19,7 @@ from html import unescape
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from page import STYLE_RE, TYPE_STYLESHEET  # noqa: E402
+from page import CONCEPT_STYLESHEET, STYLE_RE  # noqa: E402
 
 
 # ============================================================
@@ -150,14 +150,9 @@ def process(path: Path, usage: set[str], fix: bool) -> list[str]:
     return removed
 
 
-def pages_of_type(root: Path, kind: str) -> list[Path]:
-    """wiki/ 下所有 dojo:type 等于 kind 的页面。"""
-    pattern = re.compile(r'name="dojo:type"\s+content="' + re.escape(kind) + r'"')
-    return [
-        path
-        for path in sorted(root.glob("wiki/*/index.html"))
-        if pattern.search(path.read_text(encoding="utf-8"))
-    ]
+def concept_pages(root: Path) -> list[Path]:
+    """wiki/ 下所有概念页的 index.html。"""
+    return sorted(root.glob("wiki/*/index.html"))
 
 
 def find_chrome() -> str | None:
@@ -438,51 +433,45 @@ def run_render_diff(args: list[str]) -> int:
 
 
 def run_css_check(argv: list[str]) -> int:
-    """--css：对每个有样式表的页面类型（现行只有 concept）跑死规则检测。
+    """--css：对概念页的共享样式表和页面内联的 <style> 跑死规则检测。
 
     --confirm 在浏览器里复核候选；--fix 直接删。
     """
     fix = "--fix" in argv
     confirm = "--confirm" in argv
 
-    total_removed = 0
-    for name in TYPE_STYLESHEET:
-        tpl = Path(f".dojo/templates/{name}/index.html")
-        sheet = Path("libs") / TYPE_STYLESHEET[name][0]
-        for needed in (tpl, sheet):
-            if not needed.exists():
-                print(f"错误：{needed} 不存在，无从检查", file=sys.stderr)
-                return 2
-        pages = pages_of_type(Path("."), name)
-        if not pages:
-            print(f"错误：没有 dojo:type={name} 的页面", file=sys.stderr)
+    tpl = Path(".dojo/templates/concept/index.html")
+    sheet = Path("libs") / CONCEPT_STYLESHEET
+    for needed in (tpl, sheet):
+        if not needed.exists():
+            print(f"错误：{needed} 不存在，无从检查", file=sys.stderr)
             return 2
-        # 共享样式表和页面里内联的 <style> 都查；用到哪些 class，看模板和这一类的所有页面
-        targets = [sheet] + pages
-        usage = build_usage([tpl] + pages, pages)
-        candidates: set[str] = set()
-        removed_here = 0
-        for path in targets:
-            removed = process(path, usage, fix)
-            removed_here += len(removed)
-            candidates.update(CLASS_TOKEN_RE.findall("\n".join(removed)))
-            if removed:
-                print(f"{path}：{len(removed)} 条规则")
-                for selector in removed:
-                    print(f"  - {selector}")
-        if confirm and candidates:
-            # 复核在真实页面里做：模板含占位符、相对路径也解析不到，
-            # 浏览器跑模板没有意义。
-            status = confirm_removals(candidates, pages)
-            if status != 0:
-                return status
-        total_removed += removed_here
-        if not removed_here:
-            print(f"{len(targets)} 个文件里没有死 CSS")
-
-    if total_removed:
-        print(f"\n{'已清掉' if fix else '发现'} {total_removed} 条死规则")
-        return 0 if fix else 1
-    return 0
+    pages = concept_pages(Path("."))
+    if not pages:
+        print("错误：没有概念页", file=sys.stderr)
+        return 2
+    # 共享样式表和页面里内联的 <style> 都查；用到哪些 class，看模板和所有概念页
+    targets = [sheet] + pages
+    usage = build_usage([tpl] + pages, pages)
+    candidates: set[str] = set()
+    removed_total = 0
+    for path in targets:
+        removed = process(path, usage, fix)
+        removed_total += len(removed)
+        candidates.update(CLASS_TOKEN_RE.findall("\n".join(removed)))
+        if removed:
+            print(f"{path}：{len(removed)} 条规则")
+            for selector in removed:
+                print(f"  - {selector}")
+    if confirm and candidates:
+        # 复核在真实页面里做：模板含占位符、相对路径也解析不到，浏览器跑模板没有意义。
+        status = confirm_removals(candidates, pages)
+        if status != 0:
+            return status
+    if not removed_total:
+        print(f"{len(targets)} 个文件里没有死 CSS")
+        return 0
+    print(f"\n{'已清掉' if fix else '发现'} {removed_total} 条死规则")
+    return 0 if fix else 1
 
 

@@ -4,10 +4,8 @@
   const elements = {
     status: document.getElementById("app-status"),
     search: document.getElementById("search-input"),
-    type: document.getElementById("type-filter"),
     topic: document.getElementById("topic-filter"),
     sort: document.getElementById("sort-order"),
-    outdated: document.getElementById("outdated-toggle"),
     tabs: [...document.querySelectorAll("[data-view]")],
     libraryView: document.getElementById("library-view"),
     mapView: document.getElementById("map-view"),
@@ -42,10 +40,8 @@
   const state = {
     catalog: null,
     query: "",
-    type: "",
     topic: "",
     sort: loadStoredSort(),
-    showOutdated: false,
     view: "library",
   };
   let last3dKey = null;
@@ -61,14 +57,10 @@
   }
 
   function populateFilters() {
-    const options = model.getFilterOptions(state.catalog.pages, state.showOutdated);
-    elements.type.innerHTML = optionMarkup("", "全部类型")
-      + options.types.map((value) => optionMarkup(value, model.typeLabel(value))).join("");
+    const options = model.getFilterOptions(state.catalog.pages);
     elements.topic.innerHTML = optionMarkup("", "全部主题")
       + options.topics.map((value) => optionMarkup(value, value)).join("");
-    elements.type.value = options.types.includes(state.type) ? state.type : "";
     elements.topic.value = options.topics.includes(state.topic) ? state.topic : "";
-    state.type = elements.type.value;
     state.topic = elements.topic.value;
   }
 
@@ -92,9 +84,7 @@
     const pages = filteredPages();
     elements.grid.innerHTML = pages.map(model.renderCard).join("");
     renderMath(elements.grid);
-    const total = state.showOutdated
-      ? state.catalog.pages.length
-      : state.catalog.pages.filter((page) => !model.isOutdated(page)).length;
+    const total = state.catalog.pages.length;
     elements.count.textContent = pages.length === total
       ? `共 ${pages.length} 篇`
       : `${pages.length} / ${total} 篇`;
@@ -135,7 +125,6 @@
     elements.mapDetails.hidden = false;
     elements.mapWorkspace.classList.add("has-details");
     elements.mapDetails.innerHTML = `
-      <p class="detail-type type-${model.escapeHtml(page.type)}">${model.escapeHtml(model.typeLabel(page.type))}</p>
       <h3>${model.escapeHtml(page.title)}</h3>
       <p class="detail-description">${model.escapeHtml(page.summary || page.description || "暂无摘要")}</p>
       <div class="detail-actions">
@@ -151,7 +140,7 @@
     if (!state.catalog) return;
     resetMapDetails();
     const matched = filteredPages();
-    const isFiltered = Boolean(state.query || state.type || state.topic);
+    const isFiltered = Boolean(state.query || state.topic);
     const matchIds = isFiltered ? new Set(matched.map((page) => page.id)) : null;
     // 搜索时把每个命中节点的引用和被引用（一跳邻居）一并纳入地图
     const visibleIds = new Set(matchIds || matched.map((page) => page.id));
@@ -161,15 +150,9 @@
         (page.outgoing || []).forEach((id) => visibleIds.add(id));
       }
     }
-    if (!state.showOutdated) {
-      const pageById = new Map(state.catalog.pages.map((page) => [page.id, page]));
-      for (const id of [...visibleIds]) {
-        if (model.isOutdated(pageById.get(id) || {})) visibleIds.delete(id);
-      }
-    }
     elements.globalGraph3d.hidden = false;
     try {
-      const mapKey = `${state.query}|${state.type}|${state.topic}|${state.showOutdated}`;
+      const mapKey = `${state.query}|${state.topic}`;
       if (graph.has3d() && mapKey === last3dKey) {
         graph.resume3d();
         setStatus("");
@@ -215,10 +198,8 @@
 
   function clearFilters() {
     state.query = "";
-    state.type = "";
     state.topic = "";
     elements.search.value = "";
-    elements.type.value = "";
     elements.topic.value = "";
     applyFilters();
   }
@@ -226,10 +207,6 @@
   function bindEvents() {
     elements.search.addEventListener("input", () => {
       state.query = elements.search.value;
-      applyFilters();
-    });
-    elements.type.addEventListener("change", () => {
-      state.type = elements.type.value;
       applyFilters();
     });
     elements.topic.addEventListener("change", () => {
@@ -245,11 +222,6 @@
       });
     }
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
-    elements.outdated.addEventListener("change", () => {
-      state.showOutdated = elements.outdated.checked;
-      populateFilters();
-      applyFilters();
-    });
     elements.clear.addEventListener("click", clearFilters);
     // 悬停卡片时预取对应文档，点开时基本不用等
     const prefetched = new Set();

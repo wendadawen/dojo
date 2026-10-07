@@ -3,8 +3,6 @@
   if (typeof module === "object" && module.exports) module.exports = api;
   root.DojoHomeModel = api;
 }(typeof globalThis !== "undefined" ? globalThis : this, function createModel() {
-  const TYPE_LABELS = { paper: "论文", concept: "概念", note: "笔记", dataflow: "数据流", unknown: "未分类" };
-
   function normalize(value) {
     return String(value || "").normalize("NFKC").toLocaleLowerCase();
   }
@@ -16,10 +14,6 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
-  }
-
-  function typeLabel(type) {
-    return TYPE_LABELS[type] || type || "未分类";
   }
 
   function shortLabel(page) {
@@ -63,8 +57,6 @@
   function filterPages(pages, state) {
     const query = normalize(state.query);
     const matched = pages
-      .filter((page) => state.showOutdated || !isOutdated(page))
-      .filter((page) => !state.type || page.type === state.type)
       .filter((page) => !state.topic || (page.topics || []).includes(state.topic))
       .filter((page) => {
         if (!query) return true;
@@ -79,14 +71,8 @@
     return sortPages(matched, state.sort || "newest");
   }
 
-  function isOutdated(page) {
-    return page.status === "outdated";
-  }
-
-  function getFilterOptions(allPages, showOutdated) {
-    const pages = showOutdated ? allPages : allPages.filter((page) => !isOutdated(page));
+  function getFilterOptions(pages) {
     return {
-      types: [...new Set(pages.map((page) => page.type).filter(Boolean))].sort(),
       topics: [...new Set(pages.flatMap((page) => page.topics || []))]
         .sort((a, b) => a.localeCompare(b, "zh-CN")),
     };
@@ -99,7 +85,6 @@
         label: page.title,
         shortLabel: shortLabel(page),
         path: page.path,
-        type: page.type,
         topics: page.topics || [],
         role,
         match,
@@ -169,8 +154,6 @@
       <article class="document-card">
         <button class="card-main" type="button" data-open-path="${escapeHtml(page.path)}">
           <span class="card-meta">
-            <span class="type-badge type-${escapeHtml(page.type)}">${escapeHtml(typeLabel(page.type))}</span>
-            ${isOutdated(page) ? '<span class="topic-chip outdated-chip">过时</span>' : ""}
             ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
             ${page.date ? `<time class="date-chip" datetime="${escapeHtml(page.date)}">${escapeHtml(page.date)}</time>` : ""}
           </span>
@@ -184,10 +167,8 @@
     escapeHtml,
     filterPages,
     getFilterOptions,
-    isOutdated,
     makeGlobalElements,
     makeLocalGraph,
     renderCard,
-    typeLabel,
   };
 }));

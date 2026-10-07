@@ -177,8 +177,6 @@ def parse_page(root: Path, page_path: Path) -> dict:
         "title": title,
         "description": clean_text(description),
         "summary": clean_text(summary),
-        "type": parser.meta.get("dojo:type", "").strip() or "unknown",
-        "status": parser.meta.get("dojo:status", "").strip() or "current",
         "topics": page_topics,
         "tag": parser.meta.get("dojo:tag", "").strip(),
         "_has_summary": bool(summary_meta),
@@ -217,8 +215,6 @@ def build_catalog(root: Path) -> dict:
     for page in pages:
         if not page.pop("_has_summary"):
             warnings.append({"type": "missing_summary", "source": page["id"]})
-        if page["type"] == "unknown":
-            warnings.append({"type": "unclassified", "source": page["id"]})
         if not page["topics"]:
             warnings.append({"type": "missing_topics", "source": page["id"]})
         for topic in page.pop("_invalid_topics"):

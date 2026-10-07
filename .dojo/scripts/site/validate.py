@@ -31,10 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from catalog import run_catalog  # noqa: E402
 from page import (  # noqa: E402
     TEMPLATE_DIR,
-    TYPE_STYLESHEET,
     check_inline_js,
     check_template,
-    is_outdated,
     validate_page,
 )
 from styles import run_css_check, run_render_diff  # noqa: E402
@@ -51,18 +49,15 @@ def main() -> int:
     if "--css" in argv:
         return run_css_check(argv)
     if "--templates" in argv:
-        template_root = Path(TEMPLATE_DIR)
-        templates = sorted(template_root / kind / "index.html" for kind in TYPE_STYLESHEET)
-        failures = [(t, check_template(t)) for t in templates]
-        failures = [(t, errs) for t, errs in failures if errs]
-        if failures:
+        template = Path(TEMPLATE_DIR) / "concept" / "index.html"
+        errs = check_template(template)
+        if errs:
             print("模板校验失败：")
-            for template, errs in failures:
-                print(f"- {template}")
-                for error in errs:
-                    print(f"  - {error}")
+            print(f"- {template}")
+            for error in errs:
+                print(f"  - {error}")
             return 1
-        print(f"模板校验通过：{len(templates)} 个模板")
+        print("模板校验通过")
         return 0
 
     args = [a for a in argv if a not in {"--all", "--js"}]
@@ -87,12 +82,6 @@ def main() -> int:
     if missing:
         print("错误：页面不存在：" + "、".join(missing))
         return 2
-    skipped = [p for p in pages if is_outdated(p)]
-    if skipped:
-        pages = [p for p in pages if p not in skipped]
-        print(f"note: 跳过 {len(skipped)} 个 dojo:status=outdated 的页面")
-        if not pages:
-            return 0
 
     if js_only:
         js_errors, total, ran = check_inline_js(pages)

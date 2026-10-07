@@ -66,17 +66,6 @@ def body_lines(doc: dict) -> list[tuple[int, str]]:
     return out
 
 
-def page_info(wiki_root: Path, page: str) -> tuple[str, str]:
-    """读 wiki/<page>/index.html 的 dojo:type 和 dojo:status。"""
-    text = (wiki_root / page / "index.html").read_text(encoding="utf-8")
-
-    def meta(key: str) -> str:
-        m = re.search(rf'<meta name="{key}" content="([^"]*)"', text)
-        return m.group(1) if m else ""
-
-    return meta("dojo:type"), meta("dojo:status") or "current"
-
-
 # ---------- 依据 ----------
 
 def _headings(path: Path) -> list[str]:
@@ -299,7 +288,7 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
     if len(doc["chapters"]) < 2:
         errors.append("长页：除「适用条件与边界」外，至少还要有一章讲机制")
 
-    # 链接：正文不写网址；站内链接只指向现行的概念页
+    # 链接：正文不写网址；站内链接只能指向 wiki/ 下已有的页面
     for no, line in outside_fences(body_lines(doc)):
         probe = re.sub(r"\$\$.+?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$", " ", line)
         if URL_RE.search(probe):
@@ -314,11 +303,6 @@ def check(md: Path, wiki_root: Path | None = None) -> list[str]:
             page = m.group(1)
             if not (wiki_root / page / "index.html").exists():
                 errors.append(f"第 {no} 行：链接的页面 wiki/{page} 不存在，先按指南生成它")
-                continue
-            ptype, status = page_info(wiki_root, page)
-            if ptype != "concept" or status != "current":
-                errors.append(f"第 {no} 行：wiki/{page} 不是现行的概念页（类型 {ptype}，状态 {status}），"
-                              "不能作前置概念链接")
 
     errors += check_basis(doc, md.parent)
     errors += check_numbers(doc, md.parent)
@@ -485,7 +469,6 @@ def _selftest() -> int:
         ("正文写外部网址", good.replace("输出是输入的两倍", "输出是输入的两倍（https://a.com）"),
          "不写外部网址"),
         ("链接的页面不存在", good.replace("wiki/prereq", "wiki/nope"), "格式"),
-        ("链接的不是概念页", good, "不是现行的概念页"),
         ("python 后面没有输出块", good.replace("```text\n2\n```\n", ""), "要紧跟"),
         ("其他语言的代码块", good.replace("```python\nprint(2 * 1)\n```\n\n```text\n2\n```", "```c\nint x;\n```"),
          "只能是 python"),
@@ -517,17 +500,12 @@ def _selftest() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         wiki = Path(tmp) / "wiki"
         (wiki / "prereq").mkdir(parents=True)
-        (wiki / "prereq" / "index.html").write_text('<meta name="dojo:type" content="concept">', encoding="utf-8")
-        (wiki / "oldie").mkdir()
-        (wiki / "oldie" / "index.html").write_text(
-            '<meta name="dojo:type" content="paper"><meta name="dojo:status" content="outdated">', encoding="utf-8")
+        (wiki / "prereq" / "index.html").write_text("<html></html>", encoding="utf-8")
         research = wiki / "toy" / "research"
         (research / "sources").mkdir(parents=True)
         (research / "sources" / "book.md").write_text(snap, encoding="utf-8")
         md = research / "content.md"
         for name, doc, want in cases:
-            if name == "链接的不是概念页":
-                doc = good.replace("wiki/prereq", "wiki/oldie")
             md.write_text(doc, encoding="utf-8")
             errs = check(md, wiki)
             if want is None:
