@@ -1,8 +1,6 @@
 # 构建脚本
 
-## 边界
-
-`.dojo/` 只放**通用设施**，不出现任何模型名或页面名。
+`.dojo/` 下是三类辅助文件：
 
 | 目录 | 放什么 |
 |---|---|
@@ -10,20 +8,15 @@
 | `.dojo/templates/` | 页面骨架模板；已暂停类别的在 `archive/` 下 |
 | `.dojo/site/` | 首页的 JS 和 CSS，部署时拷成 `_site/assets/` |
 
-判断标准：文件里出现具体模型名或页面路径，它就不属于 `.dojo/`，而应放进该页
-自己的 `wiki/<name>/` 目录（生成脚本、图片等）。
+某页专属的东西（生成脚本、图片）放进它自己的 `wiki/<name>/`，不放 `.dojo/`。
 
-## 目录
-
-分组依据是**脚本服务哪类任务**：
+## 脚本
 
 | 目录 | 服务谁 | CI |
 |---|---|---|
 | `site/` | 整个站点：页面校验、模板、首页目录、样式，以及词表 `vocab.py`（主题、标签、类型、状态） | 跑 |
 | `concept/` | 概念页：从 `research/` 生成页面，检查大纲与正文 | 跑自检 |
 | `archive/` | 已暂停的页面类别（目前只有数据流） | 不跑 |
-
-`concept/check.py` 读 `concept/build.py` 的解析和渲染，以及 `site/vocab.py` 的词表；`archive/` 不依赖其他目录。
 
 | 脚本 | 作用 |
 |---|---|
@@ -55,8 +48,7 @@
 
 页面校验覆盖：HTML 骨架、模板占位符、重复 id、同页锚点、本地引用、
 `research/` 目录、数学字符、结构图、正文居中、元数据词表、模板与共享 CSS
-一致性。三张词表 `ALLOWED_TOPICS` / `ALLOWED_TAGS` / `ALLOWED_TYPES` 以及
-`ALLOWED_STATUS` 在同目录的 `vocab.py`，页面校验与目录构建共用同一份。
+一致性。
 
 改样式时的顺序：先 `--diff` 确认改动只影响预期页面，再 `--css` 找死规则。
 
@@ -71,8 +63,7 @@
     # 自检（CI 会跑；用虚构数据验证生成器本身可用）
     python3 .dojo/scripts/concept/build.py --selftest
 
-- 文件格式见 `guides/concept/content.md`。只认那里列出的写法，别的写法直接报错。
-- 格式错误会报出行号：缺「资料」「短页」「长页」之一、长页没有开头或没有章、章的标题带编号、折叠块里写标题、站内链接指向不存在的页面、落单的 `$` 等。
+- 文件格式见 `guides/concept/content.md`。格式错误会报出行号：缺「资料」「短页」「长页」之一、长页没有开头或没有章、章的标题带编号、折叠块里写标题、站内链接指向不存在的页面、落单的 `$` 等。
 - 每次生成都打印长页折叠块外的字数和短页的字数，超出 `guides/concept.md` 定的上限时写明。长页顶部的阅读时间也按折叠块外的字算。
 - 生成完成后自动运行 `check.py`，检查不过时退出码为 1。
 
@@ -82,17 +73,16 @@
     python3 .dojo/scripts/concept/check.py wiki/<name>/research/content.md             # 正文
     python3 .dojo/scripts/concept/check.py --selftest
 
-- 全部规则都报错，一次报完，每条写明行号、原因和 `guides/concept.md` 里的依据。
 - 大纲：长页、短页各一节；每个节点五样「标题｜写什么｜类型｜字数｜依据」，「写什么」一句话；类型限正文、公式、例子、折叠块；短页恰好三节；长页最后一个节点叫「适用条件与边界」；字数预算合计不超上限，折叠块不计入。
 - 正文：每段文字后面都要有「依据」，指向 `research/sources/` 里存在的文件，位置是标题里的一段文字或行号范围；正文里的数字必须在 sources 里作为完整的数出现（7 不算命中 17），「自行构造」的段落不查；短页恰好三节，不检查标题文字；站内链接只指向现行概念页；字数上限；代码块只能是 python 加紧跟的输出块；「依据：」必须单独成行。
 - 事实、范围、重复、文风、读不读得通，脚本不判断，由 `guides/concept/` 里的审查者负责。
-- `research/sources/` 整体不进 git，只提交 `sources/index.md`。
+- `research/sources/` 不进 git，只提交 `sources/index.md`。
 
 ### archive/
 
 已暂停类别的脚本，CI 不跑。用法见各脚本文件头部的说明。
 
-    # 校验所有 outdated 页面，结果与拆分前的 validate.py 一致
+    # 校验所有 outdated 页面
     python3 .dojo/scripts/archive/legacy-validate.py --all-outdated
     python3 .dojo/scripts/archive/legacy-validate.py wiki/<name>/index.html
 
