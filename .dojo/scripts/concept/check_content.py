@@ -6,7 +6,7 @@
 
 每条规则是下面一个函数，收到解析好的正文，返回问题列表。要增删规则，增删函数，
 再改文件末尾的 RULES。语义上的判断（事实、范围、重复、文风、读不读得通）不在这里，
-交给 guides/concept/ 里的审查者。build.py 生成完页面后会自动运行本脚本。
+交给 guides/concept/ 里的审查者。build_page.py 生成完页面后会自动运行本脚本。
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
-import build  # noqa: E402
+import build_page  # noqa: E402
 import vocab  # noqa: E402
-from checklib import (  # noqa: E402
+from check_basis import (  # noqa: E402
     LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, check_basis_list,
 )
 
@@ -53,7 +53,7 @@ class Content:
         self.sources = md.parent / "sources"
         self.out_dir = md.parent.parent
         self.wiki_root = wiki_root
-        self.doc = build.parse(self.text)  # 格式不对会抛 SystemExit，由 check() 接住
+        self.doc = build_page.parse(self.text)  # 格式不对会抛 SystemExit，由 check() 接住
         self.basis = self.doc["basis"]
         self.parts = [self.doc["short"], self.doc["opening"]] + [b for _n, _t, b in self.doc["chapters"]]
         self.body = [ln for part in self.parts for ln in part]
@@ -62,8 +62,8 @@ class Content:
     def rendered(self):
         """渲染一次，得到字数统计和代码块。格式错误时抛 SystemExit。"""
         if self._render is None:
-            ctx = build.Ctx(self.out_dir, self.wiki_root)
-            _body, _short, stats = build.render(self.doc, ctx)
+            ctx = build_page.Ctx(self.out_dir, self.wiki_root)
+            _body, _short, stats = build_page.render(self.doc, ctx)
             self._render = (stats, ctx.fences)
         return self._render
 

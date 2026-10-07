@@ -34,7 +34,7 @@ COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 # 库在运行时注入的 class，静态标记里查不到，必须视为已用
 RUNTIME_PREFIXES = ("katex", "token", "language-", "prism", "line-numbers")
 # 概念页生成器：它源码里写的 class="..." 都是页面可能出现的 class
-GENERATOR = Path(__file__).resolve().parents[1] / "concept" / "build.py"
+GENERATOR = Path(__file__).resolve().parents[1] / "concept" / "build_page.py"
 
 # --confirm 用的无头浏览器
 CHROME_CANDIDATES = (

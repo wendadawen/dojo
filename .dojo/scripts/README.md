@@ -8,7 +8,7 @@
     python3 .dojo/scripts/concept/check_outline.py wiki/<name>/research/outline.md
 
     # 生成长页和短页，并自动检查正文；--run 同时运行文中的代码并核对输出
-    python3 .dojo/scripts/concept/build.py wiki/<name>/research/content.md --run
+    python3 .dojo/scripts/concept/build_page.py wiki/<name>/research/content.md --run
 
     # 单独检查正文
     python3 .dojo/scripts/concept/check_content.py wiki/<name>/research/content.md
@@ -29,7 +29,7 @@
 
 ## 自检
 
-    python3 .dojo/scripts/concept/build.py --selftest
+    python3 .dojo/scripts/concept/build_page.py --selftest
     python3 .dojo/scripts/concept/check_outline.py --selftest
     python3 .dojo/scripts/concept/check_content.py --selftest
 
