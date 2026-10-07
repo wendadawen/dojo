@@ -6,17 +6,17 @@
 
 | 审查者 | 人数 | 提示词 | 拿到什么 |
 |---|---|---|---|
-| 事实 | 2 | `fact.md` | `content.md`、`sources/` |
-| 复算 | 1 | `recompute.md` | `content.md` |
-| 文风 | 1 | `style.md` | `content.md`、`style-examples.md` |
-| 读者 | 1 | `reader.md` | 只给生成出来的 `index.html` 和 `overview.html` |
+| 事实 | 2 | `content-fact.md` | `content.md`、`sources/` |
+| 复算 | 1 | `content-recompute.md` | `content.md` |
+| 文风 | 1 | `content-style.md` | `content.md`、`content-style-examples.md` |
+| 读者 | 1 | `content-reader.md` | 只给生成出来的 `index.html` 和 `overview.html` |
 
 ## 什么算「必须改」
 
 - **事实**：任一事实审查者对某一段答「否」。包括：依据标注的位置不对（这段话并不在讲那个位置的内容）；这段话不能从标注的位置推出。
 - **复算**：算出的结果与页面对不上；例子的代码跑不通或输出不符；推导某一步不成立。
 - **读者**：基线外的词没解释，符号没说明，推理跳了一步。「想看更多」不算。
-- **文风**：属于 `style-examples.md` 里某一类坏句式的具体句子。不凭感觉。
+- **文风**：属于 `content-style-examples.md` 里某一类坏句式的具体句子。不凭感觉。
 
 每个问题一行：`类别｜位置｜问题｜依据｜改法`。没有问题写「无」。
 
