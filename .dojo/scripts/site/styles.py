@@ -33,6 +33,8 @@ COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 
 # 库在运行时注入的 class，静态标记里查不到，必须视为已用
 RUNTIME_PREFIXES = ("katex", "token", "language-", "prism", "line-numbers")
+# 概念页生成器：它源码里写的 class="..." 都是页面可能出现的 class
+GENERATOR = Path(__file__).resolve().parents[1] / "concept" / "build.py"
 
 # --confirm 用的无头浏览器
 CHROME_CANDIDATES = (
@@ -450,9 +452,10 @@ def run_css_check(argv: list[str]) -> int:
     if not pages:
         print("错误：没有概念页", file=sys.stderr)
         return 2
-    # 共享样式表和页面里内联的 <style> 都查；用到哪些 class，看模板和所有概念页
+    # 共享样式表和页面里内联的 <style> 都查。用到哪些 class，看模板、所有概念页，
+    # 以及生成器的源码：生成器能产出的 class，样板页不一定用到（如表格、只含代码的折叠块）
     targets = [sheet] + pages
-    usage = build_usage([tpl] + pages, pages)
+    usage = build_usage([tpl, GENERATOR] + pages, pages)
     candidates: set[str] = set()
     removed_total = 0
     for path in targets:
