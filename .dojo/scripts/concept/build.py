@@ -806,11 +806,13 @@ if __name__ == "__main__":
     print(report(index_path, overview_path, stats))
     failed = False
     if a.out is None:
-        # 自动运行机械检查：规则见 check.py，全部报错
-        checker = subprocess.run([sys.executable, str(HERE / "check.py"), str(a.md)],
-                                 capture_output=True, text=True)
-        print(checker.stdout.rstrip())
-        failed = checker.returncode != 0
+        # 机械检查在 check.py，它读本文件的解析和渲染，所以放到这里才导入，避免循环
+        import check
+        problems = check.check(a.md)
+        for p in problems:
+            print(p)
+        print(f"检查：{len(problems)} 个问题" if problems else "检查通过")
+        failed = bool(problems)
     if a.run:
         ran, problems = run_code(ctx.fences)
         for p in problems:

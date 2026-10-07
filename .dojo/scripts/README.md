@@ -23,7 +23,7 @@
 | `concept/` | 概念页：从 `research/` 生成页面，检查大纲与正文 | 跑自检 |
 | `archive/` | 已暂停的页面类别（目前只有数据流） | 不跑 |
 
-依赖方向只有一个：`concept/check.py` 读 `site/vocab.py`，反过来不行。`archive/` 谁也不依赖。
+`concept/check.py` 读 `concept/build.py` 的解析和渲染，以及 `site/vocab.py` 的词表；`archive/` 不依赖其他目录。
 
 | 脚本 | 作用 |
 |---|---|

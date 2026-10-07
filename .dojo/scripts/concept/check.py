@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import re
 import sys
 import tempfile
@@ -29,16 +28,9 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 
 
-def _load(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-build = _load(HERE / "build.py", "concept_build")
+sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
+import build  # noqa: E402
 import vocab  # noqa: E402
 
 SHORT_SECTIONS = 3
