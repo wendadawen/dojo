@@ -2,13 +2,13 @@
 """所有 dojo:status=outdated 页面的校验：旧概念页，以及已暂停的论文、学习记录、数据流。
 
 site/validate.py 对 dojo:status=outdated 的页面整页跳过。
-这里把三个暂停类别的样式表、概览文案补回去（旧概念页本来就在 validate.py 的表里），
+这里把三个暂停类别的样式表补回去（旧概念页本来就在 validate.py 的表里），
 并关掉跳过，用来在需要时校验那些旧页面：
 
     python3 .dojo/scripts/archive/legacy-validate.py <页面...>
     python3 .dojo/scripts/archive/legacy-validate.py --all-outdated
 
-只做页面校验，不做模板、死 CSS、文案回写。CI 不跑。
+只做页面校验。CI 不跑。
 """
 
 from __future__ import annotations
@@ -29,9 +29,6 @@ validate.TYPE_STYLESHEET.update({
     "note": ("dojo-note.css",),
     "dataflow": ("dojo-flow.css", "dojo-dataflow.css"),
 })
-validate.OVERVIEW_TERM["paper"] = "概览"
-validate.DETAIL_TERM["paper"] = "完整解析"
-validate.OVERVIEW_LABEL["paper"] = "论文概览"
 validate.SKIP_OUTDATED = False
 
 

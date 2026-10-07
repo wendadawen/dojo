@@ -10,7 +10,6 @@
 
     # 专项
     python3 .dojo/scripts/site/validate.py --templates
-    python3 .dojo/scripts/site/validate.py --copy [--fix]
     python3 .dojo/scripts/site/validate.py --js <页面...>
     python3 .dojo/scripts/site/validate.py --css [--module T] [--template P]
                                                  [--confirm] [--fix]
@@ -94,16 +93,6 @@ NOSCRIPT_RE = re.compile(r"<noscript[\s\S]*?</noscript>", re.I)
 # 概览页与索引页的入口文案：历史上 A/B 两代并存，模板已固定为 B 世代。
 # A 世代 eyebrow「概念快速阅读」/ nav「深度教学 →」/ footer「快速阅读」
 # B 世代 eyebrow「概念概览」  / nav「完整说明 →」/ footer「概览」
-OVERVIEW_TERM = {"concept": "概览"}
-DETAIL_TERM = {"concept": "完整说明"}
-OVERVIEW_LABEL = {"concept": "概念概览"}
-TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.S)
-EYEBROW_RE = re.compile(r'(<span class="eyebrow">)(.*?)(</span>)', re.S)
-NAV_BLOCK_RE = re.compile(r"(<nav>.*?</nav>)", re.S)
-FOOTER_BLOCK_RE = re.compile(r"<footer>(.*?)</footer>", re.S)
-OVERVIEW_LINK_RE = re.compile(
-    r'<a class="overview-link"[^>]*title="[^"]*"[^>]*>.*?</a>', re.S
-)
 
 # research/ 允许的文件名集合。目录只放 .md，审查轮次按固定名字编号，sources/ 存放资料。
 RESEARCH_ALLOWED_FILES = {
@@ -586,92 +575,6 @@ def check_template(path: Path) -> list[str]:
     return errors
 
 
-# ---------- 概览页文案一致性 ----------
-
-
-def page_type_of(index_html: str) -> str:
-    match = re.search(r'name="dojo:type"\s+content="([^"]+)"', index_html)
-    return match.group(1) if match else ""
-
-
-def fix_overview_copy(text: str, ty: str) -> str:
-    """把概览页文案回填到模板的说法。
-
-    只处理 OVERVIEW_TERM 里有的类型。类型未知（拿不到 index.html 的
-    dojo:type）时原样返回——否则会拿「概览 / 完整说明」这套说法去改写
-    其他类型的页面。
-    """
-    if ty not in OVERVIEW_TERM:
-        return text
-    detail = DETAIL_TERM[ty]
-
-    text = text.replace("深度教学页", f"{detail}页").replace("深度教学", detail)
-    text = text.replace("快速阅读", "概览")
-
-    def title_sub(match: re.Match) -> str:
-        title = match.group(1).strip()
-        body = re.sub(r"\s*·\s*[^·]+?\s*·\s*Dojo\s*$", "", title)
-        body = re.sub(r"\s*·\s*Dojo\s*$", "", body).strip()
-        if body and body != title:
-            return f"<title>{body} · 概览 · Dojo</title>"
-        return match.group(0)
-
-    text = TITLE_TAG_RE.sub(title_sub, text)
-
-    def eyebrow_sub(match: re.Match) -> str:
-        inner = match.group(2)
-        tail = inner.split("·", 1)[1].strip() if "·" in inner else ""
-        label = OVERVIEW_LABEL[ty]
-        body = f"{label} · {tail}" if tail else label
-        return f"{match.group(1)}{body}{match.group(3)}"
-
-    text = EYEBROW_RE.sub(eyebrow_sub, text)
-
-    def nav_sub(match: re.Match) -> str:
-        block = match.group(1)
-        block = block.replace(r"$\leftarrow$", "←").replace(r"$\to$", "→")
-        return re.sub(
-            r'(<a href="index\.html"[^>]*>).*?(</a>)',
-            lambda m: m.group(1) + detail + " →" + m.group(2),
-            block,
-            flags=re.S,
-        )
-
-    text = NAV_BLOCK_RE.sub(nav_sub, text)
-    footer_text = f"Dojo · 概览 · 机制细节见{detail}页"
-    return FOOTER_BLOCK_RE.sub(lambda m: f"<footer>{footer_text}</footer>", text)
-
-
-def fix_index_link(text: str) -> str:
-    if '<a class="overview-link"' not in text:
-        return text
-    return OVERVIEW_LINK_RE.sub(
-        '<a class="overview-link" href="overview.html" title="查看概览">概览</a>',
-        text,
-    )
-
-
-def convert_copy(path: Path, fix: bool) -> list[str]:
-    changes: list[str] = []
-    if path.name == "overview.html":
-        index = path.parent / "index.html"
-        ty = page_type_of(index.read_text(encoding="utf-8")) if index.exists() else ""
-        original = path.read_text(encoding="utf-8")
-        updated = fix_overview_copy(original, ty)
-        if updated != original:
-            changes.append(f"{path}: 概览页文案")
-            if fix:
-                path.write_text(updated, encoding="utf-8")
-    elif path.name == "index.html":
-        original = path.read_text(encoding="utf-8")
-        updated = fix_index_link(original)
-        if updated != original:
-            changes.append(f"{path}: 概览入口链接")
-            if fix:
-                path.write_text(updated, encoding="utf-8")
-    return changes
-
-
 # ---------- 内联脚本语法 ----------
 
 # HTML 规范里浏览器会当作 JavaScript 执行的 type 取值
@@ -804,30 +707,6 @@ def check_inline_js(pages: list[Path]) -> tuple[list[str], int, bool]:
                 if message:
                     errors.append(f"{label}: {' '.join(message.split())}")
     return errors, total, True
-
-
-def check_overview_copy(fix: bool) -> int:
-    targets = sorted(Path("wiki").glob("*/overview.html")) + sorted(
-        Path("wiki").glob("*/index.html")
-    )
-    changes: list[str] = []
-    for path in targets:
-        if is_outdated(path):
-            continue
-        changes.extend(convert_copy(path, fix))
-
-    if not changes:
-        print(f"no copy drift in {len(targets)} files")
-        return 0
-    if fix:
-        print(f"已统一 {len(changes)} 处：")
-        for line in changes:
-            print(f"  {line}")
-        return 0
-    print(f"validation failed: {len(changes)} 处文案不一致")
-    for line in changes:
-        print(f"- {line}")
-    return 1
 
 
 # ============================================================
@@ -1585,9 +1464,6 @@ def main() -> int:
         return run_catalog(argv)
     if "--css" in argv:
         return run_css_check(argv)
-    if "--copy" in argv:
-        return check_overview_copy("--fix" in argv)
-
     if "--templates" in argv:
         template_root = Path(TEMPLATE_DIR)
         templates = sorted(template_root / kind / "index.html" for kind in TYPE_STYLESHEET)

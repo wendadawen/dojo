@@ -36,7 +36,6 @@
 
     # 专项
     python3 .dojo/scripts/site/validate.py --templates      # 模板
-    python3 .dojo/scripts/site/validate.py --copy [--fix]   # 概览文案
     python3 .dojo/scripts/site/validate.py --js <页面...>   # 只查内联脚本
     python3 .dojo/scripts/site/validate.py --css [--confirm] [--fix]   # 死 CSS
     python3 .dojo/scripts/site/validate.py --catalog --output _site/catalog.json
@@ -44,7 +43,7 @@
     # 改共享样式前后的渲染比对
     python3 .dojo/scripts/site/validate.py --diff <before-root> <after-root> <页面...> [--detail]
 
-只校验现行页面：标了 `dojo:status=outdated` 的页面整页跳过并提示数量。旧概念页、论文、学习记录、数据流都标了，只有没标 outdated 的页面在校验范围内。`dojo:type` 不是 `concept` 又没标 outdated 的页面报错。`--templates`、`--css`、`--copy` 只管概念页，`--all` 不含各页 `research/` 里的资料快照。
+只校验现行页面：标了 `dojo:status=outdated` 的页面整页跳过并提示数量。旧概念页、论文、学习记录、数据流都标了，只有没标 outdated 的页面在校验范围内。`dojo:type` 不是 `concept` 又没标 outdated 的页面报错。`--templates`、`--css` 只管概念页，`--all` 不含各页 `research/` 里的资料快照。
 
 页面校验覆盖：HTML 骨架、模板占位符、重复 id、同页锚点、本地引用、
 `research/` 目录、数学字符、结构图、正文居中、元数据词表、模板与共享 CSS
