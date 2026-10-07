@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Engram 是给 Transformer 加的一张条件记忆表：把以当前位置结尾的几个 token 哈希成嵌入表的行号，取出的向量由当前隐藏状态门控后加回残差流，用一次查表代替早期层对固定搭配的重建。">
+  <meta name="dojo:summary" content="Engram 把以当前位置结尾的 $n$ 个 token 哈希成嵌入表的行号，取回的向量由当前隐藏状态门控后加回残差流。查表的计算量不随表增大，与 MoE 构成两条互补的稀疏轴；总稀疏参数在两者间分配时，损失随分配比例呈 U 形。行号只由 token 决定，大表可放主机内存并提前预取。">
+  <meta name="dojo:type" content="concept">
+  <meta name="dojo:topics" content="模型结构，内存与缓存">
+  <meta name="dojo:tag" content="通用概念">
+  <title>Engram</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Engram</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Engram</h1>
+<p class="reading-time">正文 2,381 字 · 约 8 分钟阅读</p>
+
+<p>语言模型要同时做两件事：需要动态计算的组合推理，和基本固定的知识取回。命名实体、固定短语这类文本是局部的、静态的，经典 n-gram 模型用最近几个词就能覆盖它们。标准 Transformer 没有查表这一步，只能靠前几层的注意力与前馈把这类模式重新算出来。Engram 是一张条件记忆表，以每个位置结尾的最近几个 token 为键，用哈希查出嵌入表的行号，取回的向量按当前上下文加权后加回残差流。查表的计算量是常数级，不随表增大。MoE 是每个 token 只激活少数几个专家子网络、用条件计算换容量的结构，两者占的是同一笔不增加每 token 计算量的参数，可以按比例混合。</p>
+
+<h2 id="s1">1. 背景：token、隐藏状态与残差流</h2>
+
+<p>序列先被分词器切成 token，每个 token 有一个整数 id。模型把 id 变成向量后逐层处理，第 $\ell$ 层输出的 $T\times d$ 矩阵叫隐藏状态，$T$ 是序列长度，$d$ 是每个位置的向量维度。一层里包含注意力与前馈两类计算。残差流指每个位置的向量在各层之间传递的那条通路，每层算出的结果加回它，再进入下一层。训练结束后在验证集上报告损失，损失越低表示模型越好。</p>
+
+<h2 id="s2">2. 取回：用最近几个 token 决定查哪几行</h2>
+
+<p>取回这一步把每个位置映射到嵌入表的若干行。键是以该位置结尾的后缀 n-gram，也就是从这里往前数 $n$ 个 token 的 id 序列。取出的向量是表里的行，这些行是可训练的参数，跟着模型一起更新，和按语料计数得到的 n-gram 概率表不是一回事。每个位置只读固定几行，所以表的行数可以远大于一次前向真正用到的行数：增加行数只增加参数，不增加每 token 的计算量，这部分参数和 MoE 里未被选中的专家处在同一类。</p>
+
+<h3 id="s2-1">2.1 后缀 N-gram 与分词压缩</h3>
+
+<p>$n$ 个连续 token 组成的序列叫 n-gram，以位置 $t$ 结尾的那个记为 $g_{t,n}$。分词器把文本切成 token 时，写法上等价的 token 常拿到不同的 id：大小写不同、前导空格不同，都会分成两个 id。取回前先做一次分词压缩：按大小写、空格、重音等规则归一化，把等价的写法合并到同一个标准 id，把原始 id 映射成标准 id，$x'_t=\mathcal{P}(x_t)$，$\mathcal{P}$ 就是这个映射。键由标准 id 构成：$g_{t,n}=(x'_{t-n+1},\dots,x'_t)$。</p>
+
+<h3 id="s2-2">2.2 多头哈希</h3>
+
+<p>所有可能的 n-gram 组合太多，直接给每一种组合分配一行不现实，所以把键哈希成行号。哈希是确定性的映射，不同键可能映到同一行，这叫碰撞。为降低碰撞的影响，每个阶数 $n$ 配 $K$ 个独立的哈希头，第 $k$ 个头把同一个键映到自己的表里：$z_{t,n,k}=\phi_{n,k}(g_{t,n})$，$z$ 是行号，$\phi$ 是哈希函数，取出的向量是 $\mathbf{e}_{t,n,k}=\mathbf{E}_{n,k}[z_{t,n,k}]$，$\mathbf{E}_{n,k}$ 是第 $n$ 阶第 $k$ 个头的嵌入表。各头各阶取出的向量拼成一个记忆向量：$\mathbf{e}_t=\Vert_{n=2}^{N}\Vert_{k=1}^{K}\mathbf{e}_{t,n,k}$，符号 $\Vert$ 表示把向量首尾相接，$N$ 是最大阶数。拼接从 $n=2$ 开始，单个 token 本身由输入嵌入层处理，不进记忆。</p>
+
+<h2 id="s3">3. 融合：由当前上下文决定这份记忆用多少</h2>
+
+<p>取回的向量只由 token 序列决定，同一个 n-gram 在任何上下文里取到同一个向量。它本身没有上下文适应能力，碰撞和多义词还会带来噪声。所以在写回之前，用当前位置的隐藏状态给这份记忆算一个门，决定这一处用多少。</p>
+
+<h3 id="s3-1">3.1 门控公式</h3>
+
+<p>先把记忆向量投成 key 和 value：$\mathbf{k}_t=\mathbf{W}_K\mathbf{e}_t$，$\mathbf{v}_t=\mathbf{W}_V\mathbf{e}_t$，$\mathbf{W}_K$、$\mathbf{W}_V$ 是可训练的投影矩阵，把记忆向量投到与隐藏状态相同的维度。门由当前隐藏状态 $\mathbf{h}_t$ 与 key 的归一化点积给出：$$\alpha_t=\sigma\left(\frac{\mathrm{RMSNorm}(\mathbf{h}_t)^\top\mathrm{RMSNorm}(\mathbf{k}_t)}{\sqrt{d}}\right)$$ $\sigma$ 是把实数压到 $(0,1)$ 的函数，$\mathrm{RMSNorm}$ 是按均方根归一化向量的操作，$d$ 是向量维度。点积大说明记忆与上下文一致，门接近 1；不一致时门接近 0，把这份记忆压掉。门控后的值写成 $\tilde{\mathbf{v}}_t=\alpha_t\cdot\mathbf{v}_t$。</p>
+
+<h3 id="s3-2">3.2 短卷积与写回残差流</h3>
+
+<p>门逐位置决定用多少，门用的隐藏状态已经通过前面的注意力聚合了全局上下文。门控后的值再过一层短的深度因果卷积，扩大每个位置能看到的范围，然后加回残差流：$\mathbf{H}^{(\ell)}\leftarrow\mathbf{H}^{(\ell)}+\mathbf{Y}$。Engram 只插在选定的层，在该层的注意力与前馈之前生效。</p>
+
+<h3 id="s3-3">3.3 短卷积的公式</h3>
+
+<details>
+<summary>短卷积与残差相加</summary>
+<p>设 $\tilde{\mathbf{V}}$ 是门控后的值按序列排列成的矩阵，卷积核大小为 $w$，膨胀系数为 $\delta$，则</p>
+<p>$$\mathbf{Y}=\mathrm{SiLU}\left(\mathrm{Conv1D}_{w,\delta}\left(\mathrm{RMSNorm}\left(\tilde{\mathbf{V}}\right)\right)\right)+\tilde{\mathbf{V}}$$</p>
+<p>$\mathrm{Conv1D}_{w,\delta}$ 是沿序列方向的卷积，核大小 $w$ 决定单次看几个位置，膨胀系数 $\delta$ 把采样点之间的间隔拉开，使同样大的核覆盖更长的范围；深度指每个通道各自卷，因果指只看当前位置及之前的位置。$\mathrm{SiLU}$ 是激活函数，定义为 $\mathrm{SiLU}(x)=x\cdot\sigma(x)$，$\sigma$ 是前面把实数压到 $(0,1)$ 的函数。$\mathrm{RMSNorm}$ 是按均方根归一化。</p>
+</details>
+
+<details>
+<summary>小词表上的哈希与门控</summary>
+<p>用三个标准 id：The 与 the 都归为 1，cat 与 Cat 都归为 2，sat 归为 3。序列 The cat sat the Cat 的标准 id 是 $(1,2,3,1,2)$，位置 2 到 5 上的 bigram 分别是 $(1,2)$、$(2,3)$、$(3,1)$、$(1,2)$。两个哈希头都用行号 $((a\cdot x)\oplus(b\cdot y))\bmod M$，第一头取 $(a,b,M)=(1,3,7)$，第二头取 $(1,1,11)$，$\oplus$ 是异或。</p>
+<div class="code-block"><pre><code class="language-python">head1 = (1, 3, 7)
+head2 = (1, 1, 11)
+
+
+def row(head, x, y):
+    a, b, m = head
+    return ((a * x) ^ (b * y)) % m
+
+
+for gram in [(1, 2), (2, 3), (3, 1), (1, 2)]:
+    print(gram, row(head1, *gram), row(head2, *gram))</code></pre></div>
+<div class="code-block"><pre><code class="language-text">(1, 2) 0 3
+(2, 3) 4 1
+(3, 1) 0 2
+(1, 2) 0 3</code></pre></div>
+<p>$(1,2)$ 和 $(3,1)$ 在第一个头里都映到第 0 行，发生了碰撞；在第二个头里它们映到第 3 行和第 2 行，是分开的。两个头给出的行号合起来看，三个不同的 bigram 都落在不同的组合上，一个头里的碰撞被另一个头补上了。</p>
+<p>门用当前的隐藏状态和 key 的归一化点积。取隐藏状态 $h=(2,2)$，记忆与上下文相符时取 $k=(3,3)$，不符时取 $k=(-3,-3)$，归一化点积再除以向量维度 $d$ 的平方根（本例如 $\sqrt{2}$），得到两个门值。</p>
+<div class="code-block"><pre><code class="language-python">import math
+
+
+def rmsnorm(v):
+    r = math.sqrt(sum(x * x for x in v) / len(v))
+    return [x / r for x in v]
+
+
+def gate(h, k):
+    hn, kn = rmsnorm(h), rmsnorm(k)
+    s = sum(a * b for a, b in zip(hn, kn)) / math.sqrt(len(h))
+    return 1 / (1 + math.exp(-s))
+
+
+print(round(gate([2.0, 2.0], [3.0, 3.0]), 4))
+print(round(gate([2.0, 2.0], [-3.0, -3.0]), 4))</code></pre></div>
+<div class="code-block"><pre><code class="language-text">0.8044
+0.1956</code></pre></div>
+<p>相符时门约 0.8044，不符时约 0.1956。门随点积连续变化，不符时降到相符时的约四分之一。</p>
+</details>
+
+<h2 id="s4">4. 稀疏参数怎么分：与专家争同一笔预算</h2>
+
+<p>设 $P_{\mathrm{tot}}$ 是总可训练参数，不含词表嵌入与输出层；$P_{\mathrm{act}}$ 是每个 token 实际参与计算的激活参数；两者之差 $P_{\mathrm{sparse}}=P_{\mathrm{tot}}-P_{\mathrm{act}}$ 是不参与该 token 计算的那部分。MoE 里未被选中的专家、Engram 里未被取回的行都算在这里。固定 $P_{\mathrm{tot}}$ 与 $P_{\mathrm{act}}$，把这笔稀疏参数分给专家和记忆：定义 $\rho$ 是分给专家的比例，专家分到 $\rho P_{\mathrm{sparse}}$，记忆分到 $(1-\rho)P_{\mathrm{sparse}}$，$\rho=1$ 是所有稀疏参数都给专家的纯 MoE。</p>
+
+<h3 id="s4-1">4.1 损失随 $\rho$ 呈 U 形</h3>
+
+<p>固定总参数与激活参数后，改变 $\rho$ 并训练，验证损失与 $\rho$ 的关系是一条 U 形曲线。$\rho$ 接近 1 时缺少专门存固定模式的地方，模型仍要靠深度和计算重建它们；$\rho$ 接近 0 时条件计算的能力不够，需要动态推理的任务变差，记忆不能替代计算。最优落在偏向专家一侧，只把稀疏参数的约两成到两成半分给记忆，两档算力下这个位置基本一致。</p>
+
+<h3 id="s4-2">4.2 表越大，损失越低</h3>
+
+<p>把骨干固定，只放大记忆表，在资料测试的行数范围内，验证损失随行数的对数近似线性下降，行数越多损失越低。表的行数增加不改变每 token 的计算量。</p>
+
+<h3 id="s4-3">4.3 分配实验的条件</h3>
+
+<details>
+<summary>分配实验的条件</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>项目</th><th>一档</th><th>另一档</th></tr></thead>
+<tbody>
+<tr><td>训练算力（FLOPs）</td><td>$2\times10^{20}$</td><td>$6\times10^{20}$</td></tr>
+<tr><td>总参数</td><td>约 5.7B</td><td>约 9.9B</td></tr>
+<tr><td>激活参数</td><td>568M</td><td>993M</td></tr>
+<tr><td>纯 MoE 的专家数</td><td>106</td><td>99</td></tr>
+</tbody>
+</table>
+</div>
+<p>两组都保持总参数与激活参数之比约为 10，改变 $\rho$ 时只调整专家数和记忆的行数，训练流程与超参数不变。</p>
+</details>
+
+<h2 id="s5">5. 地址只由 token 决定：大表放主机内存，提前预取</h2>
+
+<p>记忆的行号只由 token id 决定，不需要等隐藏状态算出来。MoE 的路由要看隐藏状态才知道选哪些专家，Engram 不用，因此在前向开始前就能算出整个序列要读的行号。这把参数存储和计算解耦：跑模型的加速器显存容量有限，装不下的记忆表可以放在主机内存，按行号提前取回，与前面层已经在做的计算重叠，等轮到自己时数据已经到了。取回量只与每个 token 激活的行数有关，与表的总行数无关。</p>
+
+<h3 id="s5-1">5.1 卸载实验的条件与结果</h3>
+
+<details>
+<summary>卸载实验的条件与结果</summary>
+<p>设置：把整张约 100B 参数的记忆表全部放主机内存，骨干用不含专家并行的稠密模型，在 H800 上跑 512 条、长度在 100 到 1024 之间的序列，读取全部走主机内存。结果：与不带记忆表的同一个稠密骨干相比，4B 骨干的吞吐从 9031.62 降到 8858.28 token/s，8B 骨干从 6315.52 降到 6140.02 token/s，最大降幅 2.8%。</p>
+</details>
+
+<h2 id="s6">6. 放在哪几层</h2>
+
+<p>Engram 不是每层都插。放得早，后面的层不用再花深度重建局部模式；放得晚，隐藏状态已经聚合了更多全局上下文，门的判断更准，前面可供重叠读取的计算也更多。把同样大小的记忆拆成早晚两处各放一份小表，可以兼顾早介入和晚门控。</p>
+
+<h2 id="s7">7. 哪些部件起作用</h2>
+
+<p>在固定记忆参数量的对照里，去掉上下文门控或去掉分词压缩，验证损失上升得最多；去掉短卷积只带来很小的退化。把容量分给更高阶的 n-gram 在固定预算下没有更好，一种解释是更高阶的组合占走了更常见低阶模式的行，但在更大的表上是否仍然如此，资料没有下结论。</p>
+
+<h2 id="s8">8. 效果的证据：整体更好，也更深更省</h2>
+
+<p>在同总参数、同激活参数、同训练量的对照里，带 Engram 的模型优于纯 MoE 基线，而且收益不限于知识类任务，通用推理、代码和数学任务上的提升更大。查表接手局部依赖后，注意力可以更多用于全局上下文，长上下文检索类任务随之变好。</p>
+
+<h3 id="s8-1">8.1 大规模对比的设置</h3>
+
+<details>
+<summary>大规模对比的设置</summary>
+<p>模型：不含稀疏层的稠密基线，纯 MoE 基线，带记忆的模型，以及只把记忆表放大的版本。对照：所有模型用同一份数据训练同样多的 token，激活参数相同；总参数与纯 MoE 相同的那一个版本，差别只在把一部分专家换成了记忆表。任务：语言建模、知识与推理、阅读理解、代码与数学。</p>
+</details>
+
+<h3 id="s8-2">8.2 浅层相当于更深的层</h3>
+
+<p>LogitLens 把每一层的隐藏状态直接接到输出层，用 KL 散度衡量这一层的预测分布与最终预测分布的差距；CKA 比较两层表示的结构相似度。结果是带 Engram 的模型在浅层就更快接近最终预测；按 CKA，它第 5 层的表示与基线第 12 层最接近。</p>
+
+<h2 id="s9">9. 适用条件与边界</h2>
+
+<p>Engram 处理的是局部、静态、固定搭配这类规律。它换掉的是用计算重建这类模式的那部分工作：屏蔽记忆输出后，事实类任务的成绩大幅下降，需要看上下文回答的阅读理解基本保持，说明知识主要存在记忆里，上下文理解仍靠骨干的注意力与计算。记忆不能替代计算，稀疏参数全给记忆时，需要动态推理的任务会变差。Engram 是加在中间层上的模块，输入嵌入层与输出层保持原样。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Xin Cheng, Rui Tian, Wangding Zeng, et al. Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models. arXiv:2601.07372v2, 2026. <a href="https://arxiv.org/abs/2601.07372">https://arxiv.org/abs/2601.07372</a></li>
+<li>DeepSeek-AI. Engram. GitHub, commit fb7f84a21f91223715394a33a1dc24bbfb7f788e, 2026. <a href="https://github.com/deepseek-ai/Engram">https://github.com/deepseek-ai/Engram</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// ============ 进度条 + 返回顶部 ============
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  progressBar.style.width = scrolled + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+// ============ 暗/亮模式切换（带 localStorage 持久化 + highlight.js 主题切换）============
+const themeToggle = document.getElementById('themeToggle');
+const savedTheme = localStorage.getItem('theme') ||
+  (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.setAttribute('data-theme', savedTheme);
+function syncCodeTheme(theme) {
+  const light = document.getElementById('prism-light');
+  const dark = document.getElementById('prism-dark');
+  if (light && dark) {
+    light.disabled = (theme === 'dark');
+    dark.disabled = (theme !== 'dark');
+  }
+}
+syncCodeTheme(savedTheme);
+themeToggle.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  syncCodeTheme(next);
+});
+
+// ============ 自动生成侧边目录 ============
+const tocList = document.getElementById('tocList');
+const headings = document.querySelectorAll('body > h2, body > h3');
+let currentH1Li = null;
+let currentSubUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  a.dataset.target = h.id;
+  if (h.tagName === 'H3' && currentH1Li) {
+    a.classList.add('sub');
+    if (!currentSubUl) {
+      currentSubUl = document.createElement('ul');
+      currentH1Li.appendChild(currentSubUl);
+    }
+    li.appendChild(a);
+    currentSubUl.appendChild(li);
+  } else {
+    currentSubUl = null;
+    li.appendChild(a);
+    tocList.appendChild(li);
+    currentH1Li = li;
+  }
+});
+
+// ============ 滚动高亮当前章节 ============
+const sections = Array.from(document.querySelectorAll('body > h2, body > h3'));
+function updateActiveToc() {
+  let active = null;
+  for (const s of sections) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  document.querySelectorAll('.toc a').forEach(a => {
+    a.classList.toggle('active', a.dataset.target === active);
+  });
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// ============ 图片点击放大（lightbox）============
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+
+// 给所有文章里的 img 加可点击 class
+document.querySelectorAll('body > img, p ~ img, .grid img').forEach(img => {
+  if (img.id === 'lightboxImg') return;
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+
+lightbox.addEventListener('click', () => {
+  lightbox.classList.remove('open');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+});
+
+// ============ 代码块复制按钮 ============
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    } catch (err) {
+      // 降级方案
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      btn.textContent = '已复制 ✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// ============ 章节折叠按钮 ============
+document.querySelectorAll('body > h2').forEach(h1 => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const collapsed = h1.classList.toggle('collapsed');
+    let next = h1.nextElementSibling;
+    while (next && next.tagName !== 'H2') {
+      next.style.display = collapsed ? 'none' : '';
+      next = next.nextElementSibling;
+    }
+  });
+  h1.appendChild(btn);
+});
+
+// ============ 键盘快捷键：j/k 跳章节 ============
+const h1Sections = Array.from(document.querySelectorAll('body > h2'));
+document.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不响应
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    let next = h1Sections.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h1Sections) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// ============ 平滑滚动（点击目录链接）============
+document.querySelectorAll('.toc a').forEach(a => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(a.dataset.target);
+    // scroll-margin-top 已避开顶部导航；不要再 scrollBy 偏移，否则会打断平滑滚动
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+});
+</script>
+
+
+<script>
+/* 站内文档链接与外部链接在新标签页打开 */
+(function () {
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href)) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
