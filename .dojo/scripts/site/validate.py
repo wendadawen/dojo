@@ -66,7 +66,7 @@ IGNORE_PREFIXES = (
     "mailto:",
 )
 
-MARKERS = ("@content", "@component", "TODO", "TBD")
+MARKERS = ("@content", "TODO", "TBD")
 REQUIRED_WIKI_META = (
     "description",
     "dojo:summary",
@@ -105,8 +105,7 @@ OVERVIEW_LINK_RE = re.compile(
     r'<a class="overview-link"[^>]*title="[^"]*"[^>]*>.*?</a>', re.S
 )
 
-# research/ 允许的文件名集合（四类页面共用）。目录只放 .md，扩写记录与
-# 审查轮次都按固定名字编号；sources/ 与 official/ 存放引文原始快照。
+# research/ 允许的文件名集合。目录只放 .md，审查轮次按固定名字编号，sources/ 存放资料。
 RESEARCH_ALLOWED_FILES = {
     "scope.md",
     "evidence.md",
@@ -119,11 +118,10 @@ RESEARCH_ALLOWED_FILES = {
     "arbitration.md",
     "measured.md",
     "dataflow.md",
-    "concept.md",
     "content.md",
     "conflicts.md",
 }
-RESEARCH_ALLOWED_DIRS = {"sources", "official"}
+RESEARCH_ALLOWED_DIRS = {"sources"}
 REVIEW_FILE_RE = re.compile(r"(?:outline|content)-review-\d+\.md")
 INLINE_MATH_RE = re.compile(
     r"\$\$[\s\S]+?\$\$|"
@@ -401,7 +399,7 @@ def check_research_dir(research: Path) -> list[str]:
     """research/ 只放符合固定清单的 .md，不混入其他格式与临时文件。
 
     该目录不随站点发布，但仍要可长期检索：文件名限定为固定集合，审查记录
-    按 outline-review-<轮次>.md、content-review-<轮次>.md 连续编号，引文快照放在 sources/ 与 official/ 下。
+    按 outline-review-<轮次>.md、content-review-<轮次>.md 连续编号，资料放在 sources/ 下。
     """
     errors: list[str] = []
     if not research.is_dir():

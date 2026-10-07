@@ -3,7 +3,7 @@
 ## 每轮怎么审
 
 1. 派 5 个没参与写 `research/dataflow.md` 的子代理，彼此看不到对方的结果。一次全部派发。大部分审查者返回后就结束这一轮，还没返回的不计入。审查者只返回结论。
-2. 每个审查者只拿到这四份文件：`dataflow.md`、`guides/model-dataflow.md`、`guides/model-dataflow/plan.md` 和 `guides/model-dataflow/review.md`。资料按 `dataflow.md` 里「资料」一节自己去取。
+2. 每个审查者只拿到这四份文件：`dataflow.md`、`guides/archive/model-dataflow.md`、`guides/archive/model-dataflow/plan.md` 和 `guides/archive/model-dataflow/review.md`。资料按 `dataflow.md` 里「资料」一节自己去取。
 3. 每个审查者自己读资料，核对 `dataflow.md` 的全部内容：
    - 在「前提」这条路径上，源码里的每一步都画了，画上的每一步都在这条路径的源码里；
    - 节点的名字、形状、源码位置对得上。算子第二行是「原来的形状 → 变完的形状」，箭头两边都有；

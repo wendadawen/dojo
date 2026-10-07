@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """数据流页核查：事实对不对，以及连线画得干不干净。
 
-数据流页最容易出的错不是排版，而是**写出源码里根本不存在的东西**。
+数据流页最容易出的错不是排版，而是写出源码里不存在的东西。
 这个脚本把断言变成可执行的检查：
 
   1. 源码位置 —— 传入计划文件时，「源码」列指的行不是空行或注释，且含节点名
@@ -517,10 +517,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="数据流页事实核查")
     ap.add_argument("page", type=Path, help="wiki/<name>/index.html")
     ap.add_argument("--source", action="append", default=[], metavar="[LABEL=]PATH",
-                    help="权威源码，可多次传入。带 LABEL 时（如 mtp=/path/mtp.py）"
+                    help="权威源码，可多次传入。带 LABEL 时（如 aux=/path/aux.py）"
                          "只有视图标题里含该 LABEL 才用它做校验，这样每个视图可以"
-                         "有自己的权威来源（例如 MTP 视图的事实来源是 vLLM 的 mtp.py，"
-                         "而不是 transformers）")
+                         "有自己的权威来源（例如辅助模块的视图用它自己的实现文件，"
+                         "而不是主模型的源码）")
     ap.add_argument("--shapes", type=Path,
                     help="形状表 JSON：{tensor_key: [dim...]}，通常来自 safetensors 头")
     ap.add_argument("--script", action="append", default=[], type=Path,
@@ -594,7 +594,7 @@ def main() -> int:
 
     # 选源规则：
     #   · 打了标签的源（LABEL=PATH）只作用于「标题或标签里含该 LABEL」的视图；
-    #     这样 MTP 视图可以用 vLLM 的 mtp.py 校验，而其余视图用 transformers。
+    #     这样某个视图可以用它自己的源码校验，其余视图用主模型的源码。
     #   · 没打标签的源对所有视图生效。
     labeled_bodies = {label: body for label, body in labeled}
     universal = [body for path, body in sources.items() if path not in labeled_files]

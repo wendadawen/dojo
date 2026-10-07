@@ -9,7 +9,7 @@
 ## 执行
 
 1. 先确认论文原文。论断定位回原文。
-2. 依次执行规划、写作和质检规范：`guides/paper/plan.md` → `guides/paper/write.md` → `guides/paper/check.md`。
+2. 依次执行规划、写作和质检规范：`guides/archive/paper/plan.md` → `guides/archive/paper/write.md` → `guides/archive/paper/check.md`。
 3. 论断按 plan.md 的四类分级标注（论文明确声称、文献已有结论、推断、猜测）；公式、数字、实验结论必须能定位回原文，不确定的信息明确标注，不凭记忆补全。
 4. 质检的三轮审查由没参与写作的子代理执行。
 5. 完成独立审查、修复和机械验证后，确认页面 head 中的首页元数据已替换完成。

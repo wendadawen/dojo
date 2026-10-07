@@ -340,7 +340,7 @@ def _adjacent(lines: list[str], fence: tuple[int, str, str], next_no: int) -> bo
 # ---------- 大纲 ----------
 
 def check_outline(md: Path) -> list[str]:
-    """大纲：长页和短页各一份，每个节点写四样：写什么、类型、字数、依据。
+    """大纲：长页和短页各一份，每个节点写五样：标题、写什么、类型、字数、依据。
 
     格式：
         ## 长页
