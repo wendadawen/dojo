@@ -31,13 +31,14 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from checklib import LONG_LIMIT, SHORT_LIMIT  # noqa: E402
+
 TEMPLATES = HERE.parents[1] / "templates" / "concept"
 REPO_ROOT = HERE.parents[2]
 
 META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
 SECTIONS = ("资料", "短页", "长页")
-LONG_LIMIT = 5000
-SHORT_LIMIT = 1000
 
 MATH_RE = re.compile(r"\$\$.+?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$", re.S)
 LIST_RE = re.compile(r"^(\s*)(-|\d+\.)\s+(.*)$")
@@ -803,9 +804,9 @@ if __name__ == "__main__":
     print(report(index_path, overview_path, stats))
     failed = False
     if a.out is None:
-        # 机械检查在 check.py，它读本文件的解析和渲染，所以放到这里才导入，避免循环
-        import check
-        problems = check.check(a.md)
+        # 机械检查读本文件的解析和渲染，所以放到这里才导入，避免循环
+        import check_content
+        problems = check_content.check(a.md)
         for p in problems:
             print(p)
         print(f"检查：{len(problems)} 个问题" if problems else "检查通过")
