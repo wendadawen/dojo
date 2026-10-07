@@ -57,7 +57,6 @@ TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
 # <noscript> 里的 <style> 是无脚本回退的补充规则（例如让画布控件在无 JS 时
 # 显示出来），不是模板的主样式，判断样式来源时要排除。
-NOSCRIPT_RE = re.compile(r"<noscript[\s\S]*?</noscript>", re.I)
 
 # 概览页与索引页的入口文案：历史上 A/B 两代并存，模板已固定为 B 世代。
 # A 世代 eyebrow「概念快速阅读」/ nav「深度教学 →」/ footer「快速阅读」
@@ -475,17 +474,12 @@ def check_body_centering(text: str) -> list[str]:
 
 
 def check_template(path: Path) -> list[str]:
-    """模板必须声明正确类型，样式要么内联要么引用共享样式表。
-
-    模板含占位符，不能走 validate_page。内联的样式必须与 libs/ 下的共享样式表逐字一致。
-    """
+    """模板必须声明正确类型，并引用共享样式表。模板含占位符，不能走 validate_page。"""
     errors: list[str] = []
     module = path.parent.name
     allowed_css = TYPE_STYLESHEET.get(module)
     if allowed_css is None:
         return errors
-    # 模板内联样式时，与元组第一项比对（每类页面只有一个权威样式表）。
-    canonical_css = allowed_css[0]
 
     text = path.read_text(encoding="utf-8", errors="ignore")
     inspector = PageInspector()
@@ -494,39 +488,14 @@ def check_template(path: Path) -> list[str]:
     if raw_type != module:
         errors.append(f"模板的类型必须是 {module}，现在是：{raw_type or '（缺失）'}")
 
-    # 只看模板的主样式：先去掉 <noscript> 段，其中的 <style> 属于无脚本回退。
-    style_scope = NOSCRIPT_RE.sub("", text)
-    blocks = STYLE_RE.findall(style_scope)
-    linked = any(
+    if not any(
         ref.split("?", 1)[0].endswith(f"libs/{css}")
         for css in allowed_css
         for ref in inspector.stylesheets
-    )
-    if not blocks and not linked:
-        errors.append(
-            "模板要么内联、要么引用共享样式表："
-            + " 或 ".join(f"../../libs/{css}" for css in allowed_css)
-        )
-        return errors
-
-    css_path = Path("libs") / canonical_css
-    if not css_path.exists():
-        errors.append(f"共享样式表不存在：{css_path}")
-        return errors
-
-    # 外链时没有副本，无从漂移，到此为止。
-    if not blocks:
-        return errors
-
-    def normalize(css: str) -> str:
-        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
-        return re.sub(r"\s+", " ", css).strip()
-
-    if normalize(blocks[0]) != normalize(css_path.read_text(encoding="utf-8")):
-        errors.append(
-            f"模板内联的样式与 {css_path} 不一致，"
-            "两份要保持逐字相同"
-        )
+    ):
+        errors.append("模板要引用共享样式表：" + " 或 ".join(f"../../libs/{css}" for css in allowed_css))
+    elif not (Path("libs") / allowed_css[0]).exists():
+        errors.append(f"共享样式表不存在：libs/{allowed_css[0]}")
     return errors
 
 

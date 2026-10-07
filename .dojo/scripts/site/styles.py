@@ -113,25 +113,38 @@ def split_selectors(selector: str) -> list[str]:
     return [part.strip() for part in selector.split(",") if part.strip()]
 
 
+def _dead_spans(css: str, usage: set[str]) -> list[tuple[int, int, str]]:
+    spans = []
+    for selector, start, end in iter_rules(css):
+        parts = split_selectors(selector)
+        if parts and all(selector_is_dead(part, usage) for part in parts):
+            spans.append((start, end, selector.strip()))
+    return spans
+
+
+def _drop(css: str, spans: list[tuple[int, int, str]]) -> str:
+    for start, end, _ in reversed(spans):
+        css = css[:start] + css[end:]
+    return re.sub(r"\n{3,}", "\n\n", css).rstrip() + "\n"
+
+
 def process(path: Path, usage: set[str], fix: bool) -> list[str]:
+    """找出一个文件里没人用的规则。.css 文件整体检查，.html 检查里面的 <style>。"""
     document = path.read_text(encoding="utf-8")
     removed: list[str] = []
+    if path.suffix == ".css":
+        spans = _dead_spans(document, usage)
+        removed = [s for _, _, s in spans]
+        if fix and spans:
+            path.write_text(_drop(document, spans), encoding="utf-8")
+        return removed
     for block in reversed(list(STYLE_RE.finditer(document))):
-        css = block.group(1)
-        spans: list[tuple[int, int, str]] = []
-        for selector, local_start, local_end in iter_rules(css):
-            parts = split_selectors(selector)
-            if parts and all(selector_is_dead(part, usage) for part in parts):
-                spans.append((local_start, local_end, selector.strip()))
+        spans = _dead_spans(block.group(1), usage)
         if not spans:
             continue
         removed.extend(s for _, _, s in spans)
         if fix:
-            new_css = css
-            for local_start, local_end, _ in reversed(spans):
-                new_css = new_css[:local_start] + new_css[local_end:]
-            new_css = re.sub(r"\n{3,}", "\n\n", new_css).rstrip() + "\n"
-            document = document[: block.start(1)] + new_css + document[block.end(1) :]
+            document = document[: block.start(1)] + _drop(block.group(1), spans) + document[block.end(1) :]
     if fix and removed:
         path.write_text(document, encoding="utf-8")
     return removed
@@ -435,17 +448,18 @@ def run_css_check(argv: list[str]) -> int:
     total_removed = 0
     for name in TYPE_STYLESHEET:
         tpl = Path(f".dojo/templates/{name}/index.html")
-        # 模板是这一类页面样式的权威副本，缺了就无从检查；静默跳过会让
-        # 模板被误删时无人发觉，所以这里直接报错。
-        if not tpl.exists():
-            print(f"错误：模板不存在：{tpl}", file=sys.stderr)
-            return 2
+        sheet = Path("libs") / TYPE_STYLESHEET[name][0]
+        for needed in (tpl, sheet):
+            if not needed.exists():
+                print(f"错误：{needed} 不存在，无从检查", file=sys.stderr)
+                return 2
         pages = pages_of_type(Path("."), name)
         if not pages:
             print(f"错误：没有 dojo:type={name} 的页面", file=sys.stderr)
             return 2
-        targets = [tpl] + pages
-        usage = build_usage(targets, pages)
+        # 共享样式表和页面里内联的 <style> 都查；用到哪些 class，看模板和这一类的所有页面
+        targets = [sheet] + pages
+        usage = build_usage([tpl] + pages, pages)
         candidates: set[str] = set()
         removed_here = 0
         for path in targets:

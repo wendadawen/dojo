@@ -554,9 +554,6 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
     tdir = templates or TEMPLATES
 
     index_tpl = (tdir / "index.html").read_text(encoding="utf-8")
-    index_tpl = re.sub(r"<style>[\s\S]*?</style>",
-                       lambda _: '<link rel="stylesheet" href="../../libs/dojo-concept.css">',
-                       index_tpl, count=1)
     content_marker = re.search(r"<!-- @content[\s\S]*?-->", index_tpl)
     if not content_marker:
         raise SystemExit("index.html 模板里没有 @content 标记")
