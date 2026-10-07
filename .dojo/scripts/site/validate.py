@@ -11,8 +11,7 @@
     # 专项
     python3 .dojo/scripts/site/validate.py --templates
     python3 .dojo/scripts/site/validate.py --js <页面...>
-    python3 .dojo/scripts/site/validate.py --css [--module T] [--template P]
-                                                 [--confirm] [--fix]
+    python3 .dojo/scripts/site/validate.py --css [--confirm] [--fix]
     python3 .dojo/scripts/site/validate.py --catalog --output _site/catalog.json
 
     # 改共享样式前后的渲染比对
@@ -57,13 +56,13 @@ def main() -> int:
         failures = [(t, check_template(t)) for t in templates]
         failures = [(t, errs) for t, errs in failures if errs]
         if failures:
-            print("template validation failed:")
+            print("模板校验失败：")
             for template, errs in failures:
                 print(f"- {template}")
                 for error in errs:
                     print(f"  - {error}")
             return 1
-        print(f"template validation ok: {len(templates)} templates")
+        print(f"模板校验通过：{len(templates)} 个模板")
         return 0
 
     args = [a for a in argv if a not in {"--all", "--js"}]
@@ -86,7 +85,7 @@ def main() -> int:
             continue
         pages.append(path)
     if missing:
-        print("error: page not found: " + ", ".join(missing))
+        print("错误：页面不存在：" + "、".join(missing))
         return 2
     skipped = [p for p in pages if is_outdated(p)]
     if skipped:
@@ -98,14 +97,14 @@ def main() -> int:
     if js_only:
         js_errors, total, ran = check_inline_js(pages)
         if not ran:
-            print("error: node not found in PATH; install Node.js to run this check")
+            print("错误：PATH 里没有 node，这项检查需要安装 Node.js")
             return 2
         if js_errors:
-            print(f"inline script check failed: {len(js_errors)} of {total} blocks")
+            print(f"内联脚本检查失败：{total} 块里有 {len(js_errors)} 块有问题")
             for error in js_errors:
                 print(f"- {error}")
             return 1
-        print(f"inline script check ok: {len(pages)} pages, {total} blocks")
+        print(f"内联脚本检查通过：{len(pages)} 个页面，{total} 块")
         return 0
 
     if len(pages) == 1:
@@ -124,7 +123,7 @@ def main() -> int:
 
     failed = [(page, errors) for page, errors in results if errors]
     if failed:
-        print(f"validation failed: {len(failed)}/{len(results)} pages")
+        print(f"校验失败：{len(failed)}/{len(results)} 个页面")
         for page, errors in failed:
             print(f"- {page}")
             for error in errors:
@@ -133,9 +132,9 @@ def main() -> int:
 
     suffix = f"，内联脚本 {js_total} 块" if js_ran else ""
     if len(pages) == 1:
-        print(f"validation ok: {pages[0]}{suffix}")
+        print(f"校验通过：{pages[0]}{suffix}")
     else:
-        print(f"validation ok: {len(pages)} pages{suffix}")
+        print(f"校验通过：{len(pages)} 个页面{suffix}")
     return 0
 
 

@@ -44,7 +44,7 @@
     python3 .dojo/scripts/site/validate.py --catalog --output _site/catalog.json
 
     # 改共享样式前后的渲染比对
-    python3 .dojo/scripts/site/validate.py --diff <before-root> <after-root> <页面...> [--detail]
+    python3 .dojo/scripts/site/validate.py --diff <before-root> <after-root> <页面...> [--detail] [--jobs N]
 
 只校验现行页面：标了 `dojo:status=outdated` 的页面整页跳过并提示数量。旧概念页、论文、学习记录、数据流都标了，只有没标 outdated 的页面在校验范围内。`dojo:type` 不是 `concept` 又没标 outdated 的页面报错。`--templates`、`--css` 只管概念页，`--all` 不含各页 `research/` 里的资料快照。
 
@@ -53,6 +53,8 @@
 一致性。
 
 改样式时的顺序：先 `--diff` 确认改动只影响预期页面，再 `--css` 找死规则。
+
+`--css --confirm` 在 Chrome 里复核候选规则，`--diff` 用 Chrome 比对渲染，这两项需要装 Chrome。
 
 ### concept/build.py
 

@@ -207,28 +207,28 @@ def validate_page(path: Path) -> list[str]:
     inspector.feed(text)
 
     if not text.startswith("<!DOCTYPE html>"):
-        errors.append("missing <!DOCTYPE html>")
+        errors.append("缺少 <!DOCTYPE html>")
     if not text.rstrip().endswith("</html>"):
-        errors.append("missing </html>")
+        errors.append("缺少 </html>")
 
     searchable_text = re.sub(r"data:[^\"']+", "", text)
     for match in PLACEHOLDER_RE.findall(searchable_text):
-        errors.append(f"template placeholder remains: {match}")
+        errors.append(f"模板占位符没替换：{match}")
     for needle in MARKERS:
         if needle in searchable_text:
-            errors.append(f"template marker remains: {needle}")
+            errors.append(f"模板标记没清掉：{needle}")
 
     ids = ID_RE.findall(text)
     seen: set[str] = set()
     for id_value in ids:
         if id_value in seen:
-            errors.append(f"duplicate id: {id_value}")
+            errors.append(f"id 重复：{id_value}")
         seen.add(id_value)
 
     id_set = set(ids)
     for anchor in SAME_PAGE_ANCHOR_RE.findall(text):
         if anchor and anchor not in id_set:
-            errors.append(f"anchor points to missing id: #{anchor}")
+            errors.append(f"锚点指向不存在的 id：#{anchor}")
 
     for ref in LOCAL_ASSET_RE.findall(text):
         if ref.startswith(IGNORE_PREFIXES):
@@ -240,7 +240,7 @@ def validate_page(path: Path) -> list[str]:
         if clean_ref.endswith("/"):
             target = target / "index.html"
         if not target.exists():
-            errors.append(f"broken local reference {ref}")
+            errors.append(f"本地引用不存在：{ref}")
 
     # 正文里以文字形式指向的 research/ 路径必须真实存在，且不能指向目录快照。
     # research/ 整个目录不发布，正文指向它读者必然打不开；唯一例外是
@@ -251,14 +251,13 @@ def validate_page(path: Path) -> list[str]:
         target = (path.parent / mention).resolve()
         if not target.exists():
             errors.append(
-                f"reference to a missing research file: {mention}"
-                " (rewrite as '实测得到' or point to research/measured.md)"
+                f"引用了不存在的 research 文件：{mention}"
+                "（改写成「实测得到」，或指向 research/measured.md）"
             )
         else:
             errors.append(
-                f"reference to unpublished research path: {mention}"
-                " (research/ is excluded from the deployed site;"
-                " rewrite as '实测得到' or point to research/measured.md)"
+                f"引用了不发布的 research 路径：{mention}"
+                "（research/ 不随站点发布，改写成「实测得到」，或指向 research/measured.md）"
             )
 
     parts = path.parts
@@ -266,7 +265,7 @@ def validate_page(path: Path) -> list[str]:
     if is_wiki_page and path.name == "index.html":
         for name in REQUIRED_WIKI_META:
             if not inspector.meta.get(name):
-                errors.append(f"missing metadata: {name}")
+                errors.append(f"缺少元数据：{name}")
 
         # 主题取值必须是封闭词表内的大类，防止主题再次碎片化
         topics = [
@@ -277,25 +276,25 @@ def validate_page(path: Path) -> list[str]:
         for topic in topics:
             if topic not in ALLOWED_TOPICS:
                 errors.append(
-                    f"unknown topic: {topic} (allowed: {', '.join(ALLOWED_TOPICS)})"
+                    f"主题不在词表里：{topic}（可选：{'、'.join(ALLOWED_TOPICS)}）"
                 )
 
         raw_status = inspector.meta.get("dojo:status", "")
         if raw_status and raw_status not in ALLOWED_STATUS:
             errors.append(
-                f"unknown status: {raw_status} (allowed: {', '.join(ALLOWED_STATUS)};"
-                " 省略即为 current)"
+                f"状态不在词表里：{raw_status}（可选：{'、'.join(ALLOWED_STATUS)}；"
+                "省略即为 current）"
             )
 
         raw_type = inspector.meta.get("dojo:type", "")
         if raw_type and raw_type not in ALLOWED_TYPES:
             errors.append(
-                f"unknown type: {raw_type} (allowed: {', '.join(ALLOWED_TYPES)})"
+                f"类型不在词表里：{raw_type}（可选：{'、'.join(ALLOWED_TYPES)}）"
             )
         elif raw_type and raw_type not in TYPE_STYLESHEET:
             errors.append(
-                f"type {raw_type} is paused: only concept pages are maintained"
-                " (an archived page must carry dojo:status=outdated)"
+                f"类型 {raw_type} 已暂停，只维护概念页"
+                "（归档的页面要标 dojo:status=outdated）"
             )
         elif raw_type in TYPE_STYLESHEET:
             allowed_css = TYPE_STYLESHEET[raw_type]
@@ -306,27 +305,27 @@ def validate_page(path: Path) -> list[str]:
                 for ref in inspector.stylesheets
             ):
                 errors.append(
-                    f"type {raw_type} must reference one of "
-                    + ", ".join(f"../../libs/{css}" for css in allowed_css)
+                    f"类型 {raw_type} 的页面要引用 "
+                    + " 或 ".join(f"../../libs/{css}" for css in allowed_css)
                 )
 
         # 标签取封闭词表内的单一值，防止细粒度标签再次碎片化
         raw_tag = inspector.meta.get("dojo:tag", "")
         if re.search(r"[,，]", raw_tag):
-            errors.append(f"dojo:tag must be a single value, got: {raw_tag}")
+            errors.append(f"dojo:tag 只能写一个，现在是：{raw_tag}")
         elif raw_tag and raw_tag not in ALLOWED_TAGS:
             errors.append(
-                f"unknown tag: {raw_tag} (allowed: {', '.join(ALLOWED_TAGS)})"
+                f"标签不在词表里：{raw_tag}（可选：{'、'.join(ALLOWED_TAGS)}）"
             )
 
         description = inspector.meta.get("description", "")
         summary = inspector.meta.get("dojo:summary", "")
         if "$" in description:
-            errors.append("description must be plain text; put formulas in dojo:summary")
+            errors.append("description 是纯文本，公式写到 dojo:summary 里")
         if "$$" in summary:
-            errors.append("dojo:summary supports inline $...$ formulas only")
+            errors.append("dojo:summary 只支持行内公式 $...$")
         if summary.count("$") % 2:
-            errors.append("dojo:summary has unmatched $ delimiter")
+            errors.append("dojo:summary 里的 $ 没有成对")
 
     visible_text = " ".join(inspector.visible_parts)
     summary = inspector.meta.get("dojo:summary", "")
@@ -338,9 +337,9 @@ def validate_page(path: Path) -> list[str]:
             and "renderMathInElement" in text
         )
         if not has_katex_js or not has_katex_css:
-            errors.append("math content requires local KaTeX JS and CSS")
+            errors.append("有公式的页面要引用本地的 KaTeX JS 和 CSS")
         if not has_auto_render:
-            errors.append("math content requires auto-render initialization")
+            errors.append("有公式的页面要初始化 auto-render")
 
     if is_wiki_page:
         errors.extend(check_bare_math(inspector))
@@ -365,14 +364,14 @@ def check_research_dir(research: Path) -> list[str]:
     for entry in sorted(research.iterdir()):
         if entry.is_dir():
             if entry.name not in RESEARCH_ALLOWED_DIRS:
-                errors.append(f"unexpected directory in research/: {entry.name}/")
+                errors.append(f"research/ 里不该有目录：{entry.name}/")
             continue
         if not entry.name.endswith(".md"):
-            errors.append(f"non-markdown file in research/: {entry.name}")
+            errors.append(f"research/ 里不该有非 Markdown 文件：{entry.name}")
         elif entry.name in RESEARCH_ALLOWED_FILES or REVIEW_FILE_RE.fullmatch(entry.name):
             continue
         else:
-            errors.append(f"unexpected file in research/: {entry.name}")
+            errors.append(f"research/ 里不该有这个文件：{entry.name}")
     return errors
 
 
@@ -390,16 +389,16 @@ def check_bare_math(inspector: PageInspector) -> list[str]:
         if hits:
             snippet = " ".join(outside.split())[:70]
             errors.append(
-                f"unrendered math characters {''.join(hits)} in <{context}>: {snippet}"
-                " (wrap in $...$ so KaTeX renders it)"
+                f"<{context}> 里有没渲染的数学字符 {''.join(hits)}：{snippet}"
+                "（用 $...$ 包起来，KaTeX 才会渲染）"
             )
 
     summary = inspector.meta.get("dojo:summary", "")
     hits = sorted(set(BARE_MATH_RE.findall(strip_math_segments(summary))))
     if hits:
         errors.append(
-            f"unrendered math characters {''.join(hits)} in dojo:summary"
-            " (wrap in $...$ so KaTeX renders it)"
+            f"dojo:summary 里有没渲染的数学字符 {''.join(hits)}"
+            "（用 $...$ 包起来，KaTeX 才会渲染）"
         )
     return errors
 
@@ -412,24 +411,24 @@ def check_svg_text_math(text: str) -> list[str]:
         if INLINE_MATH_RE.search(inner):
             snippet = " ".join(inner.split())[:60]
             errors.append(
-                f"math delimiters inside <{tag}> are not rendered: {snippet}"
-                " (use <foreignObject> to hold the formula)"
+                f"<{tag}> 里的数学定界符不会渲染：{snippet}"
+                "（公式放进 <foreignObject>）"
             )
             continue
         hits = sorted(set(BARE_MATH_RE.findall(inner)))
         if hits:
             snippet = " ".join(inner.split())[:60]
             errors.append(
-                f"unrendered math characters {''.join(hits)} inside <{tag}>: {snippet}"
-                " (use <foreignObject> with $...$ instead)"
+                f"<{tag}> 里有没渲染的数学字符 {''.join(hits)}：{snippet}"
+                "（改用 <foreignObject> 加 $...$）"
             )
             continue
         for pattern in ASCII_MATH_PATTERNS:
             if pattern.search(inner):
                 snippet = " ".join(inner.split())[:60]
                 errors.append(
-                    f"ascii approximation of math inside <{tag}>: {snippet}"
-                    " (use <foreignObject> with $...$ instead)"
+                    f"<{tag}> 里用 ASCII 近似写公式：{snippet}"
+                    "（改用 <foreignObject> 加 $...$）"
                 )
                 break
     return errors
@@ -442,8 +441,8 @@ def check_box_drawing(text: str) -> list[str]:
         hits = BOX_DRAWING_RE.findall(block)
         if len(hits) >= BOX_DRAWING_MIN_HITS:
             errors.append(
-                f"ascii box-drawing diagram in <pre> block #{index}"
-                f" ({len(hits)} box characters); use HTML diagram or inline SVG"
+                f"第 {index} 个 <pre> 块里是制表符画的图"
+                f"（{len(hits)} 个制表符），改用 HTML 结构图或内联 SVG"
             )
     return errors
 
@@ -469,8 +468,8 @@ def check_body_centering(text: str) -> list[str]:
             value = match.group(1).strip()
             if "auto" not in value:
                 errors.append(
-                    f"inline body margin overrides the centering: margin: {value}"
-                    " (use 'margin: 0 auto' so the fixed TOC does not overlap)"
+                    f"内联的 body margin 破坏了居中：margin: {value}"
+                    "（写 margin: 0 auto，固定目录才不会盖住正文）"
                 )
     return errors
 
@@ -506,7 +505,7 @@ def check_template(path: Path) -> list[str]:
     inspector.feed(text)
     raw_type = inspector.meta.get("dojo:type", "")
     if raw_type != module:
-        errors.append(f"template type must be {module}, got: {raw_type or '(missing)'}")
+        errors.append(f"模板的类型必须是 {module}，现在是：{raw_type or '（缺失）'}")
 
     # 只看模板的主样式：先去掉 <noscript> 段，其中的 <style> 属于无脚本回退。
     style_scope = NOSCRIPT_RE.sub("", text)
@@ -518,14 +517,14 @@ def check_template(path: Path) -> list[str]:
     )
     if not blocks and not linked:
         errors.append(
-            "template must either inline or link the shared stylesheet: "
-            + " or ".join(f"../../libs/{css}" for css in allowed_css)
+            "模板要么内联、要么引用共享样式表："
+            + " 或 ".join(f"../../libs/{css}" for css in allowed_css)
         )
         return errors
 
     css_path = Path("libs") / canonical_css
     if not css_path.exists():
-        errors.append(f"missing shared stylesheet: {css_path}")
+        errors.append(f"共享样式表不存在：{css_path}")
         return errors
 
     # 外链时没有副本，无从漂移，到此为止。
@@ -538,8 +537,8 @@ def check_template(path: Path) -> list[str]:
 
     if normalize(blocks[0]) != normalize(css_path.read_text(encoding="utf-8")):
         errors.append(
-            f"template inline styles drifted from {css_path}; "
-            "keep the two copies identical"
+            f"模板内联的样式与 {css_path} 不一致，"
+            "两份要保持逐字相同"
         )
     return errors
 

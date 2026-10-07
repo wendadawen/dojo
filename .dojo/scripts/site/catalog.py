@@ -292,9 +292,8 @@ def run_catalog(argv: list[str]) -> int:
     catalog = build_catalog(args.root)
     write_catalog(catalog, args.output)
     print(
-        f"generated {len(catalog['pages'])} pages, "
-        f"{len(catalog['edges'])} edges, "
-        f"{len(catalog['warnings'])} warnings -> {args.output}"
+        f"已生成 {len(catalog['pages'])} 个页面、{len(catalog['edges'])} 条边、"
+        f"{len(catalog['warnings'])} 条警告 -> {args.output}"
     )
     return 0
 

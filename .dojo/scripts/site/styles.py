@@ -20,7 +20,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from page import STYLE_RE, TYPE_STYLESHEET  # noqa: E402
-from vocab import ALLOWED_TYPES  # noqa: E402
 
 
 # ============================================================
@@ -192,7 +191,7 @@ def confirm_removals(candidates: set[str], pages: list[Path]) -> int:
     """
     chrome = find_chrome()
     if chrome is None:
-        print("error: --confirm 需要 Chrome/Chromium，未找到", file=sys.stderr)
+        print("错误：--confirm 需要 Chrome/Chromium，未找到", file=sys.stderr)
         return 2
 
     live: set[str] = set()
@@ -200,7 +199,7 @@ def confirm_removals(candidates: set[str], pages: list[Path]) -> int:
         try:
             live |= live_classes(chrome, page)
         except Exception as error:  # noqa: BLE001 - 报告后返回
-            print(f"error: {error}", file=sys.stderr)
+            print(f"错误：{error}", file=sys.stderr)
             return 2
 
     survivors = sorted(c for c in candidates if c in live)
@@ -386,7 +385,7 @@ def run_render_diff(args: list[str]) -> int:
 
     chrome = find_chrome()
     if chrome is None:
-        print("error: no Chrome/Chromium found", file=sys.stderr)
+        print("错误：未找到 Chrome/Chromium", file=sys.stderr)
         return 2
 
     before_server, before_port = serve_tree(before_root)
@@ -396,13 +395,13 @@ def run_render_diff(args: list[str]) -> int:
         before_file = before_root / rel
         after_file = after_root / rel
         if not before_file.exists() or not after_file.exists():
-            return f"ERR  {rel}  (missing on one side)"
+            return f"ERR  {rel}  （一侧不存在）"
         before = snapshot(chrome, f"http://127.0.0.1:{before_port}/{rel}", detail)
         after = snapshot(chrome, f"http://127.0.0.1:{after_port}/{rel}", detail)
         if before is None or after is None:
-            return f"ERR  {rel}  (page did not report; check the probe)"
+            return f"ERR  {rel}  （页面没有回报，检查探针）"
         if before[:2] == after[:2]:
-            return f"ok   {rel}  ({before[0]} elements)"
+            return f"ok   {rel}  （{before[0]} 个元素）"
         lines = [f"DIFF {rel}  before={before[:2]} after={after[:2]}"]
         if detail and len(before) > 2 and len(after) > 2:
             lines.extend(explain_diff(before[2], after[2]))
@@ -419,48 +418,31 @@ def run_render_diff(args: list[str]) -> int:
         before_server.shutdown()
         after_server.shutdown()
 
-    print(f"\n{len(pages) - failed}/{len(pages)} pages identical", flush=True)
+    print(f"\n{len(pages) - failed}/{len(pages)} 个页面渲染一致", flush=True)
     return 1 if failed else 0
 
 
 
 
 def run_css_check(argv: list[str]) -> int:
-    """--css：对每个页面类型跑死规则检测。
+    """--css：对每个有样式表的页面类型（现行只有 concept）跑死规则检测。
 
-    默认覆盖 TYPE_STYLESHEET 里的类型（现行只有 concept）。用 --module 指定
-    单个类型、--template 指定模板路径；--confirm 在浏览器里复核候选；
-    --fix 直接删。
+    --confirm 在浏览器里复核候选；--fix 直接删。
     """
     fix = "--fix" in argv
     confirm = "--confirm" in argv
-    module = None
-    template = None
-    if "--module" in argv:
-        i = argv.index("--module")
-        module = argv[i + 1]
-    if "--template" in argv:
-        i = argv.index("--template")
-        template = Path(argv[i + 1])
 
-    modules = [module] if module else list(TYPE_STYLESHEET)
     total_removed = 0
-    for name in modules:
-        if name not in ALLOWED_TYPES:
-            print(
-                f"error: 未知类型 {name!r}（可选：{', '.join(ALLOWED_TYPES)}）",
-                file=sys.stderr,
-            )
-            return 2
-        tpl = template or Path(f".dojo/templates/{name}/index.html")
+    for name in TYPE_STYLESHEET:
+        tpl = Path(f".dojo/templates/{name}/index.html")
         # 模板是这一类页面样式的权威副本，缺了就无从检查；静默跳过会让
         # 模板被误删时无人发觉，所以这里直接报错。
         if not tpl.exists():
-            print(f"error: 模板不存在：{tpl}", file=sys.stderr)
+            print(f"错误：模板不存在：{tpl}", file=sys.stderr)
             return 2
         pages = pages_of_type(Path("."), name)
         if not pages:
-            print(f"error: no pages with dojo:type={name}", file=sys.stderr)
+            print(f"错误：没有 dojo:type={name} 的页面", file=sys.stderr)
             return 2
         targets = [tpl] + pages
         usage = build_usage(targets, pages)
@@ -471,7 +453,7 @@ def run_css_check(argv: list[str]) -> int:
             removed_here += len(removed)
             candidates.update(CLASS_TOKEN_RE.findall("\n".join(removed)))
             if removed:
-                print(f"{path}: {len(removed)} rules")
+                print(f"{path}：{len(removed)} 条规则")
                 for selector in removed:
                     print(f"  - {selector}")
         if confirm and candidates:
@@ -482,10 +464,10 @@ def run_css_check(argv: list[str]) -> int:
                 return status
         total_removed += removed_here
         if not removed_here:
-            print(f"no dead css in {len(targets)} files")
+            print(f"{len(targets)} 个文件里没有死 CSS")
 
     if total_removed:
-        print(f"\n{'cleaned' if fix else 'found'} {total_removed} dead rules")
+        print(f"\n{'已清掉' if fix else '发现'} {total_removed} 条死规则")
         return 0 if fix else 1
     return 0
 
