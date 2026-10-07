@@ -172,11 +172,12 @@ def check_basis(doc: dict, research: Path) -> list[str]:
 
 TEXT_SUFFIXES = {".tex", ".txt", ".md", ".bbl", ".rst", ".html", ".htm"}
 MAX_TEXT_BYTES = 2_000_000
+REPO_DIR = "repo"  # guides/concept/collect.md 规定仓库 clone 到 sources/repo/
 
 
 def _text_files(sources: Path) -> list[Path]:
     """sources/ 下用来核对数字的文本：递归读，只读论文源码、文本快照这类，
-    跳过仓库（代码和二进制太多）、PDF、图片和过大的文件。"""
+    跳过 repo/（代码和二进制太多）、PDF、图片和过大的文件。"""
     if not sources.is_dir():
         return []
     out = []
@@ -184,7 +185,7 @@ def _text_files(sources: Path) -> list[Path]:
         if not p.is_file() or p.suffix.lower() not in TEXT_SUFFIXES:
             continue
         rel = p.relative_to(sources).parts
-        if rel[0] == "repo" or p.stat().st_size > MAX_TEXT_BYTES:
+        if rel[0] == REPO_DIR or p.stat().st_size > MAX_TEXT_BYTES:
             continue
         out.append(p)
     return out

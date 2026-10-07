@@ -475,22 +475,9 @@ def check_body_centering(text: str) -> list[str]:
 
 
 def check_template(path: Path) -> list[str]:
-    """模板必须声明正确类型，且样式只有一份来源。
+    """模板必须声明正确类型，样式要么内联要么引用共享样式表。
 
-    模板因含占位符不能走 validate_page；但类型写错时，按模板生成的每个
-    页面都会错，因此在模板层面单独拦一道。
-
-    样式的处理有两种，都允许，但都必须保证「只有一份真相」：
-
-      · 内联：散文类模板这样做。模板位于 .dojo/templates/<module>/，
-        相对路径 ../../libs/ 会解析到 .dojo/libs，直接打开模板看不到样式；
-        内联后模板自身可预览。代价是多一份副本，故必须与共享文件逐字一致。
-
-      · 外链：依赖 JS 的模板这样做。数据流页离开 elk.bundled.js 与
-        dojo-flow.js 就渲染不出任何东西，独立预览本就无意义，内联只是
-        白白多一份副本。直接引用共享文件，从根上不存在漂移。
-
-    两种都不满足（既没内联也没引用）时报错。
+    模板含占位符，不能走 validate_page。内联的样式必须与 libs/ 下的共享样式表逐字一致。
     """
     errors: list[str] = []
     module = path.parent.name
@@ -574,11 +561,7 @@ LEGACY_CLOSE_RE = re.compile(r"//-->\s*$")
 
 
 class ScriptCollector(HTMLParser):
-    """收集页面里所有内联脚本的源码。
-
-    用 HTMLParser 而不是正则：它按 HTML 规则解析属性（引号内的 > 不会截断
-    标签）、正确跳过注释里的示例代码，也不要求 </script> 后面直接跟 >。
-    """
+    """收集页面里所有内联脚本的源码。"""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
@@ -616,14 +599,8 @@ class ScriptCollector(HTMLParser):
 def check_inline_js(pages: list[Path]) -> tuple[list[str], int, bool]:
     """内联 <script> 的语法检查。返回 (错误, 块数, 是否执行)。
 
-    只查语法，不执行代码：拼错括号或引号会在这里拦下，但运行时报错
-    （加载顺序、未定义全局、第三方包内部抛错）查不出来。
-
-    逐个块起 node 进程时，200 多个块要起 200 多次进程，耗时以秒计。
-    这里在单个 node 进程内用 vm.Script 逐个编译，语义与 --check 一致，
-    失败信息按 FILE: 前缀分段，便于映射回页面与块号。
-
-    node 不存在时返回「未执行」，由调用方决定是否提示，不阻断其他检查。
+    只查语法，不执行代码。所有块在一个 node 进程里用 vm.Script 逐个编译。
+    node 不存在时返回「未执行」，不阻断其他检查。
     """
     if shutil.which("node") is None:
         return [], 0, False
