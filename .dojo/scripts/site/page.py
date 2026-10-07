@@ -43,7 +43,7 @@ REQUIRED_WIKI_META = (
     "dojo:tag",
 )
 # 概念页要引用的共享样式表。
-CONCEPT_STYLESHEET = "dojo-concept.css"
+CONCEPT_STYLESHEET = "concept/dojo-concept.css"
 TEMPLATE_DIR = ".dojo/templates"
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
 

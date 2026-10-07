@@ -158,13 +158,13 @@
   async function load3dDependencies() {
     if (!root.ForceGraph3D) {
       if (!forceGraph3dPromise) {
-        const url = new URL("libs/3d-force-graph.min.js", document.baseURI).href;
+        const url = new URL("libs/site/3d-force-graph.min.js", document.baseURI).href;
         forceGraph3dPromise = loadScript(url);
       }
       await forceGraph3dPromise;
     }
     if (!spriteTextClass) {
-      const moduleUrl = new URL("libs/three-spritetext.mjs", document.baseURI).href;
+      const moduleUrl = new URL("libs/site/three-spritetext.mjs", document.baseURI).href;
       const module = await import(moduleUrl);
       spriteTextClass = module.default;
     }
