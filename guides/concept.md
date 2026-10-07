@@ -15,7 +15,7 @@
 3. **审大纲**：3 个审查者，最多 3 轮，见[审大纲](concept/review-outline.md)。
 4. **写正文**：写 `research/content.md`，每段后面附一行依据，见[正文](concept/content.md)。
 5. **审正文**：5 个审查者，最多 5 轮，见[审正文](concept/review-content.md)。
-6. **生成**：运行 `python3 .dojo/scripts/concept/build_page.py wiki/<name>/research/content.md --run`，生成两页，并自动运行机械检查。再运行 `python3 .dojo/scripts/site/validate.py wiki/<name>/index.html wiki/<name>/overview.html`。
+6. **生成**：运行 `python3 .dojo/scripts/concept/build_page.py wiki/<name>/research/content.md --run`，生成两页，并自动运行机械检查。再运行 `python3 .dojo/scripts/site/check.py wiki/<name>/index.html wiki/<name>/overview.html`。
 
 每一步完成再进入下一步。`<name>` 用小写英文和连字符。交付时回复里只写这次生成的页面路径。
 

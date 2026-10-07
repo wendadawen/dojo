@@ -1,6 +1,9 @@
-"""首页目录：扫描 wiki/*/index.html，生成首页用的 catalog.json（页面、链接关系、警告）。
+#!/usr/bin/env python3
+"""生成首页用的 catalog.json：扫描 wiki/*/index.html，得到页面、链接关系和警告。
 
-由 validate.py 调度；词表在 vocab.py。
+    python3 .dojo/scripts/site/build_catalog.py --output _site/catalog.json [--root <仓库根>]
+
+主题词表在 vocab.py。
 """
 
 from __future__ import annotations
@@ -22,9 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vocab import ALLOWED_TOPICS  # noqa: E402
 
 
-# ============================================================
-# 首页目录：扫描 wiki 生成 catalog.json（词表在文件顶部）
-# ============================================================
 SPACE_RE = re.compile(r"\s+")
 IGNORED_SCHEMES = {"http", "https", "mailto", "javascript", "data", "tel"}
 
@@ -274,16 +274,11 @@ def write_catalog(catalog: dict, output: Path) -> None:
         json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-
-
-
-
-def run_catalog(argv: list[str]) -> int:
-    """--catalog：构建首页用的 catalog.json。"""
-    parser = argparse.ArgumentParser(prog="site/validate.py --catalog")
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+def main() -> int:
+    parser = argparse.ArgumentParser(description="生成首页用的 catalog.json")
+    parser.add_argument("--root", type=Path, default=Path.cwd(), help="仓库根，默认当前目录")
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args([a for a in argv if a != "--catalog"])
+    args = parser.parse_args()
 
     catalog = build_catalog(args.root)
     write_catalog(catalog, args.output)
@@ -292,5 +287,9 @@ def run_catalog(argv: list[str]) -> int:
         f"{len(catalog['warnings'])} 条警告 -> {args.output}"
     )
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
