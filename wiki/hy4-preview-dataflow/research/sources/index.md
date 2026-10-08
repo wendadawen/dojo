@@ -1,0 +1,9 @@
+- repo/｜源码｜https://github.com/huggingface/transformers 的 `src/transformers/models/hy_v4/`｜commit cb33194ad6152bd9fad6305378d92db385dd7b32（transformers main，2026-10-08 取回）｜2026-10-08｜本模型在 transformers 里的实现，用到的文件是 `modeling_hy_v4.py`（956 行）、`configuration_hy_v4.py`（162 行）、`modular_hy_v4.py`（642 行）
+- repo/modeling_hy_v4.py｜源码｜https://huggingface.co/tencent/Hy4-preview 的模型类型 `hy_v4` 在 transformers 的实现｜commit cb33194｜2026-10-08｜模型与各层的前向实现
+- repo/configuration_hy_v4.py｜源码｜同上｜commit cb33194｜2026-10-08｜配置类 `HYV4Config`，默认值与派生字段
+- repo/modular_hy_v4.py｜源码｜同上｜commit cb33194｜2026-10-08｜模块化源码，`modeling_hy_v4.py` 由它生成
+- config.json｜配置｜https://huggingface.co/tencent/Hy4-preview/raw/main/config.json｜修订 705d81ee51566a186d645b74c974d642ef2828fe｜2026-10-08｜模型的配置，`architecture` 为 `HYV4ForCausalLM`
+- shapes.json｜权重头｜https://huggingface.co/tencent/Hy4-preview 的 `model-00001-of-00131.safetensors` 到 `model-000131`，按 HTTP Range 只取头部解析｜修订 705d81ee｜2026-10-08｜张量形状表，键已按 `modeling_hy_v4.py` 的模块路径改写，78 层形状一致时合并成 `layers.{i}` 一条
+- model.safetensors.index.json｜权重头｜https://huggingface.co/tencent/Hy4-preview/raw/main/model.safetensors.index.json｜修订 705d81ee｜2026-10-08｜分片到张量名的映射，用来确认哪些层带索引器权重
+- paper/2512.02556-DSA.pdf｜论文｜https://arxiv.org/abs/2512.02556｜arXiv 2512.02556｜2026-10-08｜DeepSeek-V3.2 技术报告，DSA 稀疏注意力与索引器
+- paper/2603.12201-IndexCache.pdf｜论文｜https://arxiv.org/abs/2603.12201｜arXiv 2603.12201｜2026-10-08｜IndexCache，跨层复用稀疏索引
