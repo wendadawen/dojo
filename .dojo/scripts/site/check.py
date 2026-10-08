@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
-"""检查页面的入口：一次跑完页面检查和内联脚本语法检查。
+"""检查页面：页面规则加内联脚本语法（需要 node）。
 
-    python3 .dojo/scripts/site/check.py <页面...>
+    python3 .dojo/scripts/site/check.py <页面或目录...>
     python3 .dojo/scripts/site/check.py --all
     python3 .dojo/scripts/site/check.py --selftest
-
-具体的检查在同目录各自的脚本里，也可以单独运行：
-    check_page.py      页面
-    check_script.py    内联脚本语法
-    check_template.py  概念页模板
-    check_css.py       没人用的 CSS
 """
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import check_css  # noqa: E402
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "concept"))
 import check_page  # noqa: E402
 import check_script  # noqa: E402
-import check_template  # noqa: E402
+from common import report  # noqa: E402
+
+
+def selftest() -> int:
+    results = [("页面：" + n, ok) for n, ok in check_page.selftest()]
+    if shutil.which("node"):
+        results += [("脚本：" + n, ok) for n, ok in check_script.selftest()]
+    return report(results, "页面检查")
 
 
 def main(args: list[str]) -> int:
     if "--selftest" in args:
-        codes = [m.selftest() for m in (check_page, check_script, check_template, check_css)]
-        return 1 if any(codes) else 0
-
+        return selftest()
     if "--all" in args:
         # research/ 不发布，里面的资料快照不是站点页面
         pages = sorted(p for p in Path("wiki").glob("**/*.html") if "research" not in p.parts)
@@ -42,25 +43,21 @@ def main(args: list[str]) -> int:
         print("错误：页面不存在：" + "、".join(missing))
         return 2
 
-    failed = 0
+    errors = []
     for page in pages:
-        errors = check_page.check(page)
-        if errors:
-            failed += 1
-            print(f"- {page}")
-            for e in errors:
-                print(f"  - {e}")
-
-    script_errors, blocks, node_ok = check_script.check(pages)
-    for e in script_errors:
-        print(f"- {e}")
-    if not node_ok:
+        errors += [f"{page}：{e}" for e in check_page.check(page)]
+    blocks = 0
+    if shutil.which("node"):
+        script_errors, blocks = check_script.check(pages)
+        errors += script_errors
+    else:
         print("提示：PATH 里没有 node，跳过内联脚本语法检查")
-
-    if failed or script_errors:
-        print(f"检查失败：{failed}/{len(pages)} 个页面有问题" + (f"，{len(script_errors)} 块脚本有问题" if script_errors else ""))
+    for e in errors:
+        print(f"- {e}")
+    if errors:
+        print(f"检查失败：{len(errors)} 个问题")
         return 1
-    print(f"检查通过：{len(pages)} 个页面" + (f"，内联脚本 {blocks} 块" if node_ok else ""))
+    print(f"检查通过：{len(pages)} 个页面，内联脚本 {blocks} 块")
     return 0
 
 

@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""检查 outline.md：格式、字数预算、依据能不能对上资料。
-
-    python3 .dojo/scripts/concept/check_outline.py wiki/<name>/research/outline.md
-    python3 .dojo/scripts/concept/check_outline.py --selftest
-
-每条规则是下面一个函数，收到解析好的大纲，返回问题列表。要增删规则，增删函数，
-再改文件末尾的 RULES。
-"""
+"""检查 outline.md：格式、字数预算、依据能不能对上资料。"""
 
 from __future__ import annotations
 
@@ -17,8 +10,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from check_basis import (  # noqa: E402
-    LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, check_basis_list,
+from common import (  # noqa: E402
+    LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT, check_basis_list, report,
 )
 
 
@@ -82,12 +75,12 @@ def words_is_integer(o: dict) -> list[str]:
 
 
 def basis_matches_sources(o: dict) -> list[str]:
-    errors, cache = [], {}
+    errors = []
     for page in o["nodes"].values():
         for no, *_, basis in page:
             if not basis.strip():
                 errors.append(f"第 {no} 行：依据不能空，写文件和位置，或写「{SELF_MADE}」")
-            for why in check_basis_list(basis, o["sources"], cache):
+            for why in check_basis_list(basis, o["sources"]):
                 errors.append(f"第 {no} 行：依据对不上：{why}")
     return errors
 
@@ -119,7 +112,7 @@ def budget_within_limit(o: dict) -> list[str]:
 
 
 RULES = [
-    has_both_pages, node_has_four_parts, each_page_has_nodes, what_is_one_short_sentence,
+    node_has_four_parts, each_page_has_nodes, what_is_one_short_sentence,
     words_is_integer, basis_matches_sources, short_has_three_sections,
     long_ends_with_boundary, budget_within_limit,
 ]
@@ -130,7 +123,7 @@ def check(md: Path) -> list[str]:
     errors = has_both_pages(o)
     if errors:
         return errors  # 缺一页时，后面的规则没有意义
-    for rule in RULES[1:]:
+    for rule in RULES:
         errors += rule(o)
     return errors
 
@@ -148,8 +141,6 @@ GOOD = "\n".join([
     "- ### 为什么要它｜讲动机｜100｜自行构造",
     "- ### 怎么用它｜讲用法｜100｜book.md 第 1 章",
 ])
-SNAPSHOT = ("# 第 1 章 玩具算子\n\n玩具算子把输入乘 2。输入取 3.5 时输出 7.0。\n"
-            "它只对数值输入成立。\n\n## 1.2 另一节\n\n更多内容。\n")
 
 # 每条规则一个坏输入，应当报出 want；want 为 None 的是不该报错的写法
 CASES = [
@@ -182,11 +173,7 @@ def selftest() -> int:
             if want is None and errs:
                 print("    意外报错：", errs)
             results.append((name, ok))
-    for name, ok in results:
-        print(("  OK  " if ok else "  FAIL") + " " + name)
-    failed = sum(1 for _, ok in results if not ok)
-    print(f"大纲检查自检失败：{failed} 项" if failed else f"大纲检查自检通过：{len(results)} 项")
-    return 1 if failed else 0
+    return report(results, "大纲检查")
 
 
 if __name__ == "__main__":

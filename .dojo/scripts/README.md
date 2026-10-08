@@ -1,46 +1,22 @@
 # 脚本
 
-在仓库根目录运行。
+在仓库根目录运行，具体命令见 `guides/concept.md` 和 `.github/workflows/pages.yml`。
 
-## 写概念页
+## concept/
 
-    # 检查大纲
-    python3 .dojo/scripts/concept/check_outline.py wiki/<name>/research/outline.md
+- `build_page.py`：读 `content.md`，生成长页和短页，`--run` 同时运行文中代码并核对输出。
+- `check_outline.py`：检查大纲。
+- `check_content.py`：检查正文。
+- `common.py`：上面三个脚本共用的常量、依据检查和自检输出。
 
-    # 生成长页和短页，并自动检查正文；--run 同时运行文中的代码并核对输出
-    python3 .dojo/scripts/concept/build_page.py wiki/<name>/research/content.md --run
+## site/
 
-    # 单独检查正文
-    python3 .dojo/scripts/concept/check_content.py wiki/<name>/research/content.md
+- `check.py`：检查页面，页面规则加内联脚本语法（需要 node）；`--all` 查所有页面。
+- `check_page.py`、`check_script.py`：`check.py` 调用的页面规则和脚本语法检查。
+- `check_css.py`：找出共享样式表里没人用的规则，`--fix` 直接删除。
+- `build_catalog.py`：扫描 `wiki/`，生成首页读的 `catalog.json`。
+- `vocab.py`：主题和标签的封闭词表。
 
-## 检查页面
+首页 `index.html` 引用的 `assets/` 和 `catalog.json` 只在 CI 里生成：`assets/` 来自 `.dojo/site/`，`catalog.json` 来自 `build_catalog.py`，不用手工收录页面。
 
-    python3 .dojo/scripts/site/check.py wiki/<name>/index.html wiki/<name>/overview.html
-    python3 .dojo/scripts/site/check.py --all
-
-`check.py` 一次跑完页面检查和内联脚本语法检查。也可以单独运行：
-
-    python3 .dojo/scripts/site/check_page.py <页面...>    # 页面
-    python3 .dojo/scripts/site/check_script.py <页面...>  # 内联脚本语法，需要 node
-    python3 .dojo/scripts/site/check_template.py          # 概念页模板
-    python3 .dojo/scripts/site/check_css.py [--fix]       # 没人用的 CSS 规则
-
-## 其他
-
-    python3 .dojo/scripts/site/build_catalog.py --output _site/catalog.json
-
-    # 改样式前后比对渲染，需要 Chrome
-    python3 .dojo/scripts/site/diff_render.py <before-root> <after-root> <页面...>
-
-## 自检
-
-每个脚本都有 `--selftest`：
-
-    python3 .dojo/scripts/concept/build_page.py --selftest
-    python3 .dojo/scripts/concept/check_outline.py --selftest
-    python3 .dojo/scripts/concept/check_content.py --selftest
-    python3 .dojo/scripts/site/check.py --selftest     # 页面、脚本、模板、CSS 四个检查的自检
-
-## 增删检查
-
-`check_outline.py`、`check_content.py`、`check_page.py` 里，每条检查是一个函数，`RULES` 列出全部。增加检查就写一个函数加进 `RULES`，再往 `CASES` 加一个会触发它的坏输入；删除就两处一起删。
+`check.py`、`check_css.py` 和 concept 下的脚本有 `--selftest`。增加检查：写一个函数加进 `RULES`，再往 `CASES` 加一个会触发它的坏输入；删除则两处一起删。
