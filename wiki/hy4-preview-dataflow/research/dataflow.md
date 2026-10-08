@@ -594,7 +594,7 @@
 | sc | 公式 | $scores = q k^\top$，在 fp32 里算，q 是 [B, T, 32, 128]，k 是单头 [B, L, 128] |
 | relu | 公式 | $scores = \max(scores, 0)$ |
 | wp | 公式 | $weights = weights\_proj(hidden\_states) \cdot 32^{-1/2} \cdot 128^{-1/2}$，weights_proj 给出每个头的权重，两个常数分别是 n_heads 与 softmax_scale |
-| wp | 说明 | weights_proj.weight [32, 6144]；32 是 index_n_heads，128 是 index_head_dim，softmax_scale 是 $128^{-1/2}$ |
+| wp | 说明 | weights_proj.weight [32, 6144]；32 是 index_n_heads，128 是 index_head_dim，softmax_scale 是 index_head_dim 的 −1/2 次方 |
 | matmul | 公式 | $index\_scores = \sum_h weights_h \cdot scores_h$，按头加权求和 |
 | aadd | 公式 | $index\_scores = index\_scores + attention\_mask$，加性掩码里晚于这个查询的位置是极小值 |
 | topk | 公式 | $topk\_indices = \mathrm{topk}(index\_scores, \min(2048, L)).indices$，取打分最高的若干个位置 |
@@ -1189,7 +1189,7 @@
 | id | 名字 | 内容 |
 |---|---|---|
 | fr | 公式 | $freqs = position\_ids \cdot inv\_freq$，inv_freq 是逆频率，长度 32 = 64 / 2 |
-| fr | 说明 | 逆频率按 $base^{-2i/d}$ 生成，base 是 rope_theta 10000000，d 就是 head_dim（64），逆频率长度 32 = 64 / 2 |
+| fr | 说明 | 逆频率按 base 的 −2i/d 次方生成，base 是 rope_theta 10000000，d 就是 head_dim（64），逆频率长度 32 = 64 / 2 |
 | cat | 公式 | $emb = \mathrm{cat}(freqs, freqs)$，长度翻倍到 64 |
 | cos | 公式 | $cos = \cos(emb) \cdot attention\_scaling$，rope_type 为 default 时 attention_scaling 为 1 |
 | sin | 公式 | $sin = \sin(emb) \cdot attention\_scaling$ |

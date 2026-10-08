@@ -274,7 +274,7 @@ def parse(plan: Path) -> dict:
 
     config = group_rows(read_table(config_rows, ["组", "名字", "值"], "config.json 表"))
     return {"plan": plan, "meta": meta, "views": views, "config_groups": config or None,
-            "config_note": "前提：" + "；".join(scope)}
+            "config_note": scope}
 
 
 # 第二行里表示「形状没写全」的占位。
@@ -282,7 +282,7 @@ SHAPE_PLACEHOLDERS = ("同形状", "同上", "不变", "—", "--")
 
 
 def check_plan(views: list[dict]) -> None:
-    """跨图与形状的机械检查：同 id 必须同形状，算子和张量的形状要写全。
+    """跨图与形状的机械检查：同 id 必须同形状，算子和张量的形状要写全，公式外的下划线不转义。
 
     不同图里第一行可以不一样——一处写变量名、一处写产生它的表达式，都指同一个量；
     但形状必须一致。同 id 形状对不上，就是两个不同的量共用了 id。
@@ -301,20 +301,48 @@ def check_plan(views: list[dict]) -> None:
                                   f"这里是「{shape}」；不是同一个量就换一个 id")
                 else:
                     shapes.setdefault(n["id"], shape)
-                continue
-            if n["kind"] == "cache":
+            elif n["kind"] == "cache":
                 if not shape or shape in SHAPE_PLACEHOLDERS:
                     errors.append(f"{where}：缓存第二行要写存的是什么")
-                continue
-            if "→" not in shape and "->" not in shape:
-                errors.append(f"{where}：算子第二行要写「原来的形状 → 变完的形状」")
-                continue
-            for side in re.split(r"→|->", shape):
-                if not side.strip() or side.strip() in SHAPE_PLACEHOLDERS:
-                    errors.append(f"{where}：算子第二行两边都要写完整形状，现在是「{shape}」")
-                    break
+            else:
+                if "→" not in shape and "->" not in shape:
+                    errors.append(f"{where}：算子第二行要写「原来的形状 → 变完的形状」")
+                else:
+                    for side in re.split(r"→|->", shape):
+                        if not side.strip() or side.strip() in SHAPE_PLACEHOLDERS:
+                            errors.append(f"{where}：算子第二行两边都要写完整形状，现在是「{shape}」")
+                            break
+            errors += _stray_underscore_escape(where, n)
+            errors += _formula_in_explanation(where, n)
     if errors:
         raise SystemExit("\n".join(errors))
+
+
+def _stray_underscore_escape(where: str, node: dict) -> list[str]:
+    """`\\_` 只在 $...$ 里有用（LaTeX 的下标分隔符）。公式外的 `\\_` 会原样显示成反斜杠，
+    要写成普通下划线。折叠和面板的每一行都要查。"""
+    texts = [node.get("shape"), node.get("detail"),
+             *(s.get("text") for s in node.get("fold") or [])]
+    errors = []
+    for text in texts:
+        if not text:
+            continue
+        for line in re.split(r"<br\s*/?>|\n", text):
+            outside = re.sub(r"\$[^$\n]*\$", "", line)
+            if "\\_" in outside:
+                errors.append(f"{where}：下划线写成 \\_ 了，公式外用普通 _（{outside.strip()[:40]}）")
+                break
+    return errors
+
+
+def _formula_in_explanation(where: str, node: dict) -> list[str]:
+    """折叠的「说明」写权重形状、配置和一句说明，不重复公式——公式归「公式」那一行，
+    算子和张量的节点本身已经画出这些量了。"""
+    errors = []
+    for sec in node.get("fold") or []:
+        if sec.get("title") == "说明" and "$" in (sec.get("text") or ""):
+            errors.append(f"{where}：折叠「说明」里不写公式，公式放进「公式」那一行")
+    return errors
 
 
 # ---------- 写页面 ----------
@@ -342,11 +370,12 @@ def build_fallback(views: list[dict]) -> str:
     return "".join(rows)
 
 
-def build_config_panel(groups, note: str = "") -> str:
-    """把 (分组名, [(键, 值), ...]) 渲染成可折叠面板。"""
+def build_config_panel(groups, note: list[str] | None = None) -> str:
+    """把 (分组名, [(键, 值), ...]) 渲染成可折叠面板。note 是「前提」一节，逐条一行。"""
     blocks: list[str] = []
     if note:
-        blocks.append(f'<div class="cfg-note">{html.escape(note)}</div>')
+        items = "".join(f"<li>{html.escape(s)}</li>" for s in note)
+        blocks.append(f'<div class="cfg-note"><b>前提</b><ul>{items}</ul></div>')
     for title, rows in groups:
         body = "".join(
             f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>"
@@ -360,7 +389,7 @@ def build_config_panel(groups, note: str = "") -> str:
 
 
 def write_page(out: Path, meta: dict, views: list[dict],
-               config_groups=None, config_note: str = "",
+               config_groups=None, config_note: list[str] | None = None,
                template: Path | None = None) -> Path:
     """把视图数据填进模板并写盘。meta 需要 title / description / summary / topics / tag。"""
     tpl = (template or TEMPLATE).read_text(encoding="utf-8")
@@ -523,7 +552,7 @@ def selftest() -> int:
             ("面板按组读入", main_view["info"][0]["title"] == "公式"
              and main_view["info"][1]["rows"] == [["hidden_size", "16"]]),
             ("config 面板已渲染", "<summary>规模</summary>" in t),
-            ("前提写进 config 面板顶部", "前提：推理；不传缓存" in t),
+            ("前提逐条写进 config 面板顶部", "<b>前提</b><ul><li>推理</li><li>不传缓存</li></ul>" in t),
             ("视图数据已内嵌", '"id":"toymodel"' in t and '"id":"toyblock"' in t),
             ("标签栏两个视图", t.count('class="flow-tab') == 2),
             ("无占位符残留", "【" not in t),
@@ -557,6 +586,13 @@ def selftest() -> int:
             ("跨图同 id 指不同的量应当报错",
              TOY_PLAN.replace("| x | 张量 | x | fp32 [B, T, 16] | | toy.py:11 |",
                               "| ids | 张量 | other | fp32 [B, T, 16] | | toy.py:11 |")),
+            ("散文里的下划线写成 \\_ 应当报错",
+             TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
+                              "| blk | 公式 | $x + f(x)$，x\\_是输入 |")),
+            ("说明里写公式应当报错",
+             TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
+                              "| blk | 公式 | $x + f(x)$，x 是输入 |\n"
+                              "| blk | 说明 | 再乘 $d^{-1/2}$ |")),
         ]:
             plan.write_text(broken, encoding="utf-8")
             try:
