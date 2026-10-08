@@ -1,0 +1,2 @@
+- paper/arxiv-v2.pdf、paper/src-v2/、paper/arxiv-v2.txt｜论文｜https://arxiv.org/abs/2601.07372v2｜v2｜2026-10-07｜Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models，提出 Engram：用哈希 n-gram 查嵌入表的条件记忆模块；LaTeX 源码在 src-v2/，纯文本快照 arxiv-v2.txt
+- repo/engram/｜仓库｜https://github.com/deepseek-ai/Engram｜fb7f84a21f91223715394a33a1dc24bbfb7f788e（2026-01-14）｜2026-10-07｜论文官方仓库：README、论文 PDF、架构图和演示数据流的单文件实现 engram_demo_v1.py
