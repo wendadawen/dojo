@@ -56,6 +56,16 @@
 
 字数按汉字加英文单词算。
 
+## 示范
+
+[Engram](wiki/engram) 是按这份指南走完六步的例子，写每一步时可以对照它的同一步：
+
+- 大纲：`wiki/engram/research/outline.md`，看节点怎么写成四样、折叠块怎么在「写什么」里点明、一章只有标题时预算怎么写。
+- 正文：`wiki/engram/research/content.md`，看折叠块怎么嵌在它补充的那段后面、推导和例子怎么拆成有序步骤、依据行怎么写。
+- 冲突记录：`wiki/engram/research/conflicts.md`。
+
+只学写法，不照搬内容；写什么仍然只依据本概念自己的资料。
+
 ## 页面信息与前置概念
 
 - 主题从 `.dojo/scripts/site/vocab.py` 的 `ALLOWED_TOPICS` 里选，标签从同一文件的 `ALLOWED_TAGS` 里选，没有贴切的用「通用概念」。
