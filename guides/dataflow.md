@@ -34,4 +34,4 @@
 
 ## 示范
 
-`wiki/deepseek-v4-1-dataflow/` 是按这份指南生成的数据流页，`research/dataflow.md` 是它的计划文件。写新页时对照它。
+`wiki/deepseek-v4-1-dataflow/` 是按这份指南生成的数据流页，`research/dataflow.md` 是它的计划文件。写新页时对照它。示范页只示范格式（怎么写节点、连线、折叠、面板），它的事实以它自己的源码为准；格式和这份指南的条文冲突时以指南为准。

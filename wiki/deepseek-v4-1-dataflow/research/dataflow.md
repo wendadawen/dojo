@@ -112,7 +112,7 @@
 | samp | 算子 | sample(logits, self.temperature) | fp32 [B, 129280] → int64 [B] |  | model.py:1270 |
 | oids | 张量 | output_ids | int64 [B] | | model.py:1270 |
 | shar | 缓存 | shared_attn | compress_kv、index_k、topk_idxs、candidates | 各层之间传递的共享量，每个前向里由靠前的层写、靠后的层读，不重置。candidates 由层 20 写，层 24、28、32、36 读 | model.py:1166-1180 |
-| tret | 张量 | (output_ids, logits, main_hidden) | — | 三个返回值：采样出的 id、logits、拼接后的 main_hidden | model.py:1272 |
+| tret | 张量 | (output_ids, logits, main_hidden) | int64 [B] × fp32 [B, 129280] × bf16 [B, 15360] | 三个返回值：采样出的 id、logits、拼接后的 main_hidden | model.py:1272 |
 
 ### 连线
 
@@ -233,7 +233,7 @@
 | x7 | 张量 | x | bf16 [B, T, 5120] | | model.py:992 |
 | cpost2 | 算子 | self.hc_post(x, residual, ffn_post, ffn_comb) | [B, T, 5120] → [B, T, 4, 5120] |  | model.py:993 |
 | hout | 张量 | x | bf16 [B, T, 4, 5120] | | model.py:993 |
-| bret | 张量 | (x, ffn_pre) | — | 第二个返回值是下一层的 pre_mix | model.py:994 |
+| bret | 张量 | (x, ffn_pre) | bf16 [B, T, 4, 5120] × fp32 [B, T, 4] | 第二个返回值是下一层的 pre_mix | model.py:994 |
 
 ### 连线
 
@@ -819,7 +819,7 @@
 | w1 | 张量 | weights | fp32 [B×T, 6] | | model.py:825 |
 | grs | 算子 | weights *= self.route_scale | fp32 [B×T, 6] → fp32 [B×T, 6] |  | model.py:826 |
 | gw | 张量 | weights | fp32 [B×T, 6] | | model.py:826 |
-| gret | 张量 | (weights, indices) | — | 两个返回值都交给 MoE | model.py:827 |
+| gret | 张量 | (weights, indices) | fp32 [B×T, 6] × int64 [B×T, 6] | 两个返回值都交给 MoE | model.py:827 |
 
 ### 连线
 

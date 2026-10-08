@@ -270,9 +270,51 @@ def parse(plan: Path) -> dict:
         title = re.split(r"[（(]", v["head"], maxsplit=1)[0].strip()
         views.append(view(v["id"], v["label"], title, nodes, edges, info=info))
 
+    check_plan(views)
+
     config = group_rows(read_table(config_rows, ["组", "名字", "值"], "config.json 表"))
     return {"plan": plan, "meta": meta, "views": views, "config_groups": config or None,
             "config_note": "前提：" + "；".join(scope)}
+
+
+# 第二行里表示「形状没写全」的占位。
+SHAPE_PLACEHOLDERS = ("同形状", "同上", "不变", "—", "--")
+
+
+def check_plan(views: list[dict]) -> None:
+    """跨图与形状的机械检查：同 id 必须同形状，算子和张量的形状要写全。
+
+    不同图里第一行可以不一样——一处写变量名、一处写产生它的表达式，都指同一个量；
+    但形状必须一致。同 id 形状对不上，就是两个不同的量共用了 id。
+    """
+    errors: list[str] = []
+    shapes: dict[str, str] = {}        # id -> 第一次出现的形状
+    for v in views:
+        for n in v["nodes"]:
+            where = f"图「{v['label']}」/{n['id']}"
+            shape = (n.get("shape") or "").strip()
+            if n["kind"] == "tensor":
+                if not shape or shape in SHAPE_PLACEHOLDERS:
+                    errors.append(f"{where}：张量第二行要写数据类型和形状")
+                elif n["id"] in shapes and shapes[n["id"]] != shape:
+                    errors.append(f"{where}：id「{n['id']}」在别处是「{shapes[n['id']]}」，"
+                                  f"这里是「{shape}」；不是同一个量就换一个 id")
+                else:
+                    shapes.setdefault(n["id"], shape)
+                continue
+            if n["kind"] == "cache":
+                if not shape or shape in SHAPE_PLACEHOLDERS:
+                    errors.append(f"{where}：缓存第二行要写存的是什么")
+                continue
+            if "→" not in shape and "->" not in shape:
+                errors.append(f"{where}：算子第二行要写「原来的形状 → 变完的形状」")
+                continue
+            for side in re.split(r"→|->", shape):
+                if not side.strip() or side.strip() in SHAPE_PLACEHOLDERS:
+                    errors.append(f"{where}：算子第二行两边都要写完整形状，现在是「{shape}」")
+                    break
+    if errors:
+        raise SystemExit("\n".join(errors))
 
 
 # ---------- 写页面 ----------
@@ -508,6 +550,13 @@ def selftest() -> int:
             ("缺少前提应当报错", TOY_PLAN.replace("## 前提", "## 其它")),
             ("缺少资料应当报错", TOY_PLAN.replace("## 资料", "## 其它说明")),
             ("不认识的小节应当报错", TOY_PLAN.replace("### 面板", "### 备注")),
+            ("算子第二行没写箭头应当报错", TOY_PLAN.replace("| 16 → 16 |", "| 16 |")),
+            ("算子第二行写「同形状」应当报错",
+             TOY_PLAN.replace("| 16 → 16 |", "| 16 → 同形状 |")),
+            ("张量第二行留空应当报错", TOY_PLAN.replace("| int64 [B, T] | |", "| | |")),
+            ("跨图同 id 指不同的量应当报错",
+             TOY_PLAN.replace("| x | 张量 | x | fp32 [B, T, 16] | | toy.py:11 |",
+                              "| ids | 张量 | other | fp32 [B, T, 16] | | toy.py:11 |")),
         ]:
             plan.write_text(broken, encoding="utf-8")
             try:
