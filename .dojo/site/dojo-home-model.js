@@ -1,8 +1,4 @@
-(function attachDojoHomeModel(root, factory) {
-  const api = factory();
-  if (typeof module === "object" && module.exports) module.exports = api;
-  root.DojoHomeModel = api;
-}(typeof globalThis !== "undefined" ? globalThis : this, function createModel() {
+window.DojoHomeModel = (function () {
   function normalize(value) {
     return String(value || "").normalize("NFKC").toLocaleLowerCase();
   }
@@ -78,78 +74,33 @@
     };
   }
 
-  function nodeFor(page, role = "normal", match = true) {
-    return {
-      data: {
-        id: page.id,
-        label: page.title,
-        shortLabel: shortLabel(page),
-        path: page.path,
-        topics: page.topics || [],
-        role,
-        match,
-        degree: (page.incoming_count || 0) + (page.outgoing_count || 0),
-      },
-    };
-  }
-
-  function edgeFor(edge, matchIds) {
-    const match = !matchIds || matchIds.has(edge.source) || matchIds.has(edge.target);
-    return {
-      data: {
-        id: edge.id,
-        source: edge.source,
-        target: edge.target,
-        count: edge.count,
-        match,
-      },
-      classes: match ? undefined : "is-adjacent",
-    };
-  }
-
-  function makeGlobalElements(catalog, visibleIds, matchIds) {
+  function makeGraphData(catalog, visibleIds, matchIds) {
     const allowed = visibleIds || new Set(catalog.pages.map((page) => page.id));
     return {
       nodes: catalog.pages
         .filter((page) => allowed.has(page.id))
-        .map((page) => {
-          const match = !matchIds || matchIds.has(page.id);
-          const node = nodeFor(page, "normal", match);
-          if (!match) node.classes = "is-adjacent";
-          return node;
-        }),
-      edges: catalog.edges
+        .map((page) => ({
+          id: page.id,
+          shortLabel: shortLabel(page),
+          degree: (page.incoming_count || 0) + (page.outgoing_count || 0),
+          match: !matchIds || matchIds.has(page.id),
+        })),
+      links: catalog.edges
         .filter((edge) => allowed.has(edge.source) && allowed.has(edge.target))
-        .map((edge) => edgeFor(edge, matchIds)),
+        .map((edge) => ({
+          source: edge.source,
+          target: edge.target,
+          match: !matchIds || matchIds.has(edge.source) || matchIds.has(edge.target),
+        })),
     };
   }
 
-  function makeLocalGraph(catalog, centerId) {
-    const pages = new Map(catalog.pages.map((page) => [page.id, page]));
-    const center = pages.get(centerId);
-    if (!center) return { nodes: [], edges: [] };
-    const incoming = new Set(center.incoming || []);
-    const outgoing = new Set(center.outgoing || []);
-    const neighbors = [...new Set([...incoming, ...outgoing])].sort();
-    const nodes = [nodeFor(center, "center")];
-    for (const id of neighbors) {
-      const page = pages.get(id);
-      if (!page) continue;
-      let role = incoming.has(id) ? "incoming" : "outgoing";
-      if (incoming.has(id) && outgoing.has(id)) role = "both";
-      nodes.push(nodeFor(page, role));
-    }
-    const ids = new Set(nodes.map((node) => node.data.id));
-    const edges = catalog.edges
-      .filter((edge) => ids.has(edge.source) && ids.has(edge.target))
-      .filter((edge) => edge.source === centerId || edge.target === centerId)
-      .map(edgeFor);
-    return { nodes, edges };
+  function summaryOf(page) {
+    return page.summary || page.description || "暂无摘要";
   }
 
   function renderCard(page) {
     const topic = (page.topics || [])[0] || page.tag || "";
-    const summary = page.summary || page.description || "暂无摘要";
     return `
       <article class="document-card">
         <button class="card-main" type="button" data-open-path="${escapeHtml(page.path)}">
@@ -158,7 +109,7 @@
             ${page.date ? `<time class="date-chip" datetime="${escapeHtml(page.date)}">${escapeHtml(page.date)}</time>` : ""}
           </span>
           <h2>${escapeHtml(page.title)}</h2>
-          <p>${escapeHtml(summary)}</p>
+          <p>${escapeHtml(summaryOf(page))}</p>
         </button>
       </article>`;
   }
@@ -167,8 +118,8 @@
     escapeHtml,
     filterPages,
     getFilterOptions,
-    makeGlobalElements,
-    makeLocalGraph,
+    makeGraphData,
     renderCard,
+    summaryOf,
   };
-}));
+}());
