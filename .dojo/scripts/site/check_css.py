@@ -4,8 +4,9 @@
     python3 .dojo/scripts/site/check_css.py [--fix]
     python3 .dojo/scripts/site/check_css.py --selftest
 
-「在用」的 class 来自四处：概念页模板、所有概念页、概念页生成器的源码、脚本里出现的标识符。
-生成器能产出的 class，样板页不一定用到（如表格的 table-scroll），所以要把生成器源码也算进来。
+「在用」的 class 来自这几处：模板、所有页面、生成器的源码、以及渲染时注入 class 的脚本。
+生成器能产出的 class，样板页不一定用到（如表格的 table-scroll），所以要把生成器源码也算进来；
+数据流页的 class 大半由 libs/dataflow/dojo-flow.js 在运行时加，所以那份脚本也要算。
 --fix 直接删掉没人用的规则。
 """
 
@@ -31,12 +32,14 @@ RUNTIME_PREFIXES = ("katex", "token", "language-", "prism", "line-numbers")
 # ---------- 找出在用的 class ----------
 
 def used_classes(path: Path) -> set[str]:
-    """一份文档里可能被用上的 class：class 属性里的，以及脚本里出现的标识符。"""
+    """一份文档里可能被用上的 class：class 属性里的，以及脚本里出现的标识符。
+    .js 文件整体当脚本看。"""
     text = path.read_text(encoding="utf-8")
     names: set[str] = set()
     for value in CLASS_ATTR_RE.findall(text):
         names.update(value.split())
-    for script in SCRIPT_RE.findall(text):
+    scripts = SCRIPT_RE.findall(text) if path.suffix in (".html", ".htm") else [text]
+    for script in scripts:
         names.update(IDENT_RE.findall(script))
     return names
 
@@ -118,17 +121,21 @@ def check(root: Path = REPO_ROOT, fix: bool = False) -> list[str]:
     sheet = root / "libs" / "concept" / "dojo-concept.css"
     template = root / ".dojo" / "templates" / "concept" / "index.html"
     generator = root / ".dojo" / "scripts" / "concept" / "build_page.py"
+    flow_sheet = root / "libs" / "dataflow" / "dojo-flow.css"
+    flow_template = root / ".dojo" / "templates" / "dataflow" / "index.html"
+    flow_generator = root / ".dojo" / "scripts" / "dataflow" / "build_page.py"
+    flow_engine = root / "libs" / "dataflow" / "dojo-flow.js"
     pages = sorted(root.glob("wiki/*/index.html"))
-    for needed in (sheet, template, generator):
+    for needed in (sheet, template, generator, flow_sheet, flow_template, flow_generator, flow_engine):
         if not needed.exists():
             return [f"错误：{needed} 不存在，无从检查"]
     if not pages:
-        return ["错误：没有概念页"]
+        return ["错误：没有页面"]
     used: set[str] = set()
-    for path in [template, generator, *pages]:
+    for path in [template, generator, flow_template, flow_generator, flow_engine, *pages]:
         used |= used_classes(path)
     problems = []
-    for path in [sheet, *pages]:
+    for path in [sheet, flow_sheet, *pages]:
         for selector in find_dead(path, used, fix):
             problems.append(f"{path.relative_to(root)}：{selector}")
     return problems
@@ -141,15 +148,25 @@ def selftest() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "libs" / "concept").mkdir(parents=True)
+        (root / "libs" / "dataflow").mkdir(parents=True)
         (root / ".dojo" / "templates" / "concept").mkdir(parents=True)
+        (root / ".dojo" / "templates" / "dataflow").mkdir(parents=True)
         (root / ".dojo" / "scripts" / "concept").mkdir(parents=True)
+        (root / ".dojo" / "scripts" / "dataflow").mkdir(parents=True)
         (root / "wiki" / "toy").mkdir(parents=True)
         sheet = root / "libs" / "concept" / "dojo-concept.css"
+        flow_sheet = root / "libs" / "dataflow" / "dojo-flow.css"
         (root / ".dojo" / "templates" / "concept" / "index.html").write_text('<p class="used">x</p>', encoding="utf-8")
+        (root / ".dojo" / "templates" / "dataflow" / "index.html").write_text('<p class="flow-app">x</p>', encoding="utf-8")
         (root / ".dojo" / "scripts" / "concept" / "build_page.py").write_text(
             "out = '<div class=\"from-generator\">'", encoding="utf-8")
+        (root / ".dojo" / "scripts" / "dataflow" / "build_page.py").write_text(
+            "out = '<div class=\"from-flow-generator\">'", encoding="utf-8")
+        (root / "libs" / "dataflow" / "dojo-flow.js").write_text(
+            "el.className = 'flow-runtime'", encoding="utf-8")
         (root / "wiki" / "toy" / "index.html").write_text(
             '<style>.page-dead { color: red; }</style><p class="page-live">x</p>', encoding="utf-8")
+        flow_sheet.write_text(".flow-app { a: b; }\n", encoding="utf-8")
 
         def run(css, fix=False):
             sheet.write_text(css, encoding="utf-8")
@@ -164,6 +181,8 @@ def selftest() -> int:
         results.append(("katex 一类运行时 class 不报", not any("katex" in e for e in run(base + ".katex-html { a: b; }\n"))))
         results.append(("不含 class 的选择器不判", not any("body" in e for e in run(base + "body { a: b; }\n"))))
         results.append(("@media 里的规则不判（已知的盲区）", not any(".in-media" in e for e in run(base + "@media (max-width: 1px) { .in-media { a: b; } }\n"))))
+        results.append(("数据流模板、生成器、引擎的 class 不算死规则",
+                        not any("dojo-flow.css" in e for e in run(base))))
         run(base + ".never-used { a: b; }\n", fix=True)
         results.append(("--fix 能删掉死规则", ".never-used" not in sheet.read_text(encoding="utf-8")
                         and ".used" in sheet.read_text(encoding="utf-8")))

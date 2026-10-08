@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""数据流页的生成器：读计划文件 research/dataflow.md，生成页面 index.html。
+
+用法（从仓库根运行）：
+    python3 .dojo/scripts/dataflow/build_page.py wiki/<name>/research/dataflow.md
+    python3 .dojo/scripts/dataflow/build_page.py --selftest
+
+计划文件的格式见 guides/dataflow/plan.md。页面上的文字全部来自计划文件，生成器只做装配：
+读模板、替换占位符、把视图数据写进页面。
+
+页面骨架是 .dojo/templates/dataflow/index.html，唯一真相源。
+
+数据结构（与引擎 libs/dataflow/dojo-flow.js 的契约，详见模板注释）
+    view  = { id, label, title, nodes[], edges[], groups[]?, notes[]?, info[]? }
+    info  = [{ title, rows: [[键, 值], ...] }]  说明面板，随视图切换
+    node  = { id, name, shape?, detail?, kind, drill?, fold? }
+    fold  = [{ title, text }]   算子的折叠，点标记打开；text 里可以有 $...$
+    edge  = { from, to, label? }
+    group = { label, members[], stroke? }
+    note  = { at, text, dx?, dy? }
+    kind：tensor | op | cache | port
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "site"))
+from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
+
+TEMPLATE = HERE.parents[1] / "templates" / "dataflow" / "index.html"
+REPO_ROOT = HERE.parents[2]
+
+KIND = {"算子": "op", "张量": "tensor", "缓存": "cache"}
+META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
+DRILL_RE = re.compile(r"^-\s*(\S+)\s+点开\s*(?:→|->)\s*(.+?)\s*$")
+EDGE_RE = re.compile(r"^-\s*([^\s→]+?)\s*(?:→|->)\s*([^\s：:]+)\s*(?:[：:]\s*(.+?))?\s*$")
+
+
+def fail(no: int, msg: str) -> None:
+    raise SystemExit(f"第 {no} 行：{msg}" if no else msg)
+
+
+def node(nid: str, name: str, shape: str | None = None, kind: str = "op",
+         src: str | None = None, detail: str | None = None,
+         drill: str | None = None) -> dict:
+    """构造一个节点。src 只是构建期的标注（源码行号或权重键），供人复核，不写进页面。"""
+    out = {"id": nid, "name": name, "kind": kind}
+    if shape:
+        out["shape"] = shape
+    if detail:
+        out["detail"] = detail
+    if drill:
+        out["drill"] = drill
+    return out
+
+
+def edge(a: str, b: str, label: str | None = None) -> dict:
+    out = {"from": a, "to": b}
+    if label:
+        out["label"] = label
+    return out
+
+
+def view(vid: str, label: str, title: str, nodes: list[dict], edges: list[dict],
+         groups: list[dict] | None = None, notes: list[dict] | None = None,
+         info: list | None = None) -> dict:
+    """info 与 config_groups 同形：(分组名, [(键, 值)])，渲染成随视图切换的说明面板。"""
+    out = {"id": vid, "label": label, "title": title, "nodes": nodes, "edges": edges,
+           "groups": groups or [], "notes": notes or []}
+    if info:
+        out["info"] = [{"title": t, "rows": [[k, v] for k, v in rows]} for t, rows in info]
+    return out
+
+
+# ---------- 从计划文件读 ----------
+
+def split_cells(line: str) -> list[str]:
+    """一行 Markdown 表格拆成单元格：$...$ 里的竖线不拆列，\\| 是字面竖线，
+    <br> 换行，反引号去掉。"""
+    body = line.strip().strip("|")
+    masked: list[str] = []
+
+    def hide(match: re.Match) -> str:
+        masked.append(match.group(0))
+        return f"\x00{len(masked) - 1}\x00"
+
+    protected = re.sub(r"\$(?:\\.|[^$])*\$", hide, body)
+    cells = re.split(r"(?<!\\)\|", protected)
+
+    def restore(text: str) -> str:
+        return re.sub(r"\x00(\d+)\x00", lambda m: masked[int(m.group(1))], text)
+
+    return [re.sub(r"<br\s*/?>", "\n", restore(c).replace("\\|", "|")).replace("`", "").strip()
+            for c in cells]
+
+
+def read_table(rows: list[tuple[int, str]], need: list[str], where: str) -> list[tuple[int, dict]]:
+    """表头按列名取值；缺列时报出表头所在行。"""
+    if not rows:
+        return []
+    head_no, head = rows[0]
+    names = split_cells(head)
+    missing = [n for n in need if n not in names]
+    if missing:
+        fail(head_no, f"{where}的表头缺少列 {'、'.join(missing)}")
+    out = []
+    for no, line in rows[1:]:
+        cells = split_cells(line)
+        if all(re.fullmatch(r":?-{3,}:?", c) for c in cells if c):
+            continue
+        out.append((no, dict(zip(names, cells + [""] * (len(names) - len(cells))))))
+    return out
+
+
+def group_rows(rows: list[tuple[int, dict]]) -> list[tuple[str, list[tuple[str, str]]]]:
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for _, r in rows:
+        groups.setdefault(r["组"], []).append((r["名字"], r["值"]))
+    return list(groups.items())
+
+
+SKIP_HEADS = {"资料", "前提", "config.json"}
+SUB_SECTIONS = ("节点", "连线", "折叠", "面板")
+
+
+def parse(plan: Path) -> dict:
+    """按 guides/dataflow/plan.md 的格式读计划文件，返回 page() 需要的参数。"""
+    text = plan.read_text(encoding="utf-8")
+    meta: dict[str, str] = {}
+    sources: list[str] = []
+    scope: list[str] = []
+    config_rows: list[tuple[int, str]] = []
+    views_raw: list[dict] = []
+    section = sub = None
+    in_fence = False
+    for no, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not s:
+            continue
+        if s.startswith("# "):
+            meta["title"] = s[2:].strip()
+        elif s.startswith("## "):
+            head = s[3:].strip()
+            if head.lower() == "config.json":
+                section, sub = "config", None
+            elif head == "资料":
+                section, sub = "sources", None
+            elif head == "前提":
+                section, sub = "scope", None
+            else:
+                section, sub = "view", None
+                views_raw.append({"head": head, "no": no, "nodes": [], "edges": [],
+                                  "drills": [], "panel": [], "folds": []})
+        elif s.startswith("### "):
+            sub = s[4:].strip()
+            if section != "view" or sub not in SUB_SECTIONS:
+                fail(no, f"不认识的小节「{sub}」，只能是 节点 / 连线 / 折叠 / 面板")
+        elif section is None and s.startswith("-"):
+            key, sep, value = s[1:].strip().partition("：")
+            if not sep:
+                key, sep, value = s[1:].strip().partition(":")
+            if key.strip() in META_KEYS:
+                meta[META_KEYS[key.strip()]] = value.strip()
+        elif section == "sources" and s.startswith("-"):
+            sources.append(s[1:].strip().replace("`", ""))
+        elif section == "scope" and s.startswith("-"):
+            scope.append(s[1:].strip().replace("`", ""))
+        elif section == "config" and s.startswith("|"):
+            config_rows.append((no, s))
+        elif section == "view" and sub in ("节点", "面板", "折叠") and s.startswith("|"):
+            views_raw[-1][{"节点": "nodes", "面板": "panel", "折叠": "folds"}[sub]].append((no, s))
+        elif section == "view" and sub == "连线" and s.startswith("-"):
+            m = DRILL_RE.match(s)
+            if m:
+                views_raw[-1]["drills"].append((no, m.group(1), m.group(2)))
+                continue
+            m = EDGE_RE.match(s)
+            if not m:
+                fail(no, "连线要写成「- a → b」或「- a → b：线上的字」")
+            views_raw[-1]["edges"].append((no, m.group(1), m.group(2), m.group(3)))
+
+    for zh, key in META_KEYS.items():
+        if key not in meta:
+            name = "模型名（# 标题）" if key == "title" else zh
+            raise SystemExit(f"计划文件缺少：{name}")
+    if not views_raw:
+        raise SystemExit("计划文件里没有图（## <类名>.forward（...））")
+    if not sources:
+        raise SystemExit("计划文件缺少「资料」一节")
+    if not scope:
+        raise SystemExit("计划文件缺少「前提」一节")
+
+    bad_topics = [t.strip() for t in re.split(r"[,，]", meta["topics"]) if t.strip() not in ALLOWED_TOPICS]
+    if bad_topics:
+        raise SystemExit("主题不在词表里：" + "、".join(bad_topics))
+    if meta["tag"] not in ALLOWED_TAGS:
+        raise SystemExit(f"标签「{meta['tag']}」不在词表里")
+
+    used: set[str] = set()
+    for v in views_raw:
+        label = re.split(r"[（(]", v["head"], maxsplit=1)[0].strip()
+        label = label[:-len(".forward")] if label.endswith(".forward") else label
+        vid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "view"
+        base, k = vid, 2
+        while vid in used:
+            vid, k = f"{base}-{k}", k + 1
+        used.add(vid)
+        v["label"], v["id"] = label, vid
+
+    def find_view(name: str) -> str | None:
+        for v in views_raw:
+            short = re.split(r"[（(]", v["head"], maxsplit=1)[0].strip()
+            if name in (v["head"], short, v["label"]):
+                return v["id"]
+        return None
+
+    views = []
+    for v in views_raw:
+        where = f"图「{v['head']}」"
+        nodes, ids = [], set()
+        for no, r in read_table(v["nodes"], ["id", "类型", "第一行", "第二行", "第三行"],
+                                where + "节点表"):
+            nid = r["id"]
+            if not nid or nid in ids:
+                fail(no, f"id「{nid}」为空或在{where}里重复")
+            if r["类型"] not in KIND:
+                fail(no, f"类型「{r['类型']}」只能是 算子 / 张量 / 缓存")
+            ids.add(nid)
+            nodes.append(node(nid, r["第一行"], r["第二行"] or None, KIND[r["类型"]],
+                              src=r.get("源码") or None, detail=r["第三行"] or None))
+        if not nodes:
+            fail(v["no"], f"{where}没有节点表")
+        by_id = {n["id"]: n for n in nodes}
+        edges = []
+        for no, a, b, label in v["edges"]:
+            for end in (a, b):
+                if end not in by_id:
+                    fail(no, f"{where}里没有节点「{end}」")
+            edges.append(edge(a, b, label))
+        for no, nid, target in v["drills"]:
+            if nid not in by_id:
+                fail(no, f"{where}里没有节点「{nid}」")
+            tid = find_view(target)
+            if tid is None:
+                fail(no, f"点开的目标「{target}」不是任何一张图的标题")
+            by_id[nid]["drill"] = tid
+        for no, r in read_table(v["folds"], ["id", "名字", "内容"], where + "折叠表"):
+            nid = r["id"]
+            if nid not in by_id:
+                fail(no, f"{where}里没有节点「{nid}」")
+            if by_id[nid]["kind"] != "op":
+                fail(no, f"折叠只写在算子上，「{nid}」不是算子")
+            if r["名字"] not in ("公式", "说明"):
+                fail(no, f"折叠的名字只能是「公式」或「说明」")
+            if not r["内容"]:
+                fail(no, "折叠要写内容")
+            by_id[nid].setdefault("fold", []).append({"title": r["名字"], "text": r["内容"]})
+        info = group_rows(read_table(v["panel"], ["组", "名字", "值"], where + "面板"))
+        title = re.split(r"[（(]", v["head"], maxsplit=1)[0].strip()
+        views.append(view(v["id"], v["label"], title, nodes, edges, info=info))
+
+    config = group_rows(read_table(config_rows, ["组", "名字", "值"], "config.json 表"))
+    return {"plan": plan, "meta": meta, "views": views, "config_groups": config or None,
+            "config_note": "前提：" + "；".join(scope)}
+
+
+# ---------- 写页面 ----------
+
+def build_fallback(views: list[dict]) -> str:
+    """无脚本回退：每个视图一张节点表，保证脚本失效时页面仍可读。"""
+    rows: list[str] = []
+    for v in views:
+        rows.append(f"<h2>{html.escape(v['label'])}：{html.escape(v['title'])}</h2>")
+        for g in v.get("info", []):
+            rows.append(f"<h3>{html.escape(g['title'])}</h3><table>")
+            rows.extend(f"<tr><th>{html.escape(k)}</th><td>{html.escape(val)}</td></tr>"
+                        for k, val in g["rows"])
+            rows.append("</table>")
+        rows.append("<table><tr><th>节点</th><th>形状 / 参数</th></tr>")
+        for n in v["nodes"]:
+            shape = n.get("shape") or n.get("detail") or ""
+            rows.append("<tr><td>{}</td><td>{}</td></tr>".format(
+                html.escape(n["name"]), html.escape(str(shape))))
+            for sec in n.get("fold") or []:
+                rows.append("<tr><td>{} · {}</td><td>{}</td></tr>".format(
+                    html.escape(n["name"]), html.escape(sec.get("title") or ""),
+                    html.escape(sec.get("text") or "")))
+        rows.append("</table>")
+    return "".join(rows)
+
+
+def build_config_panel(groups, note: str = "") -> str:
+    """把 (分组名, [(键, 值), ...]) 渲染成可折叠面板。"""
+    blocks: list[str] = []
+    if note:
+        blocks.append(f'<div class="cfg-note">{html.escape(note)}</div>')
+    for title, rows in groups:
+        body = "".join(
+            f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>"
+            for k, v in rows
+        )
+        blocks.append(
+            f'<details class="cfg-group" open><summary>{html.escape(title)}</summary>'
+            f"<table>{body}</table></details>"
+        )
+    return "".join(blocks)
+
+
+def write_page(out: Path, meta: dict, views: list[dict],
+               config_groups=None, config_note: str = "",
+               template: Path | None = None) -> Path:
+    """把视图数据填进模板并写盘。meta 需要 title / description / summary / topics / tag。"""
+    tpl = (template or TEMPLATE).read_text(encoding="utf-8")
+    target = out.resolve().parent
+    if REPO_ROOT in target.parents:
+        libs = os.path.relpath(REPO_ROOT / "libs", target).replace(os.sep, "/")
+        tpl = tpl.replace("../../libs/", f"{libs}/")
+
+    tpl = tpl.replace("【首页摘要：纯文本，一句话说清这页讲什么】", meta["description"])
+    tpl = tpl.replace("【首页摘要：可含 $...$ 公式；本篇的形状与超参逐条对准源码、config 与权重】",
+                      meta["summary"])
+    tpl = tpl.replace("【主题，逗号分隔，取自词表】", meta["topics"])
+    tpl = tpl.replace("【模型名】", meta["title"])
+
+    tabs = "".join(
+        '<button type="button" class="flow-tab{on}" data-view="{vid}">{label}</button>'.format(
+            on=" on" if i == 0 else "", vid=v["id"], label=html.escape(v["label"]))
+        for i, v in enumerate(views)
+    )
+    nav = f'<nav class="flow-bar">{tabs}</nav>'
+    tpl = re.sub(r'<nav class="flow-bar">[\s\S]*?</nav>', lambda _: nav, tpl, count=1)
+
+    fallback = f'<div class="flow-fallback">{build_fallback(views)}</div>\n  </noscript>'
+    tpl = re.sub(r'<div class="flow-fallback">[\s\S]*?</div>\n  </noscript>', lambda _: fallback,
+                 tpl, count=1)
+
+    if config_groups:
+        panel = (
+            '<section class="flow-config" id="flow-config" hidden>'
+            '<h2 class="cfg-title">config.json 参数</h2>'
+            + build_config_panel(config_groups, config_note)
+            + "</section>"
+        )
+        tpl = re.sub(r'<section class="flow-config"[\s\S]*?</section>', lambda _: panel, tpl, count=1)
+    else:
+        # 不需要参数面板时把按钮与面板整段删掉
+        tpl = re.sub(r'\s*<button type="button" class="flow-cfg-btn"[\s\S]*?</button>', "", tpl, count=1)
+        tpl = re.sub(r'\s*<section class="flow-config"[\s\S]*?</section>', "", tpl, count=1)
+
+    tpl = tpl.replace('{"views":[【视图数组】]}',
+                      json.dumps({"views": views}, ensure_ascii=False, separators=(",", ":")))
+
+    leftover = re.findall(r"【[^】]*】", tpl)
+    if leftover:
+        raise SystemExit(f"占位符未替换完，模板改了？{leftover}")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(tpl, encoding="utf-8")
+    return out
+
+
+def build(plan: Path, out: Path | None = None) -> tuple[Path, dict]:
+    """research/dataflow.md → 同一页面目录下的 index.html。"""
+    if out is None:
+        if plan.parent.name != "research":
+            raise SystemExit(f"{plan} 不在 research/ 下，用 -o 指定输出路径")
+        out = plan.parent.parent / "index.html"
+    data = parse(plan)
+    return write_page(out=out, meta=data["meta"], views=data["views"],
+                      config_groups=data["config_groups"], config_note=data["config_note"]), data
+
+
+def report(path: Path, data: dict) -> str:
+    views = data["views"]
+    nodes = sum(len(v["nodes"]) for v in views)
+    return f"已生成 {path}：{len(views)} 张图，{nodes} 个节点"
+
+
+# ---------- 自检 ----------
+
+TOY_PLAN = "\n".join([
+    "# ToyModel",
+    "",
+    "- 描述：自检页。",
+    "- 摘要：生成器自检，与任何真实模型无关。",
+    "- 主题：模型结构",
+    "- 标签：数据流",
+    "",
+    "## 资料",
+    "",
+    "- 源码：toy.py",
+    "- config.json：自拟",
+    "",
+    "## 前提",
+    "",
+    "- 推理",
+    "- 不传缓存",
+    "",
+    "## config.json",
+    "",
+    "| 组 | 名字 | 值 |",
+    "|---|---|---|",
+    "| 规模 | hidden_size | 16 |",
+    "",
+    "## ToyModel.forward（toy.py:1-9）",
+    "",
+    "### 节点",
+    "",
+    "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |",
+    "|---|---|---|---|---|---|",
+    "| ids | 张量 | input_ids | int64 [B, T] | | toy.py:2 |",
+    "| blk | 算子 | `2 × ToyBlock` | 16 → 16 | 第一行<br>第二行 | toy.py:5 |",
+    "| out | 张量 | hidden_states | fp32 [B, T, 16] | | toy.py:6 |",
+    "| kv | 缓存 | cache.update | 追加 | | toy.py:7 |",
+    "",
+    "### 连线",
+    "",
+    "- ids → blk",
+    "- blk → out：hidden",
+    "- kv->blk",
+    "- blk 点开 → ToyBlock.forward",
+    "",
+    "### 折叠",
+    "",
+    "| id | 名字 | 内容 |",
+    "|---|---|---|",
+    "| blk | 公式 | $x + f(x)$，x 是输入 |",
+    "",
+    "### 面板",
+    "",
+    "| 组 | 名字 | 值 |",
+    "|---|---|---|",
+    "| 公式 | 残差 | $x + f(x)$ |",
+    "| 公式 | 缩放 | $\\sqrt{d} \\odot x$ |",
+    "| 公式 | 绝对值 | $|d|$ |",
+    "| 配置 | hidden_size | 16 |",
+    "",
+    "## ToyBlock.forward（toy.py:10-20）",
+    "",
+    "### 节点",
+    "",
+    "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |",
+    "|---|---|---|---|---|---|",
+    "| x | 张量 | x | fp32 [B, T, 16] | | toy.py:11 |",
+])
+
+
+def selftest() -> int:
+    """用一份与任何真实模型无关的计划跑一遍，确认生成器可用、该报错的地方会报错。"""
+    checks: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        pdir = root / "wiki" / "toy" / "research"
+        pdir.mkdir(parents=True)
+        plan = pdir / "dataflow.md"
+        plan.write_text(TOY_PLAN, encoding="utf-8")
+        made, data = build(plan)
+        t = made.read_text(encoding="utf-8")
+        main_view = data["views"][0]
+        checks += [
+            ("输出到页面目录", made == root / "wiki" / "toy" / "index.html"),
+            ("两张图", [v["id"] for v in data["views"]] == ["toymodel", "toyblock"]),
+            ("点开指向第二张图", main_view["nodes"][1].get("drill") == "toyblock"),
+            ("折叠挂在算子上", main_view["nodes"][1].get("fold") == [
+                {"title": "公式", "text": "$x + f(x)$，x 是输入"}]),
+            ("<br> 换行、反引号去掉", main_view["nodes"][1]["detail"] == "第一行\n第二行"
+             and main_view["nodes"][1]["name"] == "2 × ToyBlock"),
+            ("线上的字与无空格箭头", main_view["edges"][1].get("label") == "hidden"
+             and main_view["edges"][2] == {"from": "kv", "to": "blk"}),
+            ("面板按组读入", main_view["info"][0]["title"] == "公式"
+             and main_view["info"][1]["rows"] == [["hidden_size", "16"]]),
+            ("config 面板已渲染", "<summary>规模</summary>" in t),
+            ("前提写进 config 面板顶部", "前提：推理；不传缓存" in t),
+            ("视图数据已内嵌", '"id":"toymodel"' in t and '"id":"toyblock"' in t),
+            ("标签栏两个视图", t.count('class="flow-tab') == 2),
+            ("无占位符残留", "【" not in t),
+            ("无脚本回退含节点表", "<th>节点</th>" in t),
+            ("资料和源码位置不进页面", "toy.py" not in t),
+            ("公式里的反斜杠原样保留", "\\\\sqrt{d} \\\\odot x" in t and "\\sqrt{d} \\odot x" in t),
+            ("公式里的竖线不拆列", "$|d|$" in t),
+            ("引向 libs/dataflow 与 libs/shared", "libs/dataflow/dojo-flow.js" in t
+             and "libs/shared/katex.min.js" in t),
+        ]
+        again, _ = build(plan)
+        checks.append(("幂等：两次产出一致", again.read_text(encoding="utf-8") == t))
+
+        for name, broken in [
+            ("连线指向不存在的节点应当报错", TOY_PLAN.replace("- ids → blk", "- ids → nope")),
+            ("点开的目标不存在应当报错", TOY_PLAN.replace("点开 → ToyBlock.forward", "点开 → Nope")),
+            ("折叠写在张量上应当报错", TOY_PLAN.replace("| blk | 公式 |", "| ids | 公式 |")),
+            ("折叠名字不对应当报错", TOY_PLAN.replace("| blk | 公式 |", "| blk | 残差 |")),
+            ("类型写错应当报错", TOY_PLAN.replace("| ids | 张量 |", "| ids | 向量 |")),
+            ("缺少页面信息应当报错", TOY_PLAN.replace("- 摘要：生成器自检，与任何真实模型无关。\n", "")),
+            ("缺少标签应当报错", TOY_PLAN.replace("- 标签：数据流\n", "")),
+            ("标签不在词表应当报错", TOY_PLAN.replace("- 标签：数据流", "- 标签：不存在")),
+            ("主题不在词表应当报错", TOY_PLAN.replace("- 主题：模型结构", "- 主题：不存在")),
+            ("缺少前提应当报错", TOY_PLAN.replace("## 前提", "## 其它")),
+            ("缺少资料应当报错", TOY_PLAN.replace("## 资料", "## 其它说明")),
+            ("不认识的小节应当报错", TOY_PLAN.replace("### 面板", "### 备注")),
+        ]:
+            plan.write_text(broken, encoding="utf-8")
+            try:
+                build(plan)
+                checks.append((name, False))
+            except SystemExit:
+                checks.append((name, True))
+        plan.write_text(TOY_PLAN, encoding="utf-8")
+
+        broken = root / "broken.html"
+        broken.write_text("<html>【没人替换】</html>", encoding="utf-8")
+        try:
+            write_page(out=root / "x.html", meta={"title": "T", "description": "d", "summary": "s",
+                                                 "topics": "模型结构", "tag": "数据流"},
+                       views=[], template=broken)
+            checks.append(("占位符残留时应当报错", False))
+        except SystemExit:
+            checks.append(("占位符残留时应当报错", True))
+
+    failed = [name for name, ok in checks if not ok]
+    for name, ok in checks:
+        print(("  OK  " if ok else "  FAIL") + " " + name)
+    if failed:
+        print(f"生成器自检失败：{len(failed)} 项")
+        return 1
+    print(f"生成器自检通过：{len(checks)} 项")
+    return 0
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="读 research/dataflow.md，生成同目录上一级的 index.html")
+    ap.add_argument("plan", nargs="?", type=Path, help="wiki/<name>/research/dataflow.md")
+    ap.add_argument("-o", "--out", type=Path, help="输出路径，默认 wiki/<name>/index.html")
+    ap.add_argument("--selftest", action="store_true", help="用虚构数据自检生成器")
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest())
+    if a.plan is None:
+        ap.error("需要计划文件路径")
+    if not a.plan.exists():
+        raise SystemExit(f"计划文件不存在：{a.plan}")
+    path, data = build(a.plan, a.out)
+    print(report(path, data))

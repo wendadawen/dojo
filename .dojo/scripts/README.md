@@ -13,6 +13,20 @@
     # 单独检查正文
     python3 .dojo/scripts/concept/check_content.py wiki/<name>/research/content.md
 
+## 写数据流页
+
+    # 检查计划的源码位置（要先有源码目录）
+    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/research/dataflow.md --source-root <源码目录>
+
+    # 生成页面
+    python3 .dojo/scripts/dataflow/build_page.py wiki/<name>/research/dataflow.md
+
+    # 核查节点名与形状，量连线几何，截图
+    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html \
+        --source <源码文件> --shapes wiki/<name>/research/sources/shapes.json
+    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html --geometry
+    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html --shots <目录>
+
 ## 检查页面
 
     python3 .dojo/scripts/site/check.py wiki/<name>/index.html wiki/<name>/overview.html
@@ -22,7 +36,7 @@
 
     python3 .dojo/scripts/site/check_page.py <页面...>    # 页面
     python3 .dojo/scripts/site/check_script.py <页面...>  # 内联脚本语法，需要 node
-    python3 .dojo/scripts/site/check_template.py          # 概念页模板
+    python3 .dojo/scripts/site/check_template.py          # 页面模板
     python3 .dojo/scripts/site/check_css.py [--fix]       # 没人用的 CSS 规则
 
 ## 其他
@@ -39,6 +53,8 @@
     python3 .dojo/scripts/concept/build_page.py --selftest
     python3 .dojo/scripts/concept/check_outline.py --selftest
     python3 .dojo/scripts/concept/check_content.py --selftest
+    python3 .dojo/scripts/dataflow/build_page.py --selftest
+    python3 .dojo/scripts/dataflow/check_source.py --selftest
     python3 .dojo/scripts/site/check.py --selftest     # 页面、脚本、模板、CSS 四个检查的自检
 
 ## 增删检查
