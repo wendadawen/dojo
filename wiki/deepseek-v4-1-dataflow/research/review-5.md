@@ -568,6 +568,7 @@ $ python3 .dojo/scripts/dataflow/check_source.py wiki/deepseek-v4-1-dataflow/res
 - Attention 图：`eins` 折叠的 `r` 改成 `m`（与面板「输出低秩投影」一致）；`cf` 折叠与面板「压缩 KV 的位置」的压缩分组序号由 `g` 改成 `j`，并注明与 o_groups 的组号不是一回事。
 - `lin_w` 第三行补「存法与 dtype 见折叠的说明」，`cpl_w` 第三行补「dtype 随调用点变，见折叠的说明」。
 - 视觉三张图的线性投影注明是 `nn.Linear`（PyTorch 自带，与主干 `Linear` 不是一类）：`vwqkv`、`vwo`、`vw1`、`vw2`、`vlin` 的说明各补一句。
+- 最后一批改动核对指出的两处残留：`lin_w`、`cpl_w` 的第二列由写死的 `fp8 [out, in]` 改成 `fp8 [out, in]（随调用点变，见折叠）`；`cpl_op` 说明末句由「本页每个调用点都没传 bias」改成「主干的调用点都没传 bias」。
 
 改动后重跑：
 
@@ -597,8 +598,6 @@ $ python3 .dojo/scripts/dataflow/check_source.py wiki/deepseek-v4-1-dataflow/ind
 1. 审查者 1、2 要求给 `qr_op` 补「点开 → Linear.forward」，审查者 3 同时指出 `wkv_win`、`kw` 的重复点开。作者的方案是：一个节点只留一条点开（保留折叠引用的那份），因此 `qr_op`、`wkv_win`、`kw` 都只保留 `RMSNorm.forward`，不补 Linear。
 2. 审查者 1、2、3、5 都提到 `woa` 的点开对不上，作者撤掉了这条点开（`woa` 只读权重、不调 forward）。
 
-（裁判结论见本节末尾；核对通过后写入。）
-
 **仲裁结论**：
 
 - **第 1 条（`qr_op`/`wkv_win`/`kw` 该不该补点开 `Linear.forward`）｜不必改。** 依据 plan.md 第 78 行「前向用到的、模型源码里自己定义的类，每个都画一张，用到它的节点都点开到这张图」只约束到「类」这一级：每张类图都要有节点点开过去，不要求一个同时调用两个类的节点挂两条点开。`Linear.forward` 已在 `proj`、`g1`、`u1`、`w2`、`nwkv`、`qb` 等节点点得到，`RMSNorm.forward` 由 `qr_op`/`wkv_win`/`kw` 点得到，两个类都满足。`build_page.py` 的 `by_id[nid]["drill"] = tid` 是单值赋值、无重复检测，一个节点只存一条点开是真实的引擎约束。作者保留折叠已引用的 `RMSNorm.forward`、撤掉被覆盖的 `Linear.forward`，既不重复点开也符合计划，无需再改。
@@ -608,9 +607,8 @@ $ python3 .dojo/scripts/dataflow/check_source.py wiki/deepseek-v4-1-dataflow/ind
 
 按 `review-plan.md`「最后一批改动也要核对」，把本轮全部改动交一个独立子代理核对：有没有引入源码里没有的内容、漏步或多步、接错线；有没有违背前几轮的裁定。
 
-**核对结论：通过。**（独立子代理未在本轮收口前返回，由作者按同两条判据自查，逐项对照源码核过；独立性弱于独立核对，如实记下。）
+**核对结论：通过。** 由一个独立子代理逐项对照源码核过（它返回了结论），下面（a）(b) 是它的结论、以及它指出的两处残留（已改）。
 
-- **没引入源码里没有的内容**：4 张新图逐句对各自 `forward`——`Linear`/`ColumnParallelLinear` 是 `return linear(x, self.weight, self.bias)`，`RowParallelLinear` 是 `linear(x, self.weight, None)` 加 all_reduce 与 bias 两段（单卡都不执行），`PatchEmbed` 是 `self.proj(x.flatten(1))` 加 `proj.bias`；折叠里写的选路（fp4→`fp4_gemm`、fp8→`fp8_gemm`、其余→`F.linear`）对得上 model.py:186-205。
-- **没漏步、没多步、没接错线**：新图的输入张量、权重张量、算子、输出张量齐全；`PatchEmbed` 抽出来后 `ViT` 图的 `vpe` 改成点开到新图、算式改成调用，没有留下重复。
-- **没违背前几轮裁定**：`shared` 仍不点开 `Expert.forward`；`PatchEmbed` 这次单独成图是本轮新裁定（第 10 轮裁的是「当时未成图的类要成图」，与这次一致，不冲突）；视觉支路的 `nn.Linear` 仍不点开到主干的 `Linear.forward`（不是同一个类），本轮已在折叠里注明。
+- **(a) 有没有引入源码里没有的内容、漏步或多步、接错线**：四张新图的节点 / 连线 / 折叠与各自 `forward` 逐条对得上，无凭空内容、无漏步 / 多步；补的点开类归属全部正确；撤除的 `woa` 与两处重复点开都成立且未丢失 `Linear.forward` 可达性；6 条视觉撤除全对（`vision.py` 的 `vwqkv/vwo/vw1/vw2/vlin` 都是 `nn.Linear`，`head` 是 `ParallelHead`），并已注明 `nn.Linear`。**残留两处（已改）**：(i) `lin_w` 第二列仍固定写 `fp8 [out, in]`，与同节点折叠「dtype 随调用点变」冲突；(ii) `cpl_op` 说明末句仍是「本页每个调用点都没传 bias」，与「三处都改成主干」的改动清单不符。二者皆为措辞层面，非源码事实错误。
+- **(b) 有没有违背前几轮的裁定**：无。`shared` 仍不点开 `Expert.forward`；`counts` 仍写「张量」；`patches → vcs_op` 的 `n_vit_h`/`n_vit_w` 仍未单独成节点；六张视觉图前缀仍 `vision.`。旧的「薄包装类不单独成图」是被第 10 轮仲裁取代、本轮据新裁定执行，不算违背。一处规则偏离（节点只留一条点开 vs 先例的拆节点）已列入本轮仲裁，非已定裁定。
 - **仲裁两条都判「不必改」**，理由双方都对照过源码与 `plan.md`，成立。

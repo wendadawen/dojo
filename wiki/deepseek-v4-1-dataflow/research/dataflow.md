@@ -299,7 +299,7 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | lin_x | 张量 | x | bf16 [..., in] | 参数 x；in 是这一层的输入宽度（Linear 的 self.in_features），前导各维不限，随调用点不同 | model.py:242 |
-| lin_w | 张量 | self.weight | fp8 [out, in] | 权重，out 是这一层的输出宽度（self.out_features）；存法与 dtype 见折叠的说明 | model.py:243 |
+| lin_w | 张量 | self.weight | fp8 [out, in]（随调用点变，见折叠） | 权重，out 是这一层的输出宽度（self.out_features）；存法与 dtype 见折叠的说明 | model.py:243 |
 | lin_op | 算子 | linear(x, self.weight, self.bias) | bf16 [..., in] → bf16 [..., out] |  | model.py:243 |
 | lin_y | 张量 | linear(x, self.weight, self.bias) | bf16 [..., out] | 返回值 | model.py:243 |
 
@@ -330,7 +330,7 @@
 | id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
 |---|---|---|---|---|---|
 | cpl_x | 张量 | x | bf16 [..., in] | 参数 x；in 是这一层的输入宽度，随调用点不同 | model.py:256 |
-| cpl_w | 张量 | self.weight | fp8 [out, in] | 权重，存的是本卡那一片；out 是本卡的输出宽度，单卡下即完整的 out_features；dtype 随调用点变，见折叠的说明 | model.py:257 |
+| cpl_w | 张量 | self.weight | fp8 [out, in]（随调用点变，见折叠） | 权重，存的是本卡那一片；out 是本卡的输出宽度，单卡下即完整的 out_features | model.py:257 |
 | cpl_op | 算子 | linear(x, self.weight, self.bias) | bf16 [..., in] → bf16 [..., out] |  | model.py:257 |
 | cpl_y | 张量 | linear(x, self.weight, self.bias) | bf16 [..., out] | 返回值 | model.py:257 |
 
@@ -345,7 +345,7 @@
 | id | 名字 | 内容 |
 |---|---|---|
 | cpl_op | 公式 | $y = \mathrm{linear}(x, weight, bias)$，x 是输入，weight 是 self.weight，bias 是 self.bias |
-| cpl_op | 说明 | 输出维按 rank 切分，各卡算自己那一片；单卡下 out 就是完整的 out_features，一片即整张，不需要通信<br>weight 的 dtype 同 Linear：没写 dtype 的取 dtype（fp8），wo_a 与索引器的 weights_proj 是 bf16；linear() 按这个 dtype 只走 fp8_gemm 或 F.linear 里的一条<br>本页每个调用点都没传 bias，self.bias 是 None |
+| cpl_op | 说明 | 输出维按 rank 切分，各卡算自己那一片；单卡下 out 就是完整的 out_features，一片即整张，不需要通信<br>weight 的 dtype 同 Linear：没写 dtype 的取 dtype（fp8），wo_a 与索引器的 weights_proj 是 bf16；linear() 按这个 dtype 只走 fp8_gemm 或 F.linear 里的一条<br>主干的调用点都没传 bias，self.bias 是 None |
 
 ### 面板
 
