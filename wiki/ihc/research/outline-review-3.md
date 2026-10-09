@@ -55,3 +55,18 @@
    - 长页折叠块外预算合计 2000，短页 700，都在上限以内，`check_outline.py` 通过。
 
 结论：通过。
+
+## 最后一批改动核对（第三次）
+
+对照 git HEAD 的旧版 outline.md，只看新增或改写的节点。
+
+1. 已确认清单（page == ihc、side == outline）共 1 条：「n 条流一开始是怎么来的」没有节点回答。现在「一层的前向顺序」的写什么是「入口把输入复制成 n 条流；每层先汇入、再过层、再分发；一个块里两个 HC；HC 原式末端按行求和；手算折叠」，依据补了 paper/hc-2409.19606v3.txt L182-L192（L182 是「h0 is replicated n times」，L190 是「sum the last hyper hidden matrix row-wise」）。已改对。
+2. 这一轮其余改动：
+   - 开头与「把残差扩成 n 条流」「残差流与它的两条通路」补 paper/src-v3/app.tex Pre-Norm Residual Connection、Post-Norm Residual Connection：与正文新增的 $h+\mathcal{T}(h)$、Pre-Norm、Post-Norm 公式和 $\mathcal{T}:=\mathcal{T}\circ\text{Norm}$ 约定对应，app.tex L336-L385 里有这些原式，依据成立。
+   - 「映射的参数从哪来」补 paper/dsv4-2606.19348v1.txt L393-L395：「avoid the risk of signal cancellation」在这几行，成立。
+   - 「流间取恒等的那一族」「汇入、分发、取恒等」「一条流被压得太死」改成「连接强度预先固定」，预算 250 改 150，依据去掉 Introduction 与 L68-L76：短页不再讲预归一化、后归一化，依据与正文逐一对应。
+   - 「现场算出」「定死」「挑」已全部换掉，全文无残留。
+   - 正文各节依据都是大纲对应节点依据的子集（逐节比对，无超出）；折叠块外预算长页 2150、短页 600，都在上限以内；`check_outline.py` 通过。
+3. 没有引入「必须改」类的新问题，也没有违背前几轮的裁定。
+
+结论：通过。

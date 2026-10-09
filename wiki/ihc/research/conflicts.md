@@ -5,4 +5,4 @@
 - n=2 的显存增量｜paper/src-v3/app.tex Memory Footprint 的文字写 n=2 时「less than 15%」，同一节实测表写 +15.7%｜页面采用表中的 15.7%
 - OLMo-1B-DHC×4 的 V3 验证损失｜paper/hc-2409.19606v3.txt Table 1 写 2.514，Table 2 写 2.515｜页面采用 Table 1 的 2.514
 - 训练显存增量的说法｜paper/src-v3/app.tex Memory Footprint 的文字写训练时激活显存「minor increase」，同一节实测表（hc txt Table 9）为 OLMo-1B n=4 +26.1%、OLMo-7B +28.28%｜页面只写表中数字，不用「明显」「轻微」这类评价
-- iHC 的名称｜blog/hy4-model-card.md 写 identity Hyper-Connections，repo/hy4-transformers-modeling.py L605 类文档串写 Independent Hyper-Connection｜页面采用模型卡的名字；「流间混合等价于恒等」依据代码里没有 B 这一项，不依赖名字
+- iHC 的名称｜blog/hy4-model-card.md 写 identity Hyper-Connections，repo/hy4-transformers-modeling.py L605 类文档串写 Independent Hyper-Connection｜页面采用模型卡的名字；「流间混合等价于恒等」依据代码里更新式直接加回原状态、没有 B 这一项，不依赖名字
