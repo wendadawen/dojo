@@ -14,6 +14,9 @@ SHORT_LIMIT = 1000  # 短页的字数上限
 SHORT_SECTIONS = 3
 LAST_CHAPTER = "适用条件与边界"
 SELF_MADE = "自行构造"
+OUTLINE_ROUNDS = 3  # 审大纲、审正文的轮数上限
+CONTENT_ROUNDS = 5
+FINAL_CHECK = "最后一批改动核对"
 LINES_RE = re.compile(r"[Ll](\d+)(?:\s*[-–~]\s*[Ll]?(\d+))?")
 HEADING_RE = re.compile(r"#{1,6}\s+(.*)|\\(?:sub)*(?:section|paragraph)\*?\{(.*)\}")
 
@@ -61,6 +64,15 @@ def check_basis_list(basis: str, sources: Path) -> list[str]:
         return []
     items = (i for i in re.split(r"[;；]", basis) if i.strip())
     return [why for i in items if (why := check_basis_item(i, sources))]
+
+
+def final_check_recorded(research: Path, kind: str, rounds: int) -> list[str]:
+    """审到轮数上限时，记录里要有最后一批改动的仲裁核对。"""
+    last = research / f"{kind}-review-{rounds}.md"
+    if not last.is_file() or FINAL_CHECK in last.read_text(encoding="utf-8"):
+        return []
+    return [f"{last.name}：到了轮数上限，最后一批改动要交仲裁核对，记录里写一节「{FINAL_CHECK}」，"
+            "没有改动就写无改动（guides/concept/review.md「仲裁」）"]
 
 
 def report(results: list[tuple[str, bool]], label: str) -> int:

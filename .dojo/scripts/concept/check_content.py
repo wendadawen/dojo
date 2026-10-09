@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import sys
 import tempfile
@@ -12,9 +13,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
 import build_page  # noqa: E402
+import check_outline  # noqa: E402
 import vocab  # noqa: E402
 from common import (  # noqa: E402
-    LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT, check_basis_list, report,
+    CONTENT_ROUNDS, LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT,
+    check_basis_list, final_check_recorded, report,
 )
 
 REPO_ROOT = HERE.parents[2]
@@ -27,6 +30,8 @@ TEXT_SUFFIXES = {".tex", ".txt", ".md", ".bbl", ".rst", ".html", ".htm"}
 # 接在句子后面的依据行：「依据：」后面是「自行构造」或「文件名.扩展名」；正文里自然出现的「判断依据：……」不算
 BASIS_MID_RE = re.compile(r"\S.*依据[：:]\s*(?:自行构造|[\w./-]+(?:" + "|".join(re.escape(x) for x in TEXT_SUFFIXES) + r")\b)")
 MAX_TEXT_BYTES = 2_000_000
+BUDGET_SLACK = 1.3  # 一节折叠块外的字数，最多超出大纲预算这么多倍
+SOURCE_WORDS = ("论文", "本文", "作者", "官方实现", "演示代码")  # 出处措辞，正文只写事实
 REPO_DIR = "repo"  # guides/concept/collect.md 规定仓库 clone 到 sources/repo/
 
 
@@ -46,6 +51,7 @@ class Content:
         self.parts = [self.doc["short"], self.doc["opening"]] + [b for _n, _t, b in self.doc["chapters"]]
         self.body = [ln for part in self.parts for ln in part]
         self._render = None
+        self.body_html = ""
 
     def rendered(self):
         """渲染一次，得到字数统计和代码块。格式错误时抛 SystemExit。"""
@@ -53,7 +59,19 @@ class Content:
             ctx = build_page.Ctx(self.out_dir, self.wiki_root)
             _body, _short, stats = build_page.render(self.doc, ctx)
             self._render = (stats, ctx.fences)
+            self.body_html = _body
         return self._render
+
+    def node_words(self) -> dict[str, int]:
+        """长页每个节点折叠块外的字数，键是节点标题，开头的键是「开头」。"""
+        self.rendered()
+        pieces = re.split(r"(?=<h[23] id=)", self.body_html.split('<h2 id="references">')[0])
+        words = {}
+        for piece in pieces:
+            m = re.match(r'<h([23]) id="[^"]*">[\d.]+ (.*?)</h\1>', piece)
+            title = html.unescape(re.sub(r"<[^>]+>", "", m.group(2))) if m else "开头"
+            words[title] = words.get(title, 0) + build_page.count_words(piece)
+        return words
 
 
 def outside_fences(lines):
@@ -284,12 +302,88 @@ def code_blocks_are_python_with_output(c: Content) -> list[str]:
     return errors
 
 
+def no_source_wording(c: Content) -> list[str]:
+    errors = []
+    for no, line in outside_fences(c.body):
+        for w in SOURCE_WORDS:
+            if w in re.sub(r"`[^`]*`", " ", without_math(line)):
+                errors.append(f"第 {no} 行：正文不写「{w}」这类出处措辞，直接写事实，出处放进「资料」"
+                              "（guides/concept/content.md「怎么写」）")
+    for key in ("description", "summary"):
+        errors += [f"{key}：不写「{w}」这类出处措辞" for w in SOURCE_WORDS if w in c.doc["meta"][key]]
+    return errors
+
+
+def references_are_in_sources_index(c: Content) -> list[str]:
+    index = c.sources / "index.md"
+    urls = [(r["no"], u) for r in c.doc["refs"] for u in dict.fromkeys(re.findall(r"https?://[^\s)\]]+", r["text"]))]
+    if urls and not index.is_file():
+        return ["资料：research/sources/index.md 不存在，「资料」里的链接都要先收进去（guides/concept/collect.md）"]
+    text = index.read_text(encoding="utf-8") if urls else ""
+    return [f"第 {no} 行：资料 {u} 没有收进 research/sources/index.md，只列收了的资料（guides/concept/collect.md）"
+            for no, u in urls if u not in text]
+
+
+def description_is_one_sentence(c: Content) -> list[str]:
+    if c.doc["meta"]["description"].strip().rstrip("。").count("。"):
+        return ["描述：只写一句话，第二句挪到摘要（guides/concept/outline.md「格式」）"]
+    return []
+
+
+def sections_within_budget(c: Content) -> list[str]:
+    outline = c.sources.parent / "outline.md"
+    if not outline.is_file():
+        return ["大纲：research/outline.md 不存在，正文要按审过的大纲写"]
+    budget = {t.lstrip("# ").strip(): int(w) for _no, t, _what, w, _b in check_outline.parse(outline)["nodes"]["长页"]
+              if w.isdigit()}
+    actual = c.node_words()
+    errors = [f"大纲里的「{t}」在正文里找不到，节点要一一对应，要改回去改大纲（guides/concept/content.md「怎么写」）"
+              for t in budget if t not in actual]
+    errors += [f"正文里的「{t}」大纲里没有，节点要一一对应，要改回去改大纲" for t in actual if t not in budget]
+    errors += [f"「{t}」折叠块外 {actual[t]} 字，大纲预算 {budget[t]}，超出 {BUDGET_SLACK} 倍；"
+               "删重复，或把推导、数字收进折叠块，不要回头改预算（guides/concept/content.md「怎么写」）"
+               for t in budget if t in actual and budget[t] and actual[t] > budget[t] * BUDGET_SLACK]
+    return errors
+
+
+def long_has_self_made_example(c: Content) -> list[str]:
+    lines = {no for _n, _t, body in c.doc["chapters"] for no, _l in body} | {no for no, _l in c.doc["opening"]}
+    if any(basis.strip() == SELF_MADE and no - 1 in lines for no, basis in c.basis.items()):
+        return []
+    return [f"长页：至少要有一段依据写「{SELF_MADE}」的例子，小数字，能跟着走完（guides/concept.md「长页」）"]
+
+
+def folds_promised_by_outline_exist(c: Content) -> list[str]:
+    """大纲「写什么」里写了「折叠」的长页节点，正文那一节里要真有折叠块。"""
+    outline = c.sources.parent / "outline.md"
+    if not outline.is_file():
+        return []
+    promised = [t.lstrip("# ").strip() for _no, t, what, *_ in check_outline.parse(outline)["nodes"]["长页"] if "折叠" in what]
+    opening = [ln for _no, ln in c.doc["opening"]]
+    bodies = {"开头": opening} | {name: [ln for _n, ln in body] for _no, name, body in c.doc["chapters"]}
+    errors = []
+    for title in promised:
+        lines = bodies.get(title)
+        if lines is None:
+            continue  # 节点对不上由 sections_within_budget 报
+        has_fold = any(ln.strip().startswith("::: ") for ln in lines)
+        if not has_fold and not any(ln.strip().startswith("####") for ln in lines):
+            errors.append(f"「{title}」：大纲里写了要折叠，正文这一节里没有折叠块（guides/concept/outline.md「写什么」）")
+    return errors
+
+
+def final_check_is_recorded(c: Content) -> list[str]:
+    return final_check_recorded(c.sources.parent, "content", CONTENT_ROUNDS)
+
+
 RULES = [
     dir_name_is_kebab, topics_and_tag_in_vocab, references_have_link,
     short_has_three_sections, short_has_no_fold_code_table, long_ends_with_boundary,
     no_external_url_in_body, links_point_to_existing_pages,
     every_paragraph_has_basis, basis_matches_sources, basis_on_its_own_line,
     numbers_appear_in_sources, words_within_limit, code_blocks_are_python_with_output,
+    no_source_wording, references_are_in_sources_index, description_is_one_sentence,
+    sections_within_budget, long_has_self_made_example, folds_promised_by_outline_exist, final_check_is_recorded,
 ]
 
 
@@ -327,6 +421,19 @@ GOOD = "\n".join([
     "### 适用条件与边界", "", "只对数值输入成立。", "依据：book.md 第 1 章",
 ])
 
+# 与 GOOD 配套的大纲和资料目录；预算按 GOOD 各节的实际字数留足
+OUTLINE = "\n".join([
+    "# 大纲", "", "## 长页", "",
+    "- 开头｜开头一段｜50｜book.md 第 1 章",
+    "- ### 定义｜输出是输入的两倍｜100｜book.md 第 1 章",
+    "- ### 适用条件与边界｜只对数值输入成立｜50｜book.md 第 1 章", "",
+    "## 短页", "",
+    "- ### 它是什么｜定义｜100｜book.md 第 1 章",
+    "- ### 为什么要它｜动机｜100｜自行构造",
+    "- ### 怎么用它｜用法｜100｜book.md L3-L4",
+])
+INDEX = "- https://example.com/book｜第 1 版\n"
+
 # 每条规则至少一个坏输入，应当报出 want；want 为 None 的是不该报错的写法
 CASES = [
     ("通过的页面没有报错", GOOD, None),
@@ -359,6 +466,10 @@ CASES = [
     ("短页有一段没写依据", GOOD.replace("用来演示。\n依据：自行构造\n", "用来演示。\n"), "后面没有「依据：」行"),
     ("长页有一段没写依据", GOOD.replace("只对数值输入成立。\n依据：book.md 第 1 章", "只对数值输入成立。"), "后面没有「依据：」行"),
     ("引导句和后面的列表共用一行依据", GOOD.replace("只对数值输入成立。", "分两步：\n\n1. 读入。\n2. 输出。"), None),
+    ("正文写出处措辞", GOOD.replace("玩具算子把输入乘 2。", "论文说玩具算子把输入乘 2。"), "出处措辞"),
+    ("描述写了两句", GOOD.replace("描述：自检页。", "描述：自检页。第二句。"), "只写一句话"),
+    ("资料没有收进 index.md", GOOD.replace("https://example.com/book", "https://example.com/other"), "没有收进"),
+    ("长页没有自行构造的例子", GOOD.replace("```text\n2\n```\n依据：自行构造", "```text\n2\n```\n依据：book.md 第 1 章"), "至少要有一段依据写"),
     ("小整数不能靠子串命中", GOOD.replace("开头一段。", "开头一段，共有 7 个。"), "数字 7"),
 ]
 
@@ -376,6 +487,8 @@ def selftest() -> int:
             if with_sources:
                 (research / "sources").mkdir(exist_ok=True)
                 (research / "sources" / "book.md").write_text(SNAPSHOT, encoding="utf-8")
+                (research / "sources" / "index.md").write_text(INDEX, encoding="utf-8")
+            (research / "outline.md").write_text(OUTLINE, encoding="utf-8")
             (research / "content.md").write_text(text, encoding="utf-8")
             return research / "content.md"
 
@@ -387,6 +500,28 @@ def selftest() -> int:
             if want is None and errs:
                 print("    意外报错：", errs)
             results.append((name, ok))
+        outline = md.parent / "outline.md"
+        md.write_text(GOOD.replace("开头一段。", "开头一段" + "字" * 80 + "。"), encoding="utf-8")
+        results.append(("一节超出预算的 1.3 倍", any("大纲预算 50" in e for e in check(md, wiki))))
+        fold = "\n\n::: 细节\n" + "字" * 500 + "\n依据：book.md 第 1 章\n:::\n"
+        md.write_text(GOOD.replace("依据：book.md 第 1 章\n\n```python", "依据：book.md 第 1 章" + fold + "\n```python"), encoding="utf-8")
+        errs = check(md, wiki)
+        results.append(("折叠块里的字不算进预算", "大纲预算" not in "".join(errs)))
+        md.write_text(GOOD, encoding="utf-8")
+        outline.write_text(OUTLINE.replace("### 定义", "### 定义改了"), encoding="utf-8")
+        results.append(("大纲节点和正文对不上", sum("一一对应" in e for e in check(md, wiki)) == 2))
+        outline.write_text(OUTLINE, encoding="utf-8")
+        outline.write_text(OUTLINE.replace("定义｜输出是输入的两倍", "定义｜输出是输入的两倍，推导折叠"), encoding="utf-8")
+        results.append(("大纲写了折叠而正文没有", any("没有折叠块" in e for e in check(md, wiki))))
+        md.write_text(GOOD.replace("```python\nprint(2 * 1)", "::: 推导\n两倍。\n依据：book.md 第 1 章\n:::\n\n```python\nprint(2 * 1)"), encoding="utf-8")
+        results.append(("正文有折叠块不报", not any("没有折叠块" in e for e in check(md, wiki))))
+        md.write_text(GOOD, encoding="utf-8")
+        outline.write_text(OUTLINE, encoding="utf-8")
+        record = md.parent / f"content-review-{CONTENT_ROUNDS}.md"
+        record.write_text("## 处理\n全部采纳。\n", encoding="utf-8")
+        results.append(("审到轮数上限没写最后一批改动核对", any("最后一批改动核对" in e for e in check(md, wiki))))
+        record.write_text("## 最后一批改动核对\n无改动。\n", encoding="utf-8")
+        results.append(("写了最后一批改动核对不报", not check(md, wiki)))
         results.append(("目录名不合规应当报错", any("目录名" in e for e in check(make("Bad_Name", GOOD), wiki))))
         results.append(("没有 sources 时报错", any("没有快照" in e for e in check(make("nosrc", GOOD, False), wiki))))
     return report(results, "正文检查")

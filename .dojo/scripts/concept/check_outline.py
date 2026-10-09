@@ -11,7 +11,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from common import (  # noqa: E402
-    LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT, check_basis_list, report,
+    LAST_CHAPTER, LONG_LIMIT, OUTLINE_ROUNDS, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT,
+    check_basis_list, final_check_recorded, report,
 )
 
 
@@ -111,10 +112,14 @@ def budget_within_limit(o: dict) -> list[str]:
     return errors
 
 
+def final_check_is_recorded(o: dict) -> list[str]:
+    return final_check_recorded(o["sources"].parent, "outline", OUTLINE_ROUNDS)
+
+
 RULES = [
     node_has_four_parts, each_page_has_nodes, what_is_one_short_sentence,
     words_is_integer, basis_matches_sources, short_has_three_sections,
-    long_ends_with_boundary, budget_within_limit,
+    long_ends_with_boundary, budget_within_limit, final_check_is_recorded,
 ]
 
 
@@ -173,6 +178,12 @@ def selftest() -> int:
             if want is None and errs:
                 print("    意外报错：", errs)
             results.append((name, ok))
+        record = research / f"outline-review-{OUTLINE_ROUNDS}.md"
+        md.write_text(GOOD, encoding="utf-8")
+        record.write_text("## 处理\n全部采纳。\n", encoding="utf-8")
+        results.append(("审到轮数上限没写最后一批改动核对", any("最后一批改动核对" in e for e in check(md))))
+        record.write_text("## 最后一批改动核对\n无改动。\n", encoding="utf-8")
+        results.append(("写了最后一批改动核对不报", not check(md)))
     return report(results, "大纲检查")
 
 
