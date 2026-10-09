@@ -4,7 +4,7 @@
 
 先运行：
 
-    python3 .dojo/scripts/dataflow/check_source.py <name>.md --source-root <源码目录>
+    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/research/dataflow.md --source-root <源码目录>
 
 回查「源码」列指的行不是空行或注释、且含节点名。通过后派 5 个子代理。
 

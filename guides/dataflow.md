@@ -8,12 +8,12 @@
 
 1. **收集**：把源码、`config.json`、权重文件头、论文收到 `wiki/<name>/research/sources/`，见[收集](dataflow/collect.md)。
 2. **计划**：写 `research/dataflow.md`，定下画哪条路径、分哪几张图、每张图的节点连线公式，见[计划](dataflow/plan.md)。
-3. **审计划**：派 5 个独立子代理对照源码核，见[审计划](dataflow/review-plan.md)。
+3. **审计划**：派 5 个独立子代理核（前 4 席对照源码，读者与措辞一席只看计划），见[审计划](dataflow/review-plan.md)。
 4. **生成**：运行 `python3 .dojo/scripts/dataflow/build_page.py wiki/<name>/research/dataflow.md`，得到 `wiki/<name>/index.html`。
 5. **核查页面**：见[核查](dataflow/check.md)，回查源码位置、节点名与形状、页面本身。
 6. **修改**：页面内容改 `dataflow.md` 后重新生成，再按第 5 步核查；改了事实错误就回到第 3 步重派一轮。
 
-每一步完成再进入下一步。`<name>` 用小写英文和连字符。交付时回复里只写这次生成的页面路径。
+每一步完成再进入下一步。`<name>` 用小写英文和连字符。交付要求见下节。
 
 ## 交付
 
