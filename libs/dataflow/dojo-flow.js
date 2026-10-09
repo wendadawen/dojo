@@ -720,9 +720,16 @@
         }
       }
     }
-    if (history.replaceState) history.replaceState(null, '', '#' + this.view.id);
+    if (history.replaceState && !this.skipHashWrite) {
+      history.replaceState(null, '', '#' + this.view.id);
+    }
+    this.skipHashWrite = false;
     this.renderInfo();
     if (hasManual) this.render();
+    // 适配比例算完了，标签跟着刷新；ELK 布局是异步的，落定后再刷一次
+    var self = this;
+    this.updateZoomLabel();
+    setTimeout(function () { self.updateZoomLabel(); }, 400);
   };
 
   // 说明面板跟着视图走：分组 + 键值表，与 config.json 面板同一套样式。
@@ -1016,11 +1023,21 @@
       ? Math.min(1, availW / w, availH / h)
       : Math.min(1, availW / w);
     scale = Math.max(FIT_MIN_SCALE, scale);
+    // 缩到节点名字看不清（<11px）时就不再缩，改为允许纵向拖动看下半张。
+    // 大图整图适配会把 40 个节点压成一片糊，读者第一眼什么也读不到。
+    var READABLE_MIN = 0.55;
+    if (scale < READABLE_MIN) {
+      scale = READABLE_MIN;
+      this.needsScroll = true;
+    }
     this.scale = scale;
     this.tx = pad.left + (availW - w * scale) / 2 - minX * scale;
     // 纵向：整图适配时居中，按宽度适配时顶部对齐
     var slack = availH - h * scale;
     this.ty = (mode === 'all' && slack > 0 ? pad.top + slack / 2 : pad.top) - minY * scale;
+    if (mode === 'all' && h * scale > availH) {
+      this.ty = pad.top - minY * scale;   // 放不下就从顶部开始
+    }
   };
 
   /**
@@ -1149,8 +1166,12 @@
     });
 
     if (n.kind === 'op' && n.fold && n.fold.length) {
+      var MARK_SIZE = 22, MARK_PAD = 4;
       var mark = el('foreignObject', {
-        x: p.x + p.w - 26, y: p.y + 4, width: 22, height: 22
+        x: p.x + p.w - MARK_SIZE - MARK_PAD, y: p.y + MARK_PAD,
+        width: MARK_SIZE, height: MARK_SIZE,
+        'data-right': p.x + p.w - MARK_PAD,   // 右边缘，缩放时按它定 x
+        'data-top': p.y + MARK_PAD
       });
       var wrap = document.createElement('div');
       wrap.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
@@ -1259,10 +1280,22 @@
   FlowView.prototype.applyTransform = function () {
     this.scene.setAttribute('transform',
       'translate(' + this.tx + ',' + this.ty + ') scale(' + this.scale + ')');
+    // 折叠标记随画布缩放会缩到点不中：反向放大，保证屏幕上是 22px 见方。
+    var size = Math.max(22, 22 / (this.scale || 1));
+    var nodes = this.nodeLayer ? this.nodeLayer.querySelectorAll('foreignObject[data-right]') : [];
+    Array.prototype.forEach.call(nodes, function (fo) {
+      fo.setAttribute('width', size);
+      fo.setAttribute('height', size);
+      fo.setAttribute('x', parseFloat(fo.getAttribute('data-right')) - size);
+    });
     this.positionFold();
   };
 
   FlowView.prototype.closeFold = function () {
+    if (this.foldAnchorEl) {
+      this.foldAnchorEl.classList.remove('flow-node-folding');
+      this.foldAnchorEl = null;
+    }
     if (this.foldBtn) {
       this.foldBtn.classList.remove('on');
       this.foldBtn.setAttribute('aria-expanded', 'false');
@@ -1306,22 +1339,22 @@
 
   FlowView.prototype.positionFold = function () {
     if (!this.foldEl || !this.foldAnchor || !this.foldAnchor.isConnected) return;
-    var r = this.foldAnchor.getBoundingClientRect();
     var app = this.app.getBoundingClientRect();
     var card = this.foldEl;
-    var margin = 8;
+    // 固定贴右边，不压住它所属的节点；高亮该节点，读者知道卡片说的是哪个
     var width = Math.min(440, Math.max(280, app.width - 28));
     card.style.width = width + 'px';
-    var left = r.right - app.left + margin;
-    if (left + width > app.width - 12) left = r.left - app.left - width - margin;
-    if (left < 12) left = 12;
-    var maxH = Math.min(520, Math.max(180, app.height - 24));
-    var top = r.top - app.top;
-    if (top + maxH > app.height - 12) top = app.height - 12 - maxH;
-    if (top < 12) top = 12;
-    card.style.left = left + 'px';
-    card.style.top = top + 'px';
-    card.style.maxHeight = Math.min(maxH, app.height - top - 12) + 'px';
+    card.style.left = (app.width - width - 14) + 'px';
+    card.style.top = '14px';
+    card.style.maxHeight = (app.height - 28) + 'px';
+    var anchor = this.foldAnchor.closest ? this.foldAnchor.closest('.flow-node') : null;
+    if (this.foldAnchorEl && this.foldAnchorEl !== anchor) {
+      this.foldAnchorEl.classList.remove('flow-node-folding');
+    }
+    if (anchor) {
+      anchor.classList.add('flow-node-folding');
+      this.foldAnchorEl = anchor;
+    }
   };
 
   // ---------- 交互 ----------
@@ -1404,11 +1437,16 @@
     // 复位 = 重建布局 + 整图适配（总览用），与切视图时的按宽度适配区分开
     this.fitMode = 'all';
     this.applyView(this.view.id);
-    this.updateZoomLabel();
+    // 适配是异步的（ELK 布局），布局落定后再刷一次标签
+    var self = this;
+    setTimeout(function () { self.updateZoomLabel(); }, 400);
   };
 
   root.DojoFlow = {
     mount: function (app, data) {
+      // 构造时会先 applyView(views[0]) 并把 hash 写成第一张图，
+      // 所以初始 hash 要在构造之前读走。
+      var initial = (location.hash || '').replace('#', '');
       var fv = new FlowView(app, data);
       var zoom = app.querySelector('.flow-zoom');
       if (zoom) {
@@ -1419,6 +1457,16 @@
           else if (act === 'reset') fv.resetView();
         });
       }
+      var bar = app.querySelector('.flow-bar');
+      if (bar) {
+        var syncBarEnd = function () {
+          bar.classList.toggle('at-end',
+            bar.scrollLeft + bar.clientWidth >= bar.scrollWidth - 2);
+        };
+        bar.addEventListener('scroll', syncBarEnd);
+        window.addEventListener('resize', syncBarEnd);
+        setTimeout(syncBarEnd, 0);
+      }
       if (app.querySelector('.flow-bar')) {
         app.querySelector('.flow-bar').addEventListener('click', function (e) {
           var btn = e.target.closest('.flow-tab');
@@ -1428,12 +1476,15 @@
           fv.updateZoomLabel();
         });
       }
-      var initial = (location.hash || '').replace('#', '');
       if (initial && data.views.some(function (v) { return v.id === initial; })) {
         fv.applyView(initial);
       }
       window.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape') { fv.applyView(data.views[0].id); }
+        if (e.key !== 'Escape') return;
+        // 有浮层先关浮层；没有浮层才回第一张图
+        if (fv.foldEl || !document.getElementById('flow-info').hidden
+            || !document.getElementById('flow-config').hidden) return;
+        fv.applyView(data.views[0].id);
       });
       fv.updateZoomLabel();
       return fv;
