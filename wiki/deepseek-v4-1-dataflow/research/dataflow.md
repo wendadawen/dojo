@@ -292,6 +292,133 @@
 | 配置 | vocab_size | 129280 |
 | 配置 | dim | 5120 |
 
+## Linear.forward（model.py:242-243）
+
+### 节点
+
+| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
+|---|---|---|---|---|---|
+| lin_x | 张量 | x | bf16 [..., in] | 参数 x；in 是这一层的输入宽度（Linear 的 self.in_features），前导各维不限，随调用点不同 | model.py:242 |
+| lin_w | 张量 | self.weight | fp8 [out, in] | 权重，out 是这一层的输出宽度（self.out_features）；存法与 dtype 见折叠的说明 | model.py:243 |
+| lin_op | 算子 | linear(x, self.weight, self.bias) | bf16 [..., in] → bf16 [..., out] |  | model.py:243 |
+| lin_y | 张量 | linear(x, self.weight, self.bias) | bf16 [..., out] | 返回值 | model.py:243 |
+
+### 连线
+
+- lin_x → lin_op
+- lin_w → lin_op
+- lin_op → lin_y
+
+### 折叠
+
+| id | 名字 | 内容 |
+|---|---|---|
+| lin_op | 公式 | $y = \mathrm{linear}(x, weight, bias)$，x 是输入，weight 是 self.weight，bias 是 self.bias |
+| lin_op | 说明 | weight 按调用点传的 dtype 存：没写 dtype 的取 dtype（fp8，[out, in]），路由专家的 w1、w2、w3 取 expert_dtype（fp4，两个值装一个字节，存成 [out, in/2]），索引器的 wk 是 bf16，压缩器的 wkv、wgate 是 fp32（wkv 在压缩比不大于 1 的那一层是 bf16）<br>linear() 按 weight 的 dtype 选一条路：fp4 走 fp4_gemm、fp8 走 fp8_gemm（两者都先把激活量化成 fp8），其余 dtype（bf16 与 fp32）走 F.linear；一次只走其中一条，走哪条由调用点传的 dtype 定<br>主干的调用点都没传 bias，self.bias 是 None，所以没有偏置这条线（视觉支路用的是 nn.Linear，不是这个类，另有偏置） |
+
+### 面板
+
+| 组 | 名字 | 值 |
+|---|---|---|
+| 配置 | dtype | fp8 |
+| 配置 | expert_dtype | fp4 |
+
+## ColumnParallelLinear.forward（model.py:256-257）
+
+### 节点
+
+| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
+|---|---|---|---|---|---|
+| cpl_x | 张量 | x | bf16 [..., in] | 参数 x；in 是这一层的输入宽度，随调用点不同 | model.py:256 |
+| cpl_w | 张量 | self.weight | fp8 [out, in] | 权重，存的是本卡那一片；out 是本卡的输出宽度，单卡下即完整的 out_features；dtype 随调用点变，见折叠的说明 | model.py:257 |
+| cpl_op | 算子 | linear(x, self.weight, self.bias) | bf16 [..., in] → bf16 [..., out] |  | model.py:257 |
+| cpl_y | 张量 | linear(x, self.weight, self.bias) | bf16 [..., out] | 返回值 | model.py:257 |
+
+### 连线
+
+- cpl_x → cpl_op
+- cpl_w → cpl_op
+- cpl_op → cpl_y
+
+### 折叠
+
+| id | 名字 | 内容 |
+|---|---|---|
+| cpl_op | 公式 | $y = \mathrm{linear}(x, weight, bias)$，x 是输入，weight 是 self.weight，bias 是 self.bias |
+| cpl_op | 说明 | 输出维按 rank 切分，各卡算自己那一片；单卡下 out 就是完整的 out_features，一片即整张，不需要通信<br>weight 的 dtype 同 Linear：没写 dtype 的取 dtype（fp8），wo_a 与索引器的 weights_proj 是 bf16；linear() 按这个 dtype 只走 fp8_gemm 或 F.linear 里的一条<br>本页每个调用点都没传 bias，self.bias 是 None |
+
+### 面板
+
+| 组 | 名字 | 值 |
+|---|---|---|
+| 配置 | dtype | fp8 |
+
+## RowParallelLinear.forward（model.py:271-278）
+
+### 节点
+
+| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
+|---|---|---|---|---|---|
+| rpl_x | 张量 | x | bf16 [..., in] | 参数 x；in 是这一层的输入宽度（完整的 in_features），本页只有 Attention 的 wo_b 用它 | model.py:271 |
+| rpl_w | 张量 | self.weight | fp8 [out, in] | 权重，in 是完整的 in_features，out 是输出宽度 | model.py:272 |
+| rpl_op | 算子 | linear(x, self.weight, None) | bf16 [..., in] → bf16 [..., out] |  | model.py:272 |
+| rpl_y | 张量 | linear(x, self.weight, None) | bf16 [..., out] | y；之后 all_reduce 段（单卡不执行）与 bias 段（本页 self.bias 为 None，不执行）都不走，最后 type_as(x) 返回 | model.py:272 |
+
+### 连线
+
+- rpl_x → rpl_op
+- rpl_w → rpl_op
+- rpl_op → rpl_y
+
+### 折叠
+
+| id | 名字 | 内容 |
+|---|---|---|
+| rpl_op | 公式 | $y = \mathrm{linear}(x, weight, None)$，x 是输入，weight 是 self.weight，这一调用不传 bias |
+| rpl_op | 说明 | 归约维按 rank 切分，各卡的和只是部分和，所以要通信；单卡下 in 就是完整的 in_features，weight 是整张 [out, in]，这一路已是完整的和<br>world_size 大于 1 时还有两段：先 y = y.float() 转 fp32 再 dist.all_reduce(y)；然后单独一段，由 self.bias 是否为 None 决定（与 world_size 无关），非 None 时 y += self.bias。本页单卡、各调用点也没传 bias，这两段都不执行，y 直接 type_as(x) 返回<br>weight 没写 dtype，取 dtype（fp8） |
+
+### 面板
+
+| 组 | 名字 | 值 |
+|---|---|---|
+| 配置 | dtype | fp8 |
+| 配置 | dim | 5120 |
+| 配置 | o_groups | 8 |
+| 配置 | o_lora_rank | 1024 |
+
+## PatchEmbed.forward（vision.py:42-43）
+
+### 节点
+
+| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |
+|---|---|---|---|---|---|
+| patches | 张量 | x | bf16 [S, 3, 14, 14] | 参数 x；ViT 图里 self.patch_embed(patches) 传进来的就是这份 patch 网格，与 Transformer、ViT 两图的 patches 是同一份 | vision.py:42 |
+| pe_w | 张量 | self.proj.weight | bf16 [1024, 588] | proj 的权重，588 = 3 × 14 × 14，1024 是 vision_dim | vision.py:40 |
+| pe_b | 张量 | self.proj.bias | bf16 [1024] | proj 的偏置，每个输出维一个 | vision.py:40 |
+| pe_op | 算子 | self.proj(x.flatten(1)) | bf16 [S, 3, 14, 14] → bf16 [S, 1024] |  | vision.py:43 |
+| vx | 张量 | self.proj(x.flatten(1)) | bf16 [S, 1024] | 返回值；就是 ViT 图里的 x（patch 嵌入），两图同一个量 | vision.py:43 |
+
+### 连线
+
+- patches → pe_op
+- pe_w → pe_op
+- pe_b → pe_op
+- pe_op → vx
+
+### 折叠
+
+| id | 名字 | 内容 |
+|---|---|---|
+| pe_op | 公式 | $x = x.\mathrm{flatten}(1)\, proj.weight^\top + proj.bias$，x 是 patch 网格，flatten 把每个 patch 的 3 × 14 × 14 摊平，proj 是这一行的层 |
+| pe_op | 说明 | proj 是 nn.Linear（vision.py:40），proj.weight [1024, 588]、proj.bias [1024]；PatchEmbed 只有这一次线性投影 |
+
+### 面板
+
+| 组 | 名字 | 值 |
+|---|---|---|
+| 配置 | vision_dim | 1024 |
+| 配置 | vision_patch_size | 14 |
+
 ## ViT.forward（vision.py:98-103）
 
 ### 节点
@@ -323,6 +450,7 @@
 - vblocks → vx2
 - vx2 → vnorm
 - vnorm → vout
+- vpe 点开 → PatchEmbed.forward
 - vblocks 点开 → vision.Block.forward
 - vnorm 点开 → vision.RMSNorm.forward
 
@@ -330,8 +458,8 @@
 
 | id | 名字 | 内容 |
 |---|---|---|
-| vpe | 公式 | $x = proj(patches.\mathrm{flatten}(1))$，patches 是这张图的 patch 网格，flatten 把每个 patch 的 3 × 14 × 14 摊平 |
-| vpe | 说明 | PatchEmbed：proj.weight [1024, 588]、proj.bias [1024]，588 = 3 × 14 × 14；它只有一次线性投影，本页画在这个节点上 |
+| vpe | 公式 | $x = patch\_embed(patches)$，patches 是这张图的 patch 网格，patch_embed 是 PatchEmbed，算式见点开的那张图 |
+| vpe | 说明 | PatchEmbed：proj.weight [1024, 588]、proj.bias [1024]，588 = 3 × 14 × 14，见点开的那张图 |
 | vcs_op | 公式 | $hpos$、$wpos$ 是每个 patch 在网格里的高、宽坐标；$freqs = \mathrm{flatten}([hpos, wpos] \odot inv\_freq)$，$cos = \cos(freqs)$，$sin = \sin(freqs)$，各补一个长度为 1 的维度。$inv\_freq_j = \theta^{-2j/rope\_dim}$，rope_dim 是取频率用的维度（vision_dim // vision_n_heads // 2 = 32），$\theta$ 是 vision_rope_theta |
 | vcs_op | 说明 | 频率长度 32 = rope_dim = 每个头宽度的一半，一个头里的前半段配高坐标、后半段配宽坐标；整张图只算一次，32 层共用 |
 | vblocks | 公式 | $x = block(x, cos, sin)$，block 是这一层的 vision.Block |
@@ -469,7 +597,7 @@
 | id | 名字 | 内容 |
 |---|---|---|
 | vwqkv | 公式 | $qkv = x\, wqkv.weight^\top + wqkv.bias$，x 是 norm1 之后的隐状态 |
-| vwqkv | 说明 | wqkv.weight [3072, 1024]、wqkv.bias [3072]，3072 = 3 × 1024 |
+| vwqkv | 说明 | wqkv.weight [3072, 1024]、wqkv.bias [3072]，3072 = 3 × 1024；wqkv 是 nn.Linear（PyTorch 自带，与主干的 Linear 不是一类，见 PatchEmbed 图） |
 | vsplit | 公式 | $q, k, v = \mathrm{chunk}(qkv, 3, \dim=-1)$ |
 | vview | 公式 | $q, k, v$ 各 view 成 [S, 16, 64]，16 是 n_heads，64 是 head_dim |
 | vview | 说明 | 16 × 64 = 1024，头维插在序列维之后，好按头做注意力 |
@@ -480,7 +608,7 @@
 | vsdpa | 公式 | $o = \mathrm{softmax}(q k^\top / \sqrt{64})\, v$，q、k、v 都先把头维挪到最前，64 是 head_dim |
 | vsdpa | 说明 | PyTorch 的 F.scaled_dot_product_attention，不给掩码、不做 dropout，整张图里 patch 之间全双向 |
 | vwo | 公式 | $x = o.\mathrm{transpose}(0, 1).\mathrm{reshape}(S, -1)\, wo.weight^\top + wo.bias$ |
-| vwo | 说明 | wo.weight [1024, 1024]、wo.bias [1024] |
+| vwo | 说明 | wo.weight [1024, 1024]、wo.bias [1024]；wo 也是 nn.Linear（PyTorch 自带） |
 
 ### 面板
 
@@ -523,11 +651,11 @@
 | id | 名字 | 内容 |
 |---|---|---|
 | vw1 | 公式 | $g1 = x\, w1.weight^\top$，x 是 norm2 之后的隐状态，w1 无 bias |
-| vw1 | 说明 | w1.weight [5632, 1024]，5632 = 2 × 2816，两段分别是 gate 与 up |
+| vw1 | 说明 | w1.weight [5632, 1024]，5632 = 2 × 2816，两段分别是 gate 与 up；w1 是 nn.Linear（PyTorch 自带） |
 | vspl | 公式 | $gate, up = \mathrm{chunk}(g1, 2, \dim=-1)$ |
 | vsilu | 公式 | $\mathrm{silu}(gate) \odot up$，就是 $gate \cdot \sigma(gate)$ 再逐元素乘 up |
 | vw2 | 公式 | $x = (\mathrm{silu}(gate) \odot up)\, w2.weight^\top$，w2 无 bias |
-| vw2 | 说明 | w2.weight [1024, 2816] |
+| vw2 | 说明 | w2.weight [1024, 2816]；w2 是 nn.Linear（PyTorch 自带） |
 
 ### 面板
 
@@ -635,7 +763,7 @@
 | vunf | 公式 | $x = \mathrm{unfold}(x.\mathrm{unsqueeze}(0), r, \mathrm{stride}=r).\mathrm{squeeze}(0).\mathrm{transpose}(0, 1)$，把高宽平面切成不重叠的 r×r 块，每块摊成一行。这里的 r 是视觉的 downsample_ratio（3），与注意力里的 compress_ratio 同形不同义 |
 | vunf | 说明 | 一块 r × r × 1024 摊平成 9216 维；输出行数是 ceil(n_vit_h / r) × ceil(n_vit_w / r)，就是图像在序列里占的 token 网格 |
 | vlin | 公式 | $out = w2(\mathrm{gelu}(w1(x)))$，x 是展开后的 3×3 块，w1 把 9216 维映到 5120，w2 保持 5120 |
-| vlin | 说明 | w1.weight [5120, 9216]、w1.bias [5120]、w2.weight [5120, 5120]、w2.bias [5120]，两层投影都带 bias |
+| vlin | 说明 | w1.weight [5120, 9216]、w1.bias [5120]、w2.weight [5120, 5120]、w2.bias [5120]，两层投影都带 bias；w1、w2 是 nn.Linear（PyTorch 自带） |
 
 ### 面板
 
@@ -889,6 +1017,8 @@
 - cidx_op 点开 → Indexer.forward
 - qr_op 点开 → RMSNorm.forward
 - wkv_win 点开 → RMSNorm.forward
+- qb 点开 → ColumnParallelLinear.forward
+- wb 点开 → RowParallelLinear.forward
 
 ### 折叠
 
@@ -915,8 +1045,8 @@
 | comp_op | 说明 | 只有 4 个 kv source 层（2、8、14、20）算；其余 compress_ratio 大于 0 的层 latent 为 None，直接读已有缓存；层 0、1 的压缩比为 0，整段压缩都不走 |
 | cidx_op | 公式 | $idxs = \_compress\_topk\_idxs(x, qr, latent, start\_pos, offset, compress\_len)$，offset 是窗口 KV 的长度 |
 | cidx_op | 说明 | 本层是 index source（2、8、14、20、24、28、32、36）就跑自己的 Indexer，其余 compress_ratio 大于 0 的层直接复用 shared_attn.topk_idxs<br>offset 是 window_kv 的长度，本次是 T；compress_len 是 (start_pos + T) / r |
-| cf | 公式 | $freqs = freqs\_cis[:seqlen - seqlen \% ratio: ratio]$，第 g 组取位置 $g \times ratio$，ratio 是这一层的 compress_ratio |
-| cf | 说明 | 取压缩位置的频率，一个 latent 顶替一整组，第 g 组取位置 g × r |
+| cf | 公式 | $freqs = freqs\_cis[:seqlen - seqlen \% ratio: ratio]$，第 j 组取位置 $j \times ratio$，ratio 是这一层的 compress_ratio |
+| cf | 说明 | 取压缩位置的频率，一个 latent 顶替一整组，第 j 组取位置 j × r |
 | crope | 公式 | $latent_{...,-rope\_head\_dim:} = \mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(latent_{...,-rope\_head\_dim:}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot freqs))$，latent 是压缩潜在量，freqs 是压缩位置的频率，相邻两维配成一对复数 |
 | crope | 说明 | 乘压缩位置的 freqs |
 | cquant | 公式 | $s = \mathrm{fp8}(\max(\mathrm{absmax}(latent), 6 \cdot 2^{-9}) / 6)$，$latent = \mathrm{bf16}(\mathrm{fp4}(\mathrm{clamp}(latent / s, -6, 6)) \cdot s)$。absmax 按每 16 个数一组取。latent 是加过 RoPE 的压缩 KV，scale 存成 E4M3 |
@@ -935,7 +1065,7 @@
 | grp | 说明 | 每 8 个头一组，8 × 512 = 4096。n_local_groups 是本卡的组数，单卡下等于 o_groups 8 |
 | woa | 公式 | $wo\_a = wo\_a.weight.\mathrm{view}(n\_local\_groups, o\_lora\_rank, -1)$，wo_a.weight 是 [8192, 4096]，n_local_groups 是 8，o_lora_rank 是 1024 |
 | woa | 说明 | wo_a.weight [8192, 4096]，8192 = 8 × 1024 |
-| eins | 公式 | $o_{b,s,g,r} = \sum_d o_{b,s,g,d}\, wo\_a_{g,r,d}$，o 是分组后的注意力输出，wo_a 是 wo_a.weight 按组摊开的结果 |
+| eins | 公式 | $o_{b,s,g,m} = \sum_d o_{b,s,g,d}\, wo\_a_{g,m,d}$，o 是分组后的注意力输出，wo_a 是 wo_a.weight 按组摊开的结果，g 是 o_groups 的组号、m 是 o_lora_rank 维 |
 | eins | 说明 | 每组只和本组的权重相乘，等效块对角矩阵 |
 | wb | 公式 | $x = \mathrm{flatten}(o)\, wo\_b.weight^\top$，o 是 eins 的输出，wo_b.weight 是输出投影 |
 | wb | 说明 | wo_b.weight [5120, 8192] |
@@ -948,7 +1078,7 @@
 | 公式 | YaRN | $\theta_j' = (\theta_j/16)\,\rho_j + \theta_j\,(1 - \rho_j)$，16 是 rope_factor，$\rho_j = \mathrm{clamp}\big((j - low)/(high - low), 0, 1\big)$ 是随 j 递增的斜坡，j 不大时 $\rho_j$ 为 0、保留原频率，j 变大后逐步除以 16，low 是 corrected_dim(beta_fast) 向下取整、high 是 corrected_dim(beta_slow) 向上取整。YaRN 是长上下文的频率缩放，corrected_dim(r) 由 beta_fast/beta_slow 反推出「波长恰好铺满训练长度的那个频率维下标」；只对压缩比大于 0 的层生效 |
 | 公式 | query 低秩投影 | $qr = q\_norm.weight \odot \dfrac{x\, wq\_a.weight^\top}{\sqrt{\mathrm{mean}((x\, wq\_a.weight^\top)^2) + q\_norm.eps}}$，再 $q = \mathrm{unflatten}(qr\, wq\_b.weight^\top, (n\_local\_heads, head\_dim))$。x 是本层输入 |
 | 公式 | 窗口 KV | $kv = kv\_norm.weight \odot \dfrac{x\, wkv.weight^\top}{\sqrt{\mathrm{mean}((x\, wkv.weight^\top)^2) + kv\_norm.eps}}$，x 是本层输入。后 rope_head_dim 维再乘 freqs_cis |
-| 公式 | 压缩 KV 的位置 | 第 g 个 latent 顶替第 $g r$ 到 $(g+1)r - 1$ 个 token，所以它的 RoPE 用位置 $g r$，r 是 compress_ratio |
+| 公式 | 压缩 KV 的位置 | 第 j 个 latent 顶替第 $j r$ 到 $(j+1)r - 1$ 个 token，所以它的 RoPE 用位置 $j r$，r 是 compress_ratio，j 是这个压缩组的序号（与「输出低秩投影」里的 g 不是一回事） |
 | 公式 | 稀疏注意力 | $o = \dfrac{\sum_{s} \exp(q \cdot kv_s \cdot softmax\_scale - \max)\, kv_s}{\sum_{s} \exp(q \cdot kv_s \cdot softmax\_scale - \max) + \exp(attn\_sink - \max)}$，s 取 topk_idxs 里的槽位（不是位置），kv 同时充当 k 和 v，softmax_scale 是 head_dim 的 -1/2 次方，$\max$ 是这些分数的最大值，attn_sink 是可学习参数 |
 | 公式 | 输出低秩投影 | $o_{b,s,g,m} = \sum_d o_{b,s,g,d}\, wo\_a_{g,m,d}$，再 $x = \mathrm{flatten}(o)\, wo\_b.weight^\top$。wo_a 是 wo_a.weight 按组摊开的结果，g 是 o_groups 的组号、m 是 o_lora_rank 维，与上一式的 r（compress_ratio）不是一回事 |
 | 配置 | dim | 5120 |
@@ -994,6 +1124,7 @@
 - kvg → cnorm
 - cnorm → lat
 - cnorm 点开 → RMSNorm.forward
+- proj 点开 → Linear.forward
 
 ### 折叠
 
@@ -1114,6 +1245,8 @@
 - lv → shift
 - shift → cidxs
 - kw 点开 → RMSNorm.forward
+- qop 点开 → ColumnParallelLinear.forward
+- wproj 点开 → ColumnParallelLinear.forward
 
 ### 折叠
 
@@ -1395,6 +1528,9 @@
 - hw → w2
 - ex → w2：dtype
 - w2 → eout
+- g1 点开 → Linear.forward
+- u1 点开 → Linear.forward
+- w2 点开 → Linear.forward
 
 ### 折叠
 
@@ -1499,6 +1635,7 @@
 - sum → ncast
 - nx → ncast：dtype
 - ncast → nout
+- nwkv 点开 → Linear.forward
 
 ### 折叠
 
