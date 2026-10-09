@@ -32,14 +32,16 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
+from common import (  # noqa: E402
+    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SKIP_HEADS, SUB_SECTIONS, report,
+)
 from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
 
 TEMPLATE = HERE.parents[1] / "templates" / "dataflow" / "index.html"
 REPO_ROOT = HERE.parents[2]
 
-KIND = {"算子": "op", "张量": "tensor", "缓存": "cache"}
-META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
 DRILL_RE = re.compile(r"^-\s*(\S+)\s+点开\s*(?:→|->)\s*(.+?)\s*$")
 EDGE_RE = re.compile(r"^-\s*([^\s→]+?)\s*(?:→|->)\s*([^\s：:]+)\s*(?:[：:]\s*(.+?))?\s*$")
 
@@ -125,10 +127,6 @@ def group_rows(rows: list[tuple[int, dict]]) -> list[tuple[str, list[tuple[str, 
     for _, r in rows:
         groups.setdefault(r["组"], []).append((r["名字"], r["值"]))
     return list(groups.items())
-
-
-SKIP_HEADS = {"资料", "前提", "config.json"}
-SUB_SECTIONS = ("节点", "连线", "折叠", "面板")
 
 
 def parse(plan: Path) -> dict:
@@ -275,10 +273,6 @@ def parse(plan: Path) -> dict:
     config = group_rows(read_table(config_rows, ["组", "名字", "值"], "config.json 表"))
     return {"plan": plan, "meta": meta, "views": views, "config_groups": config or None,
             "config_note": scope}
-
-
-# 第二行里表示「形状没写全」的占位。
-SHAPE_PLACEHOLDERS = ("同形状", "同上", "不变", "—", "--")
 
 
 def check_plan(views: list[dict]) -> None:
@@ -452,7 +446,7 @@ def build(plan: Path, out: Path | None = None) -> tuple[Path, dict]:
                       config_groups=data["config_groups"], config_note=data["config_note"]), data
 
 
-def report(path: Path, data: dict) -> str:
+def summary(path: Path, data: dict) -> str:
     views = data["views"]
     nodes = sum(len(v["nodes"]) for v in views)
     return f"已生成 {path}：{len(views)} 张图，{nodes} 个节点"
@@ -527,7 +521,7 @@ TOY_PLAN = "\n".join([
 ])
 
 
-def selftest() -> int:
+def selftest() -> list[tuple[str, bool]]:
     """用一份与任何真实模型无关的计划跑一遍，确认生成器可用、该报错的地方会报错。"""
     checks: list[tuple[str, bool]] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -612,14 +606,7 @@ def selftest() -> int:
         except SystemExit:
             checks.append(("占位符残留时应当报错", True))
 
-    failed = [name for name, ok in checks if not ok]
-    for name, ok in checks:
-        print(("  OK  " if ok else "  FAIL") + " " + name)
-    if failed:
-        print(f"生成器自检失败：{len(failed)} 项")
-        return 1
-    print(f"生成器自检通过：{len(checks)} 项")
-    return 0
+    return checks
 
 
 if __name__ == "__main__":
@@ -631,10 +618,10 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true", help="用虚构数据自检生成器")
     a = ap.parse_args()
     if a.selftest:
-        raise SystemExit(selftest())
+        raise SystemExit(report(selftest(), "生成器"))
     if a.plan is None:
         ap.error("需要计划文件路径")
     if not a.plan.exists():
         raise SystemExit(f"计划文件不存在：{a.plan}")
     path, data = build(a.plan, a.out)
-    print(report(path, data))
+    print(summary(path, data))

@@ -46,6 +46,10 @@ import threading
 from html import unescape
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from common import SKIP_HEADS, report  # noqa: E402
+
 # 节点名里允许出现、但不属于「源码标识符」的词：
 # 数据类型、形状记号、数学符号、以及句式里的连接词。
 ALLOWED_TOKENS = {
@@ -68,7 +72,6 @@ NAME_ALIASES = {
     "k": ("key_states", "key"),
     "v": ("value_states", "value"),
 }
-SKIP_HEADS = {"资料", "前提", "config.json"}
 
 
 def load_views(page: Path) -> list[dict]:
@@ -469,7 +472,7 @@ def run_shots(page: Path, root: Path, out: Path) -> int:
 
 # ---------- 自检 ----------
 
-def selftest() -> int:
+def selftest() -> list[tuple[str, bool]]:
     """用虚构的页面数据核对结构、名字、形状三条规则。"""
     checks: list[tuple[str, bool]] = []
     views = [{
@@ -514,11 +517,7 @@ def selftest() -> int:
     _, matched3, missing3 = check_shapes(shape_views, {"other.weight": [1]})
     checks.append(("形状表里没有的键记 warning 不报错", matched3 == 0 and bool(missing3) and not errs))
 
-    for name, ok in checks:
-        print(("  OK  " if ok else "  FAIL") + " " + name)
-    failed = sum(1 for _, ok in checks if not ok)
-    print(f"核查脚本自检失败：{failed} 项" if failed else f"核查脚本自检通过：{len(checks)} 项")
-    return 1 if failed else 0
+    return checks
 
 
 def main() -> int:
@@ -644,5 +643,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
-        raise SystemExit(selftest())
+        raise SystemExit(report(selftest(), "核查脚本"))
     sys.exit(main())

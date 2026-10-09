@@ -8,7 +8,6 @@
 具体的检查在同目录各自的脚本里，也可以单独运行：
     check_page.py      页面
     check_script.py    内联脚本语法
-    check_template.py  概念页模板
     check_css.py       没人用的 CSS
 """
 
@@ -21,12 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_css  # noqa: E402
 import check_page  # noqa: E402
 import check_script  # noqa: E402
-import check_template  # noqa: E402
 
 
 def main(args: list[str]) -> int:
     if "--selftest" in args:
-        codes = [m.selftest() for m in (check_page, check_script, check_template, check_css)]
+        codes = [m.selftest() for m in (check_page, check_script, check_css)]
         return 1 if any(codes) else 0
 
     if "--all" in args:
