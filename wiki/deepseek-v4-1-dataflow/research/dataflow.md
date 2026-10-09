@@ -867,8 +867,8 @@
 | kv0 | 张量 | kv | fp32 [B, T, 512] | 逐 token 的值投影 | model.py:465 |
 | projg | 算子 | self.wgate(x) | [B, T, 5120] → [B, T, 512] |  | model.py:465 |
 | csc | 张量 | score | fp32 [B, T, 512] | 逐 token 的门控打分 | model.py:465 |
-| pool | 算子 | 组内加权池化 | [B, T/r, r, 512] → [B, T/r, 512] |  | model.py:475 |
-| kvg | 张量 | kv | fp32 [B, T/r, 512] | 组内加权池化后的 kv | model.py:475 |
+| pool | 算子 | (kv * score.softmax(dim=2)).sum(dim=2) | [B, T/r, r, 512] → [B, T/r, 512] |  | model.py:475 |
+| kvg | 张量 | kv | fp32 [B, T/r, 512] | 组内按 score 加权求和后的 kv | model.py:475 |
 | cnorm | 算子 | self.norm(kv.to(dtype)) | fp32 [B, T/r, 512] → bf16 [B, T/r, 512] |  | model.py:485 |
 | lat | 张量 | self.norm(kv.to(dtype)) | bf16 [B, T/r, 512] | 返回值是还没加 RoPE 的压缩潜在量；层 2、8、14 汇自 cnorm，层 20 汇自 cnorm1 | model.py:485 |
 | projk1 | 算子 | self.wkv(x) | bf16 [B, T, 5120] → bf16 [B, T, 512] |  | model.py:462 |
@@ -902,7 +902,7 @@
 | projg | 符号 | $\mathbf{g}$：score，逐 token 的门控打分<br>$x$：本层输入<br>$W_g$：门控投影的权重，源码里叫 wgate.weight |
 | projg | 说明 | $W_g$ [512, 5120]（源码里叫 wgate.weight），压缩比大于 1 时是 fp32 |
 | pool | 公式 | $\mathbf{U} = \sum_t \mathrm{softmax}(\mathbf{G}_g)_t \, \mathbf{U}_{g,t}$ |
-| pool | 符号 | $\mathbf{U}$：kv，组内加权池化后的张量<br>$\mathbf{G}_g$：分组后的 score，按 $r$ 个一组重排<br>$\mathbf{U}_{g,t}$：组内第 $t$ 个 token 的值<br>$t$：组内位置，从 0 到 $r-1$ |
+| pool | 符号 | $\mathbf{U}$：kv，组内按 score 加权求和后的张量<br>$\mathbf{G}_g$：分组后的 score，按 $r$ 个一组重排<br>$\mathbf{U}_{g,t}$：组内第 $t$ 个 token 的值<br>$t$：组内位置，从 0 到 $r-1$ |
 | pool | 说明 | 组内用 score 的 softmax 做加权求和，把 $r$ 个 token 池成一个压缩条目；$r$ 就是这一层的 compress_ratio；源码写法 `(kv * score.softmax(dim=2)).sum(dim=2)` |
 | cnorm | 公式 | $\mathbf{Z} = w \odot \dfrac{\mathbf{U}.\mathrm{to}(dtype)}{\sqrt{\mathrm{mean}(\mathbf{U}^2) + \epsilon}}$ |
 | cnorm | 符号 | $\mathbf{Z}$：latent，压缩器的输出<br>$\mathbf{U}$：kv，池化后的张量<br>$w$：compressor.norm 的权重，源码里叫 norm.weight<br>$\epsilon$：1e-20<br>$\mathrm{mean}$：在最后一维<br>$\mathrm{to}(dtype)$：转回 bf16 |

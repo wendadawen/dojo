@@ -308,6 +308,15 @@ def check_plan(views: list[dict]) -> None:
                             break
             errors += _stray_underscore_escape(where, n)
             errors += _formula_in_explanation(where, n)
+            if n["kind"] == "op":
+                errors += _one_step_per_node(where, n)
+        for row in v.get("info") or []:
+            if row["title"] == "公式":
+                for name, value in row["rows"]:
+                    if len(re.findall(r"\$[^$]*\$", value)) > 1:
+                        errors.append(f"图「{v['label']}」面板/公式/{name}："
+                                      "一条只放一个式子，几个式子分几条")
+    errors += _no_generic_class_figure(views)
     if errors:
         raise SystemExit("\n".join(errors))
 
@@ -363,6 +372,31 @@ def _formula_in_explanation(where: str, node: dict) -> list[str]:
 
 
 # ---------- 写页面 ----------
+
+# 只是把通用算子套在权重上的基础层，不单独成图
+GENERIC_CLASSES = {
+    "Linear", "ColumnParallelLinear", "RowParallelLinear", "RMSNorm",
+    "Embedding", "ParallelEmbedding", "PatchEmbed", "MLP", "ParallelHead",
+}
+
+
+def _one_step_per_node(where: str, node: dict) -> list[str]:
+    """一个节点一步：第一行里套了两层以上类调用（如 self.a(self.b(x))），要拆开。"""
+    calls = re.findall(r"self\.([a-z_][a-z0-9_]*)\s*\(", node.get("name") or "")
+    if len(calls) >= 2:
+        return [f"{where}：一个节点一步，第一行套了 {'、'.join(calls)} 两个调用，拆开"]
+    return []
+
+
+def _no_generic_class_figure(views: list[dict]) -> list[str]:
+    """基础层（Linear、RMSNorm 这类）不单独成图，写在使用它们的节点上。"""
+    errors = []
+    for v in views:
+        label = (v.get("title") or "").split(".")[-1]
+        if label in GENERIC_CLASSES:
+            errors.append(f"图「{v['label']}」：{label} 是通用基础层，不该单独成图")
+    return errors
+
 
 def build_fallback(views: list[dict]) -> str:
     """无脚本回退：每个视图一张节点表，保证脚本失效时页面仍可读。"""
@@ -616,6 +650,14 @@ def selftest() -> list[tuple[str, bool]]:
              TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
                               "| blk | 公式 | $x + f(x)$，x 是输入 |\n"
                               "| blk | 说明 | 再乘 $d^{-1/2}$ |")),
+            ("算子第一行套了两层调用应当报错",
+             TOY_PLAN.replace("| blk | 算子 | `2 × ToyBlock` |",
+                              "| blk | 算子 | self.norm(self.proj(x)) |")),
+            ("面板公式一条两个式子应当报错",
+             TOY_PLAN.replace("| 公式 | 残差 | $x + f(x)$ |",
+                              "| 公式 | 残差 | $x + f(x)$，再 $y = x$ |")),
+            ("基础层单独成图应当报错",
+             TOY_PLAN.replace("## ToyBlock.forward", "## RMSNorm.forward")),
         ]:
             plan.write_text(broken, encoding="utf-8")
             try:
