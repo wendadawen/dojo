@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="FusedMoE 是 vLLM 里的 MoE 层实现，把每个 token 与其 top-k 专家的计算合并起来，用两次分组 GEMM 加一次加权求和批量算完。">
+  <meta name="dojo:summary" content="把 $M$ 个 token 的各路专家计算按专家重排对齐，收进两次分组 GEMM 和一次求和，用少数几个 kernel 批量算完。">
+  <meta name="dojo:topics" content="模型结构, 推理系统">
+  <meta name="dojo:tag" content="MoE">
+  <title>FusedMoE</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">FusedMoE</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">FusedMoE</h1>
+<p class="reading-time">正文 2,345 字 · 约 7 分钟阅读</p>
+
+<p>混合专家（MoE）把一层前馈网络换成多个并行的专家子网络。一层里配一个门控网络（gate）：它按 token（输入序列里的一个词元）当前的隐藏向量给每个专家打一个分数。实际只取分数最高的 top-$k$ 个专家，$k$ 通常远小于专家总数 $E$。每个被选中的专家各自对这个 token 做一次前馈计算，结果再按门控分数加权相加，合成一个输出向量。所以一个 token 走一遍 MoE 层，是它与选中的 $k$ 个专家配成的 $k$ 个「组合」各算一次，再合并。每个组合要做两次矩阵乘（GEMM，通用矩阵乘；原因见下一章）。</p>
+
+<p>如果每个专家各自调用一次矩阵乘，代价出在矩阵的形状上。这一批有 $M$ 个 token，共 $Mk$ 个组合，分给 $E$ 个专家，每次调用平均只有 $Mk/E$ 行。$M$ 小、$E$ 大时这个行数很小：取 $M=64$、$k=2$、$E=64$，每个专家平均两行，而列数是 token 向量的维度和专家内部的中间维度，是几千量级。</p>
+
+<p>小批量推理时，整层是访存受限的。</p>
+
+<p>FusedMoE 是 vLLM（一个大模型推理引擎）里 MoE 层的实现。所有组合合起来是「每个专家各算一批 token」，所以它先把组合按专家排序并补齐（让每个专家的行数凑成固定块大小的整数倍），再交给同一批内核（kernel，在 GPU 上并行执行的函数）：一次矩阵乘算完所有专家的第一层，一次逐元素激活，一次矩阵乘算完所有专家的第二层，最后一次把每个 token 的 $k$ 路结果按门控分数相加。所有专家的行块排进同一次内核调用的并行网格里，一次调用覆盖全部专家。</p>
+
+<h2 id="s1">1. 一个专家在算什么</h2>
+
+<p>一个专家是两层线性层，中间夹一次激活函数。设 token 向量的维度叫隐藏维，记 $H$；激活之后的中间维记 $I$。第一层把 $H$ 维扩到 $2I$ 维（$2I$ 是门与值两半，见「两次 GEMM 之间的激活」），激活把 $2I$ 维压成 $I$ 维，第二层再把 $I$ 维压回 $H$ 维。层里所有专家的权重各堆成一个张量，输出维在前：第一层是 $(E, 2I, H)$，第二层是 $(E, H, I)$。</p>
+
+<h2 id="s2">2. moe_align_block_size：按专家分段再补齐</h2>
+
+<p>批量做矩阵乘要求一个行块（对齐后按固定行数，即行块大小，切出的一段连续行）里的行都属于同一个专家，否则块内各行要乘不同的权重，矩阵乘就做不成。所以要把组合按专家排好，再把每个专家的行数补齐到行块大小的整数倍。这一步叫对齐，由函数 <code>moe_align_block_size</code> 完成。它读入每个 token 的 top-$k$ 专家编号（形状是「token 数乘 $k$」），输出三样东西：</p>
+
+<ol>
+<li><code>sorted_token_ids</code>：按专家分组排好的组合下标。组合下标是把「token 数乘 $k$」的组合展平后的编号，等于 token 号乘 $k$ 加第几路，除以 $k$ 取整才是 token 号。</li>
+<li><code>expert_ids</code>：每个行块用哪个专家，一个行块一个编号。</li>
+<li><code>num_tokens_post_padded</code>：补齐之后的总行数。</li>
+</ol>
+
+<p>补齐位填一个越界的下标，取值是组合总数 $Mk$。矩阵乘里每行按「下标是否小于组合总数」判断是否有效：补齐位的输入装成 0，写出结果时被掩码挡住，不写进输出。</p>
+
+<details>
+<summary>补齐后总行数的上界</summary>
+<p>设行块大小为 $B$，补齐后的总行数不超过 $Mk + E(B-1)$：最坏情况下每个专家都多补 $B-1$ 行。</p>
+</details>
+
+<details>
+<summary>三个 token、三个专家走一遍对齐</summary>
+<p>设一层有 $3$ 个专家，$3$ 个 token，每个 token 选 $2$ 个专家，行块大小取 $2$。三个 token 选的专家编号依次是 $(0,1)$、$(0,2)$、$(0,1)$。</p>
+<ol>
+<li>展平：组合下标等于 token 号乘 $2$ 加第几路，下标 $0$ 到 $5$ 的组合所选专家依次是 $0, 1, 0, 2, 0, 1$。</li>
+<li>分桶：专家 $0$ 收到下标 $0, 2, 4$，专家 $1$ 收到下标 $1, 5$，专家 $2$ 收到下标 $3$。</li>
+<li>补齐：专家 $0$ 有 $3$ 行，补 $1$ 个到 $4$ 行；专家 $1$ 有 $2$ 行，不用补；专家 $2$ 有 $1$ 行，补 $1$ 个到 $2$ 行。补齐位填组合总数 $6$。</li>
+<li>切成四个行块：$[0,2]$、$[4,6]$、$[1,5]$、$[3,6]$。<code>sorted_token_ids</code> 是 $0, 2, 4, 6, 1, 5, 3, 6$，<code>expert_ids</code> 是 $0, 0, 1, 2$，<code>num_tokens_post_padded</code> 是 $8$。</li>
+<li>取输入：下标除以 $2$ 取整就是 token 号，依次是 $0, 1, 2, -, 0, 2, 1, -$；两个补齐位的下标 $6$ 不小于 $6$，被掩码挡住。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 对齐后的分组 GEMM</h2>
+
+<p>排好之后，所有专家的第一层收进一次内核调用，叫分组 GEMM：一次矩阵乘，但每个行块用不同的权重。它的输出是 $(M, k, 2I)$——token、它的每一路、第一层输出宽度。</p>
+
+<p>内核把输出切成大小相等的输出块，每个输出块交给一组并行单元算，输出块总数是行方向的块数乘列方向的块数。行方向的块就是行块，列方向是沿输出宽度 $2I$ 切出的段。第 $i$ 个行块用 <code>expert_ids[i]</code> 那个专家的权重，所以同一个行块的各个输出块共用同一个专家。排列输出块时，内核不按行顺序逐行扫，而是把相邻的几个行块归为一组依次处理，让它们共用的权重留在二级缓存里被复用。这只在每个专家的行块够多时有用；专家多、每个专家只分到几个 token 时，分组没有效果。</p>
+
+<p>每个输出块先读出所属行块的专家编号，据此把权重张量的指针挪到该专家那一段：专家编号乘上「一个专家占多少元素」，就是这个专家那层权重的起点。普通矩阵乘整批用同一份权重，分组矩阵乘每块换一份。</p>
+
+<details>
+<summary>三个专家的权重怎么分段取</summary>
+<p>沿用上一节的例子，四个行块的专家编号依次是 $0, 0, 1, 2$。第一层输出宽度 $2I$ 取 $2$（也就是 $I$ 取 $1$），隐藏维 $H$ 取 $2$。第一层权重堆成一个 $(3, 2, 2)$ 的张量，第 $e$ 个专家占的元素从 $4e$ 开始，共 $4$ 个。</p>
+<ol>
+<li>第一、二个行块的专家编号是 $0$，指针挪到偏移 $0$，取权重元素 $0$ 到 $3$。</li>
+<li>第三个行块的专家编号是 $1$，指针挪到偏移 $4$，取权重元素 $4$ 到 $7$。</li>
+<li>第四个行块的专家编号是 $2$，指针挪到偏移 $8$，取权重元素 $8$ 到 $11$。</li>
+<li>四块用同一份代码、同一次内核调用，只有指针的起始偏移不同。</li>
+</ol>
+</details>
+
+<h3 id="s3-1">3.1 两种输入激活格式</h3>
+
+<p>上面这套对齐按标准格式的输入做：输入是一个 $(M, H)$ 的连续张量，配上每个 token 的 top-$k$ 专家编号与门控分数，还没有按专家分好，所以要自己按专家排序（置换），算完再还原。另一种叫分桶格式，输入形状是「专家数乘每桶最大 token 数乘 $H$」，附一个每个专家有效 token 数的计数：由分发（all2all 通信步骤，用来实现专家并行）直接把选中同一专家的 token 批到同一个桶里，所以省掉置换和还原，其余步骤一样。取哪种格式由所用的 All2All 分发决定。</p>
+
+<h2 id="s4">4. 两次 GEMM 之间的激活</h2>
+
+<p>两次 GEMM 之间夹着一次门控激活，逐元素作用，不改变行数，也不重排。第一层的输出分成前后两半，各 $I$ 维，前半叫门，后半叫值。以常用的 SiLU 门控为例，结果是 $\mathrm{SiLU}(\text{门}) \times \text{值}$，其中 $\mathrm{SiLU}(x) = x \cdot \sigma(x)$，$\sigma$ 是 Sigmoid。所以 $(M, k, 2I)$ 的第一层输出经激活变成 $(M, k, I)$，再进第二次 GEMM。</p>
+
+<h2 id="s5">5. 第二次 GEMM 与加权求和</h2>
+
+<p>第二次分组 GEMM 与第一次同构：按行块做，每块按 <code>expert_ids</code> 取该专家的第二层权重，去乘激活后的结果，得到 $(M, k, H)$——每个 token 的每一路各得一个向量，还没有合并。</p>
+
+<p>合并是最后一步，在第二次 GEMM 之后单独做：把 $(M, k, H)$ 沿 $k$ 方向求和，写进 $(M, H)$ 的输出。默认情况下门控分数已在第二次 GEMM 里乘进了每一路的结果，所以这里只做求和。</p>
+
+<h2 id="s6">6. 门控分数与数值精度</h2>
+
+<h3 id="s6-1">6.1 门控分数乘进哪一层</h3>
+
+<p>门控分数乘在哪次矩阵乘上，由内核的一个常量开关决定。默认乘在输出上：第一次 GEMM 不乘，第二次乘。有些模型（例如 top-$k$ 等于 $1$ 的情形）要求先把门控分数乘在输入上，实现上是乘在第一次 GEMM 的结果上、第二次不乘。两次调用传给开关的值正好相反。乘法要在累加器转成输出精度之前做，以保证数值稳定。</p>
+
+<h3 id="s6-2">6.2 累积与量化</h3>
+
+<p>矩阵乘沿隐藏维 $H$ 把输入切成小段逐段乘加，累加器用 32 位浮点以保证精度，循环结束后才转成输出精度。</p>
+
+<p>量化的意思是用更少的位数存权重或激活，另配一个缩放因子，用时再乘回去。配了量化时，激活在进 GEMM 前压成低精度：第一次 GEMM 之前压一次输入，第二次 GEMM 之前压一次激活函数的输出。</p>
+
+<p>缩放因子在累加完之后乘回：权重的缩放乘在所有输出上，激活的缩放乘在对应的行上。如果量化按块分组（每个量化块共用一个缩放因子），缩放因子随内层维度的块逐段乘。有些专家带偏置，就是两次矩阵乘各自多加一项与输出维等长的向量，存在另一个按专家分开的张量里；偏置不量化，也不该被缩放因子缩放，所以加在去量化之后。</p>
+
+<h2 id="s7">7. 适用条件与边界</h2>
+
+<p>token 数很少、专家数很多时，有一条跳过对齐的快速路径：当「token 数乘 top-$k$ 再乘 $4$」不超过全局专家数 $E$，且没有专家编号重映射（专家并行下每个设备只持有部分专家，编号要换成设备内的编号）、权重也不是按块分组量化的 int8 或 int4 时，内核不做排序与补齐，直接让每个行块对应一路（一个 token 的一次专家选择），块内只有一行有效，权重按这一路选中的专家取。$4$ 是一个启发式的余量系数，意在让这一批只激活全部专家中的一小部分。</p>
+
+<p>行块大小这类参数优先从按设备名命名的调优表里查。表的文件名里带着专家数、中间维、数据类型、量化分块大小和硬件名，查表时取表里最接近当前批大小的一档。找不到对应的表时，退回按批大小规则给出的默认配置，并警告性能可能欠佳。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>vLLM Team. Fused MoE Modular Kernel. vLLM design documentation. <a href="https://docs.vllm.ai/en/stable/design/fused_moe_modular_kernel/">https://docs.vllm.ai/en/stable/design/fused_moe_modular_kernel/</a></li>
+<li>vLLM Team. Fused MoE Kernel Features. vLLM design documentation. <a href="https://docs.vllm.ai/en/stable/design/moe_kernel_features/">https://docs.vllm.ai/en/stable/design/moe_kernel_features/</a></li>
+<li>vLLM Team. vllm-project/vllm source tree. <a href="https://github.com/vllm-project/vllm">https://github.com/vllm-project/vllm</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

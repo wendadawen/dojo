@@ -1,0 +1,3 @@
+- repo/vllm/｜官方仓库｜https://github.com/vllm-project/vllm｜4ed4c4433b87e45d72f401f27f1b56c932c90071（2026-10-08，浅克隆）｜2026-10-08｜vLLM 官方仓库，FusedMoE 的实现在 vllm/model_executor/layers/fused_moe/ 下，Triton kernel 在 fused_moe.py，对齐 kernel 在 moe_align_block_size.py，层与流水线组装在 layer.py、runner/moe_runner.py
+- blog/fused_moe_modular_kernel.md｜官方文档｜https://docs.vllm.ai/en/stable/design/fused_moe_modular_kernel/｜stable（取回于 2026-10-08）｜2026-10-08｜Fused MoE 模块化框架设计文档：把 fused MoE 拆成 TopKWeightAndReduce、PrepareAndFinalize、Experts 三部分及各自职责
+- blog/moe_kernel_features.md｜官方文档｜https://docs.vllm.ai/en/stable/design/moe_kernel_features/｜stable（取回于 2026-10-08）｜2026-10-08｜Fused MoE kernel 特性总览：各 All2All 后端与各 experts kernel 支持的激活格式、量化类型与量化格式
