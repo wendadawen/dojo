@@ -7,7 +7,7 @@ guides/       任务指南
 wiki/         页面，每页一个目录 wiki/<name>/
 .dojo/        模板、首页源码、脚本
 libs/         页面共用的前端库
-index.html    首页
+index.html    首页（上线时由 CI 拼装 assets/ 和 catalog.json）
 ```
 
 ## 任务
@@ -20,5 +20,5 @@ index.html    首页
 ## 约束
 
 - 页面写入 `wiki/<name>/`，用指南里的脚本生成，不手写 HTML。
-- 主题和标签只能取 `.dojo/scripts/site/vocab.py` 里的词表，写在计划文件的页面信息里。都不合适，主题用「其他领域」，标签用「通用概念」。
+- 主题和标签只能取 `.dojo/scripts/site/vocab.py` 里的词表，写在计划文件的页面信息里，兜底见指南。
 - 未获明确授权，不执行 commit、push。

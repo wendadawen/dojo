@@ -7,7 +7,6 @@
   let forceGraph3dPromise = null;
   let selectedId = null;
   let hoveredId = null;
-  let activeMode = "3d";
   let renderGeneration = 0;
   let cameraListenerAbort = null;
   let graph3dSprites = new Map();
@@ -20,21 +19,12 @@
   function colors() {
     return {
       ink: cssVar("--ink", "#171815"),
-      muted: cssVar("--muted", "#686a64"),
-      surface: cssVar("--surface", "#fffefa"),
       accent: cssVar("--accent", "#284f44"),
       line: cssVar("--graph-line", "#7d807a"),
       incoming: cssVar("--incoming", "#2f6f9f"),
       outgoing: cssVar("--outgoing", "#b45f3d"),
     };
   }
-
-
-
-
-
-
-
 
   function destroy3d() {
     renderGeneration += 1;
@@ -61,22 +51,14 @@
     return Boolean(global3d);
   }
 
-  function resume3d() {
-    if (!global3d) return false;
-    if (graph3dContainer) {
-      global3d.width(graph3dContainer.clientWidth).height(graph3dContainer.clientHeight);
-    }
-    global3d.resumeAnimation();
-    return true;
+  function resize() {
+    if (global3d) global3d.width(graph3dContainer.clientWidth).height(graph3dContainer.clientHeight);
   }
 
-
-  function graph3dData(catalog, visibleIds, matchIds) {
-    const elements = root.DojoHomeModel.makeGlobalElements(catalog, visibleIds, matchIds);
-    return {
-      nodes: elements.nodes.map((item) => ({ ...item.data })),
-      links: elements.edges.map((item) => ({ ...item.data })),
-    };
+  function resume3d() {
+    if (!global3d) return;
+    resize();
+    global3d.resumeAnimation();
   }
 
   function buildNeighborMap(links) {
@@ -235,13 +217,12 @@
     destroy3d();
     selectedId = null;
     hoveredId = null;
-    activeMode = "3d";
     const generation = renderGeneration;
     await load3dDependencies();
-    if (generation !== renderGeneration || activeMode !== "3d") return;
+    if (generation !== renderGeneration) return;
 
     graph3dContainer = container;
-    const data = graph3dData(catalog, visibleIds, matchIds);
+    const data = root.DojoHomeModel.makeGraphData(catalog, visibleIds, matchIds);
     graph3dNeighbors = buildNeighborMap(data.links);
     let fitted = false;
     // 用户一旦操作过视角，引擎停止时不再自动缩放到全图
@@ -284,7 +265,7 @@
         selectedId = null;
         hoveredId = null;
         refresh3d();
-        if (onClear) onClear();
+        onClear();
       })
       .onEngineStop(() => {
         if (fitted || selectedId || userAdjustedCamera) return;
@@ -298,13 +279,9 @@
       controls.enablePan = true;
     }
     // Retina 屏封顶 1.5 倍像素比：2 倍绘制像素近乎翻倍，视觉差异小、滚轮流畅度差异大
-    if (typeof global3d.renderer === "function") {
-      const renderer = global3d.renderer();
-      if (renderer && renderer.setPixelRatio) {
-        renderer.setPixelRatio(Math.min(root.devicePixelRatio || 1, 1.5));
-        renderer.getSize && renderer.setSize(graph3dContainer.clientWidth, graph3dContainer.clientHeight);
-      }
-    }
+    const renderer = global3d.renderer();
+    renderer.setPixelRatio(Math.min(root.devicePixelRatio || 1, 1.5));
+    renderer.setSize(container.clientWidth, container.clientHeight);
     global3d.d3VelocityDecay(.45);
     global3d.d3Force("charge").strength(-155).distanceMax(360);
     global3d.d3Force("link").distance(52);
@@ -332,10 +309,7 @@
         n.vz += (cz - n.z) * k;
       }
     });
-    graph3dResize = new ResizeObserver(() => {
-      if (!global3d) return;
-      global3d.width(container.clientWidth).height(container.clientHeight);
-    });
+    graph3dResize = new ResizeObserver(resize);
     graph3dResize.observe(container);
     refresh3d();
   }
@@ -348,21 +322,13 @@
     }
   }
 
-  function resize() {
-    if (global3d && graph3dContainer) {
-      global3d.width(graph3dContainer.clientWidth).height(graph3dContainer.clientHeight);
-    }
-  }
-
   root.DojoGraph = {
     render3d,
-    destroy3d,
     pause3d,
     has3d,
     resume3d,
     preload3d: load3dDependencies,
     focusGlobal,
     resize,
-    _graph3d: () => global3d,
   };
 }(window));

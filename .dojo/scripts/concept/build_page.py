@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""概念页的生成器：读 research/content.md，生成长页 index.html 和短页 overview.html。
-
-用法（从仓库根运行）：
-    python3 .dojo/scripts/concept/build_page.py wiki/<name>/research/content.md
-    python3 .dojo/scripts/concept/build_page.py wiki/<name>/research/content.md --run
-    python3 .dojo/scripts/concept/build_page.py --selftest
-
-文件格式见 guides/concept.md。页面上的文字都来自 content.md，生成器只做装配：
-把 Markdown 转成 HTML，给长页的章和小节编号，把「资料」生成为长页末尾的参考资料，把每段后面的「依据：」行取出并从页面里丢掉，
-并打印两页折叠块外的字数。--run 另外运行后面紧跟 text 代码块的 Python 代码，逐行比对输出。
-
-页面骨架是 .dojo/templates/concept/ 下的 index.html 和 overview.html。
-
-只认下面这些写法，写了别的会报错：
-  段落、**加粗**、`代码`、[链接](地址)、![图](assets/…)、$行内公式$、$$独立公式$$、
-  - 无序列表、1. 有序列表、表格、``` 代码块、「::: <标题>」到「:::」的折叠块、
-  <figure>/<div>/<svg> 开头的原样 HTML、短页里的 ### 小标题、长页里的 ### 章和 #### 小节。
-"""
+"""读 research/content.md，生成长页 index.html 和短页 overview.html；格式见 guides/concept/content.md。"""
 
 from __future__ import annotations
 
@@ -29,13 +12,15 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NoReturn
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from check_basis import LONG_LIMIT, SHORT_LIMIT  # noqa: E402
+from common import LONG_LIMIT, SHORT_LIMIT, report as report_checks  # noqa: E402
 
 TEMPLATES = HERE.parents[1] / "templates" / "concept"
 REPO_ROOT = HERE.parents[2]
+CONTENT_MARKER = "<!-- @content -->"
 
 META_KEYS = {"描述": "description", "摘要": "summary", "主题": "topics", "标签": "tag"}
 SECTIONS = ("资料", "短页", "长页")
@@ -53,7 +38,7 @@ BASIS_RE = re.compile(r"^依据[：:]\s*(.*)$")
 Line = tuple[int, str]
 
 
-def fail(no: int, msg: str) -> None:
+def fail(no: int, msg: str) -> NoReturn:
     raise SystemExit(f"第 {no} 行：{msg}" if no else msg)
 
 
@@ -163,18 +148,15 @@ def _fence(lines: list[Line], i: int, ctx: Ctx, out: list[str]) -> int:
 def _display_math(lines: list[Line], i: int, out: list[str]) -> int:
     no, raw = lines[i]
     s = raw.strip()
-    if len(s) > 4 and s.endswith("$$"):
-        out.append(f"<p>{html.escape(s, quote=False)}</p>")
-        return i + 1
-    buf, j = [s], i + 1
-    while j < len(lines):
-        t = lines[j][1].strip()
-        buf.append(t)
-        if t.endswith("$$"):
-            break
-        j += 1
-    else:
-        fail(no, "独立公式缺少结尾的 $$")
+    buf, j = [s], i
+    if not (len(s) > 4 and s.endswith("$$")):
+        while True:
+            j += 1
+            if j >= len(lines):
+                fail(no, "独立公式缺少结尾的 $$")
+            buf.append(lines[j][1].strip())
+            if buf[-1].endswith("$$"):
+                break
     out.append("<p>" + html.escape("\n".join(buf), quote=False) + "</p>")
     return j + 1
 
@@ -382,10 +364,7 @@ def render_blocks(lines: list[Line], ctx: Ctx, heading=None, level: str = "") ->
 # ---------- 整份文件 ----------
 
 def parse(text: str) -> dict:
-    """按 guides/concept.md 的格式切分：标题、页面信息、资料、短页、长页。
-
-    每段正文后面的「依据：」行在这里取出，从正文里删掉；返回的 basis 是「依据所在行号 → 依据」。
-    """
+    """切分标题、页面信息、资料、短页、长页；「依据：」行从正文取出，basis 是「行号 → 依据」。"""
     title, meta = "", {}
     sections: dict[str, list[Line]] = {}
     current, fence = None, False
@@ -531,35 +510,27 @@ def _fill(tpl: str, out_dir: Path, pairs: list[tuple[str, str]]) -> str:
     if REPO_ROOT in target.parents:
         up = os.path.relpath(REPO_ROOT, target).replace(os.sep, "/")
         tpl = tpl.replace('"../../', f'"{up}/')
-    for old, new in pairs:
+    for old, _ in pairs:
         if old not in tpl:
-            raise SystemExit(f"模板里找不到「{old[:30]}」，模板改了？")
-        tpl = tpl.replace(old, new) if not old.startswith("<!--") else tpl.replace(old, new, 1)
-    leftover = re.findall(r"【[^】]*】", tpl)
+            fail(0, f"模板里找不到「{old[:30]}」，模板改了？")
+    leftover = set(re.findall(r"【[^】]*】", tpl)) - {old for old, _ in pairs}
     if leftover:
-        raise SystemExit(f"占位符未替换完，模板改了？{leftover}")
-    return tpl
+        fail(0, f"模板里有没处理的占位符：{sorted(leftover)}")
+    return re.sub("|".join(re.escape(old) for old, _ in pairs), lambda m: dict(pairs)[m.group(0)], tpl)
 
 
-def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
-          templates: Path | None = None) -> tuple[Path, Path, dict, Ctx]:
-    """research/content.md → 页面目录下的 index.html 和 overview.html。"""
-    if out_dir is None:
-        if md.parent.name != "research":
-            raise SystemExit(f"{md} 不在 research/ 下，用 -o 指定输出目录")
-        out_dir = md.parent.parent
+def build(md: Path, wiki_root: Path | None = None) -> tuple[Path, Path, dict, Ctx]:
+    """research/content.md → 上一级目录下的 index.html 和 overview.html。"""
+    if md.parent.name != "research":
+        fail(0, f"{md} 要放在 research/ 下")
+    out_dir = md.parent.parent
     ctx = Ctx(out_dir, wiki_root or REPO_ROOT / "wiki")
     doc = parse(md.read_text(encoding="utf-8"))
     body, short, stats = render(doc, ctx)
     meta, title = doc["meta"], doc["title"]
-    tdir = templates or TEMPLATES
 
-    index_tpl = (tdir / "index.html").read_text(encoding="utf-8")
-    content_marker = re.search(r"<!-- @content[\s\S]*?-->", index_tpl)
-    if not content_marker:
-        raise SystemExit("index.html 模板里没有 @content 标记")
-    index_html = _fill(index_tpl, out_dir, [
-        (content_marker.group(0), body),
+    index_html = _fill((TEMPLATES / "index.html").read_text(encoding="utf-8"), out_dir, [
+        (CONTENT_MARKER, body),
         ("【首页摘要】", html.escape(meta["description"])),
         ("【首页可渲染摘要；公式使用 $...$】", html.escape(meta["summary"])),
         ("【主题，逗号分隔】", html.escape(meta["topics"])),
@@ -569,12 +540,8 @@ def build(md: Path, out_dir: Path | None = None, wiki_root: Path | None = None,
         ("【概念名】", html.escape(title)),
     ])
 
-    overview_tpl = (tdir / "overview.html").read_text(encoding="utf-8")
-    ov_marker = re.search(r"<!-- @content -->(?:\s*<!--[\s\S]*?-->)?", overview_tpl)
-    if not ov_marker:
-        raise SystemExit("overview.html 模板里没有 @content 标记")
-    overview_html = _fill(overview_tpl, out_dir, [
-        (ov_marker.group(0), short),
+    overview_html = _fill((TEMPLATES / "overview.html").read_text(encoding="utf-8"), out_dir, [
+        (CONTENT_MARKER, short),
         ("【概念名】", html.escape(title)),
         ("【主题标签】", html.escape(meta["tag"])),
         ("【定位摘要：这个概念是什么、解决什么问题】", html.escape(meta["description"])),
@@ -624,7 +591,7 @@ def report(index_path: Path, overview_path: Path, stats: dict) -> str:
 
 # ---------- 自检 ----------
 
-def _selftest() -> int:
+def selftest() -> int:
     """用一份与任何真实概念无关的数据跑一遍，确认生成器可用、该报错的地方会报错。"""
     doc = "\n".join([
         "# 玩具算子",
@@ -746,6 +713,11 @@ def _selftest() -> int:
         again, _, _, _ = build(md, wiki_root=wiki)
         checks.append(("幂等", again.read_text(encoding="utf-8") == t))
 
+        md.write_text(doc.replace("嵌套折叠。", "【注】【概念名】"), encoding="utf-8")
+        t_note = build(md, wiki_root=wiki)[0].read_text(encoding="utf-8")
+        checks.append(("正文含【】也能生成", "【注】【概念名】" in t_note))
+        md.write_text(doc, encoding="utf-8")
+
         for name, broken in [
             ("缺少短页", doc.replace("## 短页", "### 短页")),
             ("多出一节", doc.replace("## 长页", "## 其他\n\n文字\n\n## 长页")),
@@ -775,42 +747,31 @@ def _selftest() -> int:
             except SystemExit:
                 checks.append((f"{name}应当报错", True))
 
-    failed = [name for name, ok in checks if not ok]
-    for name, ok in checks:
-        print(("  OK  " if ok else "  FAIL") + " " + name)
-    if failed:
-        print(f"生成器自检失败：{len(failed)} 项")
-        return 1
-    print(f"生成器自检通过：{len(checks)} 项")
-    return 0
+    return report_checks(checks, "生成器")
 
 
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="读 research/content.md，生成页面目录下的 index.html 和 overview.html")
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("md", nargs="?", type=Path, help="wiki/<name>/research/content.md")
-    ap.add_argument("-o", "--out", type=Path, help="输出目录，默认 wiki/<name>/")
     ap.add_argument("--run", action="store_true", help="运行文中的 Python 代码并核对输出")
     ap.add_argument("--selftest", action="store_true", help="用虚构数据自检生成器")
     a = ap.parse_args()
     if a.selftest:
-        raise SystemExit(_selftest())
+        raise SystemExit(selftest())
     if a.md is None:
         ap.error("需要 content.md 的路径")
     if not a.md.exists():
-        raise SystemExit(f"文件不存在：{a.md}")
-    index_path, overview_path, stats, ctx = build(a.md, a.out)
+        fail(0, f"文件不存在：{a.md}")
+    index_path, overview_path, stats, ctx = build(a.md)
     print(report(index_path, overview_path, stats))
-    failed = False
-    if a.out is None:
-        # 机械检查读本文件的解析和渲染，所以放到这里才导入，避免循环
-        import check_content
-        problems = check_content.check(a.md)
-        for p in problems:
-            print(p)
-        print(f"检查：{len(problems)} 个问题" if problems else "检查通过")
-        failed = bool(problems)
+    import check_content  # 它反过来 import 本文件，放到这里避免循环
+    problems = check_content.check(a.md)
+    for p in problems:
+        print(p)
+    print(f"检查：{len(problems)} 个问题" if problems else "检查通过")
+    failed = bool(problems)
     if a.run:
         ran, problems = run_code(ctx.fences)
         for p in problems:

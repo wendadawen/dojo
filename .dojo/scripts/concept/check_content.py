@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""检查 content.md：依据、数字、结构、链接、字数、代码块。
-
-    python3 .dojo/scripts/concept/check_content.py wiki/<name>/research/content.md
-    python3 .dojo/scripts/concept/check_content.py --selftest
-
-每条规则是下面一个函数，收到解析好的正文，返回问题列表。要增删规则，增删函数，
-再改文件末尾的 RULES。语义上的判断（事实、范围、重复、文风、读不读得通）不在这里，
-交给 guides/concept/ 里的审查者。build_page.py 生成完页面后会自动运行本脚本。
-"""
+"""检查 content.md：依据、数字、结构、链接、字数、代码块。语义上的判断交给审查者。"""
 
 from __future__ import annotations
 
@@ -21,8 +13,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
 import build_page  # noqa: E402
 import vocab  # noqa: E402
-from check_basis import (  # noqa: E402
-    LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, check_basis_list,
+from common import (  # noqa: E402
+    LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT, check_basis_list, report,
 )
 
 REPO_ROOT = HERE.parents[2]
@@ -31,13 +23,11 @@ URL_RE = re.compile(r"https?://", re.I)
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)\s]+)\)")
 ISBN_RE = re.compile(r"ISBN[\s:：-]*[0-9Xx-]{10,17}")
 NUM_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
-MATH_RE = re.compile(r"\$\$.+?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$\n])+?(?<!\\)\$")
-# 只认真正的依据行写法：「依据：」后面是「自行构造」，或「文件名.扩展名 位置」。正文里自然出现的「判断依据：……」不算
-BASIS_MID_RE = re.compile(r"\S.*依据[：:]\s*(?:自行构造|[\w./-]+\.(?:tex|md|txt|html|pdf)\b)")
 TEXT_SUFFIXES = {".tex", ".txt", ".md", ".bbl", ".rst", ".html", ".htm"}
+# 接在句子后面的依据行：「依据：」后面是「自行构造」或「文件名.扩展名」；正文里自然出现的「判断依据：……」不算
+BASIS_MID_RE = re.compile(r"\S.*依据[：:]\s*(?:自行构造|[\w./-]+(?:" + "|".join(re.escape(x) for x in TEXT_SUFFIXES) + r")\b)")
 MAX_TEXT_BYTES = 2_000_000
 REPO_DIR = "repo"  # guides/concept/collect.md 规定仓库 clone 到 sources/repo/
-NO_BASIS = "第 {} 行：这段正文后面没有「依据：」行（guides/concept/content.md「怎么写」）"
 
 
 # ---------- 解析与小工具 ----------
@@ -46,14 +36,12 @@ class Content:
     """一份解析好的 content.md，各条规则共用。"""
 
     def __init__(self, md: Path, wiki_root: Path):
-        self.md = md
-        self.text = md.read_text(encoding="utf-8")
-        self.lines = self.text.splitlines()
-        self.research = md.parent
+        text = md.read_text(encoding="utf-8")
+        self.lines = text.splitlines()
         self.sources = md.parent / "sources"
         self.out_dir = md.parent.parent
         self.wiki_root = wiki_root
-        self.doc = build_page.parse(self.text)  # 格式不对会抛 SystemExit，由 check() 接住
+        self.doc = build_page.parse(text)  # 格式不对会抛 SystemExit，由 check() 接住
         self.basis = self.doc["basis"]
         self.parts = [self.doc["short"], self.doc["opening"]] + [b for _n, _t, b in self.doc["chapters"]]
         self.body = [ln for part in self.parts for ln in part]
@@ -80,7 +68,7 @@ def outside_fences(lines):
 
 
 def without_math(line: str) -> str:
-    return MATH_RE.sub(" ", line)
+    return build_page.MATH_RE.sub(" ", line)
 
 
 def text_files(sources: Path) -> list[Path]:
@@ -123,7 +111,7 @@ def paragraphs(lines):
 def dir_name_is_kebab(c: Content) -> list[str]:
     if NAME_RE.fullmatch(c.out_dir.name):
         return []
-    return [f"目录名：{c.out_dir.name} 要用小写英文、数字和连字符（guides/concept.md 步骤 4）"]
+    return [f"目录名：{c.out_dir.name} 要用小写英文、数字和连字符"]
 
 
 def topics_and_tag_in_vocab(c: Content) -> list[str]:
@@ -139,7 +127,7 @@ def topics_and_tag_in_vocab(c: Content) -> list[str]:
 
 
 def references_have_link(c: Content) -> list[str]:
-    return [f"第 {r['no']} 行：资料要带链接，没有网址的教材写 ISBN（guides/concept.md「资料」）"
+    return [f"第 {r['no']} 行：资料要带链接，没有网址的教材写 ISBN（guides/concept/content.md「格式」）"
             for r in c.doc["refs"] if not (URL_RE.search(r["text"]) or ISBN_RE.search(r["text"]))]
 
 
@@ -148,17 +136,16 @@ def short_has_three_sections(c: Content) -> list[str]:
     n = sum(1 for _no, line in c.doc["short"] if line.strip().startswith("### "))
     if n == SHORT_SECTIONS:
         return []
-    return [f"短页：要恰好 {SHORT_SECTIONS} 节（是什么、为什么需要、怎么做，标题与概念相关），"
-            f"现在是 {n} 节（guides/concept.md「短页」）"]
+    return [f"短页：要恰好 {SHORT_SECTIONS} 节，现在是 {n} 节（guides/concept.md「短页」）"]
 
 
 def short_has_no_fold_code_table(c: Content) -> list[str]:
     errors = []
     for no, line in c.doc["short"]:
         s = line.strip()
-        what = "折叠块" if s.startswith(":::") else "代码块" if s.startswith("```") else "表格" if s.startswith("|") else None
-        if what:
-            errors.append(f"第 {no} 行：短页不放{what}（guides/concept.md「短页」）")
+        for mark, what in (":::", "折叠块"), ("```", "代码块"), ("|", "表格"):
+            if s.startswith(mark):
+                errors.append(f"第 {no} 行：短页不放{what}（guides/concept.md「短页」）")
     return errors
 
 
@@ -174,7 +161,7 @@ def long_ends_with_boundary(c: Content) -> list[str]:
 
 
 def no_external_url_in_body(c: Content) -> list[str]:
-    return [f"第 {no} 行：正文里不写外部网址，出处放进「资料」（guides/concept.md「格式」）"
+    return [f"第 {no} 行：正文里不写外部网址，出处放进「资料」（guides/concept/content.md「格式」）"
             for no, line in outside_fences(c.body) if URL_RE.search(without_math(line))]
 
 
@@ -186,21 +173,16 @@ def links_point_to_existing_pages(c: Content) -> list[str]:
                 continue
             m = re.fullmatch(r"wiki/([\w.-]+)(?:/(?:index|overview)\.html)?(?:#.*)?", href)
             if not m:
-                errors.append(f"第 {no} 行：链接 {href} 只能写 wiki/<页面名>（guides/concept.md「格式」）")
+                errors.append(f"第 {no} 行：链接 {href} 只能写 wiki/<页面名>（guides/concept/content.md「格式」）")
             elif not (c.wiki_root / m.group(1) / "index.html").exists():
                 errors.append(f"第 {no} 行：链接的页面 wiki/{m.group(1)} 不存在，先按指南生成它")
     return errors
 
 
 def every_paragraph_has_basis(c: Content) -> list[str]:
-    """每段正文后面都要有依据行。
-
-    依据行已被 parse 从正文里取走，只留下行号。一段文字之后出现过依据行，这段就有依据；
-    同一区块里一句引导加后面的有序列表，共用区块末尾的那一行。区块由标题、折叠块的
-    开头结尾隔开。只管文字：代码块、公式、表格、图片不算段落。
-    """
+    """依据行已被 parse 取走、只剩行号；同一区块里引导句加后面的列表，共用区块末尾的一行依据。"""
     if not c.basis:
-        return ["依据：全文没有一行「依据：…」，每段正文后面都要写（guides/concept.md「正文」）"]
+        return ["依据：全文没有一行「依据：…」，每段正文后面都要写（guides/concept/content.md「怎么写」）"]
     errors, basis = [], sorted(c.basis)
     for lines in c.parts:
         fence = False
@@ -218,7 +200,7 @@ def every_paragraph_has_basis(c: Content) -> list[str]:
                 continue
             if s.startswith(("#", ":::")):
                 if pending is not None:
-                    errors.append(NO_BASIS.format(pending))
+                    errors.append(f"第 {pending} 行：这段正文后面没有「依据：」行（guides/concept/content.md「怎么写」）")
                 pending = None
             elif pending is None:
                 pending = no
@@ -226,9 +208,9 @@ def every_paragraph_has_basis(c: Content) -> list[str]:
 
 
 def basis_matches_sources(c: Content) -> list[str]:
-    errors, cache = [], {}
+    errors = []
     for no, text in c.basis.items():
-        for why in check_basis_list(text, c.sources, cache):
+        for why in check_basis_list(text, c.sources):
             errors.append(f"第 {no} 行：依据对不上：{why}")
     return errors
 
@@ -290,15 +272,15 @@ def code_blocks_are_python_with_output(c: Content) -> list[str]:
             prev = fences[k - 1] if k else None
             if not prev or prev[1] != "python" or not adjacent(prev, no):
                 errors.append(f"第 {no} 行：text 代码块只用来写 python 代码的输出，要紧跟在它后面"
-                              "（guides/concept.md「格式」）")
+                              "（guides/concept/content.md「格式」）")
         elif lang == "python":
             nxt = fences[k + 1] if k + 1 < len(fences) else None
             if not nxt or nxt[1] != "text" or not adjacent((no, lang, code), nxt[0]):
                 errors.append(f"第 {no} 行：python 代码后面要紧跟一个写运行输出的 text 代码块，"
-                              "否则无法核对（guides/concept.md「格式」）")
+                              "否则无法核对（guides/concept/content.md「格式」）")
         else:
             errors.append(f"第 {no} 行：代码块只能是 python 加输出块，现在是 {lang}；"
-                          "换成文字或表格来写例子（guides/concept.md「格式」）")
+                          "换成文字或表格来写例子（guides/concept/content.md「格式」）")
     return errors
 
 
@@ -344,8 +326,6 @@ GOOD = "\n".join([
     "```python", "print(2 * 1)", "```", "", "```text", "2", "```", "依据：自行构造", "",
     "### 适用条件与边界", "", "只对数值输入成立。", "依据：book.md 第 1 章",
 ])
-SNAPSHOT = ("# 第 1 章 玩具算子\n\n玩具算子把输入乘 2。输入取 3.5 时输出 7.0。\n"
-            "它只对数值输入成立。\n\n## 1.2 另一节\n\n更多内容。\n")
 
 # 每条规则至少一个坏输入，应当报出 want；want 为 None 的是不该报错的写法
 CASES = [
@@ -409,11 +389,7 @@ def selftest() -> int:
             results.append((name, ok))
         results.append(("目录名不合规应当报错", any("目录名" in e for e in check(make("Bad_Name", GOOD), wiki))))
         results.append(("没有 sources 时报错", any("没有快照" in e for e in check(make("nosrc", GOOD, False), wiki))))
-    for name, ok in results:
-        print(("  OK  " if ok else "  FAIL") + " " + name)
-    failed = sum(1 for _, ok in results if not ok)
-    print(f"正文检查自检失败：{failed} 项" if failed else f"正文检查自检通过：{len(results)} 项")
-    return 1 if failed else 0
+    return report(results, "正文检查")
 
 
 if __name__ == "__main__":

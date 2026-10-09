@@ -22,19 +22,17 @@
 
   function loadStoredSort() {
     try {
-      const stored = window.localStorage.getItem(SORT_STORAGE_KEY);
+      const stored = localStorage.getItem(SORT_STORAGE_KEY);
       return SORT_OPTIONS.has(stored) ? stored : "newest";
-    } catch (error) {
+    } catch {
       return "newest";
     }
   }
 
   function storeSort(value) {
     try {
-      window.localStorage.setItem(SORT_STORAGE_KEY, value);
-    } catch (error) {
-      /* file:// or restricted contexts: ignore */
-    }
+      localStorage.setItem(SORT_STORAGE_KEY, value);
+    } catch { /* 受限环境下 localStorage 不可用 */ }
   }
 
   const state = {
@@ -101,12 +99,12 @@
     }).join("")}</ul>`;
   }
 
-  function relationGroup(title, note, ids, direction) {
+  function relationGroup(title, ids, direction) {
     return `
-      <section class="relation-group is-${model.escapeHtml(direction)}">
+      <section class="relation-group is-${direction}">
         <div class="relation-group-header">
-          <h4>${model.escapeHtml(title)}</h4>
-          <span>${ids.length} ${model.escapeHtml(note)}</span>
+          <h4>${title}</h4>
+          <span>${ids.length} 篇</span>
         </div>
         ${relationList(ids)}
       </section>`;
@@ -126,12 +124,12 @@
     elements.mapWorkspace.classList.add("has-details");
     elements.mapDetails.innerHTML = `
       <h3>${model.escapeHtml(page.title)}</h3>
-      <p class="detail-description">${model.escapeHtml(page.summary || page.description || "暂无摘要")}</p>
+      <p class="detail-description">${model.escapeHtml(model.summaryOf(page))}</p>
       <div class="detail-actions">
         <a class="detail-open" href="${model.escapeHtml(page.path)}" target="_blank" rel="noopener">阅读文档&nbsp; ↗</a>
       </div>
-      ${relationGroup("引用本文", "篇", page.incoming || [], "incoming")}
-      ${relationGroup("本文引用", "篇", page.outgoing || [], "outgoing")}`;
+      ${relationGroup("引用本文", page.incoming || [], "incoming")}
+      ${relationGroup("本文引用", page.outgoing || [], "outgoing")}`;
     renderMath(elements.mapDetails);
     requestAnimationFrame(graph.resize);
   }
@@ -150,7 +148,6 @@
         (page.outgoing || []).forEach((id) => visibleIds.add(id));
       }
     }
-    elements.globalGraph3d.hidden = false;
     try {
       const mapKey = `${state.query}|${state.topic}`;
       if (graph.has3d() && mapKey === last3dKey) {
@@ -213,14 +210,12 @@
       state.topic = elements.topic.value;
       applyFilters();
     });
-    if (elements.sort) {
-      elements.sort.value = state.sort;
-      elements.sort.addEventListener("change", () => {
-        state.sort = elements.sort.value;
-        storeSort(state.sort);
-        applyFilters();
-      });
-    }
+    elements.sort.value = state.sort;
+    elements.sort.addEventListener("change", () => {
+      state.sort = elements.sort.value;
+      storeSort(state.sort);
+      applyFilters();
+    });
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
     elements.clear.addEventListener("click", clearFilters);
     // 悬停卡片时预取对应文档，点开时基本不用等

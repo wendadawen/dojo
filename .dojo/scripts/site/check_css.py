@@ -17,6 +17,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "concept"))
+from common import report  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 STYLE_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
@@ -143,7 +148,7 @@ def check(root: Path = REPO_ROOT, fix: bool = False) -> list[str]:
 
 # ---------- 自检 ----------
 
-def selftest() -> int:
+def selftest() -> list[tuple[str, bool]]:
     results = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -186,11 +191,7 @@ def selftest() -> int:
         run(base + ".never-used { a: b; }\n", fix=True)
         results.append(("--fix 能删掉死规则", ".never-used" not in sheet.read_text(encoding="utf-8")
                         and ".used" in sheet.read_text(encoding="utf-8")))
-    for name, ok in results:
-        print(("  OK  " if ok else "  FAIL") + " " + name)
-    failed = sum(1 for _, ok in results if not ok)
-    print(f"CSS 检查自检失败：{failed} 项" if failed else f"CSS 检查自检通过：{len(results)} 项")
-    return 1 if failed else 0
+    return report(results, "CSS 检查")
 
 
 if __name__ == "__main__":
