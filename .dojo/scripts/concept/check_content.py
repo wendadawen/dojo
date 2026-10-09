@@ -346,6 +346,32 @@ def sections_within_budget(c: Content) -> list[str]:
     return errors
 
 
+def long_has_self_made_example(c: Content) -> list[str]:
+    lines = {no for _n, _t, body in c.doc["chapters"] for no, _l in body} | {no for no, _l in c.doc["opening"]}
+    if any(basis.strip() == SELF_MADE and no - 1 in lines for no, basis in c.basis.items()):
+        return []
+    return [f"长页：至少要有一段依据写「{SELF_MADE}」的例子，小数字，能跟着走完（guides/concept.md「长页」）"]
+
+
+def folds_promised_by_outline_exist(c: Content) -> list[str]:
+    """大纲「写什么」里写了「折叠」的长页节点，正文那一节里要真有折叠块。"""
+    outline = c.sources.parent / "outline.md"
+    if not outline.is_file():
+        return []
+    promised = [t.lstrip("# ").strip() for _no, t, what, *_ in check_outline.parse(outline)["nodes"]["长页"] if "折叠" in what]
+    opening = [ln for _no, ln in c.doc["opening"]]
+    bodies = {"开头": opening} | {name: [ln for _n, ln in body] for _no, name, body in c.doc["chapters"]}
+    errors = []
+    for title in promised:
+        lines = bodies.get(title)
+        if lines is None:
+            continue  # 节点对不上由 sections_within_budget 报
+        has_fold = any(ln.strip().startswith("::: ") for ln in lines)
+        if not has_fold and not any(ln.strip().startswith("####") for ln in lines):
+            errors.append(f"「{title}」：大纲里写了要折叠，正文这一节里没有折叠块（guides/concept/outline.md「写什么」）")
+    return errors
+
+
 def final_check_is_recorded(c: Content) -> list[str]:
     return final_check_recorded(c.sources.parent, "content", CONTENT_ROUNDS)
 
@@ -357,7 +383,7 @@ RULES = [
     every_paragraph_has_basis, basis_matches_sources, basis_on_its_own_line,
     numbers_appear_in_sources, words_within_limit, code_blocks_are_python_with_output,
     no_source_wording, references_are_in_sources_index, description_is_one_sentence,
-    sections_within_budget, final_check_is_recorded,
+    sections_within_budget, long_has_self_made_example, folds_promised_by_outline_exist, final_check_is_recorded,
 ]
 
 
@@ -443,6 +469,7 @@ CASES = [
     ("正文写出处措辞", GOOD.replace("玩具算子把输入乘 2。", "论文说玩具算子把输入乘 2。"), "出处措辞"),
     ("描述写了两句", GOOD.replace("描述：自检页。", "描述：自检页。第二句。"), "只写一句话"),
     ("资料没有收进 index.md", GOOD.replace("https://example.com/book", "https://example.com/other"), "没有收进"),
+    ("长页没有自行构造的例子", GOOD.replace("```text\n2\n```\n依据：自行构造", "```text\n2\n```\n依据：book.md 第 1 章"), "至少要有一段依据写"),
     ("小整数不能靠子串命中", GOOD.replace("开头一段。", "开头一段，共有 7 个。"), "数字 7"),
 ]
 
@@ -483,6 +510,12 @@ def selftest() -> int:
         md.write_text(GOOD, encoding="utf-8")
         outline.write_text(OUTLINE.replace("### 定义", "### 定义改了"), encoding="utf-8")
         results.append(("大纲节点和正文对不上", sum("一一对应" in e for e in check(md, wiki)) == 2))
+        outline.write_text(OUTLINE, encoding="utf-8")
+        outline.write_text(OUTLINE.replace("定义｜输出是输入的两倍", "定义｜输出是输入的两倍，推导折叠"), encoding="utf-8")
+        results.append(("大纲写了折叠而正文没有", any("没有折叠块" in e for e in check(md, wiki))))
+        md.write_text(GOOD.replace("```python\nprint(2 * 1)", "::: 推导\n两倍。\n依据：book.md 第 1 章\n:::\n\n```python\nprint(2 * 1)"), encoding="utf-8")
+        results.append(("正文有折叠块不报", not any("没有折叠块" in e for e in check(md, wiki))))
+        md.write_text(GOOD, encoding="utf-8")
         outline.write_text(OUTLINE, encoding="utf-8")
         record = md.parent / f"content-review-{CONTENT_ROUNDS}.md"
         record.write_text("## 处理\n全部采纳。\n", encoding="utf-8")
