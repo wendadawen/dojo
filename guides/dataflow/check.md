@@ -11,9 +11,14 @@
 ## 2. 节点名与形状
 
     python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html \
-        --source <源码文件> --shapes wiki/<name>/research/sources/shapes.json
+        --source <源码文件> --source <源码文件> ... \
+        --shapes wiki/<name>/research/sources/shapes.json
 
-源码拆在多个文件时写成 `--source 标签=路径`，标签只在视图标题含该标签时生效。形状表漏了某个键记提示，不报错；页面写的形状和材料对不上、或一个键都没比对上，报错。
+把「资料」一节列出的每个源码文件各传一次（`--source` 可重复）。只传其中一份，别的图上的名字会被判「源码里找不到」。
+
+源码拆在多个文件、且不同视图该对不同的文件时，写成 `--source 标签=路径`：标签是视图标题的子串，命中哪个标签就用那几份源码；没命中任何标签的视图拿全部源码比对。形状表漏了某个键记提示，不报错；页面写的形状和材料对不上、或一个键都没比对上，报错。
+
+这一步**对示范页也要通过**——跑 `wiki/deepseek-v4-1-dataflow/index.html` 与它那四个源码文件，应当 0 错。
 
 ## 3. 页面本身
 

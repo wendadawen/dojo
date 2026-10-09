@@ -28,6 +28,7 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -58,6 +59,17 @@ NAME_ALIASES = {
 }
 
 
+# 任何方法体里都会出现的词，不能拿来证明「这一行指对了」
+TRIVIAL_WORDS = {
+    "self", "x", "y", "z", "a", "b", "c", "k", "q", "v", "w", "p", "e", "i", "j",
+    "n", "m", "t", "s", "h", "d", "r", "B", "T", "S", "N", "D", "H", "L", "O",
+    "and", "or", "per", "the", "to", "of", "in", "on", "if", "else", "not",
+    "None", "True", "False", "int", "float", "bool", "str", "list", "tuple",
+    "len", "range", "print", "return", "for", "while", "with", "as", "is",
+    "nn", "torch", "F", "Tensor", "shape", "dim", "dtype", "device",
+}
+
+
 def load_views(page: Path) -> list[dict]:
     text = page.read_text(encoding="utf-8", errors="ignore")
     m = re.search(r"window\.DOJO_FLOW_DATA = (\{.*?\});</script>", text, re.S)
@@ -78,9 +90,12 @@ def check_names(views: list[dict], sources: dict[str, str]) -> list[str]:
     """
     errors: list[str] = []
     for view in views:
+        # 拆节点时，算子第一行写外层调用、内层实参是上一步那个张量节点的 id
+        # （如 `self.kv_norm(wkva)` 里的 wkva）。这些 id 是合法名字，源码里没有。
+        local_ids = {n["id"] for n in view["nodes"]}
         for node in view["nodes"]:
             for tok in idents(node["name"]):
-                if tok in ALLOWED_TOKENS:
+                if tok in ALLOWED_TOKENS or tok in local_ids:
                     continue
                 if any(tok in body for body in sources.values()):
                     continue
@@ -229,20 +244,31 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
                 errors.append(f"{where}{fname}:{a} 是空行、注释或超出文件")
             text += [l.split("#")[0] for l in src[a - 1:b]]
         else:
-            names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*",
-                                   row.get("第一行", "").replace("`", "")))
-            words = set()
-            for n in names:
-                words |= set(NAME_ALIASES.get(n, ())) | {n}
-                words |= {w for w in re.findall(r"[A-Z]?[a-z]+", n) if len(w) >= 3}
-            blob = "\n".join(text).lower()
-            matched = any(w.lower() in blob for w in words)
+            first = row.get("第一行", "").replace("`", "")
+            # 挑出这一行里「有信息量」的标识符：调用名、属性名、类型名。
+            # self / x / B / T 这类通用词在任何方法体里都有，不能拿来证明行指对了。
+            names = {n for n in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", first)
+                     if n not in TRIVIAL_WORDS}
+            if not names:
+                continue
+            blob = "\n".join(text)
+            # 整名优先：`self.q_norm` 里的 q_norm、`Embedding` 这样的类型名，直接找
+            def hit(n: str) -> bool:
+                if n in blob:
+                    return True
+                # 合并层节点写成 `32 × vision.Block`：图上加模块前缀避开重名，
+                # 源码里只有 Block。去掉前缀再找。
+                tail = n.split(".")[-1]
+                if tail != n and tail in blob:
+                    return True
+                return any(alias in blob for alias in NAME_ALIASES.get(n, ()))
+            matched = any(hit(n) for n in names)
             # 「40 × Block」指向 layer(...) 调用时，那一行不出现类名
-            if not matched and re.fullmatch(r"\d+\s*×\s*[A-Za-z_][A-Za-z0-9_]*",
-                                            row.get("第一行", "").strip()):
+            if not matched and re.fullmatch(r"\d+\s*×\s*[A-Za-z_][A-Za-z0-9_]*", first.strip()):
                 matched = "layer(" in blob
-            if names and not matched:
-                errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字")
+            if not matched:
+                errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字"
+                              f"（{ '、'.join(sorted(names)) }）")
     return errors, checked
 
 
@@ -290,6 +316,31 @@ def selftest() -> list[tuple[str, bool]]:
     checks.append(("形状不一致会报出", matched2 == 1 and bool(errs2)))
     _, matched3, missing3 = check_shapes(shape_views, {"other.weight": [1]})
     checks.append(("形状表里没有的键记 warning 不报错", matched3 == 0 and bool(missing3) and not errs))
+
+
+    # check_plan_sources：源码位置回查的判据——名字要真的出现在所指的行里
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "m.py").write_text(
+            "def forward(self, x):\n"
+            "    qr = self.q_norm(self.wq_a(x))\n"
+            "    q = self.wq_b(qr).unflatten(-1, (4, 8))\n", encoding="utf-8")
+        plan = root / "dataflow.md"
+
+        def run(plan_text: str):
+            plan.write_text(plan_text, encoding="utf-8")
+            return check_plan_sources(plan, root)[0]
+
+        good = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
+                "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+                "| qr | 算子 | self.q_norm(qra) | 16 → 16 | | m.py:2 |\n")
+        checks.append(("计划源码位置：指对了不报", not run(good)))
+        checks.append(("计划源码位置：指到相邻的错误行会报出",
+                       bool(run(good.replace("m.py:2", "m.py:3")))))
+        checks.append(("计划源码位置：捏造的名字会报出",
+                       bool(run(good.replace("self.q_norm(qra)", "self.zzz_fake(x)")))))
+        checks.append(("计划源码位置：只有 self 这类通用词不算命中",
+                       bool(run(good.replace("self.q_norm(qra)", "self.nope(x)")))))
 
     return checks
 
@@ -365,7 +416,9 @@ def main() -> int:
             heading = (view.get("title", "") + " " + view.get("label", "")).lower()
             picked = [body for label, body in labeled_bodies.items() if label.lower() in heading]
             if not picked:
-                picked = universal
+                # 标签只是「限定」：没有标签命中这个视图时，拿全部源码比对。
+                # 只回退到未带标签的源码会把「所有源码都带了标签」变成静默免检。
+                picked = universal or list(sources.values())
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})
     shape_matched = 0

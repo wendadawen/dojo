@@ -268,7 +268,7 @@
 | vth | 张量 | self.rope_theta | float，值为 10000 | 构造时取 vision_rope_theta 10000 | vision.py:93 |
 | vcs_op | 算子 | get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta) | int n_vit_h 与 int n_vit_w → fp32 [n_vit_h × n_vit_w, 1, 32] × 2 |  | vision.py:100 |
 | vcs | 张量 | cos, sin | fp32 [n_vit_h × n_vit_w, 1, 32] × 2 | 一对二维频率表，整张图共用；32 = rope_dim | vision.py:100 |
-| vblocks | 算子 | 32 × vision.Block | bf16 [S, 1024] → bf16 [S, 1024] |  | vision.py:101-102 |
+| vblocks | 算子 | 32 × vision.Block | bf16 [S, 1024] → bf16 [S, 1024] |  | vision.py:95，101-102 |
 | vx2 | 张量 | x | bf16 [S, 1024] | | vision.py:102 |
 | vnorm | 算子 | self.norm(x) | bf16 [S, 1024] → bf16 [S, 1024] |  | vision.py:103 |
 | vout | 张量 | self.norm(x) | bf16 [S, 1024] | | vision.py:103 |
