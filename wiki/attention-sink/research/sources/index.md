@@ -1,0 +1,2 @@
+- paper/arxiv-v4.pdf、paper/src-v4/、paper/arxiv-v4.txt｜论文｜https://arxiv.org/abs/2309.17453v4｜v4｜2026-10-08｜Efficient Streaming Language Models with Attention Sinks，提出 attention sink 现象并据此给出 StreamingLLM；LaTeX 源码在 src-v4/（正文 text/，图表 figtab/），纯文本快照 arxiv-v4.txt
+- repo/streaming-llm/｜仓库｜https://github.com/mit-han-lab/streaming-llm｜2e5042606d69933d88fbf909bd77907456b9b4dd（2024-07-11）｜2026-10-08｜论文官方仓库：README 含论文摘要与 FAQ，examples/ 含 Streaming Llama Chatbot 示例
