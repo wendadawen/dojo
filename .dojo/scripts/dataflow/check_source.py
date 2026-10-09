@@ -156,13 +156,18 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[
             seen_here: set[str] = set()
 
             def resolve(norm_key: str) -> str | None:
-                """归一化后的键 → 材料里的原始键；材料里没有就记一笔「没比对」。"""
+                """归一化后的键 → 材料里的原始键。
+
+                页面写了「（检查点键 X）」却对不上材料里的任何键，就是这个形状没被核过，
+                按错报——拼错一个字母不能与「形状比对通过」同样是退出码 0。
+                """
                 # `fp32 [B×T, 384]` 这种方括号左边是 dtype 记号，不是权重键
                 if norm_key in DTYPE_WORDS:
                     return None
                 if norm_key in by_norm:
                     return by_norm[norm_key]
-                missing.append(f"{view['id']}/{node['id']}: {norm_key}")
+                errors.append(f"[{view['id']}/{node['id']}] 检查点键「{norm_key}」不在形状表里"
+                              "（拼错或材料里没有这个键，这个形状没被核过）")
                 return None
 
             # ① 键名紧跟形状
@@ -180,6 +185,12 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[
                         continue
                     compare(key, m.group(1))
                     seen_here.add(key)
+            # ③ `$W$ [512, 5120]` 这种：有形状、又没有紧跟的键名注记，等于没被核过
+            for m in re.finditer(r"\$[^$]+\$\s*\[([0-9][0-9,\s]*)\]", blob):
+                after = blob[m.end():m.end() + 24]
+                if not re.match(r"\s*[（(](?:检查点键|源码里叫)", after):
+                    errors.append(f"[{view['id']}/{node['id']}] 权重形状 [{m.group(1).strip()}]"
+                                  " 后面没写「（检查点键 …）」，这个形状没被核过")
     return errors, matched, missing
 
 
@@ -382,8 +393,8 @@ def selftest() -> list[tuple[str, bool]]:
     checks.append(("形状对得上不报", not errs and matched == 1 and not missing))
     errs2, matched2, _ = check_shapes(shape_views, {"gate.weight": [8, 8]})
     checks.append(("形状不一致会报出", matched2 == 1 and bool(errs2)))
-    _, matched3, missing3 = check_shapes(shape_views, {"other.weight": [1]})
-    checks.append(("形状表里没有的键记 warning 不报错", matched3 == 0 and bool(missing3) and not errs))
+    e3, matched3, _ = check_shapes(shape_views, {"other.weight": [1]})
+    checks.append(("写的键不在形状表里要报错（这个形状没被核过）", matched3 == 0 and bool(e3)))
 
     # 正文里的实际写法：`$W$ [512, 5120]（检查点键 layers.{i}.attn.wkv.weight）`
     sym_views = [{
@@ -407,6 +418,18 @@ def selftest() -> list[tuple[str, bool]]:
                      "detail": "fp32"}]}],
         shapes)
     checks.append(("dtype 记号不算形状键", not miss6))
+    e7, m7, _ = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
+                     "detail": "$W$ [512, 5120]（检查点键 no_such.key）"}]}],
+        shapes)
+    checks.append(("检查点键不在形状表里要报错", bool(e7)))
+    e8, m8, _ = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
+                     "detail": "$W$ [512, 5120]"}]}],
+        shapes)
+    checks.append(("权重形状没写检查点键要报错", bool(e8)))
 
 
     # check_plan_sources：源码位置回查的判据——名字要真的出现在所指的行里
