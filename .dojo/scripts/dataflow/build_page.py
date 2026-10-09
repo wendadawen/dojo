@@ -329,13 +329,36 @@ def _stray_underscore_escape(where: str, node: dict) -> list[str]:
     return errors
 
 
+# 说明里允许引的「一个符号」：可带包裹（\mathbf、\mathcal）和下标/上标，没有运算符和函数
+SYMBOL_RE = re.compile(
+    r"^(?:\\[A-Za-z]+)?\{*[A-Za-z\\][^{}]*\}*"
+    r"(?:_\{[^{}]*\}|\^\{[^{}]*\}|_[A-Za-z0-9]|\^[A-Za-z0-9])*$")
+
+
+def _is_bare_symbol(tex: str) -> bool:
+    """`$...$` 里只有一个符号（可带下标/上标和 \\mathbf 这类包裹）就返回 True。
+    有空格、运算符、逗号、括号的，算公式。"""
+    tex = tex.strip()
+    if not tex or any(ch in tex for ch in " \t=+*/<>(),|[]"):
+        return False
+    if "\\" in tex and not re.match(r"^(\\[A-Za-z]+)" + r"\{?[A-Za-z\\]", tex):
+        return False
+    return bool(SYMBOL_RE.match(tex))
+
+
 def _formula_in_explanation(where: str, node: dict) -> list[str]:
     """折叠的「说明」写权重形状、配置和一句说明，不重复公式——公式归「公式」那一行，
-    算子和张量的节点本身已经画出这些量了。"""
+    算子和张量的节点本身已经画出这些量了。
+
+    说明里引一个符号（`$I$`、`$\\mathbf{C}$`）不算公式，放行；写成带运算符的式子才算。"""
     errors = []
     for sec in node.get("fold") or []:
-        if sec.get("title") == "说明" and "$" in (sec.get("text") or ""):
-            errors.append(f"{where}：折叠「说明」里不写公式，公式放进「公式」那一行")
+        if sec.get("title") != "说明":
+            continue
+        for tex in re.findall(r"\$([^$]+)\$", sec.get("text") or ""):
+            if not _is_bare_symbol(tex):
+                errors.append(f"{where}：折叠「说明」里不写公式，公式放进「公式」那一行")
+                break
     return errors
 
 
@@ -600,6 +623,18 @@ def selftest() -> list[tuple[str, bool]]:
                 checks.append((name, False))
             except SystemExit:
                 checks.append((name, True))
+
+        # 这条不该报错：说明里引一个符号（不是公式）
+        ok_plan = TOY_PLAN.replace(
+            "| blk | 公式 | $x + f(x)$，x 是输入 |",
+            "| blk | 公式 | $x + f(x)$，x 是输入 |\n"
+            "| blk | 说明 | 乘的是 $W$，见符号栏 |")
+        plan.write_text(ok_plan, encoding="utf-8")
+        try:
+            build(plan)
+            checks.append(("说明里引一个符号不算公式", True))
+        except SystemExit:
+            checks.append(("说明里引一个符号不算公式", False))
         plan.write_text(TOY_PLAN, encoding="utf-8")
 
         broken = root / "broken.html"
