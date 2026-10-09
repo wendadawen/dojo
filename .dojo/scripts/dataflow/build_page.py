@@ -379,6 +379,9 @@ def _formula_in_explanation(where: str, node: dict) -> list[str]:
 GENERIC_CLASSES = {
     "Linear", "ColumnParallelLinear", "RowParallelLinear", "RMSNorm",
     "Embedding", "ParallelEmbedding", "PatchEmbed", "MLP", "ParallelHead",
+    # transformers 把通用层也按模型前缀命名，仍然只是套通用算子，一并列出
+    "Qwen2MLP", "Qwen2RMSNorm", "Qwen3MLP", "Qwen3RMSNorm",
+    "LlamaMLP", "LlamaRMSNorm", "MistralMLP", "MistralRMSNorm",
 }
 
 
@@ -394,7 +397,7 @@ def _no_generic_class_figure(views: list[dict]) -> list[str]:
     """基础层（Linear、RMSNorm 这类）不单独成图，写在使用它们的节点上。
 
     图标题是「<类名>.forward」（如 `vision.Block.forward`），取 `.forward` 前的那一段当类名；
-    带模块前缀的（`vision.RMSNorm`）去前缀后再比。
+    再去掉模块前缀与模型名前缀后比 GENERIC_CLASSES。
     """
     errors = []
     for v in views:
