@@ -445,7 +445,8 @@
     });
   }
 
-  // 文字里的 $...$ 交给 KaTeX 渲染；KaTeX 没加载时原样显示
+  // 文字里的 $...$ 交给 KaTeX 渲染，\n 在 HTML 里是空格，转成 <br>；
+  // KaTeX 没加载时公式原样显示
   function renderRich(target, text) {
     String(text).split(MATH_RE).forEach(function (part) {
       if (!part) return;
@@ -458,7 +459,10 @@
         }
         target.appendChild(span);
       } else {
-        target.appendChild(document.createTextNode(part));
+        part.split('\n').forEach(function (line, i) {
+          if (i) target.appendChild(document.createElement('br'));
+          target.appendChild(document.createTextNode(line));
+        });
       }
     });
   }
@@ -752,7 +756,13 @@
         var th = document.createElement('th');
         var td = document.createElement('td');
         renderRich(th, r[0]);
-        renderRich(td, r[1]);
+        // 值的每行单独一个 div：首行（公式）与后面的解释行用不同样式区分
+        String(r[1]).split('\n').forEach(function (line, i) {
+          var row = document.createElement('div');
+          row.className = i ? 'cfg-note-line' : 'cfg-formula-line';
+          renderRich(row, line);
+          td.appendChild(row);
+        });
         tr.appendChild(th);
         tr.appendChild(td);
         table.appendChild(tr);

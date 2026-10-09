@@ -364,6 +364,12 @@ def build_fallback(views: list[dict]) -> str:
     return "".join(rows)
 
 
+def panel_cell(text: str) -> str:
+    """面板单元格直接写进 HTML，所以转义后要把换行还原成 <br>。
+    （节点和折叠的文字走另一条路：那里按 \\n 拆行，不需要 <br>。）"""
+    return html.escape(str(text)).replace("\n", "<br>")
+
+
 def build_config_panel(groups, note: list[str] | None = None) -> str:
     """把 (分组名, [(键, 值), ...]) 渲染成可折叠面板。note 是「前提」一节，逐条一行。"""
     blocks: list[str] = []
@@ -372,7 +378,7 @@ def build_config_panel(groups, note: list[str] | None = None) -> str:
         blocks.append(f'<div class="cfg-note"><b>前提</b><ul>{items}</ul></div>')
     for title, rows in groups:
         body = "".join(
-            f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>"
+            f"<tr><th>{panel_cell(k)}</th><td>{panel_cell(v)}</td></tr>"
             for k, v in rows
         )
         blocks.append(
