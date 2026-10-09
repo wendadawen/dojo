@@ -263,9 +263,11 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
                     return True
                 return any(alias in blob for alias in NAME_ALIASES.get(n, ()))
             matched = any(hit(n) for n in names)
-            # 「40 × Block」指向 layer(...) 调用时，那一行不出现类名
-            if not matched and re.fullmatch(r"\d+\s*×\s*[A-Za-z_][A-Za-z0-9_]*", first.strip()):
-                matched = "layer(" in blob
+            # 「40 × Block」这类合并层节点：类名本身要出现（源码里是 `for layer in self.layers`
+            # 那种写法时，类名只在构造处出现，所以也认 `layer(`）
+            m = re.fullmatch(r"\d+\s*×\s*([A-Za-z_][A-Za-z0-9_.]*)", first.strip())
+            if not matched and m:
+                matched = m.group(1).split(".")[-1] in blob
             if not matched:
                 errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字"
                               f"（{ '、'.join(sorted(names)) }）")
@@ -341,6 +343,16 @@ def selftest() -> list[tuple[str, bool]]:
                        bool(run(good.replace("self.q_norm(qra)", "self.zzz_fake(x)")))))
         checks.append(("计划源码位置：只有 self 这类通用词不算命中",
                        bool(run(good.replace("self.q_norm(qra)", "self.nope(x)")))))
+        checks.append(("计划源码位置：方法名换成别处存在的名也要报",
+                       bool(run(good.replace("self.q_norm(qra)", "self.wq_b(qra)")))))
+        # 合并层节点 `2 × Block`：类名要在所指行里
+        merged = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
+                  "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+                  "| bl | 算子 | 2 × Block | 16 → 16 | | m.py:1-3 |\n")
+        checks.append(("计划源码位置：合并层节点类名对得上",
+                       not run(merged.replace("2 × Block", "2 × forward"))))
+        checks.append(("计划源码位置：合并层节点伪造类名要报",
+                       bool(run(merged.replace("2 × Block", "2 × TotallyFake")))))
 
     return checks
 

@@ -106,7 +106,7 @@
 | pre | 张量 | pre_mix | fp32 [B, T, 4] | 进入第 0 层时的初值，此后每层返回的 ffn_pre 都覆盖它 | model.py:1260 |
 | eng | 算子 | layer.engram(h, engram_hashes[:, :,<br>layer.engram.layer_hash_index, :], engram_mask) | [B, T, 4, 5120] → [B, T, 4, 5120] |  | model.py:1262-1263 |
 | eh | 张量 | h | bf16 [B, T, 4, 5120] | 层 1、14 在进 Block 之前，Engram 写回的残差 | model.py:1263 |
-| layers | 算子 | 40 × Block | [B, T, 4, 5120] → [B, T, 4, 5120] |  | model.py:1267 |
+| layers | 算子 | 40 × Block | [B, T, 4, 5120] → [B, T, 4, 5120] |  | model.py:1204，1267 |
 | hl | 张量 | h | bf16 [B, T, 4, 5120] | 循环里每一层 Block 返回、又喂给下一层的那份残差流（本图合并成同一个量看）；层 1、14 进层前先过 Engram 的是它，第 37、38、39 层进层前取均值的是它，循环结束后交给最后一次 hc_pre 的也是它 | model.py:1261-1267 |
 | lpm | 张量 | pre_mix | fp32 [B, T, 4] | 每一层返回的 pre_mix，喂给下一层；最后一层的送给最后一次 hc_pre | model.py:1267 |
 | avg | 算子 | h.mean(dim=2) | [B, T, 4, 5120] → [B, T, 5120] |  | model.py:1265-1266 |
