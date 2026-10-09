@@ -34,6 +34,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from common import SKIP_HEADS, report  # noqa: E402
+from build_page import split_cells  # noqa: E402  （两个脚本用同一套拆列）
 
 # 节点名里允许出现、但不属于「源码标识符」的词：
 # 数据类型、形状记号、数学符号、以及句式里的连接词。
@@ -227,7 +228,7 @@ def plan_rows(text: str):
         elif s.startswith("### "):
             sub, cols = s[4:].strip(), []
         elif head not in SKIP_HEADS and sub == "节点" and s.startswith("|"):
-            cells = [c.strip() for c in s.strip("|").split("|")]
+            cells = split_cells(s)   # 认 \| 转义、$...$ 里的竖线不拆，与生成器同一套
             if not cols:
                 cols = cells
             elif not set(s) <= set("|-: "):
@@ -239,7 +240,7 @@ def parse_refs(cell: str) -> list[tuple[str, int, int]]:
     out: list[tuple[str, int, int]] = []
     for seg in re.split(r"[；;]", cell):
         fname = ""
-        for piece in re.split(r"[，,]", seg):
+        for piece in re.split(r"[，,、]", seg):
             piece = piece.strip()
             m = re.fullmatch(r"(?:(\S+?):)?(\d+)(?:-(\d+))?", piece)
             if not m:
@@ -281,6 +282,8 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
         refs = parse_refs(row.get("源码", ""))
         if not refs:
             continue
+        # checked 计的是「有源码列的行」，其中第一行只有短名的那些核不了
+        # （下面计进 unchecked）。报出时两者分开，别让 checked 看着像全核过了。
         checked += 1
         if head_file:
             for fname, _a, _b in refs:
@@ -330,6 +333,11 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
                 errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字"
                               f"（{ '、'.join(sorted(names)) }）")
     return errors, checked, unchecked
+
+
+def _refs_ok() -> bool:
+    return (parse_refs("m.py:1、2、3") == [("m.py", 1, 1), ("m.py", 2, 2), ("m.py", 3, 3)]
+            and parse_refs("m.py:1-3，5；b.py:7") == [("m.py", 1, 3), ("m.py", 5, 5), ("b.py", 7, 7)])
 
 
 def selftest() -> list[tuple[str, bool]]:
@@ -442,6 +450,16 @@ def selftest() -> list[tuple[str, bool]]:
                                        encoding="utf-8")
         checks.append(("计划源码位置：节点指到另一份源码要报",
                        bool(run(cross.replace("m.py:2", "other.py:2")))))
+        # 含转义竖线 \| 的节点行：拆列要认它（与生成器同一套），否则整行位置免检
+        esc = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
+               "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+               "| qr | 算子 | a \\| b \\| self.q_norm(x) | 16 → 16 | | m.py:2 |\n")
+        checks.append(("计划源码位置：含转义竖线的行也核位置",
+                       not run(esc) and bool(run(esc.replace("m.py:2", "m.py:9999")))))
+        # 顿号分隔的行号
+        checks.append(("计划源码位置：顿号分隔的行号能解析",
+                       _refs_ok()))
+
         # 第一行只有短名：报「核不了」的计数
         short = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
                  "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
@@ -480,8 +498,9 @@ def main() -> int:
             for e in errors:
                 print(f"  - {e}")
             return 1
-        note = f"，另有 {unchecked} 个节点第一行只有短名（如 h、x），位置核不了、靠人看" if unchecked else ""
-        print(f"源码位置核查通过：{checked} 个节点{note}")
+        note = (f"；另有 {unchecked} 个节点第一行只有短名（如 h、x），位置核不了、靠人看"
+                if unchecked else "")
+        print(f"源码位置核查通过：{checked - unchecked} 个节点核了名字{note}")
         return 0
 
     if args.shapes and not args.shapes.exists():
