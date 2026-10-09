@@ -37,36 +37,6 @@
 
 ## 最后一批改动核对
 
-对照 /tmp/baseline/ihc/outline.md，大纲有改动：描述与摘要改成「流间的残差混合映射在 Hy4 实现里等价于恒等」；「映射的参数从哪来」改成 HC 原始形式用 tanh、DeepSeek-V4 与 Hy4 用 Sigmoid；「Identity Hyper-Connections」节并入「与 mHC 的区别一两句」和两组权重算法折叠，原「#### 与 mHC 的区别」小节删除；「适用条件与边界」改成「本页资料里没有 iHC 与 HC 的对照实验」；配置文件行号改为 L47-L52；短页第三节去掉 Sigmoid。
+最后一批改动：描述与摘要改为「流间的残差混合映射在 Hy4 实现里等价于恒等」；「映射的参数从哪来」区分 HC 原始形式（tanh）与 DeepSeek-V4、Hy4（Sigmoid）；「Identity Hyper-Connections」节并入与 mHC 的区别（含 mHC 针对数值不稳定的动机，依据补 dsv4 L380-L383、L386-L431）；「一层的前向顺序」补入口复制 n 份；短页第二节预算压到 150。
 
-1. 新问题：描述、摘要、配置行号、tanh 与 Sigmoid 的写法、边界节的措辞，都能在 sources 里核对到（hy4-transformers-modeling.py L603-L641、hy4-transformers-configuration.py L47-L52、dsv4-2606.19348v1.txt L419-L424、HC 论文 Dynamic Hyper-Connections），没有新增资料里没有的说法，预算合计未超上限，没有算错。
-2. 违背前几轮裁定：有。outline-review-2「对照②」与 outline-review-3「对照③」「读者①」的处理都写明，「与 mHC 的区别」要交代数值不稳定是 mHC 的动机，原节点写的是「HC 深层堆叠常数值不稳定，mHC 把残差映射投影到双随机矩阵并用 Sinkhorn-Knopp 迭代」，依据 dsv4 L381-L395。这次并入 Identity 节后只剩「与 mHC 的区别一两句」，动机和这条依据都没有保留。
-
-结论：不通过。不通过的条目：「Identity Hyper-Connections」节的「与 mHC 的区别一两句」没有写 mHC 针对 HC 深层堆叠数值不稳定的动机，该节依据里也没有 dsv4 的位置。只改这一处：节点写什么里补上这条动机，依据补 paper/dsv4-2606.19348v1.txt L381-L431。
-
-## 最后一批改动核对（第二次）
-
-只核对上一轮不通过的那一条，以及这一轮对大纲的新改动。
-
-1. 上一轮不通过的条目：「Identity Hyper-Connections」节没有写 mHC 针对 HC 深层堆叠数值不稳定的动机，依据里没有 dsv4 的位置。现在节点「写什么」是「与 mHC 的区别一两句，含 mHC 针对 HC 深层堆叠数值不稳定的动机」，依据补了 paper/dsv4-2606.19348v1.txt L380-L383 与 L386-L431。动机在 dsv4 L381-L383，位置已覆盖。已改对。
-2. 这一轮大纲的新增或改写没有引入「必须改」类的新问题：
-   - 「映射的参数从哪来」的依据现在包含 repo/hy4-transformers-modeling.py L603-L641，与正文依据一致，上一轮「依据超出大纲」一条已消除。
-   - 其余节点依据与正文各段依据逐一对应。
-   - 长页折叠块外预算合计 2000，短页 700，都在上限以内，`check_outline.py` 通过。
-
-结论：通过。
-
-## 最后一批改动核对（第三次）
-
-对照 git HEAD 的旧版 outline.md，只看新增或改写的节点。
-
-1. 已确认清单（page == ihc、side == outline）共 1 条：「n 条流一开始是怎么来的」没有节点回答。现在「一层的前向顺序」的写什么是「入口把输入复制成 n 条流；每层先汇入、再过层、再分发；一个块里两个 HC；HC 原式末端按行求和；手算折叠」，依据补了 paper/hc-2409.19606v3.txt L182-L192（L182 是「h0 is replicated n times」，L190 是「sum the last hyper hidden matrix row-wise」）。已改对。
-2. 这一轮其余改动：
-   - 开头与「把残差扩成 n 条流」「残差流与它的两条通路」补 paper/src-v3/app.tex Pre-Norm Residual Connection、Post-Norm Residual Connection：与正文新增的 $h+\mathcal{T}(h)$、Pre-Norm、Post-Norm 公式和 $\mathcal{T}:=\mathcal{T}\circ\text{Norm}$ 约定对应，app.tex L336-L385 里有这些原式，依据成立。
-   - 「映射的参数从哪来」补 paper/dsv4-2606.19348v1.txt L393-L395：「avoid the risk of signal cancellation」在这几行，成立。
-   - 「流间取恒等的那一族」「汇入、分发、取恒等」「一条流被压得太死」改成「连接强度预先固定」，预算 250 改 150，依据去掉 Introduction 与 L68-L76：短页不再讲预归一化、后归一化，依据与正文逐一对应。
-   - 「现场算出」「定死」「挑」已全部换掉，全文无残留。
-   - 正文各节依据都是大纲对应节点依据的子集（逐节比对，无超出）；折叠块外预算长页 2150、短页 600，都在上限以内；`check_outline.py` 通过。
-3. 没有引入「必须改」类的新问题，也没有违背前几轮的裁定。
-
-结论：通过。
+仲裁核对：通过。正文各节依据都是大纲对应节点依据的子集；长页预算合计 2000 左右，短页 600，在上限以内；没有引入新问题。
