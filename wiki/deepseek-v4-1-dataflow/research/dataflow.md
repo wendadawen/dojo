@@ -953,7 +953,11 @@
 | kv0 | 张量 | kv | fp32 [B, T, 512] | 逐 token 的值投影 | model.py:465 |
 | projg | 算子 | self.wgate(x) | [B, T, 5120] → [B, T, 512] |  | model.py:465 |
 | csc | 张量 | score | fp32 [B, T, 512] | 逐 token 的门控打分 | model.py:465 |
-| pool | 算子 | kv.unflatten(1, (-1, ratio))、score.unflatten(1, (-1, ratio)) 与 (kv * score.softmax(dim=2)).sum(dim=2) | [B, T, 512] → [B, T/r, 512] |  | model.py:473-475 |
+| cunf | 算子 | kv.unflatten(1, (-1, ratio)) | [B, T, 512] → [B, T/r, r, 512] |  | model.py:473 |
+| cunk | 张量 | kv.unflatten(1, (-1, ratio)) | fp32 [B, T/r, r, 512] | 分组后的 kv | model.py:473 |
+| cuns | 算子 | score.unflatten(1, (-1, ratio)) | [B, T, 512] → [B, T/r, r, 512] |  | model.py:474 |
+| cunsc | 张量 | score.unflatten(1, (-1, ratio)) | fp32 [B, T/r, r, 512] | 分组后的 score | model.py:474 |
+| pool | 算子 | (kv * score.softmax(dim=2)).sum(dim=2) | [B, T/r, r, 512] → [B, T/r, 512] |  | model.py:475 |
 | kvg | 张量 | kv | fp32 [B, T/r, 512] | | model.py:475 |
 | cnorm | 算子 | self.norm(kv.to(dtype)) | fp32 [B, T/r, 512] → bf16 [B, T/r, 512] |  | model.py:485 |
 | lat | 张量 | self.norm(kv.to(dtype)) | bf16 [B, T/r, 512] | 返回值是还没加 RoPE 的压缩潜在量；层 2、8、14 汇自 cnorm，层 20 汇自 cnorm1 | model.py:485 |
@@ -970,8 +974,12 @@
 - cxf → projg
 - projk → kv0
 - projg → csc
-- kv0 → pool
-- csc → pool
+- kv0 → cunf
+- cunf → cunk
+- csc → cuns
+- cuns → cunsc
+- cunk → pool
+- cunsc → pool
 - pool → kvg
 - kvg → cnorm
 - cnorm → lat
@@ -996,9 +1004,15 @@
 | cnorm1 | 公式 | $\mathbf{Z} = w \odot \mathbf{K} / \sqrt{\mathrm{mean}(\mathbf{K}^2) + \epsilon}$ |
 | cnorm1 | 符号 | $\mathbf{Z}$：latent，压缩器的输出<br>$\mathbf{K}$：kv，projk1 的输出（层 20 的 wkv，在 bf16 里算）<br>$w$：compressor.norm 的权重，源码里叫 norm.weight<br>$\epsilon$：源码里叫 norm.eps<br>$\mathrm{mean}$：在最后一维 |
 | cnorm1 | 说明 | $w$ [512]（源码里叫 layers.20.attn.compressor.norm.weight）；层 20 的 $W_{kv}$ 是 bf16（compress_ratio 不大于 1）；层 20 的 ratio 为 1，没有池化、没有门控 |
-| pool | 公式 | $\mathbf{K} = \sum_t \mathrm{softmax}(\mathbf{g})_t \, \mathbf{K}_t$ |
-| pool | 符号 | $\mathbf{K}$：kv，池化后的张量<br>$\mathbf{g}$：score，projg 的输出<br>$\mathbf{K}_t$：组内第 t 个 token 的值<br>$t$：组内位置 |
-| pool | 说明 | 按 ratio 把相邻 r 个 token 当成一组，组内用 score 的 softmax 做加权求和 |
+| cunf | 公式 | $\mathbf{K}_g = \mathrm{unflatten}(\mathbf{K}, (-1, r))$ |
+| cunf | 符号 | $\mathbf{K}_g$：分组后的 kv<br>$\mathbf{K}$：projk 的输出<br>$r$：compress_ratio |
+| cunf | 说明 | 把序列维按相邻 $r$ 个 token 一组重排成两维 |
+| cuns | 公式 | $\mathbf{G}_g = \mathrm{unflatten}(\mathbf{g}, (-1, r))$ |
+| cuns | 符号 | $\mathbf{G}_g$：分组后的 score<br>$\mathbf{g}$：projg 的输出 |
+| cuns | 说明 | 分组方式与 kv 相同，两组一一对应 |
+| pool | 公式 | $\mathbf{K} = \sum_t \mathrm{softmax}(\mathbf{G}_g)_t \, \mathbf{K}_{g,t}$ |
+| pool | 符号 | $\mathbf{K}$：kv，池化后的张量<br>$\mathbf{G}_g$：分组后的 score<br>$\mathbf{K}_{g,t}$：组内第 $t$ 个 token 的值<br>$t$：组内位置 |
+| pool | 说明 | 组内用 score 的 softmax 做加权求和 |
 | cnorm | 公式 | $\mathbf{K} = w \odot \dfrac{\mathbf{K}.\mathrm{to}(dtype)}{\sqrt{\mathrm{mean}(\mathbf{K}^2) + \epsilon}}$ |
 | cnorm | 符号 | $\mathbf{K}$：kv，池化后的张量<br>$w$：compressor.norm 的权重，源码里叫 norm.weight<br>$\epsilon$：1e-20<br>$\mathrm{mean}$：在最后一维<br>$\mathrm{to}(dtype)$：转回 bf16 |
 | cnorm | 说明 | 池化结果先转回 bf16 再 RMSNorm，$w$ [512]（源码里叫 layers.{i}.attn.compressor.norm.weight） |
