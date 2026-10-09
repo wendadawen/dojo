@@ -13,15 +13,10 @@
 
 ## 怎么存
 
-按类型放进 `sources/` 下的子目录：
-
-- `repo/`：源码，记仓库和 commit。
-- `paper/`：论文的 PDF 和 LaTeX 源码（有的话），记版本号。
+按类型放进 `sources/` 下的子目录：`repo/` 放源码，`paper/` 放论文的 PDF 和 LaTeX 源码（有的话）。`config.json` 与 `shapes.json` 直接放在 `sources/` 下，不建子目录。
 
 `sources/index.md` 每份资料一行：
 
 ```markdown
 - <文件或目录名>｜<类型：源码/论文/配置/权重头>｜<来源链接>｜<版本或 commit>｜<取回日期>｜<一句话说明它讲什么>
 ```
-
-`config.json` 与 `shapes.json` 直接放在 `sources/` 下，不建子目录。
