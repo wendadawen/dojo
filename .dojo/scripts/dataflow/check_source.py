@@ -59,6 +59,13 @@ NAME_ALIASES = {
 }
 
 
+# 出现在方括号左边的数据类型/记号，不是权重键名
+DTYPE_WORDS = {
+    "fp32", "fp16", "bf16", "fp8", "fp4", "fp8_e4m3", "fp8_e5m2", "e8m0", "e4m3", "e2m1",
+    "int8", "int16", "int32", "int64", "uint8", "bool", "float", "double", "half",
+}
+
+
 # 任何方法体里都会出现的词，不能拿来证明「这一行指对了」
 TRIVIAL_WORDS = {
     "self", "x", "y", "z", "a", "b", "c", "k", "q", "v", "w", "p", "e", "i", "j",
@@ -117,23 +124,61 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[
     errors: list[str] = []
     matched = 0
     missing: list[str] = []
+    # 两种写法都认：
+    #   ① `embed.weight [129280, 5120]`——键名紧跟形状
+    #   ② `$W_e$ [129280, 5120]（检查点键 embed.weight）`——式子用短符号，
+    #      检查点键在括号里。这种才是正文里的常见写法。
+    # 层号、专家号在两边都写成 `{i}`、`{e}` 占位（材料里也是），比对前统一换成 0。
+    NAME_THEN_SHAPE = re.compile(r"([a-z_](?:[a-z0-9_.]|\{[a-z]+\})*)\s*\[([0-9][0-9,\s]*)\]")
+    SHAPE_THEN_SRC = re.compile(r"\[([0-9][0-9,\s]*)\]\s*[（(](?:源码里叫|检查点键)\s*([A-Za-z0-9_.{}\-]+)")
+    SRC_AFTER_SYMBOL = re.compile(r"\$[^$]+\$\s*\[([0-9][0-9,\s]*)\]\s*[（(](?:源码里叫|检查点键)\s*([A-Za-z0-9_.{}\-]+)")
+
+    def placeholder(txt: str) -> str:
+        return re.sub(r"\{[a-z]+\}", "0", txt)
+
+    by_norm = {placeholder(k): k for k in shapes}
     for view in views:
         for node in view["nodes"]:
             fold_txt = " ".join((s.get("text") or "") for s in node.get("fold") or [])
             blob = " ".join(filter(None, [node.get("name"), node.get("detail"),
                                           node.get("shape"), fold_txt]))
-            for m in re.finditer(r"([a-z_](?:[a-z0-9_.]|\{[a-z]+\})*)\s*\[([0-9][0-9,\s]*)\]", blob):
-                # 层号、专家号写成 {i}、{e} 时，按第 0 个去形状表里比对
-                key = re.sub(r"\{[a-z]+\}", "0", m.group(1))
-                if key not in shapes:
-                    missing.append(f"{view['id']}/{node['id']}: {key}")
-                    continue
-                matched += 1
-                claimed = [int(x) for x in m.group(2).replace(" ", "").split(",")]
+
+            def compare(key: str, claimed_text: str) -> None:
+                nonlocal matched
+                claimed = [int(x) for x in claimed_text.replace(" ", "").split(",")]
                 expected = shapes[key]
+                matched += 1
                 if claimed != expected:
                     errors.append(f"[{view['id']}/{node['id']}] {key} 页面写 {claimed}，"
                                   f"材料里是 {expected}")
+
+            seen_here: set[str] = set()
+
+            def resolve(norm_key: str) -> str | None:
+                """归一化后的键 → 材料里的原始键；材料里没有就记一笔「没比对」。"""
+                # `fp32 [B×T, 384]` 这种方括号左边是 dtype 记号，不是权重键
+                if norm_key in DTYPE_WORDS:
+                    return None
+                if norm_key in by_norm:
+                    return by_norm[norm_key]
+                missing.append(f"{view['id']}/{node['id']}: {norm_key}")
+                return None
+
+            # ① 键名紧跟形状
+            for m in NAME_THEN_SHAPE.finditer(blob):
+                key = resolve(placeholder(m.group(1)))
+                if key is None:
+                    continue
+                compare(key, m.group(2))
+                seen_here.add(key)
+            # ② 短符号 + 形状 + （检查点键）
+            for rx in (SRC_AFTER_SYMBOL, SHAPE_THEN_SRC):
+                for m in rx.finditer(blob):
+                    key = resolve(placeholder(m.group(2)))
+                    if key is None or key in seen_here:
+                        continue
+                    compare(key, m.group(1))
+                    seen_here.add(key)
     return errors, matched, missing
 
 
@@ -318,6 +363,29 @@ def selftest() -> list[tuple[str, bool]]:
     checks.append(("形状不一致会报出", matched2 == 1 and bool(errs2)))
     _, matched3, missing3 = check_shapes(shape_views, {"other.weight": [1]})
     checks.append(("形状表里没有的键记 warning 不报错", matched3 == 0 and bool(missing3) and not errs))
+
+    # 正文里的实际写法：`$W$ [512, 5120]（检查点键 layers.{i}.attn.wkv.weight）`
+    sym_views = [{
+        "id": "main", "label": "Toy", "title": "Toy",
+        "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
+                   "detail": "$W$ [512, 5120]（检查点键 layers.{i}.attn.wkv.weight）"}],
+        "edges": [],
+    }]
+    shapes = {"layers.{i}.attn.wkv.weight": [512, 5120]}
+    e4, m4, _ = check_shapes(sym_views, shapes)
+    checks.append(("短符号 + 检查点键能对上", not e4 and m4 == 1))
+    e5, m5, _ = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
+                     "detail": "$W$ [512, 9999]（检查点键 layers.{i}.attn.wkv.weight）"}]}],
+        shapes)
+    checks.append(("短符号写法形状不一致会报出", m5 == 1 and bool(e5)))
+    _, m6, miss6 = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "b", "name": "b", "kind": "op", "shape": "fp32 [B, T]",
+                     "detail": "fp32"}]}],
+        shapes)
+    checks.append(("dtype 记号不算形状键", not miss6))
 
 
     # check_plan_sources：源码位置回查的判据——名字要真的出现在所指的行里

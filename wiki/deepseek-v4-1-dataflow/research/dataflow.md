@@ -198,7 +198,7 @@
 | ngram | 说明 | NgramHashState，把每个位置结尾的 n-gram 哈希成表行号<br>倒数第二维是 Engram 层序号，对应 engram_layer_ids 的 [1, 14]；24 = (4 − 1) × 8 |
 | emb | 公式 | $h = W_e[I]$ |
 | emb | 符号 | $h$：查出的词嵌入<br>$W_e$：词表矩阵，源码里叫 embed.weight<br>$I$：input_ids，词 id |
-| emb | 说明 | ParallelEmbedding：$W_e$ [129280, 5120]（源码里叫 embed.weight），按 rank 沿词表维切分，单卡即整张。图像 span 内的位置也照常查表，查出来的结果随后被覆盖 |
+| emb | 说明 | ParallelEmbedding：$W_e$ [129280, 5120]（检查点键 embed.weight），按 rank 沿词表维切分，单卡即整张。图像 span 内的位置也照常查表，查出来的结果随后被覆盖 |
 | venc | 公式 | $x_v = \mathrm{vision}(\mathbf{P}, u, v)$ |
 | venc | 符号 | $x_v$：ViT 的输出<br>$\mathbf{P}$：patches，这张图的 patch 网格<br>$u$：n_vit_h，patch 网格的高<br>$v$：n_vit_w，patch 网格的宽 |
 | venc | 说明 | 只对图算一次，与文本的序列长度无关。ViT 的输出交给同一图的 alen |
@@ -231,10 +231,10 @@
 | col | 说明 | 用最后一层返回的 pre_mix 把 4 份折叠成一份 |
 | fnorm | 公式 | $h = w \odot \dfrac{h}{\sqrt{\mathrm{mean}(h^2) + \epsilon}}$ |
 | fnorm | 符号 | $h$：送进 norm 的隐状态<br>$w$：norm 的权重，源码里叫 norm.weight<br>$\epsilon$：1e-20，源码里叫 norm.eps<br>$\mathrm{mean}$：在最后一维 |
-| fnorm | 说明 | $w$ [5120]（源码里叫 norm.weight） |
+| fnorm | 说明 | $w$ [5120]（检查点键 norm.weight） |
 | head | 公式 | $\mathbf{L} = h_{:,-1}\, W_h^\top$ |
 | head | 符号 | $\mathbf{L}$：logits，下一个 token 的词表打分<br>$h$：送进 head 的隐状态，只取最后一个位置 $h_{:,-1}$<br>$W_h$：词表矩阵，源码里叫 head.weight |
-| head | 说明 | $W_h$ [129280, 5120]（源码里叫 head.weight），fp32 |
+| head | 说明 | $W_h$ [129280, 5120]（检查点键 head.weight），fp32 |
 | samp | 公式 | $\mathbf{L} = \mathbf{L} / \max(\tau, 10^{-5})$；$\mathbf{O} = \mathrm{argmax}(\mathrm{softmax}(\mathbf{L}) / \xi)$ |
 | samp | 符号 | $\mathbf{L}$：logits，词表打分，按温度缩放后原地覆盖<br>$\tau$：temperature，取默认值 1<br>$\xi$：exponential，同形状的指数分布随机数<br>$\mathbf{O}$：output_ids，采样出的 id |
 | samp | 说明 | Gumbel-max：概率除以指数分布随机数后取 argmax，等价于按概率采样 |
@@ -294,7 +294,7 @@
 |---|---|---|
 | vpe | 公式 | $x = \mathrm{flatten}(\mathbf{P}, 1)\, W_p^\top + b_p$ |
 | vpe | 符号 | $x$：patch 嵌入<br>$\mathbf{P}$：patches，这张图的 patch 网格<br>$\mathrm{flatten}$：把每个 patch 的 3 × 14 × 14 摊平<br>$W_p$、$b_p$：proj 的权重与偏置，源码里叫 proj.weight、proj.bias |
-| vpe | 说明 | PatchEmbed：patch_embed 就是一次线性投影，proj 是 nn.Linear（vision.py:40），$W_p$ [1024, 588]、$b_p$ [1024]（源码里叫 proj.weight、proj.bias），588 = 3 × 14 × 14 |
+| vpe | 说明 | PatchEmbed：patch_embed 就是一次线性投影，proj 是 nn.Linear（vision.py:40），$W_p$ [1024, 588]（检查点键 vision.patch_embed.proj.weight）、$b_p$ [1024]（检查点键 vision.patch_embed.proj.bias），588 = 3 × 14 × 14 |
 | vcs_op | 公式 | $f = \mathrm{flatten}([p_h, p_w] \odot \nu)$<br>$\mathbf{c} = \cos(f)$<br>$\mathbf{s} = \sin(f)$<br>$\nu_j = \theta^{-2j/d_r}$ |
 | vcs_op | 符号 | $f$：freqs，位置频率<br>$p_h$、$p_w$：hpos、wpos，每个 patch 在网格里的高、宽坐标<br>$\nu$：inv_freq，各维的逆频率<br>$\mathbf{c}$、$\mathbf{s}$：cos、sin，位置正余弦<br>$d_r$：rope_dim，取频率用的维度（vision_dim // vision_n_heads // 2 = 32）<br>$\theta$：vision_rope_theta |
 | vcs_op | 说明 | stack 把高坐标、宽坐标配成对（第 1 维是高、第 2 维是宽），再摊平成 32 维：相邻两维一对、交替排列，偶维配高坐标、奇维配宽坐标，同一对内两维共用一个逆频率；$\mathbf{c}$、$\mathbf{s}$ 各补一个长度为 1 的维度；整张图只算一次，32 层共用 |
@@ -360,7 +360,7 @@
 |---|---|---|
 | vbn1 | 公式 | $x = w_1 \odot x / \sqrt{\mathrm{mean}(x^2) + \epsilon}$ |
 | vbn1 | 符号 | $x$：本层输入<br>$w_1$：norm1 的权重，源码里叫 norm1.weight<br>$\epsilon$：1e-6，源码里叫 norm1.eps<br>$\mathrm{mean}$：在最后一维 |
-| vbn1 | 说明 | $w_1$ [1024]（源码里叫 norm1.weight），norm1 是 vision.RMSNorm，vision 支路统一 eps = 1e-6 |
+| vbn1 | 说明 | $w_1$ [1024]（检查点键 vision.blocks.{i}.norm1.weight），norm1 是 vision.RMSNorm，vision 支路统一 eps = 1e-6 |
 | vba | 公式 | $x = \mathrm{attn}(x, \mathbf{c}, \mathbf{s})$ |
 | vba | 符号 | $x$：norm1 之后的隐状态<br>$\mathbf{c}$、$\mathbf{s}$：cos、sin，整张图共用的二维频率表 |
 | vba | 说明 | Attention，全双向，没有因果掩码；这一层用自己那份 wqkv、wo |
@@ -368,10 +368,10 @@
 | vbad | 符号 | $x$：本层输入，进注意力之前的残差<br>$x_1$：norm1 的输出，喂给注意力那份<br>$\mathrm{attn}(\cdot)$：注意力的输出<br>$\mathbf{c}$、$\mathbf{s}$：cos、sin，整张图共用的二维频率表 |
 | vbn2 | 公式 | $x = w_2 \odot x / \sqrt{\mathrm{mean}(x^2) + \epsilon}$ |
 | vbn2 | 符号 | $x$：注意力那一步的输出<br>$w_2$：norm2 的权重，源码里叫 norm2.weight<br>$\epsilon$：1e-6，源码里叫 norm2.eps<br>$\mathrm{mean}$：在最后一维 |
-| vbn2 | 说明 | $w_2$ [1024]（源码里叫 norm2.weight），norm2 是 vision.RMSNorm，vision 支路统一 eps = 1e-6 |
+| vbn2 | 说明 | $w_2$ [1024]（检查点键 vision.blocks.{i}.norm2.weight），norm2 是 vision.RMSNorm，vision 支路统一 eps = 1e-6 |
 | vmlp | 公式 | $g, u = \mathrm{chunk}(x\, W_1^\top, 2)$<br>$x = (\mathrm{silu}(g) \odot u)\, W_2^\top$ |
 | vmlp | 符号 | $x$：norm2 之后的隐状态<br>$g$、$u$：gate、up，投影后切成两路<br>$W_1$、$W_2$：w1、w2 的权重，源码里叫 w1.weight、w2.weight，无 bias |
-| vmlp | 说明 | 通用 SwiGLU 的 MLP（vision.MLP），$W_1$ [5632, 1024]、$W_2$ [1024, 2816]（源码里叫 w1.weight、w2.weight），5632 = 2 × vision_inter_dim，2816 是 vision_inter_dim；w1、w2 是 nn.Linear（PyTorch 自带） |
+| vmlp | 说明 | 通用 SwiGLU 的 MLP（vision.MLP），$W_1$ [5632, 1024]（检查点键 vision.blocks.{i}.mlp.w1.weight）、$W_2$ [1024, 2816]（检查点键 vision.blocks.{i}.mlp.w2.weight），5632 = 2 × vision_inter_dim，2816 是 vision_inter_dim；w1、w2 是 nn.Linear（PyTorch 自带） |
 | vbad2 | 公式 | $x_{out} = x + \mathrm{mlp}(x_2)$ |
 | vbad2 | 符号 | $x$：注意力那一步的输出，进前馈之前的残差<br>$x_2$：norm2 的输出，喂给前馈那份<br>$\mathrm{mlp}(\cdot)$：前馈的输出 |
 
@@ -433,7 +433,7 @@
 |---|---|---|
 | vwqkv | 公式 | $qkv = x\, W_{qkv}^\top + b_{qkv}$ |
 | vwqkv | 符号 | $qkv$：q、k、v 拼在一起的投影<br>$x$：norm1 之后的隐状态<br>$W_{qkv}$、$b_{qkv}$：wqkv 的权重与偏置，源码里叫 wqkv.weight、wqkv.bias |
-| vwqkv | 说明 | $W_{qkv}$ [3072, 1024]、$b_{qkv}$ [3072]（源码里叫 wqkv.weight、wqkv.bias），3072 = 3 × 1024；wqkv 是 nn.Linear（PyTorch 自带，与主干用的 Linear 类不是一类）。Step 2 按三等分切成 q、k、v，再各自 view 成 (S, 16, 64)，头维插在序列维之后 |
+| vwqkv | 说明 | $W_{qkv}$ [3072, 1024]（检查点键 vision.blocks.{i}.attn.wqkv.weight）、$b_{qkv}$ [3072]（检查点键 vision.blocks.{i}.attn.wqkv.bias），3072 = 3 × 1024；wqkv 是 nn.Linear（PyTorch 自带，与主干用的 Linear 类不是一类）。Step 2 按三等分切成 q、k、v，再各自 view 成 (S, 16, 64)，头维插在序列维之后 |
 | vcq | 公式 | $x_1, x_2 = \mathrm{chunk}(q.\mathrm{float}(), 2, \dim=-1)$<br>$q = \mathrm{cat}(x_1 \mathbf{c} - x_2 \mathbf{s},\ x_2 \mathbf{c} + x_1 \mathbf{s})$ |
 | vcq | 符号 | $q$：查询<br>$x_1$、$x_2$：每头前后两半<br>$\mathbf{c}$、$\mathbf{s}$：cos、sin，二维频率表 |
 | vcq | 说明 | 每个头 64 维的前一半与后一半配成一对（第 i 维配第 i+32 维），位置信息来自 patch 在网格里的高、宽；返回值再转回输入 dtype（vision.py:18-21） |
@@ -445,7 +445,7 @@
 | vsdpa | 说明 | PyTorch 的 F.scaled_dot_product_attention，不给掩码、不做 dropout，整张图里 patch 之间全双向 |
 | vwo | 公式 | $x = o.\mathrm{transpose}(0, 1).\mathrm{reshape}(S, -1)\, W_o^\top + b_o$ |
 | vwo | 符号 | $x$：输出<br>$o$：注意力输出<br>$W_o$、$b_o$：wo 的权重与偏置，源码里叫 wo.weight、wo.bias |
-| vwo | 说明 | $W_o$ [1024, 1024]、$b_o$ [1024]（源码里叫 wo.weight、wo.bias）；wo 也是 nn.Linear（PyTorch 自带） |
+| vwo | 说明 | $W_o$ [1024, 1024]（检查点键 vision.blocks.{i}.attn.wo.weight）、$b_o$ [1024]（检查点键 vision.blocks.{i}.attn.wo.bias）；wo 也是 nn.Linear（PyTorch 自带） |
 
 ### 面板
 
@@ -496,10 +496,10 @@
 | vunf | 说明 | 把高宽平面切成不重叠的 $k$×$k$ 块，每块摊成一行；一块 $k$ × $k$ × 1024 摊平成 9216 维；输出行数是 ceil(n_vit_h / $k$) × ceil(n_vit_w / $k$)，就是图像在序列里占的 token 网格 |
 | aw1 | 公式 | $out = x\, W_1^\top + b_1$ |
 | aw1 | 符号 | $out$：第一层 MLP 的输出<br>$x$：展开后的 3×3 块，9216 维<br>$W_1$、$b_1$：w1 的权重与偏置，源码里叫 w1.weight、w1.bias |
-| aw1 | 说明 | $W_1$ [5120, 9216]、$b_1$ [5120]（源码里叫 w1.weight、w1.bias），把 9216 维映到 5120；w1 是 nn.Linear（PyTorch 自带） |
+| aw1 | 说明 | $W_1$ [5120, 9216]（检查点键 aligner.w1.weight）、$b_1$ [5120]（检查点键 aligner.w1.bias），把 9216 维映到 5120；w1 是 nn.Linear（PyTorch 自带） |
 | vlin | 公式 | $\mathbf{F} = g\, W_2^\top + b_2$ |
 | vlin | 符号 | $\mathbf{F}$：embeds，对齐器的输出<br>$g$：上一节点（w1 的输出过 gelu）的值<br>$W_2$、$b_2$：w2 的权重与偏置，源码里叫 w2.weight、w2.bias |
-| vlin | 说明 | $W_2$ [5120, 5120]、$b_2$ [5120]（源码里叫 w2.weight、w2.bias）；w2 是 nn.Linear（PyTorch 自带） |
+| vlin | 说明 | $W_2$ [5120, 5120]（检查点键 aligner.w2.weight）、$b_2$ [5120]（检查点键 aligner.w2.bias）；w2 是 nn.Linear（PyTorch 自带） |
 
 ### 面板
 
@@ -599,13 +599,13 @@
 |---|---|---|
 | mixes_a | 公式 | $m = \mathrm{flatten}(x, 2)\, W^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x, 2)^2) + \epsilon)$<br>$a_j = \mathrm{sigmoid}(m_j \cdot s_0 + b_j) + \epsilon$<br>$p_j = 2\,\mathrm{sigmoid}(m_{j+C} \cdot s_1 + b_{j+C})$<br>$u_{j,k} = m_{j \cdot C + k + 2 C} \cdot s_2 + b_{j \cdot C + k + 2 C}$<br>$\mathbf{J} = \mathrm{Sinkhorn}(u)$ |
 | mixes_a | 符号 | $m$：mixes，混合系数<br>$a$、$p$、$\mathbf{J}$：attn_pre、attn_post、attn_comb，折叠、展开、混合用的系数<br>$W$、$s$、$b$：注意力那次的参数，源码里叫 hc_attn_fn、hc_attn_scale、hc_attn_base<br>$C$：hc_mult<br>$\epsilon$：Block 上的 norm_eps 与 hc_eps<br>$j$、$k$：从 0 到 C−1<br>$u$：m 里填进 J、softmax 之前的那一块，源码里没有单独的名字 |
-| mixes_a | 说明 | 一次投影同时给出 attn_pre、attn_post、attn_comb 三套系数<br>$W$ [24, 20480]、$b$ [24]、$s$ [3]（源码里叫 hc_attn_fn、hc_attn_base、hc_attn_scale），都是 fp32；24 = (2 + 4) × 4，20480 = 4 × 5120<br>mixes 与 $b$ 按顺序切成三段：前 $C$ 个给 pre，接着 $C$ 个给 post，最后 $C$ × $C$ 个给 comb；Sinkhorn 作用在整张 $u$ 上<br>Sinkhorn 先对 $u$ 的每一行做 softmax，再加 hc_eps；再按列除以（列和 + hc_eps）；然后行、列交替各再做 19 次，每次除以（和 + hc_eps）。行 20 次、列 20 次，最后一次是列 |
+| mixes_a | 说明 | 一次投影同时给出 attn_pre、attn_post、attn_comb 三套系数<br>$W$ [24, 20480]（检查点键 layers.{i}.hc_attn_fn）、$b$ [24]（检查点键 layers.{i}.hc_attn_base）、$s$ [3]（检查点键 layers.{i}.hc_attn_scale），都是 fp32；24 = (2 + 4) × 4，20480 = 4 × 5120<br>mixes 与 $b$ 按顺序切成三段：前 $C$ 个给 pre，接着 $C$ 个给 post，最后 $C$ × $C$ 个给 comb；Sinkhorn 作用在整张 $u$ 上<br>Sinkhorn 先对 $u$ 的每一行做 softmax，再加 hc_eps；再按列除以（列和 + hc_eps）；然后行、列交替各再做 19 次，每次除以（和 + hc_eps）。行 20 次、列 20 次，最后一次是列 |
 | cpre | 公式 | $x = \sum_{c=0}^{C-1} \pi_c\, x_c$ |
 | cpre | 符号 | $x$：折叠后的一份<br>$\pi$：pre_mix，上一层返回的系数<br>$x_c$：第 c 份残差<br>$C$：hc_mult |
 | cpre | 说明 | 按上一层返回的 pre_mix 把 4 份加权求和成 1 份 |
 | an | 公式 | $x = w_a \odot \dfrac{x}{\sqrt{\mathrm{mean}(x^2) + \epsilon}}$ |
 | an | 符号 | $x$：送进来的张量<br>$w_a$：attn_norm 的权重，源码里叫 attn_norm.weight<br>$\epsilon$：1e-20<br>$\mathrm{mean}$：在最后一维 |
-| an | 说明 | $w_a$ [5120]（源码里叫 attn_norm.weight） |
+| an | 说明 | $w_a$ [5120]（检查点键 layers.{i}.attn_norm.weight） |
 | attn | 公式 | $x = \mathrm{attn}(x, t)$ |
 | attn | 符号 | $x$：attn_norm 之后的隐状态<br>$t$：start_pos，0<br>$attn\_args$：这次为空 |
 | attn | 说明 | Attention，本层的窗口 KV 与压缩 KV 都在里面读写；本路径 attn_args 为空 |
@@ -614,13 +614,13 @@
 | cpost | 说明 | 把子层输出按 post 展开成 4 份，再把 residual 按 comb 混进去 |
 | mixes_f | 公式 | $m' = \mathrm{flatten}(x, 2)\, W'^\top \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathrm{flatten}(x, 2)^2) + \epsilon)$<br>$\pi_j = \mathrm{sigmoid}(m'_j \cdot s'_0 + b'_j) + \epsilon$<br>$p_j = 2\,\mathrm{sigmoid}(m'_{j+C} \cdot s'_1 + b'_{j+C})$<br>$u'_{j,k} = m'_{j \cdot C + k + 2 C} \cdot s'_2 + b'_{j \cdot C + k + 2 C}$<br>$\mathbf{J}' = \mathrm{Sinkhorn}(u')$ |
 | mixes_f | 符号 | $m'$：mixes，混合系数<br>$\pi$、$p$、$\mathbf{J}'$：ffn_pre、ffn_post、ffn_comb，折叠、展开、混合用的系数<br>$W'$、$s'$、$b'$：前馈那次的参数，源码里叫 hc_ffn_fn、hc_ffn_scale、hc_ffn_base<br>$C$：hc_mult<br>$\epsilon$：Block 上的 norm_eps 与 hc_eps<br>$j$、$k$：从 0 到 C−1<br>$u'$：m′ 里填进 J′、softmax 之前的那一块，源码里没有单独的名字 |
-| mixes_f | 说明 | $W'$ [24, 20480]、$b'$ [24]、$s'$ [3]（源码里叫 hc_ffn_fn、hc_ffn_base、hc_ffn_scale），形状与注意力那组相同<br>mixes 与 $b'$ 按顺序切成三段：前 $C$ 个给 pre，接着 $C$ 个给 post，最后 $C$ × $C$ 个给 comb；Sinkhorn 作用在整张 $u'$ 上<br>Sinkhorn 的做法与注意力那次相同：行 softmax 后加 hc_eps，再列归一化，然后交替各 19 次 |
+| mixes_f | 说明 | $W'$ [24, 20480]（检查点键 layers.{i}.hc_ffn_fn）、$b'$ [24]（检查点键 layers.{i}.hc_ffn_base）、$s'$ [3]（检查点键 layers.{i}.hc_ffn_scale），形状与注意力那组相同<br>mixes 与 $b'$ 按顺序切成三段：前 $C$ 个给 pre，接着 $C$ 个给 post，最后 $C$ × $C$ 个给 comb；Sinkhorn 作用在整张 $u'$ 上<br>Sinkhorn 的做法与注意力那次相同：行 softmax 后加 hc_eps，再列归一化，然后交替各 19 次 |
 | cpre2 | 公式 | $x = \sum_{c=0}^{C-1} a_c\, x_c$ |
 | cpre2 | 符号 | $x$：折叠后的一份<br>$a$：attn_pre，本层注意力 hc_mixes 给出的 pre<br>$x_c$：第 c 份残差<br>$C$：hc_mult |
 | cpre2 | 说明 | 用注意力子层算出的 $a$ |
 | fn | 公式 | $x = w_f \odot \dfrac{x}{\sqrt{\mathrm{mean}(x^2) + \epsilon}}$ |
 | fn | 符号 | $x$：送进来的张量<br>$w_f$：ffn_norm 的权重，源码里叫 ffn_norm.weight<br>$\epsilon$：1e-20<br>$\mathrm{mean}$：在最后一维 |
-| fn | 说明 | $w_f$ [5120]（源码里叫 ffn_norm.weight） |
+| fn | 说明 | $w_f$ [5120]（检查点键 layers.{i}.ffn_norm.weight） |
 | moe_op | 公式 | $x = \mathrm{ffn}(x, \mathbf{M})$ |
 | moe_op | 符号 | $x$：ffn_norm 之后的隐状态<br>$\mathrm{ffn}$：本层的 MoE<br>$\mathbf{M}$：image_mask，这次传进来的张量，图像 span 的位置为 True |
 | moe_op | 说明 | MoE，$\mathbf{M}$ 一路传到 Gate，用来在图像 span 的位置上换一份路由偏置 |
@@ -769,19 +769,19 @@
 |---|---|---|
 | wqa | 公式 | $u_q = x\, W_q^\top$ |
 | wqa | 符号 | $u_q$：第一层低秩投影的输出<br>$x$：本层输入<br>$W_q$：它的权重，源码里叫 wq_a.weight |
-| wqa | 说明 | $W_q$ [1280, 5120]（源码里叫 wq_a.weight）。权重是 fp8，进入 GEMM 前先把激活 $x$ 按 32 通道一块量化成 fp8（`linear()` 里的 `act_quant`，model.py:186-197） |
+| wqa | 说明 | $W_q$ [1280, 5120]（检查点键 layers.{i}.attn.wq_a.weight）。权重是 fp8，进入 GEMM 前先把激活 $x$ 按 32 通道一块量化成 fp8（`linear()` 里的 `act_quant`，model.py:186-197） |
 | qr_op | 公式 | $qr = w_q \odot \dfrac{u_q}{\sqrt{\mathrm{mean}(u_q^2) + \epsilon}}$ |
 | qr_op | 符号 | $qr$：归一化后的低秩 query<br>$u_q$：上一节点的输出<br>$w_q$：q_norm 的权重，源码里叫 q_norm.weight<br>$\mathrm{mean}$：在最后一维 |
-| qr_op | 说明 | $w_q$ [1280]（源码里叫 q_norm.weight），q_norm 是 RMSNorm，eps 取 1e-20 |
+| qr_op | 说明 | $w_q$ [1280]（检查点键 layers.{i}.attn.q_norm.weight），q_norm 是 RMSNorm，eps 取 1e-20 |
 | wkv_proj | 公式 | $u_{kv} = x\, W_{kv}^\top$ |
 | wkv_proj | 符号 | $u_{kv}$：窗口 KV 投影的输出<br>$x$：本层输入<br>$W_{kv}$：它的权重，源码里叫 wkv.weight |
-| wkv_proj | 说明 | $W_{kv}$ [512, 5120]（源码里叫 wkv.weight）；fp8 权重，同样是激活先量化成 fp8 再进 GEMM |
+| wkv_proj | 说明 | $W_{kv}$ [512, 5120]（检查点键 layers.{i}.attn.wkv.weight）；fp8 权重，同样是激活先量化成 fp8 再进 GEMM |
 | wkv_win | 公式 | $u_{kv} = w_{kv} \odot \dfrac{u_{kv}}{\sqrt{\mathrm{mean}(u_{kv}^2) + \epsilon}}$ |
 | wkv_win | 符号 | $u_{kv}$：归一化后的窗口 KV<br>$w_{kv}$：kv_norm 的权重，源码里叫 kv_norm.weight<br>$\mathrm{mean}$：在最后一维 |
-| wkv_win | 说明 | $w_{kv}$ [512]（源码里叫 kv_norm.weight），kv_norm 是 RMSNorm，eps 取 1e-20 |
+| wkv_win | 说明 | $w_{kv}$ [512]（检查点键 layers.{i}.attn.kv_norm.weight），kv_norm 是 RMSNorm，eps 取 1e-20 |
 | qb | 公式 | $q = \mathrm{unflatten}(qr\, W_q'^\top, (H, d_h))$ |
 | qb | 符号 | $q$：展开成各头的 query<br>$qr$：上一行的输出<br>$W_q'$：第二层投影，源码里叫 wq_b.weight<br>$H$：n_local_heads，本卡的头数，单卡下等于 n_heads 64<br>$d_h$：head_dim，512 |
-| qb | 说明 | $W_q'$ [32768, 1280]（源码里叫 wq_b.weight），64 × 512 = 32768；fp8 权重，激活先量化 |
+| qb | 说明 | $W_q'$ [32768, 1280]（检查点键 layers.{i}.attn.wq_b.weight），64 × 512 = 32768；fp8 权重，激活先量化 |
 | rope_q | 公式 | $q$ 的末 $d_r$ 维乘一个旋转因子（复数形式 $e^{i \varphi_t}$，逐位置） |
 | rope_q | 符号 | $q$：query<br>$d_r$：rd（rope_head_dim），64<br>$\varphi_t$：第 $t$ 个位置的旋转角<br>源码写法：$\mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(q.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot \mathcal{F}_t))$ |
 | rope_q | 说明 | 只旋转每头 512 维里的后 64 维（相邻两维配成一对复数），前 448 维不动；写在原地 |
@@ -820,7 +820,7 @@
 | cat2 | 说明 | 压缩下标在 Indexer.forward 的 shift 里已经加上窗口 KV 的长度 $T$ |
 | core | 公式 | $o = \dfrac{\sum_{\iota} \exp(q \cdot \mathbf{K}_{\mathrm{all},\iota} \cdot \mu - M) \, \mathbf{K}_{\mathrm{all},\iota}}{\sum_{\iota} \exp(q \cdot \mathbf{K}_{\mathrm{all},\iota} \cdot \mu - M) + \exp(\kappa - M)}$ |
 | core | 符号 | $o$：注意力输出<br>$q$：查询<br>$\mathbf{K}_\mathrm{all}$：同时充当 k 和 v<br>$\iota$：$\mathbf{G}$ 里的槽位（不是位置）<br>$\mu$：softmax_scale，注意力自己的，取 head_dim（512）的 −1/2 次方<br>$\kappa$：可学习注意力汇点，源码里叫 attn_sink<br>$M$：这些槽位上 $q \cdot \mathbf{K}_{\mathrm{all},\iota} \cdot \mu$ 的最大值 |
-| core | 说明 | 单 KV 头，64 个查询头看同一份 KV；公式里的注意力汇点是可学习参数 [64]（源码里叫 attn_sink）<br>下标为 −1 的槽位分子分母都不贡献 |
+| core | 说明 | 单 KV 头，64 个查询头看同一份 KV；公式里的注意力汇点是可学习参数 [64]（检查点键 layers.{i}.attn.attn_sink）<br>下标为 −1 的槽位分子分母都不贡献 |
 | unrope | 公式 | $o$ 的末 $d_r$ 维乘旋转因子 $e^{-i \varphi_t}$（query 那个旋转角的共轭） |
 | unrope | 符号 | $o$：注意力输出<br>$d_r$：rd（rope_head_dim）<br>$\varphi_t$：query 所在位置的旋转角，取共轭<br>源码写法：$\mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(o.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot \mathcal{F}_t^*))$ |
 | unrope | 说明 | 用 query 所在位置的共轭频率再转输出的末 64 维，去掉 query 的旋转。值里各键位置的旋转变成相对 query 的位置差 |
@@ -829,7 +829,7 @@
 | eins | 说明 | 每组只和本组的权重相乘，等效块对角矩阵。源码里 $o$.view(bsz, seqlen, 8, -1)（64 个头按 8 个一组摊开）与 wo_a.weight.view(8, 1024, -1)（权重按组摊开）都是纯 view，并进这一步 |
 | wb | 公式 | $x = \mathrm{flatten}(o)\, W_b^\top$ |
 | wb | 符号 | $x$：输出<br>$o$：eins 的输出<br>$W_b$：输出投影，源码里叫 wo_b.weight |
-| wb | 说明 | $W_b$ [5120, 8192]（源码里叫 wo_b.weight），8192 = 8 × 1024；fp8 权重，激活先量化 |
+| wb | 说明 | $W_b$ [5120, 8192]（检查点键 layers.{i}.attn.wo_b.weight），8192 = 8 × 1024；fp8 权重，激活先量化 |
 
 ### 面板
 
@@ -897,10 +897,10 @@
 |---|---|---|
 | projk | 公式 | $\mathbf{U} = x\, W_{kv}^\top$ |
 | projk | 符号 | $\mathbf{U}$：kv，逐 token 的值投影<br>$x$：本层输入<br>$W_{kv}$：值投影的权重，源码里叫 wkv.weight |
-| projk | 说明 | $W_{kv}$ [512, 5120]（源码里叫 wkv.weight），压缩比大于 1 时是 fp32。进 GEMM 前先把 $x$ 上转 fp32（`x.float()`），池化与门控都在 fp32 里算；只有 compress_ratio 大于 1 的 kv source 层（2、8、14）走这一支 |
+| projk | 说明 | $W_{kv}$ [512, 5120]（检查点键 layers.{i}.attn.compressor.wkv.weight），压缩比大于 1 时是 fp32。进 GEMM 前先把 $x$ 上转 fp32（`x.float()`），池化与门控都在 fp32 里算；只有 compress_ratio 大于 1 的 kv source 层（2、8、14）走这一支 |
 | projg | 公式 | $\mathbf{g} = x\, W_g^\top$ |
 | projg | 符号 | $\mathbf{g}$：score，逐 token 的门控打分<br>$x$：本层输入<br>$W_g$：门控投影的权重，源码里叫 wgate.weight |
-| projg | 说明 | $W_g$ [512, 5120]（源码里叫 wgate.weight），压缩比大于 1 时是 fp32 |
+| projg | 说明 | $W_g$ [512, 5120]（检查点键 layers.{i}.attn.compressor.wgate.weight），压缩比大于 1 时是 fp32 |
 | pool | 公式 | $\mathbf{U} = \sum_t \mathrm{softmax}(\mathbf{G}_g)_t \, \mathbf{U}_{g,t}$ |
 | pool | 符号 | $\mathbf{U}$：kv，组内按 score 加权求和后的张量<br>$\mathbf{G}_g$：分组后的 score，按 $r$ 个一组重排<br>$\mathbf{U}_{g,t}$：组内第 $t$ 个 token 的值<br>$t$：组内位置，从 0 到 $r-1$ |
 | pool | 说明 | 组内用 score 的 softmax 做加权求和，把 $r$ 个 token 池成一个压缩条目；$r$ 就是这一层的 compress_ratio；源码写法 `(kv * score.softmax(dim=2)).sum(dim=2)` |
@@ -912,7 +912,7 @@
 | projk1 | 说明 | 层 20 的 $W_{kv}$ 是 bf16（compress_ratio 不大于 1），没有 $x$.float() 与 wgate；层 20 的 ratio 为 1，没有池化、没有门控 |
 | cnorm1 | 公式 | $\mathbf{Z} = w \odot \dfrac{\mathbf{U}}{\sqrt{\mathrm{mean}(\mathbf{U}^2) + \epsilon}}$ |
 | cnorm1 | 符号 | $\mathbf{Z}$：latent，压缩器的输出<br>$\mathbf{U}$：kv，projk1 的输出（层 20 的 wkv，在 bf16 里算）<br>$w$：compressor.norm 的权重，源码里叫 norm.weight<br>$\epsilon$：源码里叫 norm.eps<br>$\mathrm{mean}$：在最后一维 |
-| cnorm1 | 说明 | $w$ [512]（源码里叫 layers.20.attn.compressor.norm.weight） |
+| cnorm1 | 说明 | $w$ [512]（检查点键 layers.{i}.attn.compressor.norm.weight） |
 
 ### 面板
 
@@ -1013,7 +1013,7 @@
 |---|---|---|
 | kw | 公式 | $\mathbf{J} = w_k \odot \dfrac{u_k}{\sqrt{\mathrm{mean}(u_k^2) + \epsilon}}$ |
 | kw | 符号 | $\mathbf{J}$：k，归一化后的索引键<br>$u_k$：wk(latent) 的输出，本图把投影与归一化并成这一步<br>$w_k$：k_norm 的权重，源码里叫 k_norm.weight<br>$\mathrm{mean}$：在最后一维 |
-| kw | 说明 | $w_k$ [128]（源码里叫 k_norm.weight），k_norm 是 RMSNorm，eps 取 1e-20；$W_k$ [128, 512]（源码里叫 wk.weight），bf16。只在本层 owns_k 且 latent 非空时执行 |
+| kw | 说明 | $w_k$ [128]（检查点键 layers.{i}.attn.indexer.k_norm.weight），k_norm 是 RMSNorm，eps 取 1e-20；$W_k$ [128, 512]（检查点键 layers.{i}.attn.indexer.wk.weight），bf16。只在本层 owns_k 且 latent 非空时执行 |
 | krope | 公式 | $\mathbf{J}$ 的末 $d_r$ 维乘旋转因子 $e^{i \varphi_j}$（压缩位置 $j$ 的频率） |
 | krope | 符号 | $\mathbf{J}$：索引键<br>$d_r$：rd（rope_head_dim）<br>$\varphi_j$：压缩位置 $j$ 的旋转角<br>源码写法：$\mathrm{flatten}(\mathrm{view\_as\_real}(\mathrm{view\_as\_complex}(\mathbf{J}.\mathrm{float}().\mathrm{unflatten}(-1,(-1,2))) \odot f))$ |
 | krope | 说明 | 128 维里的最后 64 维加 RoPE；第 $j$ 组取位置 $j$ × $r$ 的频率 |
@@ -1031,7 +1031,7 @@
 | iq_q | 说明 | 索引器的 query 也量化成 fp4 |
 | wproj | 公式 | $\mathbf{w} = (x\, W_w^\top) \cdot \mu_i \cdot H_i^{-0.5}$ |
 | wproj | 符号 | $\mathbf{w}$：weights，各索引头的系数<br>$x$：本层输入<br>$W_w$：weights_proj 的权重，源码里叫 weights_proj.weight<br>$\mu_i$：softmax_scale，索引器自己的，取 index_head_dim（128）的 −1/2 次方，与注意力那次不是同一个量<br>$H_i$：n_heads（index_n_heads），32 |
-| wproj | 说明 | $W_w$ [32, 5120]（源码里叫 weights_proj.weight） |
+| wproj | 说明 | $W_w$ [32, 5120]（检查点键 layers.{i}.attn.indexer.weights_proj.weight） |
 | idot | 公式 | $\mathbf{Q}_{b,t,i,u} = \sum_d q_{b,t,i,d}\, \mathbf{J}_{b,u,d}$ |
 | idot | 符号 | $\mathbf{Q}$：index_score，索引打分<br>$q$：索引 query<br>$\mathbf{J}$：index_k，索引键<br>$i$：einsum 里的头维<br>$d$：index_head_dim |
 | idot | 说明 | 每个索引头对每个压缩位置记一个点积 |
@@ -1301,10 +1301,10 @@
 |---|---|---|
 | g1 | 公式 | $g = x\, W_1^\top$ |
 | g1 | 符号 | $g$：gate，门分支<br>$x$：输入<br>$W_1$：w1 的权重，源码里叫 w1.weight |
-| g1 | 说明 | 路由专家的 $W_1$ 存成 [2304, 2560]（源码里叫 w1.weight） 的 fp4：末维是逻辑宽度 5120 的一半，因为 fp4 每个字节装两个值；每 32 个通道一个 E8M0 scale；激活也按 32 通道一块量化成 fp8 再进 GEMM（`linear()` 里的 `act_quant`）。结果转成 fp32，夹取在后面的 cl2 |
+| g1 | 说明 | 路由专家的 $W_1$ 存成 [2304, 2560]（检查点键 layers.{i}.ffn.experts.{i}.w1.weight） 的 fp4：末维是逻辑宽度 5120 的一半，因为 fp4 每个字节装两个值；每 32 个通道一个 E8M0 scale；激活也按 32 通道一块量化成 fp8 再进 GEMM（`linear()` 里的 `act_quant`）。结果转成 fp32，夹取在后面的 cl2 |
 | u1 | 公式 | $u = x\, W_3^\top$ |
 | u1 | 符号 | $u$：up，上分支<br>$x$：输入<br>$W_3$：w3 的权重，源码里叫 w3.weight |
-| u1 | 说明 | $W_3$ 与 $W_1$ 同一种存法（源码里叫 w3.weight、w1.weight），激活同样先量化成 fp8；结果转成 fp32 |
+| u1 | 说明 | $W_3$ 与 $W_1$ 同一种存法（检查点键 layers.{i}.ffn.experts.{i}.w3.weight、layers.{i}.ffn.experts.{i}.w1.weight），激活同样先量化成 fp8；结果转成 fp32 |
 | cl | 公式 | $u = \mathrm{clamp}(u, -\lambda, \lambda)$ |
 | cl | 符号 | $u$：up，上分支<br>$\lambda$：swiglu_limit，10 |
 | cl | 说明 | up 两头都夹；swiglu_limit 是 10.0<br>夹是为了让后面的 fp8、fp4 激活不越界 |
@@ -1319,7 +1319,7 @@
 | emw | 说明 | 只在传入 $w$ 时执行。这张图是路由专家，$w$ 来自 top-6 里该专家的权重 |
 | w2 | 公式 | $x = x.\mathrm{to}(dtype)\, W_2^\top$ |
 | w2 | 符号 | $x$：乘过路由权重的隐状态<br>$dtype$：进入 Expert 时 x 的 dtype（bf16）<br>$W_2$：w2 的权重，源码里叫 w2.weight |
-| w2 | 说明 | 路由专家的 $W_2$ 存成 [5120, 1152]（源码里叫 w2.weight） 的 fp4（末维 1152 = 2304 / 2，同样是一格装两个值），激活先量化成 fp8；共享专家是 [5120, 2304] 的 fp8，激活同样量化成 fp8 |
+| w2 | 说明 | 路由专家的 $W_2$ 存成 [5120, 1152]（检查点键 layers.{i}.ffn.experts.{i}.w2.weight） 的 fp4（末维 1152 = 2304 / 2，同样是一格装两个值），激活先量化成 fp8；共享专家是 [5120, 2304] 的 fp8，激活同样量化成 fp8 |
 
 ### 面板
 
@@ -1414,7 +1414,7 @@
 | nemb | 说明 | ParallelEngramEmbedding：表按行分片，查出 fp8 的行再用 scale 反量化成 bf16，见点开的那张图；外层 flatten 把 24 与 256 合成 6144<br>24 × 256 = 6144；层 1 的表有 384006168 行，层 14 有 384016682 行 |
 | nwkv | 公式 | $\mathbf{z} = \mathbf{e}\, W_{kv}^\top$ |
 | nwkv | 符号 | $\mathbf{z}$：kv，投影输出<br>$\mathbf{e}$：查表并 flatten 后的向量<br>$W_{kv}$：wkv 的权重，源码里叫 wkv.weight |
-| nwkv | 说明 | $W_{kv}$ [25600, 6144]（源码里叫 wkv.weight）；输出切成 key 与 value 两段 |
+| nwkv | 说明 | $W_{kv}$ [25600, 6144]（检查点键 layers.{i}.engram.wkv.weight）；输出切成 key 与 value 两段 |
 | nsplit | 公式 | $\mathbf{K}_e, \mathbf{R}_e = \mathrm{split}(\mathbf{z}, [C \cdot d, d])$ |
 | nsplit | 符号 | $\mathbf{K}_e$、$\mathbf{R}_e$：key、value，切出的两段<br>$\mathbf{z}$：W_kv 的输出<br>$C$：hc_mult（4）<br>$d$：dim，5120 |
 | nkey | 公式 | $\mathbf{K}_e = \mathbf{K}_e.\mathrm{float}().\mathrm{unflatten}(-1, (C, d))$ |
@@ -1493,10 +1493,10 @@
 |---|---|---|
 | peuq | 公式 | $\mathbf{R}_v = \mathrm{embedding}(I', W)$ |
 | peuq | 符号 | $\mathbf{R}_v$：values，查出的 fp8 行<br>$I'$：local_indices，hash_ids 减去本卡起始行<br>$W$：fp8 表，源码里叫 weight |
-| peuq | 说明 | $W$ [384016682, 256]（源码里叫 weight），按 rank 沿行切分，单卡即整张；层 1 的表有 384006168 行，层 14 有 384016682 行。这一行同时按行号取出缩放表那一份（源码把两次 lookup 写在一行），取出的 fp8 行在 pedq 里按 scale 反量化 |
+| peuq | 说明 | $W$ [384016682, 256]（检查点键 layers.14.engram.embed.weight），按 rank 沿行切分，单卡即整张；层 1 的表有 384006168 行，层 14 有 384016682 行。这一行同时按行号取出缩放表那一份（源码把两次 lookup 写在一行），取出的 fp8 行在 pedq 里按 scale 反量化 |
 | pesq | 公式 | $\mathbf{s} = \mathrm{embedding}(I', \mathbf{T})$ |
 | pesq | 符号 | $\mathbf{s}$：scales，每 32 个通道一组的缩放<br>$I'$：local_indices，hash_ids 减去本卡起始行<br>$\mathbf{T}$：缩放表，源码里叫 scale |
-| pesq | 说明 | $\mathbf{T}$ [384016682, 8]（源码里叫 scale） |
+| pesq | 说明 | $\mathbf{T}$ [384016682, 8]（检查点键 layers.14.engram.embed.scale） |
 | pedq | 公式 | $\mathbf{R}_v = \mathrm{flatten}(\mathbf{R}_v.\mathrm{float}().\mathrm{unflatten}(-1, (-1, 32)) \odot \mathbf{s}.\mathrm{float}().\mathrm{unsqueeze}(-1)).\mathrm{to}(bf16)$ |
 | pedq | 符号 | $\mathbf{R}_v$：values，反量化后的行<br>$\mathbf{s}$：scales，查出的缩放<br>$32$：fp8_block_size，256 / 32 = 8 |
 | pedq | 说明 | 查出的 fp8 行按每 32 个通道一个 scale 反量化成 bf16；单卡下源码里的 mask 与 all_reduce 不执行 |
