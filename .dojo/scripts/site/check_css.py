@@ -52,24 +52,22 @@ def used_classes(path: Path) -> set[str]:
 # ---------- 拆 CSS ----------
 
 def iter_rules(css: str):
-    """遍历 CSS 规则，产出 (选择器, 起始偏移, 结束偏移)。@media 等嵌套里的规则也产出。"""
+    """遍历 CSS 规则，产出 (选择器, 起始偏移, 结束偏移)，@media 等块里的规则各自产出。"""
     text = COMMENT_RE.sub(lambda m: " " * len(m.group(0)), css)
-    stack: list[tuple[str, int]] = []
+    stack: list[tuple[str, int]] = []   # (选择器, 规则起点)
     start = 0
-    cursor = 0
-    while cursor < len(text):
-        char = text[cursor]
+    for cursor, char in enumerate(text):
         if char == "{":
-            stack.append((text[start:cursor].strip(), cursor))
+            stack.append((text[start:cursor].strip(), start))
+            start = cursor + 1
         elif char == "}":
             if stack:
-                selector, _ = stack.pop()
+                selector, begin = stack.pop()
                 if selector and not selector.startswith("@"):
-                    yield selector, start, cursor + 1
+                    yield selector, begin, cursor + 1
             start = cursor + 1
         elif char == ";" and not stack:
             start = cursor + 1
-        cursor += 1
 
 
 def selector_is_dead(selector: str, used: set[str]) -> bool:
@@ -185,7 +183,9 @@ def selftest() -> list[tuple[str, bool]]:
         results.append(("生成器不再产出时会报出", any(".gone" in e for e in run(base + ".gone { a: b; }\n"))))
         results.append(("katex 一类运行时 class 不报", not any("katex" in e for e in run(base + ".katex-html { a: b; }\n"))))
         results.append(("不含 class 的选择器不判", not any("body" in e for e in run(base + "body { a: b; }\n"))))
-        results.append(("@media 里的规则不判（已知的盲区）", not any(".in-media" in e for e in run(base + "@media (max-width: 1px) { .in-media { a: b; } }\n"))))
+        media = "@media (max-width: 1px) { %s { a: b; } }\n"
+        results.append(("@media 里没人用的规则会报出", any(".in-media" in e for e in run(base + media % ".in-media"))))
+        results.append(("@media 里在用的规则不报", not any("dojo-concept.css" in e for e in run(base + media % ".used"))))
         results.append(("数据流模板、生成器、引擎的 class 不算死规则",
                         not any("dojo-flow.css" in e for e in run(base))))
         run(base + ".never-used { a: b; }\n", fix=True)
