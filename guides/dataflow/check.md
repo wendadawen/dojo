@@ -6,7 +6,7 @@
 
     python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/research/dataflow.md --source-root <源码目录>
 
-回查「源码」列指的行不是空行或注释、且含节点名。这一步在第 3 步之前就做过，改过计划后要重跑。
+回查「源码」列指的行不是空行或注释、且含节点名。改过计划后要重跑。
 
 ## 2. 节点名与形状
 

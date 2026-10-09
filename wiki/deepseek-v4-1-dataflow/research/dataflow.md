@@ -110,7 +110,7 @@
 | patches | 张量 | img.patches | bf16 [S, 3, 14, 14] | S 是这张图的 patch 数，等于 n_vit_h × n_vit_w；14 是 vision_patch_size | model.py:1238 |
 | venc | 算子 | self.vision(patches, n_vit_h, n_vit_w) | bf16 [S, 3, 14, 14] → bf16 [S, 1024] |  | model.py:1226 |
 | vla | 张量 | self.vision(patches, n_vit_h, n_vit_w) | bf16 [S, 1024] | ViT 的输出；源码里嵌在 aligner 的实参位置，写作 x，没有单独的变量名 | model.py:1226 |
-| alen | 算子 | self.aligner(...) | bf16 [S, 1024] → bf16 [n_llm_h × n_llm_w, 5120] |  | model.py:1226 |
+| alen | 算子 | self.aligner(vla, n_vit_h, n_vit_w) | bf16 [S, 1024] → bf16 [n_llm_h × n_llm_w, 5120] |  | model.py:1226 |
 | vemb | 张量 | self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w) | bf16 [n_llm_h × n_llm_w, 5120] | encode_image 的返回值，就是写回图像 span 的那份图像 token 嵌入 | model.py:1226 |
 | ngram | 算子 | self.engram_hash(input_ids, start_pos, engram_mask) | [B, T] → [B, T, 2, 24] |  | model.py:1252 |
 | hash | 张量 | engram_hashes | int64 [B, T, 2, 24] | | model.py:1252 |
@@ -472,7 +472,7 @@
 | vuv | 张量 | F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1) | bf16 [n_llm_h × n_llm_w, 9216] | 9216 = 3 × 3 × 1024；n_llm_h = ceil(n_vit_h / r)、n_llm_w = ceil(n_vit_w / r)，每行是一个 3×3 块的展开 | vision.py:118 |
 | aw1 | 算子 | self.w1(x) | bf16 [n_llm_h × n_llm_w, 9216] → bf16 [n_llm_h × n_llm_w, 5120] |  | vision.py:119 |
 | alg | 张量 | F.gelu(self.w1(x)) | bf16 [n_llm_h × n_llm_w, 5120] | w1 的输出再过一层 gelu（普通函数不单独成节点，跟它作用的值同节点）；源码里这一步嵌在下一行的调用里，没有单独的变量名 | vision.py:119 |
-| vlin | 算子 | self.w2(...) | bf16 [n_llm_h × n_llm_w, 5120] → bf16 [n_llm_h × n_llm_w, 5120] |  | vision.py:119 |
+| vlin | 算子 | self.w2(alg) | bf16 [n_llm_h × n_llm_w, 5120] → bf16 [n_llm_h × n_llm_w, 5120] |  | vision.py:119 |
 | vemb | 张量 | self.w2(F.gelu(self.w1(x))) | bf16 [n_llm_h × n_llm_w, 5120] | 对齐器的输出，与主干同一个维度，可以按行写回序列；与 Transformer 图的 vemb 是同一个量 | vision.py:119 |
 | vrd | 张量 | self.downsample_ratio | int，值为 3 | 构造时取 vision_downsample_ratio 3 | vision.py:109 |
 
@@ -655,7 +655,7 @@
 | fc | 张量 | freqs_cis | 复数 fp32 [T, 32] | 本次这一段。本路径 start_pos 为 0，所以是前 T 行 | model.py:767 |
 | wqa | 算子 | self.wq_a(x) | bf16 [B, T, 5120] → bf16 [B, T, 1280] |  | model.py:770 |
 | qra | 张量 | self.wq_a(x) | bf16 [B, T, 1280] | wq_a 的输出，源码里嵌在下一行的调用里，没有单独的变量名 | model.py:770 |
-| qr_op | 算子 | self.q_norm(...) | bf16 [B, T, 1280] → bf16 [B, T, 1280] |  | model.py:770 |
+| qr_op | 算子 | self.q_norm(qra) | bf16 [B, T, 1280] → bf16 [B, T, 1280] |  | model.py:770 |
 | qr | 张量 | qr | bf16 [B, T, 1280] | 索引器拿它当 query 的输入 | model.py:770 |
 | qb | 算子 | self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim)) | bf16 [B, T, 1280] → bf16 [B, T, 64, 512] |  | model.py:771 |
 | qpre | 张量 | q | bf16 [B, T, 64, 512] | | model.py:771 |
@@ -663,7 +663,7 @@
 | q | 张量 | q | bf16 [B, T, 64, 512] | | model.py:772 |
 | wkv_proj | 算子 | self.wkv(x) | bf16 [B, T, 5120] → bf16 [B, T, 512] |  | model.py:705 |
 | wkva | 张量 | self.wkv(x) | bf16 [B, T, 512] | wkv 的输出，源码里嵌在下一行的调用里，没有单独的变量名 | model.py:705 |
-| wkv_win | 算子 | self.kv_norm(...) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:705 |
+| wkv_win | 算子 | self.kv_norm(wkva) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:705 |
 | wkv_o | 张量 | kv | bf16 [B, T, 512] | | model.py:705 |
 | wrope | 算子 | apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:706 |
 | wkv_r | 张量 | kv | bf16 [B, T, 512] | | model.py:706 |
@@ -872,7 +872,7 @@
 | lat | 张量 | self.norm(kv.to(dtype)) | bf16 [B, T/r, 512] | 返回值是还没加 RoPE 的压缩潜在量；层 2、8、14 汇自 cnorm，层 20 汇自 cnorm1 | model.py:485 |
 | projk1 | 算子 | self.wkv(x) | bf16 [B, T, 5120] → bf16 [B, T, 512] |  | model.py:462 |
 | kv1 | 张量 | self.wkv(x) | bf16 [B, T, 512] | 层 20 的值投影，在 bf16 里算，没有 x.float() 与 wgate | model.py:462 |
-| cnorm1 | 算子 | self.norm(...) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:462 |
+| cnorm1 | 算子 | self.norm(kv1) | bf16 [B, T, 512] → bf16 [B, T, 512] |  | model.py:462 |
 
 ### 连线
 
@@ -935,7 +935,7 @@
 | fq | 张量 | freqs | 复数 fp32 [T/r, 32] | | model.py:540-543 |
 | wk_p | 算子 | self.wk(latent) | bf16 [B, T/r, 512] → bf16 [B, T/r, 128] |  | model.py:544 |
 | wka | 张量 | self.wk(latent) | bf16 [B, T/r, 128] | wk 的输出，源码里嵌在下一行的调用里，没有单独的变量名 | model.py:544 |
-| kw | 算子 | self.k_norm(...) | bf16 [B, T/r, 128] → bf16 [B, T/r, 128] |  | model.py:544 |
+| kw | 算子 | self.k_norm(wka) | bf16 [B, T/r, 128] → bf16 [B, T/r, 128] |  | model.py:544 |
 | k0 | 张量 | k | bf16 [B, T/r, 128] | | model.py:544 |
 | krope | 算子 | apply_rotary_emb(k[..., -rd:], freqs) | bf16 [B, T/r, 128] → bf16 [B, T/r, 128] |  | model.py:545 |
 | kr | 张量 | k | bf16 [B, T/r, 128] | | model.py:545 |
