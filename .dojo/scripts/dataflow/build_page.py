@@ -310,6 +310,8 @@ def check_plan(views: list[dict]) -> None:
             errors += _formula_in_explanation(where, n)
             if n["kind"] == "op":
                 errors += _one_step_per_node(where, n)
+                if (n.get("detail") or "").strip():
+                    errors.append(f"{where}：算子第三行留空，较长说明写进折叠的「说明」")
         for row in v.get("info") or []:
             if row["title"] == "公式":
                 for name, value in row["rows"]:
@@ -389,12 +391,17 @@ def _one_step_per_node(where: str, node: dict) -> list[str]:
 
 
 def _no_generic_class_figure(views: list[dict]) -> list[str]:
-    """基础层（Linear、RMSNorm 这类）不单独成图，写在使用它们的节点上。"""
+    """基础层（Linear、RMSNorm 这类）不单独成图，写在使用它们的节点上。
+
+    图标题是「<类名>.forward」（如 `vision.Block.forward`），取 `.forward` 前的那一段当类名；
+    带模块前缀的（`vision.RMSNorm`）去前缀后再比。
+    """
     errors = []
     for v in views:
-        label = (v.get("title") or "").split(".")[-1]
-        if label in GENERIC_CLASSES:
-            errors.append(f"图「{v['label']}」：{label} 是通用基础层，不该单独成图")
+        title = (v.get("title") or "")
+        cls = title[:-len(".forward")] if title.endswith(".forward") else title
+        if cls.split(".")[-1] in GENERIC_CLASSES:
+            errors.append(f"图「{v['label']}」：{cls} 是通用基础层，不该单独成图")
     return errors
 
 
@@ -548,8 +555,8 @@ TOY_PLAN = "\n".join([
     "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |",
     "|---|---|---|---|---|---|",
     "| ids | 张量 | input_ids | int64 [B, T] | | toy.py:2 |",
-    "| blk | 算子 | `2 × ToyBlock` | 16 → 16 | 第一行<br>第二行 | toy.py:5 |",
-    "| out | 张量 | hidden_states | fp32 [B, T, 16] | | toy.py:6 |",
+    "| blk | 算子 | `2 × ToyBlock` | 16 → 16 | | toy.py:5 |",
+    "| out | 张量 | hidden_states | fp32 [B, T, 16] | 第一行<br>第二行 | toy.py:6 |",
     "| kv | 缓存 | cache.update | 追加 | | toy.py:7 |",
     "",
     "### 连线",
@@ -602,7 +609,7 @@ def selftest() -> list[tuple[str, bool]]:
             ("点开指向第二张图", main_view["nodes"][1].get("drill") == "toyblock"),
             ("折叠挂在算子上", main_view["nodes"][1].get("fold") == [
                 {"title": "公式", "text": "$x + f(x)$，x 是输入"}]),
-            ("<br> 换行、反引号去掉", main_view["nodes"][1]["detail"] == "第一行\n第二行"
+            ("<br> 换行、反引号去掉", main_view["nodes"][2]["detail"] == "第一行\n第二行"
              and main_view["nodes"][1]["name"] == "2 × ToyBlock"),
             ("线上的字与无空格箭头", main_view["edges"][1].get("label") == "hidden"
              and main_view["edges"][2] == {"from": "kv", "to": "blk"}),
@@ -657,7 +664,11 @@ def selftest() -> list[tuple[str, bool]]:
              TOY_PLAN.replace("| 公式 | 残差 | $x + f(x)$ |",
                               "| 公式 | 残差 | $x + f(x)$，再 $y = x$ |")),
             ("基础层单独成图应当报错",
-             TOY_PLAN.replace("## ToyBlock.forward", "## RMSNorm.forward")),
+             TOY_PLAN.replace("## ToyBlock.forward", "## RMSNorm.forward")
+                     .replace("点开 → ToyBlock.forward", "点开 → RMSNorm.forward")),
+            ("算子第三行非空应当报错",
+             TOY_PLAN.replace("| blk | 算子 | `2 × ToyBlock` | 16 → 16 | |",
+                              "| blk | 算子 | `2 × ToyBlock` | 16 → 16 | 塞了说明 |")),
         ]:
             plan.write_text(broken, encoding="utf-8")
             try:
