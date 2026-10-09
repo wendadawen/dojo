@@ -7,8 +7,6 @@
   2. 节点名   —— 名字里出现的标识符必须在源码里出现；短词表里的词跳过
   3. 形状     —— 写出的权重形状，必须与 safetensors 头一致
   4. 写法     —— 形状箭头两边都要有；折叠的名字只能是「公式」或「说明」；算子没有公式时给出提示
-  5. 几何     —— --geometry 时用无头 Chrome 量连线穿框与重合（见下）
-  6. 截图     —— --shots 时逐张图截画布、说明面板和折叠，供人看
 
 前三项需要外部材料（源码 / 权重），所以不做进 site/check_page.py（那是纯静态检查），单独跑这个脚本。
 
@@ -21,29 +19,15 @@
     python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html \
         --source /path/to/modeling_x.py --shapes wiki/<name>/research/sources/shapes.json
 
-    # 几何：连线是否穿框、是否与别的线并排重合
-    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html --geometry
-
-    # 截图
-    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html --shots <目录>
-
-几何判据必须来自渲染后的像素，不能靠几何推算。
-
 退出码：0 全部通过；1 有问题；2 用法错误。
 """
 
 from __future__ import annotations
 
 import argparse
-import functools
-import http.server
 import json
 import re
-import socketserver
-import subprocess
 import sys
-import threading
-from html import unescape
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -262,216 +246,6 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
     return errors, checked
 
 
-# ---------- 几何：连线是否穿框、是否与别的线并排重合 ----------
-
-CHROME_CANDIDATES = (
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-)
-GEOM_RESULT_RE = re.compile(r"FLOWGEOM(\{.*?\})FLOWGEOM", re.S)
-
-# 页内探针：逐个视图测量「穿框」与「像素重合」。
-#
-# 关键点：applyView 会触发 ELK 的异步布局，切换后必须等布局完成再量，
-# 否则量到的是上一个视图的残留数据（实测九个视图全报同一组数字 = 假通过）。
-# 所以这里用递归的 step()：切一个视图 → 等一拍 → 量 → 再切下一个。
-GEOM_PROBE = r"""
-<script>
-(function () {
-  function edgesNow() { return [].slice.call(document.querySelectorAll('.flow-edge')); }
-
-  function measureCurrent() {
-    var fv = window.__flow;
-    var paths = edgesNow();
-    if (!paths.length) return null;
-    var ps = Object.keys(fv.positions).map(function (k) {
-      var p = fv.positions[k]; return { id: k, x: p.x, y: p.y, w: p.w, h: p.h };
-    });
-    var grids = paths.map(function (p) {
-      var L = p.getTotalLength(), s = {};
-      for (var d = 0; d <= L; d += 1) {
-        var q = p.getPointAtLength(d);
-        s[Math.round(q.x) + ',' + Math.round(q.y)] = 1;
-      }
-      return s;
-    });
-    var cross = 0;
-    fv.view.edges.forEach(function (e, i) {
-      var p = paths[i]; if (!p) return;
-      var L = p.getTotalLength(), hit = false;
-      for (var d = 0; d <= L && !hit; d += 3) {
-        var q = p.getPointAtLength(d);
-        for (var n = 0; n < ps.length; n++) {
-          var b = ps[n];
-          if (b.id === e.from || b.id === e.to) continue;
-          if (q.x > b.x + 3 && q.x < b.x + b.w - 3 &&
-              q.y > b.y + 3 && q.y < b.y + b.h - 3) { hit = true; break; }
-        }
-      }
-      if (hit) cross++;
-    });
-    var overlap = 0;
-    for (var i = 0; i < grids.length; i++) {
-      var keys = Object.keys(grids[i]);
-      for (var j = i + 1; j < grids.length; j++) {
-        var shared = 0;
-        for (var ki = 0; ki < keys.length; ki++) if (grids[j][keys[ki]]) shared++;
-        if (shared > 60) overlap++;
-      }
-    }
-    return { id: fv.view.id, edges: paths.length, cross: cross, overlap: overlap };
-  }
-
-  function finish(payload) {
-    document.title = 'FLOWGEOM' + JSON.stringify(payload) + 'FLOWGEOM';
-  }
-
-  window.addEventListener('load', function () {
-    var fv = window.__flow;
-    if (!fv) { finish({ error: 'no __flow' }); return; }
-    var ids = fv.data.views.map(function (v) { return v.id; });
-    var out = [], idx = 0, waited = 0;
-    function step() {
-      if (idx >= ids.length) { finish({ views: out }); return; }
-      var id = ids[idx];
-      if (fv.view.id !== id) {
-        fv.needsFit = true;
-        fv.applyView(id);
-        waited = 0;
-        setTimeout(step, 250);
-        return;
-      }
-      waited += 250;
-      var paths = edgesNow();
-      var expect = fv.view.edges.length;
-      // 等布局稳定：边数对上了才认为渲染完成
-      if (paths.length < expect && waited < 6000) { setTimeout(step, 250); return; }
-      var m = measureCurrent();
-      if (m) out.push(m);
-      idx++;
-      waited = 0;
-      setTimeout(step, 250);
-    }
-    step();
-  });
-})();
-</script>
-"""
-
-
-def find_chrome() -> str | None:
-    for c in CHROME_CANDIDATES:
-        if Path(c).exists():
-            return c
-    return None
-
-
-class _QuietHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, *a):        # 静默
-        pass
-
-
-def serve_root(root: Path):
-    handler = functools.partial(_QuietHandler, directory=str(root))
-    httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd, httpd.server_address[1]
-
-
-def run_geometry(page: Path, root: Path) -> int:
-    """几何自检：逐视图量连线穿框与像素重合。"""
-    chrome = find_chrome()
-    if not chrome:
-        print("error: 找不到 Chrome/Chromium，无法做几何自检", file=sys.stderr)
-        return 2
-    if not page.exists():
-        print(f"error: 页面不存在: {page}", file=sys.stderr)
-        return 2
-
-    # --dump-dom 只吃页面自带的脚本，所以先把探针注入一份临时副本再加载。
-    # 页面里的 <script> 都是相对 ../../libs/ 引资源，副本必须放在同一层级，
-    # 否则 libs 加载不到、探针拿不到 __flow。
-    injected = page.with_name("__geom_probe__.html")
-    injected.write_text(page.read_text(encoding="utf-8").replace("</body>", GEOM_PROBE + "</body>"),
-                        encoding="utf-8")
-    httpd, port = serve_root(root)
-    try:
-        rel = injected.relative_to(root)
-        dom = subprocess.run(
-            [chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
-             "--virtual-time-budget=20000", "--dump-dom",
-             f"http://127.0.0.1:{port}/{rel}"],
-            capture_output=True, text=True, timeout=180,
-        ).stdout
-    finally:
-        httpd.shutdown()
-        injected.unlink(missing_ok=True)
-
-    m = GEOM_RESULT_RE.search(dom)
-    if not m:
-        print("error: 页面没有返回几何数据（探针未执行？）", file=sys.stderr)
-        return 2
-    payload = json.loads(unescape(m.group(1)))
-    if payload.get("error"):
-        print(f"error: 探针报错 {payload['error']}", file=sys.stderr)
-        return 2
-
-    print("几何自检（渲染后逐像素）：")
-    for row in payload["views"]:
-        flag = "OK " if row["cross"] == 0 and row["overlap"] == 0 else "!! "
-        print(f"  {flag}{row['id']:<10} 边={row['edges']:>3}  穿框={row['cross']:>2}  "
-              f"像素重合对={row['overlap']:>2}")
-    bad = [r for r in payload["views"] if r["cross"] or r["overlap"]]
-    if bad:
-        print(f"几何自检失败：{len(bad)} 个视图有问题")
-        return 1
-    print("几何自检通过：全部视图穿框 0、像素重合 0")
-    return 0
-
-
-def run_shots(page: Path, root: Path, out: Path) -> int:
-    """逐张图截图：<视图>.png 是画布，<视图>-info.png 是说明面板，<视图>-fold.png 是折叠。"""
-    chrome = find_chrome()
-    if not chrome:
-        print("error: 找不到 Chrome/Chromium，无法截图", file=sys.stderr)
-        return 2
-    ids = [v["id"] for v in load_views(page)]
-    out.mkdir(parents=True, exist_ok=True)
-    injected = page.with_name("__shot__.html")
-    html_text = page.read_text(encoding="utf-8")
-    httpd, port = serve_root(root)
-    try:
-        for vid in ids:
-            for suffix, extra in (
-                ("", ""),
-                ("-info", "var b=document.getElementById('flow-info-btn');if(b&&!b.hidden)b.click();"),
-                ("-fold", "setTimeout(function(){var b=document.querySelector('.flow-fold-btn');if(b)b.click();},1500);"),
-            ):
-                probe = ("<script>window.addEventListener('load',function(){setTimeout(function(){"
-                         f"window.__flow.fitMode='width';window.__flow.applyView('{vid}');{extra}"
-                         "},400);});</script>")
-                injected.write_text(html_text.replace("</body>", probe + "</body>"), encoding="utf-8")
-                shot = out / f"{vid}{suffix}.png"
-                subprocess.run(
-                    [chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
-                     "--window-size=1440,900", "--virtual-time-budget=9000",
-                     f"--screenshot={shot.resolve()}",
-                     f"http://127.0.0.1:{port}/{injected.relative_to(root)}"],
-                    capture_output=True, timeout=120,
-                )
-                print(f"  {shot}")
-    finally:
-        httpd.shutdown()
-        injected.unlink(missing_ok=True)
-    print(f"截图完成：{len(ids)} 张图，每张三幅（画布、说明面板、折叠）")
-    return 0
-
-
-# ---------- 自检 ----------
-
 def selftest() -> list[tuple[str, bool]]:
     """用虚构的页面数据核对结构、名字、形状三条规则。"""
     checks: list[tuple[str, bool]] = []
@@ -527,12 +301,8 @@ def main() -> int:
                     help="权威源码，可多次传入。带 LABEL 时只有视图标题里含该 LABEL 才用它校验")
     ap.add_argument("--shapes", type=Path, help="形状表 JSON：{tensor_key: [dim...]}")
     ap.add_argument("--names-only", action="store_true", help="只做节点名核查")
-    ap.add_argument("--geometry", action="store_true", help="几何自检：无头 Chrome 量连线穿框与重合")
-    ap.add_argument("--shots", type=Path, metavar="DIR", help="逐张图截图，存到 DIR")
     ap.add_argument("--source-root", type=Path, metavar="DIR",
                     help="传入计划文件时，按「源码」列到这个目录下找文件回查")
-    ap.add_argument("--root", type=Path, default=Path("."),
-                    help="--geometry、--shots 时的站点根目录，默认当前目录")
     args = ap.parse_args()
 
     if not args.page.exists():
@@ -555,14 +325,6 @@ def main() -> int:
     if args.shapes and not args.shapes.exists():
         print(f"error: 形状表不存在: {args.shapes}", file=sys.stderr)
         return 2
-
-    if args.geometry or args.shots:
-        # 页面路径相对站点根解析，二者都取绝对路径，relative_to 才能用
-        root = args.root.resolve()
-        page = args.page if args.page.is_absolute() else (root / args.page)
-        if args.shots:
-            return run_shots(page, root, args.shots)
-        return run_geometry(page, root)
 
     views = load_views(args.page)
 

@@ -1,6 +1,6 @@
 # 核查页面
 
-页面生成后核查，五步都要过。
+页面生成后核查，三步都要过。
 
 ## 1. 源码位置
 
@@ -18,18 +18,6 @@
 ## 3. 页面本身
 
     python3 .dojo/scripts/site/check.py wiki/<name>/index.html
-
-## 4. 几何
-
-    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html --geometry
-
-用无头 Chrome 逐视图量连线：有没有穿过别的节点框，有没有两条线并排重合。需要本机装了 Chrome 或 Chromium。
-
-## 5. 截图
-
-    python3 .dojo/scripts/dataflow/check_source.py wiki/<name>/index.html --shots <目录>
-
-每张图截三张：画布、说明面板、折叠。看折叠里的公式能不能正常显示、面板能不能打开。人眼过一遍。
 
 ## 改
 

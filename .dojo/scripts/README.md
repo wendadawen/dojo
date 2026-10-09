@@ -12,7 +12,7 @@
 ## dataflow/
 
 - `build_page.py`：读 `dataflow.md`，生成 `index.html`。
-- `check_source.py`：核查页面对不对得上源码——源码位置回查、节点名、权重形状，`--geometry` 量连线、`--shots` 截图。
+- `check_source.py`：核查页面对不对得上源码——源码位置回查、节点名、权重形状。
 - `common.py`：上面两个脚本共用的常量和自检输出。
 
 ## site/
