@@ -1,0 +1,5 @@
+- paper/hc-2409.19606v3.pdf、paper/hc-2409.19606v3.txt、paper/src-v3/｜论文｜https://arxiv.org/abs/2409.19606v3｜v3（首版 2024-09-29）｜2026-10-08｜Hyper-Connections：把残差流扩宽成 n 条并学习三组映射，原文出处；LaTeX 源码在 src-v3/，纯文本快照 hc-2409.19606v3.txt
+- paper/dsv4-2606.19348v1.pdf、paper/dsv4-2606.19348v1.txt｜论文｜https://arxiv.org/abs/2606.19348v1｜v1｜2026-10-08｜DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence，2.2 节给出标准 HC 与 mHC 的记号、公式与超参
+- repo/hy4-preview/｜仓库｜https://github.com/Tencent-Hunyuan/Hy4-preview｜509799b（2026-08-28）｜2026-10-08｜Hy4 preview 官方仓库，README 给出 iHC 的名字与模型规格
+- repo/hy4-transformers-modeling.py、repo/hy4-transformers-configuration.py｜源码｜https://github.com/huggingface/transformers 的 src/transformers/models/hy_v4/｜commit cb33194ad6152bd9fad6305378d92db385dd7b32｜2026-10-08｜iHC 的官方实现 HYV4HyperConnection、HYV4HyperHead，以及配置类里的 hc_* 字段
+- blog/hy4-model-card.md、blog/hy4-config.txt｜模型卡与配置｜https://huggingface.co/tencent/Hy4-preview｜修订 705d81ee51566a186d645b74c974d642ef2828fe｜2026-10-08｜官方模型卡与 config.json：把 iHC 写作 identity Hyper-Connections，残差流 4 条
