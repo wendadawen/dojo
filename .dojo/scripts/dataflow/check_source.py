@@ -159,8 +159,8 @@ def check_structure(views: list[dict]) -> list[str]:
                 if n.get("kind") != "op":
                     errors.append(f"[{v['id']}/{n['id']}] 折叠只写在算子上")
                     break
-                if sec.get("title") not in ("公式", "说明"):
-                    errors.append(f"[{v['id']}/{n['id']}] 折叠的名字只能是「公式」或「说明」，"
+                if sec.get("title") not in ("公式", "符号", "说明"):
+                    errors.append(f"[{v['id']}/{n['id']}] 折叠的名字只能是「公式」「符号」或「说明」，"
                                   f"现在是 {sec.get('title')!r}")
         for e in v["edges"]:
             for end in (e["from"], e["to"]):

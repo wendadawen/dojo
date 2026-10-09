@@ -259,8 +259,8 @@ def parse(plan: Path) -> dict:
                 fail(no, f"{where}里没有节点「{nid}」")
             if by_id[nid]["kind"] != "op":
                 fail(no, f"折叠只写在算子上，「{nid}」不是算子")
-            if r["名字"] not in ("公式", "说明"):
-                fail(no, f"折叠的名字只能是「公式」或「说明」")
+            if r["名字"] not in ("公式", "符号", "说明"):
+                fail(no, "折叠的名字只能是「公式」「符号」或「说明」")
             if not r["内容"]:
                 fail(no, "折叠要写内容")
             by_id[nid].setdefault("fold", []).append({"title": r["名字"], "text": r["内容"]})
