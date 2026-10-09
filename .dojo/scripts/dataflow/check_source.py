@@ -250,7 +250,7 @@ def parse_refs(cell: str) -> list[tuple[str, int, int]]:
     return out
 
 
-def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
+def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
     """计划文件的源码位置回查：标题从 def forward 起，节点指的行不是空行或注释，且含节点名。"""
     files: dict[str, list[str] | None] = {}
 
@@ -263,10 +263,15 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
 
     errors: list[str] = []
     checked = 0
+    unchecked = 0
     for head, no, row in plan_rows(plan.read_text(encoding="utf-8")):
         if head in SKIP_HEADS:
             continue
         where = f"第 {no} 行（{head.split('（')[0]}"
+        # 这一图标题里写的源码文件。节点指到别的文件多半是张冠李戴：
+        # vision 图的节点指到 model.py 里恰好也有同名调用的行，照样能"命中"。
+        m_head = re.search(r"[（(](\S+?):\d+-\d+[）)]", head)
+        head_file = m_head.group(1) if m_head else None
         if row is None:
             m = re.search(r"[（(](\S+?):(\d+)-\d+[）)]", head)
             src = m and lines_of(m.group(1))
@@ -277,6 +282,11 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
         if not refs:
             continue
         checked += 1
+        if head_file:
+            for fname, _a, _b in refs:
+                if fname and fname != head_file:
+                    errors.append(f"{where} / {row.get('id', '?')}）这一图的源码是 {head_file}，"
+                                  f"节点却指到 {fname}")
         where += f" / {row.get('id', '?')}）"
         text = []
         for fname, a, b in refs:
@@ -294,7 +304,10 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
             # self / x / B / T 这类通用词在任何方法体里都有，不能拿来证明行指对了。
             names = {n for n in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", first)
                      if n not in TRIVIAL_WORDS}
+            # 张量第一行常只是一个短名（h、x、q、k），全是通用词，位置核不了。
+            # 这类节点交给审查者人眼核（试过拿第三行当锚点，但那是说明文字，误报多）。
             if not names:
+                unchecked += 1
                 continue
             blob = "\n".join(text)
             # 整名优先：`self.q_norm` 里的 q_norm、`Embedding` 这样的类型名，直接找
@@ -316,7 +329,7 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int]:
             if not matched:
                 errors.append(f"{where}源码 {row.get('源码')} 里找不到第一行的名字"
                               f"（{ '、'.join(sorted(names)) }）")
-    return errors, checked
+    return errors, checked, unchecked
 
 
 def selftest() -> list[tuple[str, bool]]:
@@ -421,6 +434,23 @@ def selftest() -> list[tuple[str, bool]]:
                        not run(merged.replace("2 × Block", "2 × forward"))))
         checks.append(("计划源码位置：合并层节点伪造类名要报",
                        bool(run(merged.replace("2 × Block", "2 × TotallyFake")))))
+        # 节点指到另一个文件（vision 图的节点指 model.py）
+        cross = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
+                 "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+                 "| qr | 算子 | self.q_norm(qra) | 16 → 16 | | m.py:2 |\n")
+        (root / "other.py").write_text("def forward(self, x):\n    return self.q_norm(x)\n",
+                                       encoding="utf-8")
+        checks.append(("计划源码位置：节点指到另一份源码要报",
+                       bool(run(cross.replace("m.py:2", "other.py:2")))))
+        # 第一行只有短名：报「核不了」的计数
+        short = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
+                 "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+                 "| h | 张量 | h | bf16 [B] | | m.py:2 |\n")
+        with tempfile.TemporaryDirectory() as tmp2:
+            f2 = Path(tmp2) / "d.md"
+            f2.write_text(short, encoding="utf-8")
+            _, _, unc = check_plan_sources(f2, root)
+        checks.append(("计划源码位置：短名节点计入核不了", unc == 1))
 
     return checks
 
@@ -444,13 +474,14 @@ def main() -> int:
         if not args.source_root or not args.source_root.is_dir():
             print("error: 检查计划文件要用 --source-root 指定源码目录", file=sys.stderr)
             return 2
-        errors, checked = check_plan_sources(args.page, args.source_root)
+        errors, checked, unchecked = check_plan_sources(args.page, args.source_root)
         if errors:
             print(f"源码位置核查失败：{len(errors)} 处")
             for e in errors:
                 print(f"  - {e}")
             return 1
-        print(f"源码位置核查通过：{checked} 个节点")
+        note = f"，另有 {unchecked} 个节点第一行只有短名（如 h、x），位置核不了、靠人看" if unchecked else ""
+        print(f"源码位置核查通过：{checked} 个节点{note}")
         return 0
 
     if args.shapes and not args.shapes.exists():
