@@ -1,0 +1,1 @@
+- paper/arxiv-2310.06825.pdf、paper/src-v1/｜论文｜https://arxiv.org/abs/2310.06825v1｜v1｜2026-10-10｜Mistral 7B，提出滑动窗口注意力的那篇：把每个位置能看的前序位置限制在一个固定窗口内，并用环形缓存与分块预填充处理长序列；LaTeX 源码在 src-v1/，相关小节是 Sliding Window Attention、Rolling Buffer Cache、Pre-fill and Chunking

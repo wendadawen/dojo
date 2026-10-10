@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="滑动窗口注意力让序列里每个位置只看它前面一段固定长度的位置，能看的位置随位置一起滑动。">
+  <meta name="dojo:summary" content="让每个位置只与上一层中它前面最多 $W$ 个位置算注意力；逐层叠起来，信息最多能前移 $W \times \text{层数}$ 个位置。">
+  <meta name="dojo:topics" content="注意力机制, 模型结构">
+  <meta name="dojo:tag" content="注意力">
+  <title>滑动窗口注意力</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">滑动窗口注意力</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">滑动窗口注意力</h1>
+<p class="reading-time">正文 913 字 · 约 3 分钟阅读</p>
+
+<p>大语言模型（处理文本的神经网络）的主干是一叠结构相同的网络层，每层各做一遍注意力。每个位置的输入各用一组权重做一次线性变换，得到查询、键、值三个向量；当前位置的查询去和各个位置的键比较，按比较结果把对应的值加权求和，得到这个位置的新表示。这套做法是<a href="../standard-attention/index.html">标准注意力</a>。</p>
+
+<p>滑动窗口注意力（sliding window attention，常缩写为 SWA）把「和哪些位置比」限制在一个局部范围：每个位置只和上一层里它前面的位置算注意力，最远看到前 $W$ 个位置，$W$ 叫窗口大小。这样每个位置比较的键数不再随序列长度增长。它只要一份固定大小的缓存（存已经算过的键和值），能在很长的序列上工作。</p>
+
+<h2 id="s1">1. 一个位置能看多远</h2>
+
+<p>窗口是一个位置能看到的上一层位置的集合。记输入往上数的层号为 $k$，第 $k$ 层位置 $i$ 的表示记作 $h_i$；$h_i$ 只和上一层里位置在 $i-W$ 到 $i$ 的那些位置算注意力，这一段就是它的窗口，$W$ 是窗口大小。窗口的跨度由 $W$ 定，位置每前移一格，窗口也前移一格，所以叫滑动窗口。</p>
+
+<details>
+<summary>取 $W=2$，看每个位置的窗口</summary>
+<p>取窗口大小 $W=2$，一段序列共 6 个位置，编号从 1 开始，看第 $k$ 层每个位置的窗口覆盖上一层哪些位置。位置 $i$ 的窗口从 $\max(1, i-W)$ 到 $i$；窗口覆盖的是上一层的位置，序列开头不足的部分就没有。</p>
+<ol>
+<li>位置 1：上一层位置 1 到 1，只有它自己。</li>
+<li>位置 2：上一层位置 1 到 2。</li>
+<li>位置 3：上一层位置 1 到 3。</li>
+<li>位置 4：上一层位置 2 到 4。</li>
+<li>位置 5：上一层位置 3 到 5。</li>
+<li>位置 6：上一层位置 4 到 6。</li>
+</ol>
+</details>
+
+<h3 id="s1-1">1.1 叠起来能看多远</h3>
+
+<p>一层的窗口最多覆盖到前面 $W$ 个位置，更早的位置要靠层数补。每过一层，信息最多前移 $W$ 个位置，所以叠了 $k$ 层注意力之后，一个位置最远能看到它前面 $W$ 乘 $k$ 个位置。用窗口大小 $W=4096$、32 层代入，最远约 131K 个位置。</p>
+
+<details>
+<summary>三层里最远能看到哪</summary>
+<p>设窗口大小 $W=2$，一段序列至少 10 个位置，看第 3 层位置 10 能到达输入层哪些位置。做法是从窗口最靠前的边界逐层向前回溯。</p>
+<ol>
+<li>第 1 层：位置 10 的窗口是输入层位置 8 到 10，最远到位置 8。</li>
+<li>第 2 层：位置 10 的窗口是第 1 层位置 8 到 10。看最靠前的第 1 层位置 8，它在第 1 层的窗口是输入层位置 6 到 8，最远到位置 6。所以第 2 层最远到输入层位置 6。</li>
+<li>第 3 层：位置 10 的窗口是第 2 层位置 8 到 10。看最靠前的第 2 层位置 8，它在第 2 层的窗口是第 1 层位置 6 到 8，而第 1 层位置 6 的窗口是输入层位置 4 到 6，最远到位置 4。所以第 3 层最远到输入层位置 4。</li>
+<li>从位置 10 到位置 4，距离是 6，正好是 $3 \times 2$。</li>
+</ol>
+</details>
+
+<details>
+<summary>$W=4096$、16K 序列上的加速</summary>
+<p>在输入序列长 16K、窗口大小取 4096 时，比标准注意力基线快 2x。</p>
+</details>
+
+<h2 id="s2">2. 固定大小的环形缓存</h2>
+
+<p>生成（模型逐个位置按顺序写文本）时每算一个新位置，都要拿它的查询去和前面位置的键比较；这些键和值算过一次就存下来复用，这份存储叫缓存（见 <a href="../kv-cache/index.html">KV cache</a>）。窗口固定之后，缓存也能固定：位置 $i$ 算完后，它的键和值存进缓存的第 $i \bmod W$ 个槽，槽是缓存里的一个格子，它当场用自己的键和值参与比较。位置超过 $W$ 之后，新写进来的键和值会覆盖同一个槽里最旧的那份，缓存始终只有 $W$ 个槽，占用因此停在这个固定大小上，不再随序列变长而增大。</p>
+
+<details>
+<summary>取 $W=2$ 走一遍存法</summary>
+<p>窗口大小 $W=2$，缓存有 2 个槽，编号 0、1，位置 $i$ 的键和值存进第 $i \bmod 2$ 个槽。</p>
+<ol>
+<li>位置 1：$1 \bmod 2=1$，存槽 1。</li>
+<li>位置 2：$2 \bmod 2=0$，存槽 0。</li>
+<li>位置 3：$3 \bmod 2=1$，存槽 1，覆盖位置 1 的键和值。</li>
+<li>位置 4：$4 \bmod 2=0$，存槽 0，覆盖位置 2 的键和值。</li>
+</ol>
+<p>写完位置 4，缓存里存着位置 3、4 的键和值，只占 2 个槽。</p>
+</details>
+
+<details>
+<summary>32k 序列上缓存省下的空间</summary>
+<p>序列长 32k 时，固定大小的缓存把缓存占用的空间降到原来的八分之一。</p>
+</details>
+
+<h2 id="s3">3. 一次算完的预填充与分块</h2>
+
+<p>生成时，每个新位置都以上一个为条件。但一段输入序列是一次给出的，不必一个位置一个位置地算：可以一次把整段的键和值算出来，填进缓存，这一步叫预填充。输入序列很长时，一次算完整段会占很多内存，于是把它切成几块依次处理。块长就取窗口大小 $W$。处理一块时，块内位置互相算注意力，块内用<a href="../causal-mask/index.html">因果掩码</a>让每个位置只往左看；块里靠前的位置还要看缓存里更早的键和值，看的范围由滑动窗口定；再往前的已经落在窗口外，不再参与注意力。</p>
+
+<details>
+<summary>三块输入下，第三块里的位置看到什么</summary>
+<p>输入序列切成三块：「The cat sat on」「the mat and saw」「the dog go to」。看第三块「the dog go to」里的位置：它看本块内它前面的位置，用因果掩码只往左看；也看缓存里第二块的位置，看的范围由滑动窗口定。第一块已经在窗口之外，不再看。</p>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>用它的代价是，一个位置在一层之内看不到窗口外的内容。窗口限制的是每个位置直接取值的范围，不是模型记住的范围：窗口外的内容仍会影响预测，把它理解成只记住最近 $W$ 个词是不对的。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot 等. Mistral 7B. arXiv:2310.06825v1, 2023. <a href="https://arxiv.org/abs/2310.06825">https://arxiv.org/abs/2310.06825</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
