@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="辅助损失无关路由是混合专家（MoE）训练里的一种负载均衡做法：给每个专家加一个偏置，只加到「选哪些专家」的判定上、不加到门控权重，再按专家负载用固定小步更新这个偏置，因此不用额外写辅助损失项（鼓励均衡的额外损失项）。">
+  <meta name="dojo:summary" content="把专家偏置 $b_i$ 加到路由分数上，只用 $s_{i,t}+b_i$ 决定 top-k 选谁，门控值仍取原始 $s_{i,t}$；每步训练后按 $b_i \leftarrow b_i + \gamma\,\mathrm{sign}(\bar c_i - c_i)$ 更新偏置，过载减、欠载增，不产生干扰梯度。">
+  <meta name="dojo:topics" content="训练与优化, 模型结构">
+  <meta name="dojo:tag" content="MoE">
+  <title>辅助损失无关路由</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">辅助损失无关路由</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">辅助损失无关路由</h1>
+<p class="reading-time">正文 1,749 字 · 约 6 分钟阅读</p>
+
+<p>大语言模型（用大量文本训练、能按上文续写的模型）的主干是一叠结构相同的网络层，这类层叫 Transformer 层。每层里有一块对所有位置各算一次的前馈网络（前馈层），作用是把每个位置的向量做一次变换；其中若干前馈层常被换成混合专家（<a href="../deepseek-moe/index.html">MoE</a>）层。MoE 层里有多个结构相同的小网络，每个叫一个专家；对每个 token（文本切分后的基本单位），路由分数给每个专家打一个分，只选分最高的几个专家来算，其余不参与。这样一个 token 只用到一部分参数，参数总量可以远大于每个 token 实际参与计算的量。</p>
+
+<p>不加约束时，路由会持续把多数 token 分给少数专家，被选中的专家得到更多训练，其余专家得不到足够训练，这种失效叫路由坍塌（routing collapse）。辅助损失无关路由把均衡交给一个偏置：给每个专家加一个偏置，只用它调整「选哪些专家」的判定，不加到门控权重，再按专家负载逐步更新这个偏置；偏置不进反向传播（按损失算出的梯度回传并据此更新参数，这一步叫反向传播，损失是衡量模型输出与目标差距、被最小化的函数），因此不给主任务添额外梯度。</p>
+
+<h2 id="s1">1. 为什么要绕开辅助损失</h2>
+
+<p>负载失衡的另一重代价来自专家并行——把不同专家放到不同设备上并行计算，叫专家并行；负载不均会让一部分设备排队、另一部分空闲，拖慢整体计算。</p>
+
+<p>常见的对策是在损失函数里加一项辅助损失，推动 token 均匀分到各专家。对长度为 $T$ 的序列，它写成 $L_{bal}=\alpha\sum_{i=1}^{N}f_i P_i$：$N$ 是路由专家总数（辅助损失只作用在路由专家上），$f_i$ 是分给专家 $i$ 的 token 比例，$P_i$ 是专家 $i$ 的平均路由分数，$\alpha$ 是控制这项强弱的权重。$f_i$ 与 $P_i$ 都随训练变化，$\alpha$ 越大，均衡被推得越紧。</p>
+
+<p>问题在于这是一项额外的损失项，它的梯度会掺进主任务的梯度里，使更新方向偏离语言建模目标（让模型预测下一个 token），这种多余的梯度叫干扰梯度。$\alpha$ 因此两难：取小了不足以抑制失衡，取大了会损害模型性能。</p>
+
+<h2 id="s2">2. 偏置只决定选哪些专家，不改门控权重</h2>
+
+<p>第 $t$ 个 token 送进 MoE 层前是一个向量 $\mathbf{u}_t$；每个专家 $i$ 有一个同样维度的可学习向量 $\mathbf{e}_i$，叫中心向量。路由分数取两者的内积再过一个 sigmoid，$s_{i,t}=\sigma(\mathbf{u}_t^{\top}\mathbf{e}_i)$，$\sigma$ 把任意实数压到 0 到 1 之间。</p>
+
+<p>带偏置的判定是：给每个专家一个偏置 $b_i$，选专家时看的不是 $s_{i,t}$ 而是 $s_{i,t}+b_i$。若 $s_{i,t}+b_i$ 落在所有 $\{s_{j,t}+b_j\}$ 的前 $K_r$ 名（$K_r$ 是每个 token 选几个路由专家），专家 $i$ 被选中，此时它的门控值取原始分数 $s_{i,t}$；没被选中则取 0。把未归一化的门控值记作 $g'_{i,t}$，被选中时为 $s_{i,t}$，否则为 0。</p>
+
+<p>门控值还要归一化：$g_{i,t}=g'_{i,t}/\sum_{j=1}^{N_r}g'_{j,t}$，分母只对被选中的专家求和（其余 $g'_{j,t}$ 为 0），$N_r$ 是路由专家总数；分母只含路由分数，不含偏置 $b_i$。MoE 层的输出把共享专家（始终激活、不参与路由的专家）与路由专家两部分加权相加，再加回输入：$\mathbf{h}'_t=\mathbf{u}_t+\sum_{i=1}^{N_s}\mathrm{FFN}_i^{(s)}(\mathbf{u}_t)+\sum_{i=1}^{N_r}g_{i,t}\mathrm{FFN}_i^{(r)}(\mathbf{u}_t)$，$N_s$ 是共享专家数，$\mathrm{FFN}^{(s)}$、$\mathrm{FFN}^{(r)}$ 分别是共享、路由专家的前馈网络。</p>
+
+<details>
+<summary>为什么只有偏置的相对差起作用</summary>
+<ol>
+<li>选专家时比较的是每个专家的 $s_{j,t}+b_j$。</li>
+<li>把每个 $b_j$ 同时加上同一个常数 $c$，每个分数都变成 $s_{j,t}+b_j+c$。</li>
+<li>所有分数同加一个数，大小排序不变，前 $K_r$ 名仍是同一批专家，选中的专家不变。</li>
+<li>所以真正起作用的是偏置之间的相对差，全体偏置一起平移没有效果。</li>
+</ol>
+</details>
+
+<p>因为 $b_i$ 不出现在任何乘进输出的项里，它不进入计算图（训练时记录每一步运算、供反向传播求梯度的结构），反向传播不会为它算梯度；它的更新在每步训练之外单独进行。这就是「辅助损失无关」的来处：不写任何辅助损失项，也就不产生干扰梯度。</p>
+
+<h2 id="s3">3. 按负载偏差的符号更新偏置</h2>
+
+<p>每个训练步里统计每个专家被分到多少 token：记 $c_i$ 为专家 $i$ 在这一步的整批数据上分到的 token 数，$\bar c_i=\frac{1}{N_r}\sum_{j=1}^{N_r}c_j$ 是所有路由专家负载的平均值。两者之差 $\bar c_i-c_i$ 是负载偏差：为正表示专家 $i$ 分到的 token 少于平均（欠载），为负表示多于平均（过载）。</p>
+
+<p>偏置按一条固定规则更新：$b_i\leftarrow b_i+\gamma\cdot\mathrm{sign}(\bar c_i-c_i)$。$\gamma$ 是步长，叫 bias update speed；$\mathrm{sign}$ 取符号，正数为 $+1$、负数为 $-1$、零为 $0$。欠载的专家偏差为正，$b_i$ 增加 $\gamma$，下一次它的 $s_{i,t}+b_i$ 更容易排进前 $K_r$；过载的专家偏差为负，$b_i$ 减少 $\gamma$，更不容易被选中；负载恰好等于平均则不变。偏置在训练开始时初始化为 0；原始资料的实验取 $\gamma=0.001$。</p>
+
+<p>偏置不通过反向传播学习：梯度下降（按梯度更新参数的那套方法）看不到它，每步训练结束后单独按规则更新一次。用 $\mathrm{sign}$ 而不是按偏差幅度更新，是因为把更新式换成 $b_i\leftarrow b_i+\gamma(\bar c_i-c_i)$ 的连续版本后，偏差大的专家偏置变化更快、负载更均衡一点，但模型性能没有变好，所以保留了更简单的 $\mathrm{sign}$ 版本。$\mathrm{sign}$ 只保留方向、丢掉幅度：差 1 个 token 和差很多个 token，走的步长一样。</p>
+
+<p>更新用的是历史数据（已经算过的部分）的负载，而不是当前序列里还没算到的 token 的信息。若拿当前序列的负载去调偏置，序列里靠前的 token 就用到了靠后 token 的信息，破坏语言模型的因果约束、泄露未来的 token。</p>
+
+<details>
+<summary>符号更新与按幅度更新的对照</summary>
+<p>把更新式里偏差的符号 $\mathrm{sign}(\bar c_i-c_i)$ 换成偏差本身 $\bar c_i-c_i$，在 1B（10 亿）参数模型上的验证困惑度（perplexity，衡量模型预测下一个 token 的确信程度、越低越好）与全局最大偏差 MaxVio（越低越均衡）如下。连续版本的 MaxVio 更低（更均衡），但困惑度没有更低。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>更新式</th><th style="text-align:right">验证困惑度</th><th style="text-align:right">MaxVio</th></tr></thead>
+<tbody>
+<tr><td>$b_i=b_i+\gamma\,\mathrm{sign}(\bar c_i-c_i)$，$\gamma=0.001$</td><td style="text-align:right">9.50</td><td style="text-align:right">0.044</td></tr>
+<tr><td>$b_i=b_i+\gamma\,(\bar c_i-c_i)$，$\gamma=0.001$</td><td style="text-align:right">9.51</td><td style="text-align:right">0.036</td></tr>
+<tr><td>$b_i=b_i+\gamma\,(\bar c_i-c_i)$，$\gamma=0.01$</td><td style="text-align:right">9.53</td><td style="text-align:right">0.028</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h3 id="s3-1">3.1 手算一个 4 专家选 2 的训练步</h3>
+
+<p>设 4 个路由专家（编号 0 到 3）、每个 token 选 2 个、一批 4 个 token，初始偏置全为 0；为便于手算，把步长取为 $\gamma=0.1$（实际用 $0.001$）。</p>
+
+<details>
+<summary>两轮选择的完整过程</summary>
+<p>第一轮 4 个 token 对 4 个专家的路由分数 $s_{i,t}$ 如下（这一步偏置全为 0，$s_{i,t}+b_i=s_{i,t}$）。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>token</th><th style="text-align:right">专家 0</th><th style="text-align:right">专家 1</th><th style="text-align:right">专家 2</th><th style="text-align:right">专家 3</th></tr></thead>
+<tbody>
+<tr><td>$t_1$</td><td style="text-align:right">0.55</td><td style="text-align:right">0.30</td><td style="text-align:right">0.50</td><td style="text-align:right">0.10</td></tr>
+<tr><td>$t_2$</td><td style="text-align:right">0.52</td><td style="text-align:right">0.48</td><td style="text-align:right">0.20</td><td style="text-align:right">0.15</td></tr>
+<tr><td>$t_3$</td><td style="text-align:right">0.35</td><td style="text-align:right">0.10</td><td style="text-align:right">0.20</td><td style="text-align:right">0.30</td></tr>
+<tr><td>$t_4$</td><td style="text-align:right">0.60</td><td style="text-align:right">0.45</td><td style="text-align:right">0.25</td><td style="text-align:right">0.20</td></tr>
+</tbody>
+</table>
+</div>
+<p>第一轮按每行取最大的 2 个：</p>
+<ol>
+<li>$t_1$ 选专家 0（0.55）和专家 2（0.50）。</li>
+<li>$t_2$ 选专家 0（0.52）和专家 1（0.48）。</li>
+<li>$t_3$ 选专家 0（0.35）和专家 3（0.30）。</li>
+<li>$t_4$ 选专家 0（0.60）和专家 1（0.45）。</li>
+</ol>
+<p>第一轮各专家被选中次数 $c=(4,2,1,1)$，平均 $\bar c_i=(4+2+1+1)/4=2$。负载偏差 $d_i=\bar c_i-c_i$ 为 $(2-4,\,2-2,\,2-1,\,2-1)=(-2,0,1,1)$，符号为 $(-1,0,1,1)$；乘以 $\gamma=0.1$ 后偏置更新为 $b=(-0.1,\,0,\,0.1,\,0.1)$，专家 0 的偏置降、专家 2 和 3 的偏置升。</p>
+<p>第二轮用新偏置，比较 $s_{i,t}+b_i$：</p>
+<ol>
+<li>$t_1$：$(0.45,0.30,0.60,0.20)$，选专家 2（0.60）和专家 0（0.45）。</li>
+<li>$t_2$：$(0.42,0.48,0.30,0.25)$，选专家 1（0.48）和专家 0（0.42）。</li>
+<li>$t_3$：$(0.25,0.10,0.30,0.40)$，选专家 3（0.40）和专家 2（0.30），专家 0 落选。</li>
+<li>$t_4$：$(0.50,0.45,0.35,0.30)$，选专家 0（0.50）和专家 1（0.45）。</li>
+</ol>
+<p>第二轮各专家被选中次数变成 $c=(3,2,2,1)$：专家 0 从 4 降到 3，专家 2 从 1 升到 2，其余不变，负载更均衡了。</p>
+<div class="code-block"><pre><code class="language-python">s = [[0.55, 0.30, 0.50, 0.10],
+     [0.52, 0.48, 0.20, 0.15],
+     [0.35, 0.10, 0.20, 0.30],
+     [0.60, 0.45, 0.25, 0.20]]
+n, topk, gamma = 4, 2, 0.1
+b = [0.0] * n
+
+def choose(scores):
+    return sorted(range(n), key=lambda i: scores[i], reverse=True)[:topk]
+
+def counts(bias):
+    c = [0] * n
+    for row in s:
+        for i in choose([row[j] + bias[j] for j in range(n)]):
+            c[i] += 1
+    return c
+
+c1 = counts(b)
+mean = sum(c1) / n
+b2 = [round(b[i] + gamma * (1 if mean &gt; c1[i] else (-1 if mean &lt; c1[i] else 0)), 4)
+      for i in range(n)]
+c2 = counts(b2)
+print("第 1 轮 c:", c1)
+print("平均负载:", mean)
+print("第 2 轮 b:", b2)
+print("第 2 轮 c:", c2)</code></pre></div>
+<div class="code-block"><pre><code class="language-text">第 1 轮 c: [4, 2, 1, 1]
+平均负载: 2.0
+第 2 轮 b: [-0.1, 0.0, 0.1, 0.1]
+第 2 轮 c: [3, 2, 2, 1]</code></pre></div>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>这套方法只看每个训练步整批数据上的负载 $c_i$：它把批一级的负载拉平，不检查单个序列内部。可能出现一个序列里的 token 都选中同一组专家，而批一级仍然均衡。要限制单个序列内的极端失衡，需要另加一项序列级的均衡损失来补。</p>
+
+<p>$\gamma$ 取得过小，偏置收敛慢、早期负载均衡差；取得过大，偏置在训练后期来回波动，反而破坏后期的负载均衡。$\mathrm{sign}$ 只保留方向、每步走固定的一小步，因此要靠很多步慢慢逼近均衡。</p>
+
+<p>一个常见的误解，是把 $b_i$ 当成会进加权的偏置，以为被选中后门控值用的是 $s_{i,t}+b_i$；实际上门控值与归一化分母都用原始 $s_{i,t}$。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Lean Wang, Huazuo Gao, Chenggang Zhao 等. Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts. arXiv:2408.15664v1, 2024. <a href="https://arxiv.org/abs/2408.15664">https://arxiv.org/abs/2408.15664</a></li>
+<li>DeepSeek-AI. DeepSeek-V3 Technical Report. arXiv:2412.19437v2, 2025. <a href="https://arxiv.org/abs/2412.19437">https://arxiv.org/abs/2412.19437</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
