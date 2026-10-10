@@ -1,0 +1,2 @@
+- paper/arxiv-v7.pdf、paper/src-v7/、paper/arxiv-v7.txt｜论文｜https://arxiv.org/abs/1706.03762v7｜v7（2023-08-02 修订）｜2026-10-10｜Attention Is All You Need，提出 Transformer 与其中的缩放点积注意力；LaTeX 源码在 src-v7/（正文按节拆分为 model_architecture.tex、why_self_attention.tex 等），纯文本快照 arxiv-v7.txt
+- repo/tensor2tensor/｜仓库｜https://github.com/tensorflow/tensor2tensor｜bafdc1b67730430d38d6ab802cbd51f9d053ba2e（2023-04-01）｜2026-10-10｜论文正文写明训练与评测所用代码在此仓库，作者团队的实现
