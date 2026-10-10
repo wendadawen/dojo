@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="FP8 块量化把权重和激活按固定大小分组，每组各自算一个缩放因子，元素缩放后存成 8 位浮点 E4M3，反量化时乘回该组的缩放因子。">
+  <meta name="dojo:summary" content="8 位浮点 E4M3 能表示的正规数最大只有 $448$，动态范围窄。块量化把张量切成 $128\times128$（权重）或 $1\times128$（激活）的小块，每块用自己的 $s=\max|W|/448$ 缩放，再存成 E4M3；整个张量共用一个缩放因子时，缩放因子会被少数离群值主导，量化精度下降。">
+  <meta name="dojo:topics" content="训练与优化">
+  <meta name="dojo:tag" content="量化">
+  <title>FP8 块量化</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">FP8 块量化</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">FP8 块量化</h1>
+<p class="reading-time">正文 1,323 字 · 约 4 分钟阅读</p>
+
+<p>模型把权重（模型的可学参数）和激活（前向计算中逐层流动的数值，前向计算指从输入开始按层逐层算出输出的过程）保存成张量，张量是多维数组。把每个数用 8 位浮点 E4M3 存下，比用 16 位格式存省空间，也降低读写这些数时的访存带宽压力。但 8 位能表示的数范围很窄。FP8 块量化把张量切成固定大小的块，每块各自算一个缩放因子 $s$，块内元素除以 $s$ 后存成 E4M3，用的时候再乘回 $s$。每块用自己的缩放因子，8 位的窄范围因此能逐块贴合本块的数据。</p>
+
+<h2 id="s1">1. E4M3：可表示范围与特殊值取舍</h2>
+
+<p>E4M3 是 8 位浮点：1 个符号位 $S$、4 个指数位 $E$、3 个尾数位 $M$，把 8 位写成 $S.EEEE.MMM$ 三段。它的指数带偏置 $7$，正规数的值写成</p>
+
+<p>$$F = (-1)^S \times 1.M \times 2^{E-7},$$</p>
+
+<p>其中 $1.M$ 表示把三位尾数看成小数点后的三位二进制小数、前面补一个隐含的 1。指数域 $E$ 从 $1$ 到 $15$，对应指数 $-6$ 到 $8$。最大正规数写作 $S.1111.110$，值为 $1.75 \times 2^8 = 448$；最小正规数是 $2^{-6}$，次正规数最小到 $2^{-9}$。</p>
+
+<p>E4M3 不表示无穷，只保留一种尾数位型给 NaN（正负各一个）。按 IEEE 754 的惯例，指数域全为 $1$ 的一段位型留给无穷和 NaN；E4M3 把这一段里除 $S.1111.111$ 之外的位型都让给正规数，于是多出七个更大的数，最大正规数从按惯例会得到的 $240$ 提到 $448$，动态范围（能表示的数值跨度）多出一个 2 的幂。这样取舍，是因为多出来的取值范围比多支持几个特殊值有用；正负号与零的对称性仍然保留。</p>
+
+<details>
+<summary>解出 448，以及 240 与 480 的来历</summary>
+<ol>
+<li>指数带偏置 $7$，$E=15$ 时指数为 $15-7=8$。</li>
+<li>取位型 $0.1111.110$：$S=0$，$E=1111_2=15$，尾数位 $110_2$ 表示小数 $0.75$，故 $1.M=1.75$。代入 $F=1.75\times 2^{8}=1.75\times 256=448$。</li>
+<li>若沿用 IEEE 惯例、把指数域 $1111$ 整段留给无穷和 NaN，最大正规数的指数只到 $14$，此时 $1.875\times 2^{14-7}=1.875\times 128=240$。</li>
+<li>回收这段位型后就多出 $256、288、320、352、384、416、448$ 七个数，最大从 $240$ 变成 $448$。</li>
+<li>若零只留一个编码、NaN 也只留一个编码（放弃正负对称），省下的位型可以再让给正规数，最大可达 $1.875\times 2^8=480$；但会破坏 IEEE 格式里可用整数比较正负浮点数的性质，代价不值得，故不取。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 缩放：把张量对准可表示区间</h2>
+
+<p>把精度更高的数直接按 E4M3 存下，会有一部分数超出 E4M3 能表示的范围。通用做法是先把张量整体缩放，让它的最大绝对值落到 E4M3 能表示的最大值附近，再转换；溢出的值饱和到该格式能表示的最大值，转换完再把缩放的倍数乘回去。</p>
+
+<p>一个张量共用一个缩放因子时，缩放因子由张量的最大绝对值定出。这种做法对离群值高度敏感：少数远大于其余元素的值会主导这个缩放因子，量化精度下降。</p>
+
+<details>
+<summary>一个离群值把最小的元素舍入为 0</summary>
+<p>取一个张量，元素是 $6.5$、$0.5$、$0.00001$，整个张量共用一个缩放因子。</p>
+<ol>
+<li>缩放因子 $s=6.5/448=0.0145089286$。</li>
+<li>$6.5$ 除以 $s$ 得 $448$，正好落在 E4M3 的最大正规数上，精确还原为 $6.5$。</li>
+<li>$0.5$ 除以 $s$ 得 $34.46$，最近的 E4M3 值是 $36$，还原 $36\times s=0.5223$，相对误差约 $4.5\%$。</li>
+<li>$0.00001$ 除以 $s$ 得 $0.000689$，低于最小次正规数 $2^{-9}\approx 0.001953$ 的一半，舍入为 $0$，这个元素被整个丢掉。</li>
+<li>把 $0.00001$ 单独放一块，块内最大值就是它，除以 $s$ 得 $448$，精确还原；同一元素从被丢弃变为零误差。可见误差取决于块内元素的范围，而不只取决于元素自己。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 分块：权重 128×128、激活 1×128</h2>
+
+<p>缩小粒度能缓解这个问题：不让整个张量共用一个缩放因子，而是把张量切成小块，每块各自一个。矩阵乘法 $C=A\times B$ 里，$A$ 的形状是 $M\times K$、$B$ 是 $K\times N$，$K$ 是两个矩阵共享的内维，$C$ 的形状是 $M\times N$。权重和激活各自按内维 $K$ 的方向分组：一个权重矩阵 $B$ 按 $128$ 个输入通道乘 $128$ 个输出通道切一块，激活按每个 token 的 $128$ 个通道切一片。token 是文本被分词后的一小段，前向计算时一个 token 对应激活矩阵的一行；通道是激活向量里的一个位置。</p>
+
+<p>缩放因子在运行时对该块在线求出：取这一块里绝对值最大的元素 $a$，令 $s=a/448$。块内元素 $x$ 存成把 $x/s$ 舍入到最近的 E4M3 值的结果；反量化时把存下的值乘回 $s$。放大到整块：形状为 $K\times N$ 的权重按 $128\times128$ 切，缩放因子的形状是 $(K/128)\times(N/128)$，每个块一个。</p>
+
+<details>
+<summary>一个块内 6.0、0.5 与 0.05 的往返</summary>
+<p>取一个块，块内绝对值最大的是 $6.0$，另有元素 $0.5$ 和 $0.05$。</p>
+<ol>
+<li>块内最大值 $6.0$ 定出缩放因子 $s=6.0/448=0.0133928571$。</li>
+<li>最大值除以 $s$ 得 $448$，正好落在 E4M3 的最大正规数上，精确还原为 $6.0$。</li>
+<li>$0.5$ 除以 $s$ 得 $37.33$，最近的 E4M3 值是 $36$，还原 $36\times s=0.4821$，相对误差约 $3.6\%$。</li>
+<li>$0.05$ 除以 $s$ 得 $3.733$，最近的 E4M3 值是 $3.75$，还原 $3.75\times s=0.05022$，相对误差约 $0.45\%$。</li>
+<li>把 $0.05$ 单独放一块时，它自己就是块内最大值，除以 $s$ 得 $448$，精确还原。同一元素的相对误差从 $0.45\%$ 降到 $0$。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 配套：E4M3 全用与累加精度</h2>
+
+<p>惯例是让反向传播里的梯度用 E5M2、只给前向的权重和激活用 E4M3，这也是这两种编码的推荐用法；E5M2 有 5 个指数位、2 个尾数位。这里连反向传播（从输出端往回逐层计算、据此更新权重的那一趟）的梯度也用 E4M3，所有权重、激活、梯度一律 E4M3。这么做的理由是分组缩小后，块内元素共用一个缩放因子，取值范围有限的限制被限制在块内。</p>
+
+<p>反量化嵌在累加里完成。FP8 矩阵乘法在 GPU（做并行数值计算的处理器）的 Tensor Core（做矩阵乘加的专用单元）上逐段累加，累加保留的有效位数有限：在 H800（一款 GPU）上只有约 14 位。为此每累计一段元素，就把部分和搬到 CUDA Core（GPU 的通用计算单元）上的 FP32（32 位浮点）寄存器里做全精度累加，块缩放因子也在那里乘进去。</p>
+
+<details>
+<summary>14 位累加与 K=4096 的误差</summary>
+<ol>
+<li>Tensor Core 上 FP8 矩阵乘法的累加只保留约 14 位，低于 FP32 的累加精度；内维 $K$ 越大问题越突出。</li>
+<li>取两个随机矩阵、内维 $K=4096$，有限累加精度带来的最大相对误差接近 $2\%$。</li>
+<li>每累计 $128$ 个元素就提升到 FP32 做全精度累加，是能改善精度、又不带来大开销的最小间隔。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>块量化成立的前提是块内元素能被一个缩放因子合理表示。分组越小，缩放因子越能贴近组内元素，越能容纳离群值。</p>
+
+<p>代价是每个块都要多存一个缩放因子，随权重或激活一起保存；反量化是一步额外算术。</p>
+
+<p>一个常见误解是把块量化当成逐张量缩放。逐张量缩放是整个张量共用一个缩放因子，正是块量化要取代的做法；块量化按块给出多个缩放因子。</p>
+
+<details>
+<summary>一个反例：激活梯度按权重式 128×128 分块量化会发散</summary>
+<ol>
+<li>激活按 $1\times128$ 分片，反向传播时需要换成 $128\times1$ 的分组。若改用更直接的做法——把激活梯度也照权重的 $128\times128$ 分块量化、反向只需转置——训练会发散。</li>
+<li>对象是一个约 16B（B 指十亿）总参数的 MoE 模型（MoE 指混合专家，一种每层有多个专家子网络、每个 token 只激活其中几个的模型），训练约 300B 个 token。</li>
+<li>一种解释是激活梯度在不同 token 之间高度不平衡，产生与 token 相关的离群值，块量化难以处理这种离群值。</li>
+</ol>
+</details>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Paulius Micikevicius, Dusan Stosic, Patrick Judd 等. FP8 Formats for Deep Learning. arXiv:2209.05433v2, 2022. <a href="https://arxiv.org/abs/2209.05433">https://arxiv.org/abs/2209.05433</a></li>
+<li>DeepSeek-AI. DeepSeek-V3 Technical Report. arXiv:2412.19437v2, 2024. <a href="https://arxiv.org/abs/2412.19437">https://arxiv.org/abs/2412.19437</a></li>
+<li>DeepSeek-AI. DeepSeek-V3 仓库与模型配置（inference/kernel.py、inference/configs/config_671B.json、hf-config.json）. commit 9b4e978. <a href="https://github.com/deepseek-ai/DeepSeek-V3">https://github.com/deepseek-ai/DeepSeek-V3</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

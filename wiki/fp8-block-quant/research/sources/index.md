@@ -1,0 +1,7 @@
+- paper/fp8-formats-2209.05433v2.pdf｜论文 PDF｜https://arxiv.org/abs/2209.05433 v2｜2026-10-10｜论文《FP8 Formats for Deep Learning》的 PDF，提出 E4M3 与 E5M2 两种 8 位浮点编码
+- paper/fp8-formats-2209.05433v2.txt｜论文纯文本快照｜https://arxiv.org/html/2209.05433v2｜2026-10-10｜论文 HTML 渲染页转成的纯文本，记两种编码的偏置、最大正规数、特殊值取舍，以及逐张量缩放因子的实验（4.2、4.3 节）
+- paper/deepseek-v3-2412.19437v2.pdf｜论文 PDF｜https://arxiv.org/abs/2412.19437 v2｜2026-10-10｜论文《DeepSeek-V3 Technical Report》的 PDF，其 3.3 节提出 FP8 训练的细粒度（tile- 与 block-wise）量化
+- paper/deepseek-v3-2412.19437v2.txt｜论文纯文本快照｜https://arxiv.org/html/2412.19437v2｜2026-10-10｜论文 HTML 渲染页转成的纯文本，记分块粒度（激活 1×128、权重 128×128）、在线取 max、FP32 累加、全用 E4M3，以及附录 B.2 的块量化反例
+- repo/deepseek-v3/｜官方仓库文件｜https://github.com/deepseek-ai/DeepSeek-V3｜commit 9b4e9788e4a3a731f7567338ed15d3ec549ce03b｜2026-10-10｜官方推理示例：inference/kernel.py 里 128 块、scale=448/amax、钳位 1e-4、ue8m0 的二次移动，以及权重量化/反量化与 GEMM 的接口；inference/configs/config_671B.json 给出 dtype fp8
+- repo/deepseek-v3/hf-config.json｜官方模型配置｜https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json｜2026-10-10｜官方发布的模型配置，quantization_config 记 quant_method fp8、fmt e4m3、weight_block_size [128, 128]、activation_scheme dynamic
+- repo/deepseek-v3/README.md｜官方仓库说明｜https://github.com/deepseek-ai/DeepSeek-V3/blob/main/README.md｜commit 9b4e9788e4a3a731f7567338ed15d3ec549ce03b｜2026-10-10｜官方仓库 README，说明 FP8 训练框架与「只提供 FP8 权重、需时可转 BF16」
