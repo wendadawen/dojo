@@ -249,6 +249,9 @@ def parse(plan: Path) -> dict:
         for no, nid, target in v["drills"]:
             if nid not in by_id:
                 fail(no, f"{where}里没有节点「{nid}」")
+            if by_id[nid].get("drill"):
+                # 一个节点只留一条点开，第二条会静默覆盖前一条，报出来
+                fail(no, f"{where}节点「{nid}」有不止一条点开，只留一条")
             tid = find_view(target)
             if tid is None:
                 fail(no, f"点开的目标「{target}」不是任何一张图的标题")
@@ -651,6 +654,9 @@ def selftest() -> list[tuple[str, bool]]:
         for name, broken in [
             ("连线指向不存在的节点应当报错", TOY_PLAN.replace("- ids → blk", "- ids → nope")),
             ("点开的目标不存在应当报错", TOY_PLAN.replace("点开 → ToyBlock.forward", "点开 → Nope")),
+            ("一个节点挂两条点开应当报错",
+             TOY_PLAN.replace("- blk 点开 → ToyBlock.forward",
+                              "- blk 点开 → ToyBlock.forward\n- blk 点开 → ToyModel.forward")),
             ("折叠写在张量上应当报错", TOY_PLAN.replace("| blk | 公式 |", "| ids | 公式 |")),
             ("折叠名字不对应当报错", TOY_PLAN.replace("| blk | 公式 |", "| blk | 残差 |")),
             ("类型写错应当报错", TOY_PLAN.replace("| ids | 张量 |", "| ids | 向量 |")),

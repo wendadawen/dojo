@@ -227,13 +227,17 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
 
             # ① 键名紧跟形状
             for m in NAME_THEN_SHAPE.finditer(blob):
-                # 形状后面紧跟键注（②/③ 的形态）时，前面的标识符不是键名——
-                # 那可能只是说明文字或节点名的尾巴（如 `... 源码里叫 norm.weight`
-                # 这种符号栏格式，或节点名 attn_sink）。交给 ②/③ 按括号里的键名处理，
-                # 别把它当成「键名紧跟形状」而凭空报「键不在形状表里」。
-                if re.match(r"\s*[（(](?:检查点键|源码里叫)", blob[m.end():m.end() + 12]):
+                ident = placeholder(m.group(1))
+                # 形状紧跟键注（形态③：`[64]（检查点键 X）`）时，形状前面那个标识符
+                # 往往只是节点名或说明文字的尾巴（attn_sink、core），不是键名。
+                # 「检查点键」一定带点（module.path.weight 形态），据此区分：
+                # 无点的裸标识符不当键名，交给 ② 按括号里的键名处理；
+                # 带点的（含拼错的 `gate.wieght`）照旧核，拼错要报出来。
+                annotated = re.match(r"\s*[（(](?:检查点键|源码里叫)",
+                                     blob[m.end():m.end() + 12])
+                if annotated and "." not in ident:
                     continue
-                key = resolve(placeholder(m.group(1)))
+                key = resolve(ident)
                 if key is None:
                     continue
                 compare(key, m.group(2))
@@ -317,8 +321,8 @@ def plan_rows(text: str):
                 yield head, no, dict(zip(cols, cells))
 
 
-# 行区间分隔符：半角连字符、en-dash、em-dash、波浪都认（手写常敲成后三种）
-RANGE = r"[-\u2013\u2014~]"
+# 行区间分隔符：半角连字符、en-dash、em-dash、波浪，含全角（手写常敲错）
+RANGE = r"[-\u2013\u2014~\uff5e\uff0d]"
 
 
 def parse_refs(cell: str) -> list[tuple[str, int, int]]:
@@ -542,6 +546,13 @@ def selftest() -> list[tuple[str, bool]]:
                      "detail": "[64]（检查点键 layers.{i}.attn.attn_sink）"}]}],
         {"layers.{i}.attn.attn_sink": [64]})
     checks.append(("裸形状 + 键注：前面是标识符也不误报键名", not e_f3b and m_f3b == 1))
+    # 反向：form① 键名拼错、形状后面又跟了有效键注，拼错的键名仍要报
+    e_f3c, m_f3c = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                     "detail": "gate.wieght [16, 32]（检查点键 gate.weight）"}]}],
+        {"gate.weight": [16, 32]})
+    checks.append(("带点的错键名后面跟键注也要报", bool(e_f3c)))
     checks.append(("同一个错键只报一条",
                    len([e for e in e_dup if "gate.wieght" in e]) == 1))
 
@@ -623,9 +634,9 @@ def selftest() -> list[tuple[str, bool]]:
         checks.append(("计划源码位置：顿号分隔的行号能解析",
                        _refs_ok()))
         # 行区间分隔符：半角、en-dash、em-dash、波浪都认
-        checks.append(("计划源码位置：四种行区间分隔符都能解析",
+        checks.append(("计划源码位置：六种行区间分隔符都能解析",
                        all(parse_refs(f"m.py:1{c}3") == [("m.py", 1, 3)]
-                           for c in "-\u2013\u2014~")))
+                           for c in "-\u2013\u2014~\uff5e\uff0d")))
         # 全角冒号是手写常见写法，该认；不能因此免检，也不能误报
         checks.append(("计划源码位置：全角冒号的源码列能解析",
                        not run(good.replace("m.py:2", "m.py：2"))))
@@ -708,6 +719,19 @@ def main() -> int:
         return 2
 
     views = load_views(args.page)
+
+    if args.names_only and args.shapes:
+        print("error: --names-only 与 --shapes 互斥（只核名字就不会核形状），"
+              "去掉其中一个再跑", file=sys.stderr)
+        return 2
+    if args.source_root:
+        print("error: --source-root 只用于计划文件（.md），核查页面用 --source "
+              "指名源码文件", file=sys.stderr)
+        return 2
+    if not args.source and not args.shapes:
+        print("error: 什么都没核：页面核查要至少给一个 --source 或 --shapes",
+              file=sys.stderr)
+        return 2
 
     sources: dict[str, str] = {}
     labeled: list[tuple[str, str]] = []
