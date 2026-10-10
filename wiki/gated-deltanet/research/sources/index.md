@@ -1,0 +1,2 @@
+- paper/arxiv-v3.pdf、paper/src-v3/、paper/arxiv-v3.txt｜arXiv:[2412.06464](https://arxiv.org/abs/2412.06464)｜v3（2025-03-06 修订）｜2026-10-10｜提出 gated delta rule 与 Gated DeltaNet 的论文：LaTeX 源码在 src-v3/，纯文本快照 arxiv-v3.txt
+- repo/GatedDeltaNet/｜[https://github.com/NVlabs/GatedDeltaNet](https://github.com/NVlabs/GatedDeltaNet)｜b53d6d3a161267432a79c1c04af69fa52bddc921（2026-03-13）｜2026-10-10｜NVIDIA 官方 PyTorch 实现：Gated DeltaNet 层与前向、分块算法算子
