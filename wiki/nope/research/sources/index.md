@@ -1,0 +1,4 @@
+- paper/arxiv-v2.pdf｜https://arxiv.org/abs/2305.19466｜v2（2023-11-06，NeurIPS 2023）｜2026-10-10｜提出并研究 NoPE 的原始论文：系统比较五种位置编码方案在长度泛化上的表现，NoPE 指不加任何位置编码的 decoder-only Transformer
+- paper/arxiv-v2.txt｜https://arxiv.org/abs/2305.19466｜v2（2023-11-06）｜2026-10-10｜同上论文由 PDF 转出的纯文本，供正文数字核对
+- paper/src-v2/main.tex｜https://arxiv.org/abs/2305.19466｜v2（2023-11-06）｜2026-10-10｜论文 LaTeX 源码主文件，含全部章节、证明与实验细节
+- repo/length-generalization｜https://github.com/McGill-NLP/length-generalization｜ffae2f105fca54d0c1b727279576cae94473aa52｜2026-10-10｜论文官方代码仓库，含实验配置、训练与评估脚本、事后分析 notebook
