@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="前缀缓存把已处理请求的 KV cache 留下来，新请求若与旧请求共享前缀，就直接复用这段 KV、跳过它的重算。">
+  <meta name="dojo:summary" content="共享前缀的请求不必重算同一段 KV：把已算过的 KV cache 按前缀存起来，新请求做一次长前缀匹配，命中就取用这段缓存，只算没命中的后缀。">
+  <meta name="dojo:topics" content="推理系统, 内存与缓存">
+  <meta name="dojo:tag" content="KV cache">
+  <title>前缀缓存</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">前缀缓存</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">前缀缓存</h1>
+<p class="reading-time">正文 2,100 字 · 约 7 分钟阅读</p>
+
+<p>自回归语言模型一次生成一个 token，token 是文本被分词器切出的最小单位。推理分两段：先对整段输入做一次前向前进（把整段输入送进网络，逐层算一遍），叫预填充；再逐个生成输出 token，叫解码，每一步都基于它前面所有 token。模型由多层网络堆叠，每层为每个位置算出一个隐藏状态向量；注意力是一种在每个位置之间传递信息的机制，它让每个位置由自己的隐藏状态算出键、值两个向量，再用它们和前面各位置的键、值交互，得到这一位置的输出，<a href="../causal-mask/index.html">因果掩码</a> 把可见范围限制在当前位置及其之前。把每层已算过的键、值张量（张量是多维数组，这里每个位置的键、值各是一个向量）留下来供后续步复用，这部分就是 <a href="../kv-cache/index.html">KV cache</a>。</p>
+
+<p>许多请求的输入以同一段开头：多个请求共用同一段系统提示或同一组少样本示例（提示里固定附带的少量示例输入），同一会话的多轮请求共享不断累积的历史，同一段长文档被反复提问。不利用这一点，每个请求都要把这整段前缀重算一遍，相同的 KV 被反复计算、反复占显存（显存指 GPU 的内存）。前缀缓存把已处理请求的 KV cache 留下来，新请求若与某个旧请求共享前缀，就直接取用那段 KV，只计算没被共享的剩余部分。</p>
+
+<p>做法是把已算过的 KV 连同它对应的 token 序列存进一份索引；新请求来时按共享前缀从索引中取用命中的部分，其余部分照常计算，算完的 KV 再并入索引供后续请求复用。</p>
+
+<h2 id="s1">1. 前缀为什么能复用</h2>
+
+<p>自注意力里，位置 $t$ 的键和值是由从开头到位置 $t$ 的这段 token 算出来的，不参与和它后面任何位置的交互：位置 $t$ 的输出取位置 $t$ 及之前所有位置的键、值，而位置 $t$ 自身的键、值算出来之后，不会再随后面出现的 token 改变。</p>
+
+<p>两段输入的 token 序列若以同一段 token 开头，则对这段前缀里的每一个位置，它前面（含自己）的 token 都完全相同。每个位置的 KV 只由这些 token 决定，所以这两段输入在这段前缀上的 KV 逐位相同，可以整段复用，只需要为它们在分岔点之后各自不同的后缀另算。</p>
+
+<details>
+<summary>逐位相同是怎么来的</summary>
+<p>记位置 $t$ 的键、值为 $\mathrm{kv}(x_1, \dots, x_t)$，$x_i$ 是第 $i$ 个 token，$L$ 是两段输入共享前缀的长度。</p>
+<ol>
+<li>位置 $t$ 的 KV 只用到 $x_1, \dots, x_t$，不依赖任何 $t$ 之后的 token。</li>
+<li>第一段输入是 $x_1, \dots, x_L, a_1, a_2, \dots$，第二段是 $x_1, \dots, x_L, b_1, b_2, \dots$，它们共享前 $L$ 个 token。</li>
+<li>对 $t = 1, \dots, L$，两段的 $x_1, \dots, x_t$ 相同，代入同一个 $\mathrm{kv}$ 得到相同的键、值。</li>
+<li>于是前 $L$ 个位置的 KV 逐位相同，可整段复用；从位置 $L+1$ 起两段不同，后缀各自算。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 在已有缓存里找到可复用的前缀</h2>
+
+<p>已算过的 KV 要按它对应的 token 序列组织，新请求来时才能快速找出最长的一段可复用前缀。一种结构是 radix tree（压缩前缀树）：它是一种前缀树，区别是每条边可以挂一段长度不定的 token 序列、而不只是一个元素，因此更省空间。</p>
+
+<p>树上从根到某个节点的一条路径对应一段 token 序列，这段序列的 KV cache 就随该节点保存，存成不连续的布局：这段 KV 不是连续放在一起，而是分成许多不连续的小片。</p>
+
+<p>新请求到来时，把它的输入 token 序列放进树里做前缀匹配，找出能与已有路径重合的最长一段。命中的那段 KV 直接取用、不再计算；没命中的剩余部分照常前向计算，算出的新 KV 再作为一条新路径插入树中。请求处理完成后，它的 KV 留在树里，而不是丢弃。</p>
+
+<details>
+<summary>一段前缀树随三次请求生长</summary>
+<p>这个例子里的 KV 按单个 token 复用，token 用编号表示，每条边挂一段 token，一个节点保存从根到它这条路径对应的 KV。</p>
+<ol>
+<li>请求甲的输入是 10、20、30、40、50。树是空的，整段作为一条边插入，用到的 KV 现算。</li>
+<li>请求乙的输入是 10、20、30、60。前缀匹配到 10、20、30，这段 KV 复用；剩下的 60 作为新边接在 30 之后，只算 60 的 KV。</li>
+<li>请求丙的输入是 10、20、70。前缀只匹配到 10、20；70 与 30 在第三个 token 处分岔，从第三个 token 起另算，新增一条 70 的边。</li>
+<li>三次请求都在树下留下路径，此后任何以 10、20、30 开头的输入都能直接命中这一段。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 缓存以块为单位，只复用整块</h2>
+
+<p>KV cache 在显存里不是按整段序列连续存放，而是切成固定大小的块，一个块放固定数量的 token。索引也按块来建：一块的 KV 要被复用，它在序列里对应的这一整块 token 必须已经算完，前缀尾部不满一块的部分不复用。</p>
+
+<p>每块有一个哈希键，用来在缓存里标识自己。键由三部分拼成：父块的哈希值、本块的 token，以及让本块唯一的额外哈希。把父块的哈希也算进去，使一块的键间接包含它前面所有块，于是键相同就代表从序列开头到这一块为止的整段 token 都相同。</p>
+
+<details>
+<summary>14 个 token 里只有前 8 个命中</summary>
+<p>块大小 $4$，缓存里已有请求 1 的 KV。</p>
+<ol>
+<li>请求 2 有 $14$ 个 token，前 $10$ 个与请求 1 相同。</li>
+<li>这前 $10$ 个覆盖第 1 块、第 2 块（共 $8$ 个）和第 3 块的前 $2$ 个。</li>
+<li>第 3 块只匹配 $2$ 个 token、不满一块，不命中，于是命中的只有前 $2$ 块、共 $8$ 个 token。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 显存有限：LRU 换出与引用计数</h2>
+
+<p>缓存不能无限大：被缓存的 KV 与正在运行的请求共用同一块显存池，没有为缓存单独预留固定空间。显存不够用时，系统换出缓存里最久没用到的部分，留给新的请求。</p>
+
+<p>正在被请求使用的块不能换出，否则那个请求的复用就落空。每个块记一个引用计数，表示当前有多少个请求在用它；只有计数为零的块才可以换出。</p>
+
+<p>有一种实现用前缀树组织缓存，换出从最久未用的叶子开始：先移除一个枝末的叶子，它的公共祖先只要还有别的叶子在用就仍然留着，直到这些祖先也变成叶子才轮到它们，这样公共前缀能尽量留在缓存里。另一种实现按块建索引，块排在一个空闲队列里，队列按最近使用时间排序，分配新块时从队首取；若取到的那块还是一块缓存块，就当场换出——从记录块哈希的缓存表里删掉块号、删掉哈希键，之后即使同样的 token 再来也不命中。</p>
+
+<details>
+<summary>块大小 4、共 10 块时的释放与换出顺序</summary>
+<ol>
+<li>一个请求用完被释放，它释放的 $3$ 块按逆序加入空闲队列尾部：请求的最后一块在这 $3$ 块里先入队、最靠近队首（$3$ 块整体仍在队列尾部）。最后一块要更多 token 才能算出哈希、最不可能被其他请求复用，所以让它比同请求的另两块先被换出。</li>
+<li>新请求进来时，先把它命中的缓存块从空闲队列里移出、引用计数加一，这些块这一轮不会被换出。</li>
+<li>其余块从空闲队列头逐个取用，取到的若是缓存块就按前文说的方式当场换出。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 调度顺序也影响命中率</h2>
+
+<p>命中率定义成被命中的输入 token 数除以输入 token 总数，衡量一次请求的输入里有多少 token 不需要重算。</p>
+
+<p>多个请求排队时，执行顺序会影响命中率。若在互不相关、前缀不同的请求之间频繁切换，刚缓存的段很快被换出，命中率被降低。按已匹配前缀长度排序、优先执行匹配更长的请求，能减少这种来回切换。</p>
+
+<p>这种顺序等价于对请求构成的前缀树做深度优先访问：一个分支访问完再换下一个分支，已缓存的公共祖先在这段时间里持续被命中、不会被换出。</p>
+
+<details>
+<summary>长前缀优先为什么能逼近最优</summary>
+<p>设定：一批请求的输入构成一棵前缀树，缓存容量不小于最长请求的长度。</p>
+<ol>
+<li>树上每条边对应的 KV 至少要算一次，所以全部请求的计算量下界是所有边的 KV 之和。</li>
+<li>按深度优先顺序访问：一条边第一次被算到时，接着把它整棵子树算完；子树计算期间这条边一直被命中，不会被换出。</li>
+<li>于是每条边的 KV 只算一次，计算量正好取到下界，命中率取到上界。</li>
+<li>按已匹配前缀长度排序等价于深度优先顺序：起初缓存为空，先算的请求在树里对应某个节点，从根到它的这一路都被缓存。之后每选一个请求，它都是尚未访问的节点里、与已缓存路径共享前缀最长的那个——也就是挂在已缓存路径某个节点下的下一个节点，正是深度优先会走的那一步。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 省下了什么，代价是什么</h2>
+
+<p>前缀缓存省的是预填充：命中的那段输入不必再前向计算。它不省解码，生成输出 token 的部分与有没有共享前缀无关，仍逐个 token 算。当多数时间花在生成回答上（比如输出很长）、或新请求与已有请求不共享前缀时，它不带来收益。</p>
+
+<p>算得省：命中的段跳过计算，处理同样请求的总计算量下降。占得少：多个请求共享同一段 KV、不各存一份，同时处理的请求数（批）因此能开得更大。命中率越高，这两个方向的好处越大：批更大、吞吐更高、首 token 延迟更低。</p>
+
+<p>管理这份缓存本身要花一点开销，实测这段开销不到总时间的 0.3%。</p>
+
+<details>
+<summary>命中率与开销的数字</summary>
+<ol>
+<li>在一批任务上，命中率从 50% 到 99% 不等。</li>
+<li>线上服务里，两个模型的命中率分别是 52.4% 和 74.1%，后者首 token 延迟平均降到 1.7 分之一。</li>
+<li>在一段完全没有可复用前缀的负载上，跑 100 个请求用 74.3 秒，其中维护缓存结构只占 0.2 秒。</li>
+</ol>
+</details>
+
+<h2 id="s7">7. 适用条件与边界</h2>
+
+<p>前缀缓存只在共享前缀多的时候有用。典型场景是同一段长文档被反复提问、同一会话的多轮对话、大量请求共用同一系统提示或同一组少样本示例。反过来，若新请求与已有请求不共享前缀，命中不到任何一段缓存，不带来收益。</p>
+
+<p>命中粒度是块：共享前缀的尾部不满一块时，这部分不复用，要重算。</p>
+
+<p>缓存要与正在运行的请求争显存，显存紧张时缓存会被换出，命中随之落空。</p>
+
+<p>一条容易混淆的地方：省下的是预填充的计算与显存——共享段只算一次、只存一份；但缓存本身仍占显存，把已算过的 KV 存下来是要花存储的，并不是零代价。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>vLLM Team. Automatic Prefix Caching. vLLM documentation. <a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html">https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html</a></li>
+<li>vLLM Team. Automatic Prefix Caching（design）. vLLM documentation. <a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html">https://docs.vllm.ai/en/latest/design/prefix_caching.html</a></li>
+<li>Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie 等. SGLang: Efficient Execution of Structured Language Model Programs. arXiv:2312.07104v2, 2024. <a href="https://arxiv.org/abs/2312.07104">https://arxiv.org/abs/2312.07104</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

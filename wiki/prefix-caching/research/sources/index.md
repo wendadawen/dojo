@@ -1,0 +1,5 @@
+- blog/vllm-automatic-prefix-caching.md｜vLLM 官方文档｜https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html（快照取自页面正文，页脚日期 September 20, 2026）｜2026-10-10｜vLLM 官方 Automatic Prefix Caching 特性页：说明 APC 缓存已有请求的 KV cache，共享前缀的新请求直接复用、跳过这部分计算；给出开关 enable_prefix_caching、长文档查询与多轮对话两类受益负载，以及边界（只省预填充、不省生成）
+- blog/vllm-prefix-caching-design.md｜vLLM 官方文档｜https://docs.vllm.ai/en/latest/design/prefix_caching.html（快照取自页面正文，页脚日期 June 23, 2026）｜2026-10-10｜vLLM 官方 APC 设计文档：块哈希的构成（父哈希、块内 token、额外哈希）、只缓存整块、数据结构（块池、空闲队列、缓存块表、请求块表）、分配与「触碰」、引用计数、LRU 换出、请求结束按逆序归还、重复块与部分块，以及块大小 4、14 个 prompt token 的例子
+- paper/sglang-v2.pdf｜论文 PDF｜https://arxiv.org/abs/2312.07104 v2｜2026-10-10｜SGLang 论文（提出用 radix tree 做 KV cache 自动复用，即前缀缓存）的 PDF
+- paper/src-v2/｜论文 LaTeX 源码｜arXiv:2312.07104v2（2024-06-06 修订）｜2026-10-10｜该论文 LaTeX 源码：sec-radix-attention.tex 讲 RadixAttention（radix tree、按前缀复用、LRU 先换出叶子、引用计数、命中率与缓存感知调度），sec-intro.tex 讲动机，appendix.tex 讲 KV cache 背景、调度伪代码与最优命中率证明，sec-eval.tex 讲吞吐/延迟与命中率数字
+- paper/sglang-v2.txt｜论文纯文本快照｜arXiv:2312.07104v2 渲染页 https://arxiv.org/html/2312.07104v2｜2026-10-10｜论文 HTML 渲染页转成的纯文本，供按行号核对正文里的数字
