@@ -1,0 +1,2 @@
+- paper/yoco-v2.pdf、paper/src-v2/｜论文｜https://arxiv.org/abs/2405.05254v2｜v2｜2026-10-10｜You Only Cache Once: Decoder-Decoder Architectures for Language Models，提出 YOCO：前一半层（自解码器）算出一份全局 KV，后一半层（交叉解码器）各层通过交叉注意力复用它；LaTeX 源码在 src-v2/
+- repo/yoco/｜仓库｜https://github.com/microsoft/unilm（YOCO/ 子目录）｜31c5b904ca1bf2afb4c234a6675c683a4e5fc7cd（2026-09-21）｜2026-10-10｜官方实现：README、模型代码（models/decoder/yoco.py 的 SelfDecoder/CrossDecoder），交叉解码器的全局 KV 只算一次供其所有层复用
