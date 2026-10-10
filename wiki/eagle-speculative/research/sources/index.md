@@ -1,0 +1,3 @@
+- paper/arxiv-v3.pdf、paper/src-v3/、paper/arxiv-v3.txt｜论文｜https://arxiv.org/abs/2503.01840v3｜v3（2025-03-03 提交，2025-04-23 修订）｜2026-10-10｜EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test，提出单层 decoder 的 EAGLE-3 草稿模型：放弃特征预测改为直接 token 预测、用低中高三层特征融合、引入 training-time test；LaTeX 源码在 src-v3/（paper.tex），纯文本快照 arxiv-v3.txt
+- repo/EAGLE/｜官方仓库｜https://github.com/SafeAILab/EAGLE｜cb7e0841fe0c206c6ed74a197ad5e2a1f13f5a2b（2026-02-19）｜2026-10-10｜EAGLE 系列官方实现与权重发布仓库
+- blog/repo-readme.txt｜官方仓库 README 快照｜https://raw.githubusercontent.com/SafeAILab/EAGLE/main/README.md｜v3.0.0｜2026-10-10｜仓库首页说明与加速数据
