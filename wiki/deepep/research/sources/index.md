@@ -1,0 +1,3 @@
+- blog/deepep-readme-v2.md｜https://github.com/deepseek-ai/DeepEP/blob/main/README.md｜main 分支 commit 93eb6eb（2026）｜2026-10-10｜DeepEP V2 官方 README：库定位、EPBuffer 的 dispatch/combine 接口、延迟收尾、桶集合通信、专家负载均衡、Engram、环境变量与网络配置
+- blog/deepep-legacy-v1.md｜https://github.com/deepseek-ai/DeepEP/blob/b306af0/docs/legacy.md｜commit b306af0（V2 发布时归档的 V1 文档）｜2026-10-10｜DeepEP V1 官方归档文档：两段转发机制、高吞吐与低延迟两套内核、性能表、固定槽位接收布局与接收 hook、SM 数控制
+- repo/DeepEP/｜https://github.com/deepseek-ai/DeepEP｜93eb6eb238127e96c6d7a4a625a6dad158348509（2026-10-10）｜2026-10-10｜官方仓库源码：EPBuffer 的 dispatch/combine docstring、EPHandle 字段、解析式 SM 数估算 get_theoretical_num_sms
