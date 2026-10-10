@@ -13,10 +13,10 @@
 
 - `check.py`：检查页面，页面规则加内联脚本语法（需要 node）；`--all` 查所有页面。
 - `check_page.py`、`check_script.py`：`check.py` 调用的页面规则和脚本语法检查。
-- `check_css.py`：找出共享样式表里没人用的规则，`--fix` 直接删除。
+- `check_css.py`：找出共享样式表（长页、短页两套）里没人用的规则，`--fix` 直接删除。
 - `build_catalog.py`：扫描 `wiki/`，生成首页读的 `catalog.json`。
 - `vocab.py`：主题和标签的封闭词表。
 
 首页 `index.html` 引用的 `assets/` 和 `catalog.json` 只在 CI 里生成：`assets/` 来自 `.dojo/site/`，`catalog.json` 来自 `build_catalog.py`，不用手工收录页面。
 
-`check.py`、`check_css.py` 和 concept 下的脚本有 `--selftest`。增加检查：写一个函数加进 `RULES`，再往 `CASES` 加一个会触发它的坏输入；删除则两处一起删。
+上面所有脚本都有 `--selftest`，CI 会逐个跑。增加检查：写一个函数加进 `RULES`，再往 `CASES` 加一个会触发它的坏输入；删除则两处一起删。

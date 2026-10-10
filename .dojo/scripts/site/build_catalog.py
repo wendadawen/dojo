@@ -11,9 +11,15 @@ import json
 import posixpath
 import re
 import subprocess
+import sys
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "concept"))
+from common import report  # noqa: E402
 
 
 def clean_text(value: str) -> str:
@@ -138,5 +144,71 @@ def main() -> None:
           f"{len(catalog['warnings'])} 条警告 -> {args.output}")
 
 
+# ---------- 自检 ----------
+
+PAGE = """<!DOCTYPE html><html lang="zh-CN"><head>
+<meta name="description" content="  一句  描述 ">
+<meta name="dojo:summary" content="摘要">
+<meta name="dojo:topics" content="注意力机制, 内存与缓存">
+<meta name="dojo:tag" content="注意力">
+<title>标题</title></head><body><h1>页面名</h1>{links}</body></html>
+"""
+
+
+def selftest() -> int:
+    results: list[tuple[str, bool]] = []
+
+    # normalize_target：链接归一化。href 一律按「相对源页面所在目录」解析。
+    cases = [
+        ("同目录另一页", "wiki/a/index.html", "b/", "wiki/a/b/index.html"),
+        ("上级目录另一页", "wiki/a/index.html", "../b/", "wiki/b/index.html"),
+        ("相对路径", "wiki/a/index.html", "../b/index.html", "wiki/b/index.html"),
+        ("概览页折到长页", "wiki/a/index.html", "../b/overview.html", "wiki/b/index.html"),
+        ("指向自己不算", "wiki/a/index.html", "index.html", None),
+        ("外部网址不算", "wiki/a/index.html", "https://x.com", None),
+        ("非 wiki 路径不算", "wiki/a/index.html", "../../libs/x.js", None),
+        ("锚点不算", "wiki/a/index.html", "#sec", None),
+    ]
+    for name, source, href, want in cases:
+        got = normalize_target(source, href)
+        results.append((f"链接：{name}", got == want))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "wiki" / "a").mkdir(parents=True)
+        (root / "wiki" / "b").mkdir(parents=True)
+        (root / "wiki" / "a" / "index.html").write_text(
+            PAGE.format(links='<a href="../b/">去 b</a><a href="../nope/">断链</a>'), encoding="utf-8")
+        (root / "wiki" / "b" / "index.html").write_text(PAGE.format(links=""), encoding="utf-8")
+        cat = build_catalog(root)
+        by_id = {p["id"]: p for p in cat["pages"]}
+
+        results.append(("页面：扫到两个 wiki 页", len(cat["pages"]) == 2))
+        results.append(("元数据：描述去多余空白",
+                        by_id["wiki/a/index.html"]["description"] == "一句 描述"))
+        results.append(("元数据：主题按中英文逗号拆开",
+                        by_id["wiki/a/index.html"]["topics"] == ["注意力机制", "内存与缓存"]))
+        results.append(("标题：优先取 h1",
+                        by_id["wiki/a/index.html"]["title"] == "页面名"))
+        results.append(("边：a 指向 b 记一条", len(cat["edges"]) == 1
+                        and cat["edges"][0]["target"] == "wiki/b/index.html"))
+        results.append(("边：数量累计", cat["edges"][0]["count"] == 1))
+        results.append(("出入度：b 有一入边",
+                        by_id["wiki/b/index.html"]["incoming"] == ["wiki/a/index.html"]))
+        results.append(("出入度：a 有一出边",
+                        by_id["wiki/a/index.html"]["outgoing"] == ["wiki/b/index.html"]))
+        results.append(("警告：断链被记下",
+                        [w["target"] for w in cat["warnings"]] == ["wiki/nope/index.html"]))
+        results.append(("排序：页面按标题排",
+                        [p["id"] for p in cat["pages"]] == ["wiki/a/index.html", "wiki/b/index.html"]))
+        # 无 git 历史时不应崩（临时目录不是仓库）
+        results.append(("无 git 历史时日期留空",
+                        all(p["date"] == "" for p in cat["pages"])))
+
+    return report(results, "catalog 生成")
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        raise SystemExit(selftest())
     main()
