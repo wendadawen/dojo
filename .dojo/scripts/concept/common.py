@@ -27,7 +27,17 @@ SNAPSHOT = ("# 第 1 章 玩具算子\n\n玩具算子把输入乘 2。输入取 
 
 @lru_cache
 def _lines(path: Path) -> list[str]:
-    return path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    return read_text(path, errors="ignore").splitlines()
+
+
+def read_text(path: Path, *, errors: str | None = None) -> str:
+    """读 UTF-8 文本；不是 UTF-8 时给可读诊断，而不是抛裸 UnicodeDecodeError。"""
+    try:
+        return path.read_text(encoding="utf-8", errors=errors)
+    except UnicodeDecodeError:
+        if errors is not None:  # errors="ignore" 的调用点不需要这层保护
+            raise
+        raise SystemExit(f"{path} 不是 UTF-8 编码，请转成 UTF-8 后再试")
 
 
 def _headings(path: Path) -> list[str]:
@@ -69,7 +79,7 @@ def check_basis_list(basis: str, sources: Path) -> list[str]:
 def final_check_recorded(research: Path, kind: str, rounds: int) -> list[str]:
     """审到轮数上限时，记录里要有最后一批改动的仲裁核对。"""
     last = research / f"{kind}-review-{rounds}.md"
-    if not last.is_file() or FINAL_CHECK in last.read_text(encoding="utf-8"):
+    if not last.is_file() or FINAL_CHECK in read_text(last):
         return []
     return [f"{last.name}：到了轮数上限，最后一批改动要交仲裁核对，记录里写一节「{FINAL_CHECK}」，"
             "没有改动就写无改动（guides/concept/review.md「仲裁」）"]

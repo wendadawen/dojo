@@ -16,7 +16,7 @@ from typing import NoReturn
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from common import LONG_LIMIT, SHORT_LIMIT, report as report_checks  # noqa: E402
+from common import LONG_LIMIT, SHORT_LIMIT, read_text, report as report_checks  # noqa: E402
 
 TEMPLATES = HERE.parents[1] / "templates" / "concept"
 REPO_ROOT = HERE.parents[2]
@@ -210,7 +210,7 @@ def _raw_html(lines: list[Line], i: int, out: list[str]) -> int:
 
 
 def split_row(line: str) -> list[str]:
-    """表格一行拆成单元格：公式里的 | 不拆，公式外的 \\| 是字面竖线。"""
+    """表格一行拆成单元格：公式里的 | 不拆，公式外的 \\| 是字面竖线，\\$ 是字面美元。"""
     s = line.strip()
     s = s[1:] if s.startswith("|") else s
     s = s[:-1] if s.endswith("|") and not s.endswith("\\|") else s
@@ -219,6 +219,10 @@ def split_row(line: str) -> list[str]:
         c = s[k]
         if c == "\\" and s[k + 1:k + 2] == "|":
             buf += "\\|" if in_math else "|"
+            k += 2
+            continue
+        if c == "\\" and s[k + 1:k + 2] == "$":
+            buf += "\\$"
             k += 2
             continue
         if c == "$":
@@ -238,6 +242,10 @@ def _table(lines: list[Line], i: int, ctx: Ctx, out: list[str]) -> int:
     while j < len(lines) and lines[j][1].strip().startswith("|"):
         rows.append(lines[j])
         j += 1
+    # 先查落单的 $，再切列：不然后续的列数断言会报出误导性的「列数不一致」
+    for no, r in rows:
+        if "$" in MATH_RE.sub("", r.replace("\\$", "")):
+            fail(no, f"有落单的 $：{r.strip()[:40]}")
     seps = split_row(rows[1][1]) if len(rows) > 1 else []
     if not seps or not all(re.fullmatch(r":?-{3,}:?", c) for c in seps):
         fail(rows[0][0], "表格第二行要是 |---|---| 分隔行")
@@ -525,7 +533,7 @@ def build(md: Path, wiki_root: Path | None = None) -> tuple[Path, Path, dict, Ct
         fail(0, f"{md} 要放在 research/ 下")
     out_dir = md.parent.parent
     ctx = Ctx(out_dir, wiki_root or REPO_ROOT / "wiki")
-    doc = parse(md.read_text(encoding="utf-8"))
+    doc = parse(read_text(md))
     body, short, stats = render(doc, ctx)
     meta, title = doc["meta"], doc["title"]
 

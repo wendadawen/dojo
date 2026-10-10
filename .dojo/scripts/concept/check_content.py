@@ -17,7 +17,7 @@ import check_outline  # noqa: E402
 import vocab  # noqa: E402
 from common import (  # noqa: E402
     CONTENT_ROUNDS, LAST_CHAPTER, LONG_LIMIT, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT,
-    check_basis_list, final_check_recorded, report,
+    check_basis_list, final_check_recorded, read_text, report,
 )
 
 REPO_ROOT = HERE.parents[2]
@@ -41,7 +41,7 @@ class Content:
     """一份解析好的 content.md，各条规则共用。"""
 
     def __init__(self, md: Path, wiki_root: Path):
-        text = md.read_text(encoding="utf-8")
+        text = read_text(md)
         self.lines = text.splitlines()
         self.sources = md.parent / "sources"
         self.out_dir = md.parent.parent

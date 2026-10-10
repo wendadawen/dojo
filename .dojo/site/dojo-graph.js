@@ -137,17 +137,29 @@
     });
   }
 
+  // 运行时加载的资源也要带版本号，否则更新后读者会一直命中旧缓存。
+  // 版本号取自本脚本自己的 src（CI 会给 assets/dojo-graph.js 加上 ?v=<sha>）。
+  function assetVersion() {
+    const self = document.currentScript
+      || Array.from(document.scripts).find(s => s.src && s.src.includes("dojo-graph.js"));
+    if (!self || !self.src) return "";
+    const v = new URL(self.src, document.baseURI).searchParams.get("v");
+    return v ? `?v=${encodeURIComponent(v)}` : "";
+  }
+
+  function siteAsset(path) {
+    return new URL(path + assetVersion(), document.baseURI).href;
+  }
+
   async function load3dDependencies() {
     if (!root.ForceGraph3D) {
       if (!forceGraph3dPromise) {
-        const url = new URL("libs/site/3d-force-graph.min.js", document.baseURI).href;
-        forceGraph3dPromise = loadScript(url);
+        forceGraph3dPromise = loadScript(siteAsset("libs/site/3d-force-graph.min.js"));
       }
       await forceGraph3dPromise;
     }
     if (!spriteTextClass) {
-      const moduleUrl = new URL("libs/site/three-spritetext.mjs", document.baseURI).href;
-      const module = await import(moduleUrl);
+      const module = await import(siteAsset("libs/site/three-spritetext.mjs"));
       spriteTextClass = module.default;
     }
   }

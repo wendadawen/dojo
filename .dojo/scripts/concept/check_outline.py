@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from common import (  # noqa: E402
     LAST_CHAPTER, LONG_LIMIT, OUTLINE_ROUNDS, SELF_MADE, SHORT_LIMIT, SHORT_SECTIONS, SNAPSHOT,
-    check_basis_list, final_check_recorded, report,
+    check_basis_list, final_check_recorded, read_text, report,
 )
 
 
@@ -25,7 +25,7 @@ def parse(md: Path) -> dict:
     """
     sections: dict[str, list[tuple[int, str]]] = {}
     cur = None
-    for no, line in enumerate(md.read_text(encoding="utf-8").splitlines(), 1):
+    for no, line in enumerate(read_text(md).splitlines(), 1):
         if line.startswith("## "):
             cur = line[3:].strip()
             sections[cur] = []
@@ -124,12 +124,18 @@ RULES = [
 
 
 def check(md: Path) -> list[str]:
-    o = parse(md)
+    try:
+        o = parse(md)
+    except SystemExit as e:
+        return [f"格式：{e}"]
     errors = has_both_pages(o)
     if errors:
         return errors  # 缺一页时，后面的规则没有意义
     for rule in RULES:
-        errors += rule(o)
+        try:
+            errors += rule(o)
+        except SystemExit as e:
+            return errors + [f"格式：{e}"]
     return errors
 
 

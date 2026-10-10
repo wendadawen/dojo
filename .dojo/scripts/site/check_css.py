@@ -92,26 +92,41 @@ def drop(css: str, spans: list[tuple[int, int, str]]) -> str:
     return re.sub(r"\n{3,}", "\n\n", css).rstrip() + "\n"
 
 
+# 样式表 : 使用它的模板与页面。短页与长页各有一套，都要查，否则短页的死规则永远没人管。
+TARGETS = (
+    ("libs/concept/dojo-concept.css", ("templates/concept/index.html",),
+     ("wiki/*/index.html",)),
+    ("libs/concept/dojo-overview.css", ("templates/concept/overview.html",),
+     ("wiki/*/overview.html",)),
+)
+
+
 def check(root: Path = REPO_ROOT, fix: bool = False) -> list[str]:
     """返回 ['文件：规则', ...]。fix 时直接删掉这些规则。"""
-    sheet = root / "libs" / "concept" / "dojo-concept.css"
-    template = root / ".dojo" / "templates" / "concept" / "index.html"
     generator = root / ".dojo" / "scripts" / "concept" / "build_page.py"
-    pages = sorted(root.glob("wiki/*/index.html"))
-    for needed in (sheet, template, generator):
-        if not needed.exists():
-            return [f"错误：{needed} 不存在，无从检查"]
-    if not pages:
-        return ["错误：没有概念页"]
-    used: set[str] = set()
-    for path in [template, generator, *pages]:
-        used |= used_classes(path)
-    problems = []
-    text = sheet.read_text(encoding="utf-8")
-    spans = dead_spans(text, used)
-    if fix and spans:
-        sheet.write_text(drop(text, spans), encoding="utf-8")
-    return [f"{sheet.relative_to(root)}：{selector}" for _, _, selector in spans]
+    if not generator.exists():
+        return [f"错误：{generator} 不存在，无从检查"]
+    problems: list[str] = []
+    for sheet_rel, template_rels, page_globs in TARGETS:
+        sheet = root / sheet_rel
+        templates = [root / ".dojo" / t for t in template_rels]
+        for needed in (sheet, *templates):
+            if not needed.exists():
+                return [f"错误：{needed} 不存在，无从检查"]
+        pages: list[Path] = []
+        for g in page_globs:
+            pages += sorted(root.glob(g))
+        if not pages:
+            return [f"错误：没有概念页（{sheet_rel}）"]
+        used: set[str] = set()
+        for path in [*templates, generator, *pages]:
+            used |= used_classes(path)
+        text = sheet.read_text(encoding="utf-8")
+        spans = dead_spans(text, used)
+        if fix and spans:
+            sheet.write_text(drop(text, spans), encoding="utf-8")
+        problems += [f"{sheet.relative_to(root)}：{selector}" for _, _, selector in spans]
+    return problems
 
 
 # ---------- 自检 ----------
@@ -125,18 +140,27 @@ def selftest() -> int:
         (root / ".dojo" / "scripts" / "concept").mkdir(parents=True)
         (root / "wiki" / "toy").mkdir(parents=True)
         sheet = root / "libs" / "concept" / "dojo-concept.css"
+        osheet = root / "libs" / "concept" / "dojo-overview.css"
         (root / ".dojo" / "templates" / "concept" / "index.html").write_text('<p class="used">x</p>', encoding="utf-8")
+        (root / ".dojo" / "templates" / "concept" / "overview.html").write_text('<p class="used-ov">x</p>', encoding="utf-8")
         (root / ".dojo" / "scripts" / "concept" / "build_page.py").write_text(
             "out = '<div class=\"from-generator\">'", encoding="utf-8")
         (root / "wiki" / "toy" / "index.html").write_text('<p class="page-live">x</p>', encoding="utf-8")
+        (root / "wiki" / "toy" / "overview.html").write_text('<p class="page-live-ov">x</p>', encoding="utf-8")
 
-        def run(css, fix=False):
+        def run(css, fix=False, ov=".used-ov { a: b; }\n.page-live-ov { a: b; }\n"):
             sheet.write_text(css, encoding="utf-8")
+            osheet.write_text(ov, encoding="utf-8")
             return check(root, fix)
 
         base = ".used { a: b; }\n.from-generator { a: b; }\n.page-live { a: b; }\n"
         errs = run(base)
         results.append(("在用的 class 不报（模板、生成器、页面各一）", not any("dojo-concept.css" in e for e in errs)))
+        results.append(("短页样式表也被检查（死规则会报出）",
+                        any("dojo-overview.css" in e and ".ov-dead" in e
+                            for e in run(base, ov=".used-ov { a: b; }\n.page-live-ov { a: b; }\n.ov-dead { a: b; }\n"))))
+        results.append(("短页在用的 class 不报",
+                        not any("dojo-overview.css" in e for e in run(base))))
         results.append(("没人用的规则会报出", any(".never-used" in e for e in run(base + ".never-used { a: b; }\n"))))
         results.append(("生成器不再产出时会报出", any(".gone" in e for e in run(base + ".gone { a: b; }\n"))))
         results.append(("katex 一类运行时 class 不报", not any("katex" in e for e in run(base + ".katex-html { a: b; }\n"))))
