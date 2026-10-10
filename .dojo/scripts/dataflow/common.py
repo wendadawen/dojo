@@ -5,8 +5,18 @@
 
 from __future__ import annotations
 
-# 节点表里用来分隔小节的名字；这些小节不是图
+# 节点表里用来分隔小节的名字；这些小节不是图。比较时大小写不敏感
+# （`## Config.json` 与 `## config.json` 都算），两个脚本共用这一个来源。
 SKIP_HEADS = {"资料", "前提", "config.json"}
+
+
+def is_skip_head(head: str) -> bool:
+    """这个 `## <head>` 是不是「不是图」的小节（资料 / 前提 / config.json）。
+
+    大小写不敏感，且这是唯一判据——build_page 与 check_source 都调它，
+    免得一处写 lower()、一处写精确匹配而漂开。
+    """
+    return (head or "").strip().lower() in {h.lower() for h in SKIP_HEADS}
 # 每张图下的四节
 SUB_SECTIONS = ("节点", "连线", "折叠", "面板")
 # 节点类型 → 页面里 kind 的取值

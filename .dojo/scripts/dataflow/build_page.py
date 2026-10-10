@@ -35,7 +35,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
 from common import (  # noqa: E402
-    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, report,
+    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, is_skip_head, report,
 )
 from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
 
@@ -150,11 +150,12 @@ def parse(plan: Path) -> dict:
             meta["title"] = s[2:].strip()
         elif s.startswith("## "):
             head = s[3:].strip()
-            if head.lower() == "config.json":
+            key = head.lower()
+            if key == "config.json":
                 section, sub = "config", None
-            elif head == "资料":
+            elif key == "资料":
                 section, sub = "sources", None
-            elif head == "前提":
+            elif key == "前提":
                 section, sub = "scope", None
             else:
                 section, sub = "view", None

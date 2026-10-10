@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from common import SKIP_HEADS, report  # noqa: E402
+from common import SKIP_HEADS, is_skip_head, report  # noqa: E402
 from build_page import split_cells  # noqa: E402  （两个脚本用同一套拆列）
 
 # 节点名里允许出现、但不属于「源码标识符」的词：
@@ -189,7 +189,7 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
     ANNOT_RE = re.compile(r"[^A-Za-z0-9（()）\[\]]*[（(]\s*(?:源码里叫|检查点键)"
                           r"\s*[:：=]?\s*`?([A-Za-z0-9_.{}\-]+)")
     # 只认出「键注词」，用来分辨「键注写坏了」与「压根没写键注」
-    ANNOT_HEAD_RE = re.compile(r"\s*[（(]\s*(?:源码里叫|检查点键)")
+    ANNOT_HEAD_RE = re.compile(r"[^A-Za-z0-9（()）\[\]]*[（(]\s*(?:源码里叫|检查点键)")
     SYM_RE = re.compile(r"\$[^$]*\$\s*$")
     IDENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_.{}\-]*)\s*$")
     # 文件名（vision.py、config.json、README.md）不是权重键名，别拿去 resolve。
@@ -299,11 +299,11 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
 
 
 def check_structure(views: list[dict]) -> list[str]:
-    """视图数据自洽：节点 id 不重复，边、分组、批注引用的节点和下钻目标都存在。
+    """视图数据自洽：节点 id 不重复，边端点与下钻目标都存在，算子形状箭头两边都全。
 
-    这是**页面侧兜底**：核查的是已生成的 index.html 数据，可能与 build_page 的
-    同名检查（查的是计划文件）有意重复——手工改过页面、或计划绕过生成器时，
-    只有这里能发现。重复不是冗余，两者入口不同，别互相删。"""
+    这是**页面侧兜底**：核查的是已生成的 index.html 数据，与 build_page 的同名检查
+    （查计划文件）判据对齐——手工改过页面、或计划绕过生成器时，只有这里能发现。
+    两者入口不同、判据应一致，改一处记得对另一处。"""
     errors: list[str] = []
     view_ids = {v["id"] for v in views}
     for v in views:
@@ -316,9 +316,11 @@ def check_structure(views: list[dict]) -> list[str]:
                 errors.append(f"[{v['id']}/{n['id']}] 下钻目标 {n['drill']} 不存在")
             shape = (n.get("shape") or "").strip()
             if n.get("kind") == "op" and ("→" in shape or "->" in shape):
-                left = re.split(r"→|->", shape, maxsplit=1)[0].strip()
-                if not left:
-                    errors.append(f"[{v['id']}/{n['id']}] 形状变化缺左边：{shape}")
+                # 箭头两边都要有完整形状——与 build_page 同一判据，别只查左边
+                for side, which in zip(re.split(r"→|->", shape), ("原来", "变完")):
+                    if not side.strip():
+                        errors.append(f"[{v['id']}/{n['id']}] 形状箭头缺{which}的一边：{shape}")
+                        break
             for sec in n.get("fold") or []:
                 if n.get("kind") != "op":
                     errors.append(f"[{v['id']}/{n['id']}] 折叠只写在算子上")
@@ -356,7 +358,7 @@ def plan_rows(text: str):
             yield head, no, None
         elif s.startswith("### "):
             sub, cols = s[4:].strip(), []
-        elif head not in SKIP_HEADS and sub == "节点" and s.startswith("|"):
+        elif not is_skip_head(head) and sub == "节点" and s.startswith("|"):
             cells = split_cells(s)   # 认 \| 转义、$...$ 里的竖线不拆，与生成器同一套
             if not cols:
                 cols = cells
@@ -399,7 +401,7 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
     checked = 0
     unchecked = 0
     for head, no, row in plan_rows(plan.read_text(encoding="utf-8")):
-        if head in SKIP_HEADS:
+        if is_skip_head(head):
             continue
         where = f"第 {no} 行（{head.split('（')[0]}"
         # 这一图标题里写的源码文件。节点指到别的文件多半是张冠李戴：
@@ -515,7 +517,10 @@ def selftest() -> list[tuple[str, bool]]:
 
     bad = json.loads(json.dumps(views))
     bad[0]["nodes"][1]["shape"] = "→ 16"
-    checks.append(("形状箭头缺左边会报出", any("形状变化缺左边" in e for e in check_structure(bad))))
+    checks.append(("形状箭头缺左边会报出", any("缺原来的一边" in e for e in check_structure(bad))))
+    bad2 = json.loads(json.dumps(views))
+    bad2[0]["nodes"][1]["shape"] = "16 →"
+    checks.append(("形状箭头缺右边会报出", any("缺变完的一边" in e for e in check_structure(bad2))))
 
     src = {"m.py": "def forward(self, x):\n    return self.embed_tokens(self.input_ids)\n"}
     checks.append(("名字在源码里找到就不报", not check_names(views[:1], src)))
