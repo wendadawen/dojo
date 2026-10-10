@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="语言模型预训练是在大规模无标注文本上，用预测下一个 token（文本切分后的基本单位）的目标训练语言模型，得到能续写任意文本的基座模型（尚未做后续训练的模型）。">
+  <meta name="dojo:summary" content="语言模型把文本序列的概率分解为逐步的条件概率 $p(s_1,\dots,s_n)=\prod_i p(s_i\mid s_{&lt;i})$；预训练在语料上最小化每一步的负对数概率，不需要人工标签。">
+  <meta name="dojo:topics" content="训练与优化">
+  <meta name="dojo:tag" content="训练">
+  <title>语言模型预训练</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">语言模型预训练</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">语言模型预训练</h1>
+<p class="reading-time">正文 1,213 字 · 约 4 分钟阅读</p>
+
+<p>语言模型预训练是在大量文本上训练一个模型，让它在任意一段前文之后给出下一个 token（文本切分后的基本单位）的概率分布；训练不需要人工标注，因为文本里每个位置的下一个 token 本身就是答案。训练完成后得到基座模型，它把语料上的分布建了出来。</p>
+
+<h2 id="s1">1. 语言模型的输出：前文之上的下一个 token 分布</h2>
+
+<p>语言模型给出的是分布，不是某一句话。给定一段前文，它为下一个 token 在整张词表上各给一个概率。这里的 token 是文本被切分后的基本单位，可以是一个字，也可以是一个词；词表是所有可能 token 的集合，模型只在这张表上分配概率。</p>
+
+<p>把前文记作 $s_1,\dots,s_{i-1}$，下一个 token 记作 $s_i$，模型给出的是条件概率 $p(s_i\mid s_1,\dots,s_{i-1})$：在已知前文的条件下，下一个 token 取 $s_i$ 的概率。对词表里每个 token 都有一个这样的值，它们非负且总和为 1，合起来是一张概率分布。这个「给定前文、预测下一个 token」的任务叫下一 token 预测。</p>
+
+<h3 id="s1-1">1.1 生成：把预测出的 token 接回前文再预测</h3>
+
+<p>模型一次只预测一个 token。要生成一段更长的文本，就把刚预测出的 token 接到前文后面，作为新的前文再预测下一个，如此重复。</p>
+
+<h2 id="s2">2. 把一条序列的概率分解成逐步预测</h2>
+
+<p>一条序列 $s_1,\dots,s_n$ 一起出现的概率 $p(s_1,\dots,s_n)$ 叫联合概率。语言有自然的先后顺序，因此常把联合概率拆成每一步条件概率的连乘：</p>
+
+<p>$$
+p(s_1,\dots,s_n)=\prod_{i=1}^{n} p(s_i\mid s_1,\dots,s_{i-1}).
+$$</p>
+
+<p>右边的每一项只依赖它前面的 token，这样的模型叫自回归模型。这样，把「给整条序列估一个概率」变成「在每个位置估一个条件概率」，后者的输入是前文、输出只是词表上的分布。对整条序列的概率（记作 $p(x)$）的采样和估计因此都变得可行。</p>
+
+<details>
+<summary>链式分解的推导</summary>
+<p>从两个 token 开始，条件概率的乘法公式给出：</p>
+<p>$$p(s_1,s_2)=p(s_1)\,p(s_2\mid s_1).$$</p>
+<p>再加一个 token，分两步：</p>
+<ol>
+<li>先把它看成「前两个 token 之后再来一个」：$p(s_1,s_2,s_3)=p(s_1,s_2)\,p(s_3\mid s_1,s_2)$；</li>
+<li>把第一步的 $p(s_1,s_2)$ 代入，得 $p(s_1,s_2,s_3)=p(s_1)\,p(s_2\mid s_1)\,p(s_3\mid s_1,s_2)$。</li>
+</ol>
+<p>照此每加一个 token 就乘上一个新的条件概率，展开到第 $n$ 项就是</p>
+<p>$$p(s_1,\dots,s_n)=\prod_{i=1}^{n} p(s_i\mid s_1,\dots,s_{i-1}).$$</p>
+</details>
+
+<h3 id="s2-1">2.1 逐步概率连乘的手算</h3>
+
+<p>三个 token 的序列，给定每一步的条件概率，整句概率就是它们的连乘。</p>
+
+<details>
+<summary>例子的完整过程</summary>
+<p>取词表里的三个 token 记作 $A,B,C$，一条序列为 $A,B,C$。模型在每一步给出的条件概率是：</p>
+<ol>
+<li>第一个 token：$p(A)=0.5$。</li>
+<li>第二个 token：$p(B\mid A)=0.8$。</li>
+<li>第三个 token：$p(C\mid A,B)=0.5$。</li>
+</ol>
+<p>连乘得整句概率：</p>
+<p>$$p(A,B,C)=0.5\times 0.8\times 0.5=0.2.$$</p>
+</details>
+
+<h3 id="s2-2">2.2 每一步的损失：负对数概率</h3>
+
+<p>连乘取对数后变成相加：$\log p(s_1,\dots,s_n)=\sum_i \log p(s_i\mid s_1,\dots,s_{i-1})$。每一步的条件概率不超过 1，取对数后不为正，概率越接近 1 对数越接近 0。取负号得到单步损失 $-\log p(s_i\mid s_1,\dots,s_{i-1})$：概率越低，这个值越大，也就是这一步「代价」越大。整句损失是各步损失之和。</p>
+
+<details class="code-details">
+<summary>上例各步的损失</summary>
+<div class="code-block"><pre><code class="language-python">import math
+
+ps = [0.5, 0.8, 0.5]
+losses = [-math.log(p) for p in ps]
+print([round(x, 4) for x in losses])
+print(round(sum(losses), 4))</code></pre></div>
+<div class="code-block"><pre><code class="language-text">[0.6931, 0.2231, 0.6931]
+1.6094</code></pre></div>
+</details>
+
+<h2 id="s3">3. 预训练目标：在语料上最小化平均负对数概率</h2>
+
+<p>预训练要模型对语料里每个位置的下一个 token 都给高概率。等价地，最小化下面的平均负对数概率：</p>
+
+<p>$$
+\mathcal{L}(\theta)=-\frac{1}{|D|}\sum_{x\in D}\frac{1}{|x|}\sum_{i=1}^{|x|}\log p_\theta(s_i\mid s_1,\dots,s_{i-1}).
+$$</p>
+
+<p>$\theta$ 是模型的参数，训练调整的就是它。$D$ 是语料，用来训练的全部文本；$x$ 是其中一条序列，$|x|$ 是它的 token 数，$|D|$ 是序列条数。$s_i$ 是 $x$ 的第 $i$ 个 token，$i$ 从 1 数起。$p_\theta(\cdot\mid\cdot)$ 是模型在给定前文时给下一个 token 的概率。内层求和把一条序列各位置的负对数概率相加，再除以 $|x|$；外层对所有序列取平均。这个每步取负对数、越大代表越差的量就是<a href="../cross-entropy/index.html">交叉熵</a>。</p>
+
+<p>把这个损失最小化，等价于让模型在语料上最大化似然。</p>
+
+<h3 id="s3-1">3.1 语料平均的口径</h3>
+
+<p>上面的损失把一条序列的负对数概率除以它的预测单元数，得到每个预测单元的平均负对数概率；预测单元通常取一个字符、一个字节或一个词。报告时经常把这个量再做缩放或指数化后使用。</p>
+
+<h2 id="s4">4. 训练完成后得到的基座模型</h2>
+
+<p>训练做完，得到的是基座模型。它已经把语料上的分布建了出来：给它一段前文，它能给出下一个 token 的分布，因而能续写多种文本。它以尽可能高的似然拟合这份语料，因此在语料覆盖的多种文本上都能继续，而不限于某一个任务。</p>
+
+<p>基座模型还没有做后续的对齐训练（预训练之后、在人工示范数据上继续微调的那类训练）。</p>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>这套目标只优化「预测下一个 token」，学到的行为是照语料往下续写。它与用户想要的「有用、安全地遵循指令」并不是同一件事：给定一个请求，续写出来的文本未必是那种回答，这个目标只是所要行为的一个近似。这个差异由训练目标决定，由后续训练处理。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Radford et al., Language Models are Unsupervised Multitask Learners, OpenAI, 2019, <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">链接</a></li>
+<li>Touvron et al., LLaMA: Open and Efficient Foundation Language Models, arXiv:2302.13971v1, 2023, <a href="https://arxiv.org/abs/2302.13971v1">链接</a></li>
+<li>Ouyang et al., Training language models to follow instructions with human feedback, arXiv:2203.02155v1, 2022, <a href="https://arxiv.org/abs/2203.02155v1">链接</a></li>
+<li>Shannon, A Mathematical Theory of Communication, 1948, <a href="https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf">链接</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
