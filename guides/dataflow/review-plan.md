@@ -13,9 +13,9 @@
 | 审查者 | 提示词 | 拿到什么 |
 |---|---|---|
 | 路径覆盖 | `plan-source.md` | `dataflow.md`、源码 |
-| 节点与形状 | `plan-nodes.md` | `dataflow.md`、源码、`sources/config.json` |
+| 节点与形状 | `plan-nodes.md` | `dataflow.md`、源码、`sources/config.json`、`sources/shapes.json` |
 | 连线与结构 | `plan-edges.md` | `dataflow.md`、源码 |
-| 公式与面板 | `plan-formulas.md` | `dataflow.md`、源码、`sources/config.json` |
+| 公式与面板 | `plan-formulas.md` | `dataflow.md`、源码、`sources/config.json`、`sources/shapes.json` |
 | 读者与措辞 | `plan-reader.md` | 只给 `dataflow.md` |
 
 节点席和公式席都要核「配置值照抄 config.json」「权重形状照抄 shapes.json」，所以它们除了 `dataflow.md` 和源码，还要拿到 `sources/config.json`（有的话）和 `sources/shapes.json`——材料不在手上，「照抄」就是空话。这两个文件在 `research/sources/` 下，`dataflow.md` 的「资料」一节写明取自哪里。

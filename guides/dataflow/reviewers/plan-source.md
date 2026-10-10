@@ -12,9 +12,9 @@
 1. 前提定的那条路径，源码里每一步是不是都画了。读源码的 `forward`，把每一步对照节点表。
 2. 画上的每一步是不是都在这条路径的源码里。不在前提这条路径上的分支写进节点，是多画。
 3. `if`、比较、`for` 循环不该画成节点；循环对应的层按「结构相同的层画成一个节点」处理。
-4. 只换形状、换 dtype、切一段的步骤（`reshape`、`view`、`chunk`、`float()`、`.to(dtype)`、`arange`、纯切片）不单独成节点（`plan.md`「一个节点一步」一条）——画成带公式的算子节点算多画，这一步应当并入产出它的那个算子、或写成张量节点。
-4. 该成图的类是不是都画了：属于这个模型的模块（带模型名前缀的，或类名通用但有自己的计算的）都要有图；通用基础层不该有图——清单以 `build_page.py` 的 `GENERIC_CLASSES` 为准（`Linear`、`ColumnParallelLinear`、`RowParallelLinear`、`RMSNorm`、`Embedding`、`ParallelEmbedding`、`PatchEmbed`、`MLP`、`ParallelHead`，以及 PyTorch 自带的模块）。用到某个有图的类的节点都点开到那张图。
-5. 算子和公式里没有写前提之外的分支。
+4. 只换形状、换 dtype、切一段的步骤（`reshape`、`view`、`chunk`、`float()`、`.to(dtype)`、`arange`、纯切片）不单独成节点（`plan.md`「一个节点一步」一条）——画成带公式的算子节点算多画，这一步应当并入产出它的那个算子、或写成张量节点。但 `plan.md` 例外允许的（切出多段、或展开成独立一维、且下游当数据用，如 `split` 出 key/value、`unflatten` 展开成多头）单独成算子节点，不算多画。
+5. 该成图的类是不是都画了：属于这个模型的模块（带模型名前缀的，或类名通用但有自己的计算的）都要有图；通用基础层不该有图——清单以 `build_page.py` 的 `GENERIC_CLASSES` 为准（`Linear`、`ColumnParallelLinear`、`RowParallelLinear`、`RMSNorm`、`Embedding`、`ParallelEmbedding`、`PatchEmbed`、`MLP`、`ParallelHead`，以及 PyTorch 自带的模块）。用到某个有图的类的节点都点开到那张图。
+6. 算子和公式里没有写前提之外的分支。
 
 ## 返回
 
