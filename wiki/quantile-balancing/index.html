@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Quantile Balancing 是一种混合专家的负载均衡方法：从一次前向传播的路由分数分位数直接算出每个专家的偏置，让每个专家收到目标数量的 token，替代固定步长的偏置更新。">
+  <meta name="dojo:summary" content="$\tilde b_j \leftarrow -\operatorname{quantile}_{1-k/n}(s_{:,j}-\alpha)$，$b \leftarrow \tilde b - \operatorname{mean}(\tilde b)$——从一个 batch 的分数分位数一次算出专家偏置。">
+  <meta name="dojo:topics" content="模型结构, 训练与优化">
+  <meta name="dojo:tag" content="MoE">
+  <title>Quantile Balancing</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Quantile Balancing</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Quantile Balancing</h1>
+<p class="reading-time">正文 1,943 字 · 约 6 分钟阅读</p>
+
+<p>Quantile Balancing（QB）是混合专家模型里给每个专家算偏置、用来调负载均衡的方法。它解决的问题是：一个 batch（一次一起处理的一批 token）的 token 应该均匀分给各个专家，但路由只按分数取高分，负载容易不均衡。QB 不靠一步步试，而是用一次前向（把输入算成输出的那一遍）得到的这批路由分数一次算出偏置：先给每个 token 定一个阈值（它那一行带偏置的分数里第 $k+1$ 高的值），把每个专家的分数减去对应阈值后取分位数（一组数里指定比例以下的阈值）、取负，再减掉均值，使每个专家恰好收到目标数量的 token。它替代的是<a href="../aux-loss-free-routing/index.html">固定步长的偏置更新</a>。混合专家（MoE）的每一层有若干个并列的专家子网络；一个 token（模型处理的一段文本的单位）由路由层算出一组分数，只送给分数最高的几个专家；这里用 sigmoid（把任意实数映到 0 到 1 之间的 S 形函数）算分数。</p>
+
+<h2 id="s1">1. 加在路由分数上的专家偏置</h2>
+
+<p>路由层对每个 token $x_i$ 算一组分数 $s_i = \operatorname{Sigmoid}(W_r x_i)$，$W_r$ 是路由层权重，然后选分数最高的 $k$ 个专家。QB 给每个专家 $j$ 一个偏置 $b_j$，加在分数上参与选择：选的是 $s_i + b$ 最大的 $k$ 个专家。选定之后，token 对这个专家的权重 $p_{i,j}$ 只用原始分数 $s_{i,j}$ 归一化，不含偏置。偏置因此只决定把 token 送到哪些专家，不进入混合权重，也不进入路由层的梯度，所以它可以在不干扰模型参数学习的前提下单独调负载。</p>
+
+<details>
+<summary>选择和权重的公式</summary>
+<p>$$T_i = \operatorname{argtopk}(s_i + b), \qquad p_{i,j} = \frac{s_{i,j}}{\sum_{r \in T_i} s_{i,r}}, \quad j \in T_i$$</p>
+<p>$T_i$ 是 token $i$ 选中的 $k$ 个专家的集合。</p>
+</details>
+
+<h2 id="s2">2. 旧的偏置更新为什么不够</h2>
+
+<p>旧的偏置更新走固定步长：每步把偏置加上 $\gamma \cdot \operatorname{sign}(\bar\ell - \ell_j)$，$\bar\ell$ 是专家平均负载、$\ell_j$ 是专家 $j$ 的负载、$\gamma$ 是固定步长。负载高于平均就减、低于平均就加，一次只改变 $\gamma$。步长 $\gamma$ 两难：取大了偏置来回震荡，取小了又适应得太慢。专家池增大时，把负载维持均衡会变得更难，而不均衡的路由会拖慢专家并行训练（把不同专家放到不同设备上的训练方式），也可能让部分专家训练不充分。</p>
+
+<h2 id="s3">3. 从一次前向推出下一个偏置</h2>
+
+<p>QB 从一次前向得到的这批分数里，直接算出每个专家为达到目标负载应有的偏置。记一批有 $m$ 个 token、$n$ 个专家、每个 token 选 $k$ 个，目标负载是每个专家 $q := mk/n$ 个 token。</p>
+
+<p>第一步，把选择从 Top-$k$ 换成在带偏置的分数 $s_i + b$ 上取 Top-$(k+1)$：前 $k$ 个是实际选中的专家，第 $k+1$ 个给出一个阈值 $\alpha_i$——一个专家要进 token $i$ 的 Top-$k$，分数必须超过它，所以 $\alpha_i$ 叫 cutoff。第二步，算每对 $(i,j)$ 的 margin $s_{i,j} - \alpha_i$，即原始分数减去 cutoff；用原始分数（不含旧偏置）相减，旧偏置只通过 cutoff 进来。</p>
+
+<p>第三步，反解出使专家 $j$ 恰好收到 $q$ 个 token 的偏置。在 cutoff 固定时，专家 $j$ 收到的 token 数是「margin 超过某个阈值」的个数，这个数随阈值单调下降；把它定成 $q$，阈值就落在第 $q+1$ 大的 margin 上，也就是 margin 的 $1-k/n$ 分位数。于是取</p>
+
+<p>$$\tilde b_j \leftarrow -\operatorname{quantile}_{1-k/n}\!\left(s_{:,j} - \alpha\right)$$</p>
+
+<p>第四步，减去全体偏置的均值：$b \leftarrow \tilde b - \operatorname{mean}(\tilde b)\cdot\mathbf{1}$。一个公共偏移同时加在或减在所有专家的分数上，不改变它们之间的相对大小，也就不改变 Top-$k$ 选择，减掉它只是把偏置的均值定到零。更新在下一步才生效，一个 batch 不会用自己算出的偏置来路由：这批 token 已经走完了前向，新偏置留给下一批。</p>
+
+<details>
+<summary>为什么阈值是 (1−k/n) 分位数</summary>
+<p>设 −b̃_j 为阈值，专家 j 收到的 token 数就是 margin 超过这个阈值的个数：</p>
+<p>$$q := \sum_{i=1}^{m} \mathbf{1}\!\left[s_{i,j} + \tilde b_j &gt; \alpha_i\right]$$</p>
+<p>这个计数随阈值 −b̃_j 单调递减。假设 margin 互不相等，要让计数恰好等于 $q$，阈值就取第 $q+1$ 大的 margin：比它大的正好有 $q$ 个。而 $q/m = k/n$，所以超过阈值的是 $k/n$ 比例，阈值就是 $1-k/n$ 分位数。</p>
+</details>
+
+<h2 id="s4">4. 手算一遍</h2>
+
+<p>取 $m = 6$ 个 token、$n = 3$ 个专家、$k = 1$，初始偏置全为 $0$，目标负载 $q = mk/n = 2$。分数表如下，每一行是一个 token 对三个专家的分数（2 位小数）：</p>
+
+<div class="table-scroll">
+<table>
+<thead><tr><th></th><th>$E_1$</th><th>$E_2$</th><th>$E_3$</th></tr></thead>
+<tbody>
+<tr><td>$t_1$</td><td>0.45</td><td>0.55</td><td>0.25</td></tr>
+<tr><td>$t_2$</td><td>0.65</td><td>0.90</td><td>0.40</td></tr>
+<tr><td>$t_3$</td><td>0.90</td><td>0.60</td><td>0.20</td></tr>
+<tr><td>$t_4$</td><td>0.55</td><td>0.60</td><td>0.20</td></tr>
+<tr><td>$t_5$</td><td>0.60</td><td>0.80</td><td>0.10</td></tr>
+<tr><td>$t_6$</td><td>0.85</td><td>0.55</td><td>0.80</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>偏置全为 $0$ 时按每行最大值路由，得到的负载是 $(2, 4, 0)$：$E_3$ 一个 token 也没收到，负载很不均。</p>
+
+<details>
+<summary>一步步算出新偏置</summary>
+<p>$k = 1$，cutoff $\alpha_i$ 是每行第 2 大的分数：</p>
+<ol>
+<li>$t_1$ 的分数排序 $0.55, 0.45$，$\alpha_1 = 0.45$；$t_2$：$0.90, 0.65$，$\alpha_2 = 0.65$；$t_3$：$0.90, 0.60$，$\alpha_3 = 0.60$。</li>
+<li>$t_4$：$0.60, 0.55$，$\alpha_4 = 0.55$；$t_5$：$0.80, 0.60$，$\alpha_5 = 0.60$；$t_6$：$0.85, 0.80$，$\alpha_6 = 0.80$。</li>
+<li>算 margin $s_{i,j} - \alpha_i$，每个专家一列。$E_1$：$(0, 0, 0.3, 0, 0, 0.05)$，从大到小为 $0.3, 0.05, 0, 0, 0, 0$。</li>
+<li>$E_1$ 第 $q+1 = 3$ 大的 margin 是 $0$，故 $\tilde b_1 = 0$。$E_2$：$(0.1, 0.25, 0, 0.05, 0.2, -0.25)$，从大到小为 $0.25, 0.2, 0.1, 0.05, 0, -0.25$，第 3 大为 $0.1$，$\tilde b_2 = -0.1$。</li>
+<li>$E_3$：$(-0.2, -0.25, -0.4, -0.35, -0.5, 0)$，从大到小为 $0, -0.2, -0.25, -0.35, -0.4, -0.5$，第 3 大为 $-0.25$，$\tilde b_3 = 0.25$。</li>
+<li>$\tilde b = (0, -0.1, 0.25)$，均值 $0.05$。减均值得 $b = (-0.05, -0.15, 0.20)$。</li>
+</ol>
+</details>
+
+<p>用新偏置重新路由，三个专家各收到 $2$ 个 token，负载变成 $(2, 2, 2)$。再走一步得到的偏置不变，说明这一步落在了均衡解上；这里只是用同一张表离线验证这个解是稳定的。</p>
+
+<details class="code-details">
+<summary>代码验证</summary>
+<div class="code-block"><pre><code class="language-python">scores = [[0.45, 0.55, 0.25],
+          [0.65, 0.90, 0.40],
+          [0.90, 0.60, 0.20],
+          [0.55, 0.60, 0.20],
+          [0.60, 0.80, 0.10],
+          [0.85, 0.55, 0.80]]
+m, n, k = len(scores), len(scores[0]), 1
+q = m * k // n
+
+def route(b):
+    load = [0] * n
+    for row in scores:
+        j = max(range(n), key=lambda j: (row[j] + b[j], -j))
+        load[j] += 1
+    return load
+
+def qb_step(b):
+    alpha = [sorted((row[j] + b[j] for j in range(n)), reverse=True)[k] for row in scores]
+    tilde = [0.0] * n
+    for j in range(n):
+        margins = sorted((scores[i][j] - alpha[i] for i in range(m)), reverse=True)
+        tilde[j] = -margins[q]
+    mean = sum(tilde) / n
+    return [x - mean for x in tilde]
+
+print("loads before:", route([0.0] * n))
+b = qb_step([0.0] * n)
+print("bias after step:", [round(x, 3) for x in b])
+print("loads after:", route(b))
+print("bias after another step:", [round(x, 3) for x in qb_step(b)])</code></pre></div>
+<div class="code-block"><pre><code class="language-text">loads before: [2, 4, 0]
+bias after step: [-0.05, -0.15, 0.2]
+loads after: [2, 2, 2]
+bias after another step: [-0.05, -0.15, 0.2]</code></pre></div>
+</details>
+
+<h2 id="s5">5. 为什么几步就能收敛</h2>
+
+<p>旧更新和 QB 是同一个优化目标上的两种解法。这个目标是「最大分数的均衡分配」：在「每个 token 恰好选 $k$ 个专家、每个专家恰好服务 $q$ 个 token」的约束下，让被选中配对的分数之和最大。把它松弛成连续变量后取对偶（对偶指把带约束的最大化改写为对新引入的乘子求最小），就得到一个只关于两组乘子的最小化问题。在这个对偶问题里，每个乘子单独看，精确最优恰好是前一步写的那条分位数；旧更新相当于在这个对偶目标上每步只沿次梯度（不可导点处替代梯度的方向）的符号走一小步，QB 则一步取到精确最优。这就是 QB 不需要学习率类超参数（优化时控制每步走多远的系数）、在专家很多时也能几步内收敛的原因。</p>
+
+<details>
+<summary>对偶推导</summary>
+<ol>
+<li>均衡分配问题：$\max_{x_{i,j}\in\{0,1\}}\sum_{i,j} x_{i,j} s_{i,j}$，约束每个 token $\sum_j x_{i,j} = k$、每个专家 $\sum_i x_{i,j} = mk/n$（设为整数）。$x_{i,j} = 1$ 表示 token $i$ 分配给专家 $j$。</li>
+<li>松弛 $x_{i,j}\in[0,1]$ 得到线性规划，其最优解仍是整数（这类分配问题的可行域是二部图匹配多面体，线性规划的最优解总可以取到整数），松弛不损失最优值。给 token 侧、专家侧各引入乘子 $\alpha_i$、$\beta_j$，写成 max–min 形式后交换次序。</li>
+<li>
+<p>内层对 $x$ 逐个最大化，$s_{i,j} - \alpha_i - \beta_j &gt; 0$ 时取 1、否则取 0，代回得到对偶目标</p>
+<p>$$L(\alpha, \beta) = \sum_{i,j}\max(0, s_{i,j}-\alpha_i-\beta_j) + k\sum_i \alpha_i + \frac{mk}{n}\sum_j \beta_j$$</p>
+</li>
+<li>交替最小化：固定 $\beta$ 解 $\alpha$（按 token 分块），固定 $\alpha$ 解 $\beta$（按专家分块）。$\beta$ 固定的子目标对 $\alpha$ 分段线性，当恰有 $k$ 个「$s_{i,j}-\beta_j$」在 $\alpha$ 之上时最小，所以取 $\alpha_i^*$ 为 $s_i - \beta$ 的 $1-k/n$ 分位数；对称地 $\beta_j^*$ 为 $s_{:,j} - \alpha$ 的 $1-k/n$ 分位数。两边都是同一个分位数，方法因此得名。</li>
+<li>专家侧子目标的次梯度（不可导点处替代梯度的方向）是 $\partial L/\partial\beta_j = mk/n - \sum_i \mathbf{1}[s_{i,j}-\alpha_i-\beta_j&gt;0]$，即目标负载减实际负载；又因 $b = -\beta$，在 $\beta$ 上做一步就对应到 $b$ 上的一次改动。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 大规模训练怎么算分位数</h2>
+
+<p>真实训练里 $m$ 是百万级，用来算分位数的量 $r_{i,j} = \alpha_i - s_{i,j}$（margin $s_{i,j}-\alpha_i$ 的相反数）有 $O(mn)$ 个，分布在多个数据并行 rank（每张加速卡一个副本）和梯度累积步（一次参数更新里累积的若干小批）上，训练循环里收齐再排序算精确分位数做不到。QB 改用每个专家一张 $r$ 的直方图：每个 rank 在前向时把本地 $r$ 分散累加（scatter-add）进本地的计数矩阵，这一步不通信；一个训练步结束时做一次 all-reduce（一种集合通信，把所有 rank 的计数相加并广播给每个 rank），得到全局计数；再从合并后的计数里读出分位数。因为计数可加，只要把各 rank 的计数相加，得到的就是整批 token 的直方图，而不是各 rank 分位数的平均。分位的取法：找第一个累计计数达到 $\lceil q\rceil$ 的 bin（直方图的一个区间），在 bin 内线性插值。</p>
+
+<details>
+<summary>直方图分位数估计的细节</summary>
+<ol>
+<li>分箱范围：路由分数是 sigmoid 输出，落在 $(0,1)$；cutoff $\alpha_i$ 本身是某个专家的带偏置分数 $s_{i,j'} + b_{j'}$，落在 $(b_{\min}, 1 + b_{\max})$，$b_{\min}$、$b_{\max}$ 是当前偏置的极值。于是 $r_{i,j} = \alpha_i - s_{i,j}$ 落在 $[b_{\min}-1, b_{\max}+1]$。把这个区间均分成 $B$ 个 bin，每步重算范围，bin 宽 $w = (b_{\max}-b_{\min}+2)/B$。</li>
+<li>计数矩阵：前向时每个 rank 把本地的 $r_{i,j}$ scatter-add 进每专家的计数矩阵 $H \in \mathbb{N}^{n\times B}$，跨小批累加。</li>
+<li>
+<p>恢复分位数：直方图把每个专家的每个 token 记一次，累计到某个 bin 的计数就是 $r$ 不超过该 bin 右侧的 token 数；要取的分位数对应计数 $q = mk/n$（即前面那个第 $q+1$ 大的 margin 落在的位置）。设累计计数达到 $\lceil q\rceil$ 的那个 bin 的 0 起下标为 $\rho_j$、其左侧累计 $c_j$ 个、bin 内 $h_j$ 个，则</p>
+<p>$$\tilde b_j = b_{\min} - 1 + \left(\rho_j + \operatorname{clip}\!\left(\frac{q-c_j}{h_j}, 0, 1\right)\right) w$$</p>
+</li>
+<li>误差与通信：累计计数在 bin 边界上精确，所以真分位数与估计值落在同一个 bin，误差不超过 bin 宽 $w$；$B = 1000$ 时误差最多几个 $10^{-3}$，观测不到残余负载不均衡。唯一的通信是每层每步一次 $nB$ 个整数的 all-reduce，与 $m$ 无关。对估计出的分位数沿步做指数移动平均（按权重递减地加权历史值），可以减小批间采样噪声。</li>
+</ol>
+</details>
+
+<p>推理时偏置已经固定，路由退化成一次普通的 Top-$k$ 选择，不需要任何分位数计算。</p>
+
+<h2 id="s7">7. 适用条件与边界</h2>
+
+<p>QB 的推导前提是目标负载 $q = mk/n$ 为整数，且 margins 没有恰好相等的并列——假设无并列，才会有恰好 $q$ 个 margin 落在阈值之上；实践中并列的概率为零。它只调偏置、不改变每个 token 选 $k$ 个这个稀疏性；负载靠调这里的偏置来拉平，不在损失（训练时要最小化的那个量）上另加一项（这种加在损失上、用来约束参数的一项叫正则），所以把它当成一种损失或正则是误解。另外一个误解是把「一步就均衡」推广成总是几步收敛：手算里一步到位是因为那张分数表恰好落在均衡解上，专家规模接近 $10^3$ 时仍能在几步内收敛。这个对偶视角的分配问题都假定每个专家恰好服务 $q$ 个 token。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Kimi Team. Kimi K3: Open Frontier Intelligence. Technical Report, 2026. <a href="https://arxiv.org/abs/2607.24653">https://arxiv.org/abs/2607.24653</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
