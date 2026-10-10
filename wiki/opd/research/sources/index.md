@@ -1,0 +1,2 @@
+- paper/gkd-v3.pdf、paper/src-v3/、paper/gkd-v3.txt｜论文｜https://arxiv.org/abs/2306.13649v3｜v3（2024-01-17，ICLR 2024）｜2026-10-10｜On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes：提出 on-policy KD，并把它与 supervised KD 统一为 GKD 框架；LaTeX 源码在 src-v3/（main.tex），纯文本快照 gkd-v3.txt
+- blog/tml-on-policy-distillation.txt｜原作者技术博客｜https://thinkingmachines.ai/blog/on-policy-distillation/｜2025-10-27（DOI 10.64434/tml.20251026）｜2026-10-10｜On-Policy Distillation：把逐 token 负 reverse KL 当 advantage 接入策略梯度更新学生，教师只需一次 compute_logprobs 前向，并给出与 RL/off-policy 蒸馏的计算量对比
