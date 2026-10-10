@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="DFlash 2 是在块扩散草稿器 DFlash 上增加路径选择器与两抽头动态卷积的第二代草稿器，一次前向并行猜出一整块 token 并从中串出一条连贯路径，解码无损、输出与目标模型一致。">
+  <meta name="dojo:summary" content="块内每个位置保留 top-16 候选，轻量选择器给相邻候选对打分、一次并行算完，再沿分数贪心走出一条路径；骨干里插入两抽头动态卷积，让每个位置读到前一位的表示，压住块末端的准确率衰减。">
+  <meta name="dojo:topics" content="推理系统, 模型结构">
+  <meta name="dojo:tag" content="推理加速">
+  <title>DFlash 2</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">DFlash 2</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">DFlash 2</h1>
+<p class="reading-time">正文 2,453 字 · 约 8 分钟阅读</p>
+
+<p><a href="../speculative-decoding/index.html">投机解码</a>是常见推理软件栈的一部分：一个小模型（草稿器）先猜出一块 token（词元，模型处理的最小文本单位），目标模型再一次前向（把整段输入整体算一遍、得出输出）把这整块一起验证。猜得准，一次前向就换回多个 token；猜不准，这一块就作废。以往草稿器自己也一个 token 一个 token 地猜，起草这一步仍是串行的。</p>
+
+<p>块扩散草稿器把起草也改成一次前向：草稿器一次并行猜出整块位置上每个位置的 token（因为整块同时预测，称为块扩散），再把这整块交给目标模型一次验证。</p>
+
+<p>DFlash 2 保留块扩散的一次前向结构，加了两个组件：从草稿器每位置的候选里选一条连贯路径（路径选择器），以及在草稿模型的骨干（串起各层的 transformer 主体）里插入两抽头动态卷积。它让每次验证多产出约 20% 的输出、只增加约 1.3% 的循环延迟（一次起草加验证周期的耗时），且输出与目标模型一致，接受长度（每轮验证平均接受的 token 数）比第一代更长。</p>
+
+<p>DFlash 2 于 2026-08-18 发布，发布形态是技术博客加两份草稿模型权重（模型参数）。它本身不是独立语言模型，只在投机解码服务里为目标模型起草。</p>
+
+<h2 id="s1">1. 两个剩余问题</h2>
+
+<p>块扩散草稿器在每个位置各自取自己最可能的 token，位置之间没有协调。这样留下两处余量，各自对应一个组件：一处是块内正确 token 其实已经在候选里，只是没被选中；另一处是块越靠后准确率越低。</p>
+
+<h3 id="s1-1">1.1 选择空间：答案已经在候选里</h3>
+
+<p>在一个五层草稿器上按块内位置逐位统计：只取每位置最可能的一个 token（top-1 正确率），首个位置是 85.4%；若每个位置保留前 16 个候选，正确答案落在其中的比例（top-16 正确率）是 99.5%。这两项指标都沿块下降，top-1 到最后一个位置降到 72.9%，top-16 降到 87.8%。每位置保留 top-16 时，多数正确答案已经在候选里，缺的只是把对的那个挑出来。</p>
+
+<details>
+<summary>逐位置 top-1 与 top-16 正确率（五层 Qwen3-4B 是一个目标模型、GSM8K 是小学数学题基准、条件于前文全部正确）</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>位置</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>接受长度</th></tr></thead>
+<tbody>
+<tr><td>top-1 正确率</td><td>85.4%</td><td>80.3%</td><td>79.4%</td><td>78.3%</td><td>77.5%</td><td>75.9%</td><td>72.9%</td><td>4.27</td></tr>
+<tr><td>top-16 正确率</td><td>99.5%</td><td>97.3%</td><td>94.8%</td><td>92.6%</td><td>90.8%</td><td>89.4%</td><td>87.8%</td><td>6.79</td></tr>
+</tbody>
+</table>
+</div>
+<p>接受长度一列按行分：top-1 那一行的 4.27 是基线，top-16 那一行的 6.79 是假想总能挑对时的结果。</p>
+</details>
+
+<p>假想一个总能从 top-16 里挑对的选择器，也就是 oracle（完美选择），接受长度能从 4.27 提到 6.79。这段差距是纯选择空间。</p>
+
+<h3 id="s1-2">1.2 后缀衰减：连 oracle 也在掉</h3>
+
+<p>连 oracle 也掉：完美选择下正确率仍沿块下降。这说明候选池本身在后段枯竭，任何选择器都修不了。DFlash 2 把这种现象叫后缀衰减，并归为骨干的问题。</p>
+
+<p>一个疑点是容量：五层骨干可能太小，保不住跨块的依赖。</p>
+
+<h2 id="s2">2. 路径选择器</h2>
+
+<p>路径选择器把「逐位置独立挑」换成「在候选之间串一条路径」：每个位置保留 top-16 候选，给每一对相邻候选打分，再从最后已验证的 token 出发，沿分数走出一条路径——贪心每步取分数最高的后继，或从这些分数里采样。</p>
+
+<h3 id="s2-1">2.1 相邻对打分</h3>
+
+<p>选择器只用相邻候选对打分，依据是一条设计前提：一个候选合不合适，主要取决于紧邻它前一个 token，所以给相邻对打分就够了。它和另一条路线（串行修正头）不同：串行修正头是一个逐位置重算整个词表分布的修正模块（词表即全部 token 的集合）。</p>
+
+<p>对一对相邻候选 $(a,b)$（$a$ 是前一个位置的候选，$b$ 是当前候选），分数是两项相加：</p>
+
+<p>$$S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),\,B(b)\rangle$$</p>
+
+<p>第一项 $U_t(b)$ 是草稿器自己对 $b$ 的打分。第二项衡量 $b$ 接在 $a$ 之后的连贯程度：$A$ 和 $B$ 各给一个 token 一个 256 维的嵌入（把 token 映成一个 256 维向量），其中 $A(a)$ 先与上下文门 $H(h_t)$ 逐维相乘，再与 $B(b)$ 求内积；$H(h_t)$ 由该位置的隐状态 $h_t$（该位置在草稿器里算出的那个向量）算出，用来决定匹配的哪些维计入分数。两个嵌入只有 256 维，远小于隐状态，所以第二项是在相邻候选间做一次低秩双线性匹配。</p>
+
+<details>
+<summary>手算一次选择器怎么走出一条路径</summary>
+<p>以下数字为自行构造，为方便手算把 top-16 缩到 top-2、块长缩到 3；位置按 1 起编号（各表的 0 起是另一套约定）。</p>
+<ol>
+<li>三个位置的单点评分 $U_t(b)$：位置 1 的候选取 1.0 与 0.5；位置 2 取 0.4 与 0.9；位置 3 取 0.6 与 0.3。</li>
+<li>从最后已验证的 token 进位置 1（只有这两个候选）：匹配项取 0.1 与 0.4。位置 1 的分数 $S_1=1.0+0.1=1.1$、$0.5+0.4=0.9$。</li>
+<li>位置 1 到位置 2 的匹配项取 0.5、0.1、0.2、0.7，四个分数 $S_2=0.4+0.5=0.9$、$0.9+0.1=1.0$、$0.4+0.2=0.6$、$0.9+0.7=1.6$。</li>
+<li>位置 2 到位置 3 的匹配项取 0.3、0.4、0.8、0.1，四个分数 $S_3=0.6+0.3=0.9$、$0.3+0.4=0.7$、$0.6+0.8=1.4$、$0.3+0.1=0.4$。</li>
+<li>贪心走路径：位置 1 取分数最高的候选（1.1）；位置 2 在它的后继里取分数最高的（1.0 胜过 0.9）；位置 3 再取分数最高的后继（1.4 胜过 0.4），得到一条路径。</li>
+<li>若把位置 2 到位置 3 的匹配项里 0.1 改到 1.2，对应分数升到 $0.3+1.2=1.5$，超过原来的 1.4，位置 3 就会改选那条更连贯的边——匹配项把连贯性显式算了进去。</li>
+</ol>
+</details>
+
+<p>沿分数走路径时，采样用拒绝采样（按接受-拒绝修正分布的采样法）修正草稿分布，使最终输出与目标模型的分布一致。</p>
+
+<h3 id="s2-2">2.2 为什么便宜</h3>
+
+<p>打分是全并行的：所有位置的所有相邻对一次算完，不需要额外的骨干或 LM head（把隐状态映成词表上打分的输出层）前向。唯一串行的工作是最后沿预计算的分数走路径，代价随块长线性。打分又只在 256 维嵌入上做，不碰词表大小的输出，这正是它比串行修正头开销小的地方——后者要逐位置重算整个词表的分布。</p>
+
+<details>
+<summary>选择器单项的接受长度与开销（五层 Qwen3-4B、GSM8K；开销相对朴素 DFlash；M 为百万；$T$ 为采样温度）</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>方法</th><th>参数</th><th>延迟</th><th>接受长度（$T=0$）</th><th>接受长度（$T=1$）</th></tr></thead>
+<tbody>
+<tr><td>DFlash</td><td>—</td><td>—</td><td>4.27</td><td>3.78</td></tr>
+<tr><td>加串行修正头</td><td>+77.8M</td><td>+9.6%</td><td>4.49</td><td>4.08</td></tr>
+<tr><td>加路径选择器</td><td>+2.0M</td><td>+0.6%</td><td>4.61</td><td>4.25</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<p>单独用选择器（不含卷积）时，接受长度从 4.27 提到 4.61（$T=0$）。选择器仍有上限：oracle 是 6.79。</p>
+
+<h2 id="s3">3. 两抽头动态卷积</h2>
+
+<p>后缀衰减出在草稿模型的骨干上，单靠选候选修不了，需要在骨干侧补一个局部模块。补法的算子是一个短卷积：只取两个抽头，一个看当前位置，一个看前一位（背景见<a href="../depthwise-conv/index.html">深度卷积</a>）。</p>
+
+<h3 id="s3-1">3.1 诊断：注意力的两份工作失衡</h3>
+
+<p>加深主要改善靠后的位置。三层、五层、十五层草稿器在首位几乎相同，沿块逐渐拉开。但加深是无差别的：把 5 层加到 15 层，多出来的十个注意力块（注意力机制见<a href="../standard-attention/index.html">标准注意力</a>）在每个位置都加容量，连早期那些可增益不多的位置也加，代价是参数变多、循环延迟也涨。</p>
+
+<p>另一处线索在注意力。它有两份工作：读块之前的上下文，以及建块内的依赖。但它在第二份上花得越来越少——块内 token 分到的注意力份额从第 1 层的 30% 掉到第 5 层的 8%，剩余份额也越来越集中在少数几个注意力头（注意力里并行的一路子单元）上。按这个诊断，把块内那份工作交给一个专门的短程模块，注意力只管读上下文。</p>
+
+<details>
+<summary>层数与卷积的逐位置 top-1 正确率对照（Qwen3-4B、GSM8K、$T=0$、条件于前文全部正确；卷积模型不含选择器）</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>草稿器</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr></thead>
+<tbody>
+<tr><td>3 层</td><td>85.21%</td><td>79.26%</td><td>77.18%</td><td>75.75%</td><td>73.96%</td><td>70.4%</td><td>64.97%</td></tr>
+<tr><td>5 层</td><td>85.39%</td><td>80.31%</td><td>79.39%</td><td>78.27%</td><td>77.39%</td><td>76.03%</td><td>72.86%</td></tr>
+<tr><td>15 层（3 倍参数）</td><td>86.42%</td><td>81.61%</td><td>80.68%</td><td>80.34%</td><td>80.59%</td><td>79.66%</td><td>78.73%</td></tr>
+<tr><td>5 层加卷积（加 3% 参数）</td><td>85.83%</td><td>80.94%</td><td>79.98%</td><td>79.68%</td><td>79.73%</td><td>79.43%</td><td>77.61%</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h3 id="s3-2">3.2 卷积怎么做</h3>
+
+<p>在每个草稿器层的每个注意力子层与 FFN（前馈网络）子层（子层即层内的一个计算单元）的前后，各插入一个两抽头动态卷积。它的公式是</p>
+
+<p>$$\operatorname{Conv}_{k}(x)_t=k_{t,0}\odot x_t+k_{t,1}\odot x_{t-1}$$</p>
+
+<p>其中 $x_t$ 是当前位置的表示，$x_{t-1}$ 是前一位的表示（首位改读上一个已验证 token 的表示），$k$ 是这组卷积系数的记号，$k_{t,0}$ 与 $k_{t,1}$ 是随内容变化的两个动态系数，$\odot$ 是逐维相乘（每个特征通道各自相乘）。每个系数由一个可学的基核（训练中更新的基础卷积核）加上一小项修正组成，修正由当前隐状态算出，每 16 个特征通道共享一个修正。它块内局部、无状态，直接插进 DFlash，不改注意力、LM head 或验证流程。</p>
+
+<p>因为信息只跨一位，块内所有位置仍能并行计算，一边算一边把前一位的信息传过来。收益上，只加 16.5M 参数（3%）的五层加卷积版本接近 15 层版本：它减小了后缀衰减，末位 top-1 从 5 层基线的 72.86% 提到 77.61%，而 15 层是 78.73%；卷积只让循环延迟涨 0.7%，多出的十个 transformer 层却要涨 15.2%。第 4、5 层的块内注意力平均份额也从 5 层基线的 9.4% 降到加卷积后的 0.5%，与卷积接手了局部工作、注意力回到读上下文一致。</p>
+
+<h2 id="s4">4. 组合效果</h2>
+
+<p>把选择器和卷积合起来（DFlash 2），在 Qwen3.5-4B（另一个目标模型）上，五项基准的每请求平均接受长度是 5.97，比第一代 DFlash 的 4.92 多 1.05 个 token（21%）。</p>
+
+<p>在 MATH-500（一个数学题基准）上，DFlash 2 的条件接受率（在该位置前文都正确的前提下、该位置被接受的比例）一路稳在约 86% 到末位，各基线在块末位比它低 6 到 9 个百分点。另两个目标模型上方向一致：Qwen3.8-27B（块 8，官方草稿器是 MTP）与 Muse Glimmer（块 16，官方草稿器是官方 DFlash）的均值都比各自的官方草稿器与社区草稿器更高。</p>
+
+<details>
+<summary>三个目标模型的逐基准接受长度与 Qwen3.5-4B 逐位置条件接受率</summary>
+<p>对照方法：MTP 是目标模型原生的多 token 预测路径，DSpark 是串行修正头路线的对照草稿器（Qwen3.8-27B、Muse 两表用的是社区版），DFlash 是第一代草稿器。五个基准：GSM8K 与 MATH-500 是数学题，HumanEval 与 MBPP 是代码题，MT-Bench 是对话。Qwen3.5-4B 的采样为 thinking 开启（输出长推理链）、温度 1.0、top-p 0.95、top-k 20（每步按累计概率 0.95 在前 20 个候选里采样）、presence penalty 1.5、无损拒绝采样。Qwen3.5-4B（每请求平均接受长度）：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>基准</th><th>MTP</th><th>DFlash</th><th>DSpark</th><th>DFlash 2</th></tr></thead>
+<tbody>
+<tr><td>GSM8K</td><td>4.78</td><td>4.99</td><td>5.69</td><td>6.20</td></tr>
+<tr><td>MATH-500</td><td>5.04</td><td>5.42</td><td>6.20</td><td>6.76</td></tr>
+<tr><td>HumanEval</td><td>4.84</td><td>5.43</td><td>5.80</td><td>6.28</td></tr>
+<tr><td>MBPP</td><td>4.16</td><td>4.49</td><td>4.96</td><td>5.41</td></tr>
+<tr><td>MT-Bench</td><td>3.90</td><td>4.26</td><td>4.77</td><td>5.20</td></tr>
+<tr><td>均值</td><td>4.54</td><td>4.92</td><td>5.49</td><td>5.97</td></tr>
+</tbody>
+</table>
+</div>
+<p>Qwen3.8-27B（块 8、默认采样）：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>基准</th><th>MTP</th><th>DSpark</th><th>DFlash 2</th></tr></thead>
+<tbody>
+<tr><td>GSM8K</td><td>5.02</td><td>4.36</td><td>5.46</td></tr>
+<tr><td>MATH-500</td><td>4.72</td><td>3.92</td><td>5.28</td></tr>
+<tr><td>HumanEval</td><td>3.91</td><td>3.30</td><td>4.39</td></tr>
+<tr><td>MBPP</td><td>3.99</td><td>3.51</td><td>4.79</td></tr>
+<tr><td>MT-Bench</td><td>3.74</td><td>3.01</td><td>4.10</td></tr>
+<tr><td>均值</td><td>4.28</td><td>3.62</td><td>4.80</td></tr>
+</tbody>
+</table>
+</div>
+<p>Muse Glimmer（块 16、默认采样）：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>基准</th><th>DFlash</th><th>DSpark</th><th>DFlash 2</th></tr></thead>
+<tbody>
+<tr><td>GSM8K</td><td>5.43</td><td>5.45</td><td>6.57</td></tr>
+<tr><td>MATH-500</td><td>5.39</td><td>5.01</td><td>6.56</td></tr>
+<tr><td>HumanEval</td><td>4.11</td><td>4.33</td><td>5.66</td></tr>
+<tr><td>MBPP</td><td>3.74</td><td>4.02</td><td>5.30</td></tr>
+<tr><td>MT-Bench</td><td>3.52</td><td>3.59</td><td>4.42</td></tr>
+<tr><td>均值</td><td>4.44</td><td>4.48</td><td>5.70</td></tr>
+</tbody>
+</table>
+</div>
+<p>Qwen3.5-4B 在 MATH-500 上的逐位置条件接受率（位置 0 到 14）：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>方法</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th></tr></thead>
+<tbody>
+<tr><td>MTP</td><td>84.57%</td><td>80.23%</td><td>79%</td><td>78.42%</td><td>78.63%</td><td>78.17%</td><td>77.36%</td><td>77.74%</td><td>77.91%</td><td>76.96%</td><td>78.06%</td><td>77.4%</td><td>77.49%</td><td>77.48%</td><td>77.85%</td></tr>
+<tr><td>DFlash</td><td>88.35%</td><td>77.7%</td><td>77.8%</td><td>79.45%</td><td>80.3%</td><td>81.12%</td><td>81.22%</td><td>81.07%</td><td>81.29%</td><td>80.28%</td><td>80.64%</td><td>80.29%</td><td>79.56%</td><td>78.77%</td><td>77.48%</td></tr>
+<tr><td>DSpark</td><td>87.24%</td><td>84.59%</td><td>83.79%</td><td>83.63%</td><td>83.6%</td><td>83.27%</td><td>82.97%</td><td>82.54%</td><td>82.21%</td><td>82.39%</td><td>81.58%</td><td>80.7%</td><td>81.35%</td><td>80.57%</td><td>79.86%</td></tr>
+<tr><td>DFlash 2</td><td>88.3%</td><td>85.3%</td><td>84.98%</td><td>84.88%</td><td>85.41%</td><td>85.3%</td><td>85.36%</td><td>85.13%</td><td>85.95%</td><td>85.99%</td><td>86.41%</td><td>86.46%</td><td>86.43%</td><td>86.02%</td><td>86.48%</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>收益取决于并发。单卡 H200（一种 GPU）上，Qwen3.8-27B 在并发 1 时吞吐是自回归解码（一次前向产一个 token 的朴素解码）的 2.67 到 3.43 倍；并发 8 降到 2.27 到 2.85 倍；并发 32 收窄到 1.01 到 1.45 倍，其中 MT-Bench 只有 1.01 倍。这些区间取各任务加速比的最小到最大。低并发、结构化任务（如 GSM8K、MATH-500）收益最大，高并发对话任务的收益趋近于零。</p>
+
+<details>
+<summary>Qwen3.8-27B 与 Muse Glimmer 的并发×任务吞吐（每格为输出 tok/s，即每秒输出 token 数，与相对自回归的加速比）</summary>
+<p>Qwen3.8-27B，并发 1：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>任务</th><th>自回归</th><th>MTP</th><th>DSpark</th><th>DFlash 2</th></tr></thead>
+<tbody>
+<tr><td>GSM8K</td><td>68.9</td><td>178.5 (2.59×)</td><td>185.3 (2.69×)</td><td>236.1 (3.43×)</td></tr>
+<tr><td>MATH-500</td><td>69.0</td><td>172.8 (2.51×)</td><td>174.5 (2.53×)</td><td>230.7 (3.34×)</td></tr>
+<tr><td>HumanEval</td><td>69.0</td><td>151.9 (2.20×)</td><td>159.9 (2.32×)</td><td>214.6 (3.11×)</td></tr>
+<tr><td>MBPP</td><td>69.0</td><td>153.1 (2.22×)</td><td>163.3 (2.37×)</td><td>226.9 (3.29×)</td></tr>
+<tr><td>MT-Bench</td><td>68.9</td><td>134.9 (1.96×)</td><td>137.6 (2.00×)</td><td>184.0 (2.67×)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Qwen3.8-27B，并发 8：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>任务</th><th>自回归</th><th>MTP</th><th>DSpark</th><th>DFlash 2</th></tr></thead>
+<tbody>
+<tr><td>GSM8K</td><td>467.2</td><td>1,022.1 (2.19×)</td><td>1,040.8 (2.23×)</td><td>1,328.7 (2.84×)</td></tr>
+<tr><td>MATH-500</td><td>480.0</td><td>1,023.5 (2.13×)</td><td>1,025.8 (2.14×)</td><td>1,368.3 (2.85×)</td></tr>
+<tr><td>HumanEval</td><td>483.4</td><td>934.2 (1.93×)</td><td>956.5 (1.98×)</td><td>1,291.5 (2.67×)</td></tr>
+<tr><td>MBPP</td><td>478.0</td><td>938.1 (1.96×)</td><td>974.1 (2.04×)</td><td>1,328.0 (2.78×)</td></tr>
+<tr><td>MT-Bench</td><td>480.5</td><td>835.2 (1.74×)</td><td>802.3 (1.67×)</td><td>1,090.2 (2.27×)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Qwen3.8-27B，并发 32：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>任务</th><th>自回归</th><th>MTP</th><th>DSpark</th><th>DFlash 2</th></tr></thead>
+<tbody>
+<tr><td>GSM8K</td><td>1,329.8</td><td>1,381.1 (1.04×)</td><td>1,506.5 (1.13×)</td><td>1,922.5 (1.45×)</td></tr>
+<tr><td>MATH-500</td><td>1,505.8</td><td>1,415.6 (0.94×)</td><td>1,429.0 (0.95×)</td><td>1,951.8 (1.30×)</td></tr>
+<tr><td>HumanEval</td><td>1,546.5</td><td>1,296.8 (0.84×)</td><td>1,330.1 (0.86×)</td><td>1,799.0 (1.16×)</td></tr>
+<tr><td>MBPP</td><td>1,507.7</td><td>1,314.9 (0.87×)</td><td>1,361.3 (0.90×)</td><td>1,886.8 (1.25×)</td></tr>
+<tr><td>MT-Bench</td><td>1,507.4</td><td>1,159.7 (0.77×)</td><td>1,115.5 (0.74×)</td><td>1,525.3 (1.01×)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Muse Glimmer，并发 1 / 8 / 32 的 DFlash 2 加速比依次为 3.08–4.62 倍 / 2.74–3.99 倍 / 1.15–1.68 倍（区间取各任务加速比的最小到最大）。</p>
+</details>
+
+<p>使用上还有两条限制：每个目标模型要配套一个草稿器，DFlash 2 随 Qwen3.8-27B 与 Muse Glimmer 各发布一份；配套引擎里 vLLM 与 llama.cpp（两个推理引擎）的支持还在 PR 分支（尚未合并的代码分支），未进稳定版本。</p>
+
+<p>三点容易混的地方：其一，3.43 倍是并发 1、GSM8K 那一格，不是普适加速；其二，选择器只修「从候选里挑」，修不了后缀衰减——oracle 也会衰减，那是骨干的问题，靠卷积修；其三，两抽头卷积不是加深网络，它是插在每个子层前后的局部无状态算子，只覆盖「当前位置加前一位」的短程依赖。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Inco AI，《DFlash 2: Keep Drafting Parallel》，2026-08-18，<a href="https://inco.ai/blog/dflash2/">链接</a></li>
+<li>Inco AI，Qwen3.8-27B-DFlash2 模型卡，<a href="https://huggingface.co/incoai/Qwen3.8-27B-DFlash2">链接</a></li>
+<li>Inco AI，Muse-Glimmer-30B-DFlash2 模型卡，<a href="https://huggingface.co/incoai/Muse-Glimmer-30B-DFlash2">链接</a></li>
+<li>Inco AI，Qwen3.8-27B-DFlash2-GGUF 模型卡（GGUF，一种量化模型文件格式），<a href="https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF">链接</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
