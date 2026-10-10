@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="残差连接把若干层的输入一路直连、加到这些层的输出上，让中间层只学一个相对输入的小修正，从而能训练很深的网络。">
+  <meta name="dojo:summary" content="把要拟合的映射记为 $\mathcal{H}(x)$，让层去学残差 $\mathcal{F}(x)=\mathcal{H}(x)-x$，输出就是 $\mathcal{F}(x)+x$；当恒等接近最优时，把残差推向零可能比让一叠非线性层拟合恒等映射容易。">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="网络结构">
+  <title>残差连接</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">残差连接</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">残差连接</h1>
+<p class="reading-time">正文 1,541 字 · 约 5 分钟阅读</p>
+
+<p>神经网络由一层一层叠成，每一层把输入向量变成输出向量。训练就是不断调这些层的参数，让网络输出和目标的误差变小。层数叫深度，近期证据表明深度很重要，大规模图像分类上最好的结果都用了很深的网络。但把普通网络继续加深时，出现了一个反常现象：训练误差不降反升，这叫退化。残差连接针对的就是它。它的做法是让若干层不直接拟合目标映射，而是只学这个映射与输入的差，再把输入原样加到结果上，相加后再过一次非线性函数，得到输出；这一组层连同捷径合起来叫一个残差块。把要拟合的映射记作 $\mathcal{H}(x)$，让这些层去学残差 $\mathcal{F}(x)=\mathcal{H}(x)-x$，输入经捷径加回这个残差，得到 $\mathcal{F}(x)+x$。这条从输入直通到输出的加法通路叫捷径连接。</p>
+
+<h2 id="s1">1. 加深反而更差</h2>
+
+<p>加深本应无害，甚至更好。把一个浅层网络和它的深层版本对照：深层版本可以把浅层学到的那些层照搬过来，再把多出来的层设成什么都不做，于是它至少不该比浅层差。可是实际训练时，深层版本的训练误差反而更高。这就是退化：深度增加后准确率先饱和再下降，而且训练误差本身也上升。</p>
+
+<p>退化不是过拟合。过拟合是训练误差还在下降、验证误差（在另一批留出的数据上算的误差）却开始上升，模型只是把训练集记得太熟。</p>
+
+<p>退化里训练误差自己就升了，所以问题出在优化，模型没能把深层版本训好。</p>
+
+<p>一个可能是梯度在加深时消失（反向传回来的梯度越传越小），但这组对照网络都用了批归一化（一种把每层输入重新定尺度和中心的处理），前向信号的方差不为零，反向的梯度范数也正常，所以不像梯度消失。更深的原因当时还不清楚，一个猜想是深层的普通网络收敛很慢。</p>
+
+<details>
+<summary>普通网络与残差网络的误差数字</summary>
+<p>在一个大规模图像分类数据集（ImageNet）的验证集上，比较 18 层与 34 层网络，残差网就在对应的普通网络上加捷径、层数相同。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>网络</th><th>18 层</th><th>34 层</th></tr></thead>
+<tbody>
+<tr><td>普通</td><td>27.94</td><td>28.54</td></tr>
+<tr><td>残差</td><td>27.88</td><td>25.03</td></tr>
+</tbody>
+</table>
+</div>
+<p>表里是 top-1 错误率（%），即模型给出的第一候选答案就错的那部分样本占的百分比，越低越好。普通网络加深后错误率上升，残差网络加深后错误率下降，方向与训练误差那边的现象一致。</p>
+</details>
+
+<h2 id="s2">2. 残差块怎么写</h2>
+
+<h3 id="s2-1">2.1 把目标从 $\mathcal{H}(x)$ 改成 $\mathcal{F}(x)+x$</h3>
+
+<p>残差连接改的是这几层要学什么。原本希望一叠层直接拟合目标映射 $\mathcal{H}(x)$；改成让它们拟合残差 $\mathcal{F}(x)=\mathcal{H}(x)-x$，再把输入加回去，得到 $y=\mathcal{F}(x,\{W_i\})+x$，$y$ 再过一次非线性函数才是这几层的输出。这里 $x$ 是这几层的输入，$\{W_i\}$ 是堆叠各层里待学的权重，$\mathcal{F}$ 是这些层构成的非线性函数，$+x$ 就是把输入原样送过去的那条捷径。</p>
+
+<p>这一步只是把 $\mathcal{H}$ 重写成 $\mathcal{F}+x$，$\mathcal{F}$ 与 $\mathcal{H}$ 一样能逼近要拟合的映射（这个假设当时仍未决），换的只是好不好学。</p>
+
+<h3 id="s2-2">2.2 捷径连接的代价与维度匹配</h3>
+
+<p>捷径做的是恒等映射：把输入原样送到出口，不做任何变换。维度相同时它不引入参数，也不增加计算。</p>
+
+<p>这套说法对全连接层（每个输入分量都与每个输出分量相连的一层）成立，对卷积层（对图像按局部窗口滑动做加权求和的一类层）也成立，只是加法改成两张特征图（卷积层输出的多通道二维网格，通道是其中一维）按通道、逐位置相加。如果 $\mathcal{F}$ 改变了维度，两边对不齐，就要把捷径也对齐：一种做法是给多出来的位置补零，另一种是用一个学出来的线性变换 $W_s$（投影）把输入投到目标维度，此时 $y=\mathcal{F}(x,\{W_i\})+W_s x$。实验里只把投影用在维度对不齐的地方，其余都用恒等，因为恒等已经够解决退化，而且更省内存和计算。</p>
+
+<h2 id="s3">3. 为什么它让深网好训</h2>
+
+<p>退化提示：多出来的那些层不容易用一叠非线性层逼近恒等映射。残差形式换了一个参照——如果要拟合的映射离恒等不远，网络只需在恒等的基础上学一个小的残差 $\mathcal{F}(x)$，优化的起点就已经接近正确，只要修正这个小量，比直接拟合整个映射容易。这种把问题改写、让优化更好做的想法，可能有助于给问题做预条件（换一个等价的问题表述，让同一个优化过程更容易走）。</p>
+
+<p>有一个实验和这个看法一致：在一个小图像数据集（CIFAR-10）上，量每一层卷积（卷积窗口大小是 3×3）在批归一化之后、非线性之前的输出，看它的标准差，作为这一层改动信号的大小。残差网络的响应大体比同规模的普通网络小，这与「学到的残差函数整体比非残差函数更接近零」相符；而且层数越多，单层响应越小，对照的是 20、56、110 层的残差网络。</p>
+
+<details>
+<summary>手算：为什么「什么都不做」对应残差为零</summary>
+<p>用一个最简的残差块演示算术：这块只把输入乘一个权重 $w$，没有非线性、没有偏置（每层里可加的一个可调常数），算 $y=wx$。输入取 $x=2$。</p>
+<ol>
+<li>普通形式里，块直接算出输出 $y=wx$。要让块什么都不做，即输出仍等于输入 $2$，需要 $w=1$。</li>
+<li>残差形式里，块算的是残差 $\mathcal{F}(x)=wx$，输出是 $y=\mathcal{F}(x)+x=(w+1)x$。要让块什么都不做，需要 $w=0$。</li>
+<li>取 $w=0$，得 $y=2$；取 $w=0.1$，残差 $\mathcal{F}(x)=0.2$，输出 $y=2.2$。</li>
+<li>于是普通形式里「什么都不做」对应权重恰好等于 $1$，残差形式里对应权重等于 $0$。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>残差连接是解决退化的一个可行办法，不是唯一的解法。实验里换用投影捷径也能解决退化，代价是额外的内存与计算；它和门控型捷径也不同，后者的开关由数据决定、会关闭，残差连接里的捷径则一直直通，再叠加学到的残差。</p>
+
+<p>实验中的 $\mathcal{F}$ 由两三层组成；若只有一层，就没观察到优势，因为它变成一个线性层。</p>
+
+<p>边界在深度收益上。在一个小数据集上把网络加到 1202 层，训练误差能压到 0.1% 以下，说明优化不再困难；但测试误差（在另一批数据上评估得到的误差）反而比 110 层的网络差。一种解释是过拟合——数据集太小、这么大的模型对它来说过大了。这是推测，不是已证明的结论。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun. Deep Residual Learning for Image Recognition. arXiv preprint, v1, 2015. <a href="https://arxiv.org/abs/1512.03385v1">https://arxiv.org/abs/1512.03385v1</a></li>
+<li>Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun. deep-residual-networks: official models. 2016. <a href="https://github.com/KaimingHe/deep-residual-networks">https://github.com/KaimingHe/deep-residual-networks</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
