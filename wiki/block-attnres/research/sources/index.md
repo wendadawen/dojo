@@ -1,0 +1,2 @@
+- paper/attnres-2603.15031v1.pdf、paper/attnres-2603.15031v1.txt、paper/src-v1/｜论文｜https://arxiv.org/abs/2603.15031v1｜v1｜2026-10-10｜Attention Residuals：Kimi Team 技术报告，提出 Full AttnRes 与 Block AttnRes，含动机、公式、基础设施、实验与结构化矩阵分析；LaTeX 源码在 src-v1/，纯文本快照 attnres-2603.15031v1.txt
+- repo/attnres/｜仓库｜https://github.com/MoonshotAI/Attention-Residuals｜85e22310fe5ee860b4a023de312d791de8a5a5e6（2026-03-17）｜2026-10-10｜官方仓库，README 给出 Block AttnRes 的 PyTorch 风格伪代码、缩放律结论与下游结果表
