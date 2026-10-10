@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="交叉熵是度量「用一个预测分布去描述真实结果」的平均代价，训练时最小化的就是它，标签只标出真实类别时化简为真实类预测概率的负对数。">
+  <meta name="dojo:summary" content="把「模型认为真实结果有多可能」变成可求导的代价：$H(P,Q) = -\mathbb{E}_{x\sim P}\log Q(x)$；标签只标出真实类别时化简为 $-\log Q(y)$，最小化它等价于最大似然。">
+  <meta name="dojo:topics" content="训练与优化, 概率与统计">
+  <meta name="dojo:tag" content="训练">
+  <title>交叉熵</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">交叉熵</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">交叉熵</h1>
+<p class="reading-time">正文 1,586 字 · 约 5 分钟阅读</p>
+
+<p>一个分类模型做二分类，结果的类别是「晴」和「非晴」两类。它给「晴」的概率是 $0.8$，给「非晴」的概率是 $1-0.8=0.2$，实际结果正是晴。训练要把这个模型的参数往「给真实结果更高概率」的方向调，得先把这一步的表现算成一个数。看它有没有判对是一种办法：概率 $0.8$ 大于 $0.2$，判对，记 $0$ 分。可是对错只有两种取值，把 $0.8$ 调成 $0.81$，分数仍是 $0$，参数找不到调整的方向。</p>
+
+<p>另一种办法看模型给真实结果的概率：概率低，代价就大。给「晴」$0.8$ 得到一个较小的值，给「晴」$0.2$ 得到一个较大的值。交叉熵就是这种办法，它把模型给真实结果的概率取负对数当作代价。</p>
+
+<p>在训练集上把每个样本的代价平均起来，就是这组参数的总代价；让这个总代价最小，等价于让已见数据在这组参数下出现的概率最大。</p>
+
+<h2 id="s1">1. 信息量为什么取负对数</h2>
+
+<p>一个结果携带多少信息，用自信息（self-information）度量。信息量要满足三点：确定会发生的事件信息量为零；越罕见的事件信息量越大；两个独立事件同时发生，信息量相加。同时满足这三点的取法是 $I(x) = -\log P(x)$。$P(x)$ 是结果 $x$ 发生的概率：确定事件 $P=1$，取负对数得 $0$；概率越小，负对数越大；两事件概率相乘对应取对数后相加。对数底取 $e$ 时单位叫 nats，取 $2$ 时单位叫 bit。交叉熵里的每一项 $-\log Q(x)$，就是模型把结果 $x$ 当成概率 $Q(x)$ 时携带的信息量。</p>
+
+<details>
+<summary>三条要求怎样定到 $-\log P(x)$ 上</summary>
+<ol>
+<li>把信息量写成概率的某个函数 $f(P)$。</li>
+<li>确定事件信息量为零：$f(1)=0$。</li>
+<li>独立事件相加：$f(P_1 P_2) = f(P_1) + f(P_2)$。</li>
+<li>只有对数函数把乘法变成加法，所以 $f$ 取对数，写成 $f(P) = c\log P$。</li>
+<li>越罕见的事件信息量越大，要求 $f$ 随 $P$ 变小而变大，即 $f$ 单调递减；$\log P$ 随 $P$ 变大而变大，所以系数 $c&lt;0$，记 $a=-c&gt;0$，写成 $f(P) = -a\log P$。</li>
+<li>取 $a=1$（自然对数）就得到 $I(x) = -\log P(x)$。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 熵与 KL 散度</h2>
+
+<p>熵把自信息按分布平均起来。香农熵定义为 $H(P) = \mathbb{E}_{x\sim P}[-\log P(x)]$，即自信息的期望。分布越接近确定，熵越小；越接近均匀，熵越大。离散变量下，它给出把结果写成比特串时平均每个结果所需位数的下界；二值变量的熵在两种结果概率相等时最大。</p>
+
+<p>KL 散度衡量用一个分布替代另一个分布多付的代价。同一结果空间上的两个分布 $P$、$Q$，定义为 $D_{\mathrm{KL}}(P\|Q) = \mathbb{E}_{x\sim P}[\log P(x) - \log Q(x)]$。离散变量下，本来用为 $P$ 设计的编码，平均每个结果要用 $-\mathbb{E}_{x\sim P}\log P(x)$ 位；改用为 $Q$ 设计的编码，变成 $-\mathbb{E}_{x\sim P}\log Q(x)$ 位，多出来的就是 KL 散度。它非负，当且仅当两个分布在离散情形下相同（连续情形下几乎处处相等）时为零；它也不对称，$D_{\mathrm{KL}}(P\|Q)$ 一般不等于 $D_{\mathrm{KL}}(Q\|P)$，所以不是距离。</p>
+
+<details>
+<summary>把期望展开成求和</summary>
+<p>$$D_{\mathrm{KL}}(P\|Q) = \sum_x P(x)\left(\log P(x) - \log Q(x)\right),$$</p>
+<p>对每个结果算出 $\log P(x) - \log Q(x)$，再按 $P(x)$ 加权求和。取两个结果的分布 $P = (0.5, 0.5)$、$Q = (0.25, 0.75)$ 算一遍：第一个结果贡献 $0.5 \times \log(0.5/0.25)$，第二个贡献 $0.5 \times \log(0.5/0.75)$。自然对数下 $\log 2 \approx 0.693$、$\log(2/3) \approx -0.405$，两项相加约为 $0.5 \times (0.693 - 0.405) \approx 0.144$。</p>
+</details>
+
+<h2 id="s3">3. 交叉熵</h2>
+
+<p>把真实分布 $P$ 的结果改用模型分布 $Q$ 来编码，平均每个结果的代价就是交叉熵，定义为</p>
+
+<p>$$H(P,Q) = -\mathbb{E}_{x\sim P}\log Q(x),$$</p>
+
+<p>$\log$ 取以 $2$ 为底的对数时，它的值就是平均所需位数；下面用自然对数，单位是 nats。$P$ 是结果的真实分布，$Q$ 是模型给出的预测分布。它和熵只差一个分布：把 $-\mathbb{E}_{x\sim P}\log Q(x)$ 里的 $Q$ 换成 $P$，得到熵 $H(P)$；两者相减得到 KL 散度 $D_{\mathrm{KL}}(P\|Q)$，于是</p>
+
+<p>$$H(P,Q) = H(P) + D_{\mathrm{KL}}(P\|Q).$$</p>
+
+<p>$H(P)$ 只由真实分布决定，与 $Q$ 无关，所以对 $Q$ 求最小的时候，交叉熵与 KL 散度取到同一个最小值点：最小化交叉熵等价于最小化 KL 散度，交叉熵能降到的最小值就是 $H(P)$。计算中出现 $0\log 0$ 时，按信息论的惯例取 $\lim_{x\to 0} x\log x = 0$。</p>
+
+<h2 id="s4">4. 训练里的交叉熵</h2>
+
+<p>训练集是一组样本，每个样本带一个真实标签。经验分布把训练集看成等可能的结果：大小为 $N$ 的样本集，第 $i$ 个样本的概率是 $1/N$。最大似然估计选参数 $\theta$，让这组样本在模型下出现的概率最大：</p>
+
+<p>$$\theta_{\mathrm{ML}} = \arg\max_\theta \prod_{i=1}^{N} Q(x^{(i)};\theta).$$</p>
+
+<p>$Q$ 是模型给出的预测分布，$x^{(i)}$ 是第 $i$ 个样本，$\theta$ 是模型参数。连乘容易数值下溢，取对数把它变成求和，且不改变取到最大值的那个 $\theta$；再除以样本数 $N$，写成对经验分布求期望：</p>
+
+<p>$$\theta_{\mathrm{ML}} = \arg\max_\theta \mathbb{E}_{x\sim\hat{p}_{\mathrm{data}}}\log Q(x;\theta).$$</p>
+
+<p>把最大化改成最小化（取负号），按交叉熵的定义写，就是最小化经验分布与模型分布之间的交叉熵。分类训练把真实类别写成 one-hot：一个长度等于类别数的向量，只有真实类别那一位置 $1$，其余位置为 $0$。按 one-hot 求平均，只有真实类别那一项带权重 $1$，其余项权重是 $0$，交叉熵只剩 $-\log Q(y)$，其中 $y$ 是真实类别，$Q(y)$ 是模型给真实类别的概率。</p>
+
+<details>
+<summary>二分类和多分类的手算</summary>
+<ol>
+<li>接前面二分类的例子，真实类别是「晴」：模型给「晴」的概率 $0.8$ 时，交叉熵 $-\log 0.8 \approx 0.223$；概率 $0.2$ 时，$-\log 0.2 \approx 1.609$。</li>
+<li>多分类，三个类别，模型给真实类别的概率 $0.7$：交叉熵 $-\log 0.7 \approx 0.357$。</li>
+<li>同一个多分类样本，模型给真实类别的概率 $0.1$：交叉熵 $-\log 0.1 \approx 2.303$。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 下一 token 的交叉熵</h2>
+
+<p>一段文本先被切成 token（词、子词或字符），全部可用的 token 组成词表。语言模型给这段文本的每个位置算出下一个位置上各个 token 的概率分布：softmax 把模型在这一位置的一组打分变成词表上的概率分布（每个打分取指数再归一）。把真实的下一个 token 记为 $y_t$，它前面的 token 记为 $y_{&lt;t}$；模型在这几个 token 的条件下给出预测分布 $Q$，这一位置的交叉熵是 $-\log Q(y_t)$，$Q(y_t)$ 是模型给真实 token $y_t$ 的概率。把这段文本各位置的负对数概率按位置平均，得到这段文本的损失。</p>
+
+<p>语言建模的结果常以平均负对数概率报告：把整段文本的负对数概率按字符、字节或词这类预测单元取平均。</p>
+
+<details>
+<summary>小词表上逐位置算一遍</summary>
+<ol>
+<li>取词表 $\{\text{A}, \text{B}, \text{C}\}$（$3$ 个 token）。文本有 $3$ 个 token，从第 $1$ 个位置起每步预测下一个 token，两个预测位置的真实下一个 token 分别是 B、C。</li>
+<li>位置 $1$：模型给 B 的概率 $0.6$，损失 $-\log 0.6 \approx 0.511$。</li>
+<li>位置 $2$：模型给 C 的概率 $0.5$，损失 $-\log 0.5 \approx 0.693$。</li>
+<li>两个位置平均，$(0.511 + 0.693)/2 \approx 0.602$，这就是这段文本的损失。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 适用条件与边界</h2>
+
+<p>交叉熵要成立，结果空间得先定下来，$P$ 是结果真实（或训练集经验）分布，$Q$ 是模型分布。任何由负对数似然（把模型给真实结果的概率取负对数，再按样本平均）组成的损失，都是这个训练集的经验分布与模型分布之间的交叉熵；常见的误解是以为只有 softmax 或伯努利输出才有交叉熵。均方误差也是交叉熵，它是经验分布与一个高斯模型之间的交叉熵（把高斯分布的对数似然展开，指数被对数消掉，只剩误差的平方项）。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Ian Goodfellow, Yoshua Bengio, Aaron Courville. Deep Learning. MIT Press, 2016. ISBN 978-0262035613. <a href="https://www.deeplearningbook.org">https://www.deeplearningbook.org</a></li>
+<li>Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever. Language Models are Unsupervised Multitask Learners. OpenAI, 2019. <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
