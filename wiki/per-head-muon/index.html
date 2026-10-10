@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Per-Head Muon 是 Muon 优化器在注意力投影上的改法：把优化器累积的动量矩阵沿头切成每头一块，每块单独做正交化。">
+  <meta name="dojo:summary" content="把动量矩阵按头切开、逐头正交化，使各头更新尺度均衡；分布式下用 P2P 取回分片替代全参数 all-gather。">
+  <meta name="dojo:topics" content="训练与优化">
+  <meta name="dojo:tag" content="优化器">
+  <title>Per-Head Muon</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Per-Head Muon</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Per-Head Muon</h1>
+<p class="reading-time">正文 1,461 字 · 约 5 分钟阅读</p>
+
+<p>Per-Head Muon 是 <a href="../muon-optimizer/index.html">Muon 优化器</a>在注意力 Q、K、V 投影上的一种改法。注意力层把每个位置的表示和前面各位置的表示按相关性加权求和，Q、K、V 是这一层里的三块线性投影权重，分别把输入变换成查询、键、值。Muon 是专门用于二维矩阵参数的优化器，它把动量矩阵的正交化结果当作这一步的更新；动量矩阵是优化器累积起来的梯度，形状与参数矩阵相同。正交化是把矩阵的奇异值都拉平为 1：把矩阵 $X$ 做奇异值分解 $X=USV^\top$，正交化就是把结果换成 $UV^\top$，奇异值被丢弃。这一步由 Newton-Schulz 迭代完成，它是一种用多项式反复迭代、逐步逼近正交化的算法。得到的 $UV^\top$ 叫半正交矩阵，「半」是因为它只要求行或列一边彼此正交、长度都等于 1，不像正交矩阵两边都正交。投影权重按头沿行方向堆叠，每一个头对应其中一段行块，头数记 $H$，一个头占的行数记 $d_h$。Per-Head Muon 改的是正交化的对象：不再对整块投影矩阵做，而是把动量矩阵的行按头分成 $H$ 段，每一段单独正交化。它要解决的问题是，整块正交化会让各头的更新尺度不均。</p>
+
+<h2 id="s1">1. 为什么整块正交化对多头不够好</h2>
+
+<p>动量矩阵的行按头顺序排成 $H$ 段，每段 $d_h$ 行，整块矩阵就是这些头块沿行拼起来的。对整块做正交化，是把整块矩阵的奇异值都拉平为 1，而整块的奇异向量由所有头的数据一起决定，不是每个头各自一套。资料给出的解释是，全矩阵正交化把所有头当成一个耦合块：动量尺度大的头主导了共享的更新方向，动量尺度小的头拿到的更新没有被充分正交化。</p>
+
+<details>
+<summary>两头例子：全矩阵正交化后动量尺度小的头行块范数</summary>
+<p>用两个头、每头一维、列数一维的极小动量矩阵算一遍。第一头 $M_1=[3]$，第二头 $M_2=[0.3]$，两行同向，第二头是第一头的十分之一。整块矩阵的行按头顺序排，是两行一列，$M=\begin{bmatrix}3\\0.3\end{bmatrix}$。</p>
+<ol>
+<li>两行同向，$M$ 是秩 1 矩阵，唯一非零奇异值 $\sigma_1=\sqrt{\|M_1\|^2+\|M_2\|^2}=\sqrt{3^2+0.3^2}=\sqrt{9.09}\approx3.015$。</li>
+<li>秩 1 矩阵的 $UV^\top$ 就是把 $M$ 除以 $\sigma_1$，得到 $[0.995;\,0.0995]$。</li>
+<li>第一头行块范数 $3/3.015\approx0.995$，第二头行块范数 $0.3/3.015\approx0.0995$。</li>
+<li>两头行块范数之比约 $0.995/0.0995\approx10$，动量尺度小的头这一行块的范数只有 $0.0995$。对两行一列这种非方阵，正交化只保证各列长度为 1，不保证各行，所以两行按头分块后，动量尺度小的头这一行块的范数就不到 1。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 按头切分并分别正交化</h2>
+
+<p>Per-Head Muon 把正交化的对象从整块矩阵换成每个头块。把动量矩阵的行按头分成 $H$ 段 $M_1,\dots,M_H$，每段的形状是 $d_h\times d$，$d$ 是矩阵的列数，也就是输入的维度。对每一块单独做 Newton-Schulz 正交化，得到 $H$ 个正交化后的块 $\mathrm{Ortho}(M_1),\dots,\mathrm{Ortho}(M_H)$，再按原来的头顺序拼接回整块更新。每块内部，正交化把这一块自己的奇异值拉平为 1，各头的计算不再互相牵连。</p>
+
+<details>
+<summary>两头例子：按头正交化把头块拉回单位范数</summary>
+<p>用 $M_1=[3]$、$M_2=[0.3]$。</p>
+<ol>
+<li>$M_1$ 是一个 $1\times1$ 块，正交化就是它除以自己的绝对值，$[3]/3=[1]$，行块范数为 1。</li>
+<li>$M_2$ 同样处理，$[0.3]/0.3=[1]$，行块范数也是 1。</li>
+<li>两头行块范数都等于 1，原来十倍差距的尺度被拉平。</li>
+</ol>
+</details>
+
+<details>
+<summary>逐头正交化的伪代码</summary>
+<p>输入是动量矩阵 $M$、头数 $H$；输出是拼回后的更新矩阵。</p>
+<ol>
+<li>由 $M$ 的总行数和头数 $H$ 算出每头的行数 $d_h$。</li>
+<li>把 $M$ 沿行方向切成 $H$ 段，第 $h$ 段是 $M_h$。</li>
+<li>对每个 $h$ 单独调用正交化函数，得到 $\mathrm{Ortho}(M_h)$。</li>
+<li>把 $H$ 个结果沿行拼回，作为这一层的更新。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 均衡更新尺度与开销</h2>
+
+<p>按头正交化均衡的是各头更新块的尺度，不是方向。每个头块被单独正交化，块内部新的奇异值都变成 1，所以各头的更新幅度趋于一致，不再受别的头动量尺度的影响。方向仍由各头自己的奇异向量决定，因为正交化用到的就是这一块自己的分解。资料给出的实践结果是，这样的设计让各头的学习动力学（各层参数随训练变化的走势）更均衡，并提升大尺度训练的稳定性，同时略微降低优化器开销。</p>
+
+<p>资料把降低开销的原因写成，每头块上的 Newton-Schulz 迭代比整块投影矩阵上便宜。</p>
+
+<details>
+<summary>每头块与整块的 Gram 矩阵规模对照</summary>
+<ol>
+<li>Newton-Schulz 每步的主要计算是算矩阵乘自己的转置 $XX^\top$，这个方阵叫 Gram 矩阵，它的边长等于参与计算的矩阵的行数。</li>
+<li>整块正交化时，Gram 矩阵的边长是 $H\cdot d_h$；按头分成 $H$ 块后，每块的 Gram 矩阵边长只有 $d_h$，$H$ 个小方阵各自相乘的计算量比一个大方阵小。</li>
+<li>用两头例子看：$H=2$、$d_h=1$、列数 $d=1$ 时，全矩阵的 Gram 是 $2\times2$，算一次 $2\cdot2\cdot1=4$ 次乘法；每头块的 Gram 是 $1\times1$，算一次 $1$ 次乘法，两头合计 $2$ 次。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 分布式实现里的 P2P 参数取回</h2>
+
+<p>数据并行是把训练数据分给多份模型副本、各自算梯度再合并的做法，一个副本对应一个进程。分布式优化器把参数按数据并行的进程平均切开，每个进程只存一部分，这样的一份参数称为一个分片。可 Muon 的正交化需要一个完整矩阵才能算。朴素的做法是每一步由所有进程互相交换各自的分片、把完整参数重新拼回，这种集体通信叫 all-gather。它有两个代价：每个进程都要多出一份完整参数的缓冲区，占内存；通信量随参数规模增长，在大规模训练里成为主要瓶颈。分布式实现改成不拼完整参数：每个进程只负责自己那部分参数的正交化，它向持有相应分片的进程点对点取回这部分参数所需的分片，不必取回全参数，这种点对点通信叫 P2P。取回的内容从全参数变成本地所需的分片，全参数缓冲区被去掉，内存和通信量都降下来。通信和计算再按 model-chunk（参数缓冲区的一个切分单元）的粒度重叠起来，让通信时间被计算时间掩盖。</p>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>Per-Head Muon 只对能按头分成行段的矩阵参数成立，也就是注意力 Q、K、V 投影这一类；前馈层（逐位置处理输入的那一层）等不能按头分成行段的矩阵仍用原来的 Muon。资料说的更均衡的学习动力学和更好的大尺度训练稳定性，是在它的大规模训练配置下观察到的定性结论，没有给出单独归因于按头改动的对照实验数字，不能推广成任何规模都更稳。「略微降低优化器开销」同样是定性说法，资料没有给具体数值。P2P 只把集体通信换成点对点取回，通信没有被消除。</p>
+
+<p>Per-Head Muon 不是一个新的优化器，它只是 Muon 在注意力投影上的一处改动。它也不改动 Newton-Schulz 迭代的算法，只改正交化的对象。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Kimi Team. Kimi K3: Open Frontier Intelligence. Technical Report, 2026. <a href="https://arxiv.org/abs/2607.24653">https://arxiv.org/abs/2607.24653</a></li>
+<li>Keller Jordan. Muon: An optimizer for hidden layers in neural networks. 2024. <a href="https://kellerjordan.github.io/posts/muon/">https://kellerjordan.github.io/posts/muon/</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

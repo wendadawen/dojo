@@ -1,0 +1,2 @@
+- paper/kimi-k3-2607.24653.pdf、paper/k3-src/、paper/kimi-k3-2607.24653.txt｜论文｜https://arxiv.org/abs/2607.24653｜v2｜2026-10-10｜Kimi Team. Kimi K3: Open Frontier Intelligence 官方技术报告，提出 Per-Head Muon：§2.5 "Per-Head Muon" 给出定义、动机与效果，§5.2.2 "P2P-based Muon orthogonalization" 给出分布式实现。LaTeX 源码在 k3-src/，纯文本快照 kimi-k3-2607.24653.txt
+- blog/muon-blog.txt｜作者技术博客｜https://kellerjordan.github.io/posts/muon/｜2024-12-08 发布，含 2025-07-12 增补｜2026-10-10｜Muon 作者写的介绍，把正交化定义为取最近半正交矩阵、等价于把 SVD 的奇异值拉平为 $UV^\top$
