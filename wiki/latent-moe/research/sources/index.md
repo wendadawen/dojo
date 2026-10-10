@@ -1,0 +1,2 @@
+- paper/arxiv-v1.pdf｜https://arxiv.org/abs/2601.18089｜v1｜2026-10-10｜LatentMoE 原始论文的 PDF。
+- paper/src-v1/｜https://arxiv.org/e-print/2601.18089｜v1｜2026-10-10｜论文的 LaTeX 源码与全部图，正文数字以它为凭。
