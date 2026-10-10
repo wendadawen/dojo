@@ -1,0 +1,4 @@
+- paper/arxiv-2205.14135v2.pdf｜https://arxiv.org/abs/2205.14135｜v2｜2026-10-10｜提出 FlashAttention 的论文 PDF
+- paper/arxiv-2205.14135v2.txt｜https://arxiv.org/abs/2205.14135｜v2｜2026-10-10｜论文 PDF 转出的纯文本，正文数字按它核对
+- paper/src-v2/｜https://arxiv.org/e-print/2205.14135｜v2｜2026-10-10｜论文的 LaTeX 源码，含正文、算法、证明与实验各节
+- repo/flash-attention/｜https://github.com/Dao-AILab/flash-attention｜94e22c906678e5483fa0e9e24d8e787bc2c0ed4c｜2026-10-10｜FlashAttention 与 FlashAttention-2 的官方实现
