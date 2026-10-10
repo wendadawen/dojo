@@ -1,0 +1,1 @@
+- paper/arxiv-1706.03762.pdf、paper/src/、paper/arxiv-1706.03762.txt｜论文｜https://arxiv.org/abs/1706.03762｜v7（arXiv 当前版，2023-08-02）｜2026-10-10｜Attention Is All You Need，提出 Transformer：解码器自注意力用掩码阻止位置关注后续位置，保证位置 $i$ 的预测只依赖位置小于 $i$ 的已知输出；掩码的说明在 src/model_architecture.tex 的 Decoder 段与 Applications of Attention in our Model 一节，纯文本快照 arxiv-1706.03762.txt，LaTeX 源码在 src/
