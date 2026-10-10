@@ -1,0 +1,1 @@
+- paper/hc-2409.19606v3.pdf、paper/hc-2409.19606v3.txt、paper/src-v3/｜论文｜https://arxiv.org/abs/2409.19606v3｜v3（首版 2024-09-29）｜2026-10-10｜Hyper-Connections：把残差流扩成 n 条、学习深度连接与宽度连接，原文出处；LaTeX 源码在 src-v3/，纯文本快照 hc-2409.19606v3.txt
