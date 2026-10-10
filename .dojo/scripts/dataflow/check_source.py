@@ -118,24 +118,22 @@ def check_names(views: list[dict], sources: dict[str, str]) -> list[str]:
 
 
 # 公式里 \mathrm{...} 的通用函数/记号：torch、numpy、Python 的常见函数与类型，
-# 以及数学排版里约定俗成的正体词。不属于这些的，应当在源码里出现过。
+# 数学排版里约定俗成的正体词，以及代码里出现、但排版时会改大小写的常量名。
+# 不属于这三类的（源码里自定义的函数/类/模块名）必须在某份源码里出现过。
 MATH_WORDS = {
-    # torch / numpy / Python
+    # torch / numpy / Python 的常见函数、类型、方法
     "abs", "absmax", "all", "any", "arange", "argmax", "argmin", "bincount", "cat", "ceil",
-    "chunk", "clamp", "clamp_min", "concat", "copysign", "cos", "cumsum", "exp", "expand",
-    "flatten", "flip", "float", "floor", "gather", "gelu", "int", "len", "linear", "log",
-    "masked_fill", "matmul", "max", "mean", "min", "minlength", "norm", "ones", "pad",
-    "permute", "pow", "rand", "relu", "repeat", "reshape", "roll", "rsqrt", "sigmoid",
-    "sign", "silu", "sin", "softmax", "softplus", "sort", "split", "sqrt", "squeeze",
-    "stack", "std", "sum", "tanh", "to", "tolist", "topk", "transpose", "tril", "triu",
-    "unflatten", "unfold", "unsqueeze", "var", "view", "view_as_complex", "view_as_real",
-    "where", "zeros",
-    # 数学排版约定
-    "Sinkhorn", "softmax", "argmax", "argmin", "mean", "sum", "prod", "max", "min",
-    "cat", "concat", "split", "chunk", "stack", "flatten", "reshape", "pad", "sort",
-    # 代码里出现的常量名（大小写/下划线差异）
-    "None", "True", "False", "DEAD", "TEXT", "IMAGE", "IMAGE_START", "IMAGE_END",
-    "IMAGE_NEW_LINE", "MTP", "DSpark",
+    "chunk", "clamp", "clamp_min", "concat", "copysign", "cos", "cumsum", "dot", "einsum",
+    "exp", "expand", "flatten", "flip", "float", "floor", "gather", "gelu", "int", "len",
+    "linear", "log", "masked_fill", "matmul", "max", "mean", "min", "minlength", "norm",
+    "ones", "outer", "pad", "permute", "pow", "prod", "rand", "relu", "repeat", "reshape",
+    "roll", "rsqrt", "scatter", "sigmoid", "sign", "silu", "sin", "softmax", "softplus",
+    "sort", "split", "sqrt", "squeeze", "stack", "std", "sum", "tanh", "to", "tolist",
+    "topk", "transpose", "tril", "triu", "unflatten", "unfold", "unsqueeze", "var", "vec",
+    "view", "view_as_complex", "view_as_real", "where", "zeros",
+    # 数学排版约定俗成的正体算子（源码里通常没有同名函数）
+    "diag", "det", "inv", "rank", "tr", "kron", "cov", "corr", "elementwise", "l1norm",
+    "l2norm", "layer_norm", "rms_norm", "Sinkhorn",
 }
 
 
@@ -202,6 +200,7 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[
                                   f"材料里是 {expected}")
 
             seen_here: set[str] = set()
+            reported_bad: set[str] = set()
 
             def resolve(norm_key: str) -> str | None:
                 """归一化后的键 → 材料里的原始键。
@@ -214,8 +213,11 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[
                     return None
                 if norm_key in by_norm:
                     return by_norm[norm_key]
-                errors.append(f"[{view['id']}/{node['id']}] 检查点键「{norm_key}」不在形状表里"
-                              "（拼错或材料里没有这个键，这个形状没被核过）")
+                # ① 与 ② 两个循环会各解析一次同一个键，同一个错键只报一条
+                if norm_key not in reported_bad:
+                    reported_bad.add(norm_key)
+                    errors.append(f"[{view['id']}/{node['id']}] 检查点键「{norm_key}」不在形状表里"
+                                  "（拼错或材料里没有这个键，这个形状没被核过）")
                 return None
 
             # ① 键名紧跟形状
@@ -301,7 +303,7 @@ def parse_refs(cell: str) -> list[tuple[str, int, int]]:
         fname = ""
         for piece in re.split(r"[，,、]", seg):
             piece = piece.strip()
-            m = re.fullmatch(r"(?:(\S+?):)?(\d+)(?:-(\d+))?", piece)
+            m = re.fullmatch(r"(?:(\S+?)[:：])?(\d+)(?:[-–](\d+))?", piece)
             if not m:
                 continue
             fname = m.group(1) or fname
@@ -338,8 +340,18 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
             if m and src is not None and "def forward" not in src[int(m.group(2)) - 1]:
                 errors.append(f"{where}）标题的起始行 {m.group(1)}:{m.group(2)} 不是 def forward")
             continue
-        refs = parse_refs(row.get("源码", ""))
+        if "源码" not in row:
+            # 节点表整列没写「源码」：row.get 全得空串，整张图的位置检查会空转成
+            # 「0 个节点核了名字」还不报错。缺列和缺某一格是两回事，缺列要停下。
+            errors.append(f"{where}）节点表没有「源码」列，这一图的位置回查对 0 个节点生效")
+            continue
+        src_cell = row.get("源码", "")
+        refs = parse_refs(src_cell)
         if not refs:
+            # 有源码列却解析不出 file:line（「见 m.py:2」、写错格式），这一行就免检了。
+            # 解析不出要给信号，不能和「没写」一样静默跳过。
+            errors.append(f"{where} / {row.get('id', '?')}）源码列「{src_cell.strip()}」"
+                          "解析不出「文件:行」，这一行没核位置")
             continue
         # checked 计的是「有源码列的行」，其中第一行只有短名的那些核不了
         # （下面计进 unchecked）。报出时两者分开，别让 checked 看着像全核过了。
@@ -478,6 +490,14 @@ def selftest() -> list[tuple[str, bool]]:
                      "detail": "$W$ [512, 5120]"}]}],
         shapes)
     checks.append(("权重形状没写检查点键要报错", bool(e8)))
+    # 同一个错键在「键名紧跟形状」和「短符号+键名」两条路径各解析一次，只该报一条
+    e_dup, _, _ = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
+                     "detail": "$W$ [16, 16]（检查点键 gate.wieght）"}]}],
+        shapes)
+    checks.append(("同一个错键只报一条",
+                   len([e for e in e_dup if "gate.wieght" in e]) == 1))
 
     # 公式里的函数名要有出处
     mviews = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
@@ -485,6 +505,12 @@ def selftest() -> list[tuple[str, bool]]:
                           "fold": [{"title": "公式", "text": "$y = \mathrm{softmax}(x)$"}]}]}]
     checks.append(("公式里的通用函数名不报",
                    not check_math_names(mviews, {"m.py": "def forward(): pass"}, {})))
+    # 矩阵对角化这类数学排版正体词源码里通常没有同名函数，不能误伤
+    diag_m = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
+               "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                          "fold": [{"title": "公式", "text": "$y = \mathrm{diag}(x)\\odot x$"}]}]}]
+    checks.append(("公式里的数学排版词（diag 等）不报",
+                   not check_math_names(diag_m, {"m.py": "def forward(): pass"}, {})))
     bad_m = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
               "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
                          "fold": [{"title": "公式", "text": "$y = \mathrm{zzq_fake}(x)$"}]}]}]
@@ -544,6 +570,18 @@ def selftest() -> list[tuple[str, bool]]:
         # 顿号分隔的行号
         checks.append(("计划源码位置：顿号分隔的行号能解析",
                        _refs_ok()))
+        # 全角冒号是手写常见写法，该认；不能因此免检，也不能误报
+        checks.append(("计划源码位置：全角冒号的源码列能解析",
+                       not run(good.replace("m.py:2", "m.py：2"))))
+        # 源码列有内容却解析不出文件:行（前面带字、写错格式）：报错，不能静默免检
+        checks.append(("计划源码位置：源码列解析不出要报错",
+                       bool(run(good.replace("| m.py:2 |", "| 见 m.py:2 |")))))
+        # 节点表整列没有「源码」：位置回查空转，必须报错
+        checks.append(("计划源码位置：节点表缺源码列要报错",
+                       bool(run(good.replace("| 第三行 | 源码 |", "| 第三行 |")
+                                    .replace("|---|---|---|---|---|---|",
+                                             "|---|---|---|---|---|")
+                                    .replace("| 16 → 16 | | m.py:2 |", "| 16 → 16 | |")))))
 
         # 第一行只有短名：报「核不了」的计数
         short = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"

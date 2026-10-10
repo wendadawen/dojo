@@ -313,6 +313,10 @@ def check_plan(views: list[dict]) -> None:
                 if (n.get("detail") or "").strip():
                     errors.append(f"{where}：算子第三行留空，较长说明写进折叠的「说明」")
         for row in v.get("info") or []:
+            # 面板的每一格也查越界下划线（docstring 早就这么写，实际漏了）
+            for name, value in row["rows"]:
+                errors += _stray_underscore_escape(f"图「{v['label']}」面板/{row['title']}/{name}",
+                                                   {"detail": value})
             if row["title"] == "公式":
                 for name, value in row["rows"]:
                     if len(re.findall(r"\$[^$]*\$", value)) > 1:
@@ -656,6 +660,9 @@ def selftest() -> list[tuple[str, bool]]:
             ("散文里的下划线写成 \\_ 应当报错",
              TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
                               "| blk | 公式 | $x + f(x)$，x\\_是输入 |")),
+            ("面板里的下划线写成 \\_ 也应当报错",
+             TOY_PLAN.replace("| 配置 | hidden_size | 16 |",
+                              "| 配置 | hidden_size | 见 hidden\\_size |")),
             ("说明里写公式应当报错",
              TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
                               "| blk | 公式 | $x + f(x)$，x 是输入 |\n"

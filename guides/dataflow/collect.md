@@ -15,8 +15,4 @@
 
 按类型放进 `sources/` 下的子目录：`repo/` 放源码，`paper/` 放论文的 PDF 和 LaTeX 源码（有的话）。`config.json` 与 `shapes.json` 直接放在 `sources/` 下，不建子目录。
 
-`sources/index.md` 每份资料一行：
-
-```markdown
-- <文件或目录名>｜<类型：源码/论文/配置/权重头>｜<来源链接>｜<版本或 commit>｜<取回日期>｜<一句话说明它讲什么>
-```
+每份资料的来源、版本、取回日期和一句话说明写进 `dataflow.md` 的「资料」一节（见 `plan.md`），不再单独建索引文件。
