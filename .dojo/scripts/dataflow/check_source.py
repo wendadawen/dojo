@@ -117,6 +117,54 @@ def check_names(views: list[dict], sources: dict[str, str]) -> list[str]:
     return errors
 
 
+# 公式里 \mathrm{...} 的通用函数/记号：torch、numpy、Python 的常见函数与类型，
+# 以及数学排版里约定俗成的正体词。不属于这些的，应当在源码里出现过。
+MATH_WORDS = {
+    # torch / numpy / Python
+    "abs", "absmax", "all", "any", "arange", "argmax", "argmin", "bincount", "cat", "ceil",
+    "chunk", "clamp", "clamp_min", "concat", "copysign", "cos", "cumsum", "exp", "expand",
+    "flatten", "flip", "float", "floor", "gather", "gelu", "int", "len", "linear", "log",
+    "masked_fill", "matmul", "max", "mean", "min", "minlength", "norm", "ones", "pad",
+    "permute", "pow", "rand", "relu", "repeat", "reshape", "roll", "rsqrt", "sigmoid",
+    "sign", "silu", "sin", "softmax", "softplus", "sort", "split", "sqrt", "squeeze",
+    "stack", "std", "sum", "tanh", "to", "tolist", "topk", "transpose", "tril", "triu",
+    "unflatten", "unfold", "unsqueeze", "var", "view", "view_as_complex", "view_as_real",
+    "where", "zeros",
+    # 数学排版约定
+    "Sinkhorn", "softmax", "argmax", "argmin", "mean", "sum", "prod", "max", "min",
+    "cat", "concat", "split", "chunk", "stack", "flatten", "reshape", "pad", "sort",
+    # 代码里出现的常量名（大小写/下划线差异）
+    "None", "True", "False", "DEAD", "TEXT", "IMAGE", "IMAGE_START", "IMAGE_END",
+    "IMAGE_NEW_LINE", "MTP", "DSpark",
+}
+
+
+def check_math_names(views: list[dict], sources: dict[str, str], shapes: dict) -> list[str]:
+    """折叠与面板的公式里 `\mathrm{X}` 的函数名要有出处。
+
+    通用的 torch/Python 函数名、数学排版约定词不查；其余（源码里自定义的函数、
+    类、模块名）必须在某份源码里出现——挡「凭空造个函数名」。
+    """
+    errors: list[str] = []
+    blob = "\n".join(sources.values()) + "\n" + "\n".join(shapes)
+    for view in views:
+        texts = []
+        for n in view["nodes"]:
+            texts += [s.get("text") or "" for s in n.get("fold") or []]
+        for row in view.get("info") or []:
+            texts += [v for _k, v in row["rows"]]
+        for text in texts:
+            for m in re.finditer(r"\\mathrm\{([^}]*)\}", text):
+                name = m.group(1).replace("\\_", "_").strip()
+                if not name or name in MATH_WORDS:
+                    continue
+                if name in blob:
+                    continue
+                errors.append(f"[{view['id']}] 公式里的「{name}」在源码与形状表里都找不到"
+                              "（凭空写的函数名？）")
+    return errors
+
+
 def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[str]]:
     """页面上写的权重形状必须与给定的形状表一致。
 
@@ -431,6 +479,20 @@ def selftest() -> list[tuple[str, bool]]:
         shapes)
     checks.append(("权重形状没写检查点键要报错", bool(e8)))
 
+    # 公式里的函数名要有出处
+    mviews = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
+               "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                          "fold": [{"title": "公式", "text": "$y = \mathrm{softmax}(x)$"}]}]}]
+    checks.append(("公式里的通用函数名不报",
+                   not check_math_names(mviews, {"m.py": "def forward(): pass"}, {})))
+    bad_m = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
+              "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                         "fold": [{"title": "公式", "text": "$y = \mathrm{zzq_fake}(x)$"}]}]}]
+    checks.append(("公式里凭空写的函数名要报",
+                   bool(check_math_names(bad_m, {"m.py": "def forward(): pass"}, {}))))
+    checks.append(("公式里的函数名在源码里有就不报",
+                   not check_math_names(bad_m, {"m.py": "def forward():\n    zzq_fake(x)"}, {})))
+
 
     # check_plan_sources：源码位置回查的判据——名字要真的出现在所指的行里
     with tempfile.TemporaryDirectory() as tmp:
@@ -575,6 +637,7 @@ def main() -> int:
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})
     shape_matched = 0
+    shapes: dict = {}
     if not args.names_only and args.shapes:
         # 形状表读不出来就报错退出，不要带着半截数据继续核查
         try:
@@ -588,6 +651,10 @@ def main() -> int:
             errors.append("形状表一个键都没比对上：页面里要写完整键名，如 model.layers.0.mlp.gate_proj.weight [..]")
         for key in shape_missing:
             notes.append(f"形状没比对（不在形状表里）：{key}")
+
+    # 公式里的函数名要有出处（通用的 torch/Python 名不查）
+    if sources and not args.names_only:
+        errors += check_math_names(views, sources, shapes)
 
     for note in notes:
         print(f"  提示：{note}")
