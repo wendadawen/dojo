@@ -1,0 +1,1 @@
+- paper/arxiv-v1.pdf、paper/src-v1/main.tex、paper/arxiv-v1.tar.gz｜论文｜https://arxiv.org/abs/1704.04861v1｜v1（2017）｜2026-10-10｜MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications，提出用深度可分离卷积搭建轻量网络，给出拆分定义、成本公式与缩减比 $1/N+1/D_K^2$；LaTeX 源码在 src-v1/main.tex

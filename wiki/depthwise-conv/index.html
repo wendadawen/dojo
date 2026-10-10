@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="深度可分离卷积把标准卷积一步同时做的空间滤波和跨通道组合拆成两步，先逐通道滤波，再跨通道组合，计算量随之下降。">
+  <meta name="dojo:summary" content="一步卷积同时做空间滤波和跨通道组合，拆成逐通道滤波加 $1\times1$ 组合后，成本按 $1/N+1/D_K^2$ 比例缩小；$3\times3$ 时省 8 到 9 倍。">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="网络结构">
+  <title>深度可分离卷积</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">深度可分离卷积</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">深度可分离卷积</h1>
+<p class="reading-time">正文 1,230 字 · 约 4 分钟阅读</p>
+
+<p>卷积网络由若干用卷积做计算的层叠成。它处理的输入带空间结构：把一张输入写成一个张量（多维数组），两维是空间位置（高和宽），一维是通道；通道是同一空间位置上并列的一组分量的编号，把同一个通道在各位置的值排开就是一张数表，叫一个特征图。卷积核是一个小窗口，它在每个空间位置上与输入窗口逐项相乘再求和，这一步叫空间滤波。标准卷积的核同时跨空间和跨通道，因此在同一个输出位置上一步做完两件事：对邻域做空间滤波，再把各输入通道的结果混合成一个新的输出通道，后者叫跨通道组合。深度可分离卷积把这件一步完成的事拆成两步：先每个通道各自在邻域上加权求和（逐通道滤波），再把各通道混合成新通道，后一步用窗口只有一个位置的 $1\times1$ 卷积完成。拆分后乘加量（乘法与加法运算的次数）下降。</p>
+
+<h2 id="s1">1. 一步卷积做了哪两件事</h2>
+
+<h3 id="s1-1">1.1 一步完成滤波与组合</h3>
+
+<p>标准卷积接收一个 $D_F\times D_F\times M$ 的输入 $\mathbf{F}$，输出一个 $D_F\times D_F\times N$ 的 $\mathbf{G}$：$D_F$ 是特征图的高和宽，$M$ 是输入通道数，$N$ 是输出通道数。卷积核 $\mathbf{K}$ 的形状是 $D_K\times D_K\times M\times N$，$D_K$ 是核的高和宽。窗口在输入上逐位置滑动，$i,j$ 从 $1$ 取到 $D_K$；在输入边缘外侧补零，可以让每个输出位置都取到完整窗口，输出尺寸与输入相同。位置 $k,l$（$k,l$ 从 $1$ 取到 $D_F$）、输出通道 $n$ 上的值按 $\mathbf{G}_{k,l,n}=\sum_{i,j,m}\mathbf{K}_{i,j,m,n}\cdot\mathbf{F}_{k+i-1,l+j-1,m}$ 算：把核窗口里的每个位置 $(i,j)$ 和每个输入通道 $m$ 全取一遍，用核的权重乘上输入对应位置的数，再加起来。求和号分成两部分：对 $i,j$ 求和是在邻域上加权求和，即空间滤波；对 $m$ 求和是把各输入通道混合进同一个输出通道，即跨通道组合。核的最后一个下标 $n$ 说明，同一个空间窗口对每个输出通道各有一套权重。</p>
+
+<details>
+<summary>一步卷积里的滤波与组合，以及两步各用什么样的核</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>层</th><th>核的形状</th><th>是否跨空间</th><th>是否跨通道</th></tr></thead>
+<tbody>
+<tr><td>标准卷积</td><td>$D_K\times D_K\times M\times N$</td><td>是</td><td>是</td></tr>
+<tr><td>逐通道滤波</td><td>$D_K\times D_K\times M$</td><td>是</td><td>否</td></tr>
+<tr><td>跨通道组合</td><td>$1\times1\times M\times N$</td><td>否</td><td>是</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h3 id="s1-2">1.2 一步要算多少</h3>
+
+<p>上面的求和对每个输出位置、每个输出通道都要做一遍，于是标准卷积的乘加量是 $D_K\cdot D_K\cdot M\cdot N\cdot D_F\cdot D_F$。它由四部分相乘：核的面积 $D_K^2$、输入通道数 $M$、输出通道数 $N$、输出特征图的像素数 $D_F^2$。</p>
+
+<details>
+<summary>用一组构造数字算一次标准卷积的成本</summary>
+<p>取 $D_K=3$，$M=N=64$，$D_F=16$（自行设定，只用来手算）：</p>
+<ol>
+<li>核面积 $D_K^2=9$，输出特征图每边 $D_F=16$，像素数 $D_F^2=256$。</li>
+<li>乘加量 $=9\cdot64\cdot64\cdot256=9437184$。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 拆成两步</h2>
+
+<h3 id="s2-1">2.1 逐通道滤波</h3>
+
+<p>第一步叫逐通道卷积，也叫 depthwise 卷积。它给每个输入通道单独配一个 $D_K\times D_K$ 的空间核，只在本通道的邻域上加权求和，不跨通道，输出记为 $\hat{\mathbf{G}}$：$\hat{\mathbf{G}}_{k,l,m}=\sum_{i,j}\hat{\mathbf{K}}_{i,j,m}\cdot\mathbf{F}_{k+i-1,l+j-1,m}$。核 $\hat{\mathbf{K}}$ 的形状是 $D_K\times D_K\times M$，第 $m$ 个核只作用在第 $m$ 个输入通道上，所以输出通道数和输入通道数相同，都是 $M$。它只滤波、不组合，得到的每个通道仍然只承载原来那个通道的信息。</p>
+
+<details>
+<summary>两通道的逐通道滤波小例子</summary>
+<p>用一维序列演示逐通道滤波。这里省略补零，核从序列左端对齐滑动，输出比输入短。输入两个通道，通道一 $[1,2,4,7,11]$，通道二 $[2,0,1,3,1]$；逐通道滤波给每个通道各配一个长度 3 的核，通道一用 $[1,0,-1]$，通道二用 $[0,1,-1]$。</p>
+<ol>
+<li>通道一用核 $[1,0,-1]$，核左端对齐序列左端：第 1 个位置算 $1\cdot1+0\cdot2-1\cdot4=-3$，每右移一格算下一个位置，依次得 $-3,-5,-7$。</li>
+<li>通道二用核 $[0,1,-1]$，同样左端对齐：第 1 个位置算 $0\cdot2+1\cdot0-1\cdot1=-1$，依次得 $-1,-2,2$。两个通道各自独立计算，输出仍是两个通道，互不影响。</li>
+</ol>
+</details>
+
+<h3 id="s2-2">2.2 跨通道组合与两步总成本</h3>
+
+<p>逐通道滤波缺的那一步补在第二个卷积上：它的核是 $1\times1$，空间窗口只有一个位置，因此不看邻域，只在每个位置上把 $M$ 个输入通道线性组合成 $N$ 个输出通道，这一步叫 pointwise 卷积。它接在逐通道滤波之后，两步的成本相加就是深度可分离卷积的总成本 $D_K\cdot D_K\cdot M\cdot D_F\cdot D_F+M\cdot N\cdot D_F\cdot D_F$，前一项来自逐通道滤波，后一项来自 $1\times1$。</p>
+
+<details>
+<summary>两步的顺序与各自的成本</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>步骤</th><th>核的形状</th><th>做什么</th><th>成本</th></tr></thead>
+<tbody>
+<tr><td>逐通道滤波</td><td>$D_K\times D_K\times M$</td><td>每个通道在邻域上加权求和</td><td>$D_K^2MD_F^2$</td></tr>
+<tr><td>跨通道组合</td><td>$1\times1\times M\times N$</td><td>每个位置把各通道线性组合</td><td>$MND_F^2$</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h2 id="s3">3. 省了多少</h2>
+
+<h3 id="s3-1">3.1 缩减比怎么除出来</h3>
+
+<p>把两步总成本除以标准卷积的成本，逐项约分，剩下的就是缩减比 $1/N+1/D_K^2$。</p>
+
+<details>
+<summary>缩减比的两行推导，以及沿用那组构造数字的实算</summary>
+<p>把总成本写在分子、标准成本写在分母，拆成两项再约分：</p>
+<p>$$\frac{D_K^2 M D_F^2 + M N D_F^2}{D_K^2 M N D_F^2}=\frac{D_K^2 M D_F^2}{D_K^2 M N D_F^2}+\frac{M N D_F^2}{D_K^2 M N D_F^2}=\frac{1}{N}+\frac{1}{D_K^2}$$</p>
+<p>沿用「一步要算多少」那组构造数字（$D_K=3$，$M=N=64$，$D_F=16$）实算：</p>
+<ol>
+<li>逐通道滤波成本 $9\cdot64\cdot256=147456$。</li>
+<li>跨通道组合成本 $64\cdot64\cdot256=1048576$。</li>
+<li>两步总成本 $147456+1048576=1196032$。</li>
+<li>缩减比 $1196032/9437184=0.126736$，与公式 $1/64+1/9$ 一致。</li>
+<li>反过来，标准成本是两步总成本的 $9437184/1196032$ 倍，约为 $7.9$。</li>
+</ol>
+</details>
+
+<h3 id="s3-2">3.2 什么时候省得多</h3>
+
+<p>$1/N+1/D_K^2$ 的两项里，$1/D_K^2$ 由核的大小决定，$1/N$ 由输出通道数决定。核越大 $1/D_K^2$ 越小，输出通道数越大 $1/N$ 越小，缩减比就越小、省得越多。取 $D_K=3$，$1/D_K^2=1/9$；当输出通道数 $N$ 很大时 $1/N$ 可忽略，缩减比趋于 $1/9$，即省约 9 倍，标准卷积的 $3\times3$ 版本乘加量比它多 8 到 9 倍。反过来，$N$ 小或核接近 $1\times1$ 时，$1/N+1/D_K^2$ 变大，省下的就很少。</p>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>$1/N+1/D_K^2$ 算的是乘加量的缩减比，收益成立的前提是输出特征图与输入同样大小、卷积按步长 1 计算（步长指窗口每次移动的位置数）。代价在精度（指预测准确率），换成深度可分离卷积后精度会有下降。一种误解是把逐通道滤波当成深度可分离卷积的全部：它只做滤波、不做组合，单独用会丢掉跨通道的信息。另一种是以为省下的倍数固定是 8 到 9 倍：这个数只在 $3\times3$、输出通道足够多时成立。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Howard, Zhu, Chen, Kalenichenko, Wang, Weyand, Andreetto, Adam. MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications. arXiv:1704.04861v1, 2017. <a href="https://arxiv.org/abs/1704.04861">https://arxiv.org/abs/1704.04861</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
