@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="MRoPE（多模态旋转位置编码）把旋转位置编码（给每个位置一个编号、按编号旋转向量的位置编码）的一个位置编号拆成时间、高、宽三份，让文本、图像、视频各按自己的排布取这三份编号。">
+  <meta name="dojo:summary" content="MRoPE 把 RoPE 的一个位置编号拆成时间、高、宽三份，分别驱动向量的一段维度旋转。文本 token 三份相同、退化成 1D-RoPE；图像 token 时间编号固定、高宽按行列取；视频再让时间编号逐帧增加。">
+  <meta name="dojo:topics" content="多模态, 模型结构">
+  <meta name="dojo:tag" content="位置编码">
+  <title>MRoPE</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">MRoPE</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">MRoPE</h1>
+<p class="reading-time">正文 1,152 字 · 约 4 分钟阅读</p>
+
+<p>旋转位置编码（RoPE）给序列里每个位置一个编号，按编号把注意力的查询和键各转一个角，使两个位置点积里的位置信息只由它们的相对位置决定（见<a href="../rope/index.html">旋转位置编码</a>；查询和键是注意力里做点积的两个向量，见<a href="../standard-attention/index.html">自注意力</a>）。模型逐单元处理输入，处理的最小单元叫 token，文本、图像、视频都由 token 组成。多模态指输入里的数据不止文本，还含图像、视频等多种。MRoPE（多模态旋转位置编码）把 RoPE 的一个位置编号拆成时间、高、宽三份，让每个 token 按自己的排布取这三份编号来旋转查询和键。</p>
+
+<h2 id="s1">1. 为什么一维编号不够</h2>
+
+<p>一维编号把 token 按在序列里的先后排成一条直线：位置越靠后，编号越大，任意两个 token 的距离就是两个编号之差。这对文本正合适——文本本身是一维的，前后关系就是一条链。图像和视频不是一条链。图像 token 排在高×宽两维网格上，一个 token 的位置要由它所在的行和列共同确定；视频按帧展开，还要加上它落在第几帧。用一维编号，只能把二维网格、三维视频按某种顺序拉平排成一条线，编号只反映这条线上的先后，分不出 token 是在同一行、同一列还是同一帧。一维位置编码因此限制了对三维空间（行、列、帧三个方向）和时间动态的建模。</p>
+
+<h2 id="s2">2. 文本、图像、视频各取一组编号</h2>
+
+<p>MRoPE 把位置编号拆成时间、高、宽三份，每份是一个整数，每个 token 拿到一组三个编号。</p>
+
+<ul>
+<li>文本 token：三份取同一个编号，就是它在一维序列里的位置，MRoPE 在纯文本上退化成原来那种一维的旋转位置编码（1D-RoPE）。</li>
+<li>图像：时间编号不随位置变化，每个视觉 token 的时间编号都取同一个值；高编号按它所在的行取，宽编号按它所在的列取。</li>
+<li>视频：把它看成若干帧的序列，一帧是一张图。帧内 token 的高、宽编号和图像一样取，时间编号逐帧加一。</li>
+</ul>
+
+<details>
+<summary>视频编号示例（自设）</summary>
+<p>取一段 2 帧的视频，每帧排成 3 行 2 列，共 $2\times3\times2=12$ 个视觉 token。把 token 按帧、行、列的顺序排成一串，给每个 token 写一组（时间, 高, 宽）三个编号。</p>
+<ol>
+<li>时间编号：第 0 帧的 6 个 token 都是 0，第 1 帧的 6 个都是 1，得到 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1。</li>
+<li>高编号：每帧 3 行，行号取 0 到 2，每行 2 个 token，得到 0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2。</li>
+<li>宽编号：每帧 2 列，列号取 0 到 1，逐列交替，得到 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1。</li>
+<li>三串对齐，第 0 帧第 0 行的两个 token 是 $(0,0,0)$ 和 $(0,0,1)$，高编号相同，靠宽编号区分；第 0 帧第 0 列的三个 token 是 $(0,0,0)$、$(0,1,0)$、$(0,2,0)$，宽编号相同，靠高编号区分。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 三份编号怎么接回旋转</h2>
+
+<p>旋转位置编码把向量的分量两两配对，每一对按位置编号转一个角。MRoPE 沿用这个旋转，只把配对用的编号从一份换成三份：把向量的维度分成时间、高、宽三段，时间编号驱动第一段，高编号驱动第二段，宽编号驱动第三段，每段各占多少维是预设的。段内还是旋转位置编码的转法——按这一段的编号算出余弦和正弦，把这一对分量交叉相乘再相加（见<a href="../rope/index.html">旋转位置编码</a>）。</p>
+
+<p>三段各自独立，同一帧、同一行、同一列的编号分别相同，转出的三段分量角也就分别相同。查询和键都这样转，值不转（值也是注意力里的向量，见<a href="../standard-attention/index.html">自注意力</a>），和旋转位置编码一样。</p>
+
+<h2 id="s4">4. 一次输入里多段怎么编号</h2>
+
+<p>一段输入里可能既有文字又有图像、视频，还可能有不止一张图或不止一段视频。编号按出现的先后一段一段地接：每一段先记住前面已经用过的最大编号，从它加一开始给这一段编号，段与段的编号不重叠。段内视觉 token 的时间、高、宽三份都从 0 起各自算（时间按帧、高按行、宽按列），再统一加上这一段的起始编号作为偏移；三份编号的偏移相同。段的起始编号只随这一段出现的先后增大。</p>
+
+<h2 id="s5">5. 编号变小，序列变长</h2>
+
+<p>编号不再随 token 个数一直增大，同一份编号会被同一行、同一列或同一帧的多个 token 共用。于是同样一段图像或视频，MRoPE 用到的最大编号比一维编号小，模型因此能外推到比训练更长的序列。</p>
+
+<details>
+<summary>与 1D-RoPE 的对比和长度外推</summary>
+<p>在图像和视频的下游任务上比较两种编码（1D-RoPE 是本概念所替代的一维做法），MRoPE 总体更好。长度外推上，训练时每个视频最多 16384 个 token，推理拉到 80K 个 token 时表现仍稳。</p>
+</details>
+
+<h2 id="s6">6. 适用条件与边界</h2>
+
+<p>让这套做法成立的几条：一段图像或视频要先知道它排成几行几列、视频有几帧，才编得出编号；纯文本时 MRoPE 不比 1D-RoPE 多做一步。一个位置从一份编号变成三份，三份要各自维护。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Qwen Team. Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution. arXiv:2409.12191v2, 2024. <a href="https://arxiv.org/abs/2409.12191">https://arxiv.org/abs/2409.12191</a></li>
+<li>Qwen Team. Qwen2-VL: official implementation. <a href="https://github.com/QwenLM/Qwen2-VL">https://github.com/QwenLM/Qwen2-VL</a></li>
+<li>Qwen Team. Qwen2-VL blog. <a href="https://qwenlm.github.io/blog/qwen2-vl/">https://qwenlm.github.io/blog/qwen2-vl/</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
