@@ -1,0 +1,2 @@
+- paper/arxiv-2006.16236.pdf、paper/src-v3/（arxiv.tex 等）｜论文《Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention》｜https://arxiv.org/abs/2006.16236v3｜v3｜2026-10-10｜提出线性注意力：把自注意力的相似度写成核特征映射的内积，用矩阵乘法结合律把复杂度从 O(N²) 降到 O(N)，并给出因果掩码下的循环形式；LaTeX 源码在 src-v3/，正文核对用 arxiv.tex
+- repo/fast-transformers/｜仓库 fast-transformers（官方实现）｜https://github.com/idiap/fast-transformers｜2ad36b97e64cb93862937bd21fcc9568d989561f（2023-03-23）｜2026-10-10｜官方实现：elu 特征映射、因果线性注意力 CUDA 核、循环式 Transformer 层
