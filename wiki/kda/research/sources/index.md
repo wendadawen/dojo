@@ -1,0 +1,3 @@
+- paper/｜https://arxiv.org/abs/2510.26692｜v2（2025-11-01）｜2026-10-10｜Kimi Linear 论文（含 LaTeX 源码与 PDF 转出的纯文本）；KDA 的定义、块状并行算法、与 DPLR 的等价与效率分析、作为可学习位置编码的讨论
+- repo/Kimi-Linear/｜https://github.com/MoonshotAI/Kimi-Linear｜8c1d85eb6b5f8fcefb15758691b0ce50b0827ce3（2025-11-17）｜2026-10-10｜官方仓库；README 给出 KDA 概述、混合结构比例与内核、模型链接
+- repo/flash-linear-attention/｜https://github.com/fla-org/flash-linear-attention｜a7880060012c862d58575ee23f613cafcd728d03（2026-10-10）｜2026-10-10｜官方开源 KDA 内核；含朴素参考实现 naive.py 与门计算 gate.py

@@ -1,0 +1,173 @@
+# Kimi Delta Attention
+
+- 描述：KDA 是线性注意力的一种记忆更新规则：先给矩阵状态按特征维做逐通道衰减，再按 delta 规则（用当前键值改写该键方向上已存的值）做秩一修正，用固定大小的状态达到接近软注意力的表达力（能区分多少种输入与输出关系）。
+- 摘要：给线性注意力的矩阵状态加上逐通道遗忘门 $\operatorname{Diag}(\boldsymbol{\alpha}_t)$ 与 delta 修正，合成一个 Householder 型转移矩阵，并按块并行计算，状态大小不随序列长度增长。
+- 主题：注意力机制, 模型结构
+- 标签：注意力
+
+## 资料
+
+- Yu Zhang 等. Kimi Linear: An Expressive, Efficient Attention Architecture. arXiv:2510.26692v2, 2025. [https://arxiv.org/abs/2510.26692](https://arxiv.org/abs/2510.26692)
+- Moonshot AI. Kimi-Linear: official implementation. 2025. [https://github.com/MoonshotAI/Kimi-Linear](https://github.com/MoonshotAI/Kimi-Linear)
+- fla-org. flash-linear-attention: KDA kernels. [https://github.com/fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+
+## 短页
+
+### 一个为键值建的矩阵记忆
+
+KDA 是一种[线性注意力](wiki/linear-attention)。标准的软注意力（见[注意力机制](wiki/standard-attention)）会为每个位置保存它的键和值，线性注意力不保存历史，而是维护一个矩阵状态 $\mathbf{S}_t$。键是一个 $d_k$ 维向量，用来在状态里选方向；值是一个 $d_v$ 维向量，是要记下的内容。状态形状是 $d_k$ 乘 $d_v$：键的维度决定行数，值的维度决定每行长度，每行记着落在该键方向上的值。状态大小固定，不随位置增加而变大。处理到第 $t$ 个位置时，用这个状态和该位置的查询 $\boldsymbol{q}_t$ 相乘得到输出 $\boldsymbol{o}_t=\mathbf{S}_t^\top\boldsymbol{q}_t$：查询是一个 $d_k$ 维向量，它和状态相乘，就是把状态里对应方向的内容取出来。
+依据：paper/src-v2/2-preliminary.tex Linear Attention as Online Learning；paper/src-v2/3-kda.tex Kimi Delta Attention
+
+### 为什么定长状态要遗忘和纠正
+
+只留一个定长矩阵，代价是容量有限：写进去的关联越多，新旧内容越容易互相干扰。KDA 用衰减和纠正压制干扰：衰减是每一步给状态的每一行乘一个 0 到 1 之间的系数，把不再需要的记忆逐维压低；纠正是写入新键值前先减去该键方向上已经存的值，让同一个键方向上的值可以被改写，而不是叠加。
+依据：paper/src-v2/1-intro.tex Introduction；paper/src-v2/2-preliminary.tex Gated DeltaNet as Weight Decay
+
+### 先衰减，再用键值纠正
+
+KDA 对状态的更新分两步，写成 $\mathbf{S}_t=\left(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top\right)\operatorname{Diag}(\boldsymbol{\alpha}_t)\mathbf{S}_{t-1}+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$。
+
+1. 先按特征维衰减：乘一个对角矩阵 $\operatorname{Diag}(\boldsymbol{\alpha}_t)$，$\boldsymbol{\alpha}_t$ 是一个 $d_k$ 维向量，它第 $i$ 个分量只乘状态的第 $i$ 行，于是每个键方向有各自的衰减系数。
+2. 再按 delta 规则纠正并写入。delta 规则指用当前键值改写该键方向上已存的值，让状态在这个方向上读出的结果尽量等于当前值：$\mathbf{I}$ 是单位矩阵，$(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)$ 先把状态在键 $\boldsymbol{k}_t$ 方向上已存的值减去一部分，$\beta_t$ 是这一步写入与抵消的比例，取值范围 0 到 1；$+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$ 再把当前这条键值对写进去。
+
+两步都只在 $d_k\times d_v$ 的矩阵上做。
+依据：paper/src-v2/3-kda.tex Kimi Delta Attention；paper/src-v2/2-preliminary.tex Gated DeltaNet as Weight Decay；paper/src-v2/4-model.tex Neural Parameterization
+
+## 长页
+
+线性注意力把标准注意力的「两两比对」换成一个在线更新的矩阵状态。标准注意力，也叫软注意力，在每个位置算出它和此前所有位置的分数，再按分数把值取回，因此要保留每个位置的键和值。线性注意力不保留历史，只维护一个 $d_k\times d_v$ 的矩阵 $\mathbf{S}_t$：$d_k$ 是键向量的维度，$d_v$ 是值向量的维度。每处理一个位置，就把这个位置的一条键值关联并进这个矩阵，再从它读出输出。矩阵大小与序列长度无关。
+
+KDA 是这种注意力里的一种状态更新规则。它在每一步做两件事：先把状态按特征维逐通道衰减，再按 delta 规则（用当前键值改写该键方向上已存的值）把对应的一条关联纠正后写入。逐通道衰减由一个对角矩阵 $\operatorname{Diag}(\boldsymbol{\alpha}_t)$ 给出，$\boldsymbol{\alpha}_t$ 的每个分量是该维的衰减系数；delta 修正由 $(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)$ 和 $+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$ 两部分组成，$\beta_t$ 是写入比例。需要它，是因为只有衰减或只有累加都无法保留精确的键值对应：状态要能遗忘，也要能改掉已经记住的旧值。KDA 把这两件事合成一个转移矩阵——每一步作用在旧状态上、把它变成新状态的那个矩阵，它不等于状态本身——再配一套按块并行的算法，使训练能在矩阵乘法上展开。
+依据：paper/src-v2/3-kda.tex Kimi Delta Attention；paper/src-v2/2-preliminary.tex Linear Attention as Online Learning；paper/src-v2/1-intro.tex Introduction
+
+### 状态：一个矩阵记忆
+
+线性注意力的状态是一个矩阵 $\mathbf{S}_t\in\mathbb{R}^{d_k\times d_v}$。它可以看成一张关联表：键向量的维度 $d_k$ 是表的行数，值向量的维度 $d_v$ 是每行的长度。第 $t$ 个位置的键 $\boldsymbol{k}_t$ 是 $d_k$ 维向量，在状态里选出一组行；值 $\boldsymbol{v}_t$ 是 $d_v$ 维向量，是要写进这些行的内容。最直接的写入是 $\mathbf{S}_t=\mathbf{S}_{t-1}+\boldsymbol{k}_t\boldsymbol{v}_t^\top$：外积 $\boldsymbol{k}_t\boldsymbol{v}_t^\top$ 由 $\boldsymbol{k}_t$ 的每个分量各乘 $\boldsymbol{v}_t$ 得到，形状也是 $d_k\times d_v$，直接加在旧状态上。读出时用当前位置的查询 $\boldsymbol{q}_t$ 和状态相乘，得到输出 $\boldsymbol{o}_t=\mathbf{S}_t^\top\boldsymbol{q}_t$。
+依据：paper/src-v2/2-preliminary.tex Linear Attention as Online Learning；paper/src-v2/3-kda.tex Kimi Delta Attention
+
+这条递推还有一层解释：它等于对 $-\langle\mathbf{S}^\top\boldsymbol{k}_t,\boldsymbol{v}_t\rangle$ 做一步梯度下降——梯度下降指沿让目标函数下降的方向按固定步长调整参数，这里就是沿让这个内积变大的方向小幅调整 $\mathbf{S}$，效果是不断强化最近出现的键值对应，过程中不擦除任何旧内容。不擦除的后果是状态里的关联越积越多、彼此干扰。
+依据：paper/src-v2/2-preliminary.tex Linear Attention as Online Learning
+
+::: 一张小关联表上的写入与读出
+键、值维度都取 2，状态从全零开始，用整数便于手算。
+依据：自行构造
+
+1. 第 1 个位置键 $\boldsymbol{k}_1=(1,0)$、值 $\boldsymbol{v}_1=(3,1)$：外积 $\boldsymbol{k}_1\boldsymbol{v}_1^\top=\begin{pmatrix}3&1\\0&0\end{pmatrix}$，加到状态上。
+2. 第 2 个位置键 $\boldsymbol{k}_2=(0,1)$、值 $\boldsymbol{v}_2=(0,2)$：外积 $\boldsymbol{k}_2\boldsymbol{v}_2^\top=\begin{pmatrix}0&0\\0&2\end{pmatrix}$，状态变成 $\begin{pmatrix}3&1\\0&2\end{pmatrix}$。
+3. 用查询 $\boldsymbol{q}=(1,1)$ 读出：$\mathbf{S}^\top\boldsymbol{q}=\begin{pmatrix}3&0\\1&2\end{pmatrix}\begin{pmatrix}1\\1\end{pmatrix}=(3,3)$，两个位置的值按查询方向合在一起。
+依据：自行构造
+:::
+
+### 修正：delta 规则的写入
+
+只加不减的写法会把每条新的键值对应都叠加上去，同一个键被写多次时，状态里记的是这些值的和，而不是最新的值。delta 规则换一个目标：让状态在遇到键 $\boldsymbol{k}_t$ 时读出的值尽量等于 $\boldsymbol{v}_t$。把它写成一个损失就是 $\mathcal{L}_t(\mathbf{S})=\tfrac12\|\mathbf{S}^\top\boldsymbol{k}_t-\boldsymbol{v}_t\|^2$：损失是一个衡量当前状态离目标还差多少的数，越小表示越接近目标。对 $\mathbf{S}$ 走一步梯度下降，步长取 $\beta_t$。在线梯度下降指每来一个样本就向它的目标修一步参数，这里样本是当前位置的这条键值对。
+依据：paper/src-v2/2-preliminary.tex DeltaNet: Online Gradient Descent on Reconstruction Loss
+
+对上面这个重构目标求梯度，比只看相似度多出「先减去已存值」这一步，是按比例校正，而不是累加。
+依据：paper/src-v2/table/update.tex L14-L54
+
+梯度下降的结果是 $\mathbf{S}_t=(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)\mathbf{S}_{t-1}+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$。$\mathbf{I}$ 是单位矩阵；$(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)$ 先把状态在键 $\boldsymbol{k}_t$ 方向上已经存的值减去一部分，$\beta_t$ 是这一步抵消与写入的比例，取值范围 0 到 1；$+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$ 再把当前这条键值对写进去。这属于「单位矩阵减去一个向量乘自己的矩阵」这一类秩一变换，和 Householder 变换同形：Householder 变换是 $\mathbf{I}-2\boldsymbol{u}\boldsymbol{u}^\top$ 这样由单位矩阵减去一个向量乘自己构成的变换，这里把系数换成了 $\beta_t$。
+依据：paper/src-v2/2-preliminary.tex DeltaNet: Online Gradient Descent on Reconstruction Loss；paper/src-v2/3-kda.tex Kimi Delta Attention；paper/src-v2/4-model.tex Neural Parameterization
+
+::: 换一个键方向写新值：delta 规则与只加不减的区别
+键、值维度都取 2，用整数便于手算。第 2 个位置换一个键方向写新值，看状态怎么写、怎么读。
+依据：自行构造
+
+1. 第 1 个位置键 $\boldsymbol{k}_1=(1,1)$、值 $\boldsymbol{v}_1=(2,1)$，两种规则这里结果一样：$\mathbf{S}_1=\boldsymbol{k}_1\boldsymbol{v}_1^\top=\begin{pmatrix}2&1\\2&1\end{pmatrix}$。
+2. 第 2 个位置键 $\boldsymbol{k}_2=(0,1)$、值 $\boldsymbol{v}_2=(1,3)$，取 $\beta=1$。只加不减：$\mathbf{S}_2'=\mathbf{S}_1+\boldsymbol{k}_2\boldsymbol{v}_2^\top=\begin{pmatrix}2&1\\2&1\end{pmatrix}+\begin{pmatrix}0&0\\1&3\end{pmatrix}=\begin{pmatrix}2&1\\3&4\end{pmatrix}$。
+3. delta 规则：$\mathbf{I}-\boldsymbol{k}_2\boldsymbol{k}_2^\top=\begin{pmatrix}1&0\\0&0\end{pmatrix}$ 先把状态的第二行清零，再写入 $\boldsymbol{k}_2\boldsymbol{v}_2^\top=\begin{pmatrix}0&0\\1&3\end{pmatrix}$，得到 $\mathbf{S}_2=\begin{pmatrix}2&1\\1&3\end{pmatrix}$。
+4. 用查询 $\boldsymbol{q}=(1,1)$ 读出：只加不减得 $\mathbf{S}_2'^\top\boldsymbol{q}=(5,5)$，delta 规则得 $\mathbf{S}_2^\top\boldsymbol{q}=(3,4)$。delta 规则把 $\boldsymbol{k}_2$ 方向上的旧值 $(2,1)$ 换成了 $(1,3)$，只加不减则把两者的内容叠在了一起。
+依据：自行构造
+:::
+
+### 门控：逐通道的遗忘
+
+delta 规则只在下一次写到同一个键方向时才修正旧值，中间写进去、此后再没被访问的关联会一直留着。给状态乘一个衰减门，就能在没有新写入时也弱化旧记忆。Gated DeltaNet（GDN，KDA 之前的同类工作，见[门控 DeltaNet](wiki/gated-deltanet)）用的是每个头一个标量。注意力头是注意力里一组各自独立的特征维，一个头内所有特征维共用一个遗忘率：$\mathbf{S}_t=\alpha_t(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)\mathbf{S}_{t-1}+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$，$\alpha_t\in[0,1]$ 对整张状态乘同一个数。
+依据：paper/src-v2/2-preliminary.tex Gated DeltaNet as Weight Decay；paper/src-v2/1-intro.tex Introduction
+
+这个门可以按线性注意力的通式来理解：状态更新一般写成 $\mathbf{S}_t=\mathbf{A}_t\mathbf{S}_{t-1}+\boldsymbol{k}_t\boldsymbol{v}_t^\top$，$\mathbf{A}_t$ 是作用在旧状态上的转移矩阵（管旧状态的衰减与修正），它怎么取由具体方法决定，第二项是写入项；通式把写入项的系数略去了，KDA 这一类方法的写入系数是 $\beta_t$。在 KDA 里 $\mathbf{A}_t=(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)\operatorname{Diag}(\boldsymbol{\alpha}_t)$，是一个随输入变化、可学习的矩阵因子。
+依据：paper/src-v2/7-related.tex Linear Attention with Gating Mechanism
+
+KDA 把标量门换成对角矩阵 $\operatorname{Diag}(\boldsymbol{\alpha}_t)$：$\boldsymbol{\alpha}_t$ 是一个 $d_k$ 维向量，它第 $i$ 个分量只用来乘状态第 $i$ 行，于是每个特征维有各自的遗忘率。$\boldsymbol{\alpha}_t$ 由当前位置的输入 $\boldsymbol{x}_t$ 经一个低秩投影算出：先用一个矩阵把 $\boldsymbol{x}_t$ 压到较低维度，再用一个矩阵升回 $d_k$，结果过一个衰减函数映射到 $[0,1]^{d_k}$，这个函数与 GDN、Mamba 用的同类。
+依据：paper/src-v2/3-kda.tex Kimi Delta Attention；paper/src-v2/4-model.tex Neural Parameterization
+
+合起来，KDA 一步的更新是 $\mathbf{S}_t=\left(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top\right)\operatorname{Diag}(\boldsymbol{\alpha}_t)\mathbf{S}_{t-1}+\beta_t\boldsymbol{k}_t\boldsymbol{v}_t^\top$：先由 $\operatorname{Diag}(\boldsymbol{\alpha}_t)$ 把旧状态逐维压低，再由 $(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)$ 在键方向上减去旧值、写入新值。
+依据：paper/src-v2/3-kda.tex Kimi Delta Attention
+
+::: 对角门与标量门的区别
+状态取 $\mathbf{S}=\begin{pmatrix}2&1\\1&3\end{pmatrix}$，两个特征维的衰减系数取 $\alpha_1=0.5$、$\alpha_2=0.8$，再用一步 delta 修正。
+依据：自行构造
+
+1. 标量门取 $\alpha=0.5$：$\alpha\mathbf{S}=\begin{pmatrix}1&0.5\\0.5&1.5\end{pmatrix}$，两行乘同一个数，行之间的比例不变。
+2. 对角门：$\operatorname{Diag}(\boldsymbol{\alpha})\mathbf{S}=\begin{pmatrix}1&0.5\\0.8&2.4\end{pmatrix}$，第一行乘 $0.5$、第二行乘 $0.8$，两行衰减量不同。
+3. 再接 delta 修正，键 $\boldsymbol{k}=(0,1)$、值 $\boldsymbol{v}=(1,3)$、$\beta=0.5$：$\mathbf{I}-\beta\boldsymbol{k}\boldsymbol{k}^\top=\begin{pmatrix}1&0\\0&0.5\end{pmatrix}$，作用于对角门后的状态得 $\begin{pmatrix}1&0.5\\0.4&1.2\end{pmatrix}$，再加写入项 $\beta\boldsymbol{k}\boldsymbol{v}^\top=\begin{pmatrix}0&0\\0.5&1.5\end{pmatrix}$，得 $\mathbf{S}_t=\begin{pmatrix}1&0.5\\0.9&2.7\end{pmatrix}$。第一行只被衰减，第二行衰减后又写入新值。
+依据：自行构造
+:::
+
+### 分块并行
+
+上面每一步都依赖上一步的状态，沿序列逐个算无法并行；训练需要把计算组织成矩阵乘法，才能充分利用硬件。做法是把序列切成等长的块，块内不再逐位展开，而是把一整块的位置更新表示成对块起始状态的变换加上块内部的写入量。块与块之间仍顺序传状态，块内并行。
+依据：paper/src-v2/3-kda.tex Hardware-Efficient Chunkwise Algorithm
+
+设块长为 $C$：序列切成的每一块是一个块，用方括号 $[t]$ 标块的编号，块内第 $r$ 个位置（$r$ 从 1 到 $C$）用上标标示，与位置 $t$ 区分开。块内第 $r$ 个位置的状态写成 $\mathbf{S}_{[t]}^r=\mathbf{P}_{[t]}^r\mathbf{S}_{[t]}^0+\mathbf{H}_{[t]}^r$。$\mathbf{S}_{[t]}^0$ 是这一块的起始状态，即上一块的末状态；$\mathbf{P}_{[t]}^r$ 把起始状态经过块内前 $r$ 步的衰减与修正后的结果依次相乘成一个矩阵；$\mathbf{H}_{[t]}^r$ 是块内这 $r$ 步各自写入的量、再经其后的衰减累加成的矩阵。两者各按一条只在块内走的递推算出：$\mathbf{P}_{[t]}^r=(\mathbf{I}-\beta_{[t]}^r\boldsymbol{k}_{[t]}^r\boldsymbol{k}_{[t]}^{r\top})\operatorname{Diag}(\boldsymbol{\alpha}_{[t]}^r)\mathbf{P}_{[t]}^{r-1}$，$\mathbf{H}_{[t]}^r=(\mathbf{I}-\beta_{[t]}^r\boldsymbol{k}_{[t]}^r\boldsymbol{k}_{[t]}^{r\top})\operatorname{Diag}(\boldsymbol{\alpha}_{[t]}^r)\mathbf{H}_{[t]}^{r-1}+\beta_{[t]}^r\boldsymbol{k}_{[t]}^r\boldsymbol{v}_{[t]}^{r\top}$，初值 $\mathbf{P}_{[t]}^0=\mathbf{I}$、$\mathbf{H}_{[t]}^0=\mathbf{0}$。
+依据：paper/src-v2/appendix/proof.tex Derivations for Chunkwise Parallelism of KDA
+
+按上面的递推一步步算 $\mathbf{P}$、$\mathbf{H}$ 仍要 $r$ 次小矩阵乘法。换用 WY 表示，可以把 $\mathbf{P}_{[t]}^r$、$\mathbf{H}_{[t]}^r$ 一次写成紧凑的求和式：WY 表示是把一串秩一更新压成一个式子的写法，块内一串「单位矩阵减秩一」矩阵的累乘，不必逐个乘开也能算。
+依据：paper/src-v2/3-kda.tex Hardware-Efficient Chunkwise Algorithm；paper/src-v2/appendix/proof.tex Derivations for Chunkwise Parallelism of KDA
+
+块内从起始状态往前算输出时，要分两部分处理：落在本块内、早于当前位置的键值用块内已算出的量，落在上一块及更早的用块起始状态，两部分相加。
+依据：paper/src-v2/3-kda.tex Hardware-Efficient Chunkwise Algorithm
+
+这套算法还可以把 KDA 看成广义 DPLR（对角加低秩）转移矩阵的一个受限变体：一般的 DPLR 让对角矩阵和低秩项各自取不同的向量，KDA 把低秩项的两个向量都绑到同一个键 $\boldsymbol{k}_t$ 上。约束变紧之后，块内需要二次分块（在全精度下再切一次以保数值稳定，全精度指用完整浮点精度计算、不做低位宽近似）的地方从四处减到两处，另外还省掉三个矩阵乘法。
+依据：paper/src-v2/6-discuss.tex Relation to DPLR；paper/src-v2/3-kda.tex Efficiency Analysis
+
+::: 为什么一整块能写成 P、H 两项
+把块内第 $r$ 步的更新记成 $\mathbf{S}^r=\mathbf{A}_r\mathbf{S}^{r-1}+\boldsymbol{b}_r$，其中 $\mathbf{A}_r=(\mathbf{I}-\beta^r\boldsymbol{k}^r\boldsymbol{k}^{r\top})\operatorname{Diag}(\boldsymbol{\alpha}^r)$、$\boldsymbol{b}_r=\beta^r\boldsymbol{k}^r\boldsymbol{v}^{r\top}$。用归纳证明 $\mathbf{S}^r=\mathbf{P}^r\mathbf{S}^0+\mathbf{H}^r$。
+依据：paper/src-v2/appendix/proof.tex Derivations for Chunkwise Parallelism of KDA
+
+1. $r=1$：$\mathbf{P}^1\mathbf{S}^0+\mathbf{H}^1=\mathbf{A}_1\mathbf{S}^0+\boldsymbol{b}_1=\mathbf{S}^1$。
+2. 设第 $r-1$ 步成立，$\mathbf{S}^{r-1}=\mathbf{P}^{r-1}\mathbf{S}^0+\mathbf{H}^{r-1}$。
+3. 代入第 $r$ 步：$\mathbf{S}^r=\mathbf{A}_r(\mathbf{P}^{r-1}\mathbf{S}^0+\mathbf{H}^{r-1})+\boldsymbol{b}_r=(\mathbf{A}_r\mathbf{P}^{r-1})\mathbf{S}^0+(\mathbf{A}_r\mathbf{H}^{r-1}+\boldsymbol{b}_r)$。
+4. 括号里正是 $\mathbf{P}^r$ 与 $\mathbf{H}^r$ 的递推，故 $\mathbf{S}^r=\mathbf{P}^r\mathbf{S}^0+\mathbf{H}^r$，归纳成立。
+依据：paper/src-v2/appendix/proof.tex Derivations for Chunkwise Parallelism of KDA
+:::
+
+::: 一个块的逐位手算
+取 $d_k=d_v=1$（状态退化成标量），块长 $C=2$，块起始状态为 0。两个位置的键都取 1，值取 2 和 4，两个位置的衰减系数都取 $0.5$，$\beta$ 都取 $0.5$。
+依据：自行构造
+
+1. 逐位递推：第 1 步 $\mathbf{S}=(1-0.5\times1^2)\times0.5\times0+0.5\times1\times2=1$。
+2. 第 2 步 $\mathbf{S}=(1-0.5\times1^2)\times0.5\times1+0.5\times1\times4=2.25$，块末状态是 $2.25$。
+3. 用块递推：$\mathbf{P}^1=(1-0.5\times1^2)\times0.5\times1=0.25$、$\mathbf{H}^1=0.5\times1\times2=1$，$\mathbf{P}^1\mathbf{S}^0+\mathbf{H}^1=1$，与第 1 步一致。
+4. 再一步：$\mathbf{P}^2=(1-0.5\times1^2)\times0.5\times0.25=0.0625$、$\mathbf{H}^2=(1-0.5\times1^2)\times0.5\times1+0.5\times1\times4=2.25$，$\mathbf{P}^2\mathbf{S}^0+\mathbf{H}^2=2.25$，与第 2 步一致。
+依据：自行构造
+:::
+
+::: KDA 相对一般 DPLR 内核省下的时间
+内核指在硬件上执行的一段计算程序。同一批量（1 条序列、16 个头）下，KDA 与一般 DPLR 内核的执行时间（毫秒）：输入 $2$K 时 $1.70$ 对 $2.02$，$8$K 时 $3.88$ 对 $7.55$，$32$K 时 $14.81$ 对 $29.64$，$64$K 时 $29.83$ 对 $59.22$。序列越长，KDA 相对 DPLR 的耗时大体接近一半，即约 $2$ 倍提速。
+依据：paper/src-v2/figures/kernel.tex L85-L86；paper/src-v2/figures/kernel.tex L42-L71
+:::
+
+### 作为可学习位置编码
+
+标准注意力对输入顺序不敏感，所以要在输入里加位置编码，让模型知道各位置的先后顺序。[RoPE](wiki/rope) 是一种乘性位置编码：把查询和键按位置各乘一组按维度排布的旋转，两个位置做点积时旋转相消，只剩位置之差。KDA 的转移矩阵按位置累乘，作用方式和它同类——第 $t$ 个查询与第 $i$ 个键之间的关系，由中间这些步的转移矩阵累乘体现出来。
+依据：paper/src-v2/6-discuss.tex as learnable position embeddings
+
+两者的区别在约束：RoPE 的旋转矩阵只由位置定、是正交的；KDA 的转移矩阵每一步都随输入变化、可学习，也没有正交约束。逐通道的门让不同特征维有各自的衰减快慢，相当于给不同维不同的位置尺度。
+依据：paper/src-v2/6-discuss.tex as learnable position embeddings
+
+::: KDA 与 RoPE 的通式对照
+两者的相关形式都能写成「查询乘一段累积矩阵再乘键」。RoPE 的累积矩阵是 $\prod_{j=i+1}^t\mathbf{R}_j$，$\mathbf{R}_j$ 是只由位置 $j$ 定的旋转矩阵。KDA 的累积矩阵是 $\prod_{j=i+1}^t\left(\mathbf{I}-\beta_j\boldsymbol{k}_j\boldsymbol{k}_j^\top\right)\operatorname{Diag}(\boldsymbol{\alpha}_j)$，由每一步的输入定，$\boldsymbol{k}_j$、$\boldsymbol{\alpha}_j$、$\beta_j$ 都来自该步的输入。
+依据：paper/src-v2/3-kda.tex Kimi Delta Attention；paper/src-v2/6-discuss.tex as learnable position embeddings
+:::
+
+### 适用条件与边界
+
+定长状态换来的是有限容量：要在很长的历史里精确找回某段内容，状态存不下全部，长序列建模和上下文检索会受限制。
+依据：paper/src-v2/1-intro.tex Introduction
+
+门控制记忆的寿命，让旧关联逐步淡出以缓解新旧冲突；它不负责把新值写进去，写入由 delta 修正那一步完成。
+依据：paper/src-v2/2-preliminary.tex Gated DeltaNet as Weight Decay；paper/src-v2/table/update.tex L14-L54
+
+与只加不减的线性注意力相比，KDA 的更新式在 $\boldsymbol{k}_t\boldsymbol{v}_t^\top$ 之外多出 $(\mathbf{I}-\beta_t\boldsymbol{k}_t\boldsymbol{k}_t^\top)$ 与对角门两项运算，换来的是同一键方向上的值可以被改写。
+依据：paper/src-v2/table/update.tex L14-L54；paper/src-v2/2-preliminary.tex Linear Attention as Online Learning
