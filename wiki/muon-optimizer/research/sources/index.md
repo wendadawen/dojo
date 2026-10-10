@@ -1,0 +1,4 @@
+- blog/muon-blog.txt｜https://kellerjordan.github.io/posts/muon/｜2024-12-08 发布，含 2025-07-12 增补｜2026-10-10｜作者写的 Muon 介绍：定义、设计、与 Shampoo 等前身的关系、运行开销、剩余开放问题
+- blog/muon-page.html｜https://kellerjordan.github.io/posts/muon/｜2024-12-08 发布，含 2025-07-12 增补｜2026-10-10｜上一条的网页快照，公式以图片形式嵌在其中
+- blog/muon_algo.png｜https://kellerjordan.github.io/posts/muon/｜2024-12-08｜2026-10-10｜博客里 Muon 定义处的图片（Algorithm 2 Muon）
+- repo/Muon｜https://github.com/KellerJordan/Muon｜commit f98f1cacc0263b04290753e32be8d498c1efc806｜2026-10-10｜作者的官方实现，muon.py 含 Newton-Schulz 正交化、动量更新与 MuonWithAuxAdam

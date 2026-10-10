@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Muon 是训练神经网络时用于隐藏层二维参数的一种优化器：先把累积的梯度正交化，再按学习率更新参数。">
+  <meta name="dojo:summary" content="把二维参数的更新矩阵替换成最接近它的半正交矩阵，再按学习率更新参数；正交化用 $5$ 步 Newton-Schulz 迭代近似算出。">
+  <meta name="dojo:topics" content="训练与优化">
+  <meta name="dojo:tag" content="优化器">
+  <title>Muon</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Muon</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Muon</h1>
+<p class="reading-time">正文 1,372 字 · 约 4 分钟阅读</p>
+
+<p>神经网络由一叠层组成。每层拿到一个输入向量，乘上一个权重矩阵，加上偏置，再过一次非线性函数，把输出交给下一层。偏置是这一层附带的一组常数，逐位置加到结果上。隐藏层指除网络的输入层和输出层之外的那些层，它们的输出不直接对应用户看到的数据。这些层里的权重矩阵就是二维参数：它们排成矩阵，有两个维度。与之相对，偏置，以及归一化的缩放系数（归一化把这一层算出的向量按统计量缩放和平移）等，是向量或标量，只有一个或零个维度。</p>
+
+<p>训练时每个参数都会收到一个梯度，梯度指出损失函数（衡量模型输出好坏的目标函数）在该参数上往哪个方向变化最快。优化器就是用梯度决定参数怎么更新的算法。最常见的做法是在梯度上直接按学习率走一步，学习率是每次更新的步长比例。Muon 是另一类优化器，专用于隐藏层的二维参数：它把最近若干步的梯度按比例混合成一个矩阵，叫动量，再把矩阵换成与它最接近的半正交矩阵（列或行两两正交、长度都是 1 的矩阵），最后按学习率从参数里减去。</p>
+
+<h2 id="s1">1. 正交化的更新</h2>
+
+<p>Muon 的核心操作是把更新矩阵换成一个半正交矩阵。</p>
+
+<h3 id="s1-1">1.1 更新矩阵为何近乎低秩</h3>
+
+<p>在 transformer（一种以注意力为主要计算部件的语言模型）里，隐藏层二维参数的更新矩阵通常条件数很高，而且几乎低秩：条件数指矩阵最大伸缩倍数除以最小伸缩倍数，这个比值大，说明最大和最小相差很大；低秩指更新几乎落在少数几个方向上，其余方向的分量很小。</p>
+
+<details>
+<summary>正交化为什么有效</summary>
+<p>资料对这一点的说法是推测：正交化把更新中幅度很小、但对学习仍然重要的那些方向的尺度放大。</p>
+</details>
+
+<h3 id="s1-2">1.2 正交化是什么</h3>
+
+<p>一个矩阵半正交，指它的列两两正交、每列长度是 1，或者行满足同样的条件。给定一个矩阵 $G$，在所有半正交矩阵里与 $G$ 差得最近的那一个，就是对 $G$ 的正交化结果，记作 $\mathrm{Ortho}(G)$，距离用 Frobenius 范数衡量（所有元素的平方和再开根号）。要算出它，用<a href="../svd/index.html">奇异值分解</a>：把 $G$ 写成 $USV^\top$，其中 $U$、$V$ 的列都两两正交、长度是 1，$S$ 是对角矩阵，对角元非负，叫奇异值，是矩阵在各个正交方向上的伸缩倍数。那么最近的那个半正交矩阵正好是 $UV^\top$：丢掉中间的对角矩阵，只把左右两个正交矩阵相乘。</p>
+
+<details>
+<summary>一个 2×2 的例子</summary>
+<p>取 $G=\begin{pmatrix}3&amp;0\\0&amp;2\end{pmatrix}$。它的奇异值分解里 $U=V=I$，奇异值是 $3$ 和 $2$。于是 $\mathrm{Ortho}(G)=UV^\top=I$：结果与两个奇异值的大小无关，只与左右奇异向量有关。一般地，结果是 $UV^\top$，与 $S$ 无关，所以把 $G$ 整体乘一个正数，正交化结果不变。</p>
+</details>
+
+<h3 id="s1-3">1.3 用迭代算出正交矩阵</h3>
+
+<p>奇异值分解比这个迭代慢得多，Muon 改用迭代近似算出 $UV^\top$：先把更新矩阵除以自己的 Frobenius 范数，让它的奇异值都落在 0 到 1 之间（Frobenius 范数不小于最大的奇异值，所以除完以后最大的不超过 1，等于 1 只在矩阵的秩为 1 时），再反复代入一个固定的五次多项式。这个迭代叫 Newton-Schulz 迭代，能稳定运行在 bfloat16 这种低精度浮点格式上。用 5 步即可。</p>
+
+<h2 id="s2">2. 完整更新规则</h2>
+
+<p>更新里的动量用 Nesterov 形式：方向取当前梯度与动量的一个加权组合，而不只是动量本身。正交化后的矩阵还要乘一个与形状有关的缩放因子（实现里是 $\sqrt{\max(1,n/m)}$，$n$、$m$ 是参数矩阵的两个维度）。</p>
+
+<details>
+<summary>一次更新的公式</summary>
+<p>设第 $t$ 步的梯度是 $G_t$，动量系数是 $\mu$，动量缓冲区按系数 $\mu$ 把梯度累积进去得到 $B_t$。取 Nesterov 形式时，更新方向 $U_t$ 由当前梯度与 $B_t$ 按系数 $\mu$ 混合得到；正交化 $O_t=\mathrm{Ortho}(U_t)$，实现里用 5 步 Newton-Schulz 迭代近似。参数更新写成 $\theta_t=\theta_{t-1}-\eta\,s\,O_t$，$\eta$ 是学习率，$s=\sqrt{\max(1,n/m)}$ 是形状缩放因子。</p>
+</details>
+
+<h2 id="s3">3. 哪些参数用它</h2>
+
+<p>Muon 只用于隐藏层里形状为矩阵的权重。其余参数用标准方法优化，通常就是 AdamW（另一种常用的优化器）：偏置、归一化的缩放与平移这类标量和向量参数，以及输入层（把 token，也就是文本切出的小片段，变成向量的嵌入表）和输出层（最后把表示映射成分数的分类头）。即使嵌入和分类头的权重本身是矩阵，也仍交给 AdamW。卷积核是卷积层里滑过输入、提取局部特征的小权重块，形状通常有四个维度，把它后三个维度合并成一个维度当作矩阵，就能用 Muon；但第一个卷积层交给 AdamW。</p>
+
+<p>注意力层里有产生查询、键、值的三个投影矩阵，这三个矩阵分开用 Muon 优化，比合成一个更好。</p>
+
+<h2 id="s4">4. 运行开销</h2>
+
+<p>正交化只作用在更新矩阵本身，不进入前向（把输入算到输出）和反向（从损失回传梯度）的计算。</p>
+
+<details>
+<summary>额外计算量占多少</summary>
+<p>设参数矩阵形状是 $n\times m$，取 $m\le n$。正交化迭代的每一步约需 $2(2nm^2+m^3)$ 次浮点运算，方阵时约 $6nm^2$。设迭代 $T$ 步，额外运算最多 $6Tnm^2$；若这一层是线性层，走一步训练（一次前向加一次反向）约需 $6nmB$，$B$ 是这一步通过该层的输入个数。两者相除，额外开销最多是 $Tm/B$。</p>
+<ol>
+<li>取 $T=5$、参数矩阵 $m=512$、这一步通过该层的输入 $B=1000000$，额外开销 $5\times512/1000000$，约 $0.26\%$。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>这个额外计算量在常见语言模型训练里低于 1%，但它随每一步的批量增大而变小。代价是每一步的墙钟时间比 AdamW 更长，因为正交化本身带来额外计算。</p>
+
+<p>资料没有下结论的问题有三：Muon 能否扩展到更大规模的训练，能否在大规模 GPU 集群上把正交化迭代并行展开，以及它是否只对预训练（在大规模文本上从头训练）有用，而对微调（在较小的任务数据上继续训练）和强化学习（用奖励信号调整策略）不适用。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Keller Jordan, Yuchen Jin, Vlado Boza, Jiacheng You, Franz Cesista, Laker Newhouse, Jeremy Bernstein. Muon: An optimizer for hidden layers in neural networks. 2024. <a href="https://kellerjordan.github.io/posts/muon/">https://kellerjordan.github.io/posts/muon/</a></li>
+<li>Keller Jordan. Muon. GitHub, 2024. <a href="https://github.com/KellerJordan/Muon">https://github.com/KellerJordan/Muon</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
