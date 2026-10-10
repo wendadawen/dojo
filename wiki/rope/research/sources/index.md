@@ -1,0 +1,3 @@
+- paper/arxiv-v5.pdf、paper/src-v5/｜论文｜https://arxiv.org/abs/2104.09864v5｜v5（2023-11-08，最新版）｜2026-10-10｜RoFormer: Enhanced Transformer with Rotary Position Embedding，提出 RoPE：把查询和键按绝对位置旋转，使点积只依赖相对位置；LaTeX 源码在 src-v5/，纯文本核对用 src-v5/roformer_arxiv.tex
+- repo/roformer/｜仓库｜https://github.com/ZhuiyiTechnology/roformer｜dfc678ad506fc527ba17ead8db23cbe4d947a9b4（2022-03-21）｜2026-10-10｜RoPE 官方仓库（作者方）：README 给出在自注意力层里应用旋转的伪代码，并列出预训练模型下载
+- repo/bert4keras/｜仓库｜https://github.com/bojone/bert4keras｜c1ae0dc5eff66d329ab3c5c7ee369124ddbb6f87（2024-11-11）｜2026-10-10｜论文第一作者维护的参考实现（官方仓库指向）：backend.py 的 sinusoidal_embeddings 与 apply_rotary_position_embeddings、models.py 的 RoFormer，是 RoPE 逐元素实现的来源
