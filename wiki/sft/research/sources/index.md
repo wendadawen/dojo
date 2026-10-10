@@ -1,0 +1,2 @@
+- paper/instructgpt/｜论文｜https://arxiv.org/abs/2203.02155｜v2｜2026-10-10｜Training language models to follow instructions with human feedback（InstructGPT）：提出后训练三步流程 SFT→RM→PPO，给出样本数据构成与 SFT 训练细节；LaTeX 源码在 src/，另有 PDF
+- paper/llama2/｜论文｜https://arxiv.org/abs/2307.09288｜v3｜2026-10-10｜Llama 2: Open Foundation and Fine-Tuned Chat Models；§3.1 Supervised Fine-Tuning 给出 SFT 数据量与「损失只在回答 token 上」的做法，§2 给出预训练目标；LaTeX 源码在 src/，另有 PDF
