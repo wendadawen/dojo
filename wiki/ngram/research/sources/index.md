@@ -1,0 +1,1 @@
+- paper/slp3-ch3.pdf、paper/slp3-ch3.txt｜论文｜https://web.stanford.edu/~jurafsky/slp3/3.pdf｜Draft of August 19, 2026｜2026-10-10｜Speech and Language Processing（第 3 版草稿）第 3 章 N-gram Language Models：给出 n-gram 的两层定义、链式法则与马尔可夫近似、MLE 计数估计、稀疏与平滑、困惑度评估、以及高阶 n-gram 参数随阶数增长的边界；纯文本快照 slp3-ch3.txt（pdftotext 转出）供核对数字与位置
