@@ -1,0 +1,2 @@
+- paper/arxiv-1911.02150.pdf、paper/src-mqa/｜论文｜https://arxiv.org/abs/1911.02150｜v1（2019-11-06）｜2026-10-10｜Fast Transformer Decoding: One Write-Head is All You Need，提出 multi-query attention：所有头共用一套键和值；纯文本核对用 src-mqa/main.tex
+- paper/arxiv-2305.13245.pdf、paper/src-gqa/｜论文｜https://arxiv.org/abs/2305.13245｜v3（2023-12-23，EMNLP 2023）｜2026-10-10｜GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints，提出 grouped-query attention：查询头分组、每组一套键值；纯文本核对用 src-gqa/main.tex、tables/main_results.tex、figures/ 下的 .tex
