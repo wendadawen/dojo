@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="DeepSeek Sparse Attention（DSA）是一种稀疏注意力：每个查询位置先用一个轻量的闪电索引器给所有前序位置打一个索引分数，只取分数最高的少数位置，注意力只在这少数位置上做。">
+  <meta name="dojo:summary" content="用一个小索引器给每个前序位置打一个分数，取分数最高的少数几个后只对它们做注意力，把注意力的核心计算量从 $O(L^2)$ 降到 $O(Lk)$；索引器先训练到接近稠密注意力的分布，再让模型适配稀疏模式。长上下文的训练和推理效率都因此提升。">
+  <meta name="dojo:topics" content="注意力机制">
+  <meta name="dojo:tag" content="注意力">
+  <title>DeepSeek Sparse Attention</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">DeepSeek Sparse Attention</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">DeepSeek Sparse Attention</h1>
+<p class="reading-time">正文 1,890 字 · 约 6 分钟阅读</p>
+
+<p>Transformer 是当前大语言模型（能生成文本的模型）通用的网络结构，一层里有一层注意力；一层的注意力让每个位置读取它前面位置的信息：位置 $t$ 用它的查询向量，与每个前序位置的键向量算点积得到相关程度，再按这些相关程度对各个前序位置的值向量加权求和，得到这个位置在这一层的输出（见<a href="../standard-attention/index.html">标准注意力</a>）。生成时前面各位置的键和值算过就不再变，把它们缓存下来供后面复用，这份缓存叫 KV cache（见 <a href="../kv-cache/index.html">KV cache</a>）。模型由许多结构相同的层叠成，每层传给下一层的向量叫隐藏状态。位置数为 $L$ 时，注意力要让每个位置和它前面的每个位置都算一次，这一部分（主干注意力，即模型主干那几十层里的注意力）的计算量随 $L^2$ 增长，上下文越长代价越高。</p>
+
+<p>DeepSeek Sparse Attention（DSA，DeepSeek 稀疏注意力）换一种作法：不让每个位置看全部前序位置，而是先挑出少数。它由两个部件组成，一个叫闪电索引器，给每个前序位置算一个索引分数；一个叫细粒度选择，只保留分数最高的 $k$ 个前序位置，注意力只在这 $k$ 个位置上做。</p>
+
+<h2 id="s1">1. 打分、选择、做注意力</h2>
+
+<h3 id="s1-1">1.1 闪电索引器：给每个前序位置打分</h3>
+
+<p>索引器给一个查询位置 $t$ 和每个前序位置 $s$ 算一个索引分数 $I_{t,s}$。它分成多个头，头是注意力里并行的独立计算单元，每个头在自己的小空间里算一次。每个头做的是一次点积：把查询位置的一个向量 $\mathbf{q}_{t,j}^I$ 和前序位置的一个向量 $\mathbf{k}_s^I$ 对应分量相乘再相加，$j$ 是头的编号，上标 $I$ 表示这是索引器上的量。这两个向量都由隐藏状态经一个可学习的矩阵变换得到：$\mathbf{q}_{t,j}^I$ 从当前查询位置的隐藏状态 $\mathbf{h}_t$ 得到，$\mathbf{k}_s^I$ 从前序位置的隐藏状态 $\mathbf{h}_s$ 得到。每个头的结果先过一个函数，把负数变成 $0$、正数保持不变，这个函数叫 ReLU；再乘上该头的权重 $w_{t,j}^I$（也由 $\mathbf{h}_t$ 得到），各头的结果相加就是 $I_{t,s}$。</p>
+
+<p>索引器的计算量小，一是因为它的头数少，二是因为它可以用 FP8（一种低位宽的浮点数格式）这种低精度实现；选用 ReLU 是为了吞吐（单位时间能处理多少数据）。</p>
+
+<details>
+<summary>索引分数的公式与符号</summary>
+<p>索引分数的公式是</p>
+<p>$$I_{t,s} = \sum_{j=1}^{H^I} w_{t,j}^I \cdot \operatorname{ReLU}\!\left(\mathbf{q}_{t,j}^I \cdot \mathbf{k}_s^I\right)$$</p>
+<p>$H^I$ 是索引器的头数，$j$ 是头的编号，从 $1$ 到 $H^I$；$\mathbf{q}_{t,j}^I$ 是第 $j$ 头的查询，$\mathbf{k}_s^I$ 是这个前序位置的键（各头共用），两者从隐藏状态经可学习的矩阵变换而来、维度相同；$w_{t,j}^I$ 是第 $j$ 头的权重，一个标量；$\operatorname{ReLU}$ 把负数变成 $0$；点号表示两个向量对应分量相乘再相加。</p>
+</details>
+
+<h3 id="s1-2">1.2 细粒度选择与稀疏注意力</h3>
+
+<p>第二步按索引分数挑选。对查询位置 $t$，把它的索引分数排成一列，取分数最高的 $k$ 个前序位置，这些位置各自的 KV 条目（这个位置的键和值压成的那一个向量）记为 $\mathbf{c}_s$；注意力只在被选中的这些条目上做，未选中的位置不参与加权求和，等于把它们从注意力的输入里去掉了：</p>
+
+<p>$$\mathbf{u}_t = \operatorname{Attn}\!\left(\mathbf{h}_t, \left\{ \mathbf{c}_s \mid I_{t,s} \in \operatorname{Top\text{-}k}(I_{t,:}) \right\}\right)$$</p>
+
+<p>$\operatorname{Attn}$ 是注意力函数，输入是发起查询的位置和一组 KV 条目，输出是把这组条目的值按相关程度加权求和的结果；这里发起查询的位置就是当前查询位置，它的隐藏状态 $\mathbf{h}_t$ 经投影、取查询向量后与该组的键算相关程度。$\operatorname{Top\text{-}k}(I_{t,:})$ 是位置 $t$ 那一列索引分数里最大的 $k$ 个，$\mathbf{c}_s$ 是被选中前序位置 $s$ 的 KV 条目，$\mathbf{u}_t$ 是位置 $t$ 在这一层的输出。$k$ 是一个固定的数：稀疏训练阶段每个查询位置取 2048 个 KV 条目。被选中的是散布在序列里任意位置的条目，不要求连续；长上下文里 $L$ 可到 128K 这个量级，$k$ 远小于它。</p>
+
+<details>
+<summary>一个序列里走一遍挑选与注意力</summary>
+<p>设一个查询位置前面有 5 个位置，索引器给它们的分数依次是 0.1、2.5、0.3、1.8、0.2，$k$ 取 2。查询向量与这 5 个位置的键向量的点积事先算好，依次是 0.5、2.0、1.0、1.0、0.5；键向量的维度 $d=2$，按标准注意力的做法把点积除以 $\sqrt{d}$ 缩放。5 个位置的值向量依次是 $(1,1)$、$(1,0)$、$(1,1)$、$(0,1)$、$(1,1)$。</p>
+<ol>
+<li>选位置：5 个索引分数里最大的两个是位置 2 的 2.5 和位置 4 的 1.8，所以选中位置 2 和位置 4。</li>
+<li>算缩放点积：只对选中的这两个位置算，位置 2 是 $2.0/\sqrt{2}=1.414$，位置 4 是 $1.0/\sqrt{2}=0.707$。</li>
+<li>归成权重：把每个缩放点积取指数（$e$ 的这么多次方），再除以它们的总和，得到一组和为 $1$ 的权重。两个数取指数后是 $4.113$ 和 $2.028$，和为 $6.141$，于是位置 2 的权重是 $4.113/6.141=0.670$，位置 4 是 $2.028/6.141=0.330$。</li>
+<li>加权求和：输出是 $0.670\times(1,0)+0.330\times(0,1)=(0.670,0.330)$。</li>
+<li>作为对比，若不挑选、5 个位置全部参与：5 个缩放点积是 $0.354$、$1.414$、$0.707$、$0.707$、$0.354$，取指数后分别是 $1.424$、$4.113$、$2.028$、$2.028$、$1.424$，和为 $11.018$；权重是位置 1 到 5 的 $0.129$、$0.373$、$0.184$、$0.184$、$0.129$。输出是 $0.129\times(1,1)+0.373\times(1,0)+0.184\times(1,1)+0.184\times(0,1)+0.129\times(1,1)=(0.816,0.627)$。挑选把权重集中到分数最高的两个位置上，输出也就由这两个位置主导。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 接在 MLA 上</h2>
+
+<p>DSA 接在 MLA（多头潜在注意力，把每个位置的键和值压成一个低维向量缓存、用到时再还原成键和值，见 <a href="../mla/index.html">MLA</a>）上，用的是它的一种模式：一个位置的潜在向量（它的 KV 条目）被该位置的所有查询头共用。这样索引器选一次 top-k，得到的这组前序位置对全部查询头都适用，各个头都只在这组位置上做注意力；在计算内核（GPU 上执行的一段并行计算程序）这一层，每个位置的 KV 条目由此被多个查询头共享，计算量降下来。</p>
+
+<h2 id="s3">3. 索引器怎么训出来</h2>
+
+<p>DSA 不是从零训练的，而是从一个已训练好的模型（同一系列的早期版本 DeepSeek-V3.1-Terminus，下文简称 V3.1-Terminus）出发，用继续训练引入稀疏注意力。第一阶段的注意力仍是稠密的，每个位置看全部前序位置，这一阶段叫稠密热身：只训练索引器，主干（模型里那几十层，不含索引器）的参数全部冻结、固定不变。训练目标是让索引器打出的分数接近主干注意力实际把权重分给了哪些位置——把一个查询位置在各注意力头上的分数相加，归一成一组和为 $1$ 的比例 $p_{t,:}$，再用 KL 散度（衡量两个概率分布有多接近的量）让索引器的分数分布在取指数、归一后去逼近它。</p>
+
+<p>第二阶段叫稀疏训练。这时启用挑选机制，主干和索引器都进入训练：目标仍是让索引器对齐主干注意力，但只在被选中的那 $k$ 个位置上对齐（记这组位置为 $S_t$）。这里两部分各自优化，没有梯度传递——索引器的输入被从计算图（记录一次前向计算里各步骤、供反向求梯度的那张图）里断开，梯度不回传到主干，索引器只按自己这一路的目标单独优化，主干只按语言建模的目标（预测下一个 token，即文本切出的最小单位，的目标）优化。</p>
+
+<details>
+<summary>两个阶段的训练超参</summary>
+<p>稠密热身：学习率（每一步参数更新的幅度）取 $10^{-3}$，训练 1000 步，每步 16 条序列、每条 128K 个 token，合计 2.1B 个 token。</p>
+<p>稀疏训练：学习率取 $7.3\times10^{-6}$，主干和索引器一起训练 15000 步，每步 480 条序列、每条 128K 个 token，合计 943.7B 个 token。</p>
+</details>
+
+<h2 id="s4">4. 核心计算量的变化</h2>
+
+<p>主干注意力的计算量从随 $L^2$ 增长降到随 $Lk$ 增长：$L$ 是序列长度，$k$ 是每个位置选中的前序位置数，远小于 $L$。索引器本身仍要对每个前序位置打一次分，这一部分仍随 $L^2$ 增长，但单次计算比主干注意力小得多。合起来，DSA 在长上下文场景下让整条前向流程（从输入到输出，端到端）加速，训练和推理两侧都变快。</p>
+
+<details>
+<summary>成本随位置的变化</summary>
+<p>在 H800（一种 GPU 型号）集群上、按每 GPU 小时 2 美元的租金，测了每百万 token 的成本随这个 token 在序列里位置的变化，预填充（一次处理整段输入的那一步）和解码（逐个往外写出输出的那一步）各画一条曲线。DSA 每百万 token 的成本低于基线（稠密注意力）。</p>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>DSA 是在已有模型上继续训练引入的，不是从零训练出来的：它只改注意力这一处，模型其余结构和它出发的那个检查点（训练中保存下来的那套模型参数）V3.1-Terminus 相同。</p>
+
+<p>它的加速依赖配套优化。短序列的预填充改用另一种做法，用 masked MHA（带掩码的多头注意力，掩码是一张把不该看的位置遮住的表；见<a href="../causal-mask/index.html">因果掩码</a>）来模拟 DSA，这样在短上下文下更高效。</p>
+
+<p>容易误以为索引器和主干端到端一起训练、梯度彼此回传：实际上两部分的优化分开，梯度不回传到主干。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>DeepSeek-AI. DeepSeek-V3.2-Exp: Boosting Long-Context Efficiency with DeepSeek Sparse Attention. 技术报告, 2025. <a href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp">https://github.com/deepseek-ai/DeepSeek-V3.2-Exp</a></li>
+<li>DeepSeek-AI. DeepSeek-V3.2-Exp: official implementation. 2025. <a href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp">https://github.com/deepseek-ai/DeepSeek-V3.2-Exp</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
