@@ -184,13 +184,17 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
     # 尾巴 + 说明栏形状、上一行键注 + 下一行形状…），凭空报错；为挡它加的启发式又
     # 连着误伤。改成一趟扫描后，每个形状只认「右边的键注」或「左边紧邻的键名」，
     # 按行处理（`<br>`、换行都断行），不再有跨行的假配对。
-    SHAPE_RE = re.compile(r"\[([0-9][0-9,\s]*)\]")
-    # 形状右边紧跟的键注，键名要在
-    ANNOT_RE = re.compile(r"[（(]\s*(?:源码里叫|检查点键)\s*[:：=]?\s*`?([A-Za-z0-9_.{}\-]+)")
+    SHAPE_RE = re.compile(r"\[\s*([0-9][0-9,\s]*)\s*\]")
+    # 形状右边紧跟的键注，键名要在。键注前允许空白（排版留一个空格不该改变判定）。
+    ANNOT_RE = re.compile(r"\s*[（(]\s*(?:源码里叫|检查点键)\s*[:：=]?\s*`?([A-Za-z0-9_.{}\-]+)")
     # 只认出「键注词」，用来分辨「键注写坏了」与「压根没写键注」
-    ANNOT_HEAD_RE = re.compile(r"[（(]\s*(?:源码里叫|检查点键)")
+    ANNOT_HEAD_RE = re.compile(r"\s*[（(]\s*(?:源码里叫|检查点键)")
     SYM_RE = re.compile(r"\$[^$]*\$\s*$")
     IDENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_.{}\-]*)\s*$")
+    # 文件名（vision.py、config.json、README.md）不是权重键名，别拿去 resolve。
+    # 只认常见源码/数据扩展名，`.weight`、`.wkv` 这类键尾不在内。
+    FILE_RE = re.compile(
+        r"\.(?:py|pyi|json|md|txt|rst|toml|cfg|ini|ya?ml|safetensors|bin|pdf|tex)$")
 
     def placeholder(txt: str) -> str:
         return re.sub(r"\{[a-z]+\}", "0", txt)
@@ -243,17 +247,25 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
                         ann = ANNOT_RE.match(right)
                         if ann:
                             key = resolve(placeholder(ann.group(1)))
-                            if key and key not in seen_here:
+                            if key:
+                                # 同一键在同一节点里出现多次就比多次——第一次写对、
+                                # 第二次写错也得报（不能靠 seen_here 把后一次跳过）。
                                 compare(key, dims)
                                 seen_here.add(key)
                             # 形状左边若还紧跟一个像键名的标识符（带点/下划线），
-                            # 它和括号里的键注是两处规格，也得核——不一致就是页里
-                            # 自相矛盾（如 `gate.wieght [16,32]（检查点键 gate.weight）`）。
+                            # 它和括号里的键注是两处规格：都得对得上，且得指同一个键，
+                            # 否则页里自相矛盾（`gate.wieght [16,32]（检查点键 gate.weight）`、
+                            # `image_start [129280,5120]（检查点键 embed.weight）`）。
                             idm = IDENT_RE.search(line[:m.start()])
                             if idm and re.search(r"[._]", idm.group(1)):
                                 inline = placeholder(idm.group(1))
+                                ann_key = placeholder(ann.group(1))
                                 if inline not in by_norm:
                                     resolve(inline)
+                                elif inline != ann_key:
+                                    errors.append(
+                                        f"[{view['id']}/{node['id']}] 形状前写的是「{idm.group(1)}」、"
+                                        f"键注写的是「{ann.group(1)}」，两处指的不是同一个键")
                             continue
                         if ANNOT_HEAD_RE.match(right):
                             errors.append(f"[{view['id']}/{node['id']}] 键注里没写键名"
@@ -275,6 +287,8 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
                             continue
                         ident = placeholder(idm.group(1))
                         if "." not in ident and "_" not in ident:
+                            continue
+                        if FILE_RE.search(ident):
                             continue
                         key = resolve(ident)
                         if key and key not in seen_here:
@@ -600,6 +614,35 @@ def selftest() -> list[tuple[str, bool]]:
                      "detail": "gate.wieght [16, 32]（检查点键 gate.weight）"}]}],
         {"gate.weight": [16, 32]})
     checks.append(("带点的错键名后面跟键注也要报", bool(e_f3c)))
+    # 形状与键注之间多一个空格不该改变判定（曾因此漏核/误报）
+    e_sp, m_sp = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                     "detail": "$W$ [16, 32] （检查点键 gate.weight）"}]}],
+        {"gate.weight": [16, 32]})
+    checks.append(("形状与键注之间多空格仍核上", not e_sp and m_sp == 1))
+    # 方括号内空格
+    e_sp2, m_sp2 = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                     "detail": "gate.weight [ 16, 32 ]（检查点键 gate.weight）"}]}],
+        {"gate.weight": [16, 32]})
+    checks.append(("方括号内有空格仍核上", not e_sp2 and m_sp2 == 1))
+    # 文件名引用（vision.py [..]）不是键名
+    e_fn, m_fn = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                     "detail": "见 vision.py [16, 32] 里"}]}],
+        {"gate.weight": [16, 32]})
+    checks.append(("文件名引用不当键名", not e_fn and m_fn == 0))
+    # 同一键出现两次、第二次写错，要报
+    e_tw, _ = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                     "detail": "$A$ [16, 32]（检查点键 gate.weight）"
+                               "$B$ [1, 1]（检查点键 gate.weight）"}]}],
+        {"gate.weight": [16, 32]})
+    checks.append(("同一键出现两次第二次写错要报", len([x for x in e_tw if "gate.weight" in x]) == 1))
     # 跨字段假匹配：符号栏以「源码里叫 norm.weight」结尾、说明栏以裸形状+键注开头，
     # 两者拼接后曾粘成假的 `norm.weight [64]（检查点键 …）`，凭空报错。逐字段核查后不再发生。
     e_x, m_x = check_shapes(

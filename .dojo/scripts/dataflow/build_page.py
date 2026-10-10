@@ -489,6 +489,7 @@ def write_page(out: Path, meta: dict, views: list[dict],
     tpl = tpl.replace("【首页摘要：可含 $...$ 公式；本篇的形状与超参逐条对准源码、config 与权重】",
                       meta["summary"])
     tpl = tpl.replace("【主题，逗号分隔，取自词表】", meta["topics"])
+    tpl = tpl.replace("【标签】", meta["tag"])
     tpl = tpl.replace("【模型名】", meta["title"])
 
     tabs = "".join(
