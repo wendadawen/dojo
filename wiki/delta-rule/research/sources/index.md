@@ -1,0 +1,2 @@
+- paper/arxiv-v6.pdf、paper/src-v6/、paper/arxiv-v6.txt｜论文｜https://arxiv.org/abs/2406.06484｜v6（2025-01-15）｜2026-10-10｜Parallelizing Linear Transformers with the Delta Rule over Sequence Length，把采用 delta 规则的线性 Transformer（DeltaNet）的训练按序列长度并行化；LaTeX 源码在 src-v6/，纯文本快照 arxiv-v6.txt
+- repo/flash-linear-attention/｜仓库｜https://github.com/fla-org/flash-linear-attention｜a7880060012c862d58575ee23f613cafcd728d03（2026-10-10）｜2026-10-10｜论文官方公开实现的库：README、delta 规则算子目录 fla/ops/delta_rule/（chunk、wy_fast、fused_recurrent 等）、DeltaNet 模型与层的实现，以及算子复核用的参考说明 references/delta-rule.md

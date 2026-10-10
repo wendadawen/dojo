@@ -1,0 +1,265 @@
+# Delta 规则与 DeltaNet
+
+- 描述：DeltaNet 是采用 delta 规则更新记忆的线性 Transformer：写入新键值对时，先按当前键把记忆里已有的值取出来，只按预测误差改写这条记忆，而不是直接叠加一个新键值对。
+- 摘要：线性 Transformer 的记忆用加法更新，固定容量下键一多就互相碰撞。delta 规则把写入改成纠错——取回键上已有的值，朝目标值改一步；DeltaNet 的训练靠把每步更新写成可累加的形式，分块并行到序列长度上。
+- 主题：注意力机制, 模型结构
+- 标签：注意力
+
+## 资料
+
+- Songlin Yang, Bailin Wang, Yu Zhang, Yikang Shen, Yoon Kim. Parallelizing Linear Transformers with the Delta Rule over Sequence Length. NeurIPS 2024. arXiv:2406.06484v6, 2025. [https://arxiv.org/abs/2406.06484](https://arxiv.org/abs/2406.06484)
+- Songlin Yang, et al. flash-linear-attention. commit a788006. [https://github.com/fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+
+## 短页
+
+### 记忆里改写而不是只往里加
+
+DeltaNet 是一种线性 Transformer（不在所有位置之间两两算相似度，而是把键值先合并成一个固定大小的记忆、用查询去取，从而按线性代价处理序列的一类模型）。它按位置处理一段序列（序列由 token 组成，token 是被处理的最小单位），把已经处理过的内容压成一个固定大小的矩阵 $S$，用它当记忆（见[线性注意力](wiki/linear-attention)）。记忆按「键找值」存取：写入时把一对键 $k$ 与值 $v$ 存进 $S$，读取时用一个查询向量 $q$ 去点乘 $S$，取回与这个查询对应的值。
+
+直接叠加的写法，是把值向量 $v$ 与键向量 $k$ 的外积 $v k^\top$ 加到 $S$ 上，每来一对就加一份。
+
+DeltaNet 用的是 delta 规则：写入前先按当前键向量 $k$ 从 $S$ 里把这条键上已有的值 $S k$ 取出来（这一步的差 $S k - v$ 就是预测误差），再按这个误差大小沿 $k$ 的方向修改 $S$（改动落在 $k$ 张成的秩一方向上）。它不是往记忆里再加一条，而是把这条键对应的旧值朝新值改一步。
+
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule；paper/src-v6/sections/intro.tex Introduction
+
+### 加法更新记不住太多
+
+线性注意力的记忆大小固定：$S$ 是边长等于键和值维数 $d$ 的方阵。直接叠加时，每写一对就往 $S$ 里加一份内容，写得多了，不同键的内容混在同一个矩阵里，用一个键去读，取回的值里会掺进别的键的内容——这种相互干扰叫碰撞。要记的键的数目超过维数 $d$ 以后，取回的值掺进的别的键内容更多。叠加式写入无法改动某条键已存的值，写入新值时旧值仍留在记忆里，与新的互相干扰。
+
+写入时先按当前键取回旧值，只针对这条键的旧值做替换，等于在写新的同时把这条键的旧内容替换掉。记忆大小不变，能装下更多互不干扰的键值对，按查询把之前存进去的值取回来（召回）就更准。
+
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule；paper/src-v6/sections/intro.tex Introduction
+
+### 分块并行地训练
+
+delta 更新每一步都要用到上一步的整个记忆矩阵，算完一步才能算下一步，训练只能沿着序列一步步走，用不上并行，序列很长时训练慢。
+
+第一步，把每步更新写成可以逐项相加的形式：每一步对记忆的贡献单独算出来，之后累加起来即可，不再依赖上一步的完整记忆。第二步，把序列切成若干块：块内各步的贡献合成一次矩阵运算算完，块与块之间只传递一个记忆矩阵。这样训练的计算就按块并行到序列长度上，只有块与块之间还按顺序走；块越大，顺序步数越少，并行度越高，不再是一步一步串行。
+
+依据：paper/src-v6/sections/method.tex A Memory-efficient Reparameterization；paper/src-v6/sections/method.tex Chunkwise Parallel Form for DeltaNet；paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule
+
+## 长页
+
+一个位置算自己的输出时，用它的查询向量去和前面各位置的键向量比相似度，再按相似度对值向量加权求和，这是[标准注意力](wiki/standard-attention)的做法。它要把所有位置两两的相似度都算出来，序列变长，计算量按长度的平方增长。[线性注意力](wiki/linear-attention)换一种算法：把键和值按能预先合并的方式合起来，再用查询去取，计算随序列长度线性增长，推理时把历史压在一个固定大小的记忆里。
+
+线性注意力把已经处理过的内容压成一个固定大小的矩阵状态，当记忆用。每处理一个位置，就把它的键和值配成一对写进状态；读取时用当前查询去状态里取值。最初的写法是直接叠加：状态 $S$ 每步加上新值向量与键向量的外积 $v k^\top$。这个更新简单、能并行，但记忆大小固定，序列一长，读取就越不可靠。
+
+DeltaNet 换掉这一步写入，改用 delta 规则：写入一对键值时，先按当前键从记忆里取回这条键上已有的值，再按旧值与目标值之差去改写记忆。这样记忆能在写入时被纠正，而不是只增不减。delta 规则让模型在需要把信息取回来的任务上表现更好，但 DeltaNet 原来的训练算法必须一步接一步地算，用不上现代硬件的并行，序列很长时训练开销大。要让训练用上并行，得把每步更新改写成能按序列分块并行的形式。
+
+依据：paper/src-v6/sections/intro.tex Introduction；paper/src-v6/sections/background.tex Linear Transformer: Transformers with Linear Attention；paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule
+
+### 一条能改写记忆的规则
+
+#### 加法更新为什么会失效
+
+线性注意力的记忆 $S$ 是一个 $d\times d$ 的矩阵，$d$ 是键和值的维数。每写入一对键值 $k,v$，直接叠加的写法就把外积 $v k^\top$ 加进 $S$。$S$ 的大小固定，能容纳的关联数目有限。
+
+写了很多对以后，不同键的贡献都叠在同一个矩阵里。用一个键去读，得到的不只是这条键对应的值，其中也掺进了别的键的内容，这种相互干扰叫碰撞。键的数目超过维数 $d$ 以后，掺进来的别的键内容更多。叠加式写入无法改动某条键已存的值，写入新关联时旧关联仍留在记忆里，与新的互相干扰。
+
+用查询把之前存进去的值取回来，叫召回。这类模型在需要精确召回的场合表现不好，原因在这个只加不减的写入。
+
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule
+
+#### 用预测误差改写记忆
+
+delta 更新把写入改成一次纠错：
+
+$$S_t = S_{t-1} - \beta_t (S_{t-1} k_t - v_t) k_t^\top.$$
+
+$S_{t-1} k_t$ 是按当前键 $k_t$ 从记忆里取回的值，也就是记忆此刻对这条键的预测；$v_t$ 是这次要写入的目标值；两者之差 $S_{t-1} k_t - v_t$ 是预测的误差。$\beta_t$ 是这次写入的强度，取值在 $0$ 与 $1$ 之间，越大改得越多。误差乘上 $k_t^\top$ 决定改动落在记忆的哪个方向——只有沿 $k_t$ 的那一条被改，其余方向不动。在键已归一化成单位向量的前提下（见下一章），$\beta_t=1$ 会把旧值完全换成 $v_t$，$\beta_t=0$ 时记忆不变。
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule；paper/src-v6/sections/method.tex Feature map and normalization
+
+::: 推导：delta 更新等价于走一步梯度下降
+把记忆 $S$ 看成要拟合的权重，第 $t$ 步的损失取记忆对当前键的预测与目标值的平方误差：
+
+$$\mathcal{L}_t(S) = \frac{1}{2}\| S k_t - v_t \|^2.$$
+
+损失是衡量预测差多少的一个数；梯度是损失对参数的导数，指向损失上升最快的方向。
+
+1. 对 $S$ 求导，得梯度 $\nabla_S \mathcal{L}_t = (S k_t - v_t) k_t^\top$。
+2. 沿梯度的反方向走一步，步长取 $\beta_t$：$S_t = S_{t-1} - \beta_t (S_{t-1}k_t - v_t) k_t^\top$。
+3. 这正好是上面的 delta 更新。
+
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule
+:::
+
+::: 推导：取回旧值再插值覆盖
+另一种看法把更新拆成先删后写：
+
+1. 取回旧值 $v_t^{\text{old}} = S_{t-1} k_t$。
+2. 在旧值与目标值之间插值，得到要写进去的新值 $v_t^{\text{new}} = \beta_t v_t + (1-\beta_t) v_t^{\text{old}}$。
+3. 从记忆里删去旧值对应的那一份、写入新的：$S_t = S_{t-1} - v_t^{\text{old}} k_t^\top + v_t^{\text{new}} k_t^\top$。
+4. 把第三步里新值的式子代进去，两个含旧值的项合并后剩下 $-\beta_t v_t^{\text{old}}k_t^\top$，与 $\beta_t v_t k_t^\top$ 合起来即 $-\beta_t(S_{t-1}k_t-v_t)k_t^\top$，与 delta 更新一致。
+
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule
+:::
+
+依据：paper/src-v6/sections/background.tex DeltaNet: Linear Transformers with the Delta Update Rule
+
+### 训练：从逐步更新到分块并行
+
+#### 改写成累加形式
+
+逐步更新要算 $S_t$ 才能算下一步，而 $S_t$ 是 $d\times d$ 的矩阵，留住它或反复重算都要额外的存储或计算。这里先把记忆改写成不含中间状态的纯累加形式：把线性注意力里第 $i$ 步的值向量 $v_i$ 换成一个伪值向量 $u_i$，记忆就成了
+
+$$S_t = \sum_{i=1}^t u_i k_i^\top.$$
+
+$u_i$ 由键和值递推算得：
+
+$$u_t = \beta_t \Big( v_t - \sum_{i=1}^{t-1} (k_i^\top k_t)\, u_i \Big).$$
+
+算 $u_t$ 只用前面各步的向量 $u_i$ 和 $k_i$，不必把中间的记忆矩阵 $S$ 写出来。全部 $u_i$ 算好后，后面的计算和普通线性注意力一样，只是把每个值向量 $v_i$ 换成伪值向量 $u_i$。代价是算出全部 $u_i$ 要做 $O(L^2 d)$ 次运算（$L$ 是序列长度），而且这一步本身不能完全并行；按块并行能把这一段的并行度提上去。
+依据：paper/src-v6/sections/method.tex A Memory-efficient Reparameterization
+
+::: 推导：记忆写成累加形式
+对步数 $t$ 归纳。
+
+1. $t=1$ 时 $S_1 = \beta_1 v_1 k_1^\top$，取 $u_1=\beta_1 v_1$ 即得。
+2. 设 $S_{t-1}=\sum_{i=1}^{t-1} u_i k_i^\top$。把 delta 更新写开：$S_t = S_{t-1}(I-\beta_t k_t k_t^\top)+\beta_t v_t k_t^\top$。
+3. 代入 $S_{t-1}$，把 $k_t^\top$ 提取出来：$S_t = \sum_{i=1}^{t-1} u_i k_i^\top + \Big(\beta_t v_t - \beta_t\sum_{i=1}^{t-1}(k_i^\top k_t)\,u_i\Big) k_t^\top$。
+4. 括号里正是 $u_t$，于是 $S_t=\sum_{i=1}^{t} u_i k_i^\top$，归纳成立。
+
+依据：paper/src-v6/sections/method.tex A Memory-efficient Reparameterization
+:::
+
+依据：paper/src-v6/sections/method.tex A Memory-efficient Reparameterization
+
+#### 每一步更新是一个 Householder 变换
+
+把 delta 更新整理一下，它对记忆的作用可以写成
+
+$$S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top.$$
+
+前一项把旧记忆乘上一个矩阵 $I-\beta_t k_t k_t^\top$。单位矩阵减去一个秩一矩阵，叫做广义 Householder 变换：它只改动沿 $k_t$ 方向的分量，其余方向原样保留。
+
+键和查询都按 L2 归一化成单位向量。这样 $I-\beta_t k_t k_t^\top$ 的特征值一个是 $1-\beta_t$、其余 $d-1$ 个是 $1$，都不超过 $1$，状态反复相乘也不会被放大，训练稳定。当 $\beta_t=1$ 且键是单位向量时，$I-k_t k_t^\top$ 是一个投影矩阵：把向量投到与 $k_t$ 垂直的子空间，沿 $k_t$ 的那一份被完全抹掉，其余 $d-1$ 个方向保留。
+
+依据：paper/src-v6/sections/method.tex A Memory-efficient Reparameterization；paper/src-v6/sections/method.tex Feature map and normalization
+
+#### 分块并行算法
+
+把序列切成每块长 $C$ 的若干块。块内的位置用一次矩阵运算一起算，块与块之间只传递一个记忆矩阵 $S_{[t]}$，它是第 $t$ 块的起点状态。
+
+块内第 $r$ 个位置的状态可以从块起点状态推出：
+
+$$S_{[t]}^r = S_{[t]}^0 P_{[t]}^r + H_{[t]}^r.$$
+
+$P_{[t]}^r$ 是把起点状态一路衰减到第 $r$ 位的因子，$H_{[t]}^r$ 是块内前 $r$ 步新写入的贡献之和。关键在于这两个矩阵都能用向量写出来：$P_{[t]}^r = I - \sum_{i=1}^{r} w_{[t]}^i k_{[t]}^{i\top}$，$H_{[t]}^r = \sum_{i=1}^{r} u_{[t]}^i k_{[t]}^{i\top}$，其中 $w$ 和 $u$ 由块内的前缀递推算出（$w$ 用键，$u$ 用值）。这样块内就不必保留每个位置的状态矩阵。
+
+写成矩阵形式后，块内输出由两部分组成：用块起点状态读出的部分 $Q_{[t]} S_{[t]}^\top$，和块内各位置之间用注意力算出的部分。后者的权重是 $Q_{[t]} K_{[t]}^\top \odot M$，其中 $Q_{[t]}$、$K_{[t]}$ 是块内查询、键按行堆成的矩阵，$\odot$ 是逐元素相乘，$M$ 是遮住上三角的掩码。块与块之间只传一个记忆矩阵：本块对状态的净贡献加上本块起点状态，得到下一块的起点状态。
+依据：paper/src-v6/sections/method.tex Chunkwise Parallel Form for DeltaNet
+
+::: 推导：块内状态与块级递推
+1. 把 delta 更新沿序列展开：$S_t = \sum_{i=1}^t \beta_i (v_i k_i^\top)\big(\prod_{j=i+1}^t (I-\beta_j k_j k_j^\top)\big)$。
+2. 定义从第 $i$ 步到第 $j$ 步的衰减乘积 $P_i^j=\prod_{t=i}^j (I-\beta_t k_t k_t^\top)$，以及第 $i$ 步到第 $j$ 步新写入的贡献 $H_i^j=\sum_{t=i}^j \beta_t (v_t k_t^\top) P_{t+1}^j$（$i>j$ 时 $P_i^j=I$，于是 $H_j^j=\beta_j v_j k_j^\top$）。
+3. 从第 $i$ 步的状态走到第 $j$ 步：起点状态要乘上第 $i+1$ 到第 $j$ 步的衰减乘积，再加这段新写入的贡献，即 $S_j = S_i P_{i+1}^j + H_{i+1}^j$；把下标换成块内位置（$i$ 取块起点 $0$），即得上面的 $S_{[t]}^r = S_{[t]}^0 P_{[t]}^r + H_{[t]}^r$。
+4. 再把 $P$、$H$ 展开成 $w$、$u$ 的前缀和，其中 $w_{[t]}^r = \beta_{[t]}^r\big(k_{[t]}^r - \sum_{i=1}^{r-1} w_{[t]}^i (k_{[t]}^{i\top} k_{[t]}^r)\big)$，$u_{[t]}^r = \beta_{[t]}^r\big(v_{[t]}^r - \sum_{i=1}^{r-1} u_{[t]}^i (k_{[t]}^{i\top} k_{[t]}^r)\big)$。
+5. 把块内输出也展开，得到块级的两个式子：状态更新 $S_{[t+1]} = S_{[t]} + \big(U_{[t]} - W_{[t]} S_{[t]}^\top\big)^\top K_{[t]}$，输出 $O_{[t]} = Q_{[t]} S_{[t]}^\top + \big(Q_{[t]} K_{[t]}^\top \odot M\big)\big(U_{[t]} - W_{[t]} S_{[t]}^\top\big)$。$W_{[t]}$、$U_{[t]}$ 是把块内的 $w$、$u$ 按行堆成的矩阵。
+
+依据：paper/src-v6/sections/method.tex Chunkwise Parallel Form for DeltaNet
+:::
+
+依据：paper/src-v6/sections/method.tex Chunkwise Parallel Form for DeltaNet
+
+#### 变换的矩阵形式与实现
+
+上面 $w$、$u$ 的逐步递推不是矩阵乘，用不上矩阵乘单元（一次算一整块矩阵乘的硬件单元）来加速。这里用 UT 变换把它们一次化成矩阵运算：UT 变换是这类 Householder 变换连乘的一种紧凑表示，用一次矩阵求逆就能拿到一整块的变换。对每块定义
+
+$$T_{[t]} = \big(I + \mathrm{tril}(\mathrm{diag}(\beta_{[t]}) K_{[t]} K_{[t]}^\top, -1)\big)^{-1} \mathrm{diag}(\beta_{[t]}),$$
+
+其中 $\mathrm{tril}(\cdot,-1)$ 取矩阵的严格下三角部分，$\mathrm{diag}(\beta_{[t]})$ 是把块内各步的强度排成对角阵。用它一次算出块内的两个矩阵：
+
+$$W_{[t]} = T_{[t]} K_{[t]}, \qquad U_{[t]} = T_{[t]} V_{[t]},$$
+
+其中 $V_{[t]}$ 是块内值向量按行堆成的矩阵。
+
+那个下三角矩阵的逆用前代求（从上往下逐行消去）。这样一块里的 $W$、$U$ 由几次矩阵乘加一次求逆得到，剩下的块间递推和块内输出大多是矩阵乘。分块形式的计算量和顺序步数都取自线性注意力的分块形式：计算量 $O(LCd+Ld^2)$，顺序步数 $O(L/C)$。
+依据：paper/src-v6/sections/method.tex Practical considerations；paper/src-v6/sections/background.tex Chunkwise parallel form
+
+::: 速度对比
+把逐步更新和分块两种写法都实现出来对比（模型维 $d_{\text{model}}=2048$，单头维数 $d$ 是查询、键、值各自所在子空间的维数，比模型维小；批量是一次同时处理多少条序列，它与序列长度相乘固定，逐项改变两者）：序列越长、单头维数越大，分块形式相对逐步形式的加速越多。逐步形式每步是矩阵-向量乘，凑不出大块矩阵乘，用不上矩阵乘单元；但它每步运算量小，在短序列上也不占优。
+依据：paper/src-v6/sections/method.tex Speed comparison；paper/src-v6/sections/background.tex Efficient training
+:::
+
+依据：paper/src-v6/sections/method.tex Practical considerations；paper/src-v6/sections/method.tex Speed comparison；paper/src-v6/sections/background.tex Chunkwise parallel form；paper/src-v6/sections/background.tex Efficient training
+
+### 例子：两次写入怎么改同一条记忆
+
+用一个最小的例子看加法写入和 delta 写入的差别。记忆是 $2\times 2$ 的矩阵，键和值都是二维向量。取键 $k=(1,0)$，先后写入两个值 $v_1=(3,4)$ 和 $v_2=(5,6)$，写入强度取 $\beta=1$。
+
+加法写入把两个外积都加上，$S = v_1 k^\top + v_2 k^\top$。用 $k$ 去读，得到 $v_1+v_2=(8,10)$，两个值混在一起，取不出后面写入的那个。
+
+delta 写入按 $k$ 先取回旧值再覆盖。写 $v_1$ 后记忆只记住 $v_1$；再写 $v_2$ 时，先取回的旧值是 $v_1$，按 $\beta=1$ 用 $v_2$ 完全替换掉它。这时用 $k$ 去读，得到 $v_2=(5,6)$，正是最后写入的值。
+依据：自行构造
+
+::: 跟着走一遍
+1. 写入 $v_1=(3,4)$，记忆 $S=v_1 k^\top$，即 $S$ 的第一列是 $(3,4)$，第二列是 $(0,0)$。
+2. 用 $k=(1,0)$ 读：$S k=(3,4)$，取回刚写的值。
+3. 再写入 $v_2=(5,6)$。delta 写入先取旧值 $S k=(3,4)$；$\beta=1$ 时新值取 $v_2$，抹掉沿 $k$ 的旧内容，$S$ 的第一列变成 $(5,6)$。
+4. 再读 $k$：$S k=(5,6)$，取回的是最后写入的值。
+5. 换成加法写入：$S$ 的第一列是 $(3,4)+(5,6)=(8,10)$，读 $k$ 得 $(8,10)$，两个值混在一起。
+
+依据：自行构造
+:::
+
+```python
+import numpy as np
+
+k = np.array([1.0, 0.0])
+v1 = np.array([3.0, 4.0])
+v2 = np.array([5.0, 6.0])
+
+additive = np.outer(v1, k) + np.outer(v2, k)   # 直接叠加
+delta = np.outer(v2, k)                        # 后写入的覆盖先写入的
+print(np.round(additive @ k, 1))
+print(np.round(delta @ k, 1))
+```
+
+```text
+[ 8. 10.]
+[5. 6.]
+```
+
+依据：自行构造
+
+### DeltaNet 这一层
+
+DeltaNet 的一层从输入向量 $x_t$ 算出四个量：查询 $q_t$、键 $k_t$、值 $v_t$ 和写入强度 $\beta_t$。$q_t$、$k_t$、$v_t$ 各由输入过一个线性投影得到（线性投影就是乘一个可学矩阵，如 $q_t = W_Q x_t$）。$q_t$、$k_t$ 再经 SiLU 激活，SiLU 是一种逐分量的非线性函数，把 $x$ 变成 $x \cdot \sigma(x)$，$\sigma(x) = 1/(1+e^{-x})$ 把实数压到 $0$ 与 $1$ 之间；激活后再按 L2 归一化成单位向量。$\beta_t$ 由输入的线性投影过一个取值在 $0$ 与 $1$ 之间的函数得到。
+
+这一层用 delta 规则维护记忆，再用当前查询从记忆里读出输出。它替换的是 Transformer（由若干同构层叠成的模型）里的[自注意力](wiki/standard-attention)那一层（让同一序列内各位置互相用查询、键算相似度、再按相似度取值的一层），其余部分照旧：输出过一个线性投影，加回这一层的输入（残差），做一次归一化，再进前馈层（一层里接在注意力后面的全连接子层）。参数规模和原来的自注意力层相当，都在 $4d_{\text{model}}^2$ 上下；前馈层约 $8d_{\text{model}}^2$。
+依据：paper/src-v6/sections/method.tex DeltaNet Transformer
+
+::: 这一层的计算
+1. 由输入算四个量：$q_t = W_Q x_t$，$k_t = W_K x_t$，$v_t = W_V x_t$，$\beta_t = \sigma(W_\beta x_t)$；这里 $\sigma$ 是把实数压到 $0$ 与 $1$ 之间的函数。
+2. 把查询和键归一化成单位向量：$k_t \leftarrow \mathrm{SiLU}(k_t) / \|\mathrm{SiLU}(k_t)\|_2$，$q_t$ 同样处理。
+3. 按 delta 更新维护记忆 $S$。
+4. 读出输出：$o_t = S_t q_t$。
+
+依据：paper/src-v6/sections/method.tex DeltaNet Transformer
+:::
+
+依据：paper/src-v6/sections/method.tex DeltaNet Transformer
+
+### 召回密集任务上的提升
+
+delta 规则让记忆能被改写，直接受益的是需要把存进去的信息再取回来的任务。在一组考察关联召回的合成任务里（给出一批键值对，再问某个键对应什么值），DeltaNet 在模糊召回这一项（键不完全相同、要按相近的键回忆）上高于只做加法更新的线性注意力；在真实文本上做结构化抽取（从网页、文档里把成对的字段取出来）的召回密集任务上，在 $340$M 参数一档、相同状态规模下它也更准。
+依据：paper/src-v6/sections/experiment.tex Synthetic Benchmarks；paper/src-v6/sections/experiment.tex Results；paper/src-v6/tables/mad.tex L13-L18；paper/src-v6/tables/lm_harness.tex L13-L31
+
+::: 关键数字
+在合成任务的模糊召回一项上，DeltaNet 得 $35.7$，在所引评测里最高；除 Transformer（$29.8$）外，其余模型都不超过 $14.4$。在真实结构化抽取任务上，同等状态规模（$340$M 参数一档）下 DeltaNet 得 $26.4$，按数据相关衰减的线性注意力得 $24.0$。
+
+依据：paper/src-v6/tables/mad.tex L13-L18；paper/src-v6/tables/lm_harness.tex L13-L31
+:::
+
+依据：paper/src-v6/sections/experiment.tex Synthetic Benchmarks；paper/src-v6/sections/experiment.tex Results；paper/src-v6/tables/mad.tex L13-L18；paper/src-v6/tables/lm_harness.tex L13-L31
+
+### 适用条件与边界
+
+状态规模是硬限制。记忆是固定的 $d\times d$ 矩阵，$d$ 受训练开销限制，能装下的关联有限。规模不够时，召回密集任务反而会输给状态更大的模型：在 $1.3$B 参数一档，DeltaNet 在结构化的召回密集任务上不及按数据相关衰减的线性注意力模型（这类模型给记忆乘一个随输入变的衰减系数），原因是它的状态规模不够。
+依据：paper/src-v6/sections/experiment.tex Results；paper/src-v6/sections/experiment.tex Limitations and Future Work
+
+训练速度也慢于门控线性注意力（同样按输入算衰减门、但更新全是逐元素运算的一类模型）。delta 更新的状态转移含矩阵乘、不是逐元素，核内要对单头维数做归并；门控线性注意力全是逐元素运算，容易用分块处理任意大小的单头维数。同样的分块写法下 DeltaNet 更慢，这又限制了它能用的状态规模。
+依据：paper/src-v6/sections/experiment.tex Limitations and Future Work
+
+长度外推上（把模型用到比训练时更长的序列上），超出训练长度后的表现不如带衰减的模型；资料推测原因是 DeltaNet 没有显式的衰减因子。
+依据：paper/src-v6/sections/experiment.tex Limitations and Future Work
