@@ -1,0 +1,2 @@
+- paper/arxiv-v1.pdf、paper/src-v1/｜论文｜https://arxiv.org/abs/2401.06066｜v1（2024-01-11）｜2026-10-10｜DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models，提出 DeepSeekMoE：把专家切成更细、隔离共享专家；LaTeX 源码在 src-v1/，正文文件是 main.tex
+- repo/deepseek-moe/｜仓库｜https://github.com/deepseek-ai/DeepSeek-MoE｜66edeee5a4f75cbd76e0316229ad101805a90e01（2024-01-16）｜2026-10-10｜论文官方仓库：README、模型配置与评测结果、微调脚本 finetune/finetune.py
