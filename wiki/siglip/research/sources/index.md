@@ -1,0 +1,3 @@
+- paper/arXiv-2303.15343v4.pdf｜https://arxiv.org/abs/2303.15343｜v4（2023-09-15 修订）｜2026-10-10｜SigLIP 原始论文《Sigmoid Loss for Language Image Pre-Training》PDF。
+- paper/arXiv-2303.15343v4.txt｜https://arxiv.org/abs/2303.15343｜v4｜2026-10-10｜同上论文的纯文本快照（pymupdf 抽取，`<<<PAGE n>>>` 标记分页），正文数字以它核对。
+- repo/big_vision｜https://github.com/google-research/big_vision｜commit 0127fb6b337ee2a27bf4e54dea79cff176527356｜2026-10-10｜官方仓库；sigmoid loss 实现在 big_vision/trainers/proj/image_text/_deprecated_contrastive.py，训练器在 .../siglip.py。
