@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="KV cache 布局指每一层 key、value 缓存的各个维度在内存里的排列顺序，两种排法记作 NHD 和 HND，区别是序列位置维和头维谁排在前。">
+  <meta name="dojo:summary" content="同一份 KV cache，NHD 把序列位置排在头之前，同一个位置的各个头相邻；HND 把头排在序列位置之前，同一个头在整段序列上的向量相邻。布局决定读一段缓存时拿到的是同一个位置的别的头，还是同一个头的相邻位置。">
+  <meta name="dojo:topics" content="推理系统, 内存与缓存">
+  <meta name="dojo:tag" content="KV cache">
+  <title>KV cache 布局</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">KV cache 布局</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">KV cache 布局</h1>
+<p class="reading-time">正文 836 字 · 约 3 分钟阅读</p>
+
+<p>生成时模型依次产生一个个 token（token 是模型读写文本的最小单位，可以是一个词，也可以是词的一部分）。模型由若干结构相同的层叠成，每层里都有注意力，它把每个位置的输入投影成 query、key 和 value 三个向量（见<a href="../standard-attention/index.html">标准注意力</a>）。每层都把前面位置的 key 和 value 留在显存（GPU 做并行计算时用的内存）里给后面的 token 复用，这就是 <a href="../kv-cache/index.html">KV cache</a>。一层的缓存按页、序列位置、头、每头向量这几维组织，页是一段序列位置，头是注意力对每个位置向量的划分。布局就是这些维度的排列顺序，NHD 和 HND 是其中两种：NHD 的三个字母依次对应序列位置、头、每头向量，HND 把头排到最前。排列不同，读相邻数据时拿到的是哪一维就不同。</p>
+
+<h2 id="s1">1. 排在后三维里的两个维度</h2>
+
+<p>一层的缓存里，缓存的维度按页、序列位置、头、每头向量排成四维，后三维是序列位置、头、每头向量。布局只在这后三维中的序列位置和头之间做选择，页维和每头向量维在两种布局里都不动。</p>
+
+<h3 id="s1-1">1.1 两种顺序的形状</h3>
+
+<p>缓存按页分配：显存切成固定大小的页，一页放固定的一段序列位置，页再分给不同的序列。把一页里的维度展开，NHD 把序列位置排在最前，写成页、序列位置、头、每头向量；HND 把头排在最前，写成页、头、序列位置、每头向量。</p>
+
+<p>取一页最小的情形排一遍。</p>
+
+<details>
+<summary>一页里两种顺序的元素排列</summary>
+<p>设一页放 $T=3$ 个序列位置、有 $H=2$ 个头、每个头 $d=2$ 个数，一页共 $3 \times 2 \times 2 = 12$ 个数。用 $t$ 表示第几个位置，$h$ 表示第几个头，$k$ 表示这个头里第几个数，都从 1 起。</p>
+<ol>
+<li>NHD 的顺序是序列位置、头、数：先列第 1 个位置的各个头，再列第 2 个位置……依次是 $(t,h,k) = (1,1,1), (1,1,2), (1,2,1), (1,2,2), (2,1,1), \dots$。</li>
+<li>HND 的顺序是头、序列位置、数：先列第 1 个头在三个位置上的向量，再列第 2 个头……依次是 $(h,t,k) = (1,1,1), (1,1,2), (1,2,1), (1,2,2), (1,3,1), \dots$。</li>
+<li>两种顺序的第 1、2 个数相同，都是位置 1、头 1 的两个数；第 3 个数起才分开——NHD 的第 3 个是位置 1、头 2 的第 1 个数，HND 的第 3 个是头 1、位置 2 的第 1 个数。</li>
+</ol>
+</details>
+
+<h3 id="s1-2">1.2 相邻数据是哪一维</h3>
+
+<p>NHD 里，一个头向量之后是同一个位置的下一个头；把一个位置的各个头都排完，才到下一个位置。HND 里，一个头向量之后是同一个头在下一个位置上的向量；把一个头在所有位置上的向量都排完，才到下一个头。</p>
+
+<p>从序列里的一个位置走到下一个位置要跨过多少个元素，从一个头走到下一个头又要跨过多少个。相邻的那一维步长小，另一个方向步长大，两种布局下小的是哪一边正好相反。</p>
+
+<details>
+<summary>两种布局的步长</summary>
+<p>用 $s_n$ 表示沿序列方向走一个位置跨过的元素数，$s_h$ 表示沿头方向走一个头跨过的元素数，$d$ 是每头向量的长度，$H$ 是头数，$T$ 是这段缓存里的位置数（一页里就是每页的位置数）。</p>
+<ol>
+<li>NHD 下，一个头向量之后是自己的下一个数，走完一整个头向量才到下一个头，所以 $s_h = d$；走完一个位置的所有头才到下一个位置，所以 $s_n = H \times d$。</li>
+<li>HND 下换成相邻的是位置：同一个头在各位置上的向量排在一起，走一个位置只跨一个头向量，$s_n = d$；走一个头要跨过整段序列，$s_h = T \times d$。</li>
+<li>取 $H=2$、$d=2$、$T=3$：NHD 的 $s_n = 4$、$s_h = 2$；HND 的 $s_n = 2$、$s_h = 6$。同一个缓存，从位置 1 走到位置 2，NHD 要跨 4 个数，HND 只跨 2 个。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 为什么会有两种</h2>
+
+<p>算 key、value 的那一步是输入乘投影矩阵，输出的排列本来就是序列位置、头、每头向量这个顺序。NHD 与它一致，投影出来的结果可以直接拿来当缓存，不必转置；HND 不是这个顺序，排成 HND 要多一次换序，但在缓存用低精度数值格式（每个数占的位数比常规少的浮点格式，例如 fp8）时，它对 GPU（做并行计算的处理器）实现更友好。在 fp16（与 fp8 同类、每个数占的位数更多的一种浮点格式）缓存上两种看不出明显的性能差别，默认取 NHD。</p>
+
+<h2 id="s3">3. 适用条件与边界</h2>
+
+<p>这个区分只对多头缓存成立。当注意力把 key、value 合成一个张量（多维数组）、没有头维时（如 <a href="../mla/index.html">MLA</a>），缓存里就没有这一维，也就没有这两种排法之分。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>FlashInfer 官方文档. KV-Cache Layout in FlashInfer. <a href="https://docs.flashinfer.ai/tutorials/kv_layout.html">https://docs.flashinfer.ai/tutorials/kv_layout.html</a></li>
+<li>vLLM 官方 RFC. Standardize KV-cache Layouts. <a href="https://github.com/vllm-project/vllm/issues/42082">https://github.com/vllm-project/vllm/issues/42082</a></li>
+<li>FlashInfer 源码. include/flashinfer/layout.cuh. <a href="https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/layout.cuh">https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/layout.cuh</a></li>
+<li>vLLM 源码. vllm/v1/kv_cache_layout.py. <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_cache_layout.py">https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_cache_layout.py</a></li>
+<li>vLLM 源码. vllm/config/cache.py. <a href="https://github.com/vllm-project/vllm/blob/main/vllm/config/cache.py">https://github.com/vllm-project/vllm/blob/main/vllm/config/cache.py</a></li>
+<li>vLLM 源码. vllm/v1/attention/backends/utils.py. <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/utils.py">https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/utils.py</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
