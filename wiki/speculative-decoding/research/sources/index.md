@@ -1,0 +1,1 @@
+- paper/arxiv-2211.17192.pdf、paper/src-v2/、paper/arxiv-2211.17192.txt｜论文｜https://arxiv.org/abs/2211.17192v2｜v2｜2026-10-10｜Fast Inference from Transformers via Speculative Decoding，提出投机解码与投机采样：用更小的近似模型猜若干 token，目标模型并行验证，输出分布不变；LaTeX 源码在 src-v2/，纯文本快照 arxiv-2211.17192.txt

@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="投机解码用一个更高效的近似模型先猜出接下来若干候选，再由目标模型一次并行验证这些候选，接受其中能保证输出分布不变的部分，从而用更少的串行次数生成与目标模型同分布的结果；它不改模型架构、不需要重新训练，可直接用在现成模型上。">
+  <meta name="dojo:summary" content="自回归解码每生成一个 token 都要跑一次大模型。先用一个更高效的近似模型猜 $\gamma$ 个候选，再让目标模型一次并行验证并接受，接受率越高、一次串行产出的 token 越多，而输出分布不变。">
+  <meta name="dojo:topics" content="推理系统, 模型结构">
+  <meta name="dojo:tag" content="推理加速">
+  <title>投机解码</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">投机解码</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">投机解码</h1>
+<p class="reading-time">正文 2,016 字 · 约 7 分钟阅读</p>
+
+<p>自回归模型一次生成一个 token，token 是文本被切分后的最小单位：它每生成一个 token，就接在已有序列后面，再据此生成下一个。把一段输入跑一遍模型、得到下一个 token 的分布，叫一次前向；这样逐个生成 $K$ 个 token，要 $K$ 次串行前向，每次都得等上一次算完。大模型的单次前向比小模型慢，生成整段文本的耗时随 token 数增长。</p>
+
+<p>推理（用训练好的模型算出输出）的瓶颈通常不在算术运算，而在访存与通信，算力往往没有用满，硬件上因此常有闲置的算力。</p>
+
+<p>投机解码用这份闲置算力换更少的串行次数：先用一个更高效的近似模型猜出接下来若干 token，再由目标模型一次并行验证这些猜测，只接受能保证输出分布不变的部分。一轮里目标模型只跑一次，却可能产出多个 token。</p>
+
+<h2 id="s1">1. 一步投机解码：猜、验、纠</h2>
+
+<h3 id="s1-1">1.1 猜：近似模型自回归给出 $\gamma$ 个候选</h3>
+
+<p>模型对下一个 token 给出的是词表上的一整个概率分布，词表是模型可能生成的全部 token；按一个分布的概率抽一个 token 叫采样。取概率最大的那个（argmax）、按温度（调整分布陡峭程度的参数）调整分布后再采样等做法，都等价于对某个调整后的分布做标准采样。目标模型分布 $p$ 与近似模型分布 $q$ 就指按所选采样方式调整后的分布。</p>
+
+<p>近似模型 $M_q$ 是一个更高效的模型，对同一任务给出它自己的分布 $q$。以当前前缀起步，它自回归地重复采样 $\gamma$ 次：第 $i$ 步在「前缀加此前 $i-1$ 个候选」上采出第 $i$ 个候选 $x_i$，同时留下这一步的分布 $q_i$。$\gamma$ 是每轮要猜的候选个数，是一个正整数。</p>
+
+<h3 id="s1-2">1.2 验：目标模型一次并行打分</h3>
+
+<p>把前缀本身、以及「前缀加前 $i$ 个候选」这 $\gamma+1$ 段输入一起交给目标模型 $M_p$，一次前向算出 $\gamma+1$ 个分布 $p_1,\dots,p_{\gamma+1}$。$p_i$ 是目标模型在第 $i$ 个位置上的分布。</p>
+
+<p>这 $\gamma+1$ 段能一次并行算完，是因为它们的输入在算之前就都已知：候选由近似模型先给出，每段输入不依赖别的段算出的输出，于是可以合成一批一起前向。这样做的前提是并发执行这些前向不增加墙钟时间（实际经过的时间）。</p>
+
+<h3 id="s1-3">1.3 判与纠：接受判据与修正分布</h3>
+
+<p>只凭目标模型分布 $p$ 采样一个 $x$，可以改成：先从 $q$ 采样一个 $x$，若 $q(x)\le p(x)$ 就保留；若 $q(x)&gt;p(x)$，以概率 $1-\frac{p(x)}{q(x)}$ 拒绝它，改从修正分布 $p'(x)=norm(\max(0,p(x)-q(x)))$ 重采一个。$norm$ 指把一串非负数归一化成概率分布，即每项除以它们的和；$p'$ 就是 $p$ 减去 $q$、截掉负值再归一化的结果。按这套规则抽出的 $x$，分布恰好是 $p$。</p>
+
+<p>推广到一轮出多个 token：对 $i=1,\dots,\gamma$ 各取一个均匀随机数 $r_i$，$x_i$ 在 $r_i\le\frac{p_i(x_i)}{q_i(x_i)}$ 时接受，否则拒绝。接受数 $n$ 是被连续接受、直到第一个被拒为止的候选个数；全部接受时 $n=\gamma$。</p>
+
+<p>接着补出最后一个 token：若 $n=\gamma$，$\gamma$ 个候选全被接受，从目标分布 $p_{\gamma+1}$ 采一个 $t$；若 $n&lt;\gamma$，第 $n+1$ 个候选被拒、被丢弃，改从修正分布 $norm(\max(0,p_{n+1}-q_{n+1}))$ 采一个 $t$。返回前缀、$n$ 个被接受的候选与补出的 $t$。被拒处的这次修正保证每轮至少产出一个 token，与逐个生成时一样。</p>
+
+<h3 id="s1-4">1.4 一个手算例子</h3>
+
+<details>
+<summary>一轮 $\gamma=1$ 的手算过程</summary>
+<p>词表只有 A、B、C 三个 token。</p>
+<ol>
+<li>近似模型的分布 $q=(\mathrm{A}\,0.2,\mathrm{B}\,0.5,\mathrm{C}\,0.3)$，采样得候选 $x_1=\mathrm{B}$。</li>
+<li>目标模型的分布 $p=(\mathrm{A}\,0.5,\mathrm{B}\,0.3,\mathrm{C}\,0.2)$，在 $\mathrm{B}$ 处 $p_1(\mathrm{B})/q_1(\mathrm{B})=0.3/0.5=0.6$。</li>
+<li>取随机数 $r_1=0.7&gt;0.6$，拒绝 $\mathrm{B}$，接受数 $n=0$。</li>
+<li>修正分布：$p-q=(0.3,-0.2,-0.1)$，取 $\max(0,\cdot)$ 得 $(0.3,0,0)$，归一化得 $p'=(\mathrm{A}\,1,\mathrm{B}\,0,\mathrm{C}\,0)$。</li>
+<li>从 $p'$ 补出 token，只能是 A。这一轮产出 $1$ 个 token，就是 A。</li>
+</ol>
+</details>
+
+<h3 id="s1-5">1.5 为什么输出分布不变</h3>
+
+<p>要证的是：按上面的规则抽出的 token，分布与直接对 $p$ 采样相同。做法是把「抽到某个 token」拆成「猜被接受」和「猜被拒后改采」两种情形，分别算概率再相加。</p>
+
+<details>
+<summary>逐项证明</summary>
+<ol>
+<li>修正分布是归一化的：$\sum_x\bigl(p(x)-\min(p(x),q(x))\bigr)=1-\beta$，$\beta$ 是接受概率，于是 $p'(x)=\dfrac{p(x)-\min(q(x),p(x))}{1-\beta}$。</li>
+<li>抽到 $x'$ 的概率拆成两项：$P(x=x')=P(\text{猜被接受},x=x')+P(\text{猜被拒},x=x')$。</li>
+<li>第一项：$q(x')\min\!\bigl(1,\frac{p(x')}{q(x')}\bigr)=\min(q(x'),p(x'))$。</li>
+<li>第二项：$(1-\beta)p'(x')=p(x')-\min(q(x'),p(x'))$。</li>
+<li>两项相加：$\min(p(x'),q(x'))+p(x')-\min(p(x'),q(x'))=p(x')$。</li>
+<li>于是输出分布与只跑目标模型相同。这一步对任意 $p$、$q$ 都成立，与近似模型的选取无关。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 接受率与加速比</h2>
+
+<h3 id="s2-1">2.1 接受率 $\alpha$ 衡量近似模型有多准</h3>
+
+<p>单步接受概率 $\beta$ 指：给定前缀，按投机解码的接受判据接受从 $q$ 采出的那个候选的概率。$\alpha$ 是 $\beta$ 的期望，衡量近似模型与目标模型的接近程度：$\alpha$ 越大，候选越常被接受。$\alpha$ 是模型与任务本身的性质，与硬件和软件实现无关。</p>
+
+<h3 id="s2-2">2.2 $\alpha$ 与两个分布的接近程度</h3>
+
+<p>定义一个分布对之间的距离 $D(p,q)=\sum_x|p(x)-M(x)|$，其中 $M(x)=\frac{p(x)+q(x)}{2}$ 是 $p$ 与 $q$ 的平均分布。可以推出 $D(p,q)=1-\sum_x\min(p(x),q(x))$。</p>
+
+<p>由此得到 $\beta=1-D(p,q)$，进而 $\alpha=E(\min(p,q))$。$p=q$ 时每一项 $\min$ 等于该处概率、求和为 1，$\alpha=1$，候选全被接受；两分布支撑集（概率非零的 token 集合）不相交时 $\alpha=0$。</p>
+
+<details>
+<summary>$D$ 到 $\alpha$ 的推导</summary>
+<ol>
+<li>$D(p,q)=\sum_x|p(x)-M(x)|$，代入 $M=\frac{p+q}{2}$，得 $\sum_x\frac{|p-q|}{2}$。</li>
+<li>再写成 $1-\sum_x\frac{p+q-|p-q|}{2}$，而 $\frac{p+q-|p-q|}{2}=\min(p,q)$，故 $D=1-\sum_x\min(p,q)$。</li>
+<li>接受概率 $\beta=E_{x\sim q}\min\!\bigl(1,\frac{p(x)}{q(x)}\bigr)=\sum_x\min(p(x),q(x))$，于是 $\beta=1-D$。</li>
+<li>对前缀取期望：$\alpha=E(\beta)=1-E(D)=E(\min(p,q))$。</li>
+</ol>
+</details>
+
+<h3 id="s2-3">2.3 一次串行产出几个 token</h3>
+
+<p>在假设各步的 $\beta$ 相互独立、同分布时，一轮的产出是一个上限为 $\gamma+1$、停止概率为 $1-\alpha$ 的截断几何变量，期望产出</p>
+
+<p>$$
+E(\#\ \text{产出 token})=\frac{1-\alpha^{\gamma+1}}{1-\alpha}.
+$$</p>
+
+<p>$\alpha$ 越大这个数越接近 $\gamma+1$；$\alpha=0$ 时取 1。</p>
+
+<details>
+<summary>期望产出的推导</summary>
+<ol>
+<li>把一轮拆成 $\gamma+1$ 次「是否继续产出」的判断：前 $\gamma$ 次对应 $\gamma$ 个候选，最后一次是补出的那个。</li>
+<li>每次接受以概率 $\alpha$ 发生，且各步独立；产出 token 数等于接受的次数加 1，直到首次被拒为止，上限 $\gamma+1$。</li>
+<li>这个期望等于 $\sum_{k=0}^{\gamma}\alpha^k$：产出数至少为 1，再乘以每多接受一个候选的 $\alpha$ 累加，套几何级数求和公式得 $\frac{1-\alpha^{\gamma+1}}{1-\alpha}$。</li>
+</ol>
+</details>
+
+<h3 id="s2-4">2.4 墙钟加速与最优 $\gamma$</h3>
+
+<p>定义代价系数 $c$ 为近似模型单次前向耗时与目标模型单次前向耗时之比。记目标模型单次代价为 $T$，一轮要跑 $\gamma$ 次近似模型和一次目标模型，代价为 $Tc\gamma+T$，产出 $\frac{1-\alpha^{\gamma+1}}{1-\alpha}$ 个 token。用它和逐个生成（每个 token 代价 $T$）相比，墙钟加速的期望为</p>
+
+<p>$$
+\frac{1-\alpha^{\gamma+1}}{(1-\alpha)(\gamma c+1)}.
+$$</p>
+
+<p>只要 $\alpha&gt;c$，就存在让加速大于 1 的 $\gamma$，此时加速至少为 $\frac{1+\alpha}{1+c}$，$\gamma=1$ 就取到这个下界。这个加速假设生成足够长，否则会被每轮产出的 token 数封顶。</p>
+
+<p>给定 $c$ 与 $\alpha$，最优 $\gamma$ 是使加速公式最大的那个整数，可在较小的范围里数值求出。</p>
+
+<details>
+<summary>不同 $\alpha$、$\gamma$ 下的运算量与加速</summary>
+<p>下表假设近似模型自身的耗时与运算量都可忽略。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>$\alpha$</th><th>$\gamma$</th><th>总算术运算量增幅</th><th>加速</th></tr></thead>
+<tbody>
+<tr><td>0.6</td><td>2</td><td>1.53X</td><td>1.96X</td></tr>
+<tr><td>0.8</td><td>5</td><td>1.63X</td><td>3.69X</td></tr>
+<tr><td>0.9</td><td>10</td><td>1.60X</td><td>6.86X</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h3 id="s2-5">2.5 多花算力、少读访存</h3>
+
+<p>一轮里目标模型对 $\gamma+1$ 个位置并行计算，并发算术运算量是原来的 $\gamma+1$ 倍。总算术运算量则可能上升：候选被接受时这份并发不额外增加总运算量，被拒时那次计算就浪费了。总运算量的期望增幅为 $\frac{(1-\alpha)(\gamma\hat c+\gamma+1)}{1-\alpha^{\gamma+1}}$，$\hat c$ 是近似模型与目标模型每 token 算术运算量之比。</p>
+
+<details>
+<summary>总运算量增幅的推导</summary>
+<ol>
+<li>记标准解码生成一个 token 的运算量为 $\hat T$。一轮里近似模型跑 $\gamma$ 次，每次 $\hat c\hat T$；目标模型对 $\gamma+1$ 个位置并行算一次，运算量 $\hat T(\gamma+1)$。一轮合计 $\hat T\hat c\gamma+\hat T(\gamma+1)$。</li>
+<li>一轮平均产出 $\frac{1-\alpha^{\gamma+1}}{1-\alpha}$ 个 token，用它去除一轮的运算量，得每 token 的运算量。</li>
+<li>再除以标准解码的 $\hat T$，得增幅 $\frac{(1-\alpha)(\gamma\hat c+\gamma+1)}{1-\alpha^{\gamma+1}}$。</li>
+</ol>
+</details>
+
+<p>与运算量相反，读内存的次数会下降：目标模型的权重（模型参数）与 <a href="../kv-cache/index.html">KV cache</a> 一轮只读一次，读它们的访存次数缩为原来的 $\frac{1-\alpha^{\gamma+1}}{1-\alpha}$ 分之一。</p>
+
+<p>当近似模型的代价可忽略（$c\approx0$）时，加速上界是 $\frac{1-\alpha^{\gamma+1}}{1-\alpha}$，它不超过 $\frac{1}{1-\alpha}$，$\gamma$ 越大越接近这个上界。</p>
+
+<h2 id="s3">3. 近似模型怎么选</h2>
+
+<p>投机解码对近似模型 $M_q$ 没有任何限制：$M_q$ 换成什么都不影响输出分布，它只影响速度。</p>
+
+<p>选与目标模型同一种架构、比目标小约两个数量级的模型，通常最好，因为它在接受率 $\alpha$ 与代价 $c$ 之间取得平衡：$\alpha$ 随近似模型变大而上升，但 $c$ 随之上升。</p>
+
+<p>代价可忽略的近似模型（$c\approx0$）更便于部署。一种是无参数的 n-gram 模型：按前几个 token 的统计直接给出下一个 token 的候选，取用只相当于查表。</p>
+
+<details>
+<summary>$\alpha$ 与加速的经验数字</summary>
+<p>$M_p$ 取 11B 的模型（T5-XXL），任务为英文到德语翻译，温度取 0（argmax）。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>$M_q$</th><th>$\gamma$</th><th>$\alpha$</th><th>加速</th></tr></thead>
+<tbody>
+<tr><td>T5-small（77M）</td><td>7</td><td>0.75</td><td>3.4X</td></tr>
+<tr><td>T5-base（250M）</td><td>7</td><td>0.8</td><td>2.8X</td></tr>
+<tr><td>T5-large（800M）</td><td>7</td><td>0.82</td><td>1.7X</td></tr>
+</tbody>
+</table>
+</div>
+<p>把 $M_q$ 换成 2-gram（只看前一个 token 的统计）模型，$\alpha$ 约为 0.2，取 $\gamma=3$ 得到 1.25 倍加速。</p>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>投机解码的前提是有额外算力：它靠并发换延迟，并发需要硬件上还有余量。算力本来就紧张时，无法用并发换延迟下降，这个方法不带来收益。</p>
+
+<p>它不改模型架构、不需要重新训练，可以直接用在现成的模型上。</p>
+
+<p>一个容易混淆的相近做法是拒绝采样：它也先从 $q$ 采样，但要按 $\max_x\frac{p(x)}{q(x)}$ 定一个常数上界，接受概率可能低得多；投机解码的接受概率是 $\alpha=E(\min(p,q))$，更高。</p>
+
+<p>它用更多算术运算换更少的串行次数与更少的读访存，省的是延迟，不是总运算量。</p>
+
+<details>
+<summary>$\alpha$ 的经验范围</summary>
+<p>在多种目标模型、近似模型与采样设置上，比目标小约两个数量级的近似模型通常给出 0.5 到 0.9 的 $\alpha$。</p>
+</details>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Yaniv Leviathan, Matan Kalman, Yossi Matias. Fast Inference from Transformers via Speculative Decoding. ICML 2023, arXiv:2211.17192v2, 2023. <a href="https://arxiv.org/abs/2211.17192">https://arxiv.org/abs/2211.17192</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
