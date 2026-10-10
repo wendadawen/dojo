@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="RMSNorm 是 LayerNorm 的简化：去掉减均值这一步，只把一层的加权和除以它的均方根，再乘增益；训练质量与 LayerNorm 相当而计算更省。">
+  <meta name="dojo:summary" content="归一化本来要做减均值和除标准差两件事，RMSNorm 提出假设前者可以省掉，只保留 $\bar{a}_i = a_i / \mathrm{RMS}(\mathbf{a})\, g_i$。">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="网络结构">
+  <title>RMSNorm</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">RMSNorm</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">RMSNorm</h1>
+<p class="reading-time">正文 1,201 字 · 约 4 分钟阅读</p>
+
+<p>神经网络由一层一层叠成，每一层拿到一个输入向量后，先做线性加权求和：第 $i$ 个分量的加权和是 $a_i = \sum_j w_{ij} x_j$，$w_{ij}$ 是权重，$x_j$ 是输入的第 $j$ 个分量，这些分量组成向量 $\mathbf{a}$。归一化作用在这个加权和上，把它的尺度固定住再交给激活函数（一层里把加权和变成输出的非线性环节），以稳住各层输出的量级。归一化里有一对随训练更新的可学参数：增益 $\mathbf{g}$ 用来缩放，偏置 $\mathbf{b}$ 用来平移。LayerNorm 把加权和先减均值、再除标准差，然后乘增益、加偏置。RMSNorm 的主张是只保留后半段：不减均值，只把加权和除以它的均方根（各分量平方的平均再开方），再乘增益。</p>
+
+<h2 id="s1">1. 只保留缩放</h2>
+
+<h3 id="s1-1">1.1 从 LayerNorm 去掉减均值</h3>
+
+<p>LayerNorm 对加权和做两步。第一步减掉它们的均值 $\mu = \frac{1}{n}\sum_i a_i$（$n$ 是分量个数），让结果零均值，这一步叫中心化。第二步除以标准差 $\sigma = \sqrt{\frac{1}{n}\sum_i (a_i - \mu)^2}$，把尺度固定，这一步叫缩放。之后乘增益 $\mathbf{g}$，再进激活函数。</p>
+
+<p>RMSNorm 把第一步整个去掉，只保留第二步，但除的不是标准差而是均方根：$\mathrm{RMS}(\mathbf{a}) = \sqrt{\frac{1}{n}\sum_i a_i^2}$，输出 $\bar{a}_i = a_i / \mathrm{RMS}(\mathbf{a}) \cdot g_i$。标准差量的是各分量到均值的偏离，均方根量的是各分量到 $0$ 的距离。去掉减均值后，输出不再保证零均值。</p>
+
+<p>它的一般式还带一个偏置 $\mathbf{b}$：$\mathbf{y} = f\left(\frac{\mathbf{Wx}}{\mathrm{RMS}(\mathbf{a})}\odot\mathbf{g}+\mathbf{b}\right)$，$\odot$ 是逐元素相乘，$f$ 是激活函数，$\mathbf{y}$ 是这一层的输出，$\mathbf{W}$ 是权重矩阵、$\mathbf{x}$ 是输入向量。</p>
+
+<p>均方根把归一化后的输出推到半径 $\sqrt{n}$ 的球面上：只除均方根、不乘增益时，输出的欧氏长度恰好是 $\sqrt{n}$。欧氏长度与均方根只差一个因子 $\sqrt{n}$。</p>
+
+<h3 id="s1-2">1.2 手算对照</h3>
+
+<p>取一个小的加权和向量 $\mathbf{a} = (1, 2, 3, 4)$，分量个数 $n = 4$，分别计算 LayerNorm 和 RMSNorm，比较两者的差别。</p>
+
+<details>
+<summary>手算全过程</summary>
+<ol>
+<li>均值 $\mu = (1+2+3+4)/4 = 2.5$。</li>
+<li>各分量到均值的偏离是 $(-1.5, -0.5, 0.5, 1.5)$，方差是 $(1.5^2+0.5^2+0.5^2+1.5^2)/4 = 1.25$，标准差 $\sigma = \sqrt{1.25} \approx 1.118$。</li>
+<li>LayerNorm 的输出（增益取 $1$、偏置取 $0$）是各偏离除以标准差：$(-1.342, -0.447, 0.447, 1.342)$，它的均值是 $0$。</li>
+<li>均方根 $\mathrm{RMS}(\mathbf{a}) = \sqrt{(1+4+9+16)/4} = \sqrt{7.5} \approx 2.739$。</li>
+<li>RMSNorm 的输出（增益取 $1$）是各分量除以均方根：$(0.365, 0.730, 1.095, 1.461)$。</li>
+<li>这组输出的均值是 $(0.365+0.730+1.095+1.461)/4 = 0.913$，不为零。同一个加权和，LayerNorm 先把中心平移到 $0$ 再定尺度，RMSNorm 不平移中心，直接把到原点的距离定下来，所以输出整体落在 $0$ 的同一侧。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 缩放不变性与丢失的中心化不变性</h2>
+
+<h3 id="s2-1">2.1 整体缩放不变</h3>
+
+<p>把权重矩阵整体乘一个正的常数 $\delta$，输出不变。原因是均方根的齐次性：$\mathrm{RMS}(\delta \mathbf{a}) = \delta\, \mathrm{RMS}(\mathbf{a})$，分子分母里的 $\delta$ 约掉。对输入整体缩放同样成立，逐条样本、整个数据集也成立。这就是缩放不变性：不管输入和权重的整体尺度怎么变，归一化后的输出和原来一样，层激活的尺度因此被固定。</p>
+
+<details>
+<summary>整体缩放下输出不变的推导</summary>
+<ol>
+<li>权重矩阵缩放 $\mathbf{W}' = \delta \mathbf{W}$ 后，加权和变成 $\mathbf{a}' = \delta \mathbf{a}$。</li>
+<li>由齐次性，$\mathrm{RMS}(\mathbf{a}') = \delta\, \mathrm{RMS}(\mathbf{a})$。</li>
+<li>代回输出式，$\bar{a}_i = \dfrac{a'_i}{\mathrm{RMS}(\mathbf{a}')} g_i = \dfrac{\delta a_i}{\delta\, \mathrm{RMS}(\mathbf{a})} g_i = \dfrac{a_i}{\mathrm{RMS}(\mathbf{a})} g_i$，$\delta$ 约掉。</li>
+<li>输入缩放 $\mathbf{x}' = \delta \mathbf{x}$ 的推导同理。</li>
+</ol>
+</details>
+
+<h3 id="s2-2">2.2 逐行缩放与平移会怎样</h3>
+
+<p>缩放不变性只在整体缩放下成立。如果只把个别权重行各乘一个不同的常数，均方根的线性关系被打破，输出会变。中心化不给缩放不变性，但给另一种：把加权和整体加一个常数，LayerNorm 的输出不变，这叫中心化不变性。RMSNorm 没有这一步，所以对加性扰动不免疫——加权和整体平移，输出跟着变。实践中去掉中心化质量仍与 LayerNorm 相当，隐藏状态（这一层算出的、传给下一层的向量）里未归一化的均值反而比不做归一化的原模型更稳。</p>
+
+<details>
+<summary>隐藏状态均值与标准差的实测</summary>
+<p>在一个逐 token 处理文本的翻译模型（RNNSearch）上，取一个翻译评测集（newstest2013），看解码部分 GRU（一种循环单元）的隐藏状态在各 token（文本切分后的片段）位置的均值（M）与标准差（S），位置 1 到 4 及全部位置的平均（ALL）。</p>
+<ul>
+<li>无归一化基线：M 为 -2.60、-1.19、-1.43、-1.53，ALL 为 -1.60；S 为 7.35、2.33、2.61、2.73，ALL 为 3.04。</li>
+<li>LayerNorm：M 为 -0.43、-0.48、-0.50、-0.50，ALL 为 -0.51；S 为 1.19、1.51、1.51、1.51，ALL 为 1.51。</li>
+<li>RMSNorm：M 为 -0.40、-0.60、-0.69、-0.74，ALL 为 -0.73；S 为 1.27、1.51、1.50、1.49，ALL 为 1.50。</li>
+</ul>
+</details>
+
+<h2 id="s3">3. 梯度上的表现</h2>
+
+<p>训练靠梯度下降更新参数，学习率是每次更新里决定步长大小的系数，梯度的大小直接影响参数每次移动多少。对增益 $\mathbf{g}$ 和偏置 $\mathbf{b}$ 的梯度，在输入或权重整体缩放时不变；对增益的梯度正比于归一化后的加权和，而不是原始加权和，这稳住了 $\mathbf{g}$ 的量级。</p>
+
+<p>对权重矩阵 $\mathbf{W}$ 的梯度多出一个和输入、权重都相关的矩阵项。这个矩阵项本身随缩放负相关，但代回后，梯度对输入缩放不变，只与权重缩放负相关：权重缩放越大，梯度被压得越小。这个负相关像一个自动调节学习率的机制，把梯度范数控制在合适范围，避免权重矩阵的范数过大。</p>
+
+<details>
+<summary>梯度公式与缩放后的行为</summary>
+<ol>
+<li>记 $\mathbf{v}$ 为激活函数里的一整段 $\frac{\mathbf{Wx}}{\mathrm{RMS}(\mathbf{a})} \odot \mathbf{g} + \mathbf{b}$，$\mathcal{L}$ 是损失函数，$\partial \mathcal{L} / \partial \mathbf{v}$ 是反向传播时从 $\mathcal{L}$ 传回 $\mathbf{v}$ 的梯度。</li>
+<li>对偏置的梯度是 $\dfrac{\partial \mathcal{L}}{\partial \mathbf{b}} = \dfrac{\partial \mathcal{L}}{\partial \mathbf{v}}$。</li>
+<li>对增益的梯度是 $\dfrac{\partial \mathcal{L}}{\partial \mathbf{g}} = \dfrac{\partial \mathcal{L}}{\partial \mathbf{v}} \odot \dfrac{\mathbf{Wx}}{\mathrm{RMS}(\mathbf{a})}$。</li>
+<li>对权重的梯度里含矩阵项 $\mathbf{R} = \dfrac{1}{\mathrm{RMS}(\mathbf{a})}\left(\mathbf{I} - \dfrac{(\mathbf{Wx})(\mathbf{Wx})^T}{n\, \mathrm{RMS}(\mathbf{a})^2}\right)$，$\mathbf{I}$ 是单位矩阵。对权重的梯度 $\dfrac{\partial \mathcal{L}}{\partial \mathbf{W}} = \sum_i \left[\mathbf{x}^T \otimes \left(\mathrm{diag}\left(\mathbf{g}\odot\dfrac{\partial \mathcal{L}}{\partial \mathbf{v}}\right)\mathbf{R}\right)\right]_i$，$\otimes$ 是克罗内克积。</li>
+<li>让输入或权重整体缩放 $\delta$，$\mathbf{R}$ 变成 $\mathbf{R} / \delta$；对输入缩放时，输入因子与 $\mathbf{R}$ 里的 $1/\delta$ 相抵，梯度不变；权重缩放时只留下 $1/\delta$，梯度与缩放负相关。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 省下的计算</h2>
+
+<p>LayerNorm 在除标准差之前要多做两件事：求一次均值，再把每个分量减掉它。RMSNorm 没有这两步。</p>
+
+<p>速度提升的大小随框架、硬件、网络结构和其他组件的相对开销而变。在多种模型与实现上，RMSNorm 实测比 LayerNorm 快 7%~64%。</p>
+
+<details>
+<summary>各模型上的速度数字</summary>
+<p>前四行时间按每 1000 个训练步计，后两行按每 100 步计；每行末尾的百分比是 RMSNorm 相对 LayerNorm 的加速比。完整区间是 7%~64%，覆盖不同模型与实现，下表只列其中若干项。RNNSearch 是一个循环翻译模型，Transformer 是一个基于自注意力（序列各部分互相加权的一种层）的翻译模型，注意力阅读器是一个阅读理解模型，图像-描述检索是一个跨模态（图像与文本两种模态之间）检索模型；Tensorflow、Theano、PyTorch 是三个深度学习框架。</p>
+<ul>
+<li>RNNSearch（Tensorflow）：LayerNorm 665s，RMSNorm 501s，快 24.7%。</li>
+<li>RNNSearch（Theano）：LayerNorm 988s，RMSNorm 652s，快 34.0%。</li>
+<li>RNNSearch（PyTorch）：LayerNorm 857s，RMSNorm 763s，快 11.0%。</li>
+<li>Transformer：LayerNorm 248s，RMSNorm 231s，快 6.9%。</li>
+<li>注意力阅读器：LayerNorm 392s，RMSNorm 333s，快 15.1%。</li>
+<li>图像-描述检索：LayerNorm 12.02s，RMSNorm 7.12s，快 40.8%。</li>
+</ul>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>当输入的加权和均值恰为 0 时，减不减均值没有差别，RMSNorm 与 LayerNorm 相等，这是它退化为 LayerNorm 的条件。</p>
+
+<p>另一个边界在证据的强度：「只保留缩放就够」是一个假设，不是已证明的结论，靠实验支持。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Biao Zhang, Rico Sennrich. Root Mean Square Layer Normalization. NeurIPS 2019. <a href="https://arxiv.org/abs/1910.07467">https://arxiv.org/abs/1910.07467</a></li>
+<li>Biao Zhang. rmsnorm: official implementation. 2019. <a href="https://github.com/bzhangGo/rmsnorm">https://github.com/bzhangGo/rmsnorm</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

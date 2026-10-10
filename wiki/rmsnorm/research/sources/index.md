@@ -1,0 +1,2 @@
+- paper/arxiv-v1.pdf、paper/arxiv-v1.txt、paper/src-v1/｜论文｜https://arxiv.org/abs/1910.07467v1｜v1（2019-10-16，NeurIPS 2019）｜2026-10-10｜Root Mean Square Layer Normalization，提出 RMSNorm：去掉 LayerNorm 的中心化，只用均方根归一化；LaTeX 源码在 src-v1/，纯文本快照 arxiv-v1.txt
+- repo/rmsnorm/｜仓库｜https://github.com/bzhangGo/rmsnorm｜2e726f1a3f106bb719056422f4f9b6aca03d3ce6（2023-03-28）｜2026-10-10｜论文官方仓库：README（论文要点与四个任务的复现说明）、Pytorch 版 rmsnorm_torch.py、Tensorflow 版 rmsnorm_tensorflow.py、Theano 版 layers.py
