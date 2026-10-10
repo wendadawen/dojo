@@ -1,0 +1,1 @@
+- paper/mopd-v1.pdf、paper/mopd-v1.txt｜论文｜https://arxiv.org/abs/2606.30406v1｜v1（2026-06-29）｜2026-10-10｜MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training：提出 MOPD，把多个按领域 RL 训出的教师经 on-policy 蒸馏合成一个学生；无 LaTeX 源码，纯文本快照 mopd-v1.txt
