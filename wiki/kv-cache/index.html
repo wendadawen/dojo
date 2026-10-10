@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="KV cache 是自回归生成时把每层已算过的 key 和 value 留下来复用的机制，让生成每个新 token 时不必重算全部历史。">
+  <meta name="dojo:summary" content="自回归模型逐个预测 token，每步都要用到全部历史 token 的 key 和 value。把它们按层缓存下来、每步只追加当前 token，每步注意力开销从随序列长度二次降到线性。">
+  <meta name="dojo:topics" content="推理系统, 内存与缓存">
+  <meta name="dojo:tag" content="KV cache">
+  <title>KV cache</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">KV cache</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">KV cache</h1>
+<p class="reading-time">正文 1,282 字 · 约 4 分钟阅读</p>
+
+<p>大语言模型写文本时一次只预测一个 token——token 是模型读写文本的最小单位——而每个新 token 都要用到前面所有 token 的信息，这种一个接一个往下写的方式叫自回归生成。模型由若干结构相同的层堆叠而成，每层里都有一层<a href="../standard-attention/index.html">注意力</a>，它把每个位置的输入投影成 query、key 和 value 三个向量，算某个位置的输出时，用它的 query 去和各个位置的 key 比较，按比较结果把对应的 value 加权求和。</p>
+
+<p>模型处理每个位置，都会在该层算出一套 key 和 value。在只看当前位置及其之前位置的因果注意力下，一个位置处理完之后，它的 key、value 不再随后面出现的 token 改变，因此可以算一次、反复使用。不把它们留下来，每生成一个 token 就要把前面所有位置的 key 和 value 重算一遍。KV cache 就是在生成过程中把每一层已经算出的 key 和 value 存进显存（GPU 的内存），每步只追加新 token 的那一份，让后面的 token 直接取用。</p>
+
+<h2 id="s1">1. 每步只算当前 token，历史 key、value 复用</h2>
+
+<p>生成时模型一次只处理一个新位置，但注意力的算法没有变。注意力为当前位置的 query 和各个位置的 key 各算一个分数——两者的点积，点积越大表示两者越匹配。生成是从左到右一步步走的，当前位置看不到后面还没出现的 token，这由一个掩码保证：掩码让模型注意不到未来位置。</p>
+
+<p>把这些分数除以一个缩放数再送进 softmax，softmax 把一组数变成一组和为 1 的权重，越大的数分到的权重越大；最后用这组权重把各个位置的 value 加权求和：</p>
+
+<p>$$\text{softmax}\!\left(\frac{q_t K^\top}{\sqrt{d}} \times \text{mask}\right) V$$</p>
+
+<p>其中 $q_t$ 是位置 $t$ 的 query，$K$ 和 $V$ 是各个位置的 key、value 排成的矩阵，$d$ 是每个 query、key、value 向量的维度，mask 是前面说的掩码。进入这一步计算的 query 只有当前这一个位置的那一份：$q_t$ 由位置 $t$ 的输入乘投影矩阵得到，每来一个新位置就有一个新的 query。当前这个位置同时也会算出它自己的 $k_t$ 和 $v_t$，它们和历史上各个位置的 key、value 一起进入比较和加权；历史位置的 key、value 在各自算出的那一步之后就不再改变。所以每步要新算的只有当前这一个位置的一份 query、key 和 value，用过的 query 此后不再需要。</p>
+
+<details>
+<summary>从公式看每步算了什么</summary>
+<p>位置 $t$ 这一步的输出，是它自己的 query 和所有已经出现的位置（1 到 $t$）的 key、value 一起算出来的。</p>
+<ol>
+<li>第 1 个 token 进来，算它的 $q_1$、$k_1$、$v_1$，注意力只用 $q_1$ 和 $k_1$，得到第一个输出。</li>
+<li>第 2 个 token 进来，算 $q_2$、$k_2$、$v_2$，注意力用 $q_2$ 和 $k_1, k_2$ 比较、取 $v_1, v_2$。</li>
+<li>到第 $t$ 个 token，注意力用 $q_t$ 和 $k_1, \dots, k_t$ 比较、取 $v_1, \dots, v_t$。</li>
+<li>每一步里，已经算过的那些位置的 $k$、$v$ 都不再变化（各自在算它们的那一步定下），需要新算的只有当前这一份。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 缓存按层各存一份，每步追加一个 token</h2>
+
+<p>注意力在模型的每一层里各算各的，缓存也按层进行，所以每一层都各存一份 key 和一份 value。生成往下走时，每层的缓存各自增长。</p>
+
+<p>每步算出的新的 $k_t$、$v_t$ 接在过去的 key、value 后面，缓存就是这样一步步变长的：新的 key 缓存是过去的 key 拼上当前 $k_t$，新的 value 缓存是过去的 value 拼上当前 $v_t$。</p>
+
+<details>
+<summary>拼接公式</summary>
+<p>把拼接写成公式：</p>
+<p>$$K_{\text{cache}} \leftarrow \text{concat}(K_{\text{past}}, k_t), \qquad V_{\text{cache}} \leftarrow \text{concat}(V_{\text{past}}, v_t)$$</p>
+<p>其中 $K_{\text{past}}$、$V_{\text{past}}$ 是缓存里已有的历史 key、value，$k_t$、$v_t$ 是当前这一步新算出来的，concat 表示沿序列方向接在一起。</p>
+</details>
+
+<h2 id="s3">3. 缓存省下多少计算</h2>
+
+<p>不缓存时，每生成一步都要把整段历史重新过一遍注意力：序列里每个位置都要和它之前的各个位置各比较一次，这些比较排成一张行数、列数都等于长度的分数表，工作量随长度平方增长。缓存之后，每步只需要算当前这一个位置、只和已有的各个位置各比较一次，不再回头重算。</p>
+
+<details>
+<summary>不缓存与缓存的每步开销对比</summary>
+<div class="table-scroll">
+<table>
+<thead><tr><th>不缓存</th><th>缓存</th></tr></thead>
+<tbody>
+<tr><td>每步重算全部历史的 key 和 value</td><td>每步只算当前的 key 和 value</td></tr>
+<tr><td>每步注意力开销随序列长度<b>二次</b>增长</td><td>每步注意力开销随序列长度<b>线性</b>增长</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h2 id="s4">4. 缓存有多大</h2>
+
+<p>注意力把一次计算分成若干个头，每个头各自算一套 query、key 和 value，所以缓存里存的是每个头那一套；头数记作 $H_{\text{kv}}$，每个头里向量的维度记作 $d_{\text{head}}$。生成时还可以一次并行处理多条序列，一次处理多少条叫批大小。把这两件事算上，每一层的 key 缓存和 value 缓存的形状都是 <code>[batch_size, num_heads, seq_len, head_dim]</code>：这四项依次是批大小、KV 头数、序列长度、头维度；生成过程中，序列长度随每个新 token 增加。</p>
+
+<p>把形状的各项相乘就得到缓存的元素数，元素数与批大小、序列长度都成正比，所以显存随序列长度和批大小线性增长。</p>
+
+<details>
+<summary>显存公式与一组手算</summary>
+<p>key 和 value 各存一份，所以形状的各项相乘后再乘 2；每一层各存一份，所以再乘层数 $L$；每个数占的字节数记作 $b$，再乘 $b$。合起来：</p>
+<p>$$\text{显存} = 2 \times L \times B \times T \times H_{\text{kv}} \times d_{\text{head}} \times b$$</p>
+<p>其中 $L$ 是层数，$B$ 是批大小，$T$ 是序列长度，$H_{\text{kv}}$ 是 KV 头数，$d_{\text{head}}$ 是头维度，$b$ 是每个数占的字节数，最前面的 2 是 key 和 value 两份。</p>
+<p>取一组小数字走一遍：层数 $L=2$，批大小 $B=1$，序列长度 $T=3$，KV 头数 $H_{\text{kv}}=2$，头维度 $d_{\text{head}}=4$，每个数 2 字节。</p>
+<ol>
+<li>先算一个位置在一层里、只算 key 一份的元素数：$H_{\text{kv}} \times d_{\text{head}} = 2 \times 4 = 8$。</li>
+<li>key 和 value 两份，一个位置一层是 $2 \times 8 = 16$ 个元素。</li>
+<li>一个位置、两层的值是 $2 \times 16 = 32$ 个元素。</li>
+<li>三个位置、批大小为 1，是 $3 \times 1 \times 32 = 96$ 个元素。</li>
+<li>每个数 2 字节，总共 $96 \times 2 = 192$ 字节。</li>
+</ol>
+<div class="code-block"><pre><code class="language-python">L = 2      # 层数
+B = 1      # 批大小
+T = 3      # 序列长度
+H = 2      # KV 头数
+d = 4      # 头维度
+b = 2      # 每个数的字节数
+elements = 2 * L * B * T * H * d
+print(elements)
+print(elements * b)</code></pre></div>
+<div class="code-block"><pre><code class="language-text">96
+192</code></pre></div>
+<p>把序列长度从 3 加到 6，只改这一项，字节数就翻倍，说明显存随序列长度线性增长。</p>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>缓存只在推理时用——推理指模型已经训练好、拿来做预测的阶段，训练指模型学习参数的阶段。训练时启用缓存可能引发意外错误，所以训练阶段要把它关掉。</p>
+
+<p>缓存会占去显存里相当一部分，在长序列（长上下文）里可能成为瓶颈：序列越长，缓存占的显存越多，越容易让显存不够用。</p>
+
+<p>缓存省掉的是计算——历史位置的 key 和 value 不再重算；它并不省显存。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>HuggingFace Transformers 文档. How caching works. <a href="https://huggingface.co/docs/transformers/en/cache_explanation">https://huggingface.co/docs/transformers/en/cache_explanation</a></li>
+<li>HuggingFace Transformers 文档. Cache strategies. <a href="https://huggingface.co/docs/transformers/en/kv_cache">https://huggingface.co/docs/transformers/en/kv_cache</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
