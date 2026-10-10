@@ -269,12 +269,12 @@ def parse(plan: Path) -> dict:
         views.append(view(v["id"], v["label"], title, nodes, edges, info=info))
 
     config = group_rows(read_table(config_rows, ["组", "名字", "值"], "config.json 表"))
-    check_plan(views, config, scope)
+    check_plan(views, config, scope, meta)
     return {"plan": plan, "meta": meta, "views": views, "config_groups": config or None,
             "config_note": scope}
 
 
-def check_plan(views: list[dict], config_groups=None, config_note=None) -> None:
+def check_plan(views: list[dict], config_groups=None, config_note=None, meta=None) -> None:
     """跨图与形状的机械检查：同 id 必须同形状，算子和张量的形状要写全，公式外的下划线不转义。
 
     不同图里第一行可以不一样——一处写变量名、一处写产生它的表达式，都指同一个量；
@@ -328,6 +328,11 @@ def check_plan(views: list[dict], config_groups=None, config_note=None) -> None:
                                                {"detail": f"{name}\n{value}"})
     for i, line in enumerate(config_note or [], 1):
         errors += _stray_underscore_escape(f"前提/第 {i} 条", {"detail": line})
+    # 页面信息（描述、摘要）也进页面 head，同样查越界下划线
+    if meta:
+        for key, zh in (("description", "描述"), ("summary", "摘要")):
+            if meta.get(key):
+                errors += _stray_underscore_escape(f"页面信息/{zh}", {"detail": meta[key]})
     errors += _no_generic_class_figure(views)
     if errors:
         raise SystemExit("\n".join(errors))
@@ -674,6 +679,8 @@ def selftest() -> list[tuple[str, bool]]:
                               "| 规模 | hidden_size | 见 hidden\\_size |")),
             ("前提里的下划线写成 \\_ 也应当报错",
              TOY_PLAN.replace("- 不传缓存", "- 不传\\_缓存")),
+            ("页面信息的描述里下划线写成 \\_ 也应当报错",
+             TOY_PLAN.replace("- 描述：自检页。", "- 描述：见 hidden\\_size。")),
             ("说明里写公式应当报错",
              TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
                               "| blk | 公式 | $x + f(x)$，x 是输入 |\n"

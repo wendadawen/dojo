@@ -168,7 +168,7 @@ def check_math_names(views: list[dict], sources: dict[str, str], shapes: dict) -
     return errors
 
 
-def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[str]]:
+def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
     """页面上写的权重形状必须与给定的形状表一致。
 
     返回 (错误, 比对上的键数)。页面写了「检查点键 X」而 X 不在形状表里，由 resolve()
@@ -311,6 +311,10 @@ def plan_rows(text: str):
                 yield head, no, dict(zip(cols, cells))
 
 
+# 行区间分隔符：半角连字符和 en-dash 都认（手写常敲成 en-dash）
+RANGE = r"[-\u2013]"
+
+
 def parse_refs(cell: str) -> list[tuple[str, int, int]]:
     """「a.py:1-3，5；b.py:7」→ [(a.py, 1, 3), (a.py, 5, 5), (b.py, 7, 7)]。"""
     out: list[tuple[str, int, int]] = []
@@ -318,7 +322,7 @@ def parse_refs(cell: str) -> list[tuple[str, int, int]]:
         fname = ""
         for piece in re.split(r"[，,、]", seg):
             piece = piece.strip()
-            m = re.fullmatch(r"(?:(\S+?)[:：])?(\d+)(?:[-–](\d+))?", piece)
+            m = re.fullmatch(r"(?:(\S+?)[:：])?(\d+)(?:" + RANGE + r"(\d+))?", piece)
             if not m:
                 continue
             fname = m.group(1) or fname
@@ -347,10 +351,10 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
         where = f"第 {no} 行（{head.split('（')[0]}"
         # 这一图标题里写的源码文件。节点指到别的文件多半是张冠李戴：
         # vision 图的节点指到 model.py 里恰好也有同名调用的行，照样能"命中"。
-        m_head = re.search(r"[（(](\S+?):\d+-\d+[）)]", head)
+        m_head = re.search(r"[（(](\S+?)[:：]\d+" + RANGE + r"\d+[）)]", head)
         head_file = m_head.group(1) if m_head else None
         if row is None:
-            m = re.search(r"[（(](\S+?):(\d+)-\d+[）)]", head)
+            m = re.search(r"[（(](\S+?)[:：](\d+)" + RANGE + r"\d+[）)]", head)
             src = m and lines_of(m.group(1))
             if m and src is not None and "def forward" not in src[int(m.group(2)) - 1]:
                 errors.append(f"{where}）标题的起始行 {m.group(1)}:{m.group(2)} 不是 def forward")
@@ -621,6 +625,11 @@ def selftest() -> list[tuple[str, bool]]:
             _, _, unc = check_plan_sources(f2, root)
         checks.append(("计划源码位置：短名节点计入核不了", unc == 1))
         checks.append(("计划源码位置：只写行号时按图标题的文件补全", not run(good.replace("m.py:2", "2"))))
+        # 标题行区间写成 en-dash、冒号写成全角：手写常见，不该据此判「标题没文件名」
+        checks.append(("计划源码位置：标题用 en-dash 也能补全文件名",
+                       not run(good.replace("m.py:2", "2").replace("m.py:1-3", "m.py:1\u20133"))))
+        checks.append(("计划源码位置：标题用全角冒号也能补全文件名",
+                       not run(good.replace("m.py:2", "2").replace("m.py:1-3", "m.py\uff1a1-3"))))
         checks.append(("计划源码位置：只写行号补全后指错行仍报出",
                        bool(run(good.replace("m.py:2", "3")))))
         # ``` 围栏里贴的示例图不算真图（与 build_page 同一口径）
@@ -678,6 +687,9 @@ def main() -> int:
         label, sep, path = str(raw).partition("=")
         if not sep:
             label, path = "", label
+        elif not label.strip():
+            # `=path` 或 `  =path`：标签是空白，语义上当没带标签
+            label = ""
         p = Path(path)
         if not p.exists():
             print(f"error: 源码不存在: {p}", file=sys.stderr)
@@ -708,8 +720,9 @@ def main() -> int:
             heading = (view.get("title", "") + " " + view.get("label", "")).lower()
             picked = [body for label, body in labeled_bodies.items() if label.lower() in heading]
             if not picked:
-                # 标签只是「限定」：没有标签命中这个视图时，拿全部源码比对。
-                # 只回退到未带标签的源码会把「所有源码都带了标签」变成静默免检。
+                # 标签只是「限定」：没有标签命中这个视图时，用不带标签的源码比对。
+                # 若所有源码都带了标签，universal 为空，才退回用全部——否则这一视图
+                # 一份源码都不核，成了静默免检。
                 picked = universal or list(sources.values())
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})
