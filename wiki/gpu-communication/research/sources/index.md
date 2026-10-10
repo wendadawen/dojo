@@ -1,0 +1,6 @@
+- blog/baidu-ring-allreduce.txt｜https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/｜2017-02-21｜提出 ring allreduce 的原始博客（Baidu Research，Gibiansky 撰），讲通信问题、scatter-reduce 与 allgather 两阶段、通信量公式与带宽最优性
+- blog/nccl-overview.txt｜https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html｜NCCL 2.32.3｜NCCL 官方概览：集合通信原语、单核融合、支持的互联（PCIe、NVLink、InfiniBand Verbs、IP sockets）
+- blog/nccl-collectives.txt｜https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html｜NCCL 2.32.3｜NCCL 各集合操作的官方定义（AllReduce、AllGather、ReduceScatter 等）
+- blog/gpudirect-rdma.txt｜https://docs.nvidia.com/cuda/gpudirect-rdma/index.html｜CUDA 13.4｜GPUDirect RDMA 官方文档：GPU 与网卡经 PCIe 直连、PCI BAR、内存 pinning
+- blog/rdma-networks-programming-guide.txt｜https://networking-docs.nvidia.com/doca/sdk/rdma-aware-networks-programming-guide｜DOCA｜RDMA 官方编程指南：HCA、队列对、verbs、RDMA Read/Write、内核旁路，与 TCP/IP 的对比
+- blog/nvlink.txt｜https://www.nvidia.com/en-us/data-center/nvlink/｜NVIDIA 官方页面｜NVLink 与 NVLink Switch：机内 GPU 直连、带宽与全互联拓扑
