@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="SiTU-GLU 是前馈层的一种写法，把两个乘性因子各自换成一个平滑饱和的上界函数，让它们的乘积有固定上界。">
+  <meta name="dojo:summary" content="$\mathrm{SiTU\text{-}GLU}(x)=\big[\beta_1\tanh(W_g x/\beta_1)\odot\sigma(W_g x)\big]\odot\big[\beta_2\tanh(W_u x/\beta_2)\big]$，把 SwiGLU 里两个无界的线性因子各自换成 $\beta\tanh(x/\beta)$，输出逐坐标落在 $[-\beta_1\beta_2,\beta_1\beta_2]$ 内。">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="模型架构">
+  <title>SiTU-GLU</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">SiTU-GLU</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">SiTU-GLU</h1>
+<p class="reading-time">正文 993 字 · 约 4 分钟阅读</p>
+
+<p>前馈层是网络里逐个位置各算各的一层，中间夹一个逐元素作用的非线性函数。<a href="../swiglu/index.html">SwiGLU</a> 是前馈层的一种写法：用一道门逐元素缩放一条线性投影（输入向量乘权重矩阵得到的向量）。SiTU-GLU 在 <a href="../glu/index.html">GLU</a> 家族的这个位置上做一处改动，给两个乘性因子（门支的线性因子 $W_g x$、值支的投影 $W_u x$，$W_g$ 与 $W_u$ 是权重矩阵）各施加一个 softcap（一种把实数平滑压进有限区间的函数），让两支都饱和，乘积因此有固定上界，同时近原点保持 SwiGLU 的形状。</p>
+
+<h2 id="s1">1. 为什么 SwiGLU 需要上界</h2>
+
+<p><a href="../glu/index.html">GLU</a> 用一道门逐元素缩放一条线性投影，门由 sigmoid 算出：$\sigma(z)=1/(1+e^{-z})$，把实数压到 $0$ 与 $1$ 之间。SwiGLU 把这道门换成 Swish，$\mathrm{Swish}(z)=z\sigma(z)$，门的输出是 $W_g x\odot\sigma(W_g x)$（$\odot$ 是逐元素乘积）；$W_g$ 是门分支的权重矩阵，$x$ 是输入向量。</p>
+
+<p>这么写之后，$x$ 的坐标很大时，门的线性因子 $W_g x$ 会跟着变大，值投影 $W_u x$ 也如此（$W_u$ 是值分支的权重矩阵），两个乘性因子都无界。某个坐标上两支同时很大时，乘积可能出现一个激活外点（前馈层那个非线性函数的输出里，个别坐标的值异常大），在低精度算术下有溢出风险。</p>
+
+<p>GLU 原本的 sigmoid 门不会无限增大，但它丢掉了 Swish 在正侧近似线性的响应：$W_g x$ 很大时 Swish 的门趋近 $W_g x$ 本身，而 sigmoid 门趋近 $1$。</p>
+
+<p>Kimi K3 是提出 SiTU-GLU 的模型；它的路由分支（被选中少数专家的那条支路）把若干次矩阵相乘连成一串，叠上 2.8 万亿参数规模，内部激活会出现异常大的值。</p>
+
+<h2 id="s2">2. SiTU-GLU 的公式</h2>
+
+<p>SiTU-GLU 用一个 softcap 函数：</p>
+
+<p>$$\mathrm{softcap}(z,\beta)=\beta\tanh(z/\beta).$$</p>
+
+<p>$\tanh$ 是把实数平滑压进区间 $(-1,1)$ 的函数，$\beta&gt;0$ 是一个正的常数。乘 $\beta$ 之后值域是 $(-\beta,\beta)$：$z$ 远大于 $\beta$ 时输出趋近 $\beta$，$z$ 远小于 $-\beta$ 时趋近 $-\beta$。</p>
+
+<p>SiTU-GLU 对 SwiGLU 的门分支和值分支各施加一次 softcap：</p>
+
+<p>$$\mathrm{SiTU\text{-}GLU}(x)=\Big[\beta_1\tanh\!\Big(\frac{W_g x}{\beta_1}\Big)\odot\sigma(W_g x)\Big]\odot\Big[\beta_2\tanh\!\Big(\frac{W_u x}{\beta_2}\Big)\Big].$$</p>
+
+<p>门支 $\beta_1\tanh(W_g x/\beta_1)\odot\sigma(W_g x)$ 是把 Swish 门 $W_g x\odot\sigma(W_g x)$ 里的线性因子 $W_g x$ 换成 softcap，sigmoid 因子原样保留。值支 $\beta_2\tanh(W_u x/\beta_2)$ 是把线性的 $W_u x$ 换成 softcap。</p>
+
+<p>这些量都是同形状的向量，$\odot$ 在对应分量上逐元素做，不像矩阵乘那样改变形状。设定的取值是 $\beta_1=4$ 用于门分支、$\beta_2=25$ 用于值分支。</p>
+
+<h2 id="s3">3. 手算一遍</h2>
+
+<p>取标量输入，并把两支的线性输出都取同一个值 $a$，这样能把函数本身的行为单独考察，不受两个权重矩阵影响。代入 $\beta_1=4$、$\beta_2=25$，输出随着 $a$ 增大一直落在上界 $100$ 之内，而 SwiGLU 在同一取值下继续无界增长。</p>
+
+<details>
+<summary>三点代入的完整过程</summary>
+<p>标量例子里两支的线性输出都取 $a$，于是门支是 $4\tanh(a/4)\cdot\sigma(a)$，值支是 $25\tanh(a/25)$，输出是两者之积。$\sigma(a)=1/(1+e^{-a})$。</p>
+<ol>
+<li>$a=0$：门支 $4\tanh(0)\cdot\sigma(0)=4\times 0\times 0.5=0$，值支 $25\tanh(0)=0$，输出 $0\times 0=0$。</li>
+<li>$a=10$：$\tanh(2.5)\approx 0.9866$，门支 $\approx 4\times 0.9866\times 0.99995\approx 3.9463$；$\tanh(0.4)\approx 0.3799$，值支 $\approx 25\times 0.3799\approx 9.4987$；输出 $\approx 3.9463\times 9.4987\approx 37.4846$。</li>
+<li>$a=100$：$\tanh(25)\approx 1$，门支 $\approx 4\times 1\times 1=4$；$\tanh(4)\approx 0.99933$，值支 $\approx 25\times 0.99933\approx 24.9832$；输出 $\approx 4\times 24.9832\approx 99.9329$，已贴近上界 $100$。</li>
+<li>对照 SwiGLU 在 $a=100$：门支 $100\times\sigma(100)\approx 100$，值支 $100$，输出 $\approx 100\times 100=10000$。</li>
+</ol>
+</details>
+
+<details class="code-details">
+<summary>用代码核对</summary>
+<div class="code-block"><pre><code class="language-python">import math
+
+beta1, beta2 = 4, 25
+sig = lambda z: 1 / (1 + math.exp(-z))
+
+for a in (0, 10, 100):
+    gate = beta1 * math.tanh(a / beta1) * sig(a)
+    up = beta2 * math.tanh(a / beta2)
+    print(f"a={a:3d} gate={gate:.4f} up={up:.4f} y={gate * up:.4f}")</code></pre></div>
+<div class="code-block"><pre><code class="language-text">a=  0 gate=0.0000 up=0.0000 y=0.0000
+a= 10 gate=3.9463 up=9.4987 y=37.4846
+a=100 gate=4.0000 up=24.9832 y=99.9329</code></pre></div>
+</details>
+
+<h2 id="s4">4. 近原点像 SwiGLU、正侧饱和到上界</h2>
+
+<p>softcap 在原点附近近似恒等：对 $|z|\ll\beta$，$\beta\tanh(z/\beta)=z+O(z^3/\beta^2)$，即比 $\beta$ 小得多的输入被原样传过。代进公式：$|W_g x|\ll\beta_1$ 时门支的 softcap 退化为 $W_g x$，门支回到 Swish 门 $W_g x\odot\sigma(W_g x)$；$|W_u x|\ll\beta_2$ 时值支退化为 $W_u x$。两支都近原点时，SiTU-GLU 的一阶项与 SwiGLU 相同。</p>
+
+<p>远点则被限制在有限区间里。$\|\cdot\|_\infty$ 是各坐标绝对值里最大的那个。因为 $|\tanh(z)|&lt;1$ 且 $0&lt;\sigma(z)&lt;1$，每一维的输出都满足</p>
+
+<p>$$\|\mathrm{SiTU\text{-}GLU}(x)\|_\infty\le\beta_1\beta_2=100.$$</p>
+
+<p>正侧输入很大时，输出趋近这个上界；当 $\beta_1,\beta_2\to\infty$ 时，$\beta\tanh(z/\beta)\to z$，SiTU-GLU 逐点收敛到 SwiGLU。</p>
+
+<details>
+<summary>局部展开的来历</summary>
+<p>$\tanh$ 在原点附近可以用泰勒级数展开。</p>
+<ol>
+<li>先写 $\tanh$ 在原点附近的展开。由 $\tanh u=\frac{e^{u}-e^{-u}}{e^{u}+e^{-u}}$，把 $e^{\pm u}$ 都展到 $u^3$ 项，得 $\tanh u=u-\frac{u^3}{3}+O(u^5)$。</li>
+<li>令 $u=z/\beta$，代入：$\beta\tanh(z/\beta)=\beta\Big[\frac{z}{\beta}-\frac{1}{3}\Big(\frac{z}{\beta}\Big)^3+O\Big(\Big(\frac{z}{\beta}\Big)^5\Big)\Big]=z-\frac{z^3}{3\beta^2}+O\Big(\frac{z^5}{\beta^4}\Big)$。</li>
+<li>当 $|z|\ll\beta$ 时 $\frac{z^3}{3\beta^2}$ 相对 $z$ 是高阶小量，所以 $\beta\tanh(z/\beta)=z+O\big(z^3/\beta^2\big)$。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>近原点一阶等价于 SwiGLU，前提是 $|W_g x|\ll\beta_1$ 且 $|W_u x|\ll\beta_2$：输入一旦和 $\beta$ 同量级，高阶项就不能再丢。上界的数值 $100$ 只在 $\beta_1=4$、$\beta_2=25$ 这组设定下成立。</p>
+
+<p>和直接对门预激活（门分支的线性输出 $W_g x$）做硬截断（把超过阈值的值截平）相比，softcap 的区别在梯度：硬截断在饱和后梯度为零，平滑饱和在离开饱和边界处仍保留非零梯度。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Kimi Team. Kimi K3: Open Frontier Intelligence. arXiv:2607.24653v2, 2026. <a href="https://arxiv.org/abs/2607.24653">https://arxiv.org/abs/2607.24653</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
