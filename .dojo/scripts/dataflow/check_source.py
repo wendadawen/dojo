@@ -227,6 +227,12 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
 
             # ① 键名紧跟形状
             for m in NAME_THEN_SHAPE.finditer(blob):
+                # 形状后面紧跟键注（②/③ 的形态）时，前面的标识符不是键名——
+                # 那可能只是说明文字或节点名的尾巴（如 `... 源码里叫 norm.weight`
+                # 这种符号栏格式，或节点名 attn_sink）。交给 ②/③ 按括号里的键名处理，
+                # 别把它当成「键名紧跟形状」而凭空报「键不在形状表里」。
+                if re.match(r"\s*[（(](?:检查点键|源码里叫)", blob[m.end():m.end() + 12]):
+                    continue
                 key = resolve(placeholder(m.group(1)))
                 if key is None:
                     continue
@@ -311,8 +317,8 @@ def plan_rows(text: str):
                 yield head, no, dict(zip(cols, cells))
 
 
-# 行区间分隔符：半角连字符和 en-dash 都认（手写常敲成 en-dash）
-RANGE = r"[-\u2013]"
+# 行区间分隔符：半角连字符、en-dash、em-dash、波浪都认（手写常敲成后三种）
+RANGE = r"[-\u2013\u2014~]"
 
 
 def parse_refs(cell: str) -> list[tuple[str, int, int]]:
@@ -522,6 +528,20 @@ def selftest() -> list[tuple[str, bool]]:
           "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
                      "detail": "$W$ [16, 16]（检查点键 gate.wieght）"}]}],
         shapes)
+    # 形态③：裸形状 + 键注（无 $符号$）。检查③的护栏只针对 $...$，这条走 SHAPE_THEN_SRC
+    e_f3, m_f3 = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                     "detail": "可学习参数 [64]（检查点键 layers.{i}.attn.attn_sink）"}]}],
+        {"layers.{i}.attn.attn_sink": [64]})
+    checks.append(("裸形状 + 键注能对上", not e_f3 and m_f3 == 1))
+    # 同一形态，形状前以标识符结尾（符号栏格式的尾巴）不该把那个标识符当键名
+    e_f3b, m_f3b = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "attn_sink", "kind": "op", "shape": "16 → 16",
+                     "detail": "[64]（检查点键 layers.{i}.attn.attn_sink）"}]}],
+        {"layers.{i}.attn.attn_sink": [64]})
+    checks.append(("裸形状 + 键注：前面是标识符也不误报键名", not e_f3b and m_f3b == 1))
     checks.append(("同一个错键只报一条",
                    len([e for e in e_dup if "gate.wieght" in e]) == 1))
 
@@ -602,6 +622,10 @@ def selftest() -> list[tuple[str, bool]]:
         # 顿号分隔的行号
         checks.append(("计划源码位置：顿号分隔的行号能解析",
                        _refs_ok()))
+        # 行区间分隔符：半角、en-dash、em-dash、波浪都认
+        checks.append(("计划源码位置：四种行区间分隔符都能解析",
+                       all(parse_refs(f"m.py:1{c}3") == [("m.py", 1, 3)]
+                           for c in "-\u2013\u2014~")))
         # 全角冒号是手写常见写法，该认；不能因此免检，也不能误报
         checks.append(("计划源码位置：全角冒号的源码列能解析",
                        not run(good.replace("m.py:2", "m.py：2"))))
@@ -660,6 +684,11 @@ def main() -> int:
         return 2
 
     if args.page.suffix == ".md":
+        if args.source or args.shapes or args.names_only:
+            print("error: 传计划文件（.md）时只用 --source-root；"
+                  "--source/--shapes/--names-only 是对页面（.html）的核查，换个命令跑",
+                  file=sys.stderr)
+            return 2
         if not args.source_root or not args.source_root.is_dir():
             print("error: 检查计划文件要用 --source-root 指定源码目录", file=sys.stderr)
             return 2
@@ -687,12 +716,16 @@ def main() -> int:
         label, sep, path = str(raw).partition("=")
         if not sep:
             label, path = "", label
-        elif not label.strip():
-            # `=path` 或 `  =path`：标签是空白，语义上当没带标签
-            label = ""
+        else:
+            # 标签首尾空白一律去掉；去掉后为空（`=path`、`  =path`）就当没带标签。
+            # 否则 ' block =L2.py' 的 ' block' 既不匹配视图、又会静默退回，成漏检。
+            label = label.strip()
         p = Path(path)
         if not p.exists():
             print(f"error: 源码不存在: {p}", file=sys.stderr)
+            return 2
+        if not p.is_file():
+            print(f"error: --source 要指向源码文件，不是目录: {p}", file=sys.stderr)
             return 2
         body = p.read_text(encoding="utf-8", errors="ignore")
         sources[path] = body
@@ -720,9 +753,8 @@ def main() -> int:
             heading = (view.get("title", "") + " " + view.get("label", "")).lower()
             picked = [body for label, body in labeled_bodies.items() if label.lower() in heading]
             if not picked:
-                # 标签只是「限定」：没有标签命中这个视图时，用不带标签的源码比对。
-                # 若所有源码都带了标签，universal 为空，才退回用全部——否则这一视图
-                # 一份源码都不核，成了静默免检。
+                # 没有标签命中这个视图：用不带标签的源码比对。若所有源码都带了标签
+                # （universal 为空），退回用全部源码，免得这一视图一份都不核。
                 picked = universal or list(sources.values())
             if picked:
                 errors += check_names([view], {"view": "\n".join(picked)})

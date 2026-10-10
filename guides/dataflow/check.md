@@ -24,6 +24,8 @@
 
     python3 .dojo/scripts/site/check.py wiki/<name>/index.html
 
+第 1、2 步要靠外部源码和形状表，CI 跑不了（它只跑 `site/check.py` 和两个脚本的 `--selftest`）。**CI 绿不等于这三步过了**——交付前必须自己在本地把三步都跑过，第 1、2 步尤其不能省。
+
 ## 改
 
 - 页面内容改 `dataflow.md` 后重新生成，再按本页从头核查。

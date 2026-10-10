@@ -328,9 +328,9 @@ def check_plan(views: list[dict], config_groups=None, config_note=None, meta=Non
                                                {"detail": f"{name}\n{value}"})
     for i, line in enumerate(config_note or [], 1):
         errors += _stray_underscore_escape(f"前提/第 {i} 条", {"detail": line})
-    # 页面信息（描述、摘要）也进页面 head，同样查越界下划线
+    # 页面信息（标题、描述、摘要）都进页面 head，同样查越界下划线
     if meta:
-        for key, zh in (("description", "描述"), ("summary", "摘要")):
+        for key, zh in (("title", "标题"), ("description", "描述"), ("summary", "摘要")):
             if meta.get(key):
                 errors += _stray_underscore_escape(f"页面信息/{zh}", {"detail": meta[key]})
     errors += _no_generic_class_figure(views)
@@ -681,6 +681,8 @@ def selftest() -> list[tuple[str, bool]]:
              TOY_PLAN.replace("- 不传缓存", "- 不传\\_缓存")),
             ("页面信息的描述里下划线写成 \\_ 也应当报错",
              TOY_PLAN.replace("- 描述：自检页。", "- 描述：见 hidden\\_size。")),
+            ("页面标题里的下划线写成 \\_ 也应当报错",
+             TOY_PLAN.replace("# ToyModel", "# Toy\\_Model")),
             ("说明里写公式应当报错",
              TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
                               "| blk | 公式 | $x + f(x)$，x 是输入 |\n"
