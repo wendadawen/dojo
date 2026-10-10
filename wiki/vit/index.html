@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Vision Transformer 把图像切成固定大小的小块，每块线性映射成一个向量排成序列，交给标准的 Transformer 编码器（一层层在位置之间交换信息的网络）做图像分类。">
+  <meta name="dojo:summary" content="把 $H\times W$ 的图像切成 $N=HW/P^2$ 个 $P\times P$ 的小块当作 token，用标准 Transformer 编码器处理；在 JFT-300M 这类大数据上预训练后，它在多个图像分类基准上匹配或超过当时最好的卷积网络。">
+  <meta name="dojo:topics" content="模型结构, 注意力机制">
+  <meta name="dojo:tag" content="视觉与多模态">
+  <title>Vision Transformer</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Vision Transformer</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Vision Transformer</h1>
+<p class="reading-time">正文 1,779 字 · 约 6 分钟阅读</p>
+
+<p>Vision Transformer（ViT）是一种图像分类模型。它把一张图像切成大小相同的小块，每块线性映射成一个向量，排成一串后交给标准的 Transformer 编码器处理，得到整张图像的表示，再经一个分类头（把表示映成各类别分数的层）输出类别分数。图像在这里被当成一串小块，和自然语言处理里的一串词等价，编码器就是处理文本用的标准 Transformer（见<a href="../standard-attention/index.html">标准注意力</a>）。它在大数据集上预训练（先在大量数据上训练一个通用模型）后，在多个图像分类基准上匹配或超过当时最好的卷积网络（用卷积核在图像上逐层滑动、提取局部特征的网络）。</p>
+
+<h2 id="s1">1. 把图像变成一段序列</h2>
+
+<h3 id="s1-1">1.1 分块与线性嵌入</h3>
+
+<p>标准 Transformer 的输入是一维的向量序列，图像是二维的。ViT 把 $H\times W$ 的图像按 $P\times P$ 切成不重叠的小块，一共 $N=HW/P^2$ 块：$H$、$W$ 是图像的高和宽，$P$ 是小块边长。把每块展平成一个长度 $P^2\cdot C$ 的向量，$C$ 是通道数（灰度图 $C=1$，RGB 图 $C=3$），再乘一个可学习的矩阵 $\mathbf{E}\in\mathbb{R}^{(P^2\cdot C)\times D}$（取值靠训练得到），把它映到固定的 $D$ 维，这一步的输出叫小块嵌入。$N$ 是小块序列的长度，拼上分类 token（一个专门汇总整张图像的可学习向量）后，送进编码器的是 $N+1$ 个向量。</p>
+
+<details>
+<summary>一块 4×4 图像走完切块与投影</summary>
+<p>取一张 $4\times4$ 的灰度图（$H=W=4$、$C=1$），小块边长 $P=2$，于是块数 $N=4\times4/2^2=4$，每块展平后长度 $P^2\cdot C=4$。投影矩阵取 $D=3$：</p>
+<p>$$\mathbf{E}=\begin{pmatrix}1&amp;0&amp;1\\0&amp;1&amp;1\\1&amp;1&amp;0\\0&amp;0&amp;1\end{pmatrix}$$</p>
+<p>按行切块、展平、乘 $\mathbf{E}$：</p>
+<ol>
+<li>四块按从左到右、从上到下的顺序，展平为 $(1,2,5,6)$、$(3,4,7,8)$、$(9,10,13,14)$、$(11,12,15,16)$。</li>
+<li>第 1 块乘 $\mathbf{E}$：第 1 个分量 $1\cdot1+2\cdot0+5\cdot1+6\cdot0=6$，第 2 个分量 $1\cdot0+2\cdot1+5\cdot1+6\cdot0=7$，第 3 个分量 $1\cdot1+2\cdot1+5\cdot0+6\cdot1=9$，得 $(6,7,9)$。</li>
+<li>其余三块同样计算，得第 2 块 $(10,11,15)$、第 3 块 $(22,23,33)$、第 4 块 $(26,27,39)$。</li>
+</ol>
+<div class="code-block"><pre><code class="language-python">E = [[1, 0, 1], [0, 1, 1], [1, 1, 0], [0, 0, 1]]
+img = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
+patches = []
+for i in (0, 2):
+    for j in (0, 2):
+        patches.append([img[i][j], img[i][j + 1], img[i + 1][j], img[i + 1][j + 1]])
+for k, p in enumerate(patches, 1):
+    emb = [sum(p[r] * E[r][c] for r in range(4)) for c in range(3)]
+    print("第", k, "块", p, "-&gt;", emb)</code></pre></div>
+<div class="code-block"><pre><code class="language-text">第 1 块 [1, 2, 5, 6] -&gt; [6, 7, 9]
+第 2 块 [3, 4, 7, 8] -&gt; [10, 11, 15]
+第 3 块 [9, 10, 13, 14] -&gt; [22, 23, 33]
+第 4 块 [11, 12, 15, 16] -&gt; [26, 27, 39]</code></pre></div>
+<p>四个小块嵌入各是一个 $D=3$ 的向量。</p>
+</details>
+
+<h3 id="s1-2">1.2 分类 token 与位置嵌入</h3>
+
+<p>位置嵌入加到小块嵌入上，把每块在图像中的位置信息带进序列。ViT 用的是一维位置嵌入，按小块展平的先后编号；它没有用带二维结构的位置嵌入，因为没有观察到明显收益（位置编码的通用做法见<a href="../positional-encoding/index.html">位置编码</a>）。分类则靠一个专门的可学习向量：在小块嵌入序列的最前面拼一个可学习的 $\mathbf{x}_\text{class}$，叫分类 token，作用与文本模型放在句首的特殊标记相同；取它在编码器最后一层的输出作为整张图像的表示。</p>
+
+<details>
+<summary>分类 token 与位置嵌入加进序列</summary>
+<p>接上例。送进编码器的向量数是小块数加一，即 $N+1=5$。分类 token 取 $(1,1,1)$，位置嵌入取 $5\times3$ 的小矩阵：</p>
+<p>$$\mathbf{E}_{pos}=\begin{pmatrix}0&amp;0&amp;0\\1&amp;0&amp;0\\0&amp;1&amp;0\\0&amp;0&amp;1\\1&amp;1&amp;0\end{pmatrix}$$</p>
+<p>把分类 token 拼在最前，再逐位置加上位置嵌入：</p>
+<ol>
+<li>第一行是分类 token 加它的位置嵌入：$(1,1,1)+(0,0,0)=(1,1,1)$。</li>
+<li>第 1 块：$(6,7,9)+(1,0,0)=(7,7,9)$。</li>
+<li>第 2 块：$(10,11,15)+(0,1,0)=(10,12,15)$。</li>
+<li>第 3 块：$(22,23,33)+(0,0,1)=(22,23,34)$。</li>
+<li>第 4 块：$(26,27,39)+(1,1,0)=(27,28,39)$。</li>
+</ol>
+<div class="code-block"><pre><code class="language-python">emb = [[6, 7, 9], [10, 11, 15], [22, 23, 33], [26, 27, 39]]
+x_class = [1, 1, 1]
+pos = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0]]
+seq = [x_class] + emb
+z0 = [[seq[i][c] + pos[i][c] for c in range(3)] for i in range(5)]
+for i, row in enumerate(z0):
+    print(i, row)</code></pre></div>
+<div class="code-block"><pre><code class="language-text">0 [1, 1, 1]
+1 [7, 7, 9]
+2 [10, 12, 15]
+3 [22, 23, 34]
+4 [27, 28, 39]</code></pre></div>
+<p>得到的 $\mathbf{z}_0$ 是 $5\times3$ 的矩阵，就是送进编码器的那串向量。</p>
+</details>
+
+<h2 id="s2">2. 编码器与分类头</h2>
+
+<p>编码器沿用标准 Transformer：$L$ 层堆叠，每层两部分，多头自注意力（把自注意力分成多个头并行做，见<a href="../standard-attention/index.html">标准注意力</a>）在位置之间交换信息，前馈网络（MLP，对每个位置各算各的）对每个位置单独处理。两个子层都先把输入做 LayerNorm（按每个向量自己的均值方差归一），再经过子层，输出以残差连接加回输入；MLP 是两层，中间用 GELU 激活（一种平滑的非线性函数）。最后一层的输出再取分类 token 那个位置、做一次 LayerNorm，得到图像表示。分类头把图像表示映到类别分数：预训练用的是带一个隐层（两层 MLP 的中间一层）的 MLP。</p>
+
+<details>
+<summary>编码器一层的计算式</summary>
+<p>下标 $\ell$ 是层号，$L$ 是层数，$\mathbf{z}_0$ 是嵌入后的序列，$\mathbf{z}'_\ell$、$\mathbf{z}_\ell$ 是第 $\ell$ 层两个子层的输出；MSA 是多头自注意力，LN 是 LayerNorm，MLP 是前馈网络；$\mathbf{z}_L^0$ 的上标 0 指分类 token 所在的那一行（序列里排第一）。</p>
+<p>$$\mathbf{z}'_\ell = \mathrm{MSA}(\mathrm{LN}(\mathbf{z}_{\ell-1})) + \mathbf{z}_{\ell-1},\qquad \ell=1\ldots L$$</p>
+<p>$$\mathbf{z}_\ell = \mathrm{MLP}(\mathrm{LN}(\mathbf{z}'_\ell)) + \mathbf{z}'_\ell,\qquad \ell=1\ldots L$$</p>
+<p>$$\mathbf{y} = \mathrm{LN}(\mathbf{z}_L^0)$$</p>
+</details>
+
+<h2 id="s3">3. 与卷积网络差在归纳偏置</h2>
+
+<p>卷积网络和 ViT 的差别在归纳偏置，也就是模型在结构里预先假定了数据的哪些性质。卷积网络的每一层都自带三条与图像相符的假定：局部性（每个输出只看输入的一小块邻域）、二维邻域结构（相邻的像素在网格上互为邻居）、平移等变（图像平移后输出跟着平移）。ViT 的结构里这些假定大多被去掉了：只有 MLP 仍是局部的、对平移等变，自注意力在每个位置都能看到全图，是全局的。二维结构只在两处被人工加进模型：开头把图像切成小块，以及微调（在目标任务上继续训练）时按分辨率调整位置嵌入。位置嵌入在初始化时不带任何二维位置信息，小块之间的空间关系要靠训练从数据里学。</p>
+
+<h2 id="s4">4. 预训练与高分辨率微调</h2>
+
+<p>ViT 通常先在一个大数据集上预训练，再迁移到目标任务上微调：预训练是在大量图像上学一个通用模型，微调是把这个模型在某个具体数据集上继续训练。微调时把预训练用的分类头整个去掉，换成一个 $D\times K$ 的线性层（一层矩阵变换）、初始化为零，$K$ 是目标任务的类别数。微调常在比预训练更高的分辨率上做，效果更好。保持小块边长不变，分辨率提高会让块数、也就是小块序列长度变大；编码器能接受任意长度（受硬件内存限制），但预训练好的位置嵌入可能不再有意义，所以对位置嵌入做二维插值：按每块在原图中的坐标，在原来的位置嵌入上重新取值。</p>
+
+<h2 id="s5">5. 数据规模决定成败</h2>
+
+<p>ViT 的成败取决于预训练数据量。在中等数据集上从头训练、不加强正则（防止模型过拟合的约束）时，它的准确率比同规模卷积网络低几个百分点；这是因为它缺少卷积网络的归纳偏置，数据不够时不容易泛化（在新数据上表现好）。数据量增大后结论相反：用随机抽出的 9M、30M、90M 子集做实验，ViT 在小数据上比同算力的卷积网络更容易过拟合（在训练数据上表现持续变好、在新数据上变差），但在 90M 以上的子集上反超；数据量足够大时，大规模训练弥补了归纳偏置的缺失，ViT 在多个图像识别基准上接近或超过当时最好的卷积网络。</p>
+
+<details>
+<summary>预训练数据量越大，同一个模型的准确率越高</summary>
+<p>同一个模型（ViT-B/16，其中 /16 指小块边长 16 像素）在不同大小的预训练数据上，ImageNet（一个大规模图像分类数据集）准确率随数据量上升：1.3M 张时 77.91，14M 张时 83.97，300M 张时 84.15。</p>
+</details>
+
+<h2 id="s6">6. 计算代价与规模权衡</h2>
+
+<p>固定预训练数据后比较不同规模，ViT 在同等性能下用的预训练算力比卷积网络少大约 2 到 4 倍（在五个数据集上平均），在实验的算力范围内还没有看到性能饱和。改变小块大小会同时改变序列长度与算力：用更小的小块（序列更长）稳健地提升性能，但不增加参数，改用更小的小块算力代价更高。</p>
+
+<details>
+<summary>ViT 三个规模的配置与预训练算力</summary>
+<p>层数、隐藏维度 $D$、MLP 维度、注意力头数和参数量；最后一列是在大规模数据上预训练的算力，单位 exaFLOPs（$10^{18}$ 次浮点运算）。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>模型</th><th>层数</th><th>D</th><th>MLP</th><th>头数</th><th>参数</th><th>预训练算力</th></tr></thead>
+<tbody>
+<tr><td>ViT-B/16</td><td>12</td><td>768</td><td>3072</td><td>12</td><td>86M</td><td>224</td></tr>
+<tr><td>ViT-L/16</td><td>24</td><td>1024</td><td>4096</td><td>16</td><td>307M</td><td>783</td></tr>
+<tr><td>ViT-H/14</td><td>32</td><td>1280</td><td>5120</td><td>16</td><td>632M</td><td>4262</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h2 id="s7">7. 适用条件与边界</h2>
+
+<p>ViT 成立的前提是有大规模预训练数据：数据不够时它缺少卷积网络的归纳偏置，表现不如同规模的卷积网络；从头训练时还需要较强的正则。它的代价是要先在大数据上预训练，才能追赶或超过卷积网络。两种容易出现的误解：一是以为 ViT 把图像的二维结构建进了模型，实际上二维结构只在切块和微调调分辨率两处注入；二是以为 ViT 在任何数据量下都胜过卷积网络，实际上在中等数据集上它更差，只有数据量足够大时才反超。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszkoreit, Neil Houlsby. An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale. ICLR 2021. arXiv:2010.11929v2, 2021. <a href="https://arxiv.org/abs/2010.11929">https://arxiv.org/abs/2010.11929</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

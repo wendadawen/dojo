@@ -1,0 +1,1 @@
+- paper/arxiv-v2.pdf、paper/src-v2/、paper/arxiv-v2.txt｜论文｜https://arxiv.org/abs/2010.11929v2｜v2（2021-06-03）｜2026-10-10｜An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale，提出 Vision Transformer（ViT）：把图像切成小块当 token 喂给标准 Transformer 做图像分类；LaTeX 源码在 src-v2/，纯文本快照 arxiv-v2.txt
