@@ -35,7 +35,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
 from common import (  # noqa: E402
-    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SKIP_HEADS, SUB_SECTIONS, report,
+    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, report,
 )
 from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
 
