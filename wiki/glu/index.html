@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="GLU 是一种逐维度的乘性门控单元：把输入做两个线性投影，其中一个过 sigmoid 压到 0 到 1 之间当门，再与另一个逐元素相乘，让每个维度各自决定放行多少。">
+  <meta name="dojo:summary" content="$h(\mathbf{X}) = (\mathbf{X}\ast\mathbf{W}+\mathbf{b}) \otimes \sigma(\mathbf{X}\ast\mathbf{V}+\mathbf{c})$，一条线性投影乘上一道 sigmoid 门，既保留非线性又给梯度留一条不被压的线性通路。">
+  <meta name="dojo:topics" content="模型结构, 训练与优化">
+  <meta name="dojo:tag" content="模型架构">
+  <title>GLU</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">GLU</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">GLU</h1>
+<p class="reading-time">正文 778 字 · 约 3 分钟阅读</p>
+
+<p>GLU 是一种逐维度的乘性门控单元，它按输入内容逐维度决定放行还是压低哪些信息。用法是把输入算成两个同样长的向量，其中一个的每个分量压到 0 到 1 之间当门，再与另一个逐元素相乘。压到 0 到 1 之间用的是 sigmoid，记作 $\sigma$，它把任意实数映到 0 到 1 之间。需要这么一个单元，是因为门控让网络自己控制哪些信息往下传，也给梯度留了一条不被压的通路。</p>
+
+<h2 id="s1">1. 定义</h2>
+
+<p>设某一层的输入是 $\mathbf{X}$，形状是「位置数乘特征维」：若干个位置（例如一句话里的若干个词）各带一个特征向量。GLU 把输入分别做两次线性投影，每次用一组可学的权重和偏置：先与权重按位置加权求和，再加上一组可学偏置（常数向量）。这两次投影各得一个同形的张量（多维数组），一个当值，另一个过 sigmoid 得门，两者逐元素相乘，就是这一层的输出：</p>
+
+<p>$$h(\mathbf{X}) = (\mathbf{X}\ast\mathbf{W}+\mathbf{b}) \otimes \sigma(\mathbf{X}\ast\mathbf{V}+\mathbf{c})$$</p>
+
+<p>$\mathbf{W}$、$\mathbf{b}$ 是值那一组的权重和偏置，$\mathbf{V}$、$\mathbf{c}$ 是门那一组；$\ast$ 是卷积，即与权重按位置加权求和，$\mathbf{b}$、$\mathbf{c}$ 分别加在两次卷积的结果上；$\otimes$ 是逐元素相乘，$\sigma$ 是 sigmoid。门的每个分量落在 0 与 1 之间（不含两端），它逐维度缩放值：门趋近 1，对应维度接近原样通过；门趋近 0，对应维度接近被挡掉。</p>
+
+<h2 id="s2">2. 一个手算的小例子</h2>
+
+<p>取输入 $\mathbf{X} = (1,\ 2)$，两个投影都用简单的 2×2 权重，算一遍 GLU。</p>
+
+<details>
+<summary>手算的全过程</summary>
+<p>输入是 2 维向量 $(1,\ 2)$。这里卷积核（与输入做卷积的那组权重）只覆盖一个位置，投影就是矩阵乘，两组权重都取 2×2 的矩阵，偏置取零。</p>
+<ol>
+<li>值投影 $\mathbf{W}$ 取单位阵、$\mathbf{b} = (0,\ 0)$：值 $= \mathbf{X}\mathbf{W}+\mathbf{b} = (1,\ 2)$。</li>
+<li>门投影 $\mathbf{V}$ 取 $\begin{pmatrix}1 &amp; 0\\0 &amp; -1\end{pmatrix}$、$\mathbf{c} = (0,\ 0)$：门的线性量 $= \mathbf{X}\mathbf{V}+\mathbf{c} = (1,\ -2)$。</li>
+<li>过 sigmoid：$\sigma(1) = 0.7311$，$\sigma(-2) = 0.1192$，门 $= (0.7311,\ 0.1192)$。</li>
+<li>逐元素相乘：输出 $= (1 \times 0.7311,\ 2 \times 0.1192) = (0.7311,\ 0.2384)$。</li>
+</ol>
+</details>
+
+<p>第一维的门偏大，值被压低一些；第二维的门很小，值被压得小得多。</p>
+
+<h2 id="s3">3. 它为什么给梯度留了一条线性通路</h2>
+
+<p>sigmoid 门控把它的导数乘进了梯度。GLU 的输出对输入的导数可以拆成两项，其中一项只带 sigmoid 本身、不带它的导数。</p>
+
+<details>
+<summary>导数的推导与两项的来历</summary>
+<p>把两个投影和偏置都暂时取成恒等（$\mathbf{W}=\mathbf{V}=\mathbf{I}$、$\mathbf{b}=\mathbf{c}=0$），公式缩成 $\mathbf{X}\otimes\sigma(\mathbf{X})$，对它用乘法法则（$\nabla$ 是求导算子，$\nabla\mathbf{X}$ 是上一层回传到本层的梯度）：</p>
+<p>$$\nabla[\mathbf{X} \otimes \sigma(\mathbf{X})] = \nabla\mathbf{X} \otimes \sigma(\mathbf{X}) + \mathbf{X} \otimes \sigma'(\mathbf{X}) \nabla \mathbf{X}$$</p>
+<ol>
+<li>第一项 $\nabla\mathbf{X} \otimes \sigma(\mathbf{X})$ 只乘 sigmoid 的值，不带 $\sigma'$。门开着（$\sigma$ 接近 1）时，这一项接近 $\nabla\mathbf{X}$，梯度不被缩放地传过这一层。</li>
+<li>第二项 $\mathbf{X} \otimes \sigma'(\mathbf{X}) \nabla\mathbf{X}$ 带 $\sigma'$。门饱和到 1 时 $\sigma'$ 趋近 0，这一项消失；梯度仍可通过第一项。</li>
+</ol>
+</details>
+
+<p>这条通路不带会趋近 0 的导数，梯度经过它时不被缩小。</p>
+
+<h2 id="s4">4. 和 tanh 门控的区别</h2>
+
+<p>tanh 是把实数映到 $-1$ 到 $1$、两端趋平的函数。把值那一支再套上 tanh、门仍过 sigmoid，得到 tanh 门控；它输出对输入的导数两项都带这种两端趋平的导数，输入很大时都趋近 0，没有 GLU 那条不被缩放的线性通路。</p>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>那条不被缩放的线性通路只在门被激活时成立：门饱和到 0 时，$\sigma$ 也接近 0，通路随之断开，梯度在这一维上同样传不回去。门控本身要增加参数：值、门两支各有一组权重，比不门控的单个线性层多，比较时要按相同参数量对齐。另外，门逐维度、逐位置地缩放输入，本身不把不同位置的信息混起来；在用它搭成的网络里，上下文加长带来的困惑度（衡量语言模型预测下一个词的不确定程度）改善会越来越小。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Yann N. Dauphin, Angela Fan, Michael Auli, David Grangier. Language Modeling with Gated Convolutional Networks. ICML 2017. <a href="https://arxiv.org/abs/1612.08083">https://arxiv.org/abs/1612.08083</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

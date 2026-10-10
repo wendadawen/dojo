@@ -1,0 +1,1 @@
+- paper/arxiv-v3.pdf、paper/src-v3/、paper/arxiv-v3.txt｜论文｜https://arxiv.org/abs/1612.08083v3｜v3（2017-09-08，ICML 2017）｜2026-10-10｜Language Modeling with Gated Convolutional Networks，提出门控线性单元（GLU）：用一个 sigmoid 门逐元素缩放一个线性投影；LaTeX 源码在 src-v3/（main.tex），纯文本快照 arxiv-v3.txt
