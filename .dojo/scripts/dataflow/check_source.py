@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from common import SKIP_HEADS, is_skip_head, report  # noqa: E402
+from common import is_skip_head, op_shape_error, report  # noqa: E402
 from build_page import split_cells  # noqa: E402  （两个脚本用同一套拆列）
 
 # 节点名里允许出现、但不属于「源码标识符」的词：
@@ -315,12 +315,11 @@ def check_structure(views: list[dict]) -> list[str]:
             if n.get("drill") and n["drill"] not in view_ids:
                 errors.append(f"[{v['id']}/{n['id']}] 下钻目标 {n['drill']} 不存在")
             shape = (n.get("shape") or "").strip()
-            if n.get("kind") == "op" and ("→" in shape or "->" in shape):
-                # 箭头两边都要有完整形状——与 build_page 同一判据，别只查左边
-                for side, which in zip(re.split(r"→|->", shape), ("原来", "变完")):
-                    if not side.strip():
-                        errors.append(f"[{v['id']}/{n['id']}] 形状箭头缺{which}的一边：{shape}")
-                        break
+            if n.get("kind") == "op":
+                # 与 build_page 共用 op_shape_error，判据只有一处
+                bad = op_shape_error(shape)
+                if bad:
+                    errors.append(f"[{v['id']}/{n['id']}] {bad}")
             for sec in n.get("fold") or []:
                 if n.get("kind") != "op":
                     errors.append(f"[{v['id']}/{n['id']}] 折叠只写在算子上")
@@ -517,10 +516,13 @@ def selftest() -> list[tuple[str, bool]]:
 
     bad = json.loads(json.dumps(views))
     bad[0]["nodes"][1]["shape"] = "→ 16"
-    checks.append(("形状箭头缺左边会报出", any("缺原来的一边" in e for e in check_structure(bad))))
+    checks.append(("形状箭头缺左边会报出", any("两边都要写完整形状" in e for e in check_structure(bad))))
     bad2 = json.loads(json.dumps(views))
     bad2[0]["nodes"][1]["shape"] = "16 →"
-    checks.append(("形状箭头缺右边会报出", any("缺变完的一边" in e for e in check_structure(bad2))))
+    checks.append(("形状箭头缺右边会报出", any("两边都要写完整形状" in e for e in check_structure(bad2))))
+    bad3 = json.loads(json.dumps(views))
+    bad3[0]["nodes"][1]["shape"] = "16 → 不变"
+    checks.append(("形状占位符（不变）也报出", any("两边都要写完整形状" in e for e in check_structure(bad3))))
 
     src = {"m.py": "def forward(self, x):\n    return self.embed_tokens(self.input_ids)\n"}
     checks.append(("名字在源码里找到就不报", not check_names(views[:1], src)))

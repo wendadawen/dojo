@@ -35,7 +35,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
 from common import (  # noqa: E402
-    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, is_skip_head, report,
+    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, op_shape_error,
+    report, skip_head_section,
 )
 from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
 
@@ -150,13 +151,9 @@ def parse(plan: Path) -> dict:
             meta["title"] = s[2:].strip()
         elif s.startswith("## "):
             head = s[3:].strip()
-            key = head.lower()
-            if key == "config.json":
-                section, sub = "config", None
-            elif key == "资料":
-                section, sub = "sources", None
-            elif key == "前提":
-                section, sub = "scope", None
+            skip = skip_head_section(head)   # 资料 / 前提 / config.json 之一
+            if skip:
+                section, sub = skip, None
             else:
                 section, sub = "view", None
                 views_raw.append({"head": head, "no": no, "nodes": [], "edges": [],
@@ -304,13 +301,9 @@ def check_plan(views: list[dict], config_groups=None, config_note=None, meta=Non
                 if not shape or shape in SHAPE_PLACEHOLDERS:
                     errors.append(f"{where}：缓存第二行要写存的是什么")
             else:
-                if "→" not in shape and "->" not in shape:
-                    errors.append(f"{where}：算子第二行要写「原来的形状 → 变完的形状」")
-                else:
-                    for side in re.split(r"→|->", shape):
-                        if not side.strip() or side.strip() in SHAPE_PLACEHOLDERS:
-                            errors.append(f"{where}：算子第二行两边都要写完整形状，现在是「{shape}」")
-                            break
+                bad = op_shape_error(shape)
+                if bad:
+                    errors.append(f"{where}：{bad}")
             errors += _stray_underscore_escape(where, n)
             errors += _formula_in_explanation(where, n)
             if n["kind"] == "op":
