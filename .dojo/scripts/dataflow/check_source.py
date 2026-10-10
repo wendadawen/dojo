@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from common import is_skip_head, op_shape_error, report  # noqa: E402
+from common import FOLD_NAMES, is_skip_head, op_shape_error, report  # noqa: E402
 from build_page import split_cells  # noqa: E402  （两个脚本用同一套拆列）
 
 # 节点名里允许出现、但不属于「源码标识符」的词：
@@ -301,9 +301,11 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
 def check_structure(views: list[dict]) -> list[str]:
     """视图数据自洽：节点 id 不重复，边端点与下钻目标都存在，算子形状箭头两边都全。
 
-    这是**页面侧兜底**：核查的是已生成的 index.html 数据，与 build_page 的同名检查
-    （查计划文件）判据对齐——手工改过页面、或计划绕过生成器时，只有这里能发现。
-    两者入口不同、判据应一致，改一处记得对另一处。"""
+    这是**页面侧兜底**，查的是已生成的 index.html 数据（手工改过页面、或计划绕过
+    生成器时是唯一防线）。它只覆盖 build_page.check_plan 的一部分，**不是等价复本**：
+    形状箭头一条与 check_plan 共用 `common.op_shape_error`，其余（跨图同 id 的形状、
+    id 字符集、张量/缓存第二行、算子第三行、折叠/面板/下划线/公式那一批）**只有
+    build_page 查，这里不查**。正常按指南先跑 build_page 不受影响。"""
     errors: list[str] = []
     view_ids = {v["id"] for v in views}
     for v in views:
@@ -324,7 +326,7 @@ def check_structure(views: list[dict]) -> list[str]:
                 if n.get("kind") != "op":
                     errors.append(f"[{v['id']}/{n['id']}] 折叠只写在算子上")
                     break
-                if sec.get("title") not in ("公式", "符号", "说明"):
+                if sec.get("title") not in FOLD_NAMES:
                     errors.append(f"[{v['id']}/{n['id']}] 折叠的名字只能是「公式」「符号」或「说明」，"
                                   f"现在是 {sec.get('title')!r}")
         for e in v["edges"]:

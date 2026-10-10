@@ -11,7 +11,8 @@ import re
 # 与 `## config.json` 都算）。这是唯一来源：build_page 按它分派、check_source
 # 按它跳过，免得一处写 lower()、一处写精确匹配而漂开。
 SKIP_HEAD_SECTIONS = {"资料": "sources", "前提": "scope", "config.json": "config"}
-SKIP_HEADS = set(SKIP_HEAD_SECTIONS)
+# 折叠的三栏；build_page 与 check_source 都用它校验折叠名
+FOLD_NAMES = ("公式", "符号", "说明")
 
 
 def op_shape_error(shape: str) -> str | None:

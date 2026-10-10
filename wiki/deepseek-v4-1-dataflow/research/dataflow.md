@@ -13,7 +13,7 @@
 - config.json：`inference/config.json`，副本在 `sources/config.json`，字段名与 `ModelArgs` 一一对应
 - 权重文件头：同一修订下 `model-00001-of-00048.safetensors` 到 `model-00048-of-00048.safetensors` 共 48 个分片，按 HTTP Range 只取头部解析，张量的形状表在 `sources/shapes.json`；同一层内同一子模块的编号相同的张量形状一致时合并成 `<名字>.{i}` 一条，Engram 两张词表形状不同，按具体层号列出
 - 模型卡：同一仓库的 `README.md`，副本在 `sources/model-card.md`（2026-10-08 取回）；参数量、压缩稀疏注意力的指标（模型卡里叫 CSA2）、KV 每 token 字节数、Engram 与 DSpark 的参数都取自它
-- 论文或技术报告：同一修订下的 `DeepSeek_V41_Tech_Report.pdf`
+- 论文或技术报告：同一修订下的 `DeepSeek_V41_Tech_Report.pdf`（未收副本，本页只据源码、config、权重头与模型卡）
 
 ## 前提
 
@@ -1011,6 +1011,8 @@
 
 | id | 名字 | 内容 |
 |---|---|---|
+| qop | 公式 | $\mathbf{Z}^I = \mathrm{unflatten}(q_r\, W^{I\top}_q, (h_I, d_I))$ |
+| qop | 符号 | $\mathbf{Z}^I$：q，索引器这条支路展成各头的 query（与同图 $\mathbf{Q}$ 不是一回事，那是索引打分）<br>$q_r$：qr，注意力那边算出的低秩 query（同图的 qr）<br>$W^I_q$：wq_b 的权重，源码里叫 wq_b.weight<br>$h_I$、$d_I$：n_local_heads 32、index_head_dim 128 |
 | kw | 公式 | $\mathbf{J} = w_k \odot \dfrac{u_k}{\sqrt{\mathrm{mean}(u_k^2) + \epsilon}}$ |
 | kw | 符号 | $\mathbf{J}$：k，归一化后的索引键<br>$u_k$：wk(latent) 的输出，本图把投影与归一化并成这一步<br>$w_k$：k_norm 的权重，源码里叫 k_norm.weight<br>$\mathrm{mean}$：在最后一维 |
 | kw | 说明 | $w_k$ [128]（检查点键 layers.{i}.attn.indexer.k_norm.weight），k_norm 是 RMSNorm，eps 取 1e-20；$W_k$ [128, 512]（检查点键 layers.{i}.attn.indexer.wk.weight），bf16。只在本层 owns_k 且 latent 非空时执行 |

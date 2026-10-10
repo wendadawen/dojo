@@ -18,7 +18,7 @@
     edge  = { from, to, label? }
     group = { label, members[], stroke? }
     note  = { at, text, dx?, dy? }
-    kind：tensor | op | cache | port
+    kind：tensor | op | cache
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "site"))
 from common import (  # noqa: E402
-    KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, op_shape_error,
+    FOLD_NAMES, KIND, META_KEYS, SHAPE_PLACEHOLDERS, SUB_SECTIONS, op_shape_error,
     report, skip_head_section,
 )
 from vocab import ALLOWED_TAGS, ALLOWED_TOPICS  # noqa: E402
@@ -262,7 +262,7 @@ def parse(plan: Path) -> dict:
                 fail(no, f"{where}里没有节点「{nid}」")
             if by_id[nid]["kind"] != "op":
                 fail(no, f"折叠只写在算子上，「{nid}」不是算子")
-            if r["名字"] not in ("公式", "符号", "说明"):
+            if r["名字"] not in FOLD_NAMES:
                 fail(no, "折叠的名字只能是「公式」「符号」或「说明」")
             if not r["内容"]:
                 fail(no, "折叠要写内容")
