@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="知识蒸馏是把一个已训练大型模型的知识迁移到小型模型的方法，做法是让小模型去拟合大模型给出的输出概率分布，而不是只拟合真实标签。">
+  <meta name="dojo:summary" content="在 softmax 里加热度 $T$，大模型输出的软目标里带着类与类之间的相似结构；小模型拟合这些软目标，常能与大模型的泛化能力接近，而规模小得多、便于部署。">
+  <meta name="dojo:topics" content="训练与优化, 概率与统计">
+  <meta name="dojo:tag" content="训练">
+  <title>知识蒸馏</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">知识蒸馏</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">知识蒸馏</h1>
+<p class="reading-time">正文 1,765 字 · 约 6 分钟阅读</p>
+
+<p>一个分类模型的最后一层通常是一个 softmax：它把模型为每个类别算出的原始分数 $z_i$ 变成一组概率 $q_i$，把所有类别的分数一起比较，</p>
+
+<p>$$q_i = \frac{\exp(z_i/T)}{\sum_j \exp(z_j/T)}$$</p>
+
+<p>其中分母对所有类别 $j$ 求和，$T$ 是温度，通常取 1。分数 $z_i$ 也叫 logit，是 softmax 的输入。</p>
+
+<p>模型在训练时要面对又大又冗余的数据，从中提取结构，这个过程不必实时，可以用很多算力；部署到大量用户时却对延迟和算力有更严的要求。同一个模型很难同时满足这两件事，所以训练阶段和部署阶段可以用不同的模型：训练时用一个又大又笨重的模型，它可以是若干个分别训练的模型组成的整体，也可以是一个很大、加了强正则化的模型（正则化指训练时给要最小化的那个函数加额外的约束项）；部署时再用一个小模型。</p>
+
+<p>知识蒸馏就是用一个训练过程连接这两个阶段的一种训练方式：先有一个已经训练好的大模型，再训练一个小模型去模仿它。它拿大模型输出的概率分布当训练目标，所以大模型叫老师，小模型叫学生；学生要模仿的正是老师输出的整个概率分布，而不是只学真实标签。</p>
+
+<h2 id="s1">1. 软目标：为什么概率分布比标签信息多</h2>
+
+<p>老师对每个输入都给所有类别打了分，即使它几乎总能给出正确答案，错误类别的概率之间也分出了大小。以数字识别为例，一张 2 的图可能被老师给 3 一个很小的概率、给 7 更小的概率，换一张潦草的 2 则可能反过来。这个「哪个错误答案更像它」的相对大小，是老师对数据相似结构的认识；真实标签只说这张图是 2，把这一层丢掉了。</p>
+
+<p>拿这样的概率分布当训练目标，叫软目标；只用真实标签当目标，叫硬目标。分布较平（各类概率差距较小）的软目标比硬目标携带的信息更多：每个样本传递的类别间关系信息更多，样本之间的梯度方差也更小。学生因此常常能用比老师少得多的数据来训练，并可以用更大的学习率（学习率是每步参数更新的幅度）。</p>
+
+<p>软目标本身有个障碍：老师很自信时，错误类别的概率接近 0，比如一个是 $10^{-6}$、一个是 $10^{-9}$，两者相差很大，却对<a href="../cross-entropy/index.html">交叉熵</a>代价函数（训练时要最小化的那个函数）几乎没有影响，因为都太接近 0。要让这部分信息起作用，就得把分布变软，办法是给 softmax 加温度。</p>
+
+<h2 id="s2">2. 温度与两个目标函数</h2>
+
+<p>最简单的蒸馏形式是：给老师的 softmax 加一个较高的温度 $T$，得到一组较软的软目标；再用同样的高温训练学生，让学生的 softmax 去逼近这些软目标；学生训练好之后，推理（用训练好的模型对新输入算出预测）时用回 $T=1$。温度只作用于每个样本的分数，不改变各类的先后顺序，只是把整体的分布压平。</p>
+
+<p>训练学生用的数据集合叫迁移集，可以用老师训练时用的那一份，也可以用一份没有标签的数据。只知道软目标还不够时，把真实标签也用上会更好：学生同时拟合两者。一种做法是让两项代价加权相加，第一项是学生与老师软目标之间的交叉熵，学生这一侧用与老师相同的高温；第二项是学生与真实标签之间的交叉熵，学生这一侧用 $T=1$，两项用的是同一组 logit；第二项的权重通常比第一项低很多。</p>
+
+<p>两项一起用时要把软目标那一项乘 $T^2$：软目标产生的梯度大小按 $1/T^2$ 缩小，乘上 $T^2$ 后，换温度做实验时两项的相对贡献大体不变。</p>
+
+<details>
+<summary>温度把分布压平：一个能手算的例子</summary>
+<p>取三个类别的分数 $z_1=2$、$z_2=1$、$z_3=0$，放进 softmax 公式算概率。</p>
+<ol>
+<li>用 $T=1$：三个指数是 $e^2$、$e^1$、$e^0$，约 $7.389$、$2.718$、$1$，和为 $11.107$，概率约 $0.665$、$0.245$、$0.090$。</li>
+<li>用 $T=4$：分数先各除以 4，得 $0.5$、$0.25$、$0$，三个指数约 $1.649$、$1.284$、$1$，和为 $3.933$，概率约 $0.419$、$0.326$、$0.254$。</li>
+<li>温度从 1 升到 4，最小的第三个类别从 $0.090$ 升到 $0.254$，分布被压平，最小的概率被放大得最明显。</li>
+</ol>
+<div class="code-block"><pre><code class="language-python">import math
+
+z = [2.0, 1.0, 0.0]
+for T in (1, 4):
+    e = [math.exp(x / T) for x in z]
+    s = sum(e)
+    print("T =", T, [round(x / s, 3) for x in e])</code></pre></div>
+<div class="code-block"><pre><code class="language-text">T = 1 [0.665, 0.245, 0.09]
+T = 4 [0.419, 0.326, 0.254]</code></pre></div>
+</details>
+
+<h3 id="s2-1">2.1 匹配 logits 是蒸馏的特例</h3>
+
+<p>学生每个样本都对每个 logit 产生一个交叉熵梯度。把学生的 logit 记为 $z_i$、老师的 logit 记为 $v_i$，老师软目标的概率记为 $p_i$、学生当前的记为 $q_i$，代价函数记为 $C$，在温度 $T$ 下这个梯度是</p>
+
+<p>$$\frac{\partial C}{\partial z_i} = \frac{1}{T}\left(q_i - p_i\right)$$</p>
+
+<p>温度相对 logit 的量级很高时，可以把指数做一阶近似；再假设每个样本的 logit 各自减去自己的均值（去均值），梯度化简为 $\frac{1}{NT^2}(z_i-v_i)$，$N$ 是类别数。也就是说，在高温极限下蒸馏等价于最小化 $\frac{1}{2}(z_i-v_i)^2$，即让学生的 logit 去匹配老师的 logit。温度较低时，蒸馏对远低于均值的 logit 关注得少：这些 logit 在训练老师时几乎不受约束、可能带有较大噪声，但也可能带着有用信息，哪一种效应更强要靠实验判断。</p>
+
+<details>
+<summary>从交叉熵梯度到匹配 logits 的推导</summary>
+<ol>
+<li>写出梯度。学生对第 $i$ 个 logit 的交叉熵梯度等于学生概率与老师概率之差再乘 $1/T$，即 $\frac{\partial C}{\partial z_i}=\frac{1}{T}(q_i-p_i)$。</li>
+<li>高温下把指数一阶近似。$e^{z_i/T}$ 在 $T$ 远大于 logit 量级时约等于 $1+z_i/T$，于是 $\frac{\partial C}{\partial z_i}\approx\frac{1}{T}\left(\frac{1+z_i/T}{N+\sum_j z_j/T}-\frac{1+v_i/T}{N+\sum_j v_j/T}\right)$，$N$ 是类别数。</li>
+<li>去均值化简。若每个样本的 logit 各自减去均值，则 $\sum_j z_j=\sum_j v_j=0$，上式化为 $\frac{\partial C}{\partial z_i}\approx\frac{1}{NT^2}(z_i-v_i)$。</li>
+<li>读出结论。$\frac{1}{2}(z_i-v_i)^2$ 对 $z_i$ 的梯度是 $z_i-v_i$，与上式只差一个正常数因子 $1/(NT^2)$，两者的极小点相同，所以在高温极限下蒸馏等价于匹配 logit。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 软目标传了什么：几个实验</h2>
+
+<p>在手写数字数据集 MNIST 上，一个小模型直接训练有 146 个错误；改在原来的训练之外再加一项拟合老师软目标的任务、并把它当作唯一的正则手段（老师是一个很大的模型，测试错误 67 个），这个学生降到 74 个错误。软目标把「怎么适应新数据」也传了过去。</p>
+
+<p>迁移集里完全没有数字 3 时，学生也几乎能认对它：错误大多来自 3 这一类学到的偏置（每个类别的可调常数）太低，把偏置调高后，学生认对了 98.6% 的 3。数据很少时软目标仍然有效：只用 3% 的语音训练数据，硬目标训练会记住训练数据、在新数据上变差，软目标训练却接近用全量数据的结果。</p>
+
+<p>在语音识别上，把 10 个模型的平均结果蒸馏到单个学生模型：学生与 10 个模型平均的表现接近，规模和单个模型一样。</p>
+
+<details>
+<summary>MNIST 与语音实验的条件和数字</summary>
+<p>MNIST：老师用全部 60000 个训练样本，两层各 1200 个整流线性单元（对输入取正部分的单元），训练时随机丢弃一部分单元（dropout）、并限制权重的大小，输入图像最多平移抖动 2 个像素；小模型两层各 800 个单元、不做正则。迁移集省略数字 3 时，学生共 206 个错误，其中 133 个落在测试集的 1010 个 3 上；把 3 的偏置加 3.5 后，学生 109 个错误，只有 14 个落在 3 上。迁移集只留 7 和 8 时，学生测试错误率 47.3%；把 7、8 的偏置减 7.6 后降到 13.2%。</p>
+<p>语音：只用 3%（约 20M 个样本）训练那个约 85M 个参数的模型，硬目标在训练数据上分对 67.3%、在新数据上 44.5%（准确率开始下降时就要早点停）；软目标在训练数据上 65.4%、在新数据上 57.0%；用全量数据的硬目标基线是 63.4%、58.9%。这里每个数都是分类正确的比例。</p>
+<p>语音识别的集成（把多个模型的输出合起来）与蒸馏：模型是 8 个中间层、每层 2560 个整流线性单元、输出 14000 个状态（即 14000 个输出类别），约 85M 个参数；单个基线在新数据上分对 58.9%、词错率（认错的词占全部词的比例）10.9%；10 个模型的平均是 61.1%、10.7%；蒸馏出的单模型是 60.8%、10.7%。</p>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>一个常见的误解是把训练好的模型里的「知识」等同于它那组参数；知识其实是输入到输出的映射，正因为如此，换一个更小的模型、用软目标去训练，它能被保留下来。</p>
+
+<p>温度不是越高越好。学生远小于老师、无法容纳老师的知识时，中间温度表现更好：把学生压到每层 30 个单元时，2.5 到 4 的温度比更高或更低的都好；学生足够大（每层 300 个单元以上）时，8 以上的温度结果接近。老师本身在新数据上做得好时，学生也往往在新数据上更好。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Geoffrey Hinton, Oriol Vinyals, Jeff Dean. Distilling the Knowledge in a Neural Network. NIPS 2014 Deep Learning Workshop; arXiv:1503.02531v1, 2015. <a href="https://arxiv.org/abs/1503.02531">https://arxiv.org/abs/1503.02531</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
