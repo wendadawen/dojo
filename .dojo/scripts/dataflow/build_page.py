@@ -268,14 +268,13 @@ def parse(plan: Path) -> dict:
         title = re.split(r"[（(]", v["head"], maxsplit=1)[0].strip()
         views.append(view(v["id"], v["label"], title, nodes, edges, info=info))
 
-    check_plan(views)
-
     config = group_rows(read_table(config_rows, ["组", "名字", "值"], "config.json 表"))
+    check_plan(views, config, scope)
     return {"plan": plan, "meta": meta, "views": views, "config_groups": config or None,
             "config_note": scope}
 
 
-def check_plan(views: list[dict]) -> None:
+def check_plan(views: list[dict], config_groups=None, config_note=None) -> None:
     """跨图与形状的机械检查：同 id 必须同形状，算子和张量的形状要写全，公式外的下划线不转义。
 
     不同图里第一行可以不一样——一处写变量名、一处写产生它的表达式，都指同一个量；
@@ -316,12 +315,19 @@ def check_plan(views: list[dict]) -> None:
             # 面板的每一格也查越界下划线（docstring 早就这么写，实际漏了）
             for name, value in row["rows"]:
                 errors += _stray_underscore_escape(f"图「{v['label']}」面板/{row['title']}/{name}",
-                                                   {"detail": value})
+                                                   {"detail": f"{name}\n{value}"})
             if row["title"] == "公式":
                 for name, value in row["rows"]:
                     if len(re.findall(r"\$[^$]*\$", value)) > 1:
                         errors.append(f"图「{v['label']}」面板/公式/{name}："
                                       "一条只放一个式子，几个式子分几条")
+    # config.json 表与「前提」不在任一视图里，单独查越界下划线
+    for title, rows in config_groups or []:
+        for name, value in rows:
+            errors += _stray_underscore_escape(f"config.json 面板/{title}/{name}",
+                                               {"detail": f"{name}\n{value}"})
+    for i, line in enumerate(config_note or [], 1):
+        errors += _stray_underscore_escape(f"前提/第 {i} 条", {"detail": line})
     errors += _no_generic_class_figure(views)
     if errors:
         raise SystemExit("\n".join(errors))
@@ -663,6 +669,11 @@ def selftest() -> list[tuple[str, bool]]:
             ("面板里的下划线写成 \\_ 也应当报错",
              TOY_PLAN.replace("| 配置 | hidden_size | 16 |",
                               "| 配置 | hidden_size | 见 hidden\\_size |")),
+            ("config.json 表里的下划线写成 \\_ 也应当报错",
+             TOY_PLAN.replace("| 规模 | hidden_size | 16 |",
+                              "| 规模 | hidden_size | 见 hidden\\_size |")),
+            ("前提里的下划线写成 \\_ 也应当报错",
+             TOY_PLAN.replace("- 不传缓存", "- 不传\\_缓存")),
             ("说明里写公式应当报错",
              TOY_PLAN.replace("| blk | 公式 | $x + f(x)$，x 是输入 |",
                               "| blk | 公式 | $x + f(x)$，x 是输入 |\n"

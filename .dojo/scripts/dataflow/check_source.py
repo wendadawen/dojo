@@ -133,8 +133,13 @@ MATH_WORDS = {
     "view", "view_as_complex", "view_as_real", "where", "zeros",
     # 数学排版约定俗成的正体算子（源码里通常没有同名函数）
     "diag", "det", "inv", "rank", "tr", "kron", "cov", "corr", "elementwise", "l1norm",
-    "l2norm", "layer_norm", "rms_norm", "Sinkhorn",
+    "l2norm", "layer_norm", "rms_norm", "layernorm", "rmsnorm", "groupnorm", "batchnorm",
+    "logsumexp", "median", "cumprod", "cummax", "hardswish", "mish", "erf", "erfc",
+    "sinkhorn",
 }
+# 比对时统一小写：页面上写 \mathrm{SiLU}、\mathrm{LayerNorm} 这类首字母大写的
+# 常见激活/归一化名，不该被判「凭空写的函数名」。
+MATH_WORDS_LOWER = {w.lower() for w in MATH_WORDS}
 
 
 def check_math_names(views: list[dict], sources: dict[str, str], shapes: dict) -> list[str]:
@@ -144,7 +149,7 @@ def check_math_names(views: list[dict], sources: dict[str, str], shapes: dict) -
     类、模块名）必须在某份源码里出现——挡「凭空造个函数名」。
     """
     errors: list[str] = []
-    blob = "\n".join(sources.values()) + "\n" + "\n".join(shapes)
+    blob = ("\n".join(sources.values()) + "\n" + "\n".join(shapes)).lower()
     for view in views:
         texts = []
         for n in view["nodes"]:
@@ -154,9 +159,9 @@ def check_math_names(views: list[dict], sources: dict[str, str], shapes: dict) -
         for text in texts:
             for m in re.finditer(r"\\mathrm\{([^}]*)\}", text):
                 name = m.group(1).replace("\\_", "_").strip()
-                if not name or name in MATH_WORDS:
+                if not name or name.lower() in MATH_WORDS_LOWER:
                     continue
-                if name in blob:
+                if name.lower() in blob:
                     continue
                 errors.append(f"[{view['id']}] 公式里的「{name}」在源码与形状表里都找不到"
                               "（凭空写的函数名？）")
@@ -166,11 +171,11 @@ def check_math_names(views: list[dict], sources: dict[str, str], shapes: dict) -
 def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[str]]:
     """页面上写的权重形状必须与给定的形状表一致。
 
-    返回 (错误, 比对上的键数, 页面上写了形状但不在形状表里的键)。
+    返回 (错误, 比对上的键数)。页面写了「检查点键 X」而 X 不在形状表里，由 resolve()
+    报错覆盖，不再另设一份「没比对上的键」清单。
     """
     errors: list[str] = []
     matched = 0
-    missing: list[str] = []
     # 两种写法都认：
     #   ① `embed.weight [129280, 5120]`——键名紧跟形状
     #   ② `$W_e$ [129280, 5120]（检查点键 embed.weight）`——式子用短符号，
@@ -241,7 +246,7 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int, list[
                 if not re.match(r"\s*[（(](?:检查点键|源码里叫)", after):
                     errors.append(f"[{view['id']}/{node['id']}] 权重形状 [{m.group(1).strip()}]"
                                   " 后面没写「（检查点键 …）」，这个形状没被核过")
-    return errors, matched, missing
+    return errors, matched
 
 
 def check_structure(views: list[dict]) -> list[str]:
@@ -278,11 +283,21 @@ def check_structure(views: list[dict]) -> list[str]:
 # ---------- 计划文件的源码位置回查 ----------
 
 def plan_rows(text: str):
-    """逐张图产出 (标题, 行号, {列名: 值} 或 None)，只读「节点」表。"""
+    """逐张图产出 (标题, 行号, {列名: 值} 或 None)，只读「节点」表。
+
+    ``` 代码围栏里的内容跳过，与 build_page.parse 同一口径——围栏里常贴示例
+    计划片段，里面的 `## X.forward` 和节点行不算真图。
+    """
     head = sub = None
     cols: list[str] = []
+    in_fence = False
     for no, line in enumerate(text.splitlines(), 1):
         s = line.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         if s.startswith("## "):
             head, sub, cols = s[3:].strip(), None, []
             yield head, no, None
@@ -364,6 +379,13 @@ def check_plan_sources(plan: Path, root: Path) -> tuple[list[str], int, int]:
         where += f" / {row.get('id', '?')}）"
         text = []
         for fname, a, b in refs:
+            if not fname:
+                # 「源码」列只写行号（与图标题同一文件时可省文件名）→ 用标题里的文件补。
+                fname = head_file
+                if not fname:
+                    errors.append(f"{where}「源码」列只写了行号，但这一图标题里没有"
+                                  "「<文件>:<行>」，补上文件名")
+                    break
             src = lines_of(fname)
             if src is None:
                 errors.append(f"{where}找不到源码文件 {fname}（或同名文件不止一个，"
@@ -449,11 +471,11 @@ def selftest() -> list[tuple[str, bool]]:
                    "detail": "gate.weight [16, 32]"}],
         "edges": [],
     }]
-    errs, matched, missing = check_shapes(shape_views, {"gate.weight": [16, 32]})
-    checks.append(("形状对得上不报", not errs and matched == 1 and not missing))
-    errs2, matched2, _ = check_shapes(shape_views, {"gate.weight": [8, 8]})
+    errs, matched = check_shapes(shape_views, {"gate.weight": [16, 32]})
+    checks.append(("形状对得上不报", not errs and matched == 1))
+    errs2, matched2 = check_shapes(shape_views, {"gate.weight": [8, 8]})
     checks.append(("形状不一致会报出", matched2 == 1 and bool(errs2)))
-    e3, matched3, _ = check_shapes(shape_views, {"other.weight": [1]})
+    e3, matched3 = check_shapes(shape_views, {"other.weight": [1]})
     checks.append(("写的键不在形状表里要报错（这个形状没被核过）", matched3 == 0 and bool(e3)))
 
     # 正文里的实际写法：`$W$ [512, 5120]（检查点键 layers.{i}.attn.wkv.weight）`
@@ -464,34 +486,34 @@ def selftest() -> list[tuple[str, bool]]:
         "edges": [],
     }]
     shapes = {"layers.{i}.attn.wkv.weight": [512, 5120]}
-    e4, m4, _ = check_shapes(sym_views, shapes)
+    e4, m4 = check_shapes(sym_views, shapes)
     checks.append(("短符号 + 检查点键能对上", not e4 and m4 == 1))
-    e5, m5, _ = check_shapes(
+    e5, m5 = check_shapes(
         [{"id": "main", "label": "T", "title": "T", "edges": [],
           "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
                      "detail": "$W$ [512, 9999]（检查点键 layers.{i}.attn.wkv.weight）"}]}],
         shapes)
     checks.append(("短符号写法形状不一致会报出", m5 == 1 and bool(e5)))
-    _, m6, miss6 = check_shapes(
+    errs6, m6 = check_shapes(
         [{"id": "main", "label": "T", "title": "T", "edges": [],
           "nodes": [{"id": "b", "name": "b", "kind": "op", "shape": "fp32 [B, T]",
                      "detail": "fp32"}]}],
         shapes)
-    checks.append(("dtype 记号不算形状键", not miss6))
-    e7, m7, _ = check_shapes(
+    checks.append(("dtype 记号不算形状键", not errs6))
+    e7, m7 = check_shapes(
         [{"id": "main", "label": "T", "title": "T", "edges": [],
           "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
                      "detail": "$W$ [512, 5120]（检查点键 no_such.key）"}]}],
         shapes)
     checks.append(("检查点键不在形状表里要报错", bool(e7)))
-    e8, m8, _ = check_shapes(
+    e8, m8 = check_shapes(
         [{"id": "main", "label": "T", "title": "T", "edges": [],
           "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
                      "detail": "$W$ [512, 5120]"}]}],
         shapes)
     checks.append(("权重形状没写检查点键要报错", bool(e8)))
     # 同一个错键在「键名紧跟形状」和「短符号+键名」两条路径各解析一次，只该报一条
-    e_dup, _, _ = check_shapes(
+    e_dup, _ = check_shapes(
         [{"id": "main", "label": "T", "title": "T", "edges": [],
           "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
                      "detail": "$W$ [16, 16]（检查点键 gate.wieght）"}]}],
@@ -511,6 +533,12 @@ def selftest() -> list[tuple[str, bool]]:
                           "fold": [{"title": "公式", "text": "$y = \mathrm{diag}(x)\\odot x$"}]}]}]
     checks.append(("公式里的数学排版词（diag 等）不报",
                    not check_math_names(diag_m, {"m.py": "def forward(): pass"}, {})))
+    # 首字母大写的常见激活/归一化名不该被判「凭空写」
+    caps_m = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
+               "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
+                          "fold": [{"title": "公式", "text": "$y = \mathrm{SiLU}(x)$"}]}]}]
+    checks.append(("公式里的首字母大写算子名（SiLU）不报",
+                   not check_math_names(caps_m, {"m.py": "def forward(): pass"}, {})))
     bad_m = [{"id": "main", "label": "Toy", "title": "Toy", "edges": [],
               "nodes": [{"id": "n", "name": "n", "kind": "op", "shape": "16 → 16",
                          "fold": [{"title": "公式", "text": "$y = \mathrm{zzq_fake}(x)$"}]}]}]
@@ -592,6 +620,17 @@ def selftest() -> list[tuple[str, bool]]:
             f2.write_text(short, encoding="utf-8")
             _, _, unc = check_plan_sources(f2, root)
         checks.append(("计划源码位置：短名节点计入核不了", unc == 1))
+        checks.append(("计划源码位置：只写行号时按图标题的文件补全", not run(good.replace("m.py:2", "2"))))
+        checks.append(("计划源码位置：只写行号补全后指错行仍报出",
+                       bool(run(good.replace("m.py:2", "3")))))
+        # ``` 围栏里贴的示例图不算真图（与 build_page 同一口径）
+        fenced = ("## M.forward（m.py:1-3）\n\n### 节点\n\n"
+                  "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+                  "| qr | 算子 | self.q_norm(qra) | 16 → 16 | | m.py:2 |\n\n"
+                  "```markdown\n## Fake.forward（m.py:1-3）\n\n### 节点\n\n"
+                  "| id | 类型 | 第一行 | 第二行 | 第三行 | 源码 |\n|---|---|---|---|---|---|\n"
+                  "| z | 算子 | self.zzz_fake(x) | 1 → 2 | | m.py:9 |\n```\n")
+        checks.append(("计划源码位置：代码围栏里的示例图不算真图", not run(fenced)))
 
     return checks
 
@@ -683,12 +722,10 @@ def main() -> int:
         except (OSError, ValueError) as error:
             print(f"error: 形状表无法解析: {args.shapes}（{error}）", file=sys.stderr)
             return 2
-        shape_errors, shape_matched, shape_missing = check_shapes(views, shapes)
+        shape_errors, shape_matched = check_shapes(views, shapes)
         errors += shape_errors
         if shape_matched == 0:
             errors.append("形状表一个键都没比对上：页面里要写完整键名，如 model.layers.0.mlp.gate_proj.weight [..]")
-        for key in shape_missing:
-            notes.append(f"形状没比对（不在形状表里）：{key}")
 
     # 公式里的函数名要有出处（通用的 torch/Python 名不查）
     if sources and not args.names_only:

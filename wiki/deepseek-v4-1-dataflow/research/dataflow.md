@@ -1319,7 +1319,7 @@
 | emw | 说明 | 只在传入 $w$ 时执行。这张图是路由专家，$w$ 来自 top-6 里该专家的权重 |
 | w2 | 公式 | $x = x.\mathrm{to}(dtype)\, W_2^\top$ |
 | w2 | 符号 | $x$：乘过路由权重的隐状态<br>$dtype$：进入 Expert 时 x 的 dtype（bf16）<br>$W_2$：w2 的权重，源码里叫 w2.weight |
-| w2 | 说明 | 路由专家的 $W_2$ 存成 [5120, 1152]（检查点键 layers.{i}.ffn.experts.{i}.w2.weight） 的 fp4（末维 1152 = 2304 / 2，同样是一格装两个值），激活先量化成 fp8；共享专家是 [5120, 2304] 的 fp8，激活同样量化成 fp8 |
+| w2 | 说明 | 路由专家的 $W_2$ 存成 [5120, 1152]（检查点键 layers.{i}.ffn.experts.{i}.w2.weight） 的 fp4（末维 1152 = 2304 / 2，同样是一格装两个值），激活先量化成 fp8；共享专家是 [5120, 2304]（检查点键 layers.{i}.ffn.shared_experts.w2.weight） 的 fp8，激活同样量化成 fp8 |
 
 ### 面板
 
@@ -1422,7 +1422,7 @@
 | nkey | 说明 | key 转成 fp32，再拆成 hc_mult 份 |
 | ewm | 公式 | $\mathbf{W} = w_q \odot w_k$ |
 | ewm | 符号 | $\mathbf{W}$：weight，键侧的缩放<br>$w_q$、$w_k$：两个参数，源码里叫 q_weight、k_weight |
-| ewm | 说明 | $w_q$ 与 $w_k$ 都是 [4, 5120] 的参数（源文件里 q_weight 在 model.py:347、k_weight 在 model.py:348），构造时未指定 dtype，取参考实现的默认 bf16；源码里在 fp32 里相乘（self.q_weight.float() * self.k_weight.float()），本图把 q_weight 的取用也并进这一步 |
+| ewm | 说明 | $w_q$ [4, 5120]（检查点键 layers.{i}.engram.q_weight）与 $w_k$ [4, 5120]（检查点键 layers.{i}.engram.k_weight）都是可学习参数（源文件里 q_weight 在 model.py:347、k_weight 在 model.py:348），构造时未指定 dtype，取参考实现的默认 bf16；源码里在 fp32 里相乘（self.q_weight.float() * self.k_weight.float()），本图把 q_weight 的取用也并进这一步 |
 | rstd | 公式 | $\nu = \mathrm{rsqrt}(\mathrm{mean}(x^2) + \epsilon) \cdot \mathrm{rsqrt}(\mathrm{mean}(\mathbf{K}_e^2) + \epsilon)$ |
 | rstd | 符号 | $\nu$：rstd，归一化因子<br>$x$：上转 fp32 的残差（同图的 nh）<br>$\mathbf{K}_e$：key，查表得到的键<br>$\epsilon$：Engram 上的 norm_eps<br>$\mathrm{mean}$：在最后一维 |
 | rstd | 说明 | 两边各按最后一维求均方，逐 token、逐份归一化 |
