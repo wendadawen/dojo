@@ -1,0 +1,8 @@
+- paper/src/iclr2025_conference.tex｜https://arxiv.org/abs/2503.09573｜arXiv v1（ICLR 2025 Oral）｜2026-10-10｜论文 LaTeX 源码，含正文与附录，页面的数字与说法以此为准
+- paper/bd3.pdf｜https://arxiv.org/pdf/2503.09573｜arXiv v1｜2026-10-10｜论文 PDF
+- paper/src/algs/short_algs.tex｜https://arxiv.org/abs/2503.09573｜arXiv v1｜2026-10-10｜块扩散训练与采样算法伪代码
+- paper/src/figs/mask.tex｜https://arxiv.org/abs/2503.09573｜arXiv v1｜2026-10-10｜块扩散专用注意力掩码的示意图源码（L1119-L1144 引用）
+- repo/bd3lms｜https://github.com/kuleshov-group/bd3lms｜commit 1c3e8f43d88dfbcee5ff2aa6932a9e74b31ae1d7｜2026-10-10｜官方实现，训练、采样、噪声调度、长度与似然评测脚本
+- blog/bd3lms-blog.txt｜https://m-arriola.com/bd3lms/｜2025｜2026-10-10｜作者项目页博客的纯文本快照，含动机、似然分解、噪声调度与结果表
+- blog/bd3lms-blog.html｜https://m-arriola.com/bd3lms/｜2025｜2026-10-10｜作者项目页博客原始 HTML
+- blog/bd3lms-readme.md｜https://github.com/kuleshov-group/bd3lms｜commit 1c3e8f43d88dfbcee5ff2aa6932a9e74b31ae1d7｜2026-10-10｜官方仓库 README 快照，含复现命令与检查点说明
