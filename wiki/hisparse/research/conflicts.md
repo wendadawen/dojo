@@ -1,0 +1,4 @@
+- blog/sglang-hisparse-guide.md L9 与 blog/lmsys-sglang-hisparse.md L20、L65-L71｜文档写 HiSparse 目前要求 PD 分离且只开在解码实例；博客写设计同样适用于合并部署，并给出单机 8×H200 合并部署的启动命令｜页面采用博客：两种部署都支持
+- blog/sglang-hisparse-guide.md L7 与 L170、L47｜文档总述写完整 KV 放主机、GPU 只留热缓冲；但 MiniMax M3 的稠密层 K/V 和索引 K 留在 GPU，DeepSeek V4 的 c4_indexer 和 C128 KV 仍是设备到设备传输｜页面按总述写，不写 M3 和 V4 的例外
+- blog/lmsys-sglang-hisparse.md L75 与 blog/sglang-hisparse-guide.md L9｜博客写目前支持使用 DSA 的模型族（含 DeepSeek-V3.2、GLM-5.1）；文档在此之外还列 DeepSeek V4、MiniMax M3｜页面采用文档，文档取自较新的仓库版本
+- blog/sglang-hisparse-guide.md L15、L104 与 repo/sglang/python/sglang/srt/managers/hisparse_coordinator.py L504-L583｜文档写每个请求占一块固定大小、device_buffer_size 个位置的缓冲；代码按序列长度渐进分配，凑满后再加一页保留页｜页面采用代码：「固定大小」按上限理解，两层存储一节写明渐进分配和保留页
