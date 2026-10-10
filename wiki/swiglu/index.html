@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="SwiGLU 是 Transformer 前馈层的一种写法，把前馈层的激活函数换成一道由 Swish 算出的门，逐元素缩放另一条线性投影。">
+  <meta name="dojo:summary" content="$\mathrm{SwiGLU}(x, W, V) = \mathrm{Swish}_1(xW) \otimes xV$，两条线性投影逐元素相乘，一条先过 Swish 当门，用同一参数量换更好的结果。">
+  <meta name="dojo:topics" content="模型结构">
+  <meta name="dojo:tag" content="模型架构">
+  <title>SwiGLU</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">SwiGLU</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">SwiGLU</h1>
+<p class="reading-time">正文 854 字 · 约 3 分钟阅读</p>
+
+<p>Transformer 是主干由若干相同结构的层堆叠成的网络。每层里有一个逐个位置各算各的前馈层：输入是这一位置的向量 $x$（上一层传下来的表示），先过一个线性变换，再过一个激活函数（逐元素作用的非线性函数），最后过第二个线性变换。</p>
+
+<p>SwiGLU 是一种前馈层的写法：把前馈层里的激活函数换成一道门。它用两组权重把 $x$ 分别投成两个向量，其中一个过 Swish 再与另一个逐元素相乘，最后过第二个线性变换。Swish 是一种逐元素作用的非线性函数，$\mathrm{Swish}_1(z) = z\sigma(z)$，下标 1 是系数；$\sigma$ 是 sigmoid，$\sigma(z) = 1/(1+e^{-z})$，把实数压到 0 到 1 之间。</p>
+
+<p>前馈层里通常用的是 ReLU，它对每个维度取正部。SwiGLU 的门换成 Swish 后，在同样参数量和计算量下，训练得到的困惑度（模型预测词的准确程度，越低越好）更低。</p>
+
+<h2 id="s1">1. 前馈层里换上一道门</h2>
+
+<p>前馈层对每个位置单独作用。写成不用偏置（每个输出分量上加的可学习常数）的形式是 $\mathrm{FFN}_{\mathrm{ReLU}}(x, W_1, W_2) = \max(xW_1, 0)W_2$，$x$ 是这一位置的向量，$W_1$ 是第一个权重矩阵，$\mathrm{FFN}$ 就是前馈层，$\max(\cdot, 0)$ 是 ReLU，逐元素取正部；中间过完激活函数后乘 $W_2$。</p>
+
+<p>要把中间一步改成门控，做法是把第一块权重 $W_1$ 换成两块权重 $W$、$V$，得到两个投影 $xW$ 与 $xV$，再把 $xW$ 过一道门、逐元素乘上 $xV$。这就是<a href="../glu/index.html">GLU</a>：一条投影过 sigmoid 当门，逐元素缩放另一条投影。SwiGLU 只是把这道门从 sigmoid 换成 Swish。</p>
+
+<h2 id="s2">2. SwiGLU 的公式</h2>
+
+<p>SwiGLU 用在前馈层的中间一步，公式是</p>
+
+<p>$$\mathrm{SwiGLU}(x, W, V) = \mathrm{Swish}_1(xW) \otimes xV.$$</p>
+
+<p>$x$ 是这一位置的向量，$W$ 与 $V$ 是两个同形的权重矩阵，把 $x$ 投到同一维数，$\otimes$ 是逐元素相乘。$xW$ 这一支过 Swish 当门，$xV$ 这一支被它逐元素缩放，相乘得到这一层的中间结果。</p>
+
+<p>整层前馈写成 $\mathrm{FFN}_{\mathrm{SwiGLU}}(x, W, V, W_2) = \mathrm{SwiGLU}(x, W, V)\, W_2$：中间结果再乘第三个权重矩阵 $W_2$。所以一个 SwiGLU 前馈层有三块权重，而 ReLU 前馈层只有两块。</p>
+
+<h2 id="s3">3. 手算一遍 SwiGLU</h2>
+
+<details>
+<summary>手算的全过程</summary>
+<p>取输入 $x = 2$，两个权重 $W = 3$、$V = -1$，输出权重 $W_2 = 1$，维数都是 1。</p>
+<ol>
+<li>$xV$ 这一支：$xV = 2 \times (-1) = -2$。</li>
+<li>$xW$ 这一支（门）：先算 $xW = 2 \times 3 = 6$。</li>
+<li>过 Swish：$\sigma(6) \approx 0.9975$，$\mathrm{Swish}_1(6) = 6 \times 0.9975 \approx 5.985$。</li>
+<li>逐元素相乘：中间结果 $= 5.985 \times (-2) = -11.97$。</li>
+<li>过第二个线性变换：输出 $= -11.97 \times 1 = -11.97$。</li>
+</ol>
+</details>
+
+<p>门 $= xW \cdot \sigma(xW)$，$\sigma$ 恒正，所以门的正负由 $xW$ 决定，乘积的正负由 $xW$ 与 $xV$ 共同决定。</p>
+
+<h2 id="s4">4. 隐层宽度为什么要乘 2/3</h2>
+
+<p>ReLU 前馈层的隐层维数记 $d_{ff}$，SwiGLU 的记 $d_{ff}'$；隐层指前馈层中间那一层，维数就是第一个线性变换输出的维数。要在相同参数和相同计算量下比较，就要把 SwiGLU 的 $d_{ff}'$ 缩到原来的 $\frac{2}{3}$。</p>
+
+<details>
+<summary>2/3 的来历</summary>
+<p>把 ReLU 前馈层的两块权重记为 $2d \cdot d_{ff}$，SwiGLU 的三块权重记为 $3d \cdot d_{ff}'$，$d$ 是输入 $x$ 的维数。要两者相等，$d_{ff}' = \frac{2}{3} d_{ff}$。测量用的设置里 $d_{ff} = 3072$，$d_{ff}' = \frac{2}{3} \times 3072 = 2048$。</p>
+</details>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>这套结果的前提是参数量和计算量对齐：被比较的模型参数总数和每 token（词元，序列切成的一个个片段）的计算量相同。</p>
+
+<p>预训练（先在大规模文本上训练）的去噪任务是把输入里被遮住的片段补回来，在它的困惑度上，SwiGLU 是测量过的几种写法里最好的一档。</p>
+
+<p>下游任务（预训练后微调，也就是再在具体任务上训练，如问答、句子分类）上，GLU 变体在多数任务里最好，但这一批结果本身波动较大。</p>
+
+<p>门为什么换成 Swish 而不是别的函数，资料没有给出解释。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Noam Shazeer. GLU Variants Improve Transformer. arXiv:2002.05202v1, 2020. <a href="https://arxiv.org/abs/2002.05202">https://arxiv.org/abs/2002.05202</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,1 @@
+- paper/arxiv-v1.pdf、paper/src-v1/、arxiv-v1.txt｜论文｜https://arxiv.org/abs/2002.05202v1｜v1（2020-02-12）｜2026-10-10｜GLU Variants Improve Transformer，提出 SwiGLU：把 GLU 的门从 sigmoid 换成 Swish 的 FFN 变体，用 T5 的实验比较它与 ReLU、GELU 等；LaTeX 源码在 src-v1/（main.tex），纯文本快照 arxiv-v1.txt
