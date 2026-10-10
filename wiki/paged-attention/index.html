@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="PagedAttention 是一种注意力算法，把每个序列的键、值切成固定 token 数的块存在不连续显存里，按块计算注意力，使 KV cache 能按需分配、跨序列共享，减少显存浪费。">
+  <meta name="dojo:summary" content="把序列的 KV cache 切成固定大小的块，块可存放在不连续的显存里，注意力按块逐块计算；像操作系统的分页一样按需分配、用块表映射逻辑块到物理块，并允许序列之间共享块，减少显存浪费。">
+  <meta name="dojo:topics" content="推理系统, 内存与缓存">
+  <meta name="dojo:tag" content="推理加速">
+  <title>PagedAttention</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">PagedAttention</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">PagedAttention</h1>
+<p class="reading-time">正文 2,560 字 · 约 8 分钟阅读</p>
+
+<p>大语言模型一次只生成一个 token——token 是模型读写文本的最小单位，可以是一个词，也可以是词的一部分；一串 token 构成一条序列。每生成一个 token 都要用到它前面所有位置的键和值。一个请求分两步：先把输入的提示整段算一遍，这一步叫预填；再逐个生成后面的 token，这一步叫解码。算提示时得到的每个位置的键、值，后面每一步都要再用，把这些键、值留在显存里复用，就是 <a href="../kv-cache/index.html">KV cache</a>；键和值由注意力产出（注意力让一条序列里各位置互相取信息，见<a href="../standard-attention/index.html">标准注意力</a>）。</p>
+
+<p>每个请求的 KV cache 随生成不断长大，长度事先不知道。PagedAttention 把每个序列的 KV cache 切成固定 token 数的块，块之间不要求连续存放，显存可以按实际用量分配；注意力也相应改成按块来算。它借用了操作系统里虚拟内存和分页的做法：把显存切成固定大小的物理块，用「一个请求的逻辑块映射到物理块」的办法来管理。因为能按块共享，KV cache 还能在同一个请求的多个输出之间、以及不同请求之间共用，进一步压低显存占用。</p>
+
+<h2 id="s1">1. 显存里装得下多少请求</h2>
+
+<p>模型推理时，权重在服务全程常驻显存；每个请求另占一份动态的 KV cache，随生成增长或收缩；此外还有少量临时张量，算完即弃。以 13B 参数（B 表示十亿）的模型为例，约 65% 的显存留给权重，接近 30% 给请求的 KV cache 这类动态状态，剩下的很小一部分给临时张量。权重是固定的、临时张量占比很小，所以能同时处理多少个请求，主要看 KV cache 能容纳多少，服务的吞吐因此受显存容量限制。</p>
+
+<p>而且照目前的趋势，GPU 的算力增长快于显存容量的增长。</p>
+
+<h2 id="s2">2. 连续存法浪费在哪里</h2>
+
+<p>现有系统把每个请求的 KV cache 存成一段连续内存，并且按这个请求可能的最大长度一次性预留：生成多长事先不知道，只能按上限留。由此带来三类浪费：一是为将来 token 预留的槽位，在整个请求的生命周期里占着位置，别的请求用不上；二是内部碎片，请求实际长度短于最大长度，多留的部分要等请求结束才发现用不上；三是外部碎片，不同请求预留的大小不同，分配器切出来的空隙再也合不上、用不上。实测中，真正存 token 状态的显存最低只有 20.4%。连续存法也使共享无法进行：多个序列的 KV cache 各占一段连续的显存，没法指向同一份键、值。用内存压实整理碎片也不现实，KV cache 太大，整体搬移一遍代价过高。</p>
+
+<h2 id="s3">3. 把每个序列的 KV cache 切成块</h2>
+
+<p>PagedAttention 把每个序列的 KV cache 切成一块块，每块装固定数量 token 的键和值，这个数量叫块大小，记作 $b$。块与块之间不要求存在连续的显存里，可以分散存放。取某一块时，把它的键向量按列排成一个矩阵 $K_j$、值向量按列排成 $V_j$，下标 $j$ 是块的编号，从 1 起数。每一块只覆盖序列的一段位置，整条序列的键、值由若干块拼起来。切块只是重新组织了键、值在显存里的位置，它们本身没有变。</p>
+
+<h3 id="s3-1">3.1 在块上算注意力</h3>
+
+<p>标准注意力里，位置 $i$ 的查询和它前面所有位置的键逐个点积，点积先除以 $\sqrt{d}$ 再取 SoftMax（每个分数取指数后除以指数之和）；$d$ 是查询、键向量的维度，除以 $\sqrt{d}$ 的缩放见<a href="../standard-attention/index.html">标准注意力</a>。按块算时把每个块内的键一起处理：</p>
+
+<p>$$A_{ij} = \frac{\exp(q_i^\top K_j / \sqrt{d})}{\sum_{t=1}^{\lceil i/b \rceil}\exp(q_i^\top K_t / \sqrt{d})\,\mathbf{1}}, \qquad o_i = \sum_{j=1}^{\lceil i/b \rceil} V_j A_{ij}^\top$$</p>
+
+<p>$q_i$ 是位置 $i$ 的查询向量，$d$ 是它的维度，$K_j$ 是第 $j$ 块的键矩阵，$V_j$ 是第 $j$ 块的值矩阵，$A_{ij}$ 是位置 $i$ 对第 $j$ 块内各个键归一化后的权重行，$\exp$ 是指数函数，$\mathbf{1}$ 是分量全为 1 的列向量：指数作用在向量上得到的是长度为块大小 $b$ 的行向量，乘上 $\mathbf{1}$ 就把这一块内各个位置的权重相加，$\lceil i/b \rceil$ 是位置 $i$ 之前（含位置 $i$）一共用到几块。分母对位置 $i$ 前面的所有块求和，所以归一化是跨块的；输出 $o_i$ 则把各块的 $V_j$ 乘上对应的权重行再累加。</p>
+
+<details>
+<summary>在块大小 4 的一段序列上走一遍</summary>
+<p>取查询、键向量维度 $d=2$，缩放因子 $\sqrt{d}=1.414$，查询 $q=(1.414, 0)$；序列已有 6 个位置，块大小 $b=4$，前 4 个位置在第 1 块、后 2 个在第 2 块。每个位置的键写成 $k_p=(k_{p1}, k_{p2})$，值写成标量 $v_p$（相当于值的维度为 1）；下标 $p$ 是位置编号，从 1 起数。分数 $s_p = q \cdot k_p / \sqrt{d}$，取各键的第一分量 $k_{p1}$。</p>
+<ol>
+<li>第 1 块四个键的第一分量为 0、1、0、1，第 2 块两个键为 0、2，于是六个位置的分数是 0、1、0、1、0、2。</li>
+<li>分数取指数：$\exp 0 = 1$、$\exp 1 = 2.718$、$\exp 2 = 7.389$，六个指数是 1、2.718、1、2.718、1、7.389。</li>
+<li>第 1 块四个指数之和约为 $7.437$，第 2 块约为 $8.389$。</li>
+<li>值取 $v_1$ 到 $v_6$ 为 1、2、3、4、5、6。第 1 块按分数加权求和约为 $20.310$，第 2 块约为 $49.334$。</li>
+<li>块 1 贡献分母的 7.437、块 2 贡献 8.389，两块都要算完才能得到归一化后的权重。把两块的分子分母分别相加：总分母约为 $15.826$，总分子约为 $69.644$，输出 $o_6$ 约为 $69.644 / 15.826 = 4.401$。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. KV cache 管理器</h2>
+
+<p>服务系统用一个 KV cache 管理器管显存，它的思路来自操作系统的虚拟内存：显存先切成固定大小的物理块，块好比内存页，token 好比字节，一个请求好比一个进程。一个请求的 KV cache 用一串逻辑块表示，随着新 token 生成，逻辑块从左往右填，最后一块没填满的位置留给后续生成。管理器维护一张块表，把每个逻辑块映射到某个物理块，并记下这块已经填了几个位置。逻辑块和物理块分开后，显存按实际用量分配，不必按最大长度一次留足，避免了为将来 token 预留槽位和外部碎片。</p>
+
+<h2 id="s5">5. 一个序列从头生成，块怎么变</h2>
+
+<p>一个请求的 KV cache 预填阶段把整段提示算完，得到每个位置的键和值，把它们填进逻辑块；接着每解码一步生成一个新 token，把它的键和值写进最后那个未填满的逻辑块，并把块表的已填位置加一；直到这一块填满，才分配一个新的逻辑块和一个新的物理块。任何时刻没填满的只可能是最后一个块，请求一结束，它的物理块随即回收、交给别的请求。</p>
+
+<details>
+<summary>块大小 4、提示 7 个 token 的一次生成</summary>
+<ol>
+<li>提示有 7 个 token。预填阶段算完这 7 个位置，得到它们的键和值，填进两个逻辑块：逻辑块 1 放前 4 个，逻辑块 2 放后面的 3 个，逻辑块 2 还空一个位置。</li>
+<li>管理器为逻辑块 1 分配物理块 7、为逻辑块 2 分配物理块 1，把这两条映射记进块表；比如逻辑块 2 记着「对应物理块 1、已填 3 个位置」。</li>
+<li>第一个解码步生成一个新 token，它的键和值写进逻辑块 2 空着的位置，块表里逻辑块 2 的已填位置由 3 变成 4。</li>
+<li>再解码一步时逻辑块 2 已满，这时才分配一个新的逻辑块和一个新的物理块（比如物理块 3），存下新 token 的键和值，并在块表里补一条映射。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 多个序列共用块</h2>
+
+<p>一个请求里的多个输出序列，提示部分完全一样，各自的逻辑块可以指向同一批物理块，共享的物理块用一个引用计数记着被几处指向。要往一块被多处共用的块里写时，不能就地改，先分配一个新物理块、把旧块的内容复制过去，再把引用计数减一，之后的新内容落到新块，这一步按块进行，叫写时复制。服务方预先算好并缓存起来的一段共享前缀，也按同样方式让各请求指向它的物理块，只对用户各自不同的部分另外计算。这套逻辑块到物理块的映射对上层的模型和解码过程是隐藏的：处理时只看到每个序列的一串物理块号，不必知道哪些序列之间共享，所以采用不同解码方式的请求可以混在同一批里处理。</p>
+
+<h2 id="s7">7. 显存不够时怎么办</h2>
+
+<p>请求量超过系统容量时，先来先服务：先到的先处理，抢占时最晚到的先被换出。换出以序列为单位整体进行，一个序列的块要么全换出去、要么都不换；同一请求里共享着块的多个序列也一起被抢占或恢复。恢复被换出的序列有交换和重算两条路。交换是把它的块复制到 CPU 内存，需要时再换回显存，换出的块数不会超过显存里 KV cache 的块数，所以 CPU 上的交换空间是有上界的。重算是不存换出的块，等这个序列重新调度时再算一遍，把已经生成的 token 连同原提示当成一段新的提示，一次算出所有位置的键和值，重算的耗时可能低于原来逐字生成。两条路选哪条要看块大小：块很小时交换会拆成很多次小传输、用不满带宽，此时重算开销更低；块较大时交换开销更低；具体还取决于 CPU 内存与显存之间的带宽和 GPU 的算力。</p>
+
+<h2 id="s8">8. 省下多少显存、快多少</h2>
+
+<p>同一提示生成多个输出（并行采样）时，多个输出共用提示的块，省下的显存按被跳过的块数占全部块数的比例算；请求的输入输出长度分布（轨迹）不同，省下的比例也不同。显存省下后，能放进更多请求，吞吐随之上升。</p>
+
+<details>
+<summary>共享省下的显存、吞吐与实验条件</summary>
+<p>在请求序列较短的一批轨迹上，并行采样省 6.1% - 9.8%；在序列较长的一批轨迹上省 16.2% - 30.5%。在保持相同延迟的前提下，吞吐提升 2 到 4 倍，序列越长、模型越大、解码方式越复杂，提升越明显。</p>
+</details>
+
+<h2 id="s9">9. 适用条件与边界</h2>
+
+<p>分页给注意力加了一层间接：内核（在 GPU 上执行的一段计算程序）要按块表去取不连续的块，还要处理长度不一的序列，这使注意力内核本身比高度优化的常规实现慢 20% - 26%；不过内核只影响注意力这一步，端到端仍然更快。块大小要折中：太小，读写和计算 KV cache 时用不满 GPU 的并行度；太大，内部碎片变多、能共享的机会变少；短序列多的负载里块越大越不利，实际默认取 16。因为引入了按块读取的访存方式，已有的注意力实现不能直接使用，要自己写读块的内核，常见做法是把块的读写和注意力融进同一个内核，减少内存间接带来的开销。虚拟内存和分页只适合「输出长度事先不定、性能受显存容量限制」这类负载；张量形状固定的训练、或本来就受算力限制的推理，引入这层间接可能反而更慢。它和 <a href="../flash-attention/index.html">FlashAttention</a> 容易混：FlashAttention 分块是为了把中间结果留在片上的高速存储里、少读写慢速显存，PagedAttention 分块是为了让 KV cache 能按需分配、跨序列共享。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, Ion Stoica. Efficient Memory Management for Large Language Model Serving with PagedAttention. SOSP '23, 2023. <a href="https://arxiv.org/abs/2309.06180">https://arxiv.org/abs/2309.06180</a></li>
+<li>vLLM Project. vLLM: official implementation. 2026. <a href="https://github.com/vllm-project/vllm">https://github.com/vllm-project/vllm</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

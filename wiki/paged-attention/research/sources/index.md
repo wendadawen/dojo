@@ -1,0 +1,2 @@
+- paper/src-v1/、paper/vllm-pagedattention-v1.pdf｜论文｜https://arxiv.org/abs/2309.06180v1｜v1（2023-09-12）｜2023-10-10｜Efficient Memory Management for Large Language Model Serving with PagedAttention，提出分页注意力：把每个序列的 KV cache 切成固定大小的块、存不连续显存、按块计算注意力；LaTeX 源码在 src-v1/，PDF 为 arxiv-v1
+- repo/vllm/｜仓库｜https://github.com/vllm-project/vllm｜a98247ab4db686ee03c66d5feb3c761e52a2f8ab（2026-10-10）｜2026-10-10｜论文官方实现，内含分页注意力内核与块管理器代码
