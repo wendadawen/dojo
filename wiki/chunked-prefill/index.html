@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Chunked Prefill 是把一条预填充请求切成若干计算量相近的块、分多次迭代算完，让正在解码的请求每轮与其中一块同批算。">
+  <meta name="dojo:summary" content="把长预填充切成小块分次算：每块仍让 GPU 接近满载，正在解码的请求每轮与这一块合进同一个批，于是不必等整段预填充算完，解码不被打断，每轮的计算量也接近。">
+  <meta name="dojo:topics" content="推理系统">
+  <meta name="dojo:tag" content="推理加速">
+  <title>Chunked Prefill</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Chunked Prefill</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Chunked Prefill</h1>
+<p class="reading-time">正文 1,375 字 · 约 4 分钟阅读</p>
+
+<p>预填充把整段提示一次送进模型、并行处理 token（提示是要模型接着生成的文本，token 是文本经分词得到的最小单位），解码逐个生成后面的 token。模型由很多结构相同的层叠成；<a href="../standard-attention/index.html">标准注意力</a>让位置之间交换信息，每个位置用查询与前面位置的键匹配、取回对应的值（查询、键、值都是位置算出的向量）。<a href="../kv-cache/index.html">KV cache</a>存下已处理位置的键和值供后面复用。</p>
+
+<p>解码每步只有一个 token，却要读一遍整套模型权重，瓶颈在显存带宽、算力闲置。两者混在一条流水里时，新请求的预填充插进正在解码的请求之间，打断它们。Chunked Prefill 把一条预填充请求拆成大小相近的若干块、分多次迭代算完，正在解码的请求每轮与当前这一块同批算；结果与整段一次算一样。</p>
+
+<h2 id="s1">1. 切块不改结果：逐块设掩码</h2>
+
+<p>切块要保证结果不变：每一块都要设置<a href="../causal-mask/index.html">因果掩码</a>——块内的每个查询位置只能看它自己以及它在整段提示里前面的位置，不能看后面的位置。第一块的查询只能看本块内的键；随后每一块不但看本块，还要看它之前所有块留下的键和值，这些键和值已经按顺序进了缓存。</p>
+
+<h3 id="s1-1">1.1 掩码随块移动</h3>
+
+<p>一块一块往下算时，掩码窗口跟着块一起往右移。</p>
+
+<details>
+<summary>提示 9 个 token、每块 3 个时的掩码</summary>
+<ol>
+<li>提示长度取 9 个 token，每块 3 个，分成三块：位置 1 到 3、4 到 6、7 到 9。</li>
+<li>第一块的查询：位置 1 只看键 1；位置 2 看键 1 到 2；位置 3 看 1 到 3。</li>
+<li>第二块的查询：位置 4 看键 1 到 4；位置 5 看 1 到 5；位置 6 看 1 到 6。前三个键来自缓存，后三个键在本块内。</li>
+<li>第三块的查询：位置 7 看键 1 到 7；位置 8 看 1 到 8；位置 9 看 1 到 9。</li>
+</ol>
+</details>
+
+<h3 id="s1-2">1.2 逐块算与整段算等价</h3>
+
+<p>逐块算为什么与整段算得到一样的结果，关键在于每个位置只依赖它前面的位置。</p>
+
+<details>
+<summary>等价性的推导</summary>
+<ol>
+<li>记位置 $t$ 的查询向量为 $\mathbf{q}_t$，它在这一层算出的键向量和值向量分别为 $\mathbf{K}_t$、$\mathbf{V}_t$。</li>
+<li>位置 $t$ 的注意力输出只由 $\mathbf{q}_t$ 和位置 $1$ 到 $t$ 的键值对 $(\mathbf{K}_1,\mathbf{V}_1),\dots,(\mathbf{K}_t,\mathbf{V}_t)$ 决定，掩码保证它看不到 $t$ 之后的位置。</li>
+<li>整段一次算时，位置 $t$ 用到的正是 $(\mathbf{K}_1,\mathbf{V}_1),\dots,(\mathbf{K}_t,\mathbf{V}_t)$。</li>
+<li>逐块算时，轮到位置 $t$ 所在的块，前面所有块的全部键值、以及本块中 $t$ 及其之前的键值都已算过，掩码又只让 $\mathbf{q}_t$ 看到 $1$ 到 $t$，所以它用到的键值对同样是 $(\mathbf{K}_1,\mathbf{V}_1),\dots,(\mathbf{K}_t,\mathbf{V}_t)$。</li>
+<li>对每个位置都成立，逐块算的输出与整段算逐位相同。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 解码与预填充块合成一批</h2>
+
+<p>一轮里放一块预填充，其余位置留给正在解码的请求，两者合成同一个批。批里有一个预填充块和若干解码请求，本轮的 token 总数由这一块加上这些解码决定。这种做法建立在迭代级批处理之上：请求可以在每个迭代之后进出批，而不是等一整批全部跑完。解码请求因此不用等整段预填充，只需与当前这一块同批算一轮。</p>
+
+<h3 id="s2-1">2.1 合并线性运算</h3>
+
+<p>预填充和解码在各层走的是同一套模型权重。把两者的 token 拼进同一个矩阵后，各层的权重与输入的乘法由两次变成一次矩阵乘：预填充块提供大的行数，解码 token 作为多出来的几行一起乘，权重只从显存读一次就服务了这一批里的所有 token。解码原本把大部分时间花在反复取权重上，合并后这部分开销由预填充分摊，解码由此从内存受限转为计算受限。</p>
+
+<h3 id="s2-2">2.2 并入预填充几乎不增时间</h3>
+
+<p>再加入一些解码 token，这一轮的时间几乎不变，于是一块预填充能同时推进很多个解码。</p>
+
+<details>
+<summary>同批解码的每 token 时间</summary>
+<ol>
+<li>只算预填充的批（1024 个 token，批大小 4），整个批耗时 234.8 毫秒。</li>
+<li>只算解码的批（批大小 4），解码每个 token 要 12.49 毫秒。</li>
+<li>混合批（1021 个预填充 token 加 3 个解码请求），整个批耗时 238.4 毫秒，其中解码每个 token 只要 1.2 毫秒。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 为什么它同时改善吞吐和延迟</h2>
+
+<p>两个极端都不好。整段预填充会让正在解码的请求长时间停下，每一轮之间的间隔被拉长到整段预填充的时长；反过来只做解码，批里的算力利用率低，吞吐无法提升。切块把预填充切成小块分散到很多轮里：每一轮的预填充 token 数被块的大小限住，所以某条请求的解码最多只需等一小块，间隔有界；同时每一轮都有一块预填充让算力得到利用，解码随之推进，吞吐提高。</p>
+
+<h2 id="s4">4. 块大小与预算怎么定</h2>
+
+<p>块大小决定每轮里预填充占多少。块太大，一轮里能同批的解码个数就少；块太小，每块的矩阵乘太小，GPU 利用率不高。块大小要看应用里预填充与解码 token 数之比（预填充 token 数除以解码 token 数）：这个比越小，说明解码占的比重越高，就要用小一些的块让更多解码并入同一个批；比越大，可以用越大的块。每轮允许的 token 总数（token 预算）则按延迟目标定：预算越小每轮越短，但切块开销越大。还有一个硬件细节：GPU 算矩阵乘法时把矩阵切成固定大小的瓦片、分给线程块（GPU 上并行执行的一批线程），各线程块算同样多的运算；矩阵维度不是瓦片大小的整数倍时会有空转，所以块长加上同批的解码数最好取成瓦片大小的整数倍。</p>
+
+<h2 id="s5">5. 切块的开销</h2>
+
+<p>每算一块，注意力都要把之前所有块的键和值重新读一遍：越靠前的块被后面每一块重读，重复读取的次数越多。块越小，重读越多，预填充越慢。</p>
+
+<details>
+<summary>不同块长下的开销</summary>
+<ol>
+<li>每块 64 个 token 时，注意力的耗时约是整段一次算的 3 倍，整个预填充的耗时约 5 倍。</li>
+<li>每块 256 与 512 时，预填充的端到端损失分别控制在 20% 与 10% 以内。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 适用条件与边界</h2>
+
+<p>这套办法成立有一个前提：提示要足够长，切出来的块还得大到能让 GPU 接近满载。生产环境的提示常在 1K 到 4K 个 token，块长取几百个 token 就能保住预填充效率。它提高的是解码侧效率；预填充本身的吞吐不会因此变快，所以整机吞吐的提升在 25% 上下。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Ramachandran Ramjee. SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills. arXiv:2308.16369v1, 2023. <a href="https://arxiv.org/abs/2308.16369">https://arxiv.org/abs/2308.16369</a></li>
+<li>Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov, Ramachandran Ramjee. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. arXiv:2403.02310v2, 2024. <a href="https://arxiv.org/abs/2403.02310">https://arxiv.org/abs/2403.02310</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
