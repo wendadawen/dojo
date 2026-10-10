@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="量化基础是把模型的浮点权重与激活（可学参数与逐层流动的中间结果）换成低精度整数网格上的值、以少量误差换取存储、访存与计算下降的方法。">
+  <meta name="dojo:summary" content="把权重和激活从浮点换成 8 位或 4 位整数，误差来自网格太粗、舍入和裁剪；缩放因子的取法、粒度和是否重训决定误差能减到多小。">
+  <meta name="dojo:topics" content="训练与优化, 推理系统">
+  <meta name="dojo:tag" content="量化">
+  <title>量化基础</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">量化基础</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">量化基础</h1>
+<p class="reading-time">正文 2,174 字 · 约 7 分钟阅读</p>
+
+<p>模型的权重是可学的参数，激活是前向计算里逐层流动的中间结果，前向计算指用当前权重从输入逐层算到输出，两者都存成张量，也就是多维数组。量化把张量里的浮点值换成位数更少的整数值：位数少，能表示的不同值就少，它们等间距地排在一条网格上，每个值被舍到网格上最近的格点，还原时用同一个映射换回实数。这样每个权重和激活占的比特数下降，把参数存下来、读进来和算它们的开销随之下降，代价是每个数会偏离原来的值一点。</p>
+
+<h2 id="s1">1. 量化要解决什么</h2>
+
+<p>模型规模的增长把权重和激活的存储、延迟和能耗推到部署瓶颈。参数以浮点存储时每个数占的比特多：32 位浮点占 32 比特，16 位占 16 比特。换到低位宽整数能直接减少占用的比特，换到 8 位整数每个数占 8 比特，换到 4 位占 4 比特。从 32 位浮点换到低位宽整数，存储和延迟最好情况下能降到 1/16，实际常做到 1/4 到 1/8。更低的精度在专用硬件上还有吞吐和能耗上的好处。代价是精度：位宽越低，每个数偏离原来的值越多。</p>
+
+<h2 id="s2">2. 均匀量化：缩放因子与整数网格</h2>
+
+<p>均匀量化是量化里最常用的一种：网格上相邻两个整数值等间距。它把实数 $r$ 用两个参数映射到整数 $q$：缩放因子 $S$，相邻格点之间的距离；零点 $Z$，实数 $0$ 对应的那个整数值。网格等间距的好处是能只用整数乘加直接实现；网格不等间距的量化叫非均匀量化，同样位宽下可能更贴合数据的分布，但不容易在通用硬件上高效实现。</p>
+
+<h3 id="s2-1">2.1 仿射映射与反量化</h3>
+
+<p>量化把实数映射到整数，反量化把整数还原成实数，两者是一对仿射关系</p>
+
+<p>$$r = S(q - Z),$$</p>
+
+<p>$S$ 决定网格的步长，$Z$ 让实数 $0$ 精确对应到整数 $Z$。</p>
+
+<p>从实数到整数是反过来的：$q = \mathrm{round}(r/S) + Z$，再裁到整数网格的两个端点之间。$\mathrm{round}(\cdot)$ 表示舍入到最近的整数。缩放因子由这个张量里观测到的取值范围 $[\alpha, \beta]$ 定出，$S = (\beta - \alpha)/(q_{\max} - q_{\min})$，其中 $q_{\min}$、$q_{\max}$ 是网格的两个端点，$\alpha$、$\beta$ 是观测到的最小值和最大值；零点 $Z$ 取使 $\alpha$ 映射到 $q_{\min}$ 的那个整数，$Z = q_{\min} - \mathrm{round}(\alpha/S)$。</p>
+
+<p>范围在什么时候定有两种做法：静态量化在推理（用训练好的模型算输出）前用一批样本跑一遍、统计出范围就固定下来，之后不再变；动态量化每来一个输入现算一次范围。动态往往更准，因为每个输入都有自己的范围，但要实时统计，开销更大。</p>
+
+<details>
+<summary>非对称量化的一个算例</summary>
+<p>取 $r = [-1.0, 0.6, 2.4, 6.0]$，用 3 位非对称量化，网格端点 $q_{\min} = 0$、$q_{\max} = 7$。</p>
+<ol>
+<li>观测范围 $\alpha = -1$、$\beta = 6$，$S = (6 - (-1))/(7 - 0) = 1$。</li>
+<li>零点 $Z = q_{\min} - \mathrm{round}(\alpha/S) = 0 - \mathrm{round}(-1/1) = 0 - (-1) = 1$。</li>
+<li>每个数算 $r/S + Z$，得 $[0, 1.6, 3.4, 7]$，舍入到最近整数得 $q = [0, 2, 3, 7]$。</li>
+<li>反量化 $\hat{r} = S(q - Z)$，得 $[-1, 1, 2, 6]$。</li>
+<li>误差 $\hat{r} - r = [0, 0.4, -0.4, 0]$，都不超过半个格距。</li>
+</ol>
+</details>
+
+<h3 id="s2-2">2.2 对称量化</h3>
+
+<p>对称量化把零点固定为 0，网格关于 0 对称。整数范围有两种取法：一种只用到对称的范围 $[-2^{b-1}+1, 2^{b-1}-1]$，$b$ 位时 8 位取 $[-127, 127]$、4 位取 $[-7, 7]$，缩放因子 $S = \max(|r|)/(2^{b-1}-1)$；另一种用满整数范围 $[-2^{b-1}, 2^{b-1}-1]$，8 位即 $[-128, 127]$，缩放因子 $S = 2\max(|r|)/(2^b - 1)$。用满范围的那一种更准，因为它多用一个格点。取 $[-127, 127]$ 的做法避开了 $-128$，有实现上的好处：两个数相乘时就不会出现 $(-128)\times(-128)$，乘积的绝对值始终小于 $2^{14}$，于是可以先把两个乘积累加在一个 16 位中间累加器里，再往 32 位累加器放。</p>
+
+<p>反量化只剩一次乘法 $\hat{r} = Sq$。权重常用对称量化，一个原因是反量化没有减零点这一步：零点固定在 0，推理时省掉它带来的计算开销，实现也更直接。分布在 0 的一侧更重时，比如经过一种输出非负的激活函数（把负数截成 0、只留非负输出的那种）之后的激活，取值都落在 $[0, \max]$，对称的负数那一半格点用不上，这时非对称的网格更贴合。</p>
+
+<h2 id="s3">3. 量化误差从哪来</h2>
+
+<p>量化把每个实数换成网格上最近的格点，换成别的值就产生误差。网格太粗是第一处：位宽低，能表示的格点就少，相邻格点之间的距离大，每个数被舍到的位置离它更远。舍入是第二处：不在格点上的数只能舍到最近的格点，误差来自这一步。裁剪是第三处：超出观测范围的值被裁到范围端点，误差等于它超出端点的部分。</p>
+
+<p>离群值会把误差放大。整张张量共用一个缩放因子时，张量里那个远大于其余元素的值会把范围拉大、$S$ 随之变大，其余元素除以 $S$ 之后都集中在 0 附近，只能落到少数几个格点上，分辨率被压低、误差变大。</p>
+
+<details>
+<summary>离群值把正常值限制到少数几个格点</summary>
+<p>没有离群值时，$r = [1.5, -2.5, 0.6, 3.5]$，4 位对称量化，网格取 $-7$ 到 $7$。</p>
+<ol>
+<li>$S = \max(|r|)/7 = 3.5/7 = 0.5$。</li>
+<li>$r/S = [3, -5, 1.2, 7]$，舍入得 $q = [3, -5, 1, 7]$。</li>
+<li>反量化 $\hat{r} = Sq = [1.5, -2.5, 0.5, 3.5]$，误差 $[0, 0, -0.1, 0]$，都不超过半个格距 $S/2 = 0.25$。</li>
+<li>加入一个离群值，$r = [1.5, -2.5, 0.6, 3.5, 14.0]$，仍用 4 位对称量化，最大绝对值变成 $14$。</li>
+<li>$S = 14/7 = 2$，$r/S = [0.75, -1.25, 0.3, 1.75, 7]$，舍入得 $q = [1, -1, 0, 2, 7]$。</li>
+<li>反量化 $\hat{r} = [2, -2, 0, 4, 14]$，误差 $[0.5, 0.5, -0.6, 0.5, 0]$：前四个正常值的误差从不超过 $0.25$ 涨到 $0.5$ 上下。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 用粒度把误差限制在局部</h2>
+
+<p>一个缩放因子覆盖张量里的一片数，这一片的取值范围决定网格覆盖的范围与疏密。粒度就是把张量切成多大的片、每片各用一个缩放因子。张量按层组织：一层里做一次矩阵乘或一次卷积，这一步里有若干路并行的输出，每一路对应一组权重，这样的一路叫一个通道。</p>
+
+<p>整层共用一个缩放因子时缩放因子数量最少，但层里某个通道的取值范围远大于同层其余通道时，会把这层的网格拉宽，其余通道的分辨率被压低。按组是把若干个通道合成一组、每组一个缩放因子，在分辨率和开销之间折中。按通道是每个通道一个，分辨率比整层共用一个更好，代价是缩放因子的数量增到通道数那么多。再细一档是子通道，把一个通道内部任意分组，每组一个，分辨率最好，但要处理的缩放因子最多，开销也最大。</p>
+
+<details>
+<summary>分成两个通道后离群值只影响自己那一档</summary>
+<p>把 $[1.5, -2.5, 0.6, 3.5, 14.0]$ 看成两个通道：通道 A 是 $[1.5, -2.5, 0.6, 3.5]$，通道 B 是 $[14.0]$。</p>
+<ol>
+<li>整张张量共用一个缩放因子时 $S = 2$，通道 A 的误差是 $[0.5, 0.5, -0.6, 0.5]$。</li>
+<li>改成按通道各用一个缩放因子：通道 A 的 $S = 3.5/7 = 0.5$，误差回到 $[0, 0, -0.1, 0]$；通道 B 的 $S = 14/7 = 2$，误差为 $0$。</li>
+<li>同一个离群值，只影响它所在通道 B 的网格，通道 A 的分辨率不再被它压低。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 训练后量化与量化感知训练</h2>
+
+<p>量化在训练完成后做：把已经训练好的浮点权重换成低位宽整数，再拿去部署。这条路叫训练后量化（PTQ，post-training quantization），它不需要重新训练，换完就能用，低位宽时精度下降大。</p>
+
+<p>另一条路是量化感知训练（QAT，quantization-aware training）。训练本来分两步：前向用当前的权重算出预测和损失（损失是一个衡量预测和目标差多少的数），反向从损失出发算出梯度，再按梯度更新权重。QAT 在训练的前向里就模拟量化：把权重按前面的方法量化再还原成近似权重，用这个近似权重算前向和损失；每次梯度更新之后，再把权重投影回去。模型因此在训练里见到量化带来的偏差。</p>
+
+<p>反向时，量化里的舍入不可导，照常算梯度这一段的梯度几乎处处是 0，训练传不过去。QAT 用一个直通估计器（STE，straight-through estimator）处理这一步：反向传播经过量化时，把梯度按原样传给量化前的权重，相当于把量化当成恒等映射。这样梯度能传过去，权重得以更新；代价是要重新训练。</p>
+
+<p>两条路的区别在是否重训：PTQ 不重训，快，可以在数据受限或无标注时用，低位宽时精度损失大；QAT 要重训，训练里见过量化偏差，低位宽时的精度损失小。</p>
+
+<h2 id="s6">6. 适用条件与边界</h2>
+
+<p>均匀仿射量化对正的缩放因子 $S$ 成立。对称量化适合大致关于 0 对称的分布。观测范围外的值被裁到端点，误差等于超出量，所以范围取得准不准直接决定这部分误差。均匀量化之所以是通用做法，是因为它简单，而且能高效地映射到硬件。</p>
+
+<p>精度和开销是一对：位宽越低，网格越粗、误差越大。同一份误差可以用更细的粒度或 QAT 换回来，但更细的粒度要多存、多算缩放因子，粒度细到子通道时开销尤其大，QAT 则要重新训练。它带来的速度收益依硬件而定，受片上内存、带宽和缓存层次等因素影响。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao, Michael W. Mahoney, Kurt Keutzer. A Survey of Quantization Methods for Efficient Neural Network Inference. arXiv:2103.13630, 2021. <a href="https://arxiv.org/abs/2103.13630">https://arxiv.org/abs/2103.13630</a></li>
+<li>Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, Andrew Howard, Hartwig Adam, Dmitry Kalenichenko. Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference. CVPR 2018. <a href="https://arxiv.org/abs/1712.05877">https://arxiv.org/abs/1712.05877</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
