@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="把神经网络权重量化到三个取值（正、负、零），并强制每 4 个权重恰好一个为零，使 4 个权重恰好用 5 bit 编码，平均 1.25 bit/权重。">
+  <meta name="dojo:summary" content="稀疏三值量化用一条 3:4 稀疏约束把 4 个权重装进 5 bit：每 4 个权重里 3 个非零、1 个为零，非零的取 $\pm d$。每组的合法组合恰好 $32=2^5$ 个，5 bit 编码零浪费，分组大小 4 又是 2 的幂，解码天然对齐 SIMD——同时化解三值量化在存储密度与硬件对齐之间的取舍。">
+  <meta name="dojo:topics" content="训练与优化，模型结构">
+  <meta name="dojo:tag" content="量化">
+  <title>稀疏三值量化</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">稀疏三值量化</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">稀疏三值量化</h1>
+<p class="reading-time">正文 2,477 字 · 约 8 分钟阅读</p>
+
+<p>神经网络是一层层数值计算堆起来的函数，每一层要存一组可学习的实数参数，称为权重。三值量化把这些权重压到三个取值：常见写法是给一组权重配一个缩放系数 $d$，组里每个权重只能取 $+d$、$-d$ 或 $0$ 三者之一，记成 $\{-d,0,+d\}$。权重原本是连续浮点数，<a href="../quantization-basics/index.html">量化</a>就是按阈值把它归到这三个离散值之一，反量化时再乘上 $d$ 近似还原。这样每个权重的位数很低，代价是量化误差，要靠量化感知训练（在训练时就按三值权重做前向，让模型学着适应量化误差）来补。</p>
+
+<p>把三值权重存进文件时，每个权重只取 3 种值，而定长的字只能按 2 的幂切，排法于是成了问题。一条名为 3:4 稀疏的约束要求每 4 个权重里 3 个非零、1 个为零，它把 4 个权重编成 5 bit，既压到平均 1.25 bit，又让分组大小 4 回到 2 的幂，解码因此整齐。</p>
+
+<p>缩放系数有几个尺度，不按 4 个权重一组给：量化时按输出通道给一个，落地到文件里则每 256 个权重共用一个。通道指一条指令能同时处理的一路数据，硬件按 2、4、8 这样的 2 的幂组织。每权重平均占多少 bit 用 bpw 或 bit/权重表示。SIMD 指一条指令同时对多个通道做同一个运算，通道数取 2 的幂；查表类指令一次能索引的条目数有限，用 4 bit 做索引最多 16 项。</p>
+
+<details>
+<summary>三值量化的取值规则</summary>
+<p>对一个权重 $W_{i,j}$，先定这一路的量化阈值 $\Delta_j$ 与缩放系数 $\alpha_j$，再按下式取三值：</p>
+<p>$$T_{i,j}=\begin{cases}+1, &amp; W_{i,j}&gt;\Delta_j\\ 0, &amp; |W_{i,j}|\le\Delta_j\\ -1, &amp; W_{i,j}&lt;-\Delta_j\end{cases}$$</p>
+<p>反量化时把三值乘回缩放系数，$Q(W)=T\alpha$，得到近似的浮点权重。缩放系数的另一写法是 $\alpha$，本页正文写作 $d$，两者是同一个量。</p>
+</details>
+
+<h2 id="s1">1. 三值权重的打包困境</h2>
+
+<p>三值每个权重 3 种取值，最省的编码要给每权重 $\log_2 3\approx1.58$ bit，而这个数不是 2 的幂，权重只能按整数 bit 或整数个权重一组来装，两种现成排法各有代价。第一种给每个权重固定 2 bit，2 bit 有 4 个码点（一个码点是一种取值组合），三值 3 个状态用去 3 个，余 1 个用不上；它和普通 2 bit 整数量化占一样大的空间，三值在存储上并没有省。第二种把 3 个权重挤进 5 bit，每个权重约 1.67 bit，更接近下限，但分组大小 3 不是 2 的幂，与硬件的 2 的幂通道对不上，解码要把 3 个通道的数据重新排列，速度往往反而不如第一种。</p>
+
+<h2 id="s2">2. 3:4 稀疏：4 个权重 5 bit</h2>
+
+<h3 id="s2-1">2.1 32 种组合与 1.25 bit</h3>
+
+<p>约束是硬的：每个 4 权重组里恰好一个是零，剩下三个各取 $+1$ 或 $-1$（乘上 $d$ 就是 $\pm d$）。不设约束时 4 个三值权重能取 $3^4$ 种组合；加上正好一个零，先选哪个位置是零，再定另外三个的符号，组合数正好是 $\binom{4}{3}\times 2^3=32$。32 恰好等于 $2^5$，所以每组的合法取值能用整整 5 bit 不带浪费地枚举，平均到每个权重就是 $5/4=1.25$ bit。它比前述两种排法都小，也低于自由三值的理论下限 1.58 bit，同时保住了 2 的幂的分组。</p>
+
+<h3 id="s2-2">2.2 4 bit 索引 + 1 bit 符号</h3>
+
+<p>32 种组合可以减半再存。一组里三个非零权重的符号一起取反，得到的仍是同一零位下的另一种合法组合，两者只差一个整体符号；同一零位下的 8 种符号模式因此在整体取反下两两配对。32 种组合配成 16 对，码本（一张固定的查表，一条记录一种零位与符号模式）只存每对里的一种，条目数落到 16。查表用 4 bit 索引选这 16 个条目之一，再用 1 bit 记下这一组要不要整体翻转，合计正好 5 bit。16 个条目正好填满这类查表指令的索引上限，不必拆成多次查表。</p>
+
+<h3 id="s2-3">2.3 一组 4 权重走一遍</h3>
+
+<p>取一组 4 个权重，按 3:4 约束从定零位、定符号、定缩放到编码、解码走一遍，看误差落在哪里。</p>
+
+<details>
+<summary>一组 4 权重的编解码过程</summary>
+<ol>
+<li>设这组权重为 $w=(0.61,-0.12,0.47,-0.68)$。定零位：四个绝对值 0.61、0.12、0.47、0.68 里最小的是 0.12，把 $-0.12$ 固定为零。</li>
+<li>定符号：其余三个取各自原本的符号，得到 $(+1,0,+1,-1)$。</li>
+<li>定缩放 $d$：这里为了能手算，把 $d$ 当成这 4 个权重自己的缩放；实际文件里 $d$ 是每 256 个权重共用一个。取留存权重的平均绝对值，$d=(0.61+0.47+0.68)/3=0.5867$。</li>
+<li>编码：零在第 2 位、三个非零的符号是 $(+,+,-)$，用这 4 bit 索引查到对应码本条目；这一组不需要整体翻转，符号位记 0。</li>
+<li>解码：查码本得 $(+1,0,+1,-1)$，符号位 0 不翻转，乘 $d=0.5867$，还原成 $(0.5867,0,0.5867,-0.5867)$。</li>
+<li>看误差：逐元素误差为 $(0.61-0.5867,\ -0.12-0,\ 0.47-0.5867,\ -0.68+0.5867)=(0.0233,\ -0.12,\ -0.1167,\ -0.0933)$，取绝对值即 $(0.0233,\ 0.12,\ 0.1167,\ 0.0933)$，平方和 $0.0233^2+0.12^2+0.1167^2+0.0933^2\approx0.0373$；被置零那个位置的误差 $0.12$ 是四个里最大的一项。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 为什么是 4 与 3:4</h2>
+
+<p>分组大小取 4、稀疏度定在 3:4，是硬件的三条约束一步步收窄的结果：在「每组权重压到约 1.25 bit」这个目标下，可选的分组大小最后只剩 4，且其中 3 个非零、1 个为零。</p>
+
+<details>
+<summary>三条约束如何定出 3:4</summary>
+<ol>
+<li>分组大小要是 2 的幂。硬件的向量通道按 2 的幂组织，分组大小取 2 的幂才能对齐存取，否则多一次重排。</li>
+<li>查表索引受 4 bit 限制。4 bit 索引最多指到 16 个条目，所以每组的码本条目数不能超过 16，而条目数由这组的组合数决定。</li>
+<li>稀疏度不能过半。三值模型在稀疏度超过一半时精度下滑，所以每组的非零个数至少要占一半。</li>
+<li>逐个代入。目标约 1.25 bit 时：分组取 2 要用 1:2（两个位置留一个非零）这种更稀疏的约束，这时每组要 4 bit、每权重 2.0 bit，达不到目标；分组取 8 要用 10 bit 以上、索引超过 4 bit 上限；剩下分组 4 同时满足前两条约束。分组 4 里，2:4 的条目只占 12 个、有浪费，3:4 用满 16 个，且 3:4 的稀疏度 25% 离 50% 的门槛更远，于是取 3:4。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. STQ1_0 的文件布局与 1.3125 bpw</h2>
+
+<p>格式落到文件里有一套具体排布，这套排布有一个实现名 STQ1_0。它以 256 个权重为一块：块内 64 个 4 权重组，每组的 5 bit 拆成 4 bit 索引和 1 bit 符号分开存，整块合起来 42 字节，折合每权重 1.3125 bit。标称的 1.25 bit 是纯权重编码，多出来的部分由那个 256 权重共用的缩放系数摊到每权重上。</p>
+
+<p>负责查表解码的那段计算代码（下称内核）还有一层取值顺序的选择：它不取内存里相邻的 4 个权重成一组，而在每 64 个权重里按下标隔 16 取一组（第 0、16、32、48 位），这样查表解码后各通道的权重与顺序存储的激活（逐层传递、随输入变化的那些数值数组）天然对齐，省掉一次重排。格式层面仍是「每 4 个权重一组」，隔 16 取只是内核在内存里的取值顺序。</p>
+
+<details>
+<summary>一块 256 权重的 42 字节怎么排</summary>
+<ol>
+<li>索引区：64 个 4 权重组，每组一个 4 bit 的码本索引，64×4=256 bit，即 32 字节。</li>
+<li>符号区：每组 1 bit 选表位，64 bit 即 8 字节。</li>
+<li>缩放系数：整个 256 权重共用 1 个 fp16（16 位浮点）值，占 2 字节。</li>
+<li>合计 32+8+2=42 字节，42×8/256=1.3125 bit/权重。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 编码器决定误差</h2>
+
+<p>同一格式下，误差大小取决于两个决定：缩放系数 $d$ 取多少，以及组里哪一个权重被置零。这两个决定不改变文件的字节排布，所以同一个格式可以有强弱不同的编码器。最朴素的编码器取 256 个权重里幅值最大的当缩放（amax），并置零幅值最小的那个。amax 把缩放钉在 256 个权重里的单个最大离群值上，余下的权重都得按这个偏大的尺度还原，误差因此偏大，对训练后量化尤其不利。</p>
+
+<p>缩放不取最大幅值，改对保留下来的权重做加权最小二乘拟合，权重是这个位置对输出的重要性（imatrix）；置零也不只看幅值，改逐个试算把每个位置置零带来的增量误差，挑代价最小的那个。两处交替迭代 3 轮。在一批真实专家权重（模型里按输入条件被选中参与计算的那部分权重）上，只换缩放就把加权平方误差压低 89.7%，叠加置零的改动把余下的部分又压低 4.1%，其中主要的收益来自缩放这一项。</p>
+
+<details>
+<summary>两个决定用的公式</summary>
+<p>缩放取保留下来的权重的加权最小二乘解：</p>
+<p>$$d=\frac{\sum_i m_i\,\mathrm{sel}_i\,|x_i|}{\sum_i m_i\,\mathrm{sel}_i^2}$$</p>
+<p>其中 $x_i$ 是原始权重，$|x_i|$ 取幅值，$m_i$ 是该位置的量化重要性，$\mathrm{sel}_i$ 在保留位置取 1、置零位置取 0；符号由三值另行记录，缩放只定幅值。置零对每个候选位置 $j$ 算置零后的增量代价：</p>
+<p>$$c_j=m_j\big(x_j^2-(|x_j|-d)^2\big)$$</p>
+<p>取 $c_j$ 最小的位置置零，再回到上一步用新的零位更新 $d$，如此交替 3 轮。</p>
+</details>
+
+<h2 id="s6">6. 训练侧的权重陷阱与 Arenas</h2>
+
+<p>硬性的 3:4 约束在量化感知训练里有一个副作用：每 4 个权重里总有一个为零，零在权重矩阵里分布得很均匀，整个稀疏矩阵在乘法里表现得近似一个稠密的二值矩阵，前向（从输入逐层算到输出）的信号被压平，回传（把误差梯度从输出传回前面各层）到前面各层的梯度越来越没有差别。梯度趋同，权重于是往少数几个值上挤，三值的表达能力用不上，退化成接近二值。这个现象叫权重陷阱。衡量梯度是否趋同用有效秩：把梯度矩阵的奇异值归一化成概率分布，取它的熵的指数，秩越低说明梯度越趋同；3:4 稀疏训练里这个值低到与二值量化相当。</p>
+
+<p>对治的办法叫 Arenas，是在训练时给三值层的输出加一条残余通路：输出写成 $Y=XT\alpha+\lambda_t XW$，其中 $X$ 是这一层的输入、$T$ 是三值权重矩阵、$\alpha$ 是缩放系数（本页正文写 $d$）、$W$ 是完整的浮点权重，$\lambda_t$ 是一个随时间衰减的系数。多了 $\lambda_t XW$ 这一项，回传梯度里就带上了 $W$ 的连续取值，梯度重新变得多样，前面的层能收到各自不同的更新，权重得以离开二值般的聚集。训练结束时 $\lambda_t$ 退到零，残余通路消失，推理（用训练好的模型做一次前向计算、得到输出）时只剩纯三值的计算，没有额外开销。这条通路只在训练侧，不改变格式本身，文件里存的仍是 3:4 三值权重和缩放系数。</p>
+
+<h2 id="s7">7. 实测：速度与精度</h2>
+
+<p>精度上，稀疏三值量化用比对照更少的比特，达到与位宽更高的三值方法相当的水平。</p>
+
+<details>
+<summary>两组实测数字</summary>
+<ol>
+<li>精度：1B 模型（B 指十亿，1B 即十亿参数规模）五个零样本任务（不经微调直接考的常识与推理小题，如物理常识、科学问答、指代消解）平均，稀疏三值 0.519，位宽更高的三值基线 0.519，二者相同；3B 上 0.567 对 0.576。条件：量化感知训练，10B 个 token（模型处理文本的最小单位），五个任务取三次平均。</li>
+<li>体积与速度：1B 权重转成这个格式后，在 CPU（8 线程）上实测解码 147.47 token/s、体积 358.00 MiB。</li>
+</ol>
+</details>
+
+<h2 id="s8">8. 适用条件与边界</h2>
+
+<p>这个格式解决的是权重的存储与解码。文件里每权重实际占 1.3125 bit，把标称的 1.25 直接当成文件开销会低估实际占用。它只压权重一层，激活和注意力缓存（推理时把已算出位置的注意力键值存下来、供后续位置复用）仍是高精度，长上下文推理的显存瓶颈不在这里。</p>
+
+<p>三值把连续权重压到 1.25 bit 一档，直接做训练后量化误差大，需要量化感知训练来补，前面给的精度数字都取自量化感知训练后的模型；沿这条路走的训练后量化也可以靠带校准的编码器把误差补回来，校准指用一小批数据调整编码器的缩放与零位。规模上，验证只做到 3B，更大的模型上这条约束和训练侧机制是否同样成立没有验证。</p>
+
+<p>常见的误解是省下的比特来自删掉四分之一权重；实际零不单独占存储，省下的比特来自 4 个权重的组合数被压到 32、正好用 5 bit 枚举，而 3:4 只是编码空间压缩的手段。和一般三值量化的区别也在此：一般三值量化不给稀疏约束，权重可自由取三个值；这里多一条每 4 个恰好一个零的硬约束，换来 5 bit 的整齐分组。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Hong Huang 等，Sherry: Hardware-Efficient 1.25-Bit Ternary Quantization via Fine-grained Sparsification，arXiv，2026：<a href="https://arxiv.org/abs/2601.07892">链接</a></li>
+<li>Tencent AngelSlim 官方仓库（主支），2026：<a href="https://github.com/Tencent/AngelSlim">链接</a></li>
+<li>Tencent AngelSlim 官方仓库（sherry 分支），2026：<a href="https://github.com/Tencent/AngelSlim/tree/sherry/Sherry">链接</a></li>
+<li>AngelSlim Hy4-preview GGUF 模型卡，2026：<a href="https://huggingface.co/AngelSlim/Hy4-preview-GGUF">链接</a></li>
+<li>llama.cpp 仓库 Pull Request #22836（STQ1_0 内核），2026：<a href="https://github.com/ggml-org/llama.cpp/pull/22836">链接</a></li>
+<li>AngelSlim Hy-MT1.5-1.8B-1.25bit 模型卡，2026：<a href="https://huggingface.co/AngelSlim/Hy-MT1.5-1.8B-1.25bit">链接</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

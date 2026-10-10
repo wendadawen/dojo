@@ -1,0 +1,6 @@
+# 冲突记录
+
+- 位置：实测数字（8×H20 上 STQ1_0 的解码速度）。两处说法：blog/huggingface-Hy4-preview-GGUF.md 英文表 L80 记 decode `20.47 ± 0.02 t/s`，同文件中文表 L192 记 `19.52 ± 0.01 t/s`。页面采用：英文表的 20.47（若正文引用该数）。
+- 位置：3:4 的分组方式。两处说法：论文 paper/src/Contents/3method.tex L13「exactly $N$ non-zero elements are permitted within every contiguous block of $M$ weights」（连续 4 个权重一组），落地格式 blog/llamacpp-PR22836-body.md L13「instead of grouping 4 consecutive weights (w0, w1, w2, w3), STQ1_0 groups weights that are stride-16 within each 64-weight chunk」（每 64 权重块内按 stride-16 分组）。页面采用：格式概念按论文的「每 4 个权重一组」，stride-16 作为内核在内存中的取值顺序单独说明，两者不混为一谈。
+- 位置：码本条目数。两处说法：论文 paper/src/Contents/8appendix.tex L82「A 3:4 ternary block with one shared sign bit has a total of $C_4^3 \cdot 2^{3-1} = 16$ unique patterns. This perfectly saturates the $2^4$ entries in the LUT」（4 bit 索引，16 项），落地格式 blog/huggingface-Hy4-preview-GGUF.md L90「a 4-bit code plus a 1-bit table-select, indexing a 32-entry codebook」（4 bit 码加 1 bit 选表，指向 32 项码本）。页面采用：两者相容，取「32 种组合，4 bit 索引选 16 个条目，1 bit 从 32 项码本里选另一半」，正文按此陈述。
+- 位置：1.67-bit 排法的位宽口径。两处说法：论文 paper/src/Contents/2preliminary.tex L32 与 4experiments.tex L9 作 1.67 bit（并说明 1.67 是实际打包达到的密度），落地格式 blog/llamacpp-PR22836-body.md L4 把同一「3-way packing」作 1.6875-bit、L92 的实测标签作 1.69 bpw。页面采用：正文用论文的 1.67 bit，实测表里按维护方文档另有 1.69 一类标签，两处口径不同但指同一种 3 权重/5 bit 排法。
