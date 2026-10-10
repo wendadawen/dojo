@@ -1,0 +1,4 @@
+# 资料分歧
+
+- 左右奇异向量的个数｜位置：正文「分解式与两种写法」「短页第 1 节」| 出处一：LAPACK Users' Guide 把左/右奇异向量只算前 $r$ 个——"the first $r$ columns of V the right singular vectors and the first $r$ columns of U the left singular vectors"（blog/lapack-lug/svd.txt L33-L36）。出处二：Mathematics for Machine Learning 把 $U$ 的全部 $m$ 列、$V$ 的全部 $n$ 列都叫左/右奇异向量——"ui are called the left-singular vectors ... vj ... the right-singular vectors"（blog/mml-book/mml-ch4-svd.txt L41-L43）｜页面采用：按出处二，说 $U$ 的列是左奇异向量、$V$ 的列是右奇异向量。
+- 截断 SVD 保留项数的上限｜位置：正文「最优低秩近似」| 出处一：Stanford EE263 第 17 讲在推导最优秩 $p$ 近似时写 $p<r$——"we seek matrix $\hat A$, rank($\hat A$) ≤ p < r"（blog/ee263/ee263-17_svd.txt L493）。出处二：Mathematics for Machine Learning 的 Eckart–Young 定理写 $k\le r$——"For any k ⩽ r with $\hat A^{(k)}=\sum_{i=1}^k\sigma_iu_iv_i^{\!\top}$"（blog/mml-book/mml-ch4-svd.txt L759-L761）｜页面采用：按出处二，写 $p\le r$（$p=r$ 时截断 SVD 就是 $A$ 本身）。
