@@ -1,0 +1,2 @@
+- paper/arxiv-v5.pdf、paper/src-v5/、paper/arxiv-v5.txt｜论文｜https://arxiv.org/abs/2405.04434｜v5｜2026-10-10｜DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model，提出 Multi-head Latent Attention（MLA）：用低秩 KV 联合压缩把 KV cache 压成潜在向量；LaTeX 源码在 src-v5/，纯文本快照 arxiv-v5.txt
+- repo/DeepSeek-V2/｜官方仓库｜https://github.com/deepseek-ai/DeepSeek-V2｜ec98ee3cbffc32104cd55dba8af884b3d772602a（2024-09-25，浅克隆）｜2026-10-10｜DeepSeek-V2 官方仓库：README、技术报告 PDF、架构图与模型说明
