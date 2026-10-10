@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Stable LatentMoE 是一种混合专家（MoE）层，它把路由专家的计算从模型全宽移到更窄的隐空间上进行，再用三处改动稳定训练：归一化、有界激活和分位数负载均衡。">
+  <meta name="dojo:summary" content="把被挑中的路由专家从全宽 $d$ 移到宽度为 $\ell$ 的隐空间，由此得到 896 个路由专家、每 token 激活 16 个、稀疏度 56；三处稳定化分别抑制路由分支的激活爆炸与专家负载失衡。">
+  <meta name="dojo:topics" content="模型结构, 训练与优化">
+  <meta name="dojo:tag" content="MoE">
+  <title>Stable LatentMoE</title>
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Stable LatentMoE</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Stable LatentMoE</h1>
+<p class="reading-time">正文 1,932 字 · 约 6 分钟阅读</p>
+
+<p>大语言模型的主干是一叠 Transformer 层（Transformer 是这类模型的主干结构，一叠同构的层，每层先让各位置之间交换信息、再逐个位置做变换）。层里有一部分叫前馈层，它对每个位置各算一次，通常写成两层线性投影夹一个非线性，有的写法把非线性换成两条投影逐元素相乘。混合专家（MoE）把前馈层换成一排并行的专家子网络：每个 token（文本切分后的基本单位）由一步路由按分数只挑其中几个参与计算，被挑中的叫路由专家。<a href="../deepseek-moe/index.html">DeepSeekMoE</a> 那一类组织还把一部分专家设为共享专家，它们不参与挑选，每个 token 都固定经过；这种挑选叫 top-$k$，即按分数取前 $k$ 个。稀疏度是路由专家总数除以每 token 激活的专家数。</p>
+
+<p>把路由专家的计算从全宽 $d$ 移到宽度为 $\ell$ 的隐空间（比全宽更低维的中间向量表示），这一设计叫 LatentMoE：共享专家保留全宽路径处理通用变换，路由专家在更窄的隐空间里计算。Stable LatentMoE 用这层结构，并补三处稳定化。</p>
+
+<p>这里用的路由不给辅助损失（加在训练目标上、用来使各专家负载趋于均衡的一项），而是直接按规则调整偏置，这个偏置加在该专家被挑选时用的分数上。Stable LatentMoE 用三处改动分别处理：在路由分支里插一道 <a href="../rmsnorm/index.html">RMSNorm</a>；对前馈层里相乘的两个因子分别取一个平滑上界，即 <a href="../situ-glu/index.html">SiTU-GLU</a>；专家的偏置不再按固定的步长更新，而由路由分数的分位数定出，即 Quantile Balancing。Stable LatentMoE 用在 K3 上，K3 是采用这层结构的一个模型。</p>
+
+<details>
+<summary>K3 的规模与配置取值</summary>
+<p>K3 的隐空间宽度取全宽的一半。</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>量</th><th>含义</th><th>K3 取值</th></tr></thead>
+<tbody>
+<tr><td>$d$</td><td>模型全宽</td><td>7168</td></tr>
+<tr><td>$\ell$</td><td>路由隐空间宽度</td><td>3584</td></tr>
+<tr><td>$N$</td><td>路由专家总数</td><td>896</td></tr>
+<tr><td>$k$</td><td>每 token 激活的路由专家数</td><td>16</td></tr>
+<tr><td>$N_s$</td><td>共享专家数</td><td>2</td></tr>
+<tr><td>$N/k$</td><td>稀疏度</td><td>56</td></tr>
+</tbody>
+</table>
+</div>
+</details>
+
+<h2 id="s1">1. 一层怎么算</h2>
+
+<p>这一层从前一层拿到输入 $\mathbf{x}\in\mathbb{R}^{d}$，$d$ 是模型全宽。它分成共享分支和路由分支，两支的结果相加作为这一层的输出。</p>
+
+<p>共享分支有 $N_s$ 个共享专家，每个共享专家 $E_j^{\mathrm{shared}}$ 是一个 $d$ 进 $d$ 出的前馈网络，直接处理 $\mathbf{x}$。路由分支先把 $\mathbf{x}$ 经降维矩阵 $\mathbf{W}^{\downarrow}$ 投到 $\ell$ 维隐空间，得到 $\mathbf{z}=\mathbf{W}^{\downarrow}\mathbf{x}\in\mathbb{R}^{\ell}$；路由按分数挑出前 $k$ 个路由专家，记作集合 $\mathcal{T}_k(\mathbf{x})$。每个选中的路由专家 $E_i^{\mathrm{routed}}$ 是一个 $\ell$ 进 $\ell$ 出的前馈网络，它们的输出按路由权重 $p_i$ 加权求和，得到聚合表示 $\mathbf{u}\in\mathbb{R}^{\ell}$。$\mathbf{u}$ 先过 RMSNorm 归一化，再经上投影矩阵 $\mathbf{W}^{\uparrow}$ 投回 $d$ 维。把两支合起来：</p>
+
+<p>$$\mathbf{u}=\sum_{i\in\mathcal{T}_k(\mathbf{x})} p_i\,E_i^{\mathrm{routed}}(\mathbf{W}^{\downarrow}\mathbf{x}),\qquad \mathbf{y}=\sum_{j=1}^{N_s} E_j^{\mathrm{shared}}(\mathbf{x})+\mathbf{W}^{\uparrow}\operatorname{RMSNorm}(\mathbf{u}).$$</p>
+
+<details>
+<summary>一个手算的小例子：一层从输入走到输出</summary>
+<p>取一层的最小配置：全宽 $d=2$、隐空间 $\ell=2$、2 个路由专家、每 token 选 1 个（$k=1$）、1 个共享专家。</p>
+<ol>
+<li>输入 $\mathbf{x}=[2,2]$。</li>
+<li>降维矩阵取 $\mathbf{W}^{\downarrow}=[[1,0],[0,1]]$，得 $\mathbf{z}=\mathbf{W}^{\downarrow}\mathbf{x}=[2,2]$。</li>
+<li>路由选中专家 1；设 $E_1^{\mathrm{routed}}$ 是恒等映射，则 $\mathbf{u}=p_1 E_1^{\mathrm{routed}}(\mathbf{z})=[2,2]$，只有一个获胜者时 $p_1=1$。</li>
+<li>$\mathbf{u}$ 的均方根是 $\sqrt{(2^2+2^2)/2}=2$，$\operatorname{RMSNorm}(\mathbf{u})=\mathbf{u}/2=[1,1]$，增益取 1。</li>
+<li>上投影矩阵取 $\mathbf{W}^{\uparrow}=[[1,2],[3,4]]$，得 $\mathbf{W}^{\uparrow}[1,1]^{\top}=[3,7]$。</li>
+<li>共享专家取 $E^{\mathrm{shared}}(\mathbf{x})=[[1,0],[0,2]]\mathbf{x}=[2,4]$。</li>
+<li>相加得 $\mathbf{y}=[2,4]+[3,7]=[5,11]$。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 极端稀疏放大出的两个失败模式</h2>
+
+<p>稀疏度 56 的意思是：896 个路由专家里，每个 token 只激活 16 个。</p>
+
+<p>第一个在路由分支内部。路由分支把降维矩阵 $\mathbf{W}^{\downarrow}$、路由专家自身的前馈网络、上投影矩阵 $\mathbf{W}^{\uparrow}$ 依次相乘、接成一条链，这条链上连着近四个矩阵乘法。结构本身的条件数差（条件数衡量一串运算对扰动的放大程度），在 2.8 万亿参数的规模上，它会产出路由分支内部的激活值爆炸。</p>
+
+<p>第二个在专家负载上。训练里要让近一千个专家各拿到大致相等的 token，靠的是无辅助损失路由：它给每个专家一个偏置，偏置加在用于挑选的分数上，按固定步长更新。专家池到近千这一量级，这个固定步长的更新超出了它仍然表现良好的区间，负载会失衡；失衡会拖慢专家并行训练（把不同专家放到不同设备上并行），也可能让部分专家训练不足。</p>
+
+<h2 id="s3">3. 聚合之后、上投影之前加归一化</h2>
+
+<p>归一化这里指 <a href="../rmsnorm/index.html">RMSNorm</a>：把向量各分量平方的平均开方当尺度，逐个分量除以它，再乘一个可学增益。</p>
+
+<p>原始的隐空间路由把上投影矩阵 $\mathbf{W}^{\uparrow}$ 直接作用在聚合表示 $\mathbf{u}$ 上。$\mathbf{u}$ 是选中的路由专家输出按路由权重加权求和，它的大小会随这次选中了哪些专家、权重各是多少而变，这种变化会跟着 $\mathbf{u}$ 一起进 $\mathbf{W}^{\uparrow}$，再进与共享分支的相加。Stable LatentMoE 在专家聚合之后、上投影之前插一道 RMSNorm，先把它归一化，路由分支对 $\mathbf{u}$ 尺度变化的敏感度就降低了。除了稳定训练，这道 RMSNorm 还持续改善验证损失（验证集上的损失）。</p>
+
+<details>
+<summary>插入 RMSNorm 前后</summary>
+<p>原始隐空间路由与加了归一化的做法只差一道 RMSNorm。</p>
+<ul>
+<li>原始：$\mathbf{y}=\sum_j E_j^{\mathrm{shared}}(\mathbf{x})+\mathbf{W}^{\uparrow}\mathbf{u}$。</li>
+<li>归一化后：$\mathbf{y}=\sum_j E_j^{\mathrm{shared}}(\mathbf{x})+\mathbf{W}^{\uparrow}\operatorname{RMSNorm}(\mathbf{u})$。</li>
+</ul>
+</details>
+
+<h2 id="s4">4. 两个乘性因子各加上界</h2>
+
+<p>这里的前馈激活是 <a href="../swiglu/index.html">SwiGLU</a>：两条线性投影逐元素相乘，其中一条先经 Swish 作门控（门控指用一条分支逐元素调制另一条）。Swish 指 $\operatorname{Swish}(z)=z\,\sigma(z)$，$\sigma$ 是 sigmoid 函数，$\sigma(z)=1/(1+e^{-z})$。SwiGLU 的两个乘性因子都没有上界，两个因子如果在同一个坐标上同时偏大，它们的乘积恰好在那个坐标上偏得更多，可能形成一个远高于其余坐标的激活值（外点），在低精度算术（分量用较少二进制位表示的浮点运算）下抬高溢出的风险。</p>
+
+<p>SiTU-GLU 对两个因子分别取一个平滑饱和的上界函数 softcap：$\operatorname{softcap}(z,\beta)=\beta\tanh(z/\beta)$，它在原点附近近似线性、在大值处饱和到 $\beta$。定义写作：</p>
+
+<p>$$\operatorname{SiTU\text{-}GLU}(\mathbf{x})=\Big[\beta_1\tanh\!\Big(\frac{\mathbf{W}_g\mathbf{x}}{\beta_1}\Big)\odot\sigma(\mathbf{W}_g\mathbf{x})\Big]\odot\Big[\beta_2\tanh\!\Big(\frac{\mathbf{W}_u\mathbf{x}}{\beta_2}\Big)\Big].$$</p>
+
+<p>K3 取 $\beta_1=4$ 给门那一支、$\beta_2=25$ 给上支。</p>
+
+<details>
+<summary>上界 100 与近原点的响应</summary>
+<ol>
+<li>$\tanh$ 把实数压进 $(-1,1)$，乘 $\beta$ 后值域是 $(-\beta,\beta)$。两个因子各自饱和到 $\beta_1$ 与 $\beta_2$，大到正侧时乘积不超过 $\beta_1\beta_2=4\times 25=100$。</li>
+<li>原点附近 $\tanh(z/\beta)\approx z/\beta$，两个因子分别近似 $\mathbf{W}_g\mathbf{x}$ 与 $\mathbf{W}_u\mathbf{x}$，整个式子近似 SwiGLU。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 用分位数给专家定 bias</h2>
+
+<p>负载均衡用的偏置 $b_j$ 只加在用于 top-$k$ 挑选的分数上，不进专家输出的加权比例，所以它只改变把 token 分给哪个专家，不改变各专家输出的相对权重。无辅助损失路由里，这套更新原本按固定步长做，步长要在适应太慢与负载来回震荡之间折中。</p>
+
+<p>Quantile Balancing 换掉了这个更新规则。记一批 $m$ 个 token、$N$ 个专家、每个 token 选 $k$ 个，则每个专家的目标负载是 $q=mk/N$ 个 token。它把挑选从 top-$k$ 改成在有偏置的分数上取 top-$(k{+}1)$：前 $k$ 个照常路由，第 $(k{+}1)$ 个的分数记为截断值 $\alpha_i$，一个专家要排进某个 token 的前 $k$，其分数就要超过该 token 的截断值。某个专家的偏置越高，它的分数越过各 token 截断值的机会就越多，拿到的 token 也越多；要求它恰好拿到 $q$ 个，阈值就落在各 token 的边距 $s_{i,j}-\alpha_i$（$s_{i,j}$ 是 token $i$ 在专家 $j$ 上的路由分数，$i$ 指 token、$j$ 指专家）的第 $(q{+}1)$ 大处。因为 $q/m=k/N$，这个位置也就是边距的 $(1-k/N)$ 分位数；把偏置设成这个分位数的相反数，负载就落到目标值。</p>
+
+<details>
+<summary>与固定步长更新之别，以及直方图估计</summary>
+<ol>
+<li>固定步长：$b_j\leftarrow b_j+\gamma\operatorname{sign}(\bar{L}-L_j)$，$\gamma$ 是步长，$\bar{L}$ 是平均负载、$L_j$ 是该专家当前负载；符号函数只给方向，步长恒定。</li>
+<li>分位数法：偏置由分位数一次算出，不再逐步逼近；更新只在下一步生效，一个 batch 不会用自己算出的偏置路由。</li>
+<li>规模上，边距有几百万条，分散在各张 GPU 与各累积步（梯度累积，把几个小批次的梯度攒起来再更新一次，这里每一步都有一批 token），精确取分位数不可行；改用一张各专家边距的直方图，一次全局汇总各卡的分箱计数，再从合计计数取分位数，误差不超过一个分箱宽度。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 适用条件与边界</h2>
+
+<p>这些结论成立的范围是 K3 的规模与配置：896 个路由专家、每 token 激活 16 个、隐空间宽度 3584、全宽 7168、2.8 万亿参数。三处稳定化针对的都是极端稀疏下出现的两个失败模式——固定步长的无辅助损失更新在近千专家时失衡，路由分支的连续矩阵乘法链条件数差。</p>
+
+<p>资料没有给出别的规模是否需要这三处改动：在更小的专家池或更低的稀疏度下，它们相对普通 MoE 是否仍必要，这里推不出来。</p>
+
+<p>三处稳定化不属于 LatentMoE 的定义：LatentMoE 只规定路由专家在隐空间里计算，本页说的稳定效果依赖这三处额外改动，不能当成 LatentMoE 本身的性质。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Kimi Team. Kimi K3: Open Frontier Intelligence. arXiv:2607.24653v2, 2026. <a href="https://arxiv.org/abs/2607.24653">https://arxiv.org/abs/2607.24653</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
