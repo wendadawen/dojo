@@ -232,6 +232,8 @@ def parse(plan: Path) -> dict:
             nid = r["id"]
             if not nid or nid in ids:
                 fail(no, f"id「{nid}」为空或在{where}里重复")
+            if not re.fullmatch(r"[A-Za-z0-9_.\-]+", nid):
+                fail(no, f"id「{nid}」只能用英文、数字、下划线、点、连字符")
             if r["类型"] not in KIND:
                 fail(no, f"类型「{r['类型']}」只能是 算子 / 张量 / 缓存")
             ids.add(nid)
@@ -660,6 +662,7 @@ def selftest() -> list[tuple[str, bool]]:
             ("折叠写在张量上应当报错", TOY_PLAN.replace("| blk | 公式 |", "| ids | 公式 |")),
             ("折叠名字不对应当报错", TOY_PLAN.replace("| blk | 公式 |", "| blk | 残差 |")),
             ("类型写错应当报错", TOY_PLAN.replace("| ids | 张量 |", "| ids | 向量 |")),
+            ("id 用了中文应当报错", TOY_PLAN.replace("| ids | 张量 |", "| 身份 | 张量 |")),
             ("缺少页面信息应当报错", TOY_PLAN.replace("- 摘要：生成器自检，与任何真实模型无关。\n", "")),
             ("缺少标签应当报错", TOY_PLAN.replace("- 标签：数据流\n", "")),
             ("标签不在词表应当报错", TOY_PLAN.replace("- 标签：数据流", "- 标签：不存在")),

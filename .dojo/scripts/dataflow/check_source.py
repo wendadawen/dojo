@@ -191,9 +191,13 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
     by_norm = {placeholder(k): k for k in shapes}
     for view in views:
         for node in view["nodes"]:
-            fold_txt = " ".join((s.get("text") or "") for s in node.get("fold") or [])
-            blob = " ".join(filter(None, [node.get("name"), node.get("detail"),
-                                          node.get("shape"), fold_txt]))
+            # 逐字段核查：键名与它的形状永远写在同一个字段（第三行、或折叠的某一栏）里，
+            # 跨字段相邻没有意义。早先把这些字段拼成一个字符串再正则，会把「符号」栏
+            # 末尾的 `…源码里叫 norm.weight` 与「说明」栏开头的 `[64]（检查点键 …）`
+            # 粘成假的 `norm.weight [64]（检查点键 …）`，凭空报错；为挡它加的启发式
+            # 又误伤了 form① 的错键名和真实的带点尾巴。按字段分治从根上消除这类假匹配。
+            fields = [node.get("name"), node.get("detail"), node.get("shape"),
+                      *(s.get("text") for s in node.get("fold") or [])]
 
             def compare(key: str, claimed_text: str) -> None:
                 nonlocal matched
@@ -225,37 +229,30 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
                                   "（拼错或材料里没有这个键，这个形状没被核过）")
                 return None
 
-            # ① 键名紧跟形状
-            for m in NAME_THEN_SHAPE.finditer(blob):
-                ident = placeholder(m.group(1))
-                # 形状紧跟键注（形态③：`[64]（检查点键 X）`）时，形状前面那个标识符
-                # 往往只是节点名或说明文字的尾巴（attn_sink、core），不是键名。
-                # 「检查点键」一定带点（module.path.weight 形态），据此区分：
-                # 无点的裸标识符不当键名，交给 ② 按括号里的键名处理；
-                # 带点的（含拼错的 `gate.wieght`）照旧核，拼错要报出来。
-                annotated = re.match(r"\s*[（(](?:检查点键|源码里叫)",
-                                     blob[m.end():m.end() + 12])
-                if annotated and "." not in ident:
+            for text in fields:
+                if not text:
                     continue
-                key = resolve(ident)
-                if key is None:
-                    continue
-                compare(key, m.group(2))
-                seen_here.add(key)
-            # ② 短符号 + 形状 + （检查点键）
-            for rx in (SRC_AFTER_SYMBOL, SHAPE_THEN_SRC):
-                for m in rx.finditer(blob):
-                    key = resolve(placeholder(m.group(2)))
-                    if key is None or key in seen_here:
+                # ① 键名紧跟形状（form①：`gate.weight [16, 32]`）
+                for m in NAME_THEN_SHAPE.finditer(text):
+                    key = resolve(placeholder(m.group(1)))
+                    if key is None:
                         continue
-                    compare(key, m.group(1))
+                    compare(key, m.group(2))
                     seen_here.add(key)
-            # ③ `$W$ [512, 5120]` 这种：有形状、又没有紧跟的键名注记，等于没被核过
-            for m in re.finditer(r"\$[^$]+\$\s*\[([0-9][0-9,\s]*)\]", blob):
-                after = blob[m.end():m.end() + 24]
-                if not re.match(r"\s*[（(](?:检查点键|源码里叫)", after):
-                    errors.append(f"[{view['id']}/{node['id']}] 权重形状 [{m.group(1).strip()}]"
-                                  " 后面没写「（检查点键 …）」，这个形状没被核过")
+                # ② 形状 + （检查点键 X）/（源码里叫 X）
+                for rx in (SRC_AFTER_SYMBOL, SHAPE_THEN_SRC):
+                    for m in rx.finditer(text):
+                        key = resolve(placeholder(m.group(2)))
+                        if key is None or key in seen_here:
+                            continue
+                        compare(key, m.group(1))
+                        seen_here.add(key)
+                # ③ `$W$ [512, 5120]`：有形状、后面又没跟键注，等于没被核过
+                for m in re.finditer(r"\$[^$]+\$\s*\[([0-9][0-9,\s]*)\]", text):
+                    after = text[m.end():m.end() + 24]
+                    if not re.match(r"\s*[（(](?:检查点键|源码里叫)", after):
+                        errors.append(f"[{view['id']}/{node['id']}] 权重形状 [{m.group(1).strip()}]"
+                                      " 后面没写「（检查点键 …）」，这个形状没被核过")
     return errors, matched
 
 
@@ -553,6 +550,16 @@ def selftest() -> list[tuple[str, bool]]:
                      "detail": "gate.wieght [16, 32]（检查点键 gate.weight）"}]}],
         {"gate.weight": [16, 32]})
     checks.append(("带点的错键名后面跟键注也要报", bool(e_f3c)))
+    # 跨字段假匹配：符号栏以「源码里叫 norm.weight」结尾、说明栏以裸形状+键注开头，
+    # 两者拼接后曾粘成假的 `norm.weight [64]（检查点键 …）`，凭空报错。逐字段核查后不再发生。
+    e_x, m_x = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "n", "name": "core", "kind": "op", "shape": "16 → 16",
+                     "fold": [{"title": "符号", "text": "$w$：权重，源码里叫 norm.weight"},
+                              {"title": "说明",
+                               "text": "[64]（检查点键 layers.{i}.attn.attn_sink）"}]}]}],
+        {"layers.{i}.attn.attn_sink": [64], "norm.weight": [5120]})
+    checks.append(("跨字段不粘连：符号栏尾巴与说明栏形状不互认", not e_x and m_x == 1))
     checks.append(("同一个错键只报一条",
                    len([e for e in e_dup if "gate.wieght" in e]) == 1))
 

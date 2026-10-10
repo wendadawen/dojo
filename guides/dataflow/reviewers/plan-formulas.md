@@ -6,6 +6,7 @@
 
 - `dataflow.md`
 - 源码（按计划文件「资料」一节自己去取）
+- `sources/config.json`、`sources/shapes.json`（按计划文件「资料」一节取，用来核面板配置值和公式里的数的照抄）
 
 ## 核这几件事
 
