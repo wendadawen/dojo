@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="PCP（预填充上下文并行，prefill context parallelism）把一条长请求的预填充序列计算切成几段、摊到多张卡上并行算，用来缩短预填充时间、降低用户等待首 token 的时间。">
+  <meta name="dojo:summary" content="预填充要一次算完全部输入 token、慢在首 token 时间；PCP 把这 $T$ 个新 token 切成 $N$ 段，每张卡算一段的查询、键、值，装得下全量键值就各算各段，装不下用 Ring Attention 逐块收发。">
+  <meta name="dojo:topics" content="推理系统, 并行与通信">
+  <meta name="dojo:tag" content="并行与通信">
+  <title>PCP</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">PCP</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">PCP</h1>
+<p class="reading-time">正文 919 字 · 约 3 分钟阅读</p>
+
+<p>大语言模型推理时要把一条请求的整段 token（模型处理文本的最小单位）序列算一遍。序列很长时，可以把它沿 token 维切成几份，分给多张卡同时处理，这叫上下文并行（context parallelism，CP）。它切的是同一条序列的长度方向，不同于把权重矩阵切开的<a href="../model-parallelism/index.html">张量并行</a>。同一条请求分两段算：预填充（prefill）一次读入整段提示、算出结果，解码（decode）逐 token 生成。预填充上下文并行（PCP）切预填充时要算的 token，把这批序列计算摊到多张卡上并行做，用来缩短预填充的时间。</p>
+
+<h2 id="s1">1. 预填充算得多，解码存得多</h2>
+
+<p>预填充阶段，一条有 $T$ 个新 token 的长请求要一次算出这些 token 的查询、键、值张量（注意力用查询和键打分、再按分数对值加权求和）。<a href="../standard-attention/index.html">注意力</a>里每个 token 要和已有的 token 打分，输入越长这一步越重，用户能感觉到的是首 token 的等待时间（time to first token，TTFT）。解码阶段每步只算少量新 token 的查询，却要读键值缓存（KV cache，每个 token 算出的键和值缓存下来供后面复用）里全部历史 token 的键和值，缓存装得下多少决定能同时服务多少请求，这段压力由<a href="../dcp/index.html">解码上下文并行（DCP）</a>处理。</p>
+
+<h2 id="s2">2. PCP：把预填充的序列计算摊到多张卡</h2>
+
+<p>预填充这样一条长请求，用 $N$ 张卡，就把请求切成 $N$ 段，每张卡算一段的查询、键、值。第一种是「部分查询、完整键值」：请求长度中等、还装得下完整的键和值张量时，把各卡的键、值聚到一起，每张卡算自己那段查询对应的注意力输出。第二种是「部分查询、部分键值」：长度太长、已经装不下完整键值时，每张卡只算一段的查询、键、值，再用 Ring Attention（各卡把本地键值块沿环传给下一张卡、边收边算，不必一次装下全部键值）让各卡逐块收发键、值。传哪一侧看查询与键值张量的大小：未分块的整段预填充一般传键值分片，<a href="../chunked-prefill/index.html">Chunked Prefill</a>（把一条预填充切成小块、与解码请求同批分多次算完）且缓存远长于查询时传查询分片更省。</p>
+
+<h3 id="s2-1">2.1 因果负载与首尾配对</h3>
+
+<p><a href="../causal-mask/index.html">因果掩码</a>下第 $j$ 个 token 只能看到它自己和前面的 token，要打分的键有 $j+1$ 个，位置越靠后计算越重。把序列平均划分成 $2N$ 个块（$N$ 是卡数；块是比段更细的单位），越靠后的块这一块上的计算越重：第 $0$ 块最轻、最后一块最重。若按顺序把相邻块分给同一张卡，拿到末尾重块的卡负载会比别的卡重。配平的做法叫首尾配对：让第 $i$ 张卡拿第 $i$ 块和第 $(2N-1-i)$ 块、一轻一重相加，这两块一般分处序列的前后两半、位置对称。</p>
+
+<details>
+<summary>首尾配对的手算例</summary>
+<p>取 $N=2$、共 $4$ 块的例子，每块的计算量按 $2i+1$ 算，即 $1$、$3$、$5$、$7$。</p>
+<ol>
+<li>第 $0$ 张卡拿第 $0$ 块和第 $3$ 块：$1+7=8$。</li>
+<li>第 $1$ 张卡拿第 $1$ 块和第 $2$ 块：$3+5=8$。</li>
+<li>两张卡的负载都是 $8$。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 适用条件与边界</h2>
+
+<p>PCP 是一种独立的并行方式：它增加要启动的卡数，但不增加 KV cache 的分片数，只把预填充的计算摊开。两种策略都还在开发中。与它容易混淆的是<a href="../dcp/index.html">解码上下文并行（DCP）</a>：DCP 不增加要启动的卡数，切的是解码时反复读的 KV cache，用来腾显存、提吞吐；PCP 切的是预填充要算的 token，用来缩短首 token 时间。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>vLLM 项目，Context Parallel Deployment（官方文档），2026，<a href="https://github.com/vllm-project/vllm/blob/main/docs/serving/context_parallel_deployment.md">https://github.com/vllm-project/vllm/blob/main/docs/serving/context_parallel_deployment.md</a></li>
+<li>Seonghee Lee、Sungsoo Ha、Omri Almog、Lucas Wilkinson，Efficient Decode Context Parallelism with vLLM for Long Context Workloads（vLLM 博客），2026-08-07，<a href="https://vllm.ai/blog/2026-08-07-decode-context-parallelism">https://vllm.ai/blog/2026-08-07-decode-context-parallelism</a></li>
+<li>vLLM 项目，支持上下文并行与全分片 KV cache、Ring Attention 的 RFC 26133，2025，<a href="https://github.com/vllm-project/vllm/issues/26133">https://github.com/vllm-project/vllm/issues/26133</a></li>
+<li>vLLM 项目，vLLM 官方仓库，2026，<a href="https://github.com/vllm-project/vllm">https://github.com/vllm-project/vllm</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
