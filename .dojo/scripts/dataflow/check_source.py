@@ -210,6 +210,10 @@ def check_shapes(views: list[dict], shapes: dict) -> tuple[list[str], int]:
                 nonlocal matched
                 claimed = [int(x) for x in claimed_text.replace(" ", "").split(",") if x]
                 expected = shapes[key]
+                # collect.md 允许形状表的值写成 {"shape": [...], "dtype": "BF16"}，
+                # 记了 dtype 时形状在 shape 子键里。只取形状比对，dtype 不做机械核。
+                if isinstance(expected, dict):
+                    expected = expected.get("shape", [])
                 matched += 1
                 if claimed != expected:
                     errors.append(f"[{view['id']}/{node['id']}] {key} 页面写 {claimed}，"
@@ -554,6 +558,17 @@ def selftest() -> list[tuple[str, bool]]:
     shapes = {"layers.{i}.attn.wkv.weight": [512, 5120]}
     e4, m4 = check_shapes(sym_views, shapes)
     checks.append(("短符号 + 检查点键能对上", not e4 and m4 == 1))
+    # collect.md 鼓励记 dtype，形状表的值可能是 {"shape": [...], "dtype": "BF16"}：
+    # 只比 shape 子键，dtype 不核。写错形状仍要报出。
+    dict_shapes = {"layers.{i}.attn.wkv.weight": {"shape": [512, 5120], "dtype": "BF16"}}
+    e4d, m4d = check_shapes(sym_views, dict_shapes)
+    checks.append(("形状表记了 dtype（dict 形式）也能比对形状", not e4d and m4d == 1))
+    e4d_bad, m4d_bad = check_shapes(
+        [{"id": "main", "label": "T", "title": "T", "edges": [],
+          "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
+                     "detail": "$W$ [512, 9999]（检查点键 layers.{i}.attn.wkv.weight）"}]}],
+        dict_shapes)
+    checks.append(("dict 形式形状不一致仍报出", m4d_bad == 1 and bool(e4d_bad)))
     e5, m5 = check_shapes(
         [{"id": "main", "label": "T", "title": "T", "edges": [],
           "nodes": [{"id": "w", "name": "w", "kind": "op", "shape": "16 → 16",
