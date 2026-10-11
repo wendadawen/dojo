@@ -1,4 +1,4 @@
-# GPU 通信
+# GPU Communication
 
 - 描述：GPU 通信是让多块 GPU 协作时交换数据的机制：算法上由集合通信把各卡的数据合并（如 ring all-reduce），合并后的字节经机内 NVLink 或跨机网卡与 RDMA 传输。
 - 摘要：数据并行训练每步要把各卡算出的梯度合并：用 all-reduce 求出各卡数组的和，再按卡数取平均，使每块卡得到同一份平均梯度。ring all-reduce 把它拆成 scatter-reduce 与 all-gather 两阶段，每卡经手的数约为整个数组的两倍、不随卡数线性增长；字节走的路径机内是 NVLink，跨机是网卡加 RDMA。

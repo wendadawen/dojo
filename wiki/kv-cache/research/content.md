@@ -1,4 +1,4 @@
-# KV cache
+# KV Cache
 
 - 描述：KV cache 是自回归生成时把每层已算过的 key 和 value 留下来复用的机制，让生成每个新 token 时不必重算全部历史。
 - 摘要：自回归模型逐个预测 token，每步都要用到全部历史 token 的 key 和 value。把它们按层缓存下来、每步只追加当前 token，每步注意力开销从随序列长度二次降到线性。

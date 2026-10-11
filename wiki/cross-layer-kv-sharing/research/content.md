@@ -1,4 +1,4 @@
-# 跨层 KV 复用
+# Cross-Layer KV Sharing
 
 - 描述：跨层 KV 复用让多层共用同一份全局 KV：后一半层不再各自计算，而是读取前一半层末层投影出的唯一一份，把原本每层各存一份改成后一半各层共用一份。
 - 摘要：前一半层算出唯一一份全局 KV $\hat K=\mathrm{LN}(X^{L/2})W_K$、$\hat V=\mathrm{LN}(X^{L/2})W_V$，后一半层各层复用它；缓存复杂度从 $\mathcal{O}(LND)$ 降到 $\mathcal{O}((N+L)D)$，prefill 还能提前退出一半的层。

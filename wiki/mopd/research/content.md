@@ -1,4 +1,4 @@
-# MOPD（Multi-Teacher On-Policy Distillation）
+# MOPD
 
 - 描述：MOPD 是一种后训练方法：先按领域各自训练出专项教师，再让模型在自己生成的回答上接受对应领域教师对每个输出位置的监督，把多项能力合并进一个统一的学生模型。
 - 摘要：每个领域的强化学习教师冻结后按 prompt 路由给学生打分，学生最小化逐 token 反向 KL $\mathbb{E}_{x,y\sim\pi_\theta}\big[\tfrac{1}{|y|}\sum_t\sum_v \pi_\theta(v)\log\frac{\pi_\theta(v)}{\pi_{\phi_d}(v)}\big]$ 合入多项能力，无需在权重空间平均。

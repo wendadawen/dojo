@@ -1,4 +1,4 @@
-# iHC（identity Hyper-Connections）
+# iHC
 
 - 描述：iHC 是 Hyper-Connections 的一个变体：残差流扩成 n 条，流间的残差混合映射在 Hy4 实现里等价于恒等。
 - 摘要：把残差流从一条扩成 $n$ 条，每层的输入由 $n$ 条流汇合而得，层的输出再分发回各条流；iHC 中流间的残差混合映射等价于恒等，省掉它的矩阵乘法。

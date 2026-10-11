@@ -1,4 +1,4 @@
-# OPD（On-Policy Distillation）
+# OPD
 
 - 描述：OPD 在训练时让学生模型（被训练的小模型）自己生成序列，教师模型（提供监督的强模型）对这条序列里学生实际写下的每个 token（文本最小单位）逐个打分，分数作训练信号更新学生。
 - 摘要：训练序列由学生自己采样，监督是教师逐 token 给出的对数概率比 $r=\log\pi_{\text{teacher}}(y_t)-\log\pi_S(y_t)$，它充当策略梯度里的 advantage；逐 token 的稠密反馈把每个 episode 的信号从与 token 数无关的 $O(1)$ 提高到 $O(N)$。
