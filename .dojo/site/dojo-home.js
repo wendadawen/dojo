@@ -5,7 +5,6 @@
     status: document.getElementById("app-status"),
     search: document.getElementById("search-input"),
     topic: document.getElementById("topic-filter"),
-    sort: document.getElementById("sort-order"),
     tabs: [...document.querySelectorAll("[data-view]")],
     libraryView: document.getElementById("library-view"),
     mapView: document.getElementById("map-view"),
@@ -17,29 +16,10 @@
     mapWorkspace: document.getElementById("map-workspace"),
     mapDetails: document.getElementById("map-details"),
   };
-  const SORT_STORAGE_KEY = "dojo-home-sort";
-  const SORT_OPTIONS = new Set(["newest", "oldest", "title"]);
-
-  function loadStoredSort() {
-    try {
-      const stored = localStorage.getItem(SORT_STORAGE_KEY);
-      return SORT_OPTIONS.has(stored) ? stored : "newest";
-    } catch {
-      return "newest";
-    }
-  }
-
-  function storeSort(value) {
-    try {
-      localStorage.setItem(SORT_STORAGE_KEY, value);
-    } catch { /* 受限环境下 localStorage 不可用 */ }
-  }
-
   const state = {
     catalog: null,
     query: "",
     topic: "",
-    sort: loadStoredSort(),
     view: "library",
   };
   let last3dKey = null;
@@ -50,16 +30,16 @@
     elements.status.classList.toggle("is-error", isError);
   }
 
-  function optionMarkup(value, label) {
-    return `<option value="${model.escapeHtml(value)}">${model.escapeHtml(label)}</option>`;
-  }
-
   function populateFilters() {
     const options = model.getFilterOptions(state.catalog.pages);
-    elements.topic.innerHTML = optionMarkup("", "全部主题")
-      + options.topics.map((value) => optionMarkup(value, value)).join("");
-    elements.topic.value = options.topics.includes(state.topic) ? state.topic : "";
-    state.topic = elements.topic.value;
+    const total = state.catalog.pages.length;
+    const chip = (name, label, count) =>
+      `<button type="button" class="topic-chip" data-tag="${model.escapeHtml(name)}"`
+      + ` aria-pressed="${String(state.topic === name)}">`
+      + `${model.escapeHtml(label)}<span class="count">${count}</span></button>`;
+    elements.topic.innerHTML =
+      chip("", "全部", total)
+      + options.tags.map(({ name, count }) => chip(name, name, count)).join("");
   }
 
   function filteredPages() {
@@ -197,7 +177,9 @@
     state.query = "";
     state.topic = "";
     elements.search.value = "";
-    elements.topic.value = "";
+    elements.topic.querySelectorAll(".topic-chip").forEach((el) => {
+      el.setAttribute("aria-pressed", String(el.dataset.tag === ""));
+    });
     applyFilters();
   }
 
@@ -206,14 +188,13 @@
       state.query = elements.search.value;
       applyFilters();
     });
-    elements.topic.addEventListener("change", () => {
-      state.topic = elements.topic.value;
-      applyFilters();
-    });
-    elements.sort.value = state.sort;
-    elements.sort.addEventListener("change", () => {
-      state.sort = elements.sort.value;
-      storeSort(state.sort);
+    elements.topic.addEventListener("click", (event) => {
+      const chip = event.target.closest("[data-tag]");
+      if (!chip) return;
+      state.topic = chip.dataset.tag;
+      elements.topic.querySelectorAll(".topic-chip").forEach((el) => {
+        el.setAttribute("aria-pressed", String(el.dataset.tag === state.topic));
+      });
       applyFilters();
     });
     elements.tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));

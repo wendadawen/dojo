@@ -31,29 +31,10 @@ window.DojoHomeModel = (function () {
     return a.title.localeCompare(b.title, "zh-CN") || a.id.localeCompare(b.id);
   }
 
-  function sortPages(pages, sort) {
-    const ordered = pages.slice();
-    if (sort === "oldest") {
-      ordered.sort(
-        (a, b) =>
-          (a.date || "9999-99-99").localeCompare(b.date || "9999-99-99") ||
-          compareByTitle(a, b),
-      );
-    } else if (sort === "title") {
-      ordered.sort(compareByTitle);
-    } else {
-      ordered.sort(
-        (a, b) =>
-          (b.date || "").localeCompare(a.date || "") || compareByTitle(a, b),
-      );
-    }
-    return ordered;
-  }
-
   function filterPages(pages, state) {
     const query = normalize(state.query);
     const matched = pages
-      .filter((page) => !state.topic || (page.topics || []).includes(state.topic))
+      .filter((page) => !state.topic || page.tag === state.topic)
       .filter((page) => {
         if (!query) return true;
         return normalize([
@@ -64,13 +45,23 @@ window.DojoHomeModel = (function () {
           ...(page.topics || []),
         ].join(" ")).includes(query);
       });
-    return sortPages(matched, state.sort || "newest");
+    return matched.slice().sort(
+      (a, b) =>
+        (b.date || "").localeCompare(a.date || "") || compareByTitle(a, b),
+    );
   }
 
+  // 标签是单一字段，按页数从多到少排，同数按拼音——比主题更均匀，也更好扫。
   function getFilterOptions(pages) {
+    const counts = new Map();
+    for (const page of pages) {
+      const tag = page.tag;
+      if (tag) counts.set(tag, (counts.get(tag) || 0) + 1);
+    }
     return {
-      topics: [...new Set(pages.flatMap((page) => page.topics || []))]
-        .sort((a, b) => a.localeCompare(b, "zh-CN")),
+      tags: [...counts.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"))
+        .map(([name, count]) => ({ name, count })),
     };
   }
 
@@ -100,12 +91,13 @@ window.DojoHomeModel = (function () {
   }
 
   function renderCard(page) {
-    const topic = (page.topics || [])[0] || page.tag || "";
+    // 与标签行同源：都取 tag，避免卡片写「注意力机制」、筛选写「注意力」两套说法。
+    const topic = page.tag || "";
     return `
       <article class="document-card">
         <button class="card-main" type="button" data-open-path="${escapeHtml(page.path)}">
           <span class="card-meta">
-            ${topic ? `<span class="topic-chip">${escapeHtml(topic)}</span>` : ""}
+            ${topic ? `<span class="card-tag">${escapeHtml(topic)}</span>` : ""}
             ${page.date ? `<time class="date-chip" datetime="${escapeHtml(page.date)}">${escapeHtml(page.date)}</time>` : ""}
           </span>
           <h2>${escapeHtml(page.title)}</h2>
