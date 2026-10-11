@@ -6,7 +6,8 @@
 
 - 源码：优先用 transformers 里的实现，把所用版本或 commit 写进资料。transformers 里没有这个模型时，用官方仓库的源码。
 - `config.json`：模型仓库里的那份，存一份副本到 `sources/config.json`。
-- 权重文件头：拿得到时按 HTTP Range 只取 `safetensors` 头部解析张量形状，写成 `sources/shapes.json`，键是张量名、值是维度数组。同名形状一致时合并成 `<名字>.{i}` 一条。
+- 权重文件头：拿得到时按 HTTP Range 只取 `safetensors` 头部解析张量形状**与 dtype**，写成 `sources/shapes.json`。值的写法：只有形状，写成维度数组 `[5120, 2560]`；**记得到 dtype 时写成 `{"shape": [5120, 2560], "dtype": "BF16"}`**（safetensors 头的 `dtype` 字段原样记，如 `BF16`、`F32`）。同名形状一致时合并成 `<名字>.{i}` 一条。
+- 模型卡：模型仓库的 `README.md`，存一份副本到 `sources/model-card.md`。**介绍面板要写的参数量、每 token 激活量、上下文长度一律出自它**——不收它，那几个数就只能凭印象写。
 - 论文或技术报告：有就收。
 
 和其他资料对不上时，以这一步选定的源码为准。
