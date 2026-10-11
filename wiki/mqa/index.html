@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="MQA 是一种注意力机制，让所有查询头共用同一套键和值，把生成时反复读取的键值数据缩到一份。">
+  <meta name="dojo:summary" content="生成每个新 token 都要重读全部键、值张量，这一步受显存带宽限制。MQA 让所有查询头共用一套键值，把这份数据量除以头数。">
+  <meta name="dojo:topics" content="注意力机制, 内存与缓存">
+  <meta name="dojo:tag" content="注意力">
+  <title>MQA</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">MQA</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">MQA</h1>
+<p class="reading-time">正文 1,337 字 · 约 4 分钟阅读</p>
+
+<p>多头注意力（见<a href="../standard-attention/index.html">标准注意力</a>）给每个位置算出多组查询、键和值，每组叫一个头。生成文本时模型一个 token 一个 token 往下写（token 是模型读写文本的最小单位），写每个新 token 都要把前面所有位置已经算出的键和值重读一遍（见 <a href="../kv-cache/index.html">KV cache</a>），这份数据随序列变长而变大，读取它耗掉的显存（存放这些键值的内存）带宽（每秒能读写的数据量）成了生成的瓶颈。MQA（multi-query attention，多查询注意力）让所有查询头共用一套键和值，把反复读取的这份键值数据缩到一份。</p>
+
+<h2 id="s1">1. 生成慢在反复读取键值</h2>
+
+<p>生成是自回归的：模型每次只推进一个位置，因为第 $t$ 个位置的输出决定了这一步生成哪个 token，而这个 token 又成为下一个位置的输入，前后有依赖，没法把多个位置放到一起并行算。但注意力层每一步要做的事没有变：它把当前位置的查询和这个位置及前面所有位置的键各做一次比较，再按比较结果取这些位置的值。这些键和值在前面的步骤里已经算好、也不会再变，但每一步仍要把它们从显存再读进来一次。</p>
+
+<p>每步真正要新算的只有当前位置这一份查询、键和值，读进来的却是整段历史的键和值。当序列长度与每个向量的维度 $d$ 接近、或者批大小（一次同时处理的序列条数）为 $1$ 时，访存与计算之比（这一步要读写的数据量除以算术运算量的比值）接近 $1$；硬件的运算能力比带宽高出约两个数量级，这个比值接近 $1$ 时，时间几乎都花在读写数据上，受的是显存带宽的限制，不是运算速度。序列越长，或者同时处理的序列越少，要读写的量相对算术量越大，带宽就越紧张（批大小取大时比值里的 $\frac{1}{b}$ 项变小）。</p>
+
+<details>
+<summary>访存与计算之比</summary>
+<ol>
+<li>训练时目标序列是已知的，所有位置的注意力可以并行算，计算能顺着矩阵乘法展开。</li>
+<li>分析时取几条约定的规模：待比较的位置数与查询位置数相同，都记作序列长度 $n$；每个键、值向量的维度 $k$、$v$ 都取模型维度 $d$ 除以头数 $h$；$n$ 不超过 $d$。</li>
+<li>这 $n$ 步合起来的算术量是 $\Theta(bnd^2)$，其中 $b$ 是批大小：各步的注意力计算都要和 $d$ 维的投影矩阵（把输入变成查询、键和值的那组参数）相乘，每步约 $bd^2$ 次乘加，$n$ 步合起来是这个量级。</li>
+<li>这 $n$ 步合起来的访存量是 $\Theta(bn^2d + nd^2)$：第一项来自反复读入的键、值（每个位置 $k$、$v$ 约 $d$ 个数，共 $n$ 个位置、$b$ 条序列，$n$ 步各读一遍），第二项来自各投影矩阵。</li>
+<li>两者相除，访存与计算之比是 $\Theta(\frac{n}{d} + \frac{1}{b})$。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 多头各有一套键值，MQA 合成一套</h2>
+
+<p>多头注意力里每个头各有一套键和值：输入经投影（乘一组可学的参数）得到 $h$ 个查询向量、$h$ 个键向量和 $h$ 个值向量（$h$ 为头数），每个头各占一分，键和值因此都带着一个长度为 $h$ 的头维度。算注意力时，第 $i$ 个头的查询只用第 $i$ 个头的键和值。</p>
+
+<p>MQA 只改一处：让所有头共用同一套键和值。做法是从键、值以及它们的投影里去掉头这个维度——不再是每个头一套键、一套值，而是整个序列只有一套键、一套值，被所有头的查询共用；查询仍按头分成 $h$ 份，各头算出的结果再经输出投影（把每个头的输出合回模型维度的那组参数）汇总，这一步也仍是每个头一份。于是同样的头数下，生成时每步要从显存读的键、值数据随之缩小，而算术量不变。</p>
+
+<p>按 MQA 对增量解码（每步只推进一个 token）的分析，访存与计算之比里有一项随序列长度增长，共用一套键值后这一项被缩小 $h$ 倍，理论上批大小取大时增量生成的性能会改善。</p>
+
+<details>
+<summary>两个查询头共用一套键值算一遍</summary>
+<p>设序列有两个位置，查询头数 $h=2$，每个头里查询、键、值向量的维度都是 $2$。多头要有 2 套键和 2 套值，MQA 只要 1 套。取共用的这一套：位置 0 的键 $(1,0)$、位置 1 的键 $(0,2)$；位置 0 的值 $(2,0)$、位置 1 的值 $(0,1)$。</p>
+<p>分数由当前位置的查询与该位置的键做点积得到，再经 SoftMax 归一成一组和为 $1$ 的权重（两者的算法见<a href="../standard-attention/index.html">标准注意力</a>），用权重对该位置的值加权求和就得到输出。</p>
+<ol>
+<li>两个查询头都用这同一套键和值。设位置 1 处两个头的查询是 $q_a=(1,0)$、$q_b=(0,1)$。</li>
+<li>$q_a$ 的分数是 $(1,0)\cdot(1,0)=1$、$(1,0)\cdot(0,2)=0$；SoftMax 后是 $(0.731,0.269)$，输出约 $0.731\times(2,0)+0.269\times(0,1)=(1.462,0.269)$。</li>
+<li>$q_b$ 的分数是 $(0,1)\cdot(1,0)=0$、$(0,1)\cdot(0,2)=2$；SoftMax 后是 $(0.119,0.881)$，输出约 $0.119\times(2,0)+0.881\times(0,1)=(0.238,0.881)$。</li>
+<li>两个头共用同一套键和值，查询不同，算出的输出就不同；共用键值并不把各头合并成一个，只是让它们读同一份键值数据。</li>
+</ol>
+</details>
+
+<details>
+<summary>形状与访存比值的对照</summary>
+<ol>
+<li>多头：查询形状 $[b,h,n,k]$（$n$ 个查询位置），键、值形状 $[b,h,m,k]$ 和 $[b,h,m,v]$（$m$ 个历史位置），头维度 $h$ 在键、值上。</li>
+<li>MQA：查询仍是 $[b,h,n,k]$，键变成 $[b,m,k]$、值变成 $[b,m,v]$，头维度从键、值上去掉；投影矩阵 $P_k$、$P_v$ 也从带 $h$ 的形状变成 $[d,k]$、$[d,v]$。</li>
+<li>增量一步：读入历史键 $[b,m,k]$、值 $[b,m,v]$，把当前位置的一份拼到末尾，用当前查询和全部键比较、对全部值加权求和；这个读入动作在 $n$ 步里各做一次（分析里取历史位置数 $m$ 与查询位置数 $n$ 相同）。</li>
+<li>这 $n$ 步合起来的访存量是 $\Theta(bnd + bn^2k + nd^2)$：第一项来自输入、查询与输出，第二项来自反复读入的键、值，第三项来自各投影矩阵；多头那一式 $\Theta(bn^2d + nd^2)$ 没有第一项。除以同样的 $\Theta(bnd^2)$ 算术量，访存与计算之比从 $\frac{n}{d} + \frac{1}{b}$ 变成 $\frac{1}{d} + \frac{n}{dh} + \frac{1}{b}$。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 质量与训练稳定性</h2>
+
+<p>在 WMT 2014 英德翻译任务上，MQA 的质量与多头接近：dev 集（训练时用来观察、不参与最终评测的留出数据）上的两项质量指标都比多头稍差，测试集上 beam-4 解码（每次保留 4 条候选的搜索解码）的得分略高于多头；解码速度比多头快。</p>
+
+<details>
+<summary>WMT14 英德结果与解码开销</summary>
+<p>在同一族模型上，多头与 MQA 的 dev 结果（对数困惑度是模型对每个 token 预测分布的不确定度取对数，越低越好；BLEU 是机器译文与参考译文的 n-gram 重合度，越高越好）：</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>注意力</th><th style="text-align:right">dev 对数困惑度</th><th style="text-align:right">dev BLEU</th><th style="text-align:right">测试集 BLEU（beam 4）</th></tr></thead>
+<tbody>
+<tr><td>多头</td><td style="text-align:right">1.424</td><td style="text-align:right">26.7</td><td style="text-align:right">28.4</td></tr>
+<tr><td>MQA</td><td style="text-align:right">1.439</td><td style="text-align:right">26.5</td><td style="text-align:right">28.5</td></tr>
+</tbody>
+</table>
+</div>
+<p>每 token 的解码开销（TPUv2 微秒，即一块 TPUv2 芯片上一微秒计的开销；源序列与目标序列各 128 token，批量 1024 条序列）：</p>
+<ul>
+<li>多头：编码器 1.7，解码器每步 46</li>
+<li>MQA：编码器 1.5，解码器每步 3.8</li>
+</ul>
+</details>
+
+<p>从头训练 MQA 还可能在训练中不稳定：预训练出现损失尖峰（损失值在若干步里陡升），在长输入任务上微调（在已训练好的模型上再训练）时会立刻发散（损失不再下降、训练无法继续）。</p>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>MQA 只改键和值这一侧：键、值各只剩一套，查询头数不变，所以并不是把查询头也合并起来。代价是键和值只剩一份，模型在键值这部分能表达的信息量随之变小；头数越多，可去掉的键值头越多，但每减少一个键值头，这部分信息量就更小。</p>
+
+<p>用在哪些注意力层上，MQA 替换了模型里全部注意力层——编码器自注意力（编码器处理输入序列，自注意力指同一段序列内部各位置互相看）、解码器自注意力（解码器处理已经生成的部分）、编码器-解码器注意力（也叫交叉注意力，让解码器读取编码器的输出），这三处都换。</p>
+
+<p>GQA 在多头与 MQA 之间取中间做法：把查询头分成若干组、每组一套键值，组数取 $1$ 就是 MQA、取查询头数就是原来的多头；质量比 MQA 高，速度比多头快（见 <a href="../gqa/index.html">GQA</a>）。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Noam Shazeer. Fast Transformer Decoding: One Write-Head is All You Need. arXiv:1911.02150v1, 2019. <a href="https://arxiv.org/abs/1911.02150">https://arxiv.org/abs/1911.02150</a></li>
+<li>Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, Sumit Sanghai. GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints. EMNLP 2023. arXiv:2305.13245v3, 2023. <a href="https://arxiv.org/abs/2305.13245">https://arxiv.org/abs/2305.13245</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
