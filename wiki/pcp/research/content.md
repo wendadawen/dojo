@@ -31,7 +31,7 @@
 
 ## 长页
 
-大语言模型推理时要把一条请求的整段 token（模型处理文本的最小单位）序列算一遍。序列很长时，可以把它沿 token 维切成几份，分给多张卡同时处理，这叫上下文并行（context parallelism，CP）。它切的是同一条序列的长度方向，不同于把权重矩阵切开的[张量并行](wiki/model-parallelism)。同一条请求分两段算：预填充（prefill）一次读入整段提示、算出结果，解码（decode）逐 token 生成。预填充上下文并行（PCP）切预填充时要算的 token，把这批序列计算摊到多张卡上并行做，用来缩短预填充的时间。
+大语言模型推理时要把一条请求的整段 token（模型处理文本的最小单位）序列算一遍。序列很长时，可以把它沿 token 维切成几份，分给多张卡同时处理，这叫上下文并行（context parallelism，CP）。它切的是同一条序列的长度方向，不同于把权重矩阵切开的[张量并行](wiki/tensor-parallelism)。同一条请求分两段算：预填充（prefill）一次读入整段提示、算出结果，解码（decode）逐 token 生成。预填充上下文并行（PCP）切预填充时要算的 token，把这批序列计算摊到多张卡上并行做，用来缩短预填充的时间。
 依据：blog/vllm-context-parallel-deployment.md Context Parallel Deployment；blog/vllm-rfc-26133-context-parallelism.md Motivation
 
 ### 预填充算得多，解码存得多

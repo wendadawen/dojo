@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="量化感知训练（QAT）是在训练的前向里按低位宽格式对权重先量化再反量化、用近似权重算损失，反向用直通估计器把梯度传回原始高精度权重，让模型适应量化误差的训练方法。">
+  <meta name="dojo:summary" content="把权重量化留到训练之后，模型没见过舍入误差。QAT 在训练前向插入「先量化再反量化」，反向用直通估计器（把量化当作恒等函数）传梯度，只更新另存的高精度主副本。">
+  <meta name="dojo:topics" content="训练与优化">
+  <meta name="dojo:tag" content="量化">
+  <title>QAT</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">QAT</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">QAT</h1>
+<p class="reading-time">正文 1,075 字 · 约 4 分钟阅读</p>
+
+<p>把模型的权重（训练学到的数值参数）<a href="../quantization-basics/index.html">量化</a>（把数值换成低位宽表示的值）留到训练完成之后再做，叫训练后量化（post-training quantization）：训练全程用高精度（即全精度，如 16 位）权重，训练完成后才把权重换成低位宽，模型从没见过换值带来的误差，小模型上精度下降比大模型更多。量化感知训练（quantization-aware training，QAT）把量化提前到训练里：训练时按目标低位宽格式（把数值用很少的位数表示的格式）把权重先量化再反量化（换回高精度），用近似权重算损失（衡量输出与目标差距、被训练优化的那个量）；反向（从损失算出梯度）用直通估计器（把量化这一步在反向当作恒等函数）把梯度传回原始高精度权重，让模型在训练中就适应这个误差。</p>
+
+<h2 id="s1">1. 前向模拟量化</h2>
+
+<p>QAT 在训练的前向（模型由输入算出输出的那一步）里把量化算进去。在被量化的模块里，对做点积的运算（矩阵乘这类），两个输入都先按各自的目标低位宽格式编码再反量化，得到近似值再算；归一化（把一批数值按均值方差缩放）、Softmax（把一组数变成和为 1 的占比）、激活函数（逐元素的非线性）、残差相加（把输入直接加回输出）这类非点积运算仍在高精度里做。权重另外保留一份高精度的主副本，每一步训练都更新它。把一个权重先按格式编码、再解回数值，得到的是它的近似权重 $\hat{w}$。前向用 $\hat{w}$ 而不是原始的 $w$ 参与计算，损失因此建立在这套近似权重上。</p>
+
+<h2 id="s2">2. 反向用直通估计器</h2>
+
+<p>反向传播（从损失出发逐层算出每个权重的梯度、据此更新权重）时，量化这一步把 $w$ 换成离散的 $\hat{w}$，是阶梯状、除跳变点外导数处处为零的函数，梯度无法穿过。直通估计器专门处理这种情形：反向时把这一步当作恒等函数，令梯度原样穿过，损失 $L$ 对 $w$ 的梯度 $\partial L/\partial w$ 直接取上游（反向传播中更靠近损失的那一侧）传给 $\hat{w}$ 的梯度，更新仍然作用在原始高精度权重 $w$ 上。它是偏的估计器（算出的梯度偏离真实值），但在单层上方向与真实梯度一致。</p>
+
+<details>
+<summary>单权重走一遍前向量化、反向直通</summary>
+<p>以 <a href="../mxfp4/index.html">MXFP4</a> 的块为例（块是共用同一尺度的若干个权重），取块 $[0.8, 0.3, -0.1, 0.55]$，块大小缩到 4 便于手算，看其中一个权重 $w = 0.8$ 前向量化、反向梯度怎么走。</p>
+<ol>
+<li>块内最大幅值 $0.8$，向下取 2 的幂得 $0.5$，除以元素能表示的最大 2 的幂 $4$ 得共享尺度 $s_b = 0.125$。</li>
+<li>$w$ 除以尺度得 $0.8 / 0.125 = 6.4$，按最近值取元素得 $6.0$。</li>
+<li>反量化得近似权重 $\hat{w} = 0.125 \times 6.0 = 0.75$，与原始 $w = 0.8$ 相差 $0.05$。</li>
+<li>前向用 $\hat{w} = 0.75$ 算损失。反向时直通估计器让量化这一步的导数取 $1$，上游梯度 $1$ 原样传回原始权重。</li>
+<li>优化器（按梯度更新权重的那一步）用这个梯度更新 $w$，下一轮前向会重新量化更新后的 $w$。</li>
+</ol>
+<div class="code-block"><pre><code class="language-python">import math
+
+# E2M1 是 MXFP4 的 4 位浮点元素（1 位符号、2 位指数、1 位尾数），下列为它的正数可表示值
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+
+def e2m1(v):
+    sign = -1 if v &lt; 0 else 1
+    a = abs(v)
+    return sign * min(E2M1, key=lambda r: (abs(r - a), r))
+
+
+def scale_of(block):
+    # 块内最大幅值向下的 2 的幂，除以 E2M1 的最大 2 的幂 4
+    return 2.0 ** (math.floor(math.log2(max(abs(v) for v in block))) - 2)
+
+
+block = [0.8, 0.3, -0.1, 0.55]
+s_b = scale_of(block)
+print("共享尺度", s_b)
+
+for w in block:
+    print("权重", w, "量化后", s_b * e2m1(w / s_b))
+
+print("上游梯度 1 经直通估计器传回的梯度", 1.0)</code></pre></div>
+<div class="code-block"><pre><code class="language-text">共享尺度 0.125
+权重 0.8 量化后 0.75
+权重 0.3 量化后 0.25
+权重 -0.1 量化后 -0.125
+权重 0.55 量化后 0.5
+上游梯度 1 经直通估计器传回的梯度 1.0</code></pre></div>
+</details>
+
+<h2 id="s3">3. 贯穿整个后训练</h2>
+
+<p>QAT 从<a href="../sft/index.html">监督微调</a>（用带标注的数据继续训练模型）阶段起就做，贯穿整个后训练（预训练之后的所有训练阶段），监督微调和强化学习两个阶段都做。强化学习（让模型按奖励试错改进）阶段里，模型一边自己生成数据（这一步叫 rollout）、一边拿这些数据更新自己；如果生成时用一套量化方案、训练更新时用另一套，这就是训练与推理不匹配（推理指用训练好的模型算输出）。让生成与训练共享同一套量化方案，两边看到的是同一种权重，这个不匹配就被消掉。</p>
+
+<h2 id="s4">4. 量化哪些组件</h2>
+
+<p>训练时不是所有组件都压到低位宽。专家权重（混合专家（MoE）层里每个输入只激活少数几个的并行子网络；见<a href="../fusedmoe/index.html">混合专家</a>）占显存（显卡上的内存）的大部分，压到低位宽；非专家组件（注意力这类模块，见<a href="../standard-attention/index.html">标准注意力</a>）保持高精度。激活值（层里传下去的中间数值）另用一种更宽的格式。</p>
+
+<h2 id="s5">5. 适用条件与边界</h2>
+
+<p>训练后量化的精度对小模型不够时，QAT 让模型在训练里适应量化带来的误差，把精度拉回接近全精度，损失仍比全精度略高一点。它只改训练流程，不改推理时权重的存储格式：训练里的量化只是模拟，部署的仍是按目标低位宽格式编码的权重（例如 <a href="../mxfp4/index.html">MXFP4</a>）。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Benoit Jacob 等. Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference. CVPR 2018. arXiv:1712.05877. <a href="https://arxiv.org/abs/1712.05877">https://arxiv.org/abs/1712.05877</a></li>
+<li>Yoshua Bengio, Nicholas Léonard, Aaron Courville. Estimating or Propagating Gradients Through Stochastic Neurons for Conditional Computation. arXiv:1308.3432, 2013. <a href="https://arxiv.org/abs/1308.3432">https://arxiv.org/abs/1308.3432</a></li>
+<li>Bita Darvish Rouhani 等. Microscaling Data Formats for Deep Learning. arXiv:2310.10537v3, 2023. <a href="https://arxiv.org/abs/2310.10537">https://arxiv.org/abs/2310.10537</a></li>
+<li>Kimi Team. Kimi K3: Open Frontier Intelligence. 技术报告, 2026. <a href="https://github.com/MoonshotAI/Kimi-K3">https://github.com/MoonshotAI/Kimi-K3</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

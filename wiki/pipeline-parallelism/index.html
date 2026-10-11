@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="流水线并行把网络的层按先后切成连续的若干分区，每个分区放在一块加速器上，各分区同时处理不同的 micro-batch。">
+  <meta name="dojo:summary" content="把全部层切成连续的分区放到多卡，再把一个 mini-batch 拆成 micro-batch 流水执行。只在分区边界传激活、通信量小，代价是分区造成的气泡。">
+  <meta name="dojo:topics" content="并行与通信, 训练与优化">
+  <meta name="dojo:tag" content="并行与通信">
+  <title>Pipeline Parallelism</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Pipeline Parallelism</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Pipeline Parallelism</h1>
+<p class="reading-time">正文 1,164 字 · 约 4 分钟阅读</p>
+
+<p>神经网络是一层接一层叠起来的计算结构，每一层以上一层的输出为输入做一次计算、再把结果传出；层里可训练的参数是权重。加速器（下面简称卡）是做这些计算、带自己显存的处理器，显存指卡上的存储空间。一次训练一步分前向、反向两步：前向从输入逐层算到输出，反向从输出往回逐层算梯度——梯度是每个参数该往哪个方向调、调多大幅度的指示量。</p>
+
+<p>流水线并行（pipeline parallelism，PP）把网络里的层按堆叠的先后切成连续的若干段（分区），每块卡只负责一段，一个分区的输出传给下一个分区当输入，数据依次流过。它和数据并行不同：数据并行把一次参数更新（按梯度把权重改动一次）用的整批样本拆到多块卡上、各卡处理不同的样本（一条训练数据）。</p>
+
+<h2 id="s1">1. 把全部层切成连续分区</h2>
+
+<p>网络由 $L$ 层叠成。给定分区数 $K$，流水线并行把这 $L$ 层切成 $K$ 个连续分区，第 $k$ 个分区放在第 $k$ 块卡上，分区内部是一段连续的层。</p>
+
+<p>相邻分区之间在边界处自动插入通信，只传激活（分区算出的、要传给下一个分区的中间张量——张量是多维数组，矩阵是它的二维情形）；除此之外没有别的卡间通信。分区算法让各分区的预计代价尽量均衡。</p>
+
+<h3 id="s1-1">1.1 把一个 mini-batch 拆成 micro-batch 流水</h3>
+
+<p>一次参数更新用的整批样本叫 mini-batch，其样本数为 $N$。流水线并行先把每个 mini-batch 等分成 $M$ 个更小的 micro-batch，再让这 $M$ 个 micro-batch 依次流过 $K$ 个分区。</p>
+
+<p>一个 micro-batch 从第一个分区流到第 $K$ 个分区要经过 $K$ 个分区的时间，等它离开第一个分区，第一个分区就能开始处理下一个 micro-batch。于是不同分区在同一段时间里各自处理不同的 micro-batch，除流水线的首尾两端外都在计算。</p>
+
+<p>各 micro-batch 的梯度不会各自更新参数：在整个 mini-batch 的末尾，$M$ 个 micro-batch 的梯度全部累加起来，再做一次同步更新。因此不管分成几个分区，参数更新都和没切分时一致。</p>
+
+<h3 id="s1-2">1.2 气泡从哪来、占多少</h3>
+
+<p>分区带来空闲：最前和最后一段里，有些分区还没有任务或已经做完，这段时间没有 micro-batch 可处理，它们是空的。这段空转叫气泡。</p>
+
+<p>只数前向：把流水线按时间分成一个个长度相同的时隙（每块卡处理一个 micro-batch 的时间）。$K$ 个分区、$M$ 个 micro-batch 时，气泡占一个 step（$M$ 个 micro-batch 全部流过一遍、做一次参数更新的时间）的比例约为 $\dfrac{K-1}{M+K-1}$。</p>
+
+<details>
+<summary>时隙计数推出气泡占比</summary>
+<ol>
+<li>第 $k$ 个分区要等第 $k-1$ 个分区把数据传来才能开始；第一个 micro-batch 要先流过前面所有分区。</li>
+<li>第一个 micro-batch 从分区 1 流到分区 $K$，要用掉 $K$ 个时隙；最前面的 $K-1$ 个时隙里，后面几个分区还没有任务。</li>
+<li>第一个分区把它的最后一个 micro-batch 传给第二个分区之后，还要等这个 micro-batch 走完下游 $K-1$ 个分区，这段时间它是空的，共 $K-1$ 个时隙。</li>
+<li>只数前向，一个 step 的总时隙数是 $M+K-1$；每块卡在这段时间里正好处理 $M$ 个 micro-batch、忙 $M$ 个时隙，剩下 $K-1$ 个时隙空着。</li>
+<li>空着的 $K-1$ 个时隙除以总时隙数 $M+K-1$，得气泡占比 $\dfrac{K-1}{M+K-1}$。</li>
+</ol>
+</details>
+
+<h3 id="s1-3">1.3 手算一遍气泡占比</h3>
+
+<p>分区数固定、只改 micro-batch 数，看气泡占比怎么变。</p>
+
+<details>
+<summary>两组数的气泡占比</summary>
+<ol>
+<li>取 $K=3$、$M=2$：气泡占比 $\dfrac{2}{2+3-1}=\dfrac{2}{4}=0.5$。</li>
+<li>取 $K=3$、$M=12$：气泡占比 $\dfrac{2}{12+3-1}=\dfrac{2}{14}\approx0.14$。</li>
+<li>分区数不变、只把 micro-batch 数从 2 提到 12，气泡占比从 0.5 降到约 0.14。</li>
+</ol>
+</details>
+
+<h3 id="s1-4">1.4 micro-batch 要多到多少</h3>
+
+<p>micro-batch 越多，气泡占比越小。资料在实验里把 $M$ 至少是分区数 $K$ 的 4 倍时的气泡视为可忽略；反过来，$M$ 较小时气泡不再可以忽略，$M$ 等于 1 时没有流水，任一时刻只有一块卡在算，退化为单卡。</p>
+
+<h2 id="s2">2. 切完每块卡的激活显存怎么变</h2>
+
+<p>前向算出的激活量会随层数增长，全都留下来供反向使用会占很多显存。流水线并行让每块卡在前向只存分区边界处的激活，反向时各自把这一段重新算一遍（重算）；这样峰值激活显存从与总层数成正比的量，降到与每块卡的层数、以及 micro-batch 大小有关的量。</p>
+
+<details>
+<summary>以 AmoebaNet 为例，分区与重算把单卡能装的模型扩大</summary>
+<ol>
+<li>不加分区与重算时，单块卡最多训 82M（M 指百万）参数的 AmoebaNet（一个图像分类网络）。</li>
+<li>加重算与拆 micro-batch，把中间激活显存从 6.26GB 降到 3.46GB，单卡能训到 318M 参数。</li>
+<li>再用 8 块卡做流水线并行，AmoebaNet 扩到 1.8B（B 指十亿）参数，约是没加这些手段时的 22 倍（82M 到 1.8B）。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 适用条件与边界</h2>
+
+<p>流水线并行要求每一层能放进单块卡。不同层的参数与计算量往往并不均衡，分得不均时会出现负载不均，扩展的速度受到影响。</p>
+
+<p>分区数越多，气泡占比越高，需要更多的 micro-batch 来降低气泡占比。</p>
+
+<p>即使卡之间没有高速互联，流水线并行也能扩展。</p>
+
+<p>流水线并行是模型并行（把模型的权重切分到多块卡上这一类）里的一路，不是唯一的一路。流水线并行与张量并行（<a href="../tensor-parallelism/index.html">张量并行</a>，按层内矩阵维度切）正交互补，可以组合使用。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Yanping Huang, Youlong Cheng, Ankur Bapna 等. GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism. arXiv:1811.06965, 2019. <a href="https://arxiv.org/abs/1811.06965">https://arxiv.org/abs/1811.06965</a></li>
+<li>Mohammad Shoeybi, Mostofa Patwary, Raul Puri 等. Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. arXiv:1909.08053v4, 2020. <a href="https://arxiv.org/abs/1909.08053">https://arxiv.org/abs/1909.08053</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

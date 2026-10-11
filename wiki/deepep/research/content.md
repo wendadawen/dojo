@@ -14,7 +14,7 @@
 
 ### 把 token 送到专家所在的 rank
 
-混合专家（[MoE](wiki/moe-serving)）模型里有一组专家，每个 token 只交给其中少数几个处理，用哪几个由门控网络（为每个 token 选专家的模块）选出。专家并行把这些专家分到不同 GPU 上：一个通信组里的每颗 GPU 叫一个 rank，各 rank 放一部分专家。DeepEP 负责把 token 发到它用到的专家所在的 rank，这一步叫 dispatch；专家算完，再把各专家的输出送回 token 原来的 rank，这一步叫 combine。
+混合专家（[MoE](wiki/moe)）模型里有一组专家，每个 token 只交给其中少数几个处理，用哪几个由门控网络（为每个 token 选专家的模块）选出。专家并行把这些专家分到不同 GPU 上：一个通信组里的每颗 GPU 叫一个 rank，各 rank 放一部分专家。DeepEP 负责把 token 发到它用到的专家所在的 rank，这一步叫 dispatch；专家算完，再把各专家的输出送回 token 原来的 rank，这一步叫 combine。
 依据：blog/deepep-readme-v2.md L3；blog/deepep-legacy-v1.md L3-L13
 
 ### 跨卡收发的难点
@@ -29,7 +29,7 @@ DeepEP 用两套内核分别服务推理（模型读入输入、逐步算出输�
 
 ## 长页
 
-混合专家（[MoE](wiki/moe-serving)）模型里有一组专家，每个 token 只交给其中少数几个处理，具体用哪几个由门控网络（为每个 token 选专家的模块）选出。token 是模型处理的最小单位。这些专家被分放在不同的 GPU 上，这种把专家分到各卡的并行方式叫专家并行。一个通信组里的每颗 GPU 叫一个 rank，每个 rank 负责一部分专家。MoE 的每一层算下来要搬两次数据：把 token 发到它用到的专家所在的 rank，专家算完再把结果送回 token 原来的 rank。这两步合称 MoE 的 dispatch 与 combine，是 DeepEP 要解的通信问题。每个 token 带一个长度等于隐藏维的向量，隐藏维就是 token 向量的维度。
+混合专家（[MoE](wiki/moe)）模型里有一组专家，每个 token 只交给其中少数几个处理，具体用哪几个由门控网络（为每个 token 选专家的模块）选出。token 是模型处理的最小单位。这些专家被分放在不同的 GPU 上，这种把专家分到各卡的并行方式叫专家并行。一个通信组里的每颗 GPU 叫一个 rank，每个 rank 负责一部分专家。MoE 的每一层算下来要搬两次数据：把 token 发到它用到的专家所在的 rank，专家算完再把结果送回 token 原来的 rank。这两步合称 MoE 的 dispatch 与 combine，是 DeepEP 要解的通信问题。每个 token 带一个长度等于隐藏维的向量，隐藏维就是 token 向量的维度。
 依据：blog/deepep-readme-v2.md L3；blog/deepep-legacy-v1.md L3-L13
 
 ### 把 token 送到专家所在的 rank

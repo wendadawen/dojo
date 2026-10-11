@@ -31,7 +31,7 @@ PP（pipeline parallelism，流水线并行）把模型的层按顺序切成若�
 
 ## 长页
 
-推理服务常把大模型用 PP（pipeline parallelism，[流水线并行](wiki/model-parallelism)）部署：模型按层切成若干 stage 分到不同设备，一条请求的输入先被切成 token（词元，模型处理文本的最小单位）串，逐段流过流水线。这样只在相邻 stage 之间传中间结果，通信量小。但只要各 stage 的步长不整齐，就有设备在空等，这些空等时段叫气泡，长上下文和并发都会把气泡放大。此时决定速度的是最慢的那个 stage：一次前向（模型从输入算到输出的一遍计算）的节拍由它定，那就设法让各 stage 每一步的执行时间相近。
+推理服务常把大模型用 PP（pipeline parallelism，[流水线并行](wiki/pipeline-parallelism)）部署：模型按层切成若干 stage 分到不同设备，一条请求的输入先被切成 token（词元，模型处理文本的最小单位）串，逐段流过流水线。这样只在相邻 stage 之间传中间结果，通信量小。但只要各 stage 的步长不整齐，就有设备在空等，这些空等时段叫气泡，长上下文和并发都会把气泡放大。此时决定速度的是最慢的那个 stage：一次前向（模型从输入算到输出的一遍计算）的节拍由它定，那就设法让各 stage 每一步的执行时间相近。
 依据：blog/sglang-pp-blog.txt L111-L117；paper/src-2504.14775v2/chapters/2.background_motivation.tex L81-L85；paper/src-2504.14775v2/chapters/2.background_motivation.tex L43-L52；paper/src-2102.07988v2/terapipe.tex L305-L305
 
 一条沿 token 维度切：把同一条请求的输入序列切成片段，让不同片段同时出现在不同 stage。另一条沿 batch 维度配平：把并发请求在这些 micro-batch（一次迭代里并行推进的最小批次部分）间摊匀。

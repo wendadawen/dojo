@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="LoRA（低秩适配）是一种微调方法：冻结原权重，把微调要学的权重更新量写成两个小矩阵的乘积，只训练这两个小矩阵。">
+  <meta name="dojo:summary" content="微调大模型时不动原权重 $W_0$，只训练更新量 $\Delta W = BA$，$B$ 是 $d\times r$、$A$ 是 $r\times d$，$r$ 远小于 $d$。要训练的参数从 $d^2$ 降到 $2dr$，推理时把 $BA$ 并入 $W_0$ 不增加延迟。">
+  <meta name="dojo:topics" content="训练与优化">
+  <meta name="dojo:tag" content="训练">
+  <title>LoRA</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">LoRA</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">LoRA</h1>
+<p class="reading-time">正文 1,183 字 · 约 4 分钟阅读</p>
+
+<p>LoRA（Low-Rank Adaptation，低秩适配）是一种微调方法。微调是在一个已经训练好的权重（模型里各层被训练的那组数值）上继续训练，让它适配一个新的任务。全量微调要为每个任务留一整套新的参数，代价随模型规模放大；LoRA 不动原权重，只把微调要学的更新量写成两个小矩阵的乘积，额外训练这两个小矩阵，要训练的参数因此少得多。</p>
+
+<h2 id="s1">1. 全量微调的代价</h2>
+
+<p>微调从一个已经预训练好的模型 $\Phi_0$ 出发：模型先做<a href="../pretraining/index.html">预训练</a>得到一个通用模型，微调在它上面继续训练，把它更新成 $\Phi_0 + \Delta\Phi$，使它适配某个具体任务。</p>
+
+<p>全量微调更新模型里的全部参数。对每个下游任务（要适配的某个具体任务），它都训练出一整套新的参数，这套参数和原模型的参数一样多，所以微调后得到的新模型和原模型一样大。要为每个任务各存一份这样的模型，存储和部署的代价就很高。于是需要一种做法，只训练很少一部分参数，让新模型不必和原模型一样大。</p>
+
+<h2 id="s2">2. 把更新量写成低秩</h2>
+
+<p>对一个预训练权重矩阵 $W_0$（形状 $d \times k$），微调要学的更新量记作 $\Delta W$，微调后的权重是 $W_0 + \Delta W$。</p>
+
+<p>LoRA 把更新量参数化成两个小矩阵的乘积 $\Delta W = BA$，其中 $B$ 是 $d \times r$、$A$ 是 $r \times k$，$r$ 远小于 $d$ 和 $k$。这一步就是<a href="../low-rank-projection/index.html">低秩分解</a>：用一个秩不超过 $r$ 的矩阵去近似原来的更新量。原则上可以对任意一部分权重矩阵施加这种更新，实际用时常只选其中几个。</p>
+
+<p>前向计算（由输入算出输出）变成 $h = W_0 x + BAx$，$x$ 是输入向量、$h$ 是输出向量：原来的变换 $W_0 x$ 照旧，再叠加一个低秩修正 $BAx$，两个输出的每一维分别相加。之所以能这么做，靠一个假设：适配时的权重更新量具有很低的秩（它真正需要的秩很小）。</p>
+
+<details>
+<summary>前向计算示例</summary>
+<p>取 $d = k = 2$、$r = 1$，原权重 $W_0 = \begin{pmatrix}1&amp;0\\0&amp;1\end{pmatrix}$，$B = \begin{pmatrix}2\\3\end{pmatrix}$，$A = \begin{pmatrix}1&amp;0\end{pmatrix}$，输入 $x = \begin{pmatrix}5\\7\end{pmatrix}$。</p>
+<ol>
+<li>原来的变换：$W_0 x = (5, 7)$。</li>
+<li>低秩修正：先算 $Ax = 1 \cdot 5 + 0 \cdot 7 = 5$，再算 $B \cdot 5 = (10, 15)$。</li>
+<li>叠加：$h = (5 + 10,\ 7 + 15) = (15, 22)$。</li>
+<li>取 $BA = 0$ 时，$h$ 就等于 $W_0 x = (5, 7)$，与叠加前一致。</li>
+</ol>
+</details>
+
+<h2 id="s3">3. 训练时只更新两个小矩阵</h2>
+
+<p>$A$ 用随机高斯数初始化，$B$ 初始化为零。这样训练一开始 $BA$ 就是零，更新量 $\Delta W$ 从零开始。</p>
+
+<p>在通常的设置下，训练里只有 $A$ 和 $B$ 收到梯度并更新，原权重 $W_0$ 冻结、不接收梯度。</p>
+
+<h2 id="s4">4. 要训练的参数少了多少</h2>
+
+<p>对一个 $d \times d$ 的权重矩阵（此时两维相等，都记作 $d$），全量微调要训练 $d^2$ 个参数。用 LoRA，$B$ 有 $dr$ 个元素、$A$ 有 $dr$ 个元素，合起来是 $2dr$ 个。</p>
+
+<p>$r$ 远小于 $d$ 时，$2dr$ 远小于 $d^2$，要训练和存下来的参数都少得多。</p>
+
+<details>
+<summary>一个权重矩阵的参数数量</summary>
+<p>取一个 $d = 4096$ 的权重矩阵，$r$ 取 $8$。</p>
+<ol>
+<li>全量微调要训练 $d^2 = 4096^2 = 16777216$ 个参数。</li>
+<li>LoRA 的 $B$ 有 $4096 \times 8 = 32768$ 个元素，$A$ 有 $8 \times 4096 = 32768$ 个元素，合起来是 $2 \times 4096 \times 8 = 65536$ 个。</li>
+<li>两者相比，LoRA 要训练的参数约是原来的 $65536 / 16777216 \approx 0.39\%$。</li>
+</ol>
+</details>
+
+<h2 id="s5">5. 推理时并入原权重</h2>
+
+<p>部署时，先把 $BA$ 加到 $W_0$ 上，算好并存成一个矩阵 $W = W_0 + BA$；推理（用训练好的模型算出输出）就和一个全量微调的模型一样进行。换到另一个下游任务时，从这个 $W$ 里减去 $BA$、再加上新的低秩项即可，不必重算整个权重。</p>
+
+<p>合并靠的是 $BA$ 与 $W_0$ 形状相同：两个同形状矩阵的每一维对应相加，就能得到一个同形状的矩阵，$BA$ 因此能与 $W_0$ 逐元素相加。</p>
+
+<p>这样推理时的计算量和全量微调的模型完全相同，不因为 LoRA 而增加延迟。</p>
+
+<details>
+<summary>合并前后同一个输出</summary>
+<p>取 $d = k = 2$、$r = 1$，$W_0 = \begin{pmatrix}1&amp;0\\0&amp;1\end{pmatrix}$，$B = \begin{pmatrix}2\\3\end{pmatrix}$，$A = \begin{pmatrix}1&amp;0\end{pmatrix}$，输入 $x = \begin{pmatrix}5\\7\end{pmatrix}$。</p>
+<ol>
+<li>不合并时：$BA = \begin{pmatrix}2&amp;0\\3&amp;0\end{pmatrix}$，$W_0 + BA = \begin{pmatrix}3&amp;0\\3&amp;1\end{pmatrix}$。</li>
+<li>用合并后的单个矩阵算：$(W_0 + BA)x = (3 \cdot 5 + 0 \cdot 7,\ 3 \cdot 5 + 1 \cdot 7) = (15, 22)$。</li>
+<li>用原式算：$W_0 x + BAx = (5, 7) + (10, 15) = (15, 22)$，与上一步相同，说明合并后仍是同一个变换。</li>
+</ol>
+</details>
+
+<h2 id="s6">6. 适用条件与边界</h2>
+
+<p>适配时的权重更新量具有很低的秩，这个假设不保证对所有任务都成立；任务和预训练差别很大时（例如换了语言），很小的 $r$ 可能不如把整个模型重新训练一遍。</p>
+
+<p>对全部被适配的权重矩阵都加 LoRA、并额外训练所有偏置（偏置是权重之外那部分可训练参数；通常的设置不训它），再把 $r$ 取成预训练权重矩阵的秩时，LoRA 大致能恢复全量微调的表达能力（模型能表示的功能范围）。</p>
+
+<p>LoRA 学到的更新量是 $BA$，它的秩不超过 $r$，所以 $r$ 越小，能表示的更新量越受限制。</p>
+
+<p>一处部署上的边界：如果把 $A$、$B$ 合并进 $W$ 来消除推理延迟，那么同一个 batch（一起送进模型处理的一批样本）里混合不同任务、各用不同的 $A$、$B$ 就难以处理；要这样混合，可以不合并权重，改为在前向时按样本选用对应的 $A$、$B$（适合对延迟不敏感的场景）。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen. LoRA: Low-Rank Adaptation of Large Language Models. arXiv:2106.09685v2, 2021. <a href="https://arxiv.org/abs/2106.09685">https://arxiv.org/abs/2106.09685</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

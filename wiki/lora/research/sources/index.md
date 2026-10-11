@@ -1,0 +1,1 @@
+- paper/lora-2106.09685.pdf、paper/lora-src/、paper/lora-2106.09685.txt｜论文｜https://arxiv.org/abs/2106.09685｜v2（2021-10-16）｜2026-10-11｜Hu et al. LoRA: Low-Rank Adaptation of Large Language Models，提出把微调的权重更新量参数化为低秩 $BA$、冻结预训练权重只训练两个小矩阵；LaTeX 源码在 lora-src/，纯文本快照 lora-2106.09685.txt

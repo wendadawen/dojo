@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="张量并行把一层里的权重（可训练的参数）按维度切到多块加速器上，各卡各算一部分，合起来算出同一层。">
+  <meta name="dojo:summary" content="单卡放不下一层时，把层里的权重矩阵按列或按行切到多卡。切法让 GeLU 等逐元素运算不必通信，代价是每层前向、反向各两次 all-reduce。">
+  <meta name="dojo:topics" content="并行与通信, 训练与优化">
+  <meta name="dojo:tag" content="并行与通信">
+  <title>Tensor Parallelism</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Tensor Parallelism</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Tensor Parallelism</h1>
+<p class="reading-time">正文 1,540 字 · 约 5 分钟阅读</p>
+
+<p>神经网络是一层接一层叠起来的计算结构，每一层以上一层的输出为输入做一次计算、再把结果传出；层里可训练的参数是权重，排成矩阵。加速器（下面简称卡）是做这些计算、带自己显存的处理器，显存指卡上的存储空间。一次训练一步分前向、反向两步：前向从输入逐层算到输出，反向从输出往回逐层算梯度——梯度是每个参数该往哪个方向调、调多大幅度的指示量。</p>
+
+<p>模型并行把单个网络的权重切分到多块卡上，各卡只持一部分。张量并行（tensor parallelism，TP）是其中一种：把每一层里的权重矩阵按维度切开，每块卡持有每一层的一部分权重，所有卡一起算出同一层。它和数据并行不同，数据并行把同一份完整模型复制到每块卡上、各卡处理不同的数据。</p>
+
+<p>一个由「注意力块 + 两层前馈」这样的层一层层堆起来、每层结构相同的模型是 Transformer。一个 Transformer 层由两块组成：一块多头注意力（<a href="../standard-attention/index.html">标准注意力</a>），一块两层的前馈子网络（multilayer perceptron，MLP）。切分后要把各卡的部分结果合并，这个操作是 all-reduce——把所有卡上的张量（多维数组，矩阵是它的二维情形）按元素相加，结果每块卡都拿到一份。</p>
+
+<h2 id="s1">1. 把一层的矩阵切到多卡</h2>
+
+<p>这两块的权重矩阵各自按维度切开，分别放在多块卡上。</p>
+
+<h3 id="s1-1">1.1 MLP 的列切与行切</h3>
+
+<p>MLP 的第一段是一个矩阵乘再跟一个 GeLU（逐元素非线性函数，对张量每个元素单独施加）：$Y=\mathrm{GeLU}(XA)$，其中 $X$ 是这一层的输入，$A$ 是第一段的权重矩阵。要把这一个矩阵乘切到多卡，可以从 $A$ 的两个方向切。</p>
+
+<p>一种切法只按 $A$ 的列切：把 $A$ 分成左右两块 $[A_1,A_2]$，每块卡用同一个完整输入 $X$ 计算 $XA_i$，得到输出 $Y$ 的一半 $[Y_1,Y_2]=[\mathrm{GeLU}(XA_1),\mathrm{GeLU}(XA_2)]$。GeLU 是逐元素的，可以各自独立地施加到每块卡自己算出的那一半上，这一步之前不需要任何同步。</p>
+
+<p>另一种切法按 $A$ 的行和 $X$ 的列同时切：把 $A$ 按行分成上下两块 $A^{(1)}$、$A^{(2)}$，把 $X$ 按列分成左右两块 $X^{(1)}$、$X^{(2)}$，每块卡算 $X^{(i)}A^{(i)}$，两块的部分和要加起来才做 GeLU。因为 GeLU 是非线性函数，$\mathrm{GeLU}(X^{(1)}A^{(1)}+X^{(2)}A^{(2)})$ 不等于 $\mathrm{GeLU}(X^{(1)}A^{(1)})$ 加 $\mathrm{GeLU}(X^{(2)}A^{(2)})$，这个加法必须发生在 GeLU 之前，也就是在非线性这一步之前要先同步一次。第一段因此采用列切，省掉这次同步。</p>
+
+<p>第二段的权重矩阵记作 $B$，它把 GeLU 之后的激活（层算出的、要传给下一层的中间张量）映射回输出维度。$B$ 按行切成 $B^{(1)}$、$B^{(2)}$，每块卡用自己那半激活 $Y_i$ 算 $Y_iB^{(i)}$，直接接上本地结果，这一步不需要通信。两块的结果相加才是最终输出，这一步用一次 all-reduce 完成。</p>
+
+<h3 id="s1-2">1.2 小矩阵切分示例</h3>
+
+<p>用一个最小的例子确认这两种切法合起来与不切分得到相同结果。</p>
+
+<details>
+<summary>4 维输入、两卡切分的手算</summary>
+<ol>
+<li>输入取 $X=[1,0,-1,2]$；第一段权重按列切成左右两块，各 $4\times2$。</li>
+<li>第二段权重是单位矩阵，按行切成上下两块，各 $2\times4$。</li>
+<li>卡 1 算第一段前半 $XA_1$：取 $A_1=\begin{bmatrix}1&amp;0\\1&amp;1\\0&amp;1\\1&amp;0\end{bmatrix}$，得 $[3,-1]$。</li>
+<li>卡 2 算第一段后半 $XA_2$：取 $A_2=\begin{bmatrix}0&amp;1\\1&amp;0\\1&amp;0\\0&amp;1\end{bmatrix}$，得 $[-1,3]$。</li>
+<li>逐元素做 GeLU：$\mathrm{GeLU}(3)\approx2.996$，$\mathrm{GeLU}(-1)\approx-0.159$。卡 1 得 $[2.996,-0.159]$，卡 2 得 $[-0.159,2.996]$。</li>
+<li>第二段单位矩阵按行切成 $B^{(1)}=\begin{bmatrix}1&amp;0&amp;0&amp;0\\0&amp;1&amp;0&amp;0\end{bmatrix}$、$B^{(2)}=\begin{bmatrix}0&amp;0&amp;1&amp;0\\0&amp;0&amp;0&amp;1\end{bmatrix}$。卡 1 算得 $[2.996,-0.159,0,0]$，卡 2 算得 $[0,0,-0.159,2.996]$。</li>
+<li>两块按元素相加，得输出 $[2.996,-0.159,-0.159,2.996]$。不切分时把两段拼成完整权重一次算完，得到同一个向量。</li>
+</ol>
+</details>
+
+<h3 id="s1-3">1.3 注意力按 head 切</h3>
+
+<p>注意力块里，输入先乘三个权重矩阵分别得到查询、键、值（记作 Q、K、V），注意力用它们算出每个位置对其它位置的权重。这三处的矩阵乘按列切：每个头各自有一组 Q、K、V 的权重，按列切正好让一个头的全部计算落在同一块卡上，各卡算各的头，完成注意力本身不需要通信。</p>
+
+<p>注意力之后有一个把各头输出拼回隐维度的线性层（拿一个权重矩阵对输入做一次矩阵乘、线性地合成输出的层），隐维度就是一层输出向量的宽度。这个线性层按行切，直接承接各卡本地那部分注意力输出，本步不通信；它的输出再经一次 all-reduce 相加，才是这一层注意力的完整结果。</p>
+
+<h3 id="s1-4">1.4 一层两次 all-reduce，反向对称</h3>
+
+<p>一层前向一共两次 all-reduce，反向也是两次；前向的 all-reduce 在把各卡张量按元素相加、在反向直接放过，反向的 all-reduce 在前向放过、在反向才相加。两者互为反向，可以一起接进自动求导（框架自动算梯度的机制），实现时只需几行代码。</p>
+
+<h2 id="s2">2. 切分后每块卡的显存</h2>
+
+<p>训练时显存里除了权重，还有优化器状态——训练为每个参数额外存下、用来更新它的一份量（比如记录参数历史更新方向的动量）。张量并行把模型并行区里的权重及其优化器状态、以及激活按卡切开，每块卡只存自己那一份，整个模型因此能装下比单卡容量更大的规模。</p>
+
+<p>模型并行区（被张量并行切分覆盖的那部分模型）之外的部分——dropout（训练时随机丢掉一部分单元的输出）、层归一化（把一个位置的向量归一化）、残差连接（<a href="../residual-connection/index.html">残差连接</a>，把输入直接加到输出上）——不切分，而在每块卡上各自重复算一份，省下它们跨卡通信的开销。</p>
+
+<h2 id="s3">3. 适用条件与边界</h2>
+
+<p>张量并行每一层都要 all-reduce，通信量大。它属于资料所称的 SPMD 一类（single program multiple data，所有卡跑同一份程序、处理输入张量的不同分片，分片指把张量沿某个维度切成的小块），这类靠 all-reduce 合并矩阵乘结果的做法，适用场景限于卡之间用高速互联（带宽高的一层互联）相连的时候。</p>
+
+<p>张量并行与流水线并行（<a href="../pipeline-parallelism/index.html">流水线并行</a>，按层堆叠的深度切）正交互补，可以组合使用。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Mohammad Shoeybi, Mostofa Patwary, Raul Puri 等. Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. arXiv:1909.08053v4, 2020. <a href="https://arxiv.org/abs/1909.08053">https://arxiv.org/abs/1909.08053</a></li>
+<li>Yanping Huang, Youlong Cheng, Ankur Bapna 等. GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism. arXiv:1811.06965, 2019. <a href="https://arxiv.org/abs/1811.06965">https://arxiv.org/abs/1811.06965</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>

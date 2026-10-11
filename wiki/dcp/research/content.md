@@ -21,7 +21,7 @@
 
 ### 头维切到头就只剩重复
 
-[KV cache](wiki/kv-cache) 起初沿[注意力](wiki/standard-attention)头（注意力让每个 token 和已有的 token 比对、按相关度加权取值，头是其中负责一组键和值的单元，模型有若干个）分配：普通[张量并行](wiki/model-parallelism)把缓存沿头切开，每张卡拿一组头。头数由模型结构定死，是能分给一张卡的最小单位，切到每卡一个头就到上限。分组查询注意力（[GQA](wiki/gqa)）和[多头潜在注意力（MLA）](wiki/mla)的 KV 头都很少，张量并行度超过头数后，多出来的卡只能拿同一组头的重复副本。重复副本占走显存（GPU 的内存），能同时服务的请求数就被压低。
+[KV cache](wiki/kv-cache) 起初沿[注意力](wiki/standard-attention)头（注意力让每个 token 和已有的 token 比对、按相关度加权取值，头是其中负责一组键和值的单元，模型有若干个）分配：普通[张量并行](wiki/tensor-parallelism)把缓存沿头切开，每张卡拿一组头。头数由模型结构定死，是能分给一张卡的最小单位，切到每卡一个头就到上限。分组查询注意力（[GQA](wiki/gqa)）和[多头潜在注意力（MLA）](wiki/mla)的 KV 头都很少，张量并行度超过头数后，多出来的卡只能拿同一组头的重复副本。重复副本占走显存（GPU 的内存），能同时服务的请求数就被压低。
 依据：blog/vllm-dcp-blog.md 1. Introduction；blog/vllm-dcp-blog.md 3. Challenges of Serving Long Contexts
 
 ### 聚查询、算部分注意力、按 LSE 合并
@@ -31,7 +31,7 @@
 
 ## 长页
 
-大语言模型（用大量文本训练、能按上文继续写下去的模型）的一次推理（把一段文字读进来、算出输出，不涉及训练）要把一条请求的整段 token（模型处理文本的最小单位）序列算一遍。序列很长时，可以把它沿 token 位置维切成几份，分给多张卡同时处理，这叫上下文并行（context parallelism，CP）。它切的是同一条序列的 token 位置方向，不同于把权重矩阵切开的[张量并行](wiki/model-parallelism)。同一条请求分两段算：预填充（prefill）一次读入整段提示、算出结果，解码（decode）逐 token 生成。解码上下文并行（DCP）切解码时要反复读的 [KV cache](wiki/kv-cache)（键和值，每个 token 算出的两个向量，缓存下来供后面每步复用），让每张卡只存一段、腾出显存（GPU 的内存），从而增大批大小（一次并行处理的请求数）、提高吞吐。
+大语言模型（用大量文本训练、能按上文继续写下去的模型）的一次推理（把一段文字读进来、算出输出，不涉及训练）要把一条请求的整段 token（模型处理文本的最小单位）序列算一遍。序列很长时，可以把它沿 token 位置维切成几份，分给多张卡同时处理，这叫上下文并行（context parallelism，CP）。它切的是同一条序列的 token 位置方向，不同于把权重矩阵切开的[张量并行](wiki/tensor-parallelism)。同一条请求分两段算：预填充（prefill）一次读入整段提示、算出结果，解码（decode）逐 token 生成。解码上下文并行（DCP）切解码时要反复读的 [KV cache](wiki/kv-cache)（键和值，每个 token 算出的两个向量，缓存下来供后面每步复用），让每张卡只存一段、腾出显存（GPU 的内存），从而增大批大小（一次并行处理的请求数）、提高吞吐。
 依据：blog/vllm-context-parallel-deployment.md Context Parallel Deployment；blog/vllm-dcp-blog.md 1. Introduction；blog/vllm-rfc-26133-context-parallelism.md Proposed Change
 
 ### 预填充算得多，解码存得多
@@ -43,7 +43,7 @@
 
 #### 沿头维切到头就开始重复
 
-解码时 KV cache 起初沿[注意力](wiki/standard-attention)头（注意力里每个负责一组键和值的头，模型有若干个）分配：模型有 $H$ 个 KV 头，普通[张量并行](wiki/model-parallelism)把 KV cache 沿 $H$ 维切开，每张卡拿一组头。头是能分给一张卡的最小单位，一张卡不能再只拿半个头。模型的 $H$ 由结构定死，所以当张量并行度 $t$ 超过 $H$ 之后，头部不够分，多出来的卡只能拿同一组头的副本，KV cache 就在卡间重复 $t/H$ 份。两类主流注意力的 KV 头数都不多，会先到这条上限：分组查询注意力（GQA，多个查询头共享少量 KV 头）本来只存少量 KV 头（见 [GQA](wiki/gqa)）；多头潜在注意力（MLA）把键和值压成所有查询头（算查询向量的头）共享的一个潜在向量（键值压缩后得到的低维中间表示），有效 KV 头数就是 $1$，普通张量并行下这份缓存会在每张卡上整份复制（见 [MLA](wiki/mla)）。重复的缓存多占一份显存，能留给请求的余地变小，并发度下降。
+解码时 KV cache 起初沿[注意力](wiki/standard-attention)头（注意力里每个负责一组键和值的头，模型有若干个）分配：模型有 $H$ 个 KV 头，普通[张量并行](wiki/tensor-parallelism)把 KV cache 沿 $H$ 维切开，每张卡拿一组头。头是能分给一张卡的最小单位，一张卡不能再只拿半个头。模型的 $H$ 由结构定死，所以当张量并行度 $t$ 超过 $H$ 之后，头部不够分，多出来的卡只能拿同一组头的副本，KV cache 就在卡间重复 $t/H$ 份。两类主流注意力的 KV 头数都不多，会先到这条上限：分组查询注意力（GQA，多个查询头共享少量 KV 头）本来只存少量 KV 头（见 [GQA](wiki/gqa)）；多头潜在注意力（MLA）把键和值压成所有查询头（算查询向量的头）共享的一个潜在向量（键值压缩后得到的低维中间表示），有效 KV 头数就是 $1$，普通张量并行下这份缓存会在每张卡上整份复制（见 [MLA](wiki/mla)）。重复的缓存多占一份显存，能留给请求的余地变小，并发度下降。
 依据：blog/vllm-dcp-blog.md 1. Introduction；blog/vllm-dcp-blog.md 3. Challenges of Serving Long Contexts；blog/vllm-context-parallel-deployment.md Decode Context Parallel
 
 #### 每张卡只存一段 token 的 KV
