@@ -1,6 +1,7 @@
 (function startDojoHome() {
   const model = window.DojoHomeModel;
   const graph = window.DojoGraph;
+  const desktopLinks = window.matchMedia("(hover: hover) and (pointer: fine)");
   const elements = {
     status: document.getElementById("app-status"),
     search: document.getElementById("search-input"),
@@ -106,7 +107,7 @@
       <h3>${model.escapeHtml(page.title)}</h3>
       <p class="detail-description">${model.escapeHtml(model.summaryOf(page))}</p>
       <div class="detail-actions">
-        <a class="detail-open" href="${model.escapeHtml(page.path)}" target="_blank" rel="noopener">阅读文档&nbsp; ↗</a>
+        <a class="detail-open" href="${model.escapeHtml(page.path)}" target="${desktopLinks.matches ? "_blank" : "_self"}" rel="noopener">阅读文档&nbsp; ↗</a>
       </div>
       ${relationGroup("引用本文", page.incoming || [], "incoming")}
       ${relationGroup("本文引用", page.outgoing || [], "outgoing")}`;
@@ -215,9 +216,15 @@
     document.addEventListener("click", (event) => {
       const open = event.target.closest("[data-open-path]");
       if (open) {
-        window.open(open.dataset.openPath, "_blank", "noopener");
+        if (desktopLinks.matches) {
+          window.open(open.dataset.openPath, "_blank", "noopener");
+        } else {
+          window.location.assign(open.dataset.openPath);
+        }
         return;
       }
+      const detailLink = event.target.closest(".detail-open");
+      if (detailLink) detailLink.target = desktopLinks.matches ? "_blank" : "_self";
       const mapTarget = event.target.closest("[data-map-id]");
       if (mapTarget) {
         graph.focusGlobal(mapTarget.dataset.mapId, true);

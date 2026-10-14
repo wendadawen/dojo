@@ -16,7 +16,8 @@
 - `check_css.py`：找出共享样式表（长页、短页两套）里没人用的规则，`--fix` 直接删除。
 - `build_catalog.py`：扫描 `wiki/`，生成首页读的 `catalog.json`。
 - `vocab.py`：主题和标签的封闭词表。
+- `test_navigation.cjs`：用 `node --test .dojo/scripts/site/test_navigation.cjs` 检查触屏与鼠标设备的链接打开行为。
 
 首页 `index.html` 引用的 `assets/` 和 `catalog.json` 只在 CI 里生成：`assets/` 来自 `.dojo/site/`，`catalog.json` 来自 `build_catalog.py`，不用手工收录页面。
 
-上面所有脚本都有 `--selftest`，CI 会逐个跑。增加检查：写一个函数加进 `RULES`，再往 `CASES` 加一个会触发它的坏输入；删除则两处一起删。
+上面的 Python 脚本都有 `--selftest`，CI 会逐个跑。增加检查：写一个函数加进 `RULES`，再往 `CASES` 加一个会触发它的坏输入；删除则两处一起删。
