@@ -551,7 +551,6 @@ def build(md: Path, wiki_root: Path | None = None) -> tuple[Path, Path, dict, Ct
     overview_html = _fill((TEMPLATES / "overview.html").read_text(encoding="utf-8"), out_dir, [
         (CONTENT_MARKER, short),
         ("【概念名】", html.escape(title)),
-        ("【主题标签】", html.escape(meta["tag"])),
         ("【定位摘要：这个概念是什么、解决什么问题】", html.escape(meta["description"])),
     ])
 
