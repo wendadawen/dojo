@@ -1,0 +1,2 @@
+- paper/quarot-v2.pdf、paper/quarot-v2-src/｜https://arxiv.org/abs/2404.00456v2｜arXiv v2，2024-10-29｜2026-10-13｜原作者对量化中归一化与随机化 Hadamard 变换、计算等价性和快速实现的说明；本页只提取变换本身，不展开 QuaRot 系统。
+- repo/QuaRot/｜https://github.com/spcl/QuaRot｜5008669b08c1f11f9b64d52d16fddd47ca754c5a｜2026-10-13｜作者官方完整实现，含 Hadamard 工具和运行时内核；正文数字仅依据论文文本或自行构造。
