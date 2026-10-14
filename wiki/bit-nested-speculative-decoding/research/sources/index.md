@@ -1,0 +1,2 @@
+- paper/arxiv-2610.02800.pdf、paper/src-v2/、paper/arxiv-2610.02800.txt｜论文｜https://arxiv.org/abs/2610.02800v2｜v2｜2026-10-14｜BitNest，提出位嵌套自投机解码：把低精度草稿嵌入高精度目标表示，目标由低精度基底加残差精化恢复，权重和 KV cache 共用单一物理表示并保持高精度质量
+- repo/BitNest｜官方仓库｜https://github.com/YCC-DAVID/BitNest｜main@5020cbe541a527ec2ae9adacaaa4b4f2217bc890｜2026-10-14｜论文配套实现，包含构造、评测与部署脚本

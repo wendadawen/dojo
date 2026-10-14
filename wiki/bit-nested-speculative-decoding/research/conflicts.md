@@ -1,0 +1,4 @@
+- 长页「上下文感知的 KV 读法」、短页「先建 W4，补残差成 W8，按平面读」｜论文 Context-Aware KV Nesting 写短上下文两端 KV8、长上下文草稿 KV4、验证 KV8；仓库 `bitnest/generate.py` 的 `--kv_draft` 默认 `kv4`，`scripts/run_benchmark.sh` 在 2K prompt 上也显式传 `--kv_draft kv4`｜页面采用论文策略，并写明「按论文策略」。
+- 折叠块「接受率、加速和模型质量的关键数字」｜LLaMA-3-8B BitNest WikiText-2 困惑度在主表为 6.2256，目标精度消融和附录表写作 6.223｜页面采用主表和正文的 6.2256。
+- 「适用条件与边界」Qwen2.5-7B 的 KV 精度消融｜正文 Why retain KV8 for the target? 简写为 target KV 从 KV8 到 KV4 使 GSM8K 从 81.6% 到 78.4%；附录 Additional Target-Precision Analysis 表明 81.6% 是 KV4 draft 到 KV8 target、78.4% 是 KV4 draft 到 KV4 target｜页面采用附录口径：KV4 草稿下，目标 KV 从 KV8 改用 KV4，准确率从 81.6% 降到 78.4%。
+- 「上下文感知的 KV 读法」KV 残差边界｜论文 Detailed KV-Cache Nesting 对所有 $q_4$ 写 $q_r\in[-8,7]$；仓库 `bitnest/kv_planes.py` 在 $q_4=-8$ 时把 $q_r$ 下界抬到 0｜页面采用论文口径，统一 $q_r\in[-8,7]$。

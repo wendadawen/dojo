@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="位嵌套自投机解码用同一份模型位表示支持草稿和目标：草稿是先猜后续 token 的低开销模型，目标验证这些候选；先量化出 W4 基底，再用残差补成 W8 目标，草稿只读基底，目标读基底加残差。">
+  <meta name="dojo:summary" content="同一个权重先优化出 W4 基底，再用 4-bit 残差补成 W8 目标；基底和残差分成两个位平面，草稿只读 W4 平面，目标读两个平面；KV cache 按上下文在 KV8 与 KV4/KV8 之间切换。">
+  <meta name="dojo:topics" content="推理系统, 内存与缓存">
+  <meta name="dojo:tag" content="推理加速">
+  <title>Bit-Nested Speculative Decoding</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Bit-Nested Speculative Decoding</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Bit-Nested Speculative Decoding</h1>
+<p class="reading-time">正文 1,685 字 · 约 6 分钟阅读</p>
+
+<p><a href="../speculative-decoding/index.html">投机解码</a>用草稿模型猜候选、用目标模型验证。自投机把草稿从目标模型自身导出，避免另配独立草稿模型。每个权重（模型里的可学参数）可量化成低精度整数码。4 位基底和 4 位残差合成 8 位目标视图：基底指先造出的 W4 视图，残差是补基底误差的低位码，目标视图指目标模型读取的 W8 权重视图。常规量化部署先从高精度模型导出低精度副本；这个方法的实现叫 BitNest，它反过来先建将来当草稿的 W4 基底，再固定基底补出 W8 目标视图。它取 $b_W=r_W=4$，$b_W$ 是基底位宽，$r_W$ 是残差位宽；同一思路也用于 <a href="../kv-cache/index.html">KV cache</a>。</p>
+
+<h2 id="s1">1. 先建基底，再补残差</h2>
+
+<h3 id="s1-1">1.1 旋转与 W4 基底</h3>
+
+<p>BitNest 先把两组函数保持变换 $R_1,R_2$ 融合进原权重 $W$，得到 $W'$；融合指把变换吸收进权重本身。隐藏维度是每个 token 的向量宽度，$R_1$ 作用于这个维度；$R_2$ 作用于每个注意力头的 head 维度。函数保持指模型表示变了而输入输出不变。旋转属这类变换，能压低或重排激活（逐层流动的中间结果）里的离群值，使等价模型表示更适合低精度量化。基底由 GPTQ（一种训练后量化算法）生成，以组大小 $g=128$ 处理连续权重，$g$ 是共用一个缩放的权重个数。缩放是把整数码还原成实数的实数步长。GPTQ 返回整数码 $q_4$ 和组缩放 $s_4$，记号 $(q_4,s_4)=\mathrm{Quantize}_{4,g=128}(W')$ 就表示这一映射，其中 $q_4\in[-8,7]$，草稿权重为 $W_{\mathrm{draft}}=q_4s_4$。此后 $q_4$ 和 $s_4$ 固定，后续残差在这个基底上构造。</p>
+
+<h3 id="s1-2">1.2 残差补成 W8 目标</h3>
+
+<p>固定基底后的剩余权重误差是 $\Delta W=W'-W_{\mathrm{draft}}$。残差缩放取 $s_{\mathrm{ref}}=s_4/16$；4 位有 16 个码位，4 位基底码和 4 位残差码按数值关系 $16q_4+q_r$ 合成 8 位码。合成码的可达范围是 $[-128,119]$：$q_4=-8$ 的分支把残差下界抬到 $0$，避免低于 $-128$；$q_4=7$ 时最大合成码是 $119$。clip 表示把数值裁剪到给定范围。对 $q_4&gt;-8$ 的权重，残差码是</p>
+
+<p>$$
+q_r=\operatorname{clip}\left(\operatorname{round}\left(\frac{\Delta W}{s_{\mathrm{ref}}}\right),-8,7\right).
+$$</p>
+
+<p>$q_4=-8$ 时使用刚才的下界分支。合成目标为</p>
+
+<p>$$
+W_{\mathrm{target}}=q_4s_4+q_rs_{\mathrm{ref}}=(16q_4+q_r)s_{\mathrm{ref}}.
+$$</p>
+
+<p>目标在不改基底的情况下增加精化信息；W4 视图因此是 W8 表示的严格子集。</p>
+
+<details>
+<summary>一个 4 权重组的手算例子</summary>
+<p>设 $s_4=0.16$，所以 $s_{\mathrm{ref}}=0.01$；变换后权重 $W'$ 的四个分量为 $0.63, -1.21, 0.14, 1.19$。</p>
+<ol>
+<li>为突出嵌套关系，这组设 GPTQ 的补偿结果就是最近格点：$q_4=(4,-8,1,7)$，草稿权重为 $0.64,-1.28,0.16,1.12$。</li>
+<li>残差依次是 $-0.01,0.07,-0.02,0.07$，除以 $0.01$ 后最近取整得 $q_r=(-1,7,-2,7)$。</li>
+<li>第 2 个权重 $q_4=-8$，残差 $7$ 在允许范围 $[0,7]$；合成码是 $16q_4+q_r=(63,-121,14,119)$。</li>
+<li>乘 $0.01$ 得 W8 目标视图 $0.63,-1.21,0.14,1.19$；每个值都由基底码加残差码恢复。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 双平面存储与 KV 策略</h2>
+
+<h3 id="s2-1">2.1 基底与残差分成两个位平面</h3>
+
+<p>两个 4-bit 码不把同一个权重的高低 nibble 放进一个字节。nibble 是 4 位二进制。BitNest 把所有基底码连续打包成一个基底平面，把所有残差码连续打包成一个精化平面；$N$ 为偶数个权重时，每个平面占 $N/2$ 字节。草稿读取时执行读取和乘加的程序只取基底平面，对应每个权重的 4 bit 整数码读取量；验证时再取精化平面恢复 W8。残差缩放 $s_{\mathrm{ref}}=s_4/16$ 由基底缩放导出，所以精化平面不用另存缩放。</p>
+
+<details>
+<summary>一个可寻址的位平面例子</summary>
+<p>设 4 个权重的基底码和残差码分别是 $(4,-8,1,7)$、$(-1,7,-2,7)$。</p>
+<ol>
+<li>若按权重交错进字节，基底和残差都在相邻 nibble 里；草稿即使只要基底码，字节加载仍会带上残差码。</li>
+<li>有符号 4-bit 码先加 $8$ 变成无符号码。位平面 A 连续打包基底 $(12,0,9,15)$，位平面 B 连续打包残差 $(7,15,6,15)$；每个码都落在 4-bit 的 $[0,15]$。</li>
+<li>草稿内核只读平面 A 的 $N/2$ 字节；目标内核读平面 A 和 B，共 $N$ 字节，再分别减 $8$ 恢复有符号码。</li>
+</ol>
+</details>
+
+<h3 id="s2-2">2.2 上下文感知的 KV 读法</h3>
+
+<p><a href="../kv-cache/index.html">KV cache</a> 保存历史 key 和 value；key 用于和当前位置比较，value 用于加权求和。token 是文本最小单位；<a href="../standard-attention/index.html">注意力</a>为当前位置计算每个历史位置的匹配分数，再按分数加权求和 value，head 是注意力里的一个通道组。上下文指输入 token 序列的长度。BitNest 策略是：短上下文里草稿和验证都读 KV8（8 位 key/value 视图），长上下文里草稿读 KV4（4 位 key/value 视图）基底、验证读两个平面恢复 KV8；采用这一策略是因为短上下文里 KV 流量小、KV4 会降低草稿与目标一致性，长上下文才切到低精度草稿读取。写入 KV 时，一个 key 或 value 向量 $x$ 按每个 token、每个 KV head 对称量化；对称量化围绕 0 取有符号码，用同一个缩放还原。$d=128$ 是每个 head 的维度。缩放 $s=\max_i|x_i|/7$，基底为 $q_4=\operatorname{clip}(\operatorname{round}(x/s),-8,7)$；BitNest 策略对所有 $q_4$ 取残差码 $q_r=\operatorname{clip}(\operatorname{round}((x-q_4s)/(s/16)),-8,7)$，KV8 目标为 $\hat x_{\mathrm{target}}=(16q_4+q_r)s/16$。</p>
+
+<p>草稿为新候选写的 KV 状态先临时保留；验证时目标模型重算这些状态，接受的前缀留在持久缓存，被拒后缀丢弃。</p>
+
+<h2 id="s3">3. 草稿读取减半，接受率保持高位</h2>
+
+<h3 id="s3-1">3.1 草稿读取减半，平均接受率 95.2%</h3>
+
+<p>固定基底和共享缩放使目标视图由同一批基底码生成，两个精度视图保持对齐。在四个 7B–8B（参数量 7 billion 到 8 billion）语言模型（已训练用于生成文本的模型）的六个工作负载上，生成时平均接受率（被接受的草稿候选比例）是 95.2%，四个模型的平均值在 94.8%–95.7%；相对同一引擎的 16-bit 自回归基线（每生成一个 token 跑一次模型的对照），端到端解码加速是 1.48–1.61 倍。</p>
+
+<details>
+<summary>接受率、加速和模型质量的关键数字</summary>
+<ol>
+<li>2K（2048 个 token）前缀、batch size（一次同时处理的序列数）1、生成 256 token 的 NVIDIA RTX A6000 GPU 设置下，四个公开开源语言模型（LLaMA 和 Qwen 系列）LLaMA-2-7B、LLaMA-3-8B、Qwen2-7B、Qwen2.5-7B 的六任务平均接受率分别为 95.7%、95.3%、95.0%、94.8%。</li>
+<li>各模型六个工作负载的加速倍数如下：LLaMA-2-7B 为 1.50、1.59、1.59、1.61、1.60、1.57 倍；LLaMA-3-8B 为 1.53、1.55、1.59、1.59、1.56、1.49 倍；Qwen2-7B 为 1.48、1.53、1.54、1.55、1.53、1.52 倍；Qwen2.5-7B 为 1.52、1.58、1.57、1.58、1.59、1.57 倍。</li>
+<li>质量接近 W8 目标视图：BitNest 在 WikiText-2（文本基准）上的困惑度（语言建模误差，越低越好）为 6.2256，W8A8 为 6.1617，FP16（16 位浮点）为 6.1389；这些是 LLaMA-3-8B 的结果。</li>
+</ol>
+</details>
+
+<h3 id="s3-2">3.2 一份权重和受控 KV</h3>
+
+<p>嵌套权重（基底加残差得到的 W8 目标视图）的持久存储就是 W8 目标视图本身：LLaMA-2-7B 语言模型为 6.22 GiB，和单独 W8 模型相同；不用再为 W4 草稿保留另一份表示。上下文到 32K 时，KV cache 占内存的比例上升，BitNest 峰值内存为 21.0 GiB。在一类 16 GB 边缘计算板上，LLaMA-2-7B-32K（上下文扩展版）的解码约 1.5 倍于 FP16（16 位浮点）自回归。</p>
+
+<details>
+<summary>存储和边缘端数字的条件</summary>
+<ol>
+<li>6.22 GiB 是 LLaMA-2-7B 的嵌套权重存储；单独 W8 目标加独立 W4 草稿需 9.38 GiB，差距来自后者要另存草稿表示。</li>
+<li>21.0 GiB 是 32K 上下文下的 BitNest 峰值内存。</li>
+<li>边缘结果在 NVIDIA Jetson Orin NX16（16 GB 边缘计算板），batch size 1、贪心解码（每步取最高分 token）、只测解码段：LLaMA-2-7B-32K 为 9.0–9.3 tok/s（每秒生成 token 数）；FP16 AR（FP16 自回归）为 6.0 tok/s。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>它的速度收益依赖系统能按权重平面访问和执行：正常运行下草稿只发生基底平面的低开销读取，验证用两个平面恢复 W8 目标视图。低精度视图主要承担起草：LLaMA-3-8B 语言模型上 W4A8（4 位权重、8 位激活）的 GSM8K（数学题基准）为 41.4%，读回精化平面的 BitNest 目标恢复到 49.8%；KV4 正常只给草稿。KV4 草稿下，目标模型的 KV 从 KV8 改用 KV4 时，Qwen2.5-7B 语言模型的 GSM8K 从 81.6% 降到 78.4%。草稿与目标的一致性用接受率衡量，目标保真用最终输出质量衡量；两边都用 KV4 时接受率仍达 93.3%，但 GSM8K 比只用 KV4 草稿的 81.6% 更差。</p>
+
+<p>KV 精化的速度收益随 KV 访问占比增大。GQA（分组查询注意力，多个查询 head 共享 key/value head）已经降低 KV 流量，KV4 草稿带来的吞吐差距小。它目前是自投机，不使用能并行生成候选 token 块的独立草稿模型。$\gamma$ 是每轮草稿候选数；$\gamma$ 增大会降低单槽（单个候选位）接受率，在 2 到 6 的测试范围里吞吐在中间 $\gamma$ 处最高。</p>
+
+<details>
+<summary>边界里的消融条件</summary>
+<ol>
+<li>93.3% 是 Qwen2.5-7B、W8A8 权重、KV4 draft 到 KV4 target、$\gamma=4$ 的接受率。</li>
+<li>32K 下，LLaMA-2-7B-32K（MHA，多头注意力，32 个 KV head）草稿用 BF16（16 位浮点）KV、KV8、KV4 的吞吐是 23.4、28.5、34.3 tok/s；Qwen2.5-7B（GQA）对应吞吐是 50.7、51.1、51.4 tok/s。LLaMA-2-7B-32K 草稿用 KV4、KV8 的接受率分别为 0.875、0.944。</li>
+<li>LLaMA-2-7B-32K 草稿用 KV4 时，4K 下 $\gamma=2$ 到 6 的吞吐是 57.2、56.8、59.3、56.1、55.6 tok/s，31K 下是 33.0、33.6、34.3、34.0、33.0 tok/s。</li>
+</ol>
+</details>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>Chence Yang, Ningxi Cheng, Arash Akbari, Qitao Tan, Qingchan Zhu, Ci Zhang, Changdi Yang, Yanzhi Wang, Wei Niu, Jinhui Wang, Jin Lu, Geng Yuan. BitNest: Bit-Nested Speculative Decoding for Memory-Efficient LLM Inference Acceleration. arXiv:2610.02800v2, 2026. <a href="https://arxiv.org/abs/2610.02800">https://arxiv.org/abs/2610.02800</a></li>
+<li>YCC-DAVID. BitNest 官方仓库. commit 5020cbe541a527ec2ae9adacaaa4b4f2217bc890, 2026. <a href="https://github.com/YCC-DAVID/BitNest">https://github.com/YCC-DAVID/BitNest</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// 站内文档链接与外部链接在新标签页打开
+document.querySelectorAll('a[href]').forEach(a => {
+  const href = a.getAttribute('href');
+  if (href && href[0] !== '#' && (/^[a-z][a-z0-9+.\-]*:/i.test(href) || /\.html?(?:[?#]|$)/i.test(href))) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+});
+</script>
+
+</body>
+</html>
