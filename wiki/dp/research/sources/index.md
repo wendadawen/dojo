@@ -1,0 +1,1 @@
+- blog/dynamic-programming.md | https://en.wikipedia.org/wiki/Dynamic_programming | revision 1376326876 | 2026-10-14 | 维基百科对动态规划的定义、适用条件、自顶向下与自底向上方法、Bellman 方程和典型算法的官方概述。
