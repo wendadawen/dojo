@@ -1,0 +1,4 @@
+- blog/glm-5.3-flash.txt｜https://z.ai/blog/glm-5.3-flash｜2026-10-14 取回｜2026-10-14｜官方博客快照：说明稀疏/线性混合注意力，以及 IndexPool 通过加权池化把 4 个 indexer key 向量压成 1 个
+- blog/glm-5.3-flash-model-card.md｜https://huggingface.co/zai-org/GLM-5.3-Flash｜sha 91b69215804f2d2036a8867f6ce44848e278dcda（2026-10-12）｜2026-10-14｜官方模型卡快照：GLM-5.3-Flash 的混合注意力与架构概述
+- blog/glm-5.3-flash-config.json｜https://huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json｜sha 91b69215804f2d2036a8867f6ce44848e278dcda（2026-10-12）｜2026-10-14｜官方模型配置：index_kpool=4、index_topk=2048、index_kpool_always_select_tail=true
+- repo/transformers｜https://github.com/huggingface/transformers｜151bc09e17e319b6d2ddb0b8cb397826362ed118（2026-10-14，浅克隆）｜2026-10-14｜GLM-5.3-Flash 官方集成实现：Glm5NextTextIndexer 的 k-pool 压缩、选择、尾部处理和 indexer key 缓存

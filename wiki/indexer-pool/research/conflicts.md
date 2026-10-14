@@ -1,0 +1,2 @@
+- modeling_glm5_next.py L827 与 L902-L905｜docstring 写尾部使输出为 `[B, S, 2*topk - 1]`；实现写 `output_width = index_topk` 再加 `index_kpool - 1`｜页面采用实现口径：最多加 $P-1$。
+- cache_utils.py L337 与 modeling_glm5_next.py L839-L846｜缓存文档写索引器 key 缓存末维是 `index_head_dim`；GLM 实现传入门控向量和有效位拼接后的 `packed_states`，末维更大｜页面采用 GLM 实现口径：缓存的是拼接状态向量。
