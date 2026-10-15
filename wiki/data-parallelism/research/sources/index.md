@@ -1,0 +1,3 @@
+- tensorrt-llm-parallel-strategy.md｜https://nvidia.github.io/TensorRT-LLM/features/parallel-strategy.html｜2026-10-15 快照｜2026-10-15｜TensorRT-LLM 官方并行策略文档，定义推理里的 Data Parallelism 并说明它与 TP、PP、EP 的适用场景。
+- vllm-data-parallel-deployment.md｜https://docs.vllm.ai/en/stable/serving/data_parallel_deployment/｜2026-10-15 快照｜2026-10-15｜vLLM 官方数据并行部署文档，说明整体 DP、请求路由、负载均衡、DP 与 TP/MoE 组合的机制。
+- sglang-server-arguments.md｜https://docs.sglang.ai/advanced_features/server_arguments.html｜2026-10-15 快照（raw GitHub 文档源）｜2026-10-15｜SGLang 官方服务参数文档，说明 DP replica 数量、吞吐取舍和 attention 专用 DP 配置。

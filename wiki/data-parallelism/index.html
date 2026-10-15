@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="数据并行把同一份模型复制到多个推理工作进程，每个进程独立处理不同请求，输入按负载均衡分给各进程。">
+  <meta name="dojo:summary" content="请求级 DP 用多份完整模型并行处理不同请求来提高吞吐；每个副本保留自己请求的 KV cache，路由器按当前负载分配请求。它是复制品之间的分工，不是把一层切到多卡。">
+  <meta name="dojo:topics" content="推理系统, 并行与通信">
+  <meta name="dojo:tag" content="推理系统">
+  <title>Data Parallelism</title>
+  <link rel="icon" href="../../libs/shared/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../../libs/shared/katex.min.css">
+  <script defer src="../../libs/shared/katex.min.js"></script>
+  <script defer src="../../libs/shared/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ],
+      throwOnError: false
+    });"></script>
+  <!-- Prism.js 代码高亮（本地，GitHub Primer 主题 + 函数调用扩展） -->
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-light.css" id="prism-light">
+  <link rel="stylesheet" href="../../libs/concept/prism-primer-dark.css" id="prism-dark" disabled>
+  <script defer src="../../libs/concept/prism.min.js"></script>
+  <script defer src="../../libs/concept/prism-python.min.js"
+    onload="Prism.languages.insertBefore('python','punctuation',{method:{pattern:/(\.)\s*([A-Za-z_]\w*)\s*(?=\()/,lookbehind:!0,alias:'function'},function:{pattern:/\b([A-Za-z_]\w*)\s*(?=\()/,alias:'function'}});Prism.languages.insertBefore('python','operator',{number:/\b\d+\.?\d*\b/});document.querySelectorAll('pre code').forEach(b=>{try{Prism.highlightElement(b)}catch(e){}});"></script>
+  <link rel="stylesheet" href="../../libs/concept/dojo-concept.css">
+  <script defer src="../../libs/concept/dojo-links.js"></script>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">Data Parallelism</span>
+    <div class="nav-links">
+      <a class="home-link" href="../../index.html" aria-label="返回首页" title="返回首页">⌂</a>
+      <a class="overview-link" href="overview.html" title="查看概览">概览</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="切换主题">
+        <span class="icon-moon">◐</span>
+        <span class="icon-sun">☀</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<aside class="toc" id="toc">
+  <div class="toc-title">目录</div>
+  <ul id="tocList"></ul>
+</aside>
+
+<div class="lightbox" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<h1 class="title">Data Parallelism</h1>
+<p class="reading-time">正文 573 字 · 约 2 分钟阅读</p>
+
+<p>推理是让模型从输入生成输出；这里的模型是一组可复制的学习参数。GPU 是实际执行计算的卡。推理系统里的数据并行（Data Parallelism，DP）把整个模型复制到多个 GPU。这里的请求是用户提交的一次输入和它要的生成结果。纯请求级 DP 中，每个副本处理不同请求，各自独立完成推理；rank 是承载模型副本的一个工作进程。SGLang 用 <code>--data-parallel-size</code> 或 <code>--dp-size</code> 配置数据并行副本的数量。</p>
+
+<h2 id="s1">1. 一个 DP rank 怎么处理请求</h2>
+
+<p>一个 rank 持有整份模型权重。它接到一个或一批请求后，从输入算到输出。不同请求由负载均衡分给不同 rank；例如在线部署中，vLLM 当前的内部负载均衡按各工作进程的运行和等待队列分配新请求。</p>
+
+<h3 id="s1-1">1.1 请求分流的例子</h3>
+
+<p>设 2 个 rank 各已有负载为 1 的运行请求。6 个新请求的长度依次是 3、1、4、1、5、9；这里的长度是例子里计量负载的抽象单位，每个请求的负载就是它的长度。</p>
+
+<details>
+<summary>两种分流过程与比较</summary>
+<ol>
+<li>轮询不看长度：6 个请求按 0、1 循环分给两个 rank。rank 0 的新增负载是 $3+4+5=12$，rank 1 是 $1+1+9=11$。</li>
+<li>按当前待处理负载分流：两个 rank 起点都是 1。第 1 个请求给 rank 0，累计到 $4,1$；第 2 个请求给更短的 rank 1，累计到 $4,2$；第 3 个请求在 $4$ 和 $2$ 之间给 rank 1，累计到 $4,6$；第 4 个请求在 $4$ 和 $6$ 之间给 rank 0，累计到 $5,6$；第 5 个请求在 $5$ 和 $6$ 之间给 rank 0，累计到 $10,6$；第 6 个请求在 $10$ 和 $6$ 之间给 rank 1，累计到 $10,15$。</li>
+<li>6 个请求的负载合计是 $23$。若比较含初始请求的最终总负载，轮询是 $13,12$，按当前负载分流是 $10,15$，最大值从 13 变成 15；若只比较新增负载，则分别是 $12,11$ 和 $9,14$，最大值从 12 变成 14。</li>
+</ol>
+</details>
+
+<h2 id="s2">2. 每个副本为什么有独立 KV cache</h2>
+
+<p><a href="../kv-cache/index.html">KV cache</a> 的请求状态不随模型权重复制。不同用户请求被路由到不同 DP rank，因此 KV cache 按 rank 划分。</p>
+
+<details>
+<summary>2 个 rank 的缓存容量例子</summary>
+<ol>
+<li>设 rank 0 和 rank 1 各有一个独立的 KV cache 池，每个池最多放 4 个 token。</li>
+<li>rank 0 已放 3 个 token，只能再放 1 个；rank 1 已放 1 个 token，只能再放 3 个。</li>
+<li>若把两个池当作一个 8-token 合并池，rank 0 超出自己 4-token 上限的状态可以放进合并池的剩余空间；两个独立池没有这个共用空间。</li>
+<li>因此这个例子里的缓存容量属于每个 rank，不是先合并成一池再分。</li>
+</ol>
+</details>
+
+<p>token 是模型输入或输出的文本片段。在 vLLM 中，DP engine 是承载一个 rank 的独立模型工作进程；每个 DP engine 有独立 KV cache。</p>
+
+<h2 id="s3">3. 它为什么提高吞吐</h2>
+
+<p>在有足量请求且内存足够时，DP 有利于提高吞吐。</p>
+
+<details>
+<summary>单位时间完成量的例子</summary>
+<ol>
+<li>设 rank A、B 各用 4 秒完成 2 个请求。</li>
+<li>两 rank 并行在 4 秒内完成 4 个请求，单位时间完成量是 $4/4=1$ 个/秒。</li>
+<li>若同一个 rank 按同样速度逐个处理这 4 个请求，每个请求需要 $4/2=2$ 秒，共 $2+2+2+2=8$ 秒，单位时间完成量是 $4/8=0.5$ 个/秒。</li>
+<li>相比单 rank，两 rank 的比值是 $1/0.5=2$。</li>
+</ol>
+</details>
+
+<h2 id="s4">4. 适用条件与边界</h2>
+
+<p>DP 更适合大批量、高吞吐场景。DP 复制整份模型，内存代价随副本数增长。请求量要足以利用多份副本。</p>
+
+<p>负载均衡对请求级 DP 有益。</p>
+
+<p>与张量并行（<a href="../tensor-parallelism/index.html">Tensor Parallelism</a>）不同，TP 把模型权重切开，TP 组内的多卡处理同一输入；请求级 DP 保留完整副本，每个 DP rank 处理不同请求。DP 也可与 TP 组合：rank 是逻辑副本单位；纯 DP 下一个 rank 通常对应一个工作进程，组合 TP 时一个 rank 可由多卡共同持有完整模型。</p>
+
+<h2 id="references">参考资料</h2>
+<ol>
+<li>NVIDIA TensorRT LLM. Parallelism in TensorRT LLM. 官方文档. 2026-10-15 快照. <a href="https://nvidia.github.io/TensorRT-LLM/features/parallel-strategy.html">https://nvidia.github.io/TensorRT-LLM/features/parallel-strategy.html</a></li>
+<li>vLLM. Data Parallel Deployment. 官方文档. 2026-10-15 快照. <a href="https://docs.vllm.ai/en/stable/serving/data_parallel_deployment/">https://docs.vllm.ai/en/stable/serving/data_parallel_deployment/</a></li>
+<li>SGLang. Server Arguments. 官方文档. 2026-10-15 快照. <a href="https://docs.sglang.ai/advanced_features/server_arguments.html">https://docs.sglang.ai/advanced_features/server_arguments.html</a></li>
+</ol>
+
+<button class="back-to-top" id="backToTop" aria-label="返回顶部">↑</button>
+
+<script>
+// 进度条 + 返回顶部
+const progressBar = document.getElementById('progress');
+const backToTop = document.getElementById('backToTop');
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  progressBar.style.width = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100 + '%';
+  backToTop.classList.toggle('visible', h.scrollTop > 400);
+});
+backToTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+// 暗/亮模式切换，localStorage 持久化，同步 Prism 主题
+const root = document.documentElement;
+function setTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  document.getElementById('prism-light').disabled = theme === 'dark';
+  document.getElementById('prism-dark').disabled = theme !== 'dark';
+}
+setTheme(localStorage.getItem('theme') ||
+  (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  setTheme(next);
+});
+
+// 侧边目录：h2 为一级，h3 挂在上一个 h2 下
+const tocList = document.getElementById('tocList');
+const headings = Array.from(document.querySelectorAll('body > h2, body > h3'));
+let h2Li = null;
+let subUl = null;
+headings.forEach(h => {
+  if (!h.id) {
+    h.id = h.textContent.trim().replace(/[\s#?？：]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  }
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent.replace(/^Q\d+[：:]\s*/, '').slice(0, 30);
+  li.appendChild(a);
+  if (h.tagName === 'H3' && h2Li) {
+    a.classList.add('sub');
+    if (!subUl) h2Li.appendChild(subUl = document.createElement('ul'));
+    subUl.appendChild(li);
+  } else {
+    subUl = null;
+    tocList.appendChild(li);
+    h2Li = li;
+  }
+});
+
+// 滚动高亮当前章节
+const tocLinks = document.querySelectorAll('.toc a');
+function updateActiveToc() {
+  let active = null;
+  for (const s of headings) {
+    if (s.getBoundingClientRect().top < 120) active = s.id;
+  }
+  tocLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + active));
+}
+window.addEventListener('scroll', updateActiveToc, { passive: true });
+updateActiveToc();
+
+// 图片点击放大
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+document.querySelectorAll('body > img, p ~ img').forEach(img => {
+  img.classList.add('article-image');
+  img.addEventListener('click', () => {
+    lightboxImg.src = img.src;
+    lightboxCaption.textContent = img.alt || '';
+    lightbox.classList.add('open');
+  });
+});
+lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
+
+// 代码块复制按钮
+document.querySelectorAll('.code-block pre').forEach(pre => {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = '复制';
+  btn.addEventListener('click', async () => {
+    const code = (pre.querySelector('code') || pre).innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = code;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+  pre.parentElement.appendChild(btn);
+});
+
+// 章节折叠按钮
+const h2s = headings.filter(h => h.tagName === 'H2');
+h2s.forEach(h => {
+  const btn = document.createElement('span');
+  btn.className = 'collapse-btn';
+  btn.textContent = '▼';
+  btn.title = '折叠/展开';
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const collapsed = h.classList.toggle('collapsed');
+    for (let next = h.nextElementSibling; next && next.tagName !== 'H2'; next = next.nextElementSibling) {
+      next.style.display = collapsed ? 'none' : '';
+    }
+  });
+  h.appendChild(btn);
+});
+
+// 键盘：Esc 关闭大图，j/k 跳章节
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') lightbox.classList.remove('open');
+  if (e.target.matches('input, textarea')) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown' && e.shiftKey) {
+    e.preventDefault();
+    const next = h2s.find(s => s.getBoundingClientRect().top > 120);
+    if (next) next.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (e.key === 'k' || e.key === 'ArrowUp' && e.shiftKey) {
+    e.preventDefault();
+    let prev = null;
+    for (const s of h2s) {
+      if (s.getBoundingClientRect().top >= 120) break;
+      prev = s;
+    }
+    if (prev) prev.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+</script>
+
+</body>
+</html>
